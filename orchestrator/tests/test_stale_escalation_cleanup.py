@@ -803,18 +803,23 @@ class TestStrandRecordNeedsAWaitingWorkflow:
     only the filing is gated.
     """
 
+    @staticmethod
+    async def _sweep_one_aged_info_note(harness: Harness) -> EscalationQueue:
+        harness.config.info_l0_router_enabled = False
+        queue = _queue_of(harness)
+        _seed_escalation(
+            queue, 'esc-4242-1', '4242', age_secs=STRAND_AGE_SECS, severity='info'
+        )
+        await harness._dismiss_stale_escalations()
+        return queue
+
     async def test_a_sweep_stranding_only_info_notes_files_no_record(
         self, strand_harness: Harness
     ):
         """No workflow was waiting, so there is nobody the record could have saved."""
-        strand_harness.config.info_l0_router_enabled = False
-        queue = _queue_of(strand_harness)
-        _seed_escalation(
-            queue, 'esc-4242-1', '4242', age_secs=STRAND_AGE_SECS, severity='info'
-        )
+        queue = await self._sweep_one_aged_info_note(strand_harness)
 
-        await strand_harness._dismiss_stale_escalations()
-
+        assert _get(queue, 'esc-4242-1').resolution_class == 'stale-strand'
         assert _aggregate_escalations(strand_harness) == []
         assert [e for e in queue.get_pending() if e.level == 1] == []
 
@@ -822,14 +827,8 @@ class TestStrandRecordNeedsAWaitingWorkflow:
         self, strand_harness: Harness, caplog
     ):
         """The noise was the filing, not the telemetry: stamp, event and WARNING stay."""
-        strand_harness.config.info_l0_router_enabled = False
-        queue = _queue_of(strand_harness)
-        _seed_escalation(
-            queue, 'esc-4242-1', '4242', age_secs=STRAND_AGE_SECS, severity='info'
-        )
-
         with caplog.at_level(logging.WARNING):
-            await strand_harness._dismiss_stale_escalations()
+            queue = await self._sweep_one_aged_info_note(strand_harness)
 
         record = _get(queue, 'esc-4242-1')
         assert record.status == 'dismissed'
@@ -837,8 +836,12 @@ class TestStrandRecordNeedsAWaitingWorkflow:
         (event,) = _strand_events(strand_harness)
         assert event['data']['workflow_blocked'] is False
         assert event['data']['severity'] == 'info'
-        warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
-        assert any('strand' in m.lower() for m in warnings), warnings
+        (sweep_line,) = [
+            r.getMessage() for r in caplog.records
+            if r.levelno >= logging.WARNING and 'STALE-STRAND' in r.getMessage()
+        ]
+        assert '0 with a workflow waiting' in sweep_line
+        assert 'no level-1 record filed' in sweep_line
 
     async def test_a_mixed_sweep_files_one_record_naming_every_strand(
         self, strand_harness: Harness
