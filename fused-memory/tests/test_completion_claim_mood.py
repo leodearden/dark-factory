@@ -249,6 +249,10 @@ class TestModalFormsAreNotClaims:
                 'asked that it be filed as tkt_0RRRC5AASJ9Z630VP4PCN9H376', 'reify',
                 id='asked-filed-as-ticket',
             ),
+            pytest.param(
+                'PREREQUISITES: task 208 and task 762 must both be merged to main first.',
+                'solar_challenge_platform', id='solar-must-both-be-merged',
+            ),
         ],
     )
     def test_a_subjunctive_be_is_not_a_claim(self, text, project):
@@ -270,6 +274,31 @@ class TestModalFormsAreNotClaims:
     )
     def test_a_subjunctive_be_elsewhere_leaves_the_claim(self, text, claim):
         assert _triples(text) == [claim]
+
+    @pytest.mark.parametrize(
+        'text',
+        [
+            pytest.param("it'll be when task 5422 has landed", id='contracted-will-when'),
+            pytest.param(
+                "the next step'll be after task 5422 has merged", id='contracted-will-after',
+            ),
+            pytest.param(
+                "the question'll be whether task 5422 has landed", id='contracted-will-whether',
+            ),
+            pytest.param("that'd be once #5422 has shipped", id='contracted-would-once'),
+            pytest.param("it'd be when task 5422 has landed", id='contracted-would-when'),
+            pytest.param('let it be if task 5422 has landed', id='let-if'),
+            pytest.param('let the rollout be after task 5422 has landed', id='let-after'),
+            pytest.param('the right moment would be once task 5422 has landed', id='modal-once'),
+            pytest.param('the plan was to be after task 5422 has landed', id='to-be-after'),
+            pytest.param(
+                "it'll be as soon as task 5422 has landed", id='multi-word-as-soon-as',
+            ),
+            pytest.param("it'll be in case task 5422 has landed", id='multi-word-in-case'),
+        ],
+    )
+    def test_a_mood_cue_after_be_keeps_its_scope(self, text):
+        assert _triples(text) == []
 
 
 class TestNonAssertiveScopes:
