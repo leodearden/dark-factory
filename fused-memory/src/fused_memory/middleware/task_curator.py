@@ -369,6 +369,9 @@ class BackfillResult:
 BACKFILL_UPSERT_BATCH_SIZE = 128
 """Most points one backfill upsert request carries, far under Qdrant's 32 MiB request limit."""
 
+BACKFILL_DEFAULT_CONCURRENCY = 10
+"""Most embedding calls a backfill keeps in flight unless told otherwise."""
+
 
 @dataclass
 class PruneResult:
@@ -2090,6 +2093,7 @@ class TaskCurator:
         tasks: list[dict],
         project_id: str,
         *,
+        concurrency: int = BACKFILL_DEFAULT_CONCURRENCY,
         batch_size: int = BACKFILL_UPSERT_BATCH_SIZE,
     ) -> BackfillResult:
         """Upsert embeddings for a flat list of existing task dicts.
@@ -2104,11 +2108,20 @@ class TaskCurator:
         Args:
             tasks: Flat list of task dicts (as returned by flatten_task_tree).
             project_id: Project identifier used for the collection name and point IDs.
-            batch_size: Most points one upsert request carries.
+            concurrency: Most embedding calls in flight at once; at least 1.
+            batch_size: Most points one upsert request carries; at least 1.
 
         Returns:
             BackfillResult with counts of upserted, skipped, and error tasks.
+
+        Raises:
+            ValueError: *concurrency* or *batch_size* is below 1, raised before
+                any embed or Qdrant call. ``asyncio.Semaphore(0)`` would
+                otherwise block the run forever without an error.
         """
+        for knob, value in (('concurrency', concurrency), ('batch_size', batch_size)):
+            if value < 1:
+                raise ValueError(f'backfill_corpus: {knob} must be >= 1, got {value}')
         if not tasks:
             return BackfillResult()
 
@@ -2117,7 +2130,7 @@ class TaskCurator:
         collection = await self._ensure_collection(project_id)
         embedder = await self._get_embedder()
         client = await self._get_qdrant()
-        embed_slots = asyncio.Semaphore(10)
+        embed_slots = asyncio.Semaphore(concurrency)
         batches = [titled[start:start + batch_size] for start in range(0, len(titled), batch_size)]
 
         for number, batch in enumerate(batches, start=1):
