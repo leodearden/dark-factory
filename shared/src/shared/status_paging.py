@@ -3,6 +3,8 @@
 ``get_statuses`` may answer with a slice of the map and a pagination
 envelope. This module turns those slices back into one map, or refuses: a
 read whose completeness cannot be proven is never handed back as complete.
+It also holds the request each page sends and the reader for a dispatched
+JSON-RPC reply, which every orchestrator reader of ``get_statuses`` uses.
 """
 
 from __future__ import annotations
@@ -12,7 +14,16 @@ from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from typing import Generic, TypeVar
 
-__all__ = ['STATUSES_SAFE_PAGE_SIZE', 'StatusPage', 'StatusPagingError', 'walk_status_pages']
+from shared.mcp_envelope import parse_tool_result
+
+__all__ = [
+    'STATUSES_SAFE_PAGE_SIZE',
+    'StatusPage',
+    'StatusPagingError',
+    'read_status_page',
+    'status_page_arguments',
+    'walk_status_pages',
+]
 
 STATUSES_SAFE_PAGE_SIZE = 2000
 """How many statuses one ``get_statuses`` page may carry.
@@ -53,6 +64,35 @@ class StatusPage(Generic[K]):
     statuses: Mapping[K, str]
     delivered: int
     pagination: object
+
+
+def status_page_arguments(arguments: Mapping[str, object], offset: int) -> dict[str, object]:
+    """The ``get_statuses`` arguments that ask for the page at *offset*.
+
+    The first request is the caller's own.  A continuation names an explicit
+    ``page_size``, because ``fused-memory/src/fused_memory/server/tools.py::get_statuses``
+    ignores ``offset`` when ``page_size`` is omitted and ``auto_paginate`` is False.
+    """
+    if offset == 0:
+        return dict(arguments)
+    return {**arguments, 'page_size': STATUSES_SAFE_PAGE_SIZE, 'offset': offset}
+
+
+def read_status_page(reply: object) -> StatusPage[str]:
+    """Read one ``dispatch_tool`` JSON-RPC reply to ``get_statuses`` as a walk page.
+
+    Raises :class:`~shared.mcp_envelope.EnvelopeParseError` for a reply with
+    no ``statuses`` mapping.  ``pagination`` is passed through raw, so
+    :func:`walk_status_pages` alone decides whether it can be trusted.
+    """
+    statuses, err = parse_tool_result(reply, 'statuses', dict)
+    if err is not None:
+        raise err
+    payload, err = parse_tool_result(reply, None, dict)
+    if err is not None:
+        raise err
+    assert statuses is not None and payload is not None  # invariant: parse_tool_result → (None, err) | (value, None)
+    return StatusPage(statuses, len(statuses), payload.get('pagination'))
 
 
 async def walk_status_pages(

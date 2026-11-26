@@ -53,7 +53,12 @@ from shared.scheduler_state import (
     RequeueCooldown,
     SchedulerStateSnapshot,
 )
-from shared.status_paging import STATUSES_SAFE_PAGE_SIZE, StatusPage, walk_status_pages
+from shared.status_paging import (
+    StatusPage,
+    read_status_page,
+    status_page_arguments,
+    walk_status_pages,
+)
 from shared.task_claimant import has_live_claimant, is_stranded_blocked
 from shared.task_metadata import Milestone
 from shared.task_metadata_wire import coerce_task_metadata
@@ -2886,18 +2891,9 @@ class Scheduler:
             arguments['ids'] = list(ids)
 
         async def _page(offset: int) -> StatusPage[str]:
-            call_arguments = arguments if offset == 0 else {
-                **arguments, 'page_size': STATUSES_SAFE_PAGE_SIZE, 'offset': offset,
-            }
-            result = await self.dispatch_tool('get_statuses', call_arguments, timeout=15)
-            statuses, err = parse_tool_result(result, 'statuses', dict)
-            if err is not None:
-                raise err
-            payload, err = parse_tool_result(result, None, dict)
-            if err is not None:
-                raise err
-            assert statuses is not None and payload is not None  # invariant: parse_tool_result → (None, err) | (value, None)
-            return StatusPage(statuses, len(statuses), payload.get('pagination'))
+            return read_status_page(await self.dispatch_tool(
+                'get_statuses', status_page_arguments(arguments, offset), timeout=15,
+            ))
 
         try:
             return await walk_status_pages(_page, self._project_root), None
