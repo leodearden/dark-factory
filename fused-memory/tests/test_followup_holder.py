@@ -35,6 +35,17 @@ def _followup(**extra: Any) -> dict[str, Any]:
     }
 
 
+def _finding_set(**extra: Any) -> dict[str, Any]:
+    return {
+        'source': 'review-all',
+        'x_finding_key': ['fk-1'],
+        'x_finding_run': 'review-all-proj-20261126',
+        'finding_set_hold': {'ruling': 'Leo 2026-11-12 on fk-1'},
+        'files': [_FILE],
+        **extra,
+    }
+
+
 async def _file_followup(stack: Stack, title: str, *, priority: str = 'low', **metadata: Any) -> str:
     return await stack.file_normal(
         title=title, description=f'{title}: one observation.', priority=priority,
@@ -119,6 +130,53 @@ async def test_a_medium_a_planned_and_a_cited_followup_are_not_held(
     assert len(await stack.holder_ids()) == 1
     for task_id in (medium, planned, cited):
         await _assert_unheld(stack, task_id)
+
+
+@pytest.mark.asyncio
+async def test_a_marked_finding_set_is_born_held_on_both_filing_paths(
+    stack: Stack, curator_creates: list[PreparedCandidate],
+) -> None:
+    ticketed = await stack.file_normal(
+        title='Step 1: add the public name', description='Step 1 of the finding set.',
+        priority='low', metadata=_finding_set(),
+    )
+    planned = await stack.file_planned(
+        title='Step 2: judge.py imports it', description='Step 2 of the finding set.',
+        priority='low', metadata=_finding_set(),
+    )
+
+    [holder] = await stack.holder_ids()
+    for task_id in (ticketed, planned):
+        assert await stack.dependencies(task_id) == [holder], task_id
+        assert str((await stack.metadata(task_id))[FOLLOWUP_HOLD_METADATA_KEY]['holder']) == holder, task_id
+    held_events = await stack.events(EventType.followup_held)
+    assert {'task_id': ticketed, 'holder_id': holder} in held_events
+    assert {'task_id': planned, 'holder_id': holder} in held_events
+
+
+@pytest.mark.asyncio
+async def test_a_committed_finding_set_with_internal_edges_stays_held(
+    stack: Stack, curator_creates: list[PreparedCandidate],
+) -> None:
+    root = await stack.file_planned(
+        title='Step 1: add the public name', description='Step 1 of the finding set.',
+        priority='low', metadata=_finding_set(),
+    )
+    leaf = await stack.file_planned(
+        title='Step 2: judge.py imports it', description='Step 2 of the finding set.',
+        priority='low', metadata=_finding_set(),
+    )
+    edge = await stack.call('add_dependency', id=leaf, depends_on=root)
+    assert isinstance(edge, dict) and 'error' not in edge, edge
+
+    committed = await stack.call('commit_planning', task_ids=f'{root},{leaf}')
+
+    assert 'error' not in committed, committed
+    [holder] = await stack.holder_ids()
+    for task_id in (root, leaf):
+        assert (await stack.row(task_id))['status'] == 'pending', task_id
+        assert holder in await stack.dependencies(task_id), task_id
+    assert await stack.events(EventType.followup_promoted) == []
 
 
 @pytest.mark.asyncio
