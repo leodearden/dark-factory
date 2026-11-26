@@ -513,14 +513,22 @@ class TestRunPanel:
 
     @pytest.mark.asyncio
     async def test_its_turn_cap_reaches_every_reviewer_dispatch(self, source: _Source) -> None:
+        variant = VariantConfig(
+            name='pair',
+            description='Test',
+            reviewers=[
+                ReviewerSpec(name='r1', model='sonnet', specialization='S1.'),
+                ReviewerSpec(name='r2', model='sonnet', specialization='S2.'),
+            ],
+        )
         with patch(
             'orchestrator.evals.reviewer_trial.runner.invoke_agent',
             new_callable=AsyncMock,
             side_effect=_make_verdict_writing_invoke(verdict='PASS'),
         ) as mock_invoke:
-            await run_panel(_one_reviewer(), _diff_in(source), stagger_secs=0, max_turns=30)
+            await run_panel(variant, _diff_in(source), stagger_secs=0, max_turns=30)
 
-        assert mock_invoke.call_args.kwargs['max_turns'] == 30
+        assert [call.kwargs['max_turns'] for call in mock_invoke.call_args_list] == [30, 30]
 
     @pytest.mark.usefixtures('code_default_config')
     @pytest.mark.asyncio
@@ -1053,6 +1061,7 @@ class TestPanelCache:
         assert dispatched == ['ungated']
         assert second == first
 
+    @pytest.mark.usefixtures('code_default_config')
     @pytest.mark.parametrize('change', [
         pytest.param(lambda: {'prices': default_price_table()}, id='prices'),
         pytest.param(lambda: {'usage_gate': _GATE}, id='gate'),
@@ -1122,18 +1131,21 @@ class TestPanelCache:
         infos = [r.getMessage() for r in caplog.records if r.levelno == logging.INFO]
         assert any(str(entry) in message for message in infos), infos
 
-    @pytest.mark.usefixtures('code_default_config')
     @pytest.mark.asyncio
-    async def test_a_corrupt_legacy_entry_is_rerun(self, source: _Source, tmp_path: Path) -> None:
+    async def test_a_corrupt_legacy_entry_is_rerun_even_at_its_30_turn_cap(
+        self, source: _Source, tmp_path: Path,
+    ) -> None:
         variant, diff, results_dir = _one_reviewer(), _diff_in(source), tmp_path / 'results'
         results_dir.mkdir()
         (results_dir / f'{variant.name}__{diff.diff_id}.json').write_text('{not json')
 
         with _counted_reviewers() as dispatched:
-            result = await run_panel_cached(variant, diff, results_dir=results_dir, stagger_secs=0)
+            result = await run_panel_cached(variant, diff, results_dir=results_dir, stagger_secs=0, max_turns=30)
 
         assert dispatched == ['ungated']
-        assert result.run_key == _SMOKE_KEY
+        assert result.run_key == PanelRunKey.of(
+            prices=None, usage_gate=None, diff_cap_chars=DIFF_CAP_CHARS, max_turns=30,
+        )
 
     @pytest.mark.parametrize('stored', [
         pytest.param(lambda variant, diff: '{not json', id='corrupt'),
@@ -1201,6 +1213,51 @@ class TestPanelCache:
         assert dispatched == []
         [warning] = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
         assert 'Reused 2 legacy panel' in warning and str(results_dir) in warning, warning
+
+    @pytest.mark.usefixtures('code_default_config')
+    @pytest.mark.asyncio
+    async def test_run_trial_counts_the_legacy_panels_its_cap_passes_over_before_any_reviewer_runs(
+        self, source: _Source, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        variant, results_dir = _one_reviewer(), tmp_path / 'results'
+        diffs = [_diff_in(source, diff_id='d1'), _diff_in(source, diff_id='d2')]
+        for diff in diffs:
+            _write_legacy_panel(results_dir, PanelRunResult(variant_name=variant.name, diff_id=diff.diff_id))
+        warned_before_dispatch: list[bool] = []
+
+        async def _run_panel_noting_the_warning(*args, **kwargs) -> PanelRunResult:
+            warned_before_dispatch.append(any(
+                'legacy panel' in r.getMessage() for r in caplog.records if r.levelno == logging.WARNING
+            ))
+            return await run_panel(*args, **kwargs)
+
+        with (
+            caplog.at_level(logging.INFO, logger='orchestrator.evals.reviewer_trial.runner'),
+            _counted_reviewers() as dispatched,
+            patch('orchestrator.evals.reviewer_trial.runner.run_panel', side_effect=_run_panel_noting_the_warning),
+        ):
+            await run_trial([variant], CorpusManifest(diffs=diffs), results_dir=results_dir, stagger_secs=0)
+
+        assert dispatched == ['ungated', 'ungated']
+        assert warned_before_dispatch == [True, True]
+        [warning] = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert 'Not reusing 2 legacy panel' in warning and str(results_dir) in warning, warning
+        assert 'ran at 30 turns, this run uses 90' in warning, warning
+
+    @pytest.mark.usefixtures('code_default_config')
+    @pytest.mark.asyncio
+    async def test_run_trial_runs_every_pair_at_one_resolved_cap(self, source: _Source, tmp_path: Path) -> None:
+        diffs = [_diff_in(source, diff_id='d1'), _diff_in(source, diff_id='d2')]
+
+        with (
+            _counted_reviewers(),
+            patch('orchestrator.evals.reviewer_trial.runner.run_panel_cached', wraps=run_panel_cached) as spy,
+        ):
+            await run_trial(
+                [_one_reviewer()], CorpusManifest(diffs=diffs), results_dir=tmp_path / 'results', stagger_secs=0,
+            )
+
+        assert [call.kwargs['max_turns'] for call in spy.await_args_list] == [90, 90]
 
     @pytest.mark.asyncio
     async def test_run_trial_threads_its_stagger_to_each_panel(self, source: _Source, tmp_path: Path) -> None:

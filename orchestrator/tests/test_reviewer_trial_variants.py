@@ -401,7 +401,7 @@ class TestTrialReviewerTurnCap:
         assert trial_reviewer_max_turns(30) == 30
 
     def test_a_non_positive_cap_is_refused_naming_it(self) -> None:
-        with pytest.raises(ValueError, match='0'):
+        with pytest.raises(ValueError, match=r'got 0\b'):
             trial_reviewer_max_turns(0)
-        with pytest.raises(ValueError, match='0'):
+        with pytest.raises(ValueError, match=r'got 0\b'):
             build_trial_reviewer_role(VARIANT_A.reviewers[0], max_turns=0)

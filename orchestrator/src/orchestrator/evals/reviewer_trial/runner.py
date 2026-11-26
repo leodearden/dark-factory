@@ -610,7 +610,9 @@ async def run_trial(
 
     *prices* (default-off) is threaded through to each ``run_panel`` call so
     cross-family (codex/gemini) reviewers get a non-sentinel cost column.
-    Reused legacy panels are counted in one warning.
+    Every pair runs at one turn cap, resolved once. Reused legacy panels are
+    counted in one warning; legacy panels this cap passes over are counted in
+    one warning before any reviewer runs.
 
     Raises FixtureEnrichmentMissing, before any reviewer runs, when a
     context-complete variant meets a fixture with no ``context``. Fixtures with
@@ -622,6 +624,8 @@ async def run_trial(
         if unenriched:
             raise FixtureEnrichmentMissing(unenriched)
     _warn_of_sourceless_fixtures(corpus.diffs)
+    turns = trial_reviewer_max_turns(max_turns)
+    _warn_of_passed_over_legacy_panels(variants, corpus.diffs, results_dir or _RESULTS_DIR, turns)
 
     semaphore = asyncio.Semaphore(max_parallel_panels)
     all_results: list[PanelRunResult] = []
@@ -632,7 +636,7 @@ async def run_trial(
                 return await run_panel_cached(
                     variant, diff, results_dir=results_dir, stagger_secs=stagger_secs,
                     prices=prices, usage_gate=usage_gate, diff_cap_chars=diff_cap_chars,
-                    max_turns=max_turns,
+                    max_turns=turns,
                 )
             except FixtureNotMaterialisable as exc:
                 logger.warning(
@@ -682,6 +686,23 @@ def _warn_of_sourceless_fixtures(diffs: Sequence[CorpusDiff]) -> None:
         '%d of %d fixtures have no source checkout, so each is skipped unless its panel is already cached: %s',
         sum(projects.total() for projects in projects_by_reason.values()), len(diffs), groups,
     )
+
+
+def _warn_of_passed_over_legacy_panels(
+    variants: Sequence[VariantConfig], diffs: Sequence[CorpusDiff], out_dir: Path, turns: int,
+) -> None:
+    if turns == LEGACY_PANEL_MAX_TURNS:
+        return
+    passed_over = sum(
+        1 for variant in variants for diff in diffs
+        if (out_dir / _slot_filename(variant.name, diff.diff_id, None)).exists()
+    )
+    if passed_over:
+        logger.warning(
+            'Not reusing %d legacy panel(s) from %s: they ran at %d turns, this run uses %d; '
+            'see docs/plan-scoring-and-judge.md, "Reviewer-trial panel cache and score loop (task 6741)"',
+            passed_over, out_dir, LEGACY_PANEL_MAX_TURNS, turns,
+        )
 
 
 async def run_and_score(
