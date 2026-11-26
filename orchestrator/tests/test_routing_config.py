@@ -128,23 +128,13 @@ class TestOrchestratorConfigRoundTripsWithNewFields:
     extending RoutingConfig)."""
 
     def test_default_orchestrator_config_constructs_ok(self):
+        """The shipped rule table constructs and validates. Its ids and order
+        are pinned once, in
+        test_routing_byte_equivalence.py::TestExperimentOneRuleTable."""
         cfg = OrchestratorConfig()
         assert cfg.routing.ladder == list(DEFAULT_LADDER)
         assert cfg.routing.per_model_daily_ceiling_usd == {}
-        # Step-10 (task epsilon) shipped one default policy rule via
-        # defaults.yaml (the byte-equivalent transcription of the
-        # pre-epsilon Rust heuristic); task theta (Phase 3) replaced it with
-        # two language-agnostic rules, task mu (Phase 4) appended the
-        # retry-tier-up rung, and task nu (Phase 4 adaptive) inserted the
-        # simple-saturated-full-path rung ahead of it -- this is no longer
-        # the bare RoutingConfig() pydantic default (see
-        # TestRoutingConfigDefaults.test_rules_defaults_empty for that), but
-        # OrchestratorConfig() still constructs and validates fine with it
-        # present, which is this test's actual point.
-        assert [r.id for r in cfg.routing.rules] == [
-            'large-plan-steps', 'large-plan-modules',
-            'simple-saturated-full-path', 'retry-tier-up',
-        ]
+        assert cfg.routing.rules
 
     def test_orchestrator_config_with_rule_constructs_ok(self):
         cfg = OrchestratorConfig(
