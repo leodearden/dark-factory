@@ -362,12 +362,14 @@ async def test_a_proceeding_train_verifies_and_lands(
 ) -> None:
     req = await _train(git_ops, config, 'T2')
     queue: asyncio.Queue[Any] = asyncio.Queue()
+    verifier = FakeVerifier()
     screen = ScriptedScreen()
-    lane = make_lane(git_ops, queue, event_store=event_store, screen=screen)
+    lane = make_lane(git_ops, queue, verifier=verifier, event_store=event_store, screen=screen)
 
     outcome = await merge_through_lane(lane, queue, req)
 
     assert outcome.status == 'done', outcome
+    assert verifier.verified == [req.task_id]
     assert [call.site for call in screen.calls] == [ScreenSite.TRAIN]
     assert req.mark_member_done.call_count == 3
     assert [data['outcome'] for data in _events(event_store, 'merge_attempt', req.task_id)] == ['done']
