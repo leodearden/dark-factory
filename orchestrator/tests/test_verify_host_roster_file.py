@@ -275,3 +275,35 @@ def test_a_malformed_file_fails_loudly_naming_the_path(tmp_path: Path, text: str
     path = _write(tmp_path, text)
     with pytest.raises(RosterFileError, match=re.escape(str(path))):
         load_roster(path)
+
+
+EXAMPLE_ROSTER = Path(__file__).resolve().parents[2] / 'config' / 'verify-hosts.example.yaml'
+
+
+def _example() -> Roster:
+    assert EXAMPLE_ROSTER.is_file(), EXAMPLE_ROSTER
+    return load_roster(EXAMPLE_ROSTER)
+
+
+class TestTheTrackedExample:
+    """config/verify-hosts.example.yaml is the documented shape; keep it executable."""
+
+    def test_the_example_declares_a_host_with_a_project(self) -> None:
+        roster = _example()
+        assert roster.hosts
+        assert all(host.projects for host in roster.hosts.values())
+
+    def test_every_project_block_names_its_project_root(self) -> None:
+        roster = _example()
+        for name in roster.hosts:
+            for project_id, host_config in roster.host_configs(name).items():
+                assert 'project_root' in host_config, (name, project_id)
+
+    def test_every_runner_validates_as_the_dispatcher_would(self) -> None:
+        roster = _example()
+        project_ids = {project_id for host in roster.hosts.values() for project_id in host.projects}
+        for project_id in sorted(project_ids):
+            for runner in roster.runners_for_project(project_id):
+                paths = VerifyRunnerConfig.model_validate(dataclasses.asdict(runner)).gate_paths()
+                assert Path(paths.source).is_absolute()
+                assert Path(paths.root).is_absolute()
