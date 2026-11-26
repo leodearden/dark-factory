@@ -7,7 +7,7 @@ step per row id. The renders a host installs (its per-project YAML, its
 orchestrator wrapper) are built here from the private verify-host roster.
 
 Usage:
-  verify_host_contract.py requirements
+  verify_host_contract.py requirements [--titles]
   verify_host_contract.py render HOST [--roster FILE] --out DIR
 """
 
@@ -194,6 +194,7 @@ def render_host_env(spec: HostSpec, reference: EnvironmentFacts, ssh_bin: str) -
         'DF_CHECKOUT_PATH': spec.df_checkout_path,
         'GATE_CHECKOUTS_PATH': spec.gate_checkouts_path,
         'WRAPPER_PATH': spec.wrapper_path,
+        'TOOL_PATH_PRELUDE': REMOTE_TOOL_PATH_PRELUDE,
         'REF_TIME_ZONE': reference.time_zone or '',
         'REF_LOCALE': reference.locale or '',
         'REF_UV_VERSION': reference.uv_version or '',
@@ -464,7 +465,8 @@ def renders(spec: HostSpec, reference: EnvironmentFacts, ssh_bin: str) -> dict[s
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     commands = parser.add_subparsers(dest='command', required=True)
-    commands.add_parser('requirements', help='print the requirement ids, one per line, in execution order')
+    requirements = commands.add_parser('requirements', help='print the requirement ids, one per line, in order')
+    requirements.add_argument('--titles', action='store_true', help='print id<TAB>title per line')
     render = commands.add_parser('render', help="write a host's per-project YAML, wrapper.sh and host.env")
     render.add_argument('host')
     render.add_argument('--roster', type=Path, help='roster file (default: the ORCH_VERIFY_HOSTS_FILE resolution)')
@@ -475,7 +477,7 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     if args.command == 'requirements':
-        print('\n'.join(row.id for row in REQUIREMENTS))
+        print('\n'.join(f'{row.id}\t{row.title}' if args.titles else row.id for row in REQUIREMENTS))
         return 0
     roster_path = args.roster or roster_file_path(os.environ)
     try:

@@ -117,6 +117,13 @@ def test_requirements_prints_the_table_ids_in_execution_order() -> None:
     assert proc.stdout.splitlines() == TABLE_IDS
 
 
+def test_requirements_titles_pairs_each_id_with_its_title() -> None:
+    proc = _run('requirements', '--titles')
+    assert proc.returncode == 0, proc.stderr
+    pairs = [line.split('\t') for line in proc.stdout.splitlines()]
+    assert pairs == [[row.id, row.title] for row in _contract().REQUIREMENTS]
+
+
 def test_the_table_in_process_matches_the_cli() -> None:
     assert [row.id for row in _contract().REQUIREMENTS] == TABLE_IDS
 
@@ -152,6 +159,7 @@ class TestRender:
         assert _sourced(env_file, 'WRAPPER_PATH') == ['/usr/local/bin/orchestrator']
         assert _sourced(env_file, 'SSH_BIN') == ['ssh']
         assert _sourced(env_file, 'SSH_OPTS') == list(contract.DISPATCHER_SSH_OPTS)
+        assert _sourced(env_file, 'TOOL_PATH_PRELUDE') == [REMOTE_TOOL_PATH_PRELUDE]
         assert _sourced(env_file, 'PROJECT_IDS') == ['p', 'q']
         assert _sourced(env_file, 'CONFIG_PATHS') == ['/srv/host/p.yaml', '/srv/host/q.yaml']
         assert _sourced(env_file, 'PROJECT_ROOTS') == ['/srv/host/p', '/srv/host/q']
