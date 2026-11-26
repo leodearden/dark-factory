@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import fcntl
+import logging
 import os
 import subprocess
 import sys
@@ -38,6 +39,7 @@ from orchestrator.git_ops import (
     WorktreeKind,
 )
 from orchestrator.merge_lane.outcome_facts import MergeBlockCategory
+from orchestrator.merge_lane.types import MergeOutcome
 from orchestrator.merge_lane.screen import (
     MERGE_SCREEN_ALARM_TASK_ID,
     Bounce,
@@ -45,6 +47,7 @@ from orchestrator.merge_lane.screen import (
     Proceed,
     ScreenSite,
     run_screen,
+    screen_or_proceed,
 )
 from orchestrator.verify import NodeIdResult, NodeIdStatus
 from orchestrator.verify_cancel import lane_lock_path
@@ -630,3 +633,166 @@ async def test_run_screen_only_restricts_to_the_named_checks(mapping_tree: Path,
     assert sorted(call.ids) == ['pkg/t.py::fails', 'pkg/t.py::passes']
     assert call.prefixes == ('pkg',)
     assert call.concurrent_groups is True
+
+
+# ---------------------------------------------------------------------------
+# fail-open robustness: absent and raising collaborators, the port-boundary guard
+
+_LANE_LOGGER = 'orchestrator.merge_lane'
+
+
+def _lane_warnings(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    return [r for r in caplog.records if r.name == _LANE_LOGGER and r.levelno == logging.WARNING]
+
+
+@pytest.mark.asyncio
+async def test_absent_collaborators_still_bounce_an_own_defect(
+    repo: Path, history: History, git_ops: GitOps,
+) -> None:
+    screen = MergeScreen(git_ops, None, None)
+
+    decision = await _screen_item(screen, _config(repo), history.item, history.base)
+
+    assert isinstance(decision, Bounce)
+    assert decision.outcome.failure_category == 'merge_screen'
+    assert decision.check_ids == ('clean',)
+
+
+@pytest.mark.asyncio
+async def test_absent_collaborators_raise_and_close_no_alarm(
+    repo: Path, history: History, git_ops: GitOps,
+) -> None:
+    runner = ScriptedRunner(verdict=_status_for_clean('error'))
+    screen = MergeScreen(git_ops, None, None, run_ids=runner)
+    config = _config(repo, error_streak_alarm=1)
+
+    decisions = [await _screen_item(screen, config, history.item, history.base) for _ in range(3)]
+    runner.verdict = _defect_fails
+    clean = await _screen_item(screen, config, history.base, history.base)
+
+    assert all(isinstance(decision, Proceed) for decision in [*decisions, clean])
+
+
+class _RaisingEvents:
+    def emit(self, event_type: EventType, *, task_id: str | None = None, data: dict | None = None) -> int:
+        raise OSError('event store disk full')
+
+
+class _RaisingEscalationQueue:
+    """Every call the alarm makes fails, as the file-backed queue can."""
+
+    def make_id(self, key: str) -> str:
+        raise OSError('queue: make_id')
+
+    def submit(self, escalation: Any) -> object:
+        raise OSError('queue: submit')
+
+    def has_open_l1(self, task_id: str) -> bool:
+        raise OSError('queue: has_open_l1')
+
+    def get_by_task(self, task_id: str, status: str | None = None) -> list[Any]:
+        raise OSError('queue: get_by_task')
+
+    def resolve(
+        self, escalation_id: str, resolution: str, *,
+        resolved_by: str | None = None, resolution_class: str | None = None,
+    ) -> object:
+        raise OSError('queue: resolve')
+
+
+@pytest.mark.asyncio
+async def test_raising_collaborators_lose_no_decision(
+    repo: Path, history: History, git_ops: GitOps,
+) -> None:
+    runner = ScriptedRunner()
+    screen = MergeScreen(git_ops, _RaisingEvents(), _RaisingEscalationQueue(), run_ids=runner)
+    config = _config(repo, error_streak_alarm=1)
+
+    bounced = await _screen_item(screen, config, history.item, history.base)
+    runner.verdict = _status_for_clean('error')
+    errored = await _screen_item(screen, config, history.item, history.base)
+
+    assert isinstance(bounced, Bounce)
+    assert bounced.check_ids == ('clean',)
+    assert isinstance(errored, Proceed)
+
+
+@pytest.mark.asyncio
+async def test_a_raising_queue_still_lets_the_event_emit(
+    repo: Path, history: History, git_ops: GitOps, caplog: pytest.LogCaptureFixture,
+) -> None:
+    events = RecordingEvents()
+    runner = ScriptedRunner(verdict=_status_for_clean('error'))
+    screen = MergeScreen(git_ops, events, _RaisingEscalationQueue(), run_ids=runner)
+    config = _config(repo, error_streak_alarm=1)
+
+    with caplog.at_level(logging.WARNING, logger=_LANE_LOGGER):
+        decisions = [await _screen_item(screen, config, history.item, history.base) for _ in range(2)]
+
+    assert all(isinstance(decision, Proceed) for decision in decisions)
+    assert [event['error_streak'] for event in events.screens()] == [1, 2]
+    warnings = _lane_warnings(caplog)
+    assert len(warnings) == 2
+    assert all(r.exc_info is not None and isinstance(r.exc_info[1], OSError) for r in warnings)
+
+
+@pytest.mark.asyncio
+async def test_a_raising_event_sink_is_logged_and_swallowed(
+    repo: Path, history: History, git_ops: GitOps, caplog: pytest.LogCaptureFixture,
+) -> None:
+    screen = MergeScreen(git_ops, _RaisingEvents(), RecordingEscalationQueue(), run_ids=ScriptedRunner())
+
+    with caplog.at_level(logging.WARNING, logger=_LANE_LOGGER):
+        decision = await _screen_item(screen, _config(repo), history.item, history.base)
+
+    assert isinstance(decision, Bounce)
+    [warning] = _lane_warnings(caplog)
+    assert warning.exc_info is not None and isinstance(warning.exc_info[1], OSError)
+
+
+@dataclass
+class _FixedPort:
+    """A ScreenPort that returns *decision*, or raises *raises* when it is set."""
+
+    decision: Any = None
+    raises: BaseException | None = None
+
+    async def screen_item(
+        self, *, task_id: str, merged_sha: str, base_sha: str | None,
+        config: OrchestratorConfig, site: ScreenSite,
+    ) -> Any:
+        if self.raises is not None:
+            raise self.raises
+        return self.decision
+
+
+async def _through_guard(port: _FixedPort, config: OrchestratorConfig) -> Any:
+    return await screen_or_proceed(
+        port, task_id='42', merged_sha='m' * 40, base_sha='b' * 40, config=config, site=ScreenSite.MERGER,
+    )
+
+
+@pytest.mark.asyncio
+async def test_screen_or_proceed_turns_a_raising_port_into_proceed(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    with caplog.at_level(logging.WARNING, logger=_LANE_LOGGER):
+        decision = await _through_guard(_FixedPort(raises=RuntimeError('boom')), _config(tmp_path))
+
+    assert isinstance(decision, Proceed)
+    [warning] = _lane_warnings(caplog)
+    assert warning.exc_info is not None and isinstance(warning.exc_info[1], RuntimeError)
+    assert '42' in warning.getMessage()
+
+
+@pytest.mark.asyncio
+async def test_screen_or_proceed_passes_a_bounce_through(tmp_path: Path) -> None:
+    bounce = Bounce(MergeOutcome('blocked', reason='x'), ('clean',))
+
+    assert await _through_guard(_FixedPort(decision=bounce), _config(tmp_path)) is bounce
+
+
+@pytest.mark.asyncio
+async def test_screen_or_proceed_lets_cancellation_through(tmp_path: Path) -> None:
+    with pytest.raises(asyncio.CancelledError):
+        await _through_guard(_FixedPort(raises=asyncio.CancelledError()), _config(tmp_path))
