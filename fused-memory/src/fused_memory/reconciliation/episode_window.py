@@ -21,9 +21,12 @@ Graphiti write still executing for the project began
   sample, so its ``created_at`` is later than the sample, which is later than
   ``run.started_at``; or it was executing at the sample, so its ``created_at``
   is no earlier than the recorded start.
-- Live. With nothing executing the cursor is exactly ``run.started_at``. A
-  write executes for at most the queue's ``write_timeout_seconds``, so the
-  cursor lags only by in-flight writes and never freezes on an empty cycle.
+- Live. With nothing executing the cursor is exactly ``run.started_at``. The
+  queue's ``write_timeout_seconds`` bounds a write until it lands, and its
+  post-landing tail is bounded by that tail's own I/O budgets. The executing
+  window still spans the tail, which only makes the cursor more conservative.
+  So the cursor lags only by in-flight writes and never freezes on an empty
+  cycle.
 
 The sample travels in Stage 1's report stats.
 

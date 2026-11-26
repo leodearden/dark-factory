@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import contextvars
 import json
 import logging
 import random
@@ -278,6 +279,42 @@ POST_EXECUTE_DEAD_PREFIX = (
 CLAIMABLE_STATUSES: tuple[str, ...] = ('pending', 'retry', 'parked')
 _CLAIMABLE_SQL = 'status IN ({})'.format(', '.join(f"'{s}'" for s in CLAIMABLE_STATUSES))
 
+@dataclass(frozen=True)
+class _AttemptBudget:
+    """One queue attempt's write budget, and the task running that attempt."""
+
+    owner: asyncio.Task[Any] | None
+    timeout: asyncio.Timeout
+
+
+_ATTEMPT_BUDGET: contextvars.ContextVar[_AttemptBudget | None] = contextvars.ContextVar(
+    'durable_queue_attempt_budget', default=None,
+)
+
+
+def release_attempt_budget() -> None:
+    """Disarm the current queue attempt's write budget: its backend write LANDED.
+
+    An executor calls this the instant its backend write lands. Cancelling the
+    attempt after that cannot un-land the write; it only sends the item down
+    the retry path, which re-executes it: the duplicate ``executed`` exists to
+    prevent.
+
+    Only the attempt's own task can disarm it. asyncio copies the attempt's
+    context into every task the attempt creates, and such a task can neither
+    vouch that the attempt's write landed nor act on a budget whose attempt
+    may already have ended. The owner sees its budget only inside the budget's
+    scope, where it is armed or expiring. So outside a queue attempt, in any
+    other task, or once the budget has expired, this is a no-op: it never
+    raises.
+    """
+    attempt = _ATTEMPT_BUDGET.get()
+    if attempt is None or attempt.owner is not asyncio.current_task():
+        return
+    if attempt.timeout.expired():
+        return
+    attempt.timeout.reschedule(None)
+
 
 class DurableWriteQueue:
     """SQLite WAL-backed write queue with per-group workers and global semaphore.
@@ -525,6 +562,9 @@ class DurableWriteQueue:
     async def _process_item(self, item: QueueItem) -> None:
         """Execute the write, handle success/failure.
 
+        The write budget bounds the attempt until its backend write lands
+        (``release_attempt_budget``), never the post-landing tail.
+
         Callbacks run *before* marking completed so that a callback
         failure triggers retry instead of being silently lost.
 
@@ -559,10 +599,14 @@ class DurableWriteQueue:
                     item.callback_type, value, row_id=item.id, raw_payload=item.payload,
                 )
                 with self._executing(item):
-                    result = await asyncio.wait_for(
-                        self._execute_write(value),
-                        timeout=self._write_timeout_seconds,
-                    )
+                    async with asyncio.timeout(self._write_timeout_seconds) as budget:
+                        token = _ATTEMPT_BUDGET.set(
+                            _AttemptBudget(owner=asyncio.current_task(), timeout=budget)
+                        )
+                        try:
+                            result = await self._execute_write(value)
+                        finally:
+                            _ATTEMPT_BUDGET.reset(token)
                 # The backend write LANDED. Anything that fails below is a
                 # post-execute failure, which is a materially different fact
                 # for anyone deciding whether a dead item is safe to replay.
