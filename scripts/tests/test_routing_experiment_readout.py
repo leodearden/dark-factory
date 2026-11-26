@@ -10,7 +10,6 @@ import dataclasses
 import hashlib
 import json
 import random
-import subprocess
 import sys
 from dataclasses import dataclass
 from datetime import datetime
@@ -19,6 +18,7 @@ from pathlib import Path
 import pytest
 import routing_experiment_readout as readout
 from shared.routing_split import split_bucket
+from shared.testing_own_time import run_on_own_time
 
 UNTIL = '2026-11-20T00:00:00+00:00'
 IN_WINDOW = '2026-11-10T12:00:00+00:00'
@@ -483,6 +483,28 @@ def test_main_names_each_skipped_root_and_its_reason_on_the_rule_line(
         assert str(root) in err
 
 
+def test_an_until_with_a_non_utc_offset_reads_the_same_window_as_its_utc_spelling(
+    fleet_root, capsys,
+):
+    root = fleet_root(
+        'proj-a',
+        [
+            TaskSpec(1, results=(ResultRow('done', '2026-11-19T23:00:00+00:00'),)),
+            TaskSpec(2, results=(ResultRow('done', '2026-11-20T00:30:00+00:00'),)),
+        ],
+    )
+
+    def _out(until):
+        argv = ['--roots', str(root), '--salt', SALT, '--until', until]
+        assert readout.main(argv, environ={}, unit_environment=_unit_must_not_be_read) == 0
+        return capsys.readouterr().out
+
+    utc = _out('2026-11-20T00:00:00+00:00')
+    assert 'window [2026-10-21T00:00:00+00:00, 2026-11-20T00:00:00+00:00)' in _rule_line(utc)
+    assert 'population = the 1 tasks' in _rule_line(utc)
+    assert _out('2026-11-20T02:00:00+02:00') == utc
+
+
 def test_main_over_only_unreadable_roots_exits_nothing_read(unreadable_roots, capsys):
     assert _run_main(unreadable_roots) == readout.EXIT_NOTHING_READ
     assert 'no runs.db was readable' in capsys.readouterr().err
@@ -607,6 +629,19 @@ def test_means_count_only_eligible_tasks_and_a_thin_metric_gets_no_null():
     assert readout.MIN_ELIGIBLE_PER_ARM == 20
     assert verify.null is None
     assert _row(comparison, 'cost_usd').null is not None
+
+
+def test_the_last_of_three_arms_gets_a_null_comparable_to_a_drawn_arms():
+    overrides = _balanced_overrides(25)
+    records = _arm_records({0: overrides, 1: overrides, 2: overrides})
+
+    drawn, complement = (_row(comparison, 'cost_usd') for comparison in _compare(records, buckets=3))
+
+    assert (complement.base_n, complement.arm_n) == (drawn.base_n, drawn.arm_n) == (25, 25)
+    assert drawn.null is not None
+    assert complement.null is not None
+    assert 0.5 < complement.null.p99 / drawn.null.p99 < 2.0
+    assert 0.5 < complement.null.mde / drawn.null.mde < 2.0
 
 
 def test_the_same_records_and_seed_give_identical_comparisons():
@@ -740,16 +775,16 @@ def test_aa_on_a_balanced_split_passes(balanced_root, capsys):
     assert '--aa fails when a headline metric has |diff| > null p99' in _rule_line(out)
 
 
+_CHILD_READOUT_BUDGET_S = 60.0  # own time; the child needs about half a second
+
+
 def test_aa_on_a_skewed_split_exits_one_from_a_real_child_process(fleet_root):
     root = fleet_root('proj-a', _skewed_fleet_specs())
 
-    completed = subprocess.run(
+    completed = run_on_own_time(
         [sys.executable, str(SCRIPT), '--aa', '--roots', str(root), '--salt', SALT,
-         '--buckets', '2', '--days', '30', '--until', UNTIL],
-        capture_output=True,
-        text=True,
-        timeout=120,
-        check=False,
+         '--buckets', '2', '--days', '30', '--until', UNTIL, '--resamples', '400'],
+        budget=_CHILD_READOUT_BUDGET_S,
     )
 
     assert completed.returncode == readout.EXIT_AA_SKEWED, completed.stderr
