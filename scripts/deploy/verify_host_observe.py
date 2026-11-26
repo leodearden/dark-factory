@@ -30,6 +30,7 @@ SYNC_PROBE_BLOCK_BYTES = 4096
 GIB = 1 << 30
 CREDENTIAL_FILE = Path('.claude') / '.credentials.json'
 WRAPPER_PROBE_ARG = 'gate-identity'
+WRAPPER_PROBE_GATE_BIN = '/bin/echo'
 
 _Facts = TypeVar('_Facts', bound='_StrictJson')
 
@@ -247,7 +248,7 @@ def _checkout(path: str) -> CheckoutFacts:
 
 
 def _wrapper_probe(wrapper: str) -> tuple[str | None, int | None]:
-    proc = _run([wrapper, WRAPPER_PROBE_ARG], env={**os.environ, 'ORCH_GATE_BIN': '/bin/echo'})
+    proc = _run([wrapper, WRAPPER_PROBE_ARG], env={**os.environ, 'ORCH_GATE_BIN': WRAPPER_PROBE_GATE_BIN})
     if proc is None:
         return None, None
     return proc.stdout.strip(), proc.returncode

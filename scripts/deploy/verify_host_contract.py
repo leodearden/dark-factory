@@ -76,14 +76,6 @@ class Verdict:
 
 
 @dataclass(frozen=True)
-class Requirement:
-    id: str
-    title: str
-    needed: str
-    evaluate: 'Evaluator'
-
-
-@dataclass(frozen=True)
 class ProjectSpec:
     project_id: str
     config_path: str
@@ -227,46 +219,82 @@ class Observation:
     unobserved_reason: str
 
 
-Evaluator = Callable[[Observation, EnvironmentFacts, HostSpec], Verdict]
-HostEvaluator = Callable[[HostFacts, EnvironmentFacts, HostSpec], Verdict]
+@dataclass(frozen=True)
+class Finding:
+    verdict: VerdictValue
+    observed: str
+
+
+NeedStatement = Callable[[EnvironmentFacts, HostSpec], str]
+Judge = Callable[[Observation, EnvironmentFacts, HostSpec], Finding]
+HostJudge = Callable[[HostFacts, EnvironmentFacts, HostSpec], Finding]
+
+
+@dataclass(frozen=True)
+class Requirement:
+    id: str
+    title: str
+    needed: NeedStatement
+    judge: Judge
+
+    def evaluate(self, observation: Observation, reference: EnvironmentFacts, spec: HostSpec) -> Verdict:
+        finding = self.judge(observation, reference, spec)
+        return Verdict(finding.verdict, finding.observed, self.needed(reference, spec))
+
 
 REQUIRED_OS = ('ubuntu', '24.04')
 MIN_LANDLOCK_ABI = 2
 UPDATE_INSTEAD = 'updateInstead'
 GIB_IN_KIB = 1024 * 1024
+REQUIRED_TOOLS: Mapping[str, Callable[[HostFacts], str | None]] = {
+    'git': lambda host: host.git_version,
+    'bash': lambda host: host.bash_version,
+    'flock': lambda host: host.flock_version,
+    'npm': lambda host: host.npm_version,
+}
+_SCOPE_CAP_SETTING = '.'.join(MEMORY_MAX_GIB_KEYS)
+_WRAPPER_PROBE = f'with ORCH_GATE_BIN={verify_host_observe.WRAPPER_PROBE_GATE_BIN} it'
+_CREDENTIAL_IN_HOME = f'~/{verify_host_observe.CREDENTIAL_FILE}'
 
 
-def _judged(problems: Sequence[str], ok_observed: str, needed: str, warnings: Sequence[str] = ()) -> Verdict:
+def _judged(problems: Sequence[str], ok_observed: str, warnings: Sequence[str] = ()) -> Finding:
     if problems:
-        return Verdict('fail', '; '.join(problems), needed)
+        return Finding('fail', '; '.join(problems))
     if warnings:
-        return Verdict('warn', '; '.join(warnings), needed)
-    return Verdict('ok', ok_observed, needed)
+        return Finding('warn', '; '.join(warnings))
+    return Finding('ok', ok_observed)
 
 
-def _on_host_facts(evaluate: HostEvaluator) -> Evaluator:
-    """Run *evaluate* on the host's facts, or fail the row when the host went unobserved."""
+def _on_host_facts(judge: HostJudge) -> Judge:
+    """Run *judge* on the host's facts, or fail the row when the host went unobserved."""
 
-    def evaluate_observation(observation: Observation, reference: EnvironmentFacts, spec: HostSpec) -> Verdict:
+    def judge_observation(observation: Observation, reference: EnvironmentFacts, spec: HostSpec) -> Finding:
         if observation.host is None:
-            return Verdict('fail', f'not observed: {observation.unobserved_reason}', 'an observation of the host')
-        return evaluate(observation.host, reference, spec)
+            return Finding('fail', f'not observed: {observation.unobserved_reason}')
+        return judge(observation.host, reference, spec)
 
-    return evaluate_observation
+    return judge_observation
 
 
-def _network(observation: Observation, reference: EnvironmentFacts, spec: HostSpec) -> Verdict:
+def _network_needed(reference: EnvironmentFacts, spec: HostSpec) -> str:
+    return f'ssh {" ".join(DISPATCHER_SSH_OPTS)} {spec.ssh_host} true exits 0; its host key in known_hosts'
+
+
+def _network(observation: Observation, reference: EnvironmentFacts, spec: HostSpec) -> Finding:
     network = observation.network
-    needed = f'ssh {" ".join(DISPATCHER_SSH_OPTS)} {spec.ssh_host} true exits 0; its host key in known_hosts'
     problems = []
     if not network.reachable:
         problems.append(f'unreachable: {network.detail}')
     elif not network.host_key_pinned:
         problems.append(f'no known_hosts entry for {spec.ssh_host}: {network.detail}')
-    return _judged(problems, f'{spec.ssh_host} reachable; host key pinned', needed)
+    return _judged(problems, f'{spec.ssh_host} reachable; host key pinned')
 
 
-def _os_and_user(host: HostFacts, reference: EnvironmentFacts, spec: HostSpec) -> Verdict:
+def _os_and_user_needed(reference: EnvironmentFacts, spec: HostSpec) -> str:
+    return f'{" ".join(REQUIRED_OS)}; a non-root user; git user.name and user.email'
+
+
+def _os_and_user(host: HostFacts, reference: EnvironmentFacts, spec: HostSpec) -> Finding:
     problems = []
     if (host.os_id, host.os_version_id) != REQUIRED_OS:
         problems.append(f'os {host.os_id} {host.os_version_id}')
@@ -274,11 +302,14 @@ def _os_and_user(host: HostFacts, reference: EnvironmentFacts, spec: HostSpec) -
         problems.append(f'user {host.user} is root')
     if not (host.git_user_name and host.git_user_email):
         problems.append(f'git identity {host.git_user_name!r} <{host.git_user_email!r}>')
-    observed = f'{host.os_id} {host.os_version_id}; user {host.user} (uid {host.uid}); git identity set'
-    return _judged(problems, observed, f'{" ".join(REQUIRED_OS)}; a non-root user; git user.name and user.email')
+    return _judged(problems, f'{host.os_id} {host.os_version_id}; user {host.user} (uid {host.uid}); git identity set')
 
 
-def _time_zone_and_locale(host: HostFacts, reference: EnvironmentFacts, spec: HostSpec) -> Verdict:
+def _time_zone_and_locale_needed(reference: EnvironmentFacts, spec: HostSpec) -> str:
+    return f'time zone {reference.time_zone}; locale {reference.locale}, available; tzdata-legacy installed'
+
+
+def _time_zone_and_locale(host: HostFacts, reference: EnvironmentFacts, spec: HostSpec) -> Finding:
     env = host.environment
     problems = []
     if env.time_zone is None or env.time_zone != reference.time_zone:
@@ -289,18 +320,23 @@ def _time_zone_and_locale(host: HostFacts, reference: EnvironmentFacts, spec: Ho
         problems.append(f'locale {env.locale} not available on the host')
     if not env.tzdata_legacy_installed:
         problems.append('tzdata-legacy not installed')
-    needed = f'time zone {reference.time_zone}; locale {reference.locale}, available; tzdata-legacy installed'
-    return _judged(problems, f'time zone {env.time_zone}; locale {env.locale}; tzdata-legacy installed', needed)
+    return _judged(problems, f'time zone {env.time_zone}; locale {env.locale}; tzdata-legacy installed')
 
 
 def _node_major(version: str | None) -> str | None:
     return version.split('.')[0] if version else None
 
 
-def _toolchain(host: HostFacts, reference: EnvironmentFacts, spec: HostSpec) -> Verdict:
+def _toolchain_needed(reference: EnvironmentFacts, spec: HostSpec) -> str:
+    return (
+        f'{", ".join(REQUIRED_TOOLS)}; uv {reference.uv_version}; uv-managed CPython 3.13; '
+        f'node {_node_major(reference.node_version)}.x'
+    )
+
+
+def _toolchain(host: HostFacts, reference: EnvironmentFacts, spec: HostSpec) -> Finding:
     env = host.environment
-    tools = {'git': host.git_version, 'bash': host.bash_version, 'flock': host.flock_version, 'npm': host.npm_version}
-    problems = [f'{tool} missing' for tool, version in tools.items() if version is None]
+    problems = [f'{tool} missing' for tool, version_of in REQUIRED_TOOLS.items() if version_of(host) is None]
     if reference.uv_version is None or env.uv_version != reference.uv_version:
         problems.append(f'uv {env.uv_version}')
     if host.uv_python_313 is None:
@@ -308,28 +344,33 @@ def _toolchain(host: HostFacts, reference: EnvironmentFacts, spec: HostSpec) -> 
     node_major = _node_major(reference.node_version)
     if node_major is None or _node_major(env.node_version) != node_major:
         problems.append(f'node {env.node_version}')
-    needed = f'git, bash, flock, npm; uv {reference.uv_version}; uv-managed CPython 3.13; node {node_major}.x'
-    observed = f'uv {env.uv_version}; node {env.node_version}; CPython 3.13 at {host.uv_python_313}'
-    return _judged(problems, observed, needed)
+    return _judged(problems, f'uv {env.uv_version}; node {env.node_version}; CPython 3.13 at {host.uv_python_313}')
 
 
-def _systemd(host: HostFacts, reference: EnvironmentFacts, spec: HostSpec) -> Verdict:
+def _systemd_needed(reference: EnvironmentFacts, spec: HostSpec) -> str:
+    return 'systemd-run --user --scope true exits 0; linger yes'
+
+
+def _systemd(host: HostFacts, reference: EnvironmentFacts, spec: HostSpec) -> Finding:
     problems = []
     if host.systemd_run_scope_rc != 0:
         problems.append(f'systemd-run --user --scope true exited {host.systemd_run_scope_rc}')
     if host.linger != 'yes':
         problems.append(f'linger {host.linger}')
-    return _judged(problems, 'user scope runs; linger yes', 'systemd-run --user --scope true exits 0; linger yes')
+    return _judged(problems, 'user scope runs; linger yes')
 
 
-def _kernel(host: HostFacts, reference: EnvironmentFacts, spec: HostSpec) -> Verdict:
+def _kernel_needed(reference: EnvironmentFacts, spec: HostSpec) -> str:
+    return f'Landlock ABI {MIN_LANDLOCK_ABI} or higher; /var/tmp writable'
+
+
+def _kernel(host: HostFacts, reference: EnvironmentFacts, spec: HostSpec) -> Finding:
     problems = []
     if host.landlock_abi < MIN_LANDLOCK_ABI:
         problems.append(f'Landlock ABI {host.landlock_abi}' if host.landlock_abi >= 0 else 'no Landlock')
     if not host.var_tmp_writable:
         problems.append('/var/tmp not writable')
-    observed = f'Landlock ABI {host.landlock_abi}; /var/tmp writable'
-    return _judged(problems, observed, f'Landlock ABI {MIN_LANDLOCK_ABI} or higher; /var/tmp writable')
+    return _judged(problems, f'Landlock ABI {host.landlock_abi}; /var/tmp writable')
 
 
 def _scope_max_gib(host_config: Mapping[str, Any]) -> int | None:
@@ -339,38 +380,61 @@ def _scope_max_gib(host_config: Mapping[str, Any]) -> int | None:
     return value if isinstance(value, int) else None
 
 
-def _memory(host: HostFacts, reference: EnvironmentFacts, spec: HostSpec) -> Verdict:
-    caps = [cap for cap in (_scope_max_gib(project.host_config) for project in spec.projects) if cap is not None]
-    needed_gib = sum(caps)
+def _scope_caps(spec: HostSpec) -> tuple[int, ...]:
+    return tuple(cap for cap in (_scope_max_gib(project.host_config) for project in spec.projects) if cap is not None)
+
+
+def _memory_needed(reference: EnvironmentFacts, spec: HostSpec) -> str:
+    return f'swap present; MemAvailable at least {sum(_scope_caps(spec))} GiB (the summed {_SCOPE_CAP_SETTING})'
+
+
+def _memory(host: HostFacts, reference: EnvironmentFacts, spec: HostSpec) -> Finding:
+    caps = _scope_caps(spec)
     problems = []
     if not host.swap_total_kib:
         problems.append(f'swap {host.swap_total_kib} KiB')
-    if host.mem_available_kib is None or host.mem_available_kib < needed_gib * GIB_IN_KIB:
+    if host.mem_available_kib is None or host.mem_available_kib < sum(caps) * GIB_IN_KIB:
         problems.append(f'MemAvailable {host.mem_available_kib} KiB')
-    warnings = [] if caps else ['no project states verify_cgroup_memory.max_gib']
-    needed = f'swap present; MemAvailable at least {needed_gib} GiB (the summed verify_cgroup_memory.max_gib)'
+    warnings = [] if caps else [f'no project states {_SCOPE_CAP_SETTING}']
     observed = f'MemAvailable {host.mem_available_kib} KiB; swap {host.swap_total_kib} KiB'
-    return _judged(problems, observed, needed, warnings)
+    return _judged(problems, observed, warnings)
 
 
-def _disk(host: HostFacts, reference: EnvironmentFacts, spec: HostSpec) -> Verdict:
-    footprints = [project.disk_footprint_gib for project in spec.projects if project.disk_footprint_gib is not None]
-    needed_gib = sum(footprints)
+def _disk_footprints(spec: HostSpec) -> tuple[int, ...]:
+    return tuple(project.disk_footprint_gib for project in spec.projects if project.disk_footprint_gib is not None)
+
+
+def _disk_needed(reference: EnvironmentFacts, spec: HostSpec) -> str:
+    return (
+        f'at least {sum(_disk_footprints(spec))} GiB free (the summed disk_footprint_gib); '
+        f'synchronous writes within {SYNC_WRITE_WARN_MS:g} ms'
+    )
+
+
+def _disk(host: HostFacts, reference: EnvironmentFacts, spec: HostSpec) -> Finding:
+    footprints = _disk_footprints(spec)
     problems = []
-    if host.disk_free_gib is None or host.disk_free_gib < needed_gib:
+    if host.disk_free_gib is None or host.disk_free_gib < sum(footprints):
         problems.append(f'{host.disk_free_gib} GiB free')
     warnings = [] if footprints else ['no project states disk_footprint_gib']
     if host.sync_write_ms is None or host.sync_write_ms > SYNC_WRITE_WARN_MS:
         warnings.append(f'synchronous write {host.sync_write_ms} ms')
-    needed = (
-        f'at least {needed_gib} GiB free (the summed disk_footprint_gib); '
-        f'synchronous writes within {SYNC_WRITE_WARN_MS:g} ms'
+    return _judged(problems, f'{host.disk_free_gib} GiB free; synchronous write {host.sync_write_ms} ms', warnings)
+
+
+def _checkout_roots(spec: HostSpec) -> tuple[str, ...]:
+    return tuple(dict.fromkeys([spec.df_checkout_path, *(project.project_root for project in spec.projects)]))
+
+
+def _checkouts_needed(reference: EnvironmentFacts, spec: HostSpec) -> str:
+    return (
+        f'{", ".join(_checkout_roots(spec))} exist with receive.denyCurrentBranch={UPDATE_INSTEAD}; '
+        'the df venv has its orchestrator'
     )
-    return _judged(problems, f'{host.disk_free_gib} GiB free; synchronous write {host.sync_write_ms} ms', needed, warnings)
 
 
-def _checkouts(host: HostFacts, reference: EnvironmentFacts, spec: HostSpec) -> Verdict:
-    roots = dict.fromkeys([spec.df_checkout_path, *(project.project_root for project in spec.projects)])
+def _checkouts(host: HostFacts, reference: EnvironmentFacts, spec: HostSpec) -> Finding:
+    roots = _checkout_roots(spec)
     problems = []
     for root in roots:
         facts = host.checkouts.get(root)
@@ -380,11 +444,17 @@ def _checkouts(host: HostFacts, reference: EnvironmentFacts, spec: HostSpec) -> 
             problems.append(f'{root} receive.denyCurrentBranch={facts.receive_deny_current_branch}')
     if not host.df_orchestrator_executable:
         problems.append(f'{spec.df_checkout_path}/.venv/bin/orchestrator not executable')
-    needed = f'{", ".join(roots)} exist with receive.denyCurrentBranch={UPDATE_INSTEAD}; the df venv has its orchestrator'
-    return _judged(problems, f'{len(roots)} checkouts accept pushes to their branch', needed)
+    return _judged(problems, f'{len(roots)} checkouts accept pushes to their branch')
 
 
-def _wrapper(host: HostFacts, reference: EnvironmentFacts, spec: HostSpec) -> Verdict:
+def _wrapper_needed(reference: EnvironmentFacts, spec: HostSpec) -> str:
+    return (
+        f'{spec.wrapper_path} equals a fresh render; '
+        f'{_WRAPPER_PROBE} prints {verify_host_observe.WRAPPER_PROBE_ARG!r}'
+    )
+
+
+def _wrapper(host: HostFacts, reference: EnvironmentFacts, spec: HostSpec) -> Finding:
     problems = []
     if host.wrapper_text is None:
         problems.append(f'{spec.wrapper_path} absent')
@@ -392,15 +462,19 @@ def _wrapper(host: HostFacts, reference: EnvironmentFacts, spec: HostSpec) -> Ve
         problems.append(f'{spec.wrapper_path} differs from a fresh render')
     probe = (host.wrapper_probe_stdout, host.wrapper_probe_rc)
     if probe != (verify_host_observe.WRAPPER_PROBE_ARG, 0):
-        problems.append(f'with ORCH_GATE_BIN=/bin/echo it printed {probe[0]!r} and exited {probe[1]}')
-    needed = (
-        f'{spec.wrapper_path} equals a fresh render; with ORCH_GATE_BIN=/bin/echo it prints '
-        f'{verify_host_observe.WRAPPER_PROBE_ARG!r}'
-    )
-    return _judged(problems, f'{spec.wrapper_path} as rendered; honours ORCH_GATE_BIN', needed)
+        problems.append(f'{_WRAPPER_PROBE} printed {probe[0]!r} and exited {probe[1]}')
+    return _judged(problems, f'{spec.wrapper_path} as rendered; honours ORCH_GATE_BIN')
 
 
-def _per_host_yaml(host: HostFacts, reference: EnvironmentFacts, spec: HostSpec) -> Verdict:
+def _config_paths(spec: HostSpec) -> str:
+    return ', '.join(project.config_path for project in spec.projects)
+
+
+def _per_host_yaml_needed(reference: EnvironmentFacts, spec: HostSpec) -> str:
+    return f'{_config_paths(spec)} equal fresh renders of the roster host_config'
+
+
+def _per_host_yaml(host: HostFacts, reference: EnvironmentFacts, spec: HostSpec) -> Finding:
     problems = []
     for project in spec.projects:
         text = host.configs.get(project.config_path)
@@ -408,49 +482,32 @@ def _per_host_yaml(host: HostFacts, reference: EnvironmentFacts, spec: HostSpec)
             problems.append(f'project {project.project_id!r}: {project.config_path} missing')
         elif text != render_host_config(project.host_config):
             problems.append(f'project {project.project_id!r}: {project.config_path} differs from a fresh render')
-    paths = ', '.join(project.config_path for project in spec.projects)
-    return _judged(problems, f'{paths} as rendered', f'{paths} equal fresh renders of the roster host_config')
+    return _judged(problems, f'{_config_paths(spec)} as rendered')
 
 
-def _no_credentials(host: HostFacts, reference: EnvironmentFacts, spec: HostSpec) -> Verdict:
-    credential = f'~/{verify_host_observe.CREDENTIAL_FILE}'
-    problems = [f'{credential} present for {host.user}'] if host.credentials_present else []
-    return _judged(problems, f'no {credential}', f'no {credential} for the verify user')
+def _no_credentials_needed(reference: EnvironmentFacts, spec: HostSpec) -> str:
+    return f'no {_CREDENTIAL_IN_HOME} for the verify user'
+
+
+def _no_credentials(host: HostFacts, reference: EnvironmentFacts, spec: HostSpec) -> Finding:
+    problems = [f'{_CREDENTIAL_IN_HOME} present for {host.user}'] if host.credentials_present else []
+    return _judged(problems, f'no {_CREDENTIAL_IN_HOME}')
 
 
 REQUIREMENTS = (
-    Requirement('network', 'Network',
-                "reachable with the dispatcher's own ssh options; host key pinned in the workstation's known_hosts",
-                _network),
-    Requirement('os_and_user', 'OS and user',
-                'Ubuntu 24.04; a non-root user; git identity set', _on_host_facts(_os_and_user)),
-    Requirement('time_zone_and_locale', 'Time zone and locale',
-                "the workstation's time zone and locale, the locale available; tzdata-legacy installed",
+    Requirement('network', 'Network', _network_needed, _network),
+    Requirement('os_and_user', 'OS and user', _os_and_user_needed, _on_host_facts(_os_and_user)),
+    Requirement('time_zone_and_locale', 'Time zone and locale', _time_zone_and_locale_needed,
                 _on_host_facts(_time_zone_and_locale)),
-    Requirement('toolchain', 'Toolchain',
-                "git, bash, flock, npm; uv at the workstation's version; uv-managed CPython 3.13; "
-                "node at the workstation's major", _on_host_facts(_toolchain)),
-    Requirement('systemd', 'systemd',
-                '`systemd-run --user --scope true` succeeds over non-interactive ssh (linger on)',
-                _on_host_facts(_systemd)),
-    Requirement('kernel', 'Kernel', 'Landlock ABI 2 or higher; /var/tmp writable', _on_host_facts(_kernel)),
-    Requirement('memory', 'Memory',
-                "swap present; MemAvailable at least the sum of the projects' verify_cgroup_memory.max_gib",
-                _on_host_facts(_memory)),
-    Requirement('disk', 'Disk',
-                f"free space at least the projects' disk_footprint_gib; synchronous writes under "
-                f'{SYNC_WRITE_WARN_MS:g} ms (warn above)', _on_host_facts(_disk)),
-    Requirement('checkouts', 'Checkouts',
-                'the Dark Factory checkout and each project checkout exist with '
-                'receive.denyCurrentBranch=updateInstead; the Dark Factory venv has its orchestrator',
-                _on_host_facts(_checkouts)),
-    Requirement('wrapper', 'Wrapper',
-                'the installed wrapper equals the rendered template and honours ORCH_GATE_BIN',
-                _on_host_facts(_wrapper)),
-    Requirement('per_host_yaml', 'Per-host YAML',
-                "each project's config_path holds a fresh render of its host_config", _on_host_facts(_per_host_yaml)),
-    Requirement('no_credentials', 'No credentials',
-                "no agent OAuth token file in the verify user's home", _on_host_facts(_no_credentials)),
+    Requirement('toolchain', 'Toolchain', _toolchain_needed, _on_host_facts(_toolchain)),
+    Requirement('systemd', 'systemd', _systemd_needed, _on_host_facts(_systemd)),
+    Requirement('kernel', 'Kernel', _kernel_needed, _on_host_facts(_kernel)),
+    Requirement('memory', 'Memory', _memory_needed, _on_host_facts(_memory)),
+    Requirement('disk', 'Disk', _disk_needed, _on_host_facts(_disk)),
+    Requirement('checkouts', 'Checkouts', _checkouts_needed, _on_host_facts(_checkouts)),
+    Requirement('wrapper', 'Wrapper', _wrapper_needed, _on_host_facts(_wrapper)),
+    Requirement('per_host_yaml', 'Per-host YAML', _per_host_yaml_needed, _on_host_facts(_per_host_yaml)),
+    Requirement('no_credentials', 'No credentials', _no_credentials_needed, _on_host_facts(_no_credentials)),
 )
 
 
