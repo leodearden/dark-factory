@@ -459,6 +459,60 @@ class TestCoreFormation:
         }, f'absorbed_request_ids mismatch: {data.get("absorbed_request_ids")}'
 
 
+# ─── Task 5411: narrow-gate items never ride a train ────────────────────────
+
+@pytest.mark.asyncio
+class TestNarrowGateExclusion:
+    """A waiting single the narrow merge gate would verify narrowly stays solo."""
+
+    @pytest.mark.parametrize(('gate_enabled', 'members'), [
+        (True, ['t1', 't3']),
+        (False, ['t1', 't2', 't3']),
+    ])
+    async def test_a_docs_only_single_stays_solo_while_the_gate_is_on(
+        self,
+        git_ops: GitOps,
+        git_repo: Path,
+        git_config,
+        gate_enabled: bool,
+        members: list[str],
+    ):
+        from orchestrator.config import MergeDeepConfig
+        from orchestrator.merge_lane.types import TrainCallbacks
+        from orchestrator.merge_lane.worker import GroupMergeRequest, SpeculativeMergeWorker
+        from orchestrator.narrow_gate_config import NarrowMergeGateConfig
+
+        config = lane_scene_config(
+            git_repo, git_config,
+            merge_train_coalesce_enabled=True,
+            merge_deep=MergeDeepConfig(chain_cap=0),
+            narrow_merge_gate=NarrowMergeGateConfig(enabled=gate_enabled, docs_paths=['*.md']),
+        )
+        reqs = [
+            _make_req(task_id, f'task/{task_id}', await _make_branch_with_file(git_ops, task_id, name, body), config)
+            for task_id, name, body in (
+                ('t1', 'file_a.py', 'a = 1\n'),
+                ('t2', 'NOTES.md', 'notes\n'),
+                ('t3', 'file_c.py', 'c = 3\n'),
+            )
+        ]
+        worker = SpeculativeMergeWorker(
+            git_ops, asyncio.Queue(),
+            train_callback_factory=lambda _train_id: TrainCallbacks(
+                status_check=AsyncMock(return_value={}), mark_member_done=AsyncMock(),
+            ),
+        )
+        worker._intake.replace_lane('normal', reqs)
+
+        assert await worker._maybe_coalesce_waiting_singles() is True
+
+        buffered = list(worker._intake.buffered('normal'))
+        trains = [r for r in buffered if isinstance(r, GroupMergeRequest)]
+        assert [t.member_task_ids for t in trains] == [members]
+        solo = [r.task_id for r in buffered if not isinstance(r, GroupMergeRequest)]
+        assert solo == ([] if 't2' in members else ['t2'])
+
+
 # ─── Step 7 ─────────────────────────────────────────────────────────────────
 
 @pytest.mark.asyncio

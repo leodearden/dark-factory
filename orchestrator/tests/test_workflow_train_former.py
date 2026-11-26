@@ -17,11 +17,13 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _landing_git_scenarios import LandingRepo
 from _orch_helpers import MOCK_WORKFLOW_PROJECT_ROOT, pydantic_spec
 
 from orchestrator.config import OrchestratorConfig
 from orchestrator.event_store import EventType
 from orchestrator.git_ops import TrainStackResult
+from orchestrator.narrow_gate_config import NarrowMergeGateConfig
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
 
 # ---------------------------------------------------------------------------
@@ -42,6 +44,7 @@ def _make(
     former_enabled: bool = False,
     max_members: int = 3,
     get_tasks_return: list[dict] | None = None,
+    narrow_merge_gate: NarrowMergeGateConfig | None = None,
 ) -> _Fixture:
     assignment = MagicMock()
     assignment.task_id = task_id
@@ -65,6 +68,7 @@ def _make(
     config.max_consecutive_merge_thrash = 3
     config.merge_train_former_enabled = former_enabled
     config.merge_train_max_members = max_members
+    config.narrow_merge_gate = narrow_merge_gate or NarrowMergeGateConfig()
 
     scheduler = MagicMock()
     scheduler.update_task = AsyncMock(return_value=True)
@@ -284,6 +288,31 @@ class TestSelectTrainMembers:
         }
         result = fn('200', ['201'], ranges_by_id, max_members=3)
         assert result[0] == '200'
+
+    def test_an_excluded_candidate_never_rides(self):
+        fn = self._fn()
+        ranges_by_id = {'A': {'a.py': [(1, 1)]}, 'B': {'b.md': [(1, 1)]}, 'C': {'c.py': [(1, 1)]}}
+
+        result = fn('A', ['B', 'C'], ranges_by_id, max_members=3, excluded=frozenset({'B'}))
+
+        assert result == ['A', 'C']
+
+    def test_an_excluded_anchor_forms_no_train(self):
+        fn = self._fn()
+        ranges_by_id = {'A': {'a.md': [(1, 1)]}, 'B': {'b.py': [(1, 1)]}, 'C': {'c.py': [(1, 1)]}}
+
+        assert fn('A', ['B', 'C'], ranges_by_id, max_members=3, excluded=frozenset({'A'})) == []
+
+    def test_omitting_excluded_selects_as_before(self):
+        fn = self._fn()
+        ranges_by_id = {
+            '200': {'src/foo.rs': [(1, 10)]},
+            '201': {'src/foo.rs': [(5, 30)]},
+            '202': {'src/foo.rs': [(40, 50)]},
+        }
+
+        assert fn('200', ['202', '201'], ranges_by_id, max_members=3) == ['200', '202']
+        assert fn('200', ['202', '201'], ranges_by_id, 3, excluded=frozenset()) == ['200', '202']
 
 
 # ---------------------------------------------------------------------------
@@ -848,3 +877,66 @@ class TestTrainCandidatesFetchesInProgressOnly:
         assert call_kwargs['statuses'] == ['in-progress'], (
             f"Expected statuses=['in-progress'], got {call_kwargs['statuses']}"
         )
+
+
+_DOCS_ONLY_GATE = NarrowMergeGateConfig(enabled=True, docs_paths=['*.md'])
+
+
+@pytest.fixture
+def task_branches(tmp_path: Path) -> LandingRepo:
+    """A repo whose task/200 and task/202 change code and whose task/201 changes only docs."""
+    root = tmp_path / 'repo'
+    root.mkdir()
+    repo = LandingRepo.init(root)
+    repo.commit('base', {'README.md': 'hello\n', 'mod.py': 'x = 1\n'})
+    for task_id, files in (
+        ('200', {'mod.py': 'x = 2\n'}),
+        ('201', {'README.md': 'reworded\n'}),
+        ('202', {'mod.py': 'x = 1\ny = 2\n'}),
+    ):
+        repo.git('checkout', '-q', '-b', f'task/{task_id}', 'main')
+        repo.commit(task_id, files)
+    repo.git('checkout', '-q', 'main')
+    return repo
+
+
+class TestMaybeFormTrainNarrowExclusion:
+    """A branch the narrow merge gate would verify narrowly never joins a train (task 5411)."""
+
+    def _former(self, repo: LandingRepo, task_id: str, candidates: list[str], gate: NarrowMergeGateConfig) -> _Fixture:
+        fix = _make(
+            task_id=task_id, former_enabled=True, max_members=4,
+            get_tasks_return=[_ip_task(c) for c in candidates], narrow_merge_gate=gate,
+        )
+        fix.git_ops.project_root = repo.root
+        fix.wf.event_store = MagicMock()
+        return fix
+
+    def _train_members(self, fix: _Fixture) -> set[str]:
+        return {c.args[0] for c in fix.scheduler.update_task.call_args_list if 'train' in c.args[1]}
+
+    @pytest.mark.asyncio
+    async def test_a_docs_only_candidate_is_left_out(self, task_branches: LandingRepo):
+        fix = self._former(task_branches, '200', ['201', '202'], _DOCS_ONLY_GATE)
+
+        assert await fix.wf._maybe_form_train() is True
+
+        assert self._train_members(fix) == {'200', '202'}
+        fix.git_ops.stack_train_branches.assert_awaited_once_with(['200', '202'])
+
+    @pytest.mark.asyncio
+    async def test_a_docs_only_anchor_forms_no_train(self, task_branches: LandingRepo):
+        fix = self._former(task_branches, '201', ['200', '202'], _DOCS_ONLY_GATE)
+
+        assert await fix.wf._maybe_form_train() is False
+
+        assert self._train_members(fix) == set()
+        fix.git_ops.stack_train_branches.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_with_the_gate_off_a_docs_only_candidate_rides(self, task_branches: LandingRepo):
+        fix = self._former(task_branches, '200', ['201', '202'], NarrowMergeGateConfig(docs_paths=['*.md']))
+
+        assert await fix.wf._maybe_form_train() is True
+
+        assert self._train_members(fix) == {'200', '201', '202'}
