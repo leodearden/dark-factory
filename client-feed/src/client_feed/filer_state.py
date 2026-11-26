@@ -28,11 +28,12 @@ _LOCK_MODE: Final = 0o600
 
 
 class RefRecord(BaseModel):
-    """An unconverged ref's refused attempts at converging, the step and code that last refused it, and the fallback its fix submission took once one applies."""
+    """An unconverged ref's refused attempts at converging, how many of those refused its fix's restatement, the step and code that last refused it, and the fallback its fix submission took once one applies."""
 
     model_config = ConfigDict(frozen=True, extra='forbid')
 
     attempts: PositiveInt
+    restatements: NonNegativeInt = 0
     last_tool: Token | None = None
     last_code: Token
     fallback: FilerFallback | None = None

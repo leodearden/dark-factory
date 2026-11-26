@@ -48,7 +48,7 @@ from client_feed.policy import FilerPolicy, Policy
 
 logger = logging.getLogger(__name__)
 
-FALLBACK_AFTER_ATTEMPTS: Final = 5
+FALLBACK_AFTER_RESTATEMENTS: Final = 5
 MAX_BACKOFF_SECONDS: Final = 300
 
 _UNCONVERGED_LINE: Final = '%s not converged: %s refused (%s, %s), %s after %d attempts'
@@ -109,7 +109,7 @@ class _Outcome:
 
 
 class _RefusedWithRecord(Exception):
-    """A refusal that leaves a ref unconverged, with the ref's record as it stood before this refusal is counted."""
+    """A refusal that leaves a ref unconverged, with the record this refusal leaves the ref."""
 
     def __init__(self, refused: ToolRefused, record: RefRecord | None) -> None:
         self.refused = refused
@@ -117,12 +117,23 @@ class _RefusedWithRecord(Exception):
         super().__init__(str(refused))
 
 
+def _counted(record: RefRecord | None, refused: ToolRefused) -> RefRecord | None:
+    """The record a refusal leaves: for one a retry alone will not clear, one more attempt naming the step and code that refused it; else unchanged."""
+    if refused.disposition not in _COUNTED:
+        return record
+    if record is None:
+        return RefRecord(attempts=1, last_tool=refused.tool, last_code=refused.code)
+    return record.model_copy(
+        update={'attempts': record.attempts + 1, 'last_tool': refused.tool, 'last_code': refused.code}
+    )
+
+
 @contextmanager
-def _keeping_record(record: RefRecord | None) -> Iterator[None]:
+def _counting(record: RefRecord | None) -> Iterator[None]:
     try:
         yield
     except ToolRefused as refused:
-        raise _RefusedWithRecord(refused, record) from None
+        raise _RefusedWithRecord(refused, _counted(record, refused)) from None
 
 
 @dataclass(frozen=True)
@@ -240,36 +251,21 @@ def _gate_and_commit(
     tools.commit_planning(still_deferred)
 
 
-def _with_attempt(record: RefRecord | None, refused: ToolRefused) -> RefRecord:
-    """`record` with one more attempt, naming the step and code that refused it; a fallback it holds is kept."""
-    return RefRecord(
-        attempts=1 if record is None else record.attempts + 1,
-        last_tool=refused.tool,
-        last_code=refused.code,
-        fallback=None if record is None else record.fallback,
-    )
-
-
-def _counted(record: RefRecord | None, refused: ToolRefused) -> RefRecord | None:
-    """The record a refusal leaves: one more attempt for a refusal a retry alone will not clear, else unchanged."""
-    return _with_attempt(record, refused) if refused.disposition in _COUNTED else record
-
-
-def _restatement_fallback(record: RefRecord | None, refused: ToolRefused) -> RefRecord | None:
-    """The counted record, with its typed-facts fallback, that a refused restatement resubmits under; None while it is only retried."""
-    if refused.disposition not in _COUNTED:
-        return None
-    counted = _with_attempt(record, refused)
-    if refused.disposition is not Disposition.FALLBACK and counted.attempts < FALLBACK_AFTER_ATTEMPTS:
-        return None
-    return counted.model_copy(update={'fallback': FilerFallback(kind=refused.kind, code=refused.code)})
+def _restated(record: RefRecord | None, refused: ToolRefused) -> RefRecord | None:
+    """The counted record a refused restatement leaves: one more restatement, with the typed-facts fallback once its refusal says so."""
+    if record is None or refused.disposition not in _COUNTED:
+        return record
+    restatements = record.restatements + 1
+    falls_back = refused.disposition is Disposition.FALLBACK or restatements >= FALLBACK_AFTER_RESTATEMENTS
+    fallback = FilerFallback(kind=refused.kind, code=refused.code) if falls_back else record.fallback
+    return record.model_copy(update={'restatements': restatements, 'fallback': fallback})
 
 
 def _submitted(
     tools: ClosedTools, report: DefectReported, ref: str, filer: FilerPolicy, record: RefRecord | None
 ) -> _Filed:
     fallback = None if record is None else record.fallback
-    with _keeping_record(record):
+    with _counting(record):
         submission = fix_submission(report, ref=ref, priority=filer.fix_priority, fallback=fallback)
         task_id = tools.submit_planned(submission)
     return _Filed(_just_submitted(task_id), facts_of(report, fallback), record)
@@ -284,9 +280,9 @@ def _submit_fix(
     try:
         return _submitted(tools, report, ref, filer, record)
     except _RefusedWithRecord as refusal:
-        record = _restatement_fallback(record, refusal.refused)
-        if record is None:
-            raise
+        record = _restated(refusal.record, refusal.refused)
+        if record is None or record.fallback is None:
+            raise _RefusedWithRecord(refusal.refused, record) from None
     return _submitted(tools, report, ref, filer, record)
 
 
@@ -294,7 +290,7 @@ def _filed_fix(
     tools: ClosedTools, report: DefectReported, ref: str, policy: Policy, record: RefRecord | None
 ) -> _Filed | None:
     """The ref's filer fix, submitted if the store holds none; None when the ref was filed by hand."""
-    with _keeping_record(record):
+    with _counting(record):
         lookup = tools.lookup_defect_ref(ref)
         carriers = [tools.get_task(carrier.task_id) for carrier in lookup.carriers]
         mine = [view for view in carriers if view.source == FILER_IDENTITY]
@@ -314,12 +310,15 @@ def converge_filing(
     try:
         filed = _filed_fix(tools, report, ref, policy, record)
         if filed is not None:
-            with _keeping_record(filed.record):
+            with _counting(filed.record):
                 _gate_and_commit(tools, report, ref, policy, filer, filed.fix, filed.facts)
     except _RefusedWithRecord as refusal:
-        counted = _counted(refusal.record, refusal.refused)
-        return _Outcome(refused=_unconverged(ref, refusal.refused, counted), record=counted)
+        return _stopped(ref, refusal)
     return _Outcome()
+
+
+def _stopped(ref: str, refusal: _RefusedWithRecord) -> _Outcome:
+    return _Outcome(refused=_unconverged(ref, refusal.refused, refusal.record), record=refusal.record)
 
 
 def _unconverged(ref: str, refused: ToolRefused, record: RefRecord | None) -> Unconverged:
@@ -381,13 +380,13 @@ def _withdraw_and_cancel_fix(tools: ClosedTools, ref: str, project_id: str) -> N
 def converge_ruling(tools: ClosedTools, ref: str, project_id: str, record: RefRecord | None) -> _Outcome:
     """Carry Leo's portal ruling to the filer's own fix and gate: withdraw and cancel the fix first, since a cancelled gate releases it."""
     try:
-        _withdraw_and_cancel_fix(tools, ref, project_id)
-        for gate in _filer_tasks(tools, tools.find_gates(ref)):
-            if gate.status not in _TERMINAL:
-                tools.cancel(gate.task_id)
-    except ToolRefused as refused:
-        counted = _counted(record, refused)
-        return _Outcome(refused=_unconverged(ref, refused, counted), record=counted)
+        with _counting(record):
+            _withdraw_and_cancel_fix(tools, ref, project_id)
+            for gate in _filer_tasks(tools, tools.find_gates(ref)):
+                if gate.status not in _TERMINAL:
+                    tools.cancel(gate.task_id)
+    except _RefusedWithRecord as refusal:
+        return _stopped(ref, refusal)
     return _Outcome()
 
 
