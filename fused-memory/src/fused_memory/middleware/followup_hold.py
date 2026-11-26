@@ -17,8 +17,10 @@ from typing import TYPE_CHECKING, Any, ClassVar, Final
 
 from pydantic import BaseModel, ConfigDict, ValidationError
 from shared.followup_hold_records import (
+    FINDING_SET_HOLD_METADATA_KEY,
     FOLLOWUP_HOLD_METADATA_KEY,
     FOLLOWUP_HOLDER_METADATA_KEY,
+    FindingSetHold,
     FollowupHold,
     FollowupHolder,
     PromotionCause,
@@ -95,8 +97,10 @@ _REVIEW_SUGGESTIONS_CONTEXT: Final = 'review_suggestions'
 _FINDING_KEY: Final = 'x_finding_key'
 _PRD_PATH_KEY: Final = 'prd_path'
 _CITATION_KEYS: Final = (_FINDING_KEY, _PRD_PATH_KEY)
-_HOLD_EXCLUDING_KEYS: Final = ('execution_class', *_CITATION_KEYS, 'human_decomposed')
-_HOLD_SCOPE_KEYS: Final = ('source', 'spawn_context', 'task_kind', *_HOLD_EXCLUDING_KEYS)
+_CITED_KEYS: Final = (*_CITATION_KEYS, 'human_decomposed')
+_HOLD_SCOPE_KEYS: Final = (
+    'source', 'spawn_context', 'task_kind', 'execution_class', *_CITED_KEYS, FINDING_SET_HOLD_METADATA_KEY,
+)
 _BACKFILL_FIELDS: Final = (
     'priority',
     'dependencies',
@@ -115,23 +119,42 @@ def is_holder(task: Mapping[str, object]) -> bool:
 
 
 def hold_scope(metadata: object, priority: object) -> bool:
-    """Decision 9: a low follow-up or reviewer suggestion of the normal kind that nothing cites.
+    """Decision 9: a low task of the normal kind needing no human, in one of two arms.
 
-    ``human_decomposed`` is the mark every planning-mode birth carries, so a PRD decompose is
-    never held at filing or by the backfill.
+    The uncited follow-up arm holds a follow-up or reviewer suggestion that nothing cites.
+    ``human_decomposed`` is the mark every planning-mode birth carries, so this arm never holds a
+    PRD decompose. The finding-set arm holds a task that cites a finding and carries a valid
+    ``finding_set_hold`` marker, whatever its source, and even when it was born in planning mode.
     """
     if not isinstance(priority, str) or priority not in HELD_PRIORITIES:
         return False
     fields = raw_metadata_dict(metadata, source=_METADATA_SOURCE)
+    if fields.get('task_kind') not in (None, 'normal') or fields.get('execution_class'):
+        return False
+    return _uncited_followup(fields) or _finding_set_member(fields)
+
+
+def _uncited_followup(fields: Mapping[str, object]) -> bool:
     filed_as_followup = (
         fields.get('source') == _FOLLOWUP_SOURCE
         or fields.get('spawn_context') == _REVIEW_SUGGESTIONS_CONTEXT
     )
-    return (
-        filed_as_followup
-        and fields.get('task_kind') in (None, 'normal')
-        and not any(fields.get(key) for key in _HOLD_EXCLUDING_KEYS)
-    )
+    return filed_as_followup and not any(fields.get(key) for key in _CITED_KEYS)
+
+
+def _finding_set_member(fields: Mapping[str, object]) -> bool:
+    return bool(fields.get(_FINDING_KEY)) and _finding_set_hold(fields) is not None
+
+
+def _finding_set_hold(fields: Mapping[str, object], task_id: object = None) -> FindingSetHold | None:
+    raw = fields.get(FINDING_SET_HOLD_METADATA_KEY)
+    if raw is None:
+        return None
+    try:
+        return FindingSetHold.model_validate(raw)
+    except ValidationError as exc:
+        logger.warning('followup_hold: task %s carries a malformed finding_set_hold marker: %s', task_id, exc)
+        return None
 
 
 def hold_at_create(
