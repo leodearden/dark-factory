@@ -101,12 +101,15 @@ async def test_the_cost_trust_flag_follows_the_env_not_the_endpoint_kind(tmp_pat
         'ANTHROPIC_BASE_URL': 'https://token-plan-ams.xiaomimimo.com/anthropic',
     }
 
-    vendor = await _collect(repo, base, workflow=proxied, endpoint_kind=EndpointKind.VENDOR_CLOUD)
-    native = await _collect(repo, base)
+    proxied_native = await _collect(
+        repo, base, workflow=proxied, endpoint_kind=EndpointKind.NATIVE_ANTHROPIC,
+    )
+    unproxied_vllm = await _collect(repo, base, endpoint_kind=EndpointKind.SELF_HOSTED_VLLM)
 
-    assert vendor.cli_cost_untrusted is True
-    assert vendor.endpoint_kind is EndpointKind.VENDOR_CLOUD
-    assert native.cli_cost_untrusted is False
+    assert proxied_native.cli_cost_untrusted is True
+    assert proxied_native.endpoint_kind is EndpointKind.NATIVE_ANTHROPIC
+    assert unproxied_vllm.cli_cost_untrusted is False
+    assert unproxied_vllm.endpoint_kind is EndpointKind.SELF_HOSTED_VLLM
 
 
 @pytest.mark.asyncio
