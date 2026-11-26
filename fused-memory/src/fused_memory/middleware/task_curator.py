@@ -2096,8 +2096,10 @@ class TaskCurator:
 
         The corpus is written in batches of at most *batch_size* points: each
         slice of tasks is embedded, then upserted, before the next slice is
-        embedded. Idempotent: uses the same deterministic UUID5 point-ID
-        scheme as record_task(). Re-running just re-upserts the same points.
+        embedded. A batch whose upsert fails is logged, its points are counted
+        in ``errors``, and the run continues with the next slice. Idempotent:
+        uses the same deterministic UUID5 point-ID scheme as record_task(), so
+        a rerun re-upserts the same points, including a failed batch's.
 
         Args:
             tasks: Flat list of task dicts (as returned by flatten_task_tree).
@@ -2116,23 +2118,55 @@ class TaskCurator:
         embedder = await self._get_embedder()
         client = await self._get_qdrant()
         embed_slots = asyncio.Semaphore(10)
+        batches = [titled[start:start + batch_size] for start in range(0, len(titled), batch_size)]
 
-        for start in range(0, len(titled), batch_size):
-            batch = titled[start:start + batch_size]
+        for number, batch in enumerate(batches, start=1):
             embedded = await asyncio.gather(*(
                 self._backfill_point(task, project_id, embedder, embed_slots) for task in batch
             ))
             points = [point for point in embedded if point is not None]
-            result.errors += len(batch) - len(points)
-            if points:
-                await client.upsert(collection_name=collection, points=points)
-                result.upserted += len(points)
+            landed = await self._upsert_backfill_batch(
+                client, collection, points,
+                project_id=project_id, number=number, total=len(batches),
+            )
+            result.upserted += landed
+            result.errors += len(batch) - landed
+            if landed:
+                logger.info(
+                    'task_curator: backfill_corpus project=%s batch %d/%d upserted, '
+                    '%d points so far',
+                    project_id, number, len(batches), result.upserted,
+                )
 
         logger.info(
             'task_curator: backfill_corpus complete project=%s upserted=%d skipped=%d errors=%d',
             project_id, result.upserted, result.skipped, result.errors,
         )
         return result
+
+    @staticmethod
+    async def _upsert_backfill_batch(
+        client: AsyncQdrantClient,
+        collection: str,
+        points: list[PointStruct],
+        *,
+        project_id: str,
+        number: int,
+        total: int,
+    ) -> int:
+        """Upsert one backfill batch; how many of *points* landed: all of them, or 0 (logged)."""
+        if not points:
+            return 0
+        try:
+            await client.upsert(collection_name=collection, points=points)
+        except Exception:
+            logger.warning(
+                'task_curator: backfill_corpus project=%s batch %d/%d of %d points '
+                'failed to upsert',
+                project_id, number, total, len(points), exc_info=True,
+            )
+            return 0
+        return len(points)
 
     async def _backfill_point(
         self,
