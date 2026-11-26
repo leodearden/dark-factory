@@ -159,7 +159,12 @@ class StubMcpServer:
         self.close()
 
     def close(self) -> None:
-        """Stop serving; idempotent, and :attr:`url` keeps naming the closed port."""
+        """Stop serving; idempotent, and :attr:`url` keeps naming the port.
+
+        A closed port is free for any concurrent bind, so a test that needs a
+        URL nothing answers holds :func:`shared.testing_sockets.refused_port`
+        instead.
+        """
         if self._httpd is None:
             return
         self._httpd.shutdown()
