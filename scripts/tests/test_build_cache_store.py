@@ -257,6 +257,16 @@ class TestPrune:
         assert report["over_cap"] is True
         assert report["remaining_bytes"] == 1000
 
+    def test_min_age_secs_zero_makes_a_minute_old_file_eligible(
+        self, world: PrunerWorld
+    ) -> None:
+        path = put_object(world.store, "abc-fresh", 100, mtime_age=60)
+        code, report = world.prune("--min-age-secs", "0", cap=0)
+        assert code == 0
+        assert not path.exists()
+        assert report["removed"] == 1
+        assert report["skipped_young"] == 0
+
     def test_directories_are_never_removed(self, world: PrunerWorld) -> None:
         emptied = put_object(world.store, "abc-one", 100, mtime_age=DAY).parent
         precreated = world.store / "f" / "f" / "f"
@@ -500,11 +510,9 @@ TMPFS = Path("/dev/shm")
 def tmpfs_scratch_root() -> Path | None:
     """A fresh directory on a writable, exec-allowed tmpfs, or None.
 
-    An install pre-creates 4,368 store directories. On the loaded workstation's
-    ext4 that one mkdir took 26-36s (measured 2026-11-19, load average ~130),
-    which pushed installs in the full suite past their timeout; tmpfs takes 0.1s.
-    None sends the world back to tmp_path: the landlock agent sandbox, for one,
-    cannot create entries under /dev (task 7711).
+    An install pre-creates 4,368 store directories, which is slow on a loaded
+    disk. None sends the world back to tmp_path: the landlock agent sandbox,
+    for one, cannot create entries under /dev (task 7711).
     """
     try:
         if os.statvfs(TMPFS).f_flag & (os.ST_NOEXEC | os.ST_RDONLY):
@@ -615,6 +623,32 @@ class TestStoreInstall:
         assert installed.store_pid() == pid
         rerun_calls = installed.systemctl_calls()[calls_before:]
         assert not [call for call in rerun_calls if "restart" in call]
+
+    @pytest.mark.parametrize(
+        ("drifted", "restarted"),
+        [
+            pytest.param(STORE_UNIT, {STORE_UNIT}, id="store-unit"),
+            pytest.param(PRUNE_SERVICE, set(), id="prune-service"),
+            pytest.param(PRUNE_TIMER, {PRUNE_TIMER}, id="prune-timer"),
+        ],
+    )
+    def test_a_drifted_unit_is_rewritten_and_restarts_only_what_it_runs(
+        self, installed: StoreWorld, drifted: str, restarted: set[str]
+    ) -> None:
+        rendered = installed.unit_text(drifted)
+        with (installed.unit_dir / drifted).open("a") as unit:
+            unit.write("# hand edit\n")
+        calls_before = len(installed.systemctl_calls())
+        pid = installed.store_pid()
+
+        proc = installed.install()
+
+        assert proc.returncode == 0, installed.install_report(proc)
+        assert installed.unit_text(drifted) == rendered
+        rerun_calls = installed.systemctl_calls()[calls_before:]
+        assert {call[2] for call in rerun_calls if call[1:2] == ["restart"]} == restarted
+        if STORE_UNIT not in restarted:
+            assert installed.store_pid() == pid
 
     @pytest.mark.parametrize("change", ["rotate", "recreate"])
     def test_changed_credentials_restart_the_store(

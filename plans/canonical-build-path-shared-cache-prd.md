@@ -466,14 +466,24 @@ Dark-factory `scripts/deploy/`:
   directories, then signals rclone to drop its directory cache.
 - `build_cache_drift_probe.sh`: prints one digest line per cache-key input of a host (compiler binaries
   including `cc1`, `cc1plus` and `as`, toolchain, system package versions, prebuilt archives, tool
-  versions). It is the committed form of the study's `prd-scout/S8-drift-probe.sh`, plus one line per
-  pkg-config module that reify's dependencies probe, with its version and `libdir`, or `ABSENT`. The
-  module list is derived from reify's `Cargo.lock` each run: every registry crate's
-  `[package.metadata.system-deps]` entries and `x11-dl`'s probe list (32 modules at reify `27c69f616f`).
-  A build script that bakes a pkg-config answer into generated source makes its crate and every
-  dependent miss on a host that answers differently; gate α's 18 cross-host misses were `libxss-dev`
-  present on one host only (`xscrnsaver`), which the fixed package list did not see. Whole-system
-  package or module lists are not compared: the hosts legitimately differ in hundreds of unrelated ones.
+  versions). `cc1`, `cc1plus` and `as` are printed although sccache hashes only the compiler driver: a
+  host whose driver matches but whose `cc1` differs would serve the other host's objects. It is the
+  committed form of the study's `prd-scout/S8-drift-probe.sh`, plus one line per pkg-config module that
+  reify's dependencies probe, with its version and `libdir`, or `ABSENT`. The module list is derived
+  from reify's `Cargo.lock` each run: every registry crate's `[package.metadata.system-deps]` entries
+  and `x11-dl`'s probe list (30 modules at reify `27c69f616f`). A target-scoped `cfg(...)` table of
+  system-deps entries is descended one level, and every target's modules are listed without evaluating
+  the cfg. A module listed only for a non-Linux target is usually `ABSENT` on both Linux hosts; when it
+  is not, its line can differ without being a key input, which errs toward a false difference, never a
+  missed one. A build script that bakes a pkg-config answer into generated source makes its crate and
+  every dependent miss on a host that answers differently; gate α's 18 cross-host misses were
+  `libxss-dev` present on one host only (`xscrnsaver`), which the fixed package list did not see.
+  `#info.cargo.registry-sources-missing` names the locked registry crates whose source is not on the
+  host. It is informational and never compared: which sources a host holds depends on what it last
+  fetched (a Linux build never downloads `windows-*` or `objc2-*` crates), not on a key input. A missing
+  crate that declares system-deps still shows, as `pkg-config.<module>` lines absent on that host only.
+  Whole-system package or module lists are not compared: the hosts legitimately differ in hundreds of
+  unrelated ones.
 - `check_build_cache_in_service.py --observations <file> --host <runner> --since <ISO> --min-runs N
   [--canon-root <path> --status-json <file>]`:
 
@@ -672,7 +682,7 @@ files (`config.py`, `verify.py`, `harness.py`) are contended, and pinning the ch
   configuration and `build_canon` in its yaml; reset the laptop's task-verify lanes and merge lane so
   their build directories are recreated; wait for laptop verifies; run the drift probe on both hosts and
   compare (on 2026-11-19, after `libxss-dev` and `libocct-draw-dev` were installed on the workstation, the
-  study's probe and the 32 reify-probed pkg-config modules showed no difference); run the in-service check with `--min-runs 5` and `--canon-root`; then set `expect_canon` for
+  study's probe and the reify-probed pkg-config modules showed no difference); run the in-service check with `--min-runs 5` and `--canon-root`; then set `expect_canon` for
   the laptop. Watch the laptop's verify memory cap for a killed compile, and verify wall time for a slow
   store (decisions 14, 15).
   Signal: the in-service check exits 0 for the laptop, and an observation row for a laptop verify shows
@@ -733,3 +743,10 @@ files (`config.py`, `verify.py`, `harness.py`) are contended, and pinning the ch
    the two. Passing it as a cargo `--config` argument would not. Decide at β2.
 9. **How the observer reaches `VerifyRunnerPool.dispatch`.** A late-bound process-wide sink avoids editing
    the pool's five construction sites; decide at η against what task 10737 does for its own alarm.
+10. **One store process for both addresses.** One rclone binds 127.0.0.1 and the tailscale address. When
+    the workstation has no tailscale address, its own builds lose the store too, fall back to
+    `local_fallback`, and fire the degraded alarm. Accepted (task 10969): two listener processes over one
+    directory each keep their own directory cache, and a key PUT through one read 404 through the other
+    after that process had looked it up (measured 2026-11-25, rclone v1.75.0, default flags), so
+    splitting the listeners would split the cache between the hosts. Trigger to revisit: a workstation
+    degraded alarm whose cause was tailscale, not the store.

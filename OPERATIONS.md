@@ -2278,7 +2278,7 @@ cannot see `tailscaled.service` or `network-online.target`, so the unit has no
 `After=`. Until tailscaled assigns its address, rclone fails to bind it, and
 that failure takes the loopback address down too. The unit retries every 2 s,
 and `StartLimitIntervalSec=0` keeps a slow tailscale start from tripping the
-start limit.
+start limit. Why one process serves both addresses: PRD open question 10.
 
 ### The host configuration file
 
@@ -2414,6 +2414,11 @@ Each executing host has the sentinel `__build_cache_degraded__<host>`, category
 C10. When it fires: run `--check` on the workstation and
 `--check --host-config` on the host, then read that host's latest rows.
 
+When the store is unreachable on the workstation, check `tailscale ip -4`
+first. The store is one rclone process bound to both addresses, so with no
+tailscale address it serves neither, and the workstation's own builds fall
+back too (PRD open question 10).
+
 ### Pruning
 
 `build-cache-store-prune.timer` runs daily, delayed at random by up to an hour,
@@ -2447,24 +2452,13 @@ diff /tmp/drift-<workstation>.tsv /tmp/drift-leo-laptop.tsv
 ```
 
 Zero differences outside `#info` lines are required before gates ι and κ.
-Each pkg-config module that reify's dependencies probe has its own
-`pkg-config.<module>` line, carrying its version and `libdir`, or `ABSENT`, so
-the diff names the module. α's cross-host misses were `xscrnsaver` present on
-the laptop only (libxss-dev, esc-10782-1). The module list is derived from the
-checkout's `Cargo.lock` on every run: each locked registry crate's
-`[package.metadata.system-deps]` entries, read from its source under
-`$CARGO_HOME/registry/src`, plus the pkg-config names in x11-dl's `build.rs`.
-`#info.cargo.registry-sources-missing` names locked registry crates whose
-source is not on that host. It is informational and never compared: it lists
-what the host has not fetched, mostly target-specific crates a Linux build
-never downloads. If a missing crate declares system-deps, its
-`pkg-config.<module>` lines are absent on that host only, so the diff shows
-it. Run `cargo fetch` in the reify checkout on that host and probe again. Whole-system
-package and module lists are not compared, because the hosts legitimately
-differ in hundreds of unrelated packages. A probe of a checkout with no
-`Cargo.lock` exits 2.
+When `#info.cargo.registry-sources-missing` names a crate on one host only, run
+`cargo fetch` in that host's reify checkout and probe again.
 
-`REIFY_PROBE_DEEP=1` adds the digests of the C++ wrappers' header closures.
+It exits 0 when it printed every line, 1 when deriving the pkg-config module
+lines from `Cargo.lock` failed, and 2 when the checkout is not a directory or
+has no `Cargo.lock`. `REIFY_PROBE_DEEP=1` adds the digests of the C++
+wrappers' header closures. PRD C13 says what each line covers and why.
 
 ### Shrinking the old host sccache cache
 
