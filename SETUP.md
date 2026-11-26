@@ -16,6 +16,7 @@ see `OPERATIONS.md` once you're up and running.
 | Node 22+ | Needed for the Playwright MCP server and for `npx pyright` (the type-check command dark-factory itself uses). That pyright is version-pinned by the repo-root `package.json` / `package-lock.json`; run `npm ci` once at the repo root so the bare `npx pyright` resolves the pin instead of fetching whatever is current. Every cold verify worktree does that itself, via `verify_cold_preprovision_command`. |
 | [Claude Code CLI](https://www.npmjs.com/package/@anthropic-ai/claude-code) | `npm install -g @anthropic-ai/claude-code`, then `claude` once interactively to complete OAuth login. |
 | `bubblewrap` | Optional per-agent sandboxing primitive. Degrades gracefully if absent — see "Status & known limitations" in `README.md`. |
+| [rustup](https://rustup.rs) (`cargo`) and [`tokei`](https://github.com/XAMPPRocky/tokei) | Needed only for the nightly quality snapshot of a Cargo project (`OPERATIONS.md` §"Nightly quality snapshot (03:45)"): the Rust instrument runs `cargo metadata` and tokei from `~/.cargo/bin`. Install rustup, then `cargo install --locked tokei`. Its lizard comes from `uv sync --all-packages`. |
 
 **Accounts and keys:**
 - **`ANTHROPIC_API_KEY` is NOT needed.** Agents authenticate as the Claude Code
