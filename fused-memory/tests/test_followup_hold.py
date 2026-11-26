@@ -13,7 +13,11 @@ from typing import Any
 
 import pytest
 from pydantic import ValidationError
-from shared.followup_hold_records import FOLLOWUP_HOLD_METADATA_KEY, FOLLOWUP_HOLDER_METADATA_KEY
+from shared.followup_hold_records import (
+    FINDING_SET_HOLD_METADATA_KEY,
+    FOLLOWUP_HOLD_METADATA_KEY,
+    FOLLOWUP_HOLDER_METADATA_KEY,
+)
 
 from fused_memory.middleware.followup_hold import (
     FollowupHolderProtectedError,
@@ -126,6 +130,55 @@ def test_a_low_followup_is_in_hold_scope(metadata: Any, priority: str) -> None:
 ])
 def test_a_task_outside_the_hold_rule_is_not_held(metadata: Any, priority: str | None) -> None:
     assert not hold_scope(metadata, priority)
+
+
+_SET_MARKER = {'ruling': 'Leo 2026-11-12 on fk-c0932f0b7df1'}
+_FINDING_SET = {
+    'source': 'review-all',
+    'x_finding_key': ['fk-c0932f0b7df1'],
+    'x_finding_run': 'review-all-dark_factory-20261008',
+    FINDING_SET_HOLD_METADATA_KEY: _SET_MARKER,
+}
+
+
+@pytest.mark.parametrize(('metadata', 'priority'), [
+    (_FINDING_SET, 'low'),
+    (_FINDING_SET, 'polish'),
+    ({**_FINDING_SET, 'human_decomposed': True}, 'low'),
+    ({**_FINDING_SET, 'prd_path': 'plans/x-prd.md'}, 'low'),
+    ({**_FINDING_SET, 'complexity': 'simple'}, 'low'),
+    ({**_FINDING_SET, 'x_finding_key': 'fk-x'}, 'low'),
+    (json.dumps({**_FINDING_SET, 'human_decomposed': True}), 'low'),
+], ids=['low', 'polish', 'planning-birth', 'prd-path', 'simple', 'scalar-finding-key', 'json-string'])
+def test_a_marked_finding_set_member_is_in_hold_scope(metadata: Any, priority: str) -> None:
+    assert hold_scope(metadata, priority)
+
+
+@pytest.mark.parametrize(('metadata', 'priority'), [
+    (_FINDING_SET, 'medium'),
+    ({**_FINDING_SET, 'task_kind': 'deterministic'}, 'low'),
+    ({**_FINDING_SET, 'execution_class': 'operational'}, 'low'),
+    ({'source': 'review-all', FINDING_SET_HOLD_METADATA_KEY: _SET_MARKER}, 'low'),
+    ({**_FINDING_SET, 'x_finding_key': []}, 'low'),
+    ({**_FINDING_SET, FINDING_SET_HOLD_METADATA_KEY: None}, 'low'),
+], ids=['medium', 'deterministic', 'execution-class', 'no-finding-key', 'empty-finding-key', 'marker-none'])
+def test_a_marked_task_outside_the_finding_set_arm_is_not_held(metadata: Any, priority: str) -> None:
+    assert not hold_scope(metadata, priority)
+
+
+@pytest.mark.parametrize('marker', [
+    {},
+    {'ruling': ''},
+    {**_SET_MARKER, 'extra': 1},
+    'yes',
+], ids=['empty', 'empty-ruling', 'extra-key', 'string'])
+def test_a_malformed_finding_set_marker_is_not_held_and_warns(
+    marker: object, caplog: pytest.LogCaptureFixture,
+) -> None:
+    with caplog.at_level('WARNING', logger='fused_memory.middleware.followup_hold'):
+        assert not hold_scope({**_FINDING_SET, FINDING_SET_HOLD_METADATA_KEY: marker}, 'low')
+
+    assert any(FINDING_SET_HOLD_METADATA_KEY in record.getMessage() for record in caplog.records)
 
 
 _HELD_AT = '2026-11-19T04:30:00+00:00'

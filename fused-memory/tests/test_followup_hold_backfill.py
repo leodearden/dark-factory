@@ -78,6 +78,24 @@ async def test_the_backfill_holds_every_matching_pending_followup_in_one_event(s
 
 
 @pytest.mark.asyncio
+async def test_the_backfill_holds_a_pending_marked_finding_set_member(stack: Stack) -> None:
+    finding_set_member = {'source': 'review-all', 'x_finding_key': ['fk-1'], 'human_decomposed': True}
+    marked = await stack.seed(
+        'Marked finding-set member', {**finding_set_member, 'finding_set_hold': {'ruling': 'r'}}, priority='low',
+    )
+    unmarked = await stack.seed('Unmarked finding-set member', dict(finding_set_member), priority='low')
+    unmarked_before = await stack.row(unmarked)
+
+    count = await stack.interceptor.backfill_followup_holds(stack.root, known_roots=[stack.root])
+
+    assert count == 1
+    [holder] = await stack.holder_ids()
+    assert await stack.dependencies(marked) == [holder]
+    assert str((await stack.metadata(marked))[FOLLOWUP_HOLD_METADATA_KEY]['holder']) == holder
+    assert await stack.row(unmarked) == unmarked_before
+
+
+@pytest.mark.asyncio
 async def test_a_second_backfill_adds_nothing_and_still_reports(stack: Stack) -> None:
     matching, _untouched = await _seed_stock(stack)
     await stack.interceptor.backfill_followup_holds(stack.root, known_roots=[stack.root])
