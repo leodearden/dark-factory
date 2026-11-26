@@ -1347,9 +1347,7 @@ class TestTheAdapterWalksAPagedAnswer:
         population = numbered_statuses(10)
         session = PagingStatusesSession(population, cap=3)
 
-        statuses, error = await self._adapter(session, tmp_path).get_statuses(
-            list(range(1, 11)),  # type: ignore[arg-type]
-        )
+        statuses, error = await self._adapter(session, tmp_path).get_statuses(list(population))
 
         assert (statuses, error) == (population, None)
         first, *continuations = session.requests
