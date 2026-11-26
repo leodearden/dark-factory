@@ -481,3 +481,138 @@ def test_accounting_violations_count_distinct_texts_of_the_four_prefixes():
 def test_worktree_ledger_records_alone_are_not_accounting_violations():
     tally = canary.accounting_violations([audit(1, LEDGER_TEXT), audit(2, LEDGER_TEXT)])
     assert (tally.distinct_texts, tally.records_with_any, tally.worktree_ledger_records) == (0, 0, 2)
+
+
+# ---------------------------------------------------------------------------
+# Main's history: which commits the queue landed, the gate re-verify split,
+# red-main episodes from the main-tip sweep, and what started on a red main.
+# ---------------------------------------------------------------------------
+
+
+def main_history() -> tuple[canary.MainUpdate, ...]:
+    return (
+        canary.MainUpdate(at=at(10), new_sha='d1', commits=('d1',)),
+        canary.MainUpdate(at=at(20), new_sha='m2', commits=('m2',)),
+        canary.MainUpdate(at=at(30), new_sha='f3', commits=('f1', 'f2', 'f3')),
+        canary.MainUpdate(at=at(40), new_sha='d5', commits=('d4', 'd5')),
+    )
+
+
+def test_every_commit_of_a_queue_landing_is_queue_and_the_rest_direct():
+    ledger = canary.classify_commits(main_history(), {'m2', 'f3'})
+
+    queue, direct = canary.CommitClass.QUEUE, canary.CommitClass.DIRECT
+    assert ledger.classes == {
+        'd1': direct, 'm2': queue, 'f1': queue, 'f2': queue, 'f3': queue, 'd4': direct, 'd5': direct,
+    }
+    assert ledger.landed_at['f1'] == at(30)
+    assert ledger.landed_at['d4'] == at(40)
+
+
+def gate(minutes: float, rebased_from: str, reverify: bool = True) -> dict[str, Any]:
+    return ev(minutes, 'g', reverify=reverify, rebased_from=rebased_from, rebased_onto='onto')
+
+
+def test_gate_reverify_split_buckets_each_gate_by_what_landed_under_it():
+    ledger = canary.classify_commits(main_history(), {'m2', 'f3'})
+    ranges = {
+        ('q', 'onto'): ('m2',), ('d', 'onto'): ('d1',), ('b', 'onto'): ('m2', 'd4'),
+        ('e', 'onto'): (), ('u', 'onto'): ('m2', 'zz'),
+    }
+    gates = [
+        gate(1, 'q'), gate(2, 'd'), gate(3, 'b'), gate(4, 'e'), gate(5, 'q', reverify=False),
+        gate(6, 'u'), gate(7, 'missing'),
+    ]
+
+    split = canary.gate_reverify_split(gates, ranges, ledger.classes)
+
+    assert split == {
+        canary.GateRange.QUEUE_ONLY: 1, canary.GateRange.DIRECT_ONLY: 1, canary.GateRange.BOTH: 1,
+        canary.GateRange.EMPTY: 1, canary.GateRange.UNCLASSIFIED: 2,
+    }
+
+
+def full(letter: str) -> str:
+    return letter * 40
+
+
+def sweep(start: float, letter: str, passed: bool, filed: bool | None = None) -> canary.SweepVerdict:
+    return canary.SweepVerdict(
+        started_at=at(start), verdict_at=at(start + 5), sha12=full(letter)[:12], passed=passed, filed=filed,
+    )
+
+
+def test_red_episodes_open_only_at_a_filed_failure_and_close_at_the_next_green():
+    sweeps = [
+        sweep(100, 'a', True), sweep(110, 'b', False, False), sweep(120, 'c', False, True),
+        sweep(130, 'd', False, False), sweep(140, 'e', True), sweep(150, 'f', False, False),
+        sweep(160, '1', True), sweep(170, '2', False, True),
+    ]
+    landed_at = {full(x): at(t) for x, t in [('a', 10), ('b', 20), ('c', 30), ('d', 40), ('e', 50), ('f', 60), ('1', 70)]}
+
+    result = canary.red_episodes(sweeps, landed_at)
+
+    closed, still_open = result.episodes
+    assert (closed.first_red_sha12, closed.opening_sha12, closed.green_sha12) == (
+        full('b')[:12], full('c')[:12], full('e')[:12],
+    )
+    assert (closed.candidate_after, closed.start, closed.end, closed.red_verdicts) == (at(10), at(20), at(50), 3)
+    assert (still_open.first_red_sha12, still_open.green_sha12) == (full('2')[:12], None)
+    assert (still_open.candidate_after, still_open.start, still_open.end) == (at(70), at(170), None)
+    assert result.unconfirmed == 3
+
+
+def test_an_episode_whose_shas_never_landed_falls_back_to_the_sweep_clock():
+    sweeps = [sweep(100, 'b', False, True), sweep(140, 'e', True)]
+
+    (episode,) = canary.red_episodes(sweeps, {}).episodes
+
+    assert (episode.candidate_after, episode.start, episode.end) == (None, at(100), at(145))
+
+
+def episode(start: float, end: float | None, after: float | None = None) -> canary.RedEpisode:
+    return canary.RedEpisode(
+        first_red_sha12='r', opening_sha12='r', green_sha12=None if end is None else 'g',
+        candidate_after=None if after is None else at(after), start=at(start),
+        end=None if end is None else at(end), red_verdicts=1,
+    )
+
+
+def test_verifies_started_on_red_counts_starts_inside_an_episode_by_kind():
+    verify = [
+        completed(150, 'local', 30, passed=False),  # started 120: on red, failed
+        completed(250, 'local', 30, passed=True),   # started 220: after the episode
+        completed(190, 'local', 30, passed=True),   # started 160: on red
+    ]
+    cancelled = [cancelled_verify(130, 'laptop', 20)]  # started 110: on red
+    tasks = [
+        canary.TaskVerifyStart(task_id='t1', at=at(150), passed=False),
+        canary.TaskVerifyStart(task_id='t2', at=at(199), passed=True),
+        canary.TaskVerifyStart(task_id='t3', at=at(200), passed=None),
+    ]
+
+    result = canary.verifies_started_on_red([episode(100, 200)], verify, cancelled, tasks)
+
+    assert (result.merge.started, result.merge.share, result.merge.failed) == (3, 0.75, 1)
+    assert (result.task.started, result.task.share, result.task.failed) == (2, pytest.approx(2 / 3), 1)
+
+
+def test_an_open_episode_covers_every_later_start():
+    tasks = [canary.TaskVerifyStart(task_id='t', at=at(10_000), passed=True)]
+    result = canary.verifies_started_on_red([episode(100, None)], [], [], tasks)
+    assert result.task.started == 1
+    assert result.merge.share is None
+
+
+def test_chain_attributed_episodes_need_a_chain_landing_in_the_candidate_range():
+    ledger = canary.CommitLedger(
+        classes={},
+        landed_at={'in': at(15), 'at-red': at(20), 'at-green': at(10), 'later': at(95)},
+    )
+    first, second = episode(20, 50, after=10), episode(90, None, after=70)
+
+    assert canary.chain_attributed_episodes([first, second], ledger, ['in']) == 1
+    assert canary.chain_attributed_episodes([first], ledger, ['at-red']) == 1
+    assert canary.chain_attributed_episodes([first], ledger, ['at-green']) == 0
+    assert canary.chain_attributed_episodes([second], ledger, ['later', 'unlanded']) == 0
+    assert canary.chain_attributed_episodes([], ledger, ['in']) == 0
