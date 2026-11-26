@@ -137,7 +137,7 @@ FILE_EXTENSIONS: frozenset[str] = frozenset({
     'lock', 'log',
     'manifest', 'md', 'mjs', 'mts',
     'npmrc', 'png', 'py', 'python-version',
-    'ri', 'rs', 'scss', 'service', 'sh', 'step', 'stl', 'svg',
+    'ri', 'rs', 'scss', 'service', 'sh', 'stderr', 'step', 'stl', 'svg',
     'template', 'timer', 'tombstones', 'toml', 'ts', 'tsv', 'tsx', 'txt', 'typed',
     'yaml', 'yml',
 })
