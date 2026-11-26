@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import re
 import uuid
 from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -20,6 +21,7 @@ from fused_memory.config.schema import CuratorConfig, FusedMemoryConfig
 from fused_memory.middleware.curator_types import DEFAULT_PRIORITY
 from fused_memory.middleware.task_curator import (
     _PRIORITY_RANK,
+    BACKFILL_DEFAULT_CONCURRENCY,
     BACKFILL_UPSERT_BATCH_SIZE,
     BackfillResult,
     TaskCurator,
@@ -393,6 +395,45 @@ class TestBackfillBatching:
         assert 'batch 2/3' in message
         assert '3 points' in message
         assert warnings[0].exc_info is not None
+
+
+class TestBackfillConcurrency:
+    @staticmethod
+    async def _backfill(
+        embedder: RecordingEmbedder, tasks: list[dict], **knobs: int,
+    ) -> BackfillResult:
+        curator = in_memory_corpus_curator(embedder)
+        try:
+            return await curator.backfill_corpus(tasks, 'proj', **knobs)
+        finally:
+            await curator.close()
+
+    @pytest.mark.asyncio
+    async def test_peak_in_flight_embeds_equal_the_concurrency(self):
+        embedder = RecordingEmbedder()
+        result = await self._backfill(embedder, _titled_tasks(10), concurrency=3)
+
+        assert embedder.peak == 3
+        assert result.upserted == 10
+
+    @pytest.mark.asyncio
+    async def test_default_concurrency_is_ten(self):
+        embedder = RecordingEmbedder()
+        await self._backfill(embedder, _titled_tasks(12))
+
+        assert BACKFILL_DEFAULT_CONCURRENCY == 10
+        assert embedder.peak == BACKFILL_DEFAULT_CONCURRENCY
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('knob', 'value'), [('concurrency', 0), ('concurrency', -1), ('batch_size', 0)],
+    )
+    async def test_non_positive_knob_is_refused_before_any_embed(self, knob: str, value: int):
+        embedder = RecordingEmbedder()
+        with pytest.raises(ValueError, match=f'{knob}.*{re.escape(str(value))}'):
+            await self._backfill(embedder, _titled_tasks(3), **{knob: value})
+
+        assert embedder.calls == 0
 
 
 # ──────────────────────────────────────────────────────────────────────────────
