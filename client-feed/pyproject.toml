@@ -56,6 +56,7 @@ markers = [
     "timing(reason): a deadline, grace period or timeout is the behaviour under test, named by reason=; the timing-dependence lint (fused-memory/scripts/_timing_dependence.py) accepts a real sleep, an elapsed-vs-literal assert or a literal wait deadline only under it. Not deselected by default.",
 ]
 asyncio_mode = "auto"
+addopts = "-n auto --dist loadgroup"
 # timeout/timeout_method: the fleet-wide value (plans/pytest-per-test-timeout-measurement-2026-09-17.md)
 # and rationale (shared/pyproject.toml, tests/scripts/test_timeout_method_policy.py).
 timeout = 420
@@ -67,7 +68,7 @@ dev = [
     "pytest>=8.0.0",
     "pytest-asyncio>=0.21.0",
     "pytest-timeout>=2.4.0",
-    # verify's injected -n; see tests/scripts/test_merge_gate_parallelism_config.py::RULED_SERIAL_MEMBERS
+    # this member's own addopts -n, and verify's injected -n; see tests/scripts/test_merge_gate_parallelism_config.py::PARALLEL_ADDOPTS_MEMBERS
     "pytest-xdist>=3.6.0",
     "ruff>=0.7.1",
 ]
