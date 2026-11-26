@@ -306,3 +306,105 @@ def test_queue_to_land_is_the_median_of_done_landings_in_hours():
 
 def test_queue_to_land_is_unmeasured_without_a_landing():
     assert canary.queue_to_land([]).p50_hours is None
+
+
+# ---------------------------------------------------------------------------
+# Chain figures over merge_verify payloads: chain_items, chain_task_ids,
+# chain_depth_reason {basis, pass_estimate, row: [threshold, depth], queue_depth}.
+# ---------------------------------------------------------------------------
+
+
+def chain_verify(
+    end_minutes: float, task_id: str, items: Any, *, secs: float = 600.0, passed: bool = True,
+    members: list[str] | None = None, reason: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    return ev(end_minutes, task_id, runner='local', chain_items=items, duration_ms=secs * 1000,
+              passed=passed, chain_task_ids=members or [task_id], chain_depth_reason=reason)
+
+
+def sized(depth: int, queue_depth: int, basis: str = 'pass_estimate') -> dict[str, Any]:
+    return {'basis': basis, 'pass_estimate': 0.9, 'row': [0.876, depth], 'queue_depth': queue_depth}
+
+
+def test_deep_chain_p90_is_the_nearest_rank_p90_of_deep_verifies():
+    verify = [chain_verify(i, 't', 2, secs=100.0 * (i + 1)) for i in range(10)]
+    verify += [chain_verify(20, 'solo', 1, secs=99999.0), chain_verify(21, 'odd', True, secs=99999.0)]
+    assert canary.deep_chain_p90_secs(verify) == 900.0
+
+
+def test_deep_chain_p90_is_unmeasured_without_a_deep_verify():
+    assert canary.deep_chain_p90_secs([chain_verify(1, 'solo', 1)]) is None
+
+
+def test_chain_items_distribution_tallies_every_verify():
+    verify = [chain_verify(1, 'a', 1), chain_verify(2, 'b', 4), chain_verify(3, 'c', 4)]
+    assert canary.chain_items_distribution(verify) == {1: 1, 4: 2}
+
+
+def test_depth_reason_tally_buckets_by_basis_and_unsized():
+    verify = [
+        chain_verify(1, 'a', 3, reason=sized(4, 9)),
+        chain_verify(2, 'b', 1, reason=sized(4, 9, basis='no_estimate')),
+        chain_verify(3, 'c', 1),
+        chain_verify(4, 'd', 4, reason=sized(4, 9)),
+    ]
+    assert canary.depth_reason_tally(verify) == {'pass_estimate': 2, 'no_estimate': 1, 'unsized': 1}
+
+
+def test_depth_starved_splits_too_few_waiting_from_other():
+    verify = [
+        chain_verify(1, 'a', 2, reason=sized(4, 2)),  # starved, too few waiting
+        chain_verify(2, 'b', 2, reason=sized(4, 9)),  # starved, other
+        chain_verify(3, 'c', 4, reason=sized(4, 9)),  # full depth
+        chain_verify(4, 'd', 1),                      # unsized
+    ]
+
+    result = canary.depth_starved(verify)
+
+    assert (result.sized, result.starved, result.too_few_waiting, result.other) == (3, 2, 1, 1)
+    assert result.share_of_verifies == 0.5
+
+
+def test_post_red_chain_solos_count_unretired_members_re_verified_alone():
+    verify = [
+        chain_verify(100, 'a', 3, secs=1800, passed=False, members=['a', 'b', 'c']),  # red, predates lo
+        chain_verify(105, 'e', 2, secs=600, members=['e', 'f']),                      # green chain
+        chain_verify(150, 'a', 1, secs=1200),                 # counted
+        chain_verify(160, 'b', 1, secs=1200, passed=False),   # b landed in between: not counted
+        chain_verify(170, 'd', 1, secs=1200),                 # never in a red chain
+        chain_verify(180, 'e', 1, secs=1800),                 # its chain was green
+    ]
+    finalized = [ev(120, 'b', state='done'), ev(155, 'a', state='blocked'), ev(190, 'a', state='done')]
+
+    result = canary.post_red_chain_solos(verify, finalized, at(110), at(300))
+
+    assert result.count == 1
+    assert result.hours == pytest.approx(1 / 3)
+    assert result.share_of_verify_hours == pytest.approx(20 / 90)
+    assert result.next_finalize_blocked == 1
+
+
+def test_a_solo_running_beside_its_red_chain_is_not_a_post_red_solo():
+    verify = [
+        chain_verify(100, 'a', 2, secs=1800, passed=False, members=['a', 'b']),
+        chain_verify(110, 'a', 1, secs=1200),  # started at 90, before the red chain ended
+    ]
+    assert canary.post_red_chain_solos(verify, [], at(0), at(300)).count == 0
+
+
+def test_per_item_chain_wall_over_deep_enough_chains():
+    verify = [
+        chain_verify(1, 'a', 8, secs=800.0),
+        chain_verify(2, 'b', 10, secs=3000.0),
+        chain_verify(3, 'c', 9, secs=1800.0),
+        chain_verify(4, 'd', 5, secs=99999.0),
+    ]
+
+    wall = canary.per_item_chain_wall(verify, min_items=8)
+
+    assert wall is not None
+    assert (wall.n, wall.p50_secs, wall.max_secs) == (3, 200.0, 300.0)
+
+
+def test_per_item_chain_wall_is_none_without_a_deep_enough_chain():
+    assert canary.per_item_chain_wall([chain_verify(1, 'a', 5)], min_items=8) is None
