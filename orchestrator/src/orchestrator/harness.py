@@ -1697,6 +1697,30 @@ class _OrphanDisposition(Enum):
     KEPT = 'kept'
 
 
+@dataclass(frozen=True)
+class _StaleL0StrandSweep:
+    """The strands one startup sweep dismissed, tallied once for its WARNING line and its record."""
+
+    strands: tuple[dict[str, Any], ...]
+
+    @property
+    def max_pending_secs(self) -> int:
+        return max(s['pending_secs'] for s in self.strands)
+
+    @property
+    def workflow_waiting(self) -> int:
+        return sum(1 for s in self.strands if s['workflow_blocked'])
+
+    @property
+    def files_a_record(self) -> bool:
+        """Only a strand a workflow was waiting on earns a level-1 record (task 5200).
+
+        Leo's ruling (b) on esc-__stale_l0_strand_sweep__-4: an info-only
+        sweep's record is noise, so it keeps its telemetry and files nothing.
+        """
+        return self.workflow_waiting > 0
+
+
 class Harness:
     """Top-level orchestration loop."""
 
@@ -13357,11 +13381,13 @@ class Harness:
         the per-strand event and the WARNING line.  The level-1 record is
         filed only when a strand had a workflow waiting (Leo's ruling (b) on
         esc-__stale_l0_strand_sweep__-4, task 5200).  With
-        ``info_l0_router_enabled`` the notes the router owns are routed first
-        and never counted, so the records filed are for blocking strands.  An
-        info strand (the router off, or an eval-lane note the router does not
-        own) is stamped and reported but files no record; it stays readable
-        by id from the escalation archive.
+        ``info_l0_router_enabled`` the info notes the router owns are routed
+        first, never dismissed unread (plans/info-l0-disposition-router-prd.md
+        boundary #16): a held or still-unrouted one survives the sweep for the
+        orphan reaper, and none is counted as a strand, so the records filed
+        are for blocking strands.  An info strand (the router off, or an
+        eval-lane note the router does not own) is stamped and reported but
+        files no record; it stays readable by id from the escalation archive.
 
         Why the startup sweep is the ONLY place this class is ever observed:
         ``_reap_orphan_l0_escalations`` skips any L0 whose task has a live
@@ -13369,11 +13395,6 @@ class Harness:
         L0 with a parked workflow can never age out there.  The origin strand
         esc-5189-7 sat pending 20h58m for exactly that reason — a workflow WAS
         attending it — and then this sweep closed it as ordinary restart noise.
-
-        Info notes the info-L0 router owns are routed first, never dismissed
-        unread (plans/info-l0-disposition-router-prd.md boundary #16): a held
-        or still-unrouted one survives the sweep for the orphan reaper, and
-        none is counted as a strand.
         """
         if self._escalation_queue is None:
             return
@@ -13488,10 +13509,7 @@ class Harness:
         return strands
 
     def _report_stale_l0_strands(self, strands: list[dict[str, Any]]) -> None:
-        """Emit one event per swept strand; file the aggregate only when a workflow was waiting.
-
-        An info-only sweep keeps its events and WARNING but files no record (task 5200).
-        """
+        """Emit one event per swept strand, log the sweep, and hand it to the record filer."""
         if not strands:
             return
 
@@ -13503,22 +13521,20 @@ class Harness:
                     data={k: v for k, v in strand.items() if k != 'task_id'},
                 )
 
-        max_age = max(s['pending_secs'] for s in strands)
-        waiting = sum(1 for s in strands if s['workflow_blocked'])
+        sweep = _StaleL0StrandSweep(tuple(strands))
         filing = (
-            'filing the level-1 strand record' if waiting
+            'filing the level-1 strand record' if sweep.files_a_record
             else 'no level-1 record filed because no workflow was waiting'
         )
         logger.warning(
-            f'Dismissed {len(strands)} STALE-STRAND L0 escalation(s) at startup '
-            f'(max pending {max_age}s, {waiting} with a workflow waiting); these '
-            f'had been waiting far longer than the '
+            f'Dismissed {len(sweep.strands)} STALE-STRAND L0 escalation(s) at startup '
+            f'(max pending {sweep.max_pending_secs}s, {sweep.workflow_waiting} with a '
+            f'workflow waiting); these had been waiting far longer than the '
             f'{self.config.orphan_l0_timeout_secs:.0f}s strand threshold and are '
             f'NOT ordinary restart artifacts; {filing}'
         )
 
-        if waiting:
-            self._file_stale_l0_strand_escalation(strands)
+        self._file_stale_l0_strand_escalation(sweep)
 
     # Strand-sweep aggregate escalation (task 3172).  One record per sweep that
     # strands an L0 a workflow was waiting on (task 5200), however many strands
@@ -13568,8 +13584,11 @@ class Harness:
             f'the strands this sweep dismissed, which no earlier record lists.\n\n'
         )
 
-    def _file_stale_l0_strand_escalation(self, strands: list[dict[str, Any]]) -> None:
+    def _file_stale_l0_strand_escalation(self, sweep: _StaleL0StrandSweep) -> None:
         """File ONE level-1 escalation for the strands this restart destroyed.
+
+        Filed only when ``sweep.files_a_record``: a strand had a workflow
+        waiting.  The record then names every strand, info ones included.
 
         Level is load-bearing.  ``dismiss_all_pending`` sweeps every pending L0
         at startup, so an aggregate filed at L0 would be erased by the very
@@ -13588,16 +13607,16 @@ class Harness:
         it into the same decision instead of closing it as a duplicate.
         """
         queue = getattr(self, '_escalation_queue', None)
-        if not queue or not strands:
+        if not queue or not sweep.files_a_record:
             return
+        strands = sweep.strands
         try:
             open_records = self._open_stale_l0_strand_records(queue.get_pending())
 
-            max_age = max(s['pending_secs'] for s in strands)
-            blocked = sum(1 for s in strands if s['workflow_blocked'])
+            max_age = sweep.max_pending_secs
             summary = (
                 f'{len(strands)} L0 escalation(s) stranded across restart '
-                f'(max pending {max_age}s, {blocked} with a workflow waiting)'
+                f'(max pending {max_age}s, {sweep.workflow_waiting} with a workflow waiting)'
             )[:200]
             lines = '\n'.join(
                 f'  - {s["escalation_id"]} (task {s["task_id"]}): pending '
