@@ -11,12 +11,12 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 from _orch_helpers import HermeticMcpSession
+from _paging_statuses_session import PagingStatusesSession, numbered_statuses
 from _recording_event_store import _RecordingEventStore
 from shared.locking import directory_locks
 from shared.mcp_envelope import resolver_failed
 from shared.status_paging import STATUSES_SAFE_PAGE_SIZE, StatusPagingError
 from shared.task_metadata_wire import coerce_task_metadata
-from shared.testing_mcp_stub import tool_reply_body
 
 from orchestrator.already_landed_tick_view import AlreadyLandedTickView
 from orchestrator.config import (
@@ -6074,69 +6074,6 @@ class TestGetStatusesFailsLoud:
 # TestGetStatusesPaging (task 3396)
 # ---------------------------------------------------------------------------
 
-class _PagingStatusesSession:
-    """A ``get_statuses`` server paging like ``fused_memory/server/tools.py::_pagination_meta``.
-
-    With ``page_size`` it serves ``min(page_size, cap)`` entries from
-    ``offset``.  Without it, a population larger than *cap* is TRUNCATED to
-    *cap* entries and marked ``auto_paginated``; any other unpaged request is
-    answered with the whole map and no envelope, which means complete.
-    """
-
-    def __init__(
-        self,
-        population: dict[str, str],
-        *,
-        cap: int | None = None,
-        fail_at_offset: int | None = None,
-        first_page_claims_returned: int | None = None,
-    ) -> None:
-        self._population = population
-        self._cap = cap
-        self._fail_at_offset = fail_at_offset
-        self._first_page_claims_returned = first_page_claims_returned
-        self.requests: list[dict] = []
-
-    async def call_tool(self, name: str, arguments: dict, *, timeout: float = 15) -> dict:
-        assert name == 'get_statuses', name
-        self.requests.append(dict(arguments))
-        offset = arguments.get('offset', 0)
-        if offset == self._fail_at_offset:
-            raise OSError(f'connection reset at offset {offset}')
-        ids = arguments.get('ids')
-        items = [(tid, status) for tid, status in self._population.items()
-                 if ids is None or tid in ids]
-        return tool_reply_body(self._payload(items, arguments.get('page_size'), offset))
-
-    def _payload(self, items: list[tuple[str, str]], requested: int | None, offset: int) -> dict:
-        if requested is not None:
-            served = requested if self._cap is None else min(requested, self._cap)
-            echoed, marker = requested, {}
-        elif self._cap is None or len(items) <= self._cap:
-            return {'statuses': dict(items)}
-        else:
-            served, echoed, marker = self._cap, self._cap, {'auto_paginated': True}
-        window = dict(items[offset:offset + served])
-        returned = len(window)
-        if offset == 0 and self._first_page_claims_returned is not None:
-            returned = self._first_page_claims_returned
-        return {
-            'statuses': window,
-            'pagination': {
-                'total': len(items),
-                'offset': offset,
-                'page_size': echoed,
-                'returned': returned,
-                'has_more': offset + len(window) < len(items),
-                **marker,
-            },
-        }
-
-
-def _numbered_statuses(count: int) -> dict[str, str]:
-    return {str(tid): 'done' if tid % 3 else 'pending' for tid in range(1, count + 1)}
-
-
 class TestGetStatusesPaging:
     """``Scheduler.get_statuses`` walks a paged answer to the whole map, or fails (task 3396).
 
@@ -6148,15 +6085,15 @@ class TestGetStatusesPaging:
     """
 
     @staticmethod
-    def _scheduler(session: _PagingStatusesSession) -> Scheduler:
+    def _scheduler(session: PagingStatusesSession) -> Scheduler:
         scheduler = Scheduler(OrchestratorConfig(), mcp_session=session)
         scheduler.finish_startup()
         return scheduler
 
     @pytest.mark.asyncio
     async def test_a_truncated_answer_is_walked_to_the_whole_map(self):
-        population = _numbered_statuses(10)
-        session = _PagingStatusesSession(population, cap=3)
+        population = numbered_statuses(10)
+        session = PagingStatusesSession(population, cap=3)
 
         assert await self._scheduler(session).get_statuses() == (population, None)
 
@@ -6169,9 +6106,9 @@ class TestGetStatusesPaging:
 
     @pytest.mark.asyncio
     async def test_every_continuation_keeps_the_ids_filter_and_project_root(self):
-        population = _numbered_statuses(10)
+        population = numbered_statuses(10)
         named = ['2', '4', '6', '8', '10']
-        session = _PagingStatusesSession(population, cap=2)
+        session = PagingStatusesSession(population, cap=2)
 
         statuses, err = await self._scheduler(session).get_statuses(ids=named)
 
@@ -6185,7 +6122,7 @@ class TestGetStatusesPaging:
 
     @pytest.mark.asyncio
     async def test_a_transport_failure_mid_walk_is_an_error_not_a_partial_map(self):
-        session = _PagingStatusesSession(_numbered_statuses(10), cap=3, fail_at_offset=3)
+        session = PagingStatusesSession(numbered_statuses(10), cap=3, fail_at_offset=3)
 
         statuses, err = await self._scheduler(session).get_statuses()
 
@@ -6195,8 +6132,8 @@ class TestGetStatusesPaging:
 
     @pytest.mark.asyncio
     async def test_an_envelope_that_miscounts_its_page_is_refused(self):
-        session = _PagingStatusesSession(
-            _numbered_statuses(10), cap=3, first_page_claims_returned=2,
+        session = PagingStatusesSession(
+            numbered_statuses(10), cap=3, first_page_claims_returned=2,
         )
 
         statuses, err = await self._scheduler(session).get_statuses()
@@ -6208,8 +6145,8 @@ class TestGetStatusesPaging:
     @pytest.mark.parametrize('cap', [pytest.param(None, id='no-cap'), pytest.param(10, id='within-cap')])
     @pytest.mark.parametrize('ids', [pytest.param(None, id='all'), pytest.param(['1', '7'], id='by-ids')])
     async def test_a_complete_answer_costs_one_unpaged_call(self, cap, ids):
-        population = _numbered_statuses(10)
-        session = _PagingStatusesSession(population, cap=cap)
+        population = numbered_statuses(10)
+        session = PagingStatusesSession(population, cap=cap)
 
         statuses, err = await self._scheduler(session).get_statuses(ids=ids)
 

@@ -29,7 +29,9 @@ from unittest.mock import MagicMock
 import pytest
 from _orch_helpers import CannedMcpSession, mcp_tool_envelope, pydantic_spec
 from _packaged_defaults import load_packaged_defaults
+from _paging_statuses_session import PagingStatusesSession, numbered_statuses
 from shared.mcp_envelope import EnvelopeParseError
+from shared.status_paging import STATUSES_SAFE_PAGE_SIZE, StatusPagingError
 from shared.task_submit import SubmitFailed, SubmitOutcome, SubmittedTask, SubmittedTicket
 
 from orchestrator.config import OrchestratorConfig
@@ -1215,7 +1217,9 @@ class TestGetStatusesHasOneParser:
     """The adapter and ``scheduler.py::Scheduler.get_statuses`` read one tool's answer,
     so they must agree on every response ``dispatch_tool`` can hand back: the JSON-RPC
     bodies the transport and the eval stub emit, and also the already-unwrapped
-    payloads that no transport emits, which both must refuse alike.
+    payloads that no transport emits, which both must refuse alike.  They must also
+    agree on every PAGED sequence of responses: the same pages asked for, and the
+    same map or the same failure at the end.
 
     Driven through BOTH public entry points over the SAME real ``Scheduler`` — the
     adapter's production composition (``merge_lane/worker.py``, ``workflow.py``) —
@@ -1281,6 +1285,108 @@ class TestGetStatusesHasOneParser:
         assert (adapter_error is None) == (scheduler_error is None), (
             adapter_error, scheduler_error,
         )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'paging',
+        [
+            pytest.param({}, id='walked_to_completion'),
+            pytest.param({'fail_at_offset': 3}, id='transport_failure_mid_walk'),
+            pytest.param({'first_page_claims_returned': 2}, id='miscounted_first_page'),
+        ],
+    )
+    async def test_adapter_and_scheduler_agree_on_a_paged_answer(self, paging, tmp_path):
+        from orchestrator.chronic_flake import SchedulerChronicFlakeTaskClient
+        from orchestrator.scheduler import Scheduler
+
+        population = numbered_statuses(10)
+        ids = list(population)
+        config = OrchestratorConfig(project_root=tmp_path)
+        session = PagingStatusesSession(population, cap=3, **paging)
+        scheduler = Scheduler(config, mcp_session=session)
+        adapter = SchedulerChronicFlakeTaskClient(scheduler, config.project_root)
+
+        scheduler_statuses, scheduler_error = await scheduler.get_statuses(ids)
+        scheduler_requests = list(session.requests)
+        adapter_statuses, adapter_error = await adapter.get_statuses(ids)
+        adapter_requests = session.requests[len(scheduler_requests):]
+
+        assert adapter_statuses == scheduler_statuses
+        assert (adapter_error is None) == (scheduler_error is None), (
+            adapter_error, scheduler_error,
+        )
+        assert adapter_requests == scheduler_requests
+        if not paging:
+            assert adapter_statuses == population
+
+
+class TestTheAdapterWalksAPagedAnswer:
+    """``SchedulerChronicFlakeTaskClient.get_statuses`` over a paging server, through the
+    real ``Scheduler`` it is composed with: a paged answer is the whole map, and a walk
+    that fails is ``({}, err)`` with one warning of the adapter's own."""
+
+    @staticmethod
+    def _adapter(session: PagingStatusesSession, tmp_path):
+        from orchestrator.chronic_flake import SchedulerChronicFlakeTaskClient
+        from orchestrator.scheduler import Scheduler
+
+        config = OrchestratorConfig(project_root=tmp_path)
+        return SchedulerChronicFlakeTaskClient(
+            Scheduler(config, mcp_session=session), config.project_root,
+        )
+
+    @staticmethod
+    def _adapter_warnings(caplog) -> list[logging.LogRecord]:
+        return [
+            record for record in caplog.records
+            if record.name == 'orchestrator.chronic_flake' and record.levelno == logging.WARNING
+        ]
+
+    @pytest.mark.asyncio
+    async def test_a_truncated_answer_is_walked_to_the_whole_map(self, tmp_path):
+        population = numbered_statuses(10)
+        session = PagingStatusesSession(population, cap=3)
+
+        statuses, error = await self._adapter(session, tmp_path).get_statuses(
+            list(range(1, 11)),  # type: ignore[arg-type]
+        )
+
+        assert (statuses, error) == (population, None)
+        first, *continuations = session.requests
+        assert 'page_size' not in first and 'offset' not in first, first
+        for request in session.requests:
+            assert request['ids'] == list(population), request
+            assert request['project_root'] == str(tmp_path), request
+        assert [request['page_size'] for request in continuations] == [STATUSES_SAFE_PAGE_SIZE] * 3
+        assert [request['offset'] for request in continuations] == [3, 6, 9]
+
+    @pytest.mark.asyncio
+    async def test_a_miscounted_page_is_refused_with_one_warning(self, tmp_path, caplog):
+        session = PagingStatusesSession(numbered_statuses(10), cap=3, first_page_claims_returned=2)
+
+        with caplog.at_level(logging.WARNING):
+            statuses, error = await self._adapter(session, tmp_path).get_statuses(
+                list(numbered_statuses(10)),
+            )
+
+        assert statuses == {}
+        assert isinstance(error, StatusPagingError), repr(error)
+        assert len(self._adapter_warnings(caplog)) == 1, caplog.records
+
+    @pytest.mark.asyncio
+    async def test_a_transport_failure_mid_walk_is_an_error_with_one_warning(
+        self, tmp_path, caplog,
+    ):
+        session = PagingStatusesSession(numbered_statuses(10), cap=3, fail_at_offset=3)
+
+        with caplog.at_level(logging.WARNING):
+            statuses, error = await self._adapter(session, tmp_path).get_statuses(
+                list(numbered_statuses(10)),
+            )
+
+        assert statuses == {}
+        assert isinstance(error, OSError), repr(error)
+        assert len(self._adapter_warnings(caplog)) == 1, caplog.records
 
 
 class TestSubmitTaskThroughTheRealScheduler:
