@@ -31,12 +31,6 @@ WRITES = stores.GUARDED_WRITES
 RESOLVES = stores.GUARDED_RESOLVES
 TOOLS = READS + WRITES + RESOLVES
 FILED_TASK = '77'
-_FILING = {
-    'task_id': FILED_TASK,
-    'agent_role': 'implementer',
-    'category': 'design_concern',
-    'summary': 's',
-}
 
 
 def status_of(queue: EscalationQueue, escalation_id: str) -> str:
@@ -75,18 +69,9 @@ def seeded_id(queue: EscalationQueue) -> str:
 
 @pytest.fixture
 def kwargs_for(seeded_id: str) -> Callable[[str], dict[str, Any]]:
-    table: dict[str, dict[str, Any]] = {
-        'get_pending_escalations': {'task_id': '42'},
-        'get_escalation': {'escalation_id': seeded_id},
-        'get_task_escalation_history': {'task_id': '42'},
-        'get_task_escalations': {'task_id': '42'},
-        'escalate_info': dict(_FILING),
-        'escalate_blocker': dict(_FILING),
-        'resolve_issue': {
-            'escalation_id': seeded_id, 'resolution': 'closed', 'action': 'close_only',
-        },
-    }
-    return lambda name: dict(table[name])
+    return lambda name: stores.guarded_arguments(
+        name, task_id='42', escalation_id=seeded_id, filed_task_id=FILED_TASK,
+    )
 
 
 @pytest.fixture
@@ -338,11 +323,11 @@ class TestWireShape:
 
     @pytest.mark.asyncio
     async def test_reconciliation_write_returns_the_error_over_the_wire(
-        self, recon_server: FastMCP, other: Path,
+        self, recon_server: FastMCP, other: Path, kwargs_for: Callable[[str], dict[str, Any]],
     ) -> None:
         async with Client(recon_server) as client:
             result = await client.call_tool(
-                'escalate_info', {**_FILING, 'project_root': str(other)},
+                'escalate_info', {**kwargs_for('escalate_info'), 'project_root': str(other)},
             )
 
         assert 'reconciliation store' in result.data['error']
