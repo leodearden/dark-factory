@@ -1460,10 +1460,11 @@ class TestCascadeCitationRepointPass:
 
         async def _blink(project_root):
             calls['n'] += 1
-            # One scan per record per pass and no sweeps on the override
-            # arm: calls 1-3 are the pre-flight, 4 and 5 are GRANDCHILD's
-            # and CHILD's repoint-pass scans, so 6 is the target's.
-            if calls['n'] >= 6:
+            # One batched pre-flight read, then one scan per record on the
+            # repoint pass and no sweeps on the override arm: call 1 is the
+            # pre-flight, 2 and 3 are GRANDCHILD's and CHILD's repoint-pass
+            # scans, so 4 is the target's.
+            if calls['n'] >= 4:
                 raise RuntimeError('task db blinked')
             return snapshot
 
