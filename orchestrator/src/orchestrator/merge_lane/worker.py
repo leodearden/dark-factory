@@ -184,7 +184,7 @@ from orchestrator.merge_lane.request_ledger import (
     report_stuck_requests,
 )
 from orchestrator.merge_lane.reverify_gate_decision import GateClearance, ReverifyDispatch
-from orchestrator.merge_lane.screen import Bounce, ScreenPort, ScreenSite
+from orchestrator.merge_lane.screen import Bounce, ScreenPort, ScreenSite, screen_or_proceed
 from orchestrator.merge_lane.shadow import (
     _maybe_schedule_shadow_compare,
     _run_cold_shadow_verify,
@@ -1543,8 +1543,8 @@ async def _screen_merged_item(
         return result
     merge_result = result.merge_result
     assert merge_result.merge_commit is not None
-    decision = await worker._screen.screen_item(
-        task_id=req.task_id, merged_sha=merge_result.merge_commit.strip(),
+    decision = await screen_or_proceed(
+        worker._screen, task_id=req.task_id, merged_sha=merge_result.merge_commit.strip(),
         base_sha=merge_result.pre_merge_sha, config=req.config, site=ScreenSite.MERGER,
     )
     if not isinstance(decision, Bounce):
@@ -2716,8 +2716,8 @@ async def _screen_train_tip(
     if worker._screen is None:
         return None
     assert merge_result.merge_commit is not None
-    decision = await worker._screen.screen_item(
-        task_id=req.task_id, merged_sha=merge_result.merge_commit.strip(),
+    decision = await screen_or_proceed(
+        worker._screen, task_id=req.task_id, merged_sha=merge_result.merge_commit.strip(),
         base_sha=merge_result.pre_merge_sha, config=req.config, site=ScreenSite.TRAIN,
     )
     if not isinstance(decision, Bounce):
