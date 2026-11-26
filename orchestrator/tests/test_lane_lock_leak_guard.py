@@ -2986,42 +2986,12 @@ class TestCancelledAcquireNeverOrphansTheLaneLock:
         The gate is released only AFTER the cancellation has been observed, so
         this is unambiguously the post-cancellation win and not a race the test
         happened to lose.
-        """
-        gate = threading.Event()
-        obs = self._stub_acquire(monkeypatch, gate, _SENTINEL_FD)
-        lock_path = lane_lock_path(tmp_path / 'lane')
 
-        task = asyncio.create_task(
-            GitOps._acquire_lane_flock_off_thread(lock_path, 5.0)
-        )
-        assert await wait_until(obs['running'].is_set), (  # type: ignore[union-attr]
-            'the acquire never reached the worker thread — cancelling now '
-            'would prove nothing about a late win'
-        )
-
-        task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await task
-        assert not obs['released'], (
-            'nothing may be released before the acquire has produced anything'
-        )
-
-        gate.set()  # the acquire wins the lock AFTER its awaiter is gone
-        assert await wait_until(lambda: _SENTINEL_FD in obs['released']), (  # type: ignore[operator]
-            f'the late-won fd was ORPHANED: a cancelled acquire dropped a held '
-            f'lane lock (reify esc-5548-5 — held until process exit, found only '
-            f'by hand in /proc/locks); released={obs["released"]!r}'
-        )
-
-    async def test_the_late_win_is_already_released_once_its_orphaned_acquire_settles(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-    ):
-        """Awaiting the orphaned acquire is a sufficient settle for its release.
-
-        The end-to-end cases below settle on exactly this: the release callback
-        is attached to the in-flight acquire at cancellation, before anyone
-        else can await it, so by the time that acquire has settled for a later
-        awaiter its late win has already been released.
+        Awaiting the orphaned acquire is also a sufficient settle for that
+        release, and the end-to-end cases below settle on exactly this: the
+        release callback is attached to the in-flight acquire at cancellation,
+        before anyone else can await it, so by the time that acquire has settled
+        for a later awaiter its late win has already been released.
         """
         gate = threading.Event()
         obs = self._stub_acquire(monkeypatch, gate, _SENTINEL_FD)
@@ -3059,9 +3029,10 @@ class TestCancelledAcquireNeverOrphansTheLaneLock:
         await asyncio.gather(*orphans)
 
         assert obs['released'] == [_SENTINEL_FD], (
-            f'the late win had not been released by the time its orphaned '
-            f'acquire settled, so a settle on the acquire would race the '
-            f'release; released={obs["released"]!r}'
+            f'the late-won fd was not released by the time its orphaned acquire '
+            f'settled: either it was ORPHANED (reify esc-5548-5 — held until '
+            f'process exit) or a settle on the acquire races the release; '
+            f'released={obs["released"]!r}'
         )
 
     async def test_cancelled_acquire_that_times_out_releases_nothing(
