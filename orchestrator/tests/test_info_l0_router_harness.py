@@ -472,6 +472,20 @@ class TestStartupAmnestyRoutesInfoNotes:
         )
         assert _curator(harness).calls == []
 
+    async def test_an_aged_eval_lane_info_note_is_a_strand_that_files_no_record(
+        self, harness: Harness,
+    ):
+        """No workflow waited on it, so it is stamped and reported but files no L1 (task 5200)."""
+        esc = _submit_aged(harness, '2339', worktree=EVAL_WORKTREE)
+
+        await harness._dismiss_stale_escalations()
+
+        assert _current(harness, esc.id).resolution_class == 'stale-strand'
+        (event,) = _strand_events(harness)
+        assert event['data']['workflow_blocked'] is False
+        assert _l1s(harness, agent_role='harness-stale-l0-strand-sweep') == []
+        assert _curator(harness).calls == []
+
     async def test_with_the_router_disabled_every_l0_is_dismissed_as_before(self, harness: Harness):
         harness.config.info_l0_router_enabled = False
         info = _submit_aged(harness, '42', seconds_ago=30.0)
