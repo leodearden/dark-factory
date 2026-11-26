@@ -100,9 +100,32 @@ def service(mock_config):
     svc = MemoryService(mock_config)
     svc.graphiti = MagicMock()
     svc.graphiti.remove_edge = AsyncMock()
+    svc.graphiti.get_edge_text = AsyncMock(return_value=('name', 'fact'))
     svc.mem0 = MagicMock()
     svc.mem0.delete = AsyncMock(return_value={'message': 'deleted'})
+    # An "id exists" world by default: delete_memory reads the record before
+    # deleting it, and a mem0 delete also asks the child gate for a count.
+    svc.mem0.get_point_by_id = AsyncMock(return_value=dict(_EXISTING_POINT_PAYLOAD))
+    svc.mem0.count_by_metadata = AsyncMock(return_value=0)
     return svc
+
+
+_EXISTING_POINT_PAYLOAD = {'data': 'a record that exists', 'user_id': 'test'}
+
+
+def _install_mock_journal(svc):
+    journal = MagicMock()
+    journal.log_write_op = AsyncMock()
+    journal.log_backend_op = AsyncMock()
+    svc._write_journal = journal
+    return journal
+
+
+def _install_event_buffer(svc):
+    buffer = MagicMock()
+    buffer.push = AsyncMock()
+    svc._event_buffer = buffer
+    return buffer
 
 
 class TestGraphitiBackendRemoveEdgeTruncatedUuid:
@@ -259,6 +282,106 @@ class TestMemoryServiceDeleteMemoryRejectsTruncatedUuid:
         service.graphiti.remove_edge.assert_called_once_with(
             CANONICAL_UUID, group_id='test'
         )
+
+
+class TestMemoryServiceDeleteMemoryRefusesNonexistentId:
+    """A well-formed id that resolves to nothing RETURNS MemoryNotFound.
+
+    The other half of the silent no-op: both backends treat a miss as
+    "already deleted", so without an existence read a stale but well-formed
+    id got a confirming envelope, a success=True journal row and a
+    memory_deleted event. The refusal is RETURNED, not raised, because the
+    internal callers treat "did not raise" as success and some delete the
+    same id twice by design.
+    """
+
+    @staticmethod
+    def _assert_not_found(result, *, store):
+        assert result['error_type'] == 'MemoryNotFound'
+        assert result['store'] == store
+        assert result['id'] == CANONICAL_UUID
+        assert CANONICAL_UUID in result['error']
+        assert 'status' not in result
+
+    @pytest.mark.asyncio
+    async def test_mem0_miss_returns_not_found_and_leaves_no_trace(self, service):
+        journal = _install_mock_journal(service)
+        buffer = _install_event_buffer(service)
+        service.mem0.get_point_by_id = AsyncMock(return_value=None)
+
+        result = await service.delete_memory(
+            memory_id=CANONICAL_UUID, store='mem0', project_id='test'
+        )
+
+        self._assert_not_found(result, store='mem0')
+        service.mem0.delete.assert_not_awaited()
+        journal.log_write_op.assert_not_awaited()
+        journal.log_backend_op.assert_not_awaited()
+        buffer.push.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_graphiti_miss_returns_not_found_and_leaves_no_trace(self, service):
+        from graphiti_core.errors import EdgeNotFoundError
+
+        journal = _install_mock_journal(service)
+        buffer = _install_event_buffer(service)
+        service.graphiti.get_edge_text = AsyncMock(
+            side_effect=EdgeNotFoundError(CANONICAL_UUID)
+        )
+
+        result = await service.delete_memory(
+            memory_id=CANONICAL_UUID, store='graphiti', project_id='test'
+        )
+
+        self._assert_not_found(result, store='graphiti')
+        service.graphiti.remove_edge.assert_not_awaited()
+        journal.log_write_op.assert_not_awaited()
+        journal.log_backend_op.assert_not_awaited()
+        buffer.push.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_repeated_delete_returns_rather_than_raises(self, service):
+        """The idempotent-retry contract the internal callers rely on.
+
+        summary_pool and task_knowledge_sync GC sweeps, the harness,
+        scope_freshness, targeted recon and the scripts under
+        fused-memory/scripts/ all treat "did not raise" as success, so the
+        second delete of an id must not turn into an error.
+        """
+        first = await service.delete_memory(
+            memory_id=CANONICAL_UUID, store='mem0', project_id='test'
+        )
+        assert first['status'] == 'deleted'
+
+        service.mem0.get_point_by_id = AsyncMock(return_value=None)
+        second = await service.delete_memory(
+            memory_id=CANONICAL_UUID, store='mem0', project_id='test'
+        )
+
+        self._assert_not_found(second, store='mem0')
+        service.mem0.delete.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_an_unreadable_mem0_record_is_not_a_miss(self, service):
+        service.mem0.get_point_by_id = AsyncMock(side_effect=TimeoutError('qdrant'))
+
+        with pytest.raises(TimeoutError):
+            await service.delete_memory(
+                memory_id=CANONICAL_UUID, store='mem0', project_id='test'
+            )
+
+        service.mem0.delete.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_an_unreadable_graphiti_edge_is_not_a_miss(self, service):
+        service.graphiti.get_edge_text = AsyncMock(side_effect=TimeoutError('falkordb'))
+
+        with pytest.raises(TimeoutError):
+            await service.delete_memory(
+                memory_id=CANONICAL_UUID, store='graphiti', project_id='test'
+            )
+
+        service.graphiti.remove_edge.assert_not_awaited()
 
 
 # ── MCP tool boundary ────────────────────────────────────────────────────────
