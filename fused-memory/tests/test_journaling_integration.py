@@ -51,6 +51,9 @@ def service(mock_config, write_journal):
     # measured (`metadata.parent_id` has zero footprint).
     svc.mem0.count_by_metadata = AsyncMock(return_value=0)
     svc.mem0.scroll_by_metadata = AsyncMock(return_value=[])
+    # delete_memory reads the record before deleting it (task 4859), so the
+    # delete case needs an id that exists.
+    svc.mem0.get_point_by_id = AsyncMock(return_value={'data': 'exists', 'user_id': 'test'})
 
     svc.durable_queue = MagicMock()
     svc.durable_queue.enqueue = AsyncMock(return_value=1)

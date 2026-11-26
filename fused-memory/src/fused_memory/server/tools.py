@@ -5589,7 +5589,9 @@ def create_mcp_server(
 
         Accepts either *memory_id* (canonical) or *id* (alias matching the key
         search results and this tool's own response return). Exactly one must
-        be provided; supplying both with conflicting values is an error.
+        be provided; supplying both with conflicting values is an error. A
+        well-formed id that resolves to nothing returns ``MemoryNotFound`` and
+        deletes nothing.
 
         **Every ``store='mem0'`` delete** passes through the citation-repoint
         gate, whoever issues it (task 3624): task metadata still citing the

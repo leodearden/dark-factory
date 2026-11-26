@@ -24,14 +24,22 @@ citation-repoint gate is reached. Both layers exist because they cover
 different callers and because `mcp_tool_errors` flattens an exception to
 `{'error', 'error_type'}` and cannot carry the hint through a raise.
 
+`TestMemoryServiceDeleteMemoryRefusesNonexistentId` closes the other half of
+the same silent no-op (task 4859): a WELL-FORMED id that resolves to nothing
+in either store now returns a `MemoryNotFound` envelope and leaves no backend
+call, journal row or event. It returns rather than raises, so a repeated
+delete stays non-erroring for the internal callers that treat "did not raise"
+as success. Both halves of the class are now closed at the service.
+
 `TestGraphitiBackendRemoveEdgeTruncatedUuid` is deliberately UNCHANGED and
 still passing. `GraphitiBackend.remove_edge` still swallows
 `EdgeNotFoundError` and returns `None` without calling `edge.delete`, and
 that is still correct for a genuinely already-deleted edge — hardening it
 would change idempotent-delete semantics for every caller. It is retained
-because it documents the layer *behind* the new guard: anything that
-bypassed the guard would still fail silently, which is precisely why the
-guard has to sit above it.
+because it documents the layer *behind* the new guards: anything that
+bypassed them would still fail silently, which is precisely why the
+guards have to sit above it. The service's existence read uses
+`get_edge_text` for this reason, rather than a stricter `remove_edge`.
 """
 from __future__ import annotations
 
