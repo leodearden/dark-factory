@@ -866,7 +866,8 @@ async def run_adjudicator_plan(
     discloses it as ``escaped``. A run given a *filer* is about to be applied, so
     for a source in :data:`CALIBRATION_GATED_SOURCES` it first withholds the
     pending heals whose adjudicator has no passing calibration (see
-    :func:`_publish_plan`).
+    :func:`_publish_plan`). The run row names the invocations-ledger run its
+    adjudicator's calls were written under.
     """
     reads = await read_links(
         store, census, projects, created_in, presence_projects=presence_projects,
@@ -874,7 +875,9 @@ async def run_adjudicator_plan(
     adjudicated = await _adjudicate(
         _candidates(reads), ledger, adjudicate, max_asked=max_adjudications,
     )
-    run_id = ledger.start_run(source, writes=False)
+    run_id = ledger.start_run(
+        source, writes=False, invocation_run_id=adjudicate.invocation_run_id,
+    )
     new_ids = ledger.add_adjudications(run_id, adjudicated.records)
     ledger.reuse_adjudications(run_id, [row.adjudication_id for row in adjudicated.reused])
     bases = [
