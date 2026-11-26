@@ -935,7 +935,7 @@ What a degraded source holds back is stated in `plans/client-feed-prd.md`
 
 The same failures are WARNING lines in the unit's journal.
 
-#### Rolling back to feed 1.0
+#### Rolling back the publisher
 
 1.0 code refuses a 1.1 `cursor.json`, because `Cursor` is `extra='forbid'`
 (`client-feed/src/client_feed/feed_io.py::Cursor`), and then restarts every
@@ -955,6 +955,18 @@ python3 -c 'import json, sys; p = sys.argv[1]; c = json.load(open(p)); c.pop("de
 code refuses to open a feed holding one, with a contract violation at that
 line. Roll back only while `grep -c '"source":"filer"' <out>/feed.jsonl`
 prints 0; once a heartbeat has named `filer`, fix forward instead.
+
+Rolling back to a feed 1.1 build from before task 11885 needs the same stop and
+one key popped. Every cursor a later build writes carries
+`deferred_gate_reports`, as `{}` when nothing is held, and the earlier build's
+`Cursor` refuses that key whatever it holds. The other two keys are 1.1 keys,
+so they stay. The `filer` caveat above does not apply: `filer` is a `Source` in
+every 1.1 build.
+
+```bash
+systemctl --user stop client-feed@<name>.service
+python3 -c 'import json, sys; p = sys.argv[1]; c = json.load(open(p)); c.pop("deferred_gate_reports", None); open(p, "w").write(json.dumps(c))' <out>/cursor.json
+```
 
 #### The isolation check
 
