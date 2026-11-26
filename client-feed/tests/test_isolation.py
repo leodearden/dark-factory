@@ -62,6 +62,7 @@ SNAPSHOT_REVEALED: Final = 'client-feed/src/client_feed/envelope.py'
 FIXTURE_DIR: Final = Path(__file__).parent / 'fixtures' / 'snapshot-dark-factory'
 FIXTURE_FILES: Final = (FEED_FILENAME, STATE_FILENAME)
 REGENERATE_FIXTURE_ENV: Final = 'CLIENT_FEED_REGENERATE_SNAPSHOT_FIXTURE'
+FIXTURE_LEAK_NEEDLES: Final = ('CANARY-', '/home/', '/tmp/', 'pytest-of-')
 
 
 @pytest.fixture
@@ -241,6 +242,9 @@ def test_b22_a_snapshot_of_this_checkout_over_its_live_slice_is_valid_and_leaks_
         pytest.skip(f'no live task store at {tasks_db(live)}')
     repo = clone_of_checkout(CHECKOUT_ROOT, tmp_path / 'clone')
     ids = copy_live_slice(live, repo.root, prd_path=CLIENT_FEED_PRD, marker=CANARY_A_DESC)
+    if not ids:
+        pytest.skip(f'{tasks_db(live)} holds no task under {CLIENT_FEED_PRD}')
+    titles = live_titles(live, ids)
     in_dir, out_dir, policy = tmp_path / 'in', tmp_path / 'out', tmp_path / 'policy.yaml'
     write_engagement(in_dir, project_id=SNAPSHOT_PROJECT, delivered=None)
     request_reveals(in_dir, SNAPSHOT_REVEALED, '../x', at=REQUESTED_AT)
@@ -254,7 +258,7 @@ def test_b22_a_snapshot_of_this_checkout_over_its_live_slice_is_valid_and_leaks_
         'max_cases_per_run': SNAPSHOT_FIXTURE_MAX_CASES,
     }))
 
-    _snapshot(policy, capsys)
+    assert _snapshot(policy, capsys).degraded == ()
 
     validated = main(['validate-feed', '--out-dir', str(out_dir), '--project-id', SNAPSHOT_PROJECT])
     assert validated == 0, capsys.readouterr().out
@@ -266,7 +270,6 @@ def test_b22_a_snapshot_of_this_checkout_over_its_live_slice_is_valid_and_leaks_
     upserts = [line for line in lines if isinstance(line, TaskUpserted)]
     assert upserts
     assert {line.task_id for line in upserts} <= set(ids)
-    titles = live_titles(live, ids)
     assert [(line.task_id, line.title) for line in upserts] == [
         (line.task_id, redact_paths(titles[line.task_id])) for line in upserts
     ]
@@ -276,7 +279,7 @@ def test_b22_a_snapshot_of_this_checkout_over_its_live_slice_is_valid_and_leaks_
     trees = [line for line in lines if isinstance(line, TreeSnapshot)]
     assert trees and trees[-1].files
     assert all(matches_any(SNAPSHOT_VISIBLE_GLOBS, file.path) for tree in trees for file in tree.files)
-    assert _leaks(out_dir, needles=(CANARY_A_DESC, '/home/', str(tmp_path))) == []
+    assert _leaks(out_dir, needles=(*FIXTURE_LEAK_NEEDLES, str(tmp_path))) == []
     if os.environ.get(REGENERATE_FIXTURE_ENV) == '1':
         FIXTURE_DIR.mkdir(parents=True, exist_ok=True)
         for name in FIXTURE_FILES:
@@ -289,7 +292,7 @@ def test_the_committed_dark_factory_snapshot_is_a_valid_bounded_leak_free_feed(
     assert {path.name for path in FIXTURE_DIR.iterdir()} == {*FIXTURE_FILES, 'README.md'}
     validated = main(['validate-feed', '--out-dir', str(FIXTURE_DIR), '--project-id', SNAPSHOT_PROJECT])
     assert validated == 0, capsys.readouterr().out
-    assert _leaks(FIXTURE_DIR, needles=('CANARY-', '/home/', '/tmp/', 'pytest-of-')) == []
+    assert _leaks(FIXTURE_DIR, needles=FIXTURE_LEAK_NEEDLES) == []
     assert parse_state((FIXTURE_DIR / STATE_FILENAME).read_text()).prds
     lines = read_feed_lines(FIXTURE_DIR)
     for kind in (TaskUpserted, TreeSnapshot, FileRevealed):

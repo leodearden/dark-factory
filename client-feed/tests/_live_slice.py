@@ -116,13 +116,16 @@ def _copy_escalations(live: Path, queue: EscalationQueueDir, ids: tuple[int, ...
 
 
 def copy_live_slice(live: Path, root: Path, *, prd_path: str, marker: str) -> tuple[int, ...]:
-    """Copy `prd_path`'s slice of `live` under `root`, `marker` appended to every hidden task field; the task ids."""
+    """Copy `prd_path`'s slice of `live` under `root`, `marker` appended to every hidden task field; the task ids.
+
+    No ids, and nothing copied, when `live` holds no master task under `prd_path`.
+    """
     tasks, runs = TasksDb.create(root), RunsDb.create(root)
     queue = EscalationQueueDir.create(root)
     with _with_live_attached(tasks.path, tasks_db(live)) as conn:
         ids = _copy_tasks(conn, prd_path=prd_path, marker=marker)
     if not ids:
-        raise AssertionError(f'no {_TAG} task in {tasks_db(live)} has metadata.prd_path {prd_path!r}')
+        return ()
     if runs_db(live).is_file():
         with _with_live_attached(runs.path, runs_db(live)) as conn:
             _copy_runs(conn, ids)

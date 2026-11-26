@@ -776,8 +776,10 @@ escalation text (never shown). A second feed transport. Per-person links. Failin
     with their dependencies, events, task results, verify archives and escalation root records.
     Every live database is attached through a `file:...?mode=ro` URI. Each `task_upserted` title
     must equal the path-redacted live title, read back read-only
-    (`client-feed/tests/_live_slice.py::live_titles`). B22 is skipped only when the checkout that
-    `shared/src/shared/project_layout.py::main_checkout_of` names has no `.taskmaster/tasks/tasks.db`.
+    (`client-feed/tests/_live_slice.py::live_titles`) straight after the copy. B22 is skipped only
+    when the checkout that `shared/src/shared/project_layout.py::main_checkout_of` names has no
+    `.taskmaster/tasks/tasks.db`, or has one holding no master task under `plans/client-feed-prd.md`.
+    A snapshot that reports any source in `degraded` fails it.
     B1, B2, B15, the ban in (d) and the fixture check never skip.
   - (c) The recorder `client-feed/tests/_audit_hook.py::recording` now records database opens
     (`client-feed/tests/_audit_hook.py::DatabaseOpened`, a `file:` URI decoded to its path). It also
