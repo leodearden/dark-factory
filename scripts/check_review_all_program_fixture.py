@@ -127,24 +127,64 @@ def _refuse_cwd_inside_checkout(cwd: Path) -> None:
         raise ScenarioFailed(f'refused: cwd {cwd} is inside the checkout {REPO_ROOT}')
 
 
+@contextlib.contextmanager
+def _sigterm_held() -> Iterator[None]:
+    signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
+    try:
+        yield
+    finally:
+        signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGTERM})
+
+
+def _release_sigterm() -> None:
+    signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGTERM})
+
+
+def _stop(proc: subprocess.Popen[str]) -> None:
+    with _sigterm_held():
+        proc.terminate()
+        try:
+            proc.wait(timeout=STORE_STOP_GRACE_SECS)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+
+
+@contextlib.contextmanager
+def _owned_child(argv: Sequence[str], *, cwd: Path, env: Mapping[str, str], stderr: Any) -> Iterator[subprocess.Popen[str]]:
+    """Spawn *argv*, then terminate (if still running) and reap it on every exit path.
+
+    SIGTERM is held across the spawn, so the walk's SystemExit can never land inside
+    ``Popen()`` and orphan the child it just forked; the child itself starts with SIGTERM
+    released. A SIGTERM held meanwhile is delivered once the child is owned.
+    """
+    proc: subprocess.Popen[str] | None = None
+    try:
+        with _sigterm_held():
+            proc = subprocess.Popen(
+                argv, cwd=cwd, env=dict(env), stdout=subprocess.PIPE, stderr=stderr, text=True,
+                preexec_fn=_release_sigterm,
+            )
+        yield proc
+    finally:
+        if proc is not None:
+            _stop(proc)
+
+
 def run_script(
     journal: Journal, script: Path, args: Sequence[str], *, cwd: Path, env: Mapping[str, str],
 ) -> Invocation:
     """The one place the walk runs a program script: ``-I -S``, from *cwd*, with exactly *env*."""
     _refuse_cwd_inside_checkout(cwd)
     argv = _isolated_argv(script, args)
-    try:
-        proc = subprocess.run(
-            argv, cwd=cwd, env=dict(env), capture_output=True, text=True,
-            timeout=SCRIPT_TIMEOUT_SECS,
-        )
-    except subprocess.TimeoutExpired:
-        raise ScenarioFailed(
-            f'{script.name} {" ".join(args)} did not exit within {SCRIPT_TIMEOUT_SECS}s',
-        ) from None
-    invocation = Invocation(
-        script, tuple(args), argv, cwd, frozenset(env), proc.returncode, proc.stdout, proc.stderr,
-    )
+    with _owned_child(argv, cwd=cwd, env=env, stderr=subprocess.PIPE) as proc:
+        try:
+            stdout, stderr = proc.communicate(timeout=SCRIPT_TIMEOUT_SECS)
+        except subprocess.TimeoutExpired:
+            raise ScenarioFailed(
+                f'{script.name} {" ".join(args)} did not exit within {SCRIPT_TIMEOUT_SECS}s',
+            ) from None
+    invocation = Invocation(script, tuple(args), argv, cwd, frozenset(env), proc.returncode, stdout, stderr)
     journal.record(invocation)
     return invocation
 
@@ -161,42 +201,20 @@ def _endpoint_line(proc: subprocess.Popen[str], stderr_path: Path) -> str:
     return line
 
 
-def _stop(proc: subprocess.Popen[str]) -> None:
-    """Terminate and reap *proc*; a SIGTERM arriving meanwhile is delivered once it is reaped."""
-    signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
-    try:
-        proc.terminate()
-        try:
-            proc.wait(timeout=STORE_STOP_GRACE_SECS)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait()
-    finally:
-        signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGTERM})
-
-
 @contextlib.contextmanager
 def serving(journal: Journal, store: Path, *flags: str, scratch: Path) -> Iterator[str]:
-    """Serve *store* with ``fake_store.py`` launched like every script; yield its endpoint URL.
-
-    The store is terminated and reaped on every exit path.
-    """
+    """Serve *store* with ``fake_store.py`` launched like every script; yield its endpoint URL."""
     cwd = Path(tempfile.mkdtemp(prefix='store-', dir=scratch))
     _refuse_cwd_inside_checkout(cwd)
     args = ('--port', '0', '--store', str(store), *flags)
     argv = _isolated_argv(FAKE_STORE, args)
     env = {'PATH': os.environ.get('PATH', ''), 'HOME': str(cwd)}
     stderr_path = cwd / 'stderr.log'
-    proc: subprocess.Popen[str] | None = None
-    try:
-        with stderr_path.open('w', encoding='utf-8') as stderr:
-            proc = subprocess.Popen(argv, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=stderr, text=True)
+    with stderr_path.open('w', encoding='utf-8') as stderr, \
+            _owned_child(argv, cwd=cwd, env=env, stderr=stderr) as proc:
         url = _endpoint_line(proc, stderr_path)
         journal.record(Invocation(FAKE_STORE, args, argv, cwd, frozenset(env), None, url, ''))
         yield url
-    finally:
-        if proc is not None:
-            _stop(proc)
 
 
 def edit_store(path: Path, changes: Mapping[int, Mapping[str, Any] | None]) -> None:
@@ -218,6 +236,31 @@ def edit_store(path: Path, changes: Mapping[int, Mapping[str, Any] | None]) -> N
 
 def read_json(path: Path) -> Any:
     return json.loads(path.read_text(encoding='utf-8'))
+
+
+def fixture_return(name: str) -> dict[str, Any]:
+    return read_json(FIXTURE_RETURNS / name)
+
+
+def store_task(task_id: int, store_fixture: str = 'store.json') -> dict[str, Any]:
+    (task,) = [task for task in read_json(FIXTURE_DIR / store_fixture)['tasks'] if task['id'] == task_id]
+    return task
+
+
+def check_names(task: Mapping[str, Any]) -> list[str]:
+    return [check['name'] for check in task['metadata'].get('delivered_checks', [])]
+
+
+def snapshot(directory: Path) -> dict[str, bytes]:
+    """Every file under *directory*, by relative path."""
+    if not directory.exists():
+        return {}
+    return {str(path.relative_to(directory)): path.read_bytes()
+            for path in sorted(directory.rglob('*')) if path.is_file()}
+
+
+def output(invocation: Invocation) -> str:
+    return invocation.stdout + invocation.stderr
 
 
 @dataclass(frozen=True)
@@ -357,8 +400,142 @@ def b1_init(walk: Walk) -> str:
     return f'fixture program initialised; {key} in {"+".join(streams)} refused'
 
 
+# store.json's tasks outside the program around S1's touched paths: 201 declares one in
+# metadata.files, 202 anchors one in a delivered check, 203's check anchors the path S1.decompose
+# moves, and 204's anchors the path it deletes.
+SEAM_DECLARER, SEAM_ANCHOR, REPATHED_TASK, DELETED_PATH_TASK = 201, 202, 203, 204
+
+
+def _candidate_rows(stdout: str) -> dict[int, str]:
+    """seam_scan's ``| task <id>: …`` rows, by task id."""
+    rows: dict[int, str] = {}
+    for line in stdout.splitlines():
+        if line.startswith('| task ') and ':' in line:
+            task_id = line.removeprefix('| task ').partition(':')[0]
+            if task_id.isdigit():
+                rows[int(task_id)] = rows.get(int(task_id), '') + line
+    return rows
+
+
+def _expect_author_applied(run: ProgramRun, applied: Invocation) -> str:
+    authored = fixture_return('S1.author.json')
+    moved = run.home / 'returns' / 'S1.author.json'
+    expect(moved.is_file() and moved.read_bytes() == (FIXTURE_RETURNS / 'S1.author.json').read_bytes(),
+           'returns/S1.author.json is the fixture return, byte for byte', applied)
+    expect(not any((run.home / 'inbox').iterdir()), 'inbox/ is empty after the apply', applied)
+    expect(any(line.get('op') == 'stream_status' and line.get('stream') == 'S1'
+               and line.get('status') == 'authored' and line.get('prd_path') == authored['prd_path']
+               for line in run.ledger()),
+           f'the ledger records S1 authored with prd_path {authored["prd_path"]}', applied)
+    digest = next(iter(applied.stdout.splitlines()), '')
+    expect(digest.startswith('S1 author: ') and digest.endswith('→ returns/S1.author.json'),
+           f'the first stdout line is the S1 author digest, not {digest!r}', applied)
+    return digest
+
+
+def _expect_seam_candidates(run: ProgramRun) -> None:
+    scanned = expect_exit(run.run('seam_scan.py', 'S1', '--run', RUN_ID), 0, 'seam_scan.py lists S1 candidates')
+    rows = _candidate_rows(scanned.stdout)
+    expect('metadata.files' in rows.get(SEAM_DECLARER, ''),
+           f'seam_scan names task {SEAM_DECLARER}, declaring a touched path in metadata.files', scanned)
+    (anchor_check,) = check_names(store_task(SEAM_ANCHOR))
+    expect(anchor_check in rows.get(SEAM_ANCHOR, ''),
+           f'seam_scan names task {SEAM_ANCHOR}, anchoring a touched path in check {anchor_check}', scanned)
+
+
+def b2_author_applied(walk: Walk) -> str:
+    run = walk.new_run('b2-author')
+    run.init()
+    applied = expect_exit(run.run('apply_return.py', run.put_inbox('S1.author.json')), 0,
+                          'apply_return.py applies S1.author')
+    digest = _expect_author_applied(run, applied)
+    _expect_seam_candidates(run)
+    return f'{digest}; seam_scan lists tasks {SEAM_DECLARER} and {SEAM_ANCHOR}'
+
+
+B3_REJECTIONS = (
+    ('S1.decompose.notes-over-cap.json', 'form: notes:', 'notes'),
+    ('S1.decompose.absent-filed.json', 'contradiction: ', 'filed[0].task_id'),
+)
+
+
+def _rejection_lines(invocation: Invocation) -> list[str]:
+    return [line for line in output(invocation).splitlines() if line.startswith(('form: ', 'contradiction: '))]
+
+
+def _expect_rejected(run: ProgramRun, fixture: str, prefix: str, fragment: str) -> None:
+    inbox = run.put_inbox(fixture, stem='S1.decompose')
+    before = snapshot(run.home)
+    checked = expect_exit(run.run('apply_return.py', '--check', inbox), 1, f'--check rejects {fixture}')
+    applied = expect_exit(run.run('apply_return.py', inbox), 1, f'apply_return.py rejects {fixture}')
+    for invocation in (checked, applied):
+        expect(any(line.startswith(prefix) and fragment in line for line in _rejection_lines(invocation)),
+               f'{invocation.describe()} names {fragment} on a {prefix!r} line', invocation)
+    expect(_rejection_lines(checked) == _rejection_lines(applied),
+           f'--check and apply reject {fixture} with the same lines', applied)
+    expect(snapshot(run.home) == before, f'rejecting {fixture} moves and appends nothing', applied)
+
+
+def b3_decompose_rejected(walk: Walk) -> str:
+    run = walk.new_run('b3-rejected')
+    run.init()
+    run.applied('S1.author.json')
+    for fixture, prefix, fragment in B3_REJECTIONS:
+        _expect_rejected(run, fixture, prefix, fragment)
+    return 'form error on notes and store contradiction on filed[0].task_id; --check agrees; home untouched'
+
+
+def _expect_scan_repaths(run: ProgramRun) -> None:
+    scan = expect_exit(run.run('clerk_batch.py', 'write', '--run', RUN_ID, '--scan'), 0,
+                       'clerk_batch.py write --scan')
+    ledger = run.ledger()
+    repaths = {line['task']: line for line in ledger
+               if line.get('op') == 'action' and line.get('lead_op') == 'repath'}
+    (moved_from,) = [move['from'] for move in fixture_return('S1.decompose.json')['moves'] if move['to']]
+    (check,) = check_names(store_task(REPATHED_TASK))
+    text = repaths.get(REPATHED_TASK, {}).get('text', '')
+    expect(check in text and moved_from in text,
+           f'a repath action for task {REPATHED_TASK} names check {check} and {moved_from}', scan)
+    deleted_id = repaths.get(DELETED_PATH_TASK, {}).get('id')
+    expect(deleted_id is not None and any(
+        line.get('op') == 'action_result' and line.get('id') == deleted_id
+        and line.get('state') == 'kept-for-human' for line in ledger),
+        f'the repath for task {DELETED_PATH_TASK}, whose path the to: null move deletes, is kept for a human',
+        scan)
+
+
+def _expect_held_on_roster(run: ProgramRun) -> str:
+    (leaf,) = fixture_return('S1.decompose.json')['held']
+    roster = expect_exit(run.run('program_doc.py', '--run', RUN_ID, '--roster'), 0, 'program_doc.py --roster')
+    held = [line for line in roster.stdout.splitlines() if line.startswith(f'held {leaf["task_id"]} ')]
+    expect(len(held) == 1 and f'release owner {leaf["release_owner"]}' in held[0],
+           f'--roster lists held leaf {leaf["task_id"]} with release owner {leaf["release_owner"]}', roster)
+    return held[0]
+
+
+def b4_decompose_applied(walk: Walk) -> str:
+    run = walk.new_run('b4-decompose')
+    run.init()
+    run.applied('S1.author.json')
+    decomposed = expect_exit(run.run('apply_return.py', run.put_inbox('S1.decompose.json')), 0,
+                             'apply_return.py applies S1.decompose')
+    actions = [line for line in run.ledger()
+               if line.get('op') == 'action' and line.get('return') == 'returns/S1.decompose.json']
+    expect(len(actions) == len(fixture_return('S1.decompose.json')['lead_actions']),
+           'the ledger records one action per S1.decompose lead_action', decomposed)
+    _expect_scan_repaths(run)
+    again = run.run('apply_return.py', run.put_inbox('S1.decompose.json'))
+    expect_exit(again, 1, 'a second application of S1.decompose is refused')
+    expect('already applied' in output(again), 'the second application is refused as already applied', again)
+    held = _expect_held_on_roster(run)
+    return f'{len(actions)} actions, scan repaths {REPATHED_TASK} and keeps {DELETED_PATH_TASK} for a human; {held}'
+
+
 SCENARIOS = (
     Scenario('B1', 'init', b1_init),
+    Scenario('B2', 'author return applied', b2_author_applied),
+    Scenario('B3', 'decompose return rejected, both classes', b3_decompose_rejected),
+    Scenario('B4', 'decompose return applied', b4_decompose_applied),
 )
 
 
