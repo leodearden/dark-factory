@@ -1868,8 +1868,9 @@ def create_mcp_server(
           'escape there strands exactly the live pointers this gate exists to '
           'protect.'
     )
-    # (task 3624) Appended to whichever refusal a caller gets when they DID send
-    # allow_dangling_citations but not as a literal boolean True. Without it the
+    # (task 3624) Appended when a caller DID send allow_dangling_citations but
+    # not as a literal boolean True, and the refusal they got is one the
+    # override clears (_dangling_override_is_the_remedy). Without it the
     # strictness degrades silently into a dead end: the value is dropped, the
     # ordinary refusal comes back, and its hint instructs them to pass the very
     # flag they believe they just passed — a retry loop for an LLM caller.
@@ -1880,6 +1881,26 @@ def create_mcp_server(
         "allow_mcp_markup) — a truthy 'yes', 1 or 'true' must not unlock an "
         'irreversible delete. Resend it as JSON true if you meant to override.'
     )
+    # (task 4859) The same report for every OTHER refusal. The ignored value is
+    # still named, but a resend is not advertised: the override either cannot
+    # clear this refusal or would strand citers the caller has a survivor for.
+    _IGNORED_DANGLING_OVERRIDE_NOT_A_REMEDY_HINT = (
+        'NOTE: allow_dangling_citations was supplied but its value is not the '
+        'literal boolean True, so it was IGNORED. The override is not the way '
+        'past THIS refusal in any case: fix what the refusal above names.'
+    )
+    # (task 4859) The refusals the allow_dangling_citations override exists to
+    # clear. The one home for that policy: both the ignored-override note and
+    # the cascade hint derive their advice from it.
+    _DANGLING_OVERRIDE_REMEDIES = frozenset({'CitationRepointRequired'})
+
+    def _dangling_override_is_the_remedy(rejection: Mapping[str, Any]) -> bool:
+        if rejection.get('error_type') in _DANGLING_OVERRIDE_REMEDIES:
+            return True
+        if rejection.get('error_type') != 'CascadeCitationGateRejected':
+            return False
+        blocked = rejection.get('blocked') or []
+        return bool(blocked) and all(_dangling_override_is_the_remedy(b) for b in blocked)
     _CITATION_REPLACEMENT_NOT_FOUND_HINT = (
         'replacement_memory_id is well-formed but resolves to nothing, so '
         'repointing to it would rewrite every live citation to address a '
@@ -5854,14 +5875,18 @@ def create_mcp_server(
             # just passed, and would retry into the same wall. Name the value
             # that was ignored instead (loud-over-silent-degradation). A literal
             # False is a deliberate "no", not a malformed yes, so it is honoured
-            # without comment — this fires only for a non-boolean value.
+            # without comment — this fires only for a non-boolean value. The
+            # resend is advertised only where the override is the remedy.
             if override_supplied and not isinstance(raw_override, bool):
+                note = (
+                    _IGNORED_DANGLING_OVERRIDE_HINT
+                    if _dangling_override_is_the_remedy(rejection)
+                    else _IGNORED_DANGLING_OVERRIDE_NOT_A_REMEDY_HINT
+                )
                 rejection = {
                     **rejection,
                     'ignored_override': {'allow_dangling_citations': raw_override},
-                    'hint': ' '.join(
-                        p for p in (rejection.get('hint'), _IGNORED_DANGLING_OVERRIDE_HINT) if p
-                    ),
+                    'hint': ' '.join(p for p in (rejection.get('hint'), note) if p),
                 }
             return rejection
         result = await memory_service.delete_memory(
