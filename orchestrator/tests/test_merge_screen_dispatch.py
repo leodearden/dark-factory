@@ -65,9 +65,10 @@ class ScreenCall:
 
 @dataclass
 class ScriptedScreen:
-    """A ScreenPort that records each call and bounces or proceeds as told."""
+    """A ScreenPort that records each call and bounces, proceeds or raises as told."""
 
     bounce: bool = False
+    raises: BaseException | None = None
     calls: list[ScreenCall] = field(default_factory=list)
 
     async def screen_item(
@@ -75,6 +76,8 @@ class ScriptedScreen:
         config: OrchestratorConfig, site: ScreenSite,
     ) -> ScreenDecision:
         self.calls.append(ScreenCall(task_id, merged_sha, base_sha, site))
+        if self.raises is not None:
+            raise self.raises
         if not self.bounce:
             return Proceed()
         return Bounce(
@@ -196,6 +199,26 @@ async def test_proceed_verifies_and_lands(
     assert await git_ops.get_main_sha() == outcome.merge_sha
     assert [call.task_id for call in screen.calls] == ['b1']
     assert [data['outcome'] for data in _events(event_store, 'merge_attempt', 'b1')] == ['done']
+
+
+@pytest.mark.asyncio
+async def test_a_raising_screen_fails_open_at_the_merger(
+    git_ops: GitOps, config: OrchestratorConfig, event_store: EventStore, repo: Path,
+) -> None:
+    req = await branch_merge_request(git_ops, config, 'r1', filename='r1.md')
+    queue: asyncio.Queue[Any] = asyncio.Queue()
+    verifier = FakeVerifier()
+    screen = ScriptedScreen(raises=RuntimeError('screen exploded'))
+    lane = make_lane(git_ops, queue, verifier=verifier, event_store=event_store, screen=screen)
+
+    outcome = await merge_through_lane(lane, queue, req)
+
+    assert outcome.status == 'done', outcome
+    assert 'r1' in verifier.verified
+    assert [data['outcome'] for data in _events(event_store, 'merge_attempt', 'r1')] == ['done']
+    assert _merge_worktrees(repo) == []
+    assert lane.snapshot()['entries'] == []
+    assert [call.site for call in screen.calls] == [ScreenSite.MERGER]
 
 
 # ---------------------------------------------------------------------------
@@ -372,3 +395,22 @@ async def test_a_proceeding_train_verifies_and_lands(
     assert [call.site for call in screen.calls] == [ScreenSite.TRAIN]
     assert req.mark_member_done.call_count == 3
     assert [data['outcome'] for data in _events(event_store, 'merge_attempt', req.task_id)] == ['done']
+
+
+@pytest.mark.asyncio
+async def test_a_raising_screen_fails_open_at_the_train_tip(
+    git_ops: GitOps, config: OrchestratorConfig, event_store: EventStore, repo: Path,
+) -> None:
+    req = await _train(git_ops, config, 'T3')
+    queue: asyncio.Queue[Any] = asyncio.Queue()
+    verifier = FakeVerifier()
+    screen = ScriptedScreen(raises=RuntimeError('screen exploded'))
+    lane = make_lane(git_ops, queue, verifier=verifier, event_store=event_store, screen=screen)
+
+    outcome = await merge_through_lane(lane, queue, req)
+
+    assert outcome.status == 'done', outcome
+    assert verifier.verified == [req.task_id]
+    assert req.mark_member_done.call_count == 3
+    assert _merge_worktrees(repo) == []
+    assert [call.site for call in screen.calls] == [ScreenSite.TRAIN]
