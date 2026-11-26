@@ -1,0 +1,30 @@
+{
+  "task_id": "7919",
+  "reason": "review amendments: a switched-off merge screen closes its merge_screen_unavailable alarm (screen.py +1 cognitive; the alarm close moved to merge_lane/sentinel_alarm.py), and the screen-bounce thrash test pins the _last_merge_block_reason gate _run_merge_phase reads (+1 private read)",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/screen.py",
+      "baseline": 76,
+      "current": 77
+    },
+    {
+      "measure": "private_reads",
+      "key": "orchestrator/tests/test_workflow_merge_blocked_surfacing.py",
+      "baseline": 11,
+      "current": 12
+    },
+    {
+      "measure": "total:cognitive",
+      "key": "<cluster>",
+      "baseline": 5355,
+      "current": 5358
+    },
+    {
+      "measure": "total:private_reads",
+      "key": "<cluster>",
+      "baseline": 6140,
+      "current": 6141
+    }
+  ]
+}
