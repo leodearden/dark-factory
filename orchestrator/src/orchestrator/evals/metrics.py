@@ -124,8 +124,12 @@ class EvalMetrics:
     # (is_proxied_endpoint), so resolve_cost_usd never takes the CLI's own cost
     # figure. Legacy cells stored this as 'is_local_model' (results.py legacy rule).
     cli_cost_untrusted: bool = False
-    # The endpoint the candidate config declared (EvalConfig.endpoint_kind);
-    # None for a cell recorded before task 9970.
+    # The declared EvalConfig.endpoint_kind of the config whose env the cell's
+    # workflow ran under, which is not always the labelled candidate: run_eval's
+    # implementer config (on a judge cell, the pinned implementer, not the judge
+    # candidate), run_end_to_end's impl_config (not the architect), and the
+    # architect config on an architect cell. None for a cell recorded before
+    # task 9970.
     endpoint_kind: EndpointKind | None = None
     workflow_duration_ms: int = 0
     turns_used: int = 0

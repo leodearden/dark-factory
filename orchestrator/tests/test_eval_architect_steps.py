@@ -92,6 +92,7 @@ def _attempt(**over) -> ArchitectAttempt:
         'outcome': 'done',
         'plan': {},
         'declines': dict.fromkeys(DECLINE_KINDS),
+        'endpoint_kind': EndpointKind.NATIVE_ANTHROPIC,
     }
     return ArchitectAttempt(**(fields | over))
 

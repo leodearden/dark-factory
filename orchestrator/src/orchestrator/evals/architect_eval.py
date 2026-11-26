@@ -170,12 +170,11 @@ class ArchitectAttempt:
     outcome: str
     plan: dict
     declines: Mapping[str, dict | None]
+    endpoint_kind: EndpointKind
     usage: ArchitectUsage = dataclasses.field(default_factory=ArchitectUsage)
     cost_usd: float = 0.0
     cost_source: str = 'cli'
     cli_cost_untrusted: bool = False
-    # None means not stamped, never a guessed native endpoint.
-    endpoint_kind: EndpointKind | None = None
     unmeasured: Unmeasured | None = None
 
 
