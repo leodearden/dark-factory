@@ -359,3 +359,90 @@ def test_loading_leaves_both_stores_byte_identical_and_creates_no_sibling_files(
 
     assert {store: hashlib.sha256(store.read_bytes()).hexdigest() for store in stores} == before
     assert {store.parent: sorted(store.parent.iterdir()) for store in stores} == listing_before
+
+
+# --- keys, several roots, skipped roots ------------------------------------
+
+
+def _run_main(roots, *extra):
+    return readout.main(
+        ['--roots', ','.join(str(root) for root in roots), '--salt', SALT, '--until', UNTIL,
+         *extra],
+        environ={},
+        unit_environment=_unit_must_not_be_read,
+    )
+
+
+def _rule_line(text):
+    (line,) = [line for line in text.splitlines() if line.startswith('rule:')]
+    return line
+
+
+def test_candidate_key_buckets_by_the_stored_key_and_counts_tasks_without_one(fleet_root):
+    root = fleet_root(
+        'proj-a',
+        [
+            TaskSpec(1, candidate_key='ck-1'),
+            TaskSpec(2, candidate_key=None),
+            TaskSpec(3, in_tasks_db=False),
+        ],
+    )
+
+    load = _load([root], key=readout.KeyKind.CANDIDATE_KEY)
+
+    (record,) = load.records
+    assert (record.task_id, record.key) == ('1', 'ck-1')
+    assert record.bucket == split_bucket(SALT, 'ck-1', 2)
+    assert load.exclusions == {'no candidate_key': 2}
+
+
+def test_records_carry_their_project_so_one_task_id_in_two_projects_is_two_records(
+    fleet_root,
+):
+    roots = [
+        fleet_root('proj-a', [TaskSpec(1)]),
+        fleet_root('proj-b', [TaskSpec(1), TaskSpec(2)]),
+    ]
+
+    load = _load(roots)
+
+    assert sorted((record.project, record.task_id) for record in load.records) == [
+        ('proj-a', '1'), ('proj-b', '1'), ('proj-b', '2'),
+    ]
+
+
+@pytest.fixture
+def unreadable_roots(tmp_path):
+    absent = tmp_path / 'no-runs'
+    absent.mkdir()
+    garbage = tmp_path / 'garbage'
+    (garbage / 'data' / 'orchestrator').mkdir(parents=True)
+    (garbage / 'data' / 'orchestrator' / 'runs.db').write_bytes(b'not a sqlite database\n' * 64)
+    return [absent, garbage]
+
+
+def test_main_names_each_skipped_root_and_its_reason_on_the_rule_line(
+    fleet_root, unreadable_roots, capsys,
+):
+    roots = [
+        *unreadable_roots,
+        fleet_root('no-tasks', [TaskSpec(7)], with_tasks_db=False),
+        fleet_root('good', [TaskSpec(1)]),
+    ]
+
+    status = _run_main(roots)
+
+    assert status == readout.EXIT_OK
+    out, err = capsys.readouterr()
+    rule = _rule_line(out)
+    assert 'read good, no-tasks' in rule
+    assert 'no-runs (runs.db absent)' in rule
+    assert 'garbage (runs.db unreadable: file is not a database)' in rule
+    assert 'no-tasks (tasks.db absent)' in rule
+    for root in unreadable_roots:
+        assert str(root) in err
+
+
+def test_main_over_only_unreadable_roots_exits_nothing_read(unreadable_roots, capsys):
+    assert _run_main(unreadable_roots) == readout.EXIT_NOTHING_READ
+    assert 'no runs.db was readable' in capsys.readouterr().err
