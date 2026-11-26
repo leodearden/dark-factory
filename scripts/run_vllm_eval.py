@@ -32,7 +32,9 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-sys.path.insert(0, "/home/leo/src/runpod-toolkit")
+sys.path.insert(
+    0, os.environ.get("RUNPOD_TOOLKIT_PATH", str(Path(__file__).resolve().parents[2] / "runpod-toolkit"))
+)
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "orchestrator" / "src"))
 from orchestrator.evals.configs import (
     FINAL_RUN_CONFIGS,
@@ -43,18 +45,25 @@ from orchestrator.evals.configs import (
 from orchestrator.evals.results import ResultStore
 from orchestrator.evals.runner import WORKFLOW_CELL_TIMEOUT_MINUTES, cell_timeout_minutes
 from orchestrator.evals.snapshots import eval_worktree_root
-from runpod_toolkit.compute import PodStatus, RunPodClient  # type: ignore[import]
-from runpod_toolkit.config import RunPodConfig  # type: ignore[import]
+
+try:
+    from runpod_toolkit.compute import PodStatus, RunPodClient  # type: ignore[import]
+    from runpod_toolkit.config import RunPodConfig  # type: ignore[import]
+except ModuleNotFoundError as exc:
+    raise ModuleNotFoundError(
+        f"{exc}. Set RUNPOD_TOOLKIT_PATH to the runpod-toolkit checkout: it defaults to the "
+        "runpod-toolkit sibling of the checkout this launcher ships in, which a task worktree "
+        "under .worktrees/ does not have.",
+        name=exc.name,
+    ) from exc
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
 SSH_KEY = os.path.expanduser("~/.ssh/id_runpod")
-with open(SSH_KEY + ".pub") as _fh:
-    SSH_PUBKEY = _fh.read().strip()
 
-PROJECT_ROOT = Path("/home/leo/src/dark-factory")
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 ORCHESTRATOR_DIR = PROJECT_ROOT / "orchestrator"
 TASKS_DIR = ORCHESTRATOR_DIR / "src/orchestrator/evals/tasks"
 RESULT_STORE = ResultStore.packaged()
@@ -89,6 +98,19 @@ def _load_runpod_api_key() -> str:
         "RUNPOD_API_KEY not found. Add `RUNPOD_API_KEY=rpa_...` to "
         f"{PROJECT_ROOT}/.env or export it in your shell."
     )
+
+
+def read_ssh_pubkey() -> str:
+    """The public half of SSH_KEY, which the pod authorises; read when a pod is created, never at import."""
+    pubkey_path = Path(f"{SSH_KEY}.pub")
+    try:
+        return pubkey_path.read_text().strip()
+    except FileNotFoundError:
+        raise RuntimeError(
+            f"{pubkey_path} not found. Create the RunPod key pair with "
+            f"`ssh-keygen -t ed25519 -f {SSH_KEY}`."
+        ) from None
+
 
 # H200 variants to try in priority order when a config requests H200.
 H200_VARIANTS = [
@@ -268,12 +290,12 @@ def build_eval_env() -> dict[str, str]:
     resolve to the shared pool, since ``dark-factory-orchestrator.yaml``
     declares ``accounts_file:
     "${USAGE_ACCOUNTS_FILE:/home/leo/src/dark-factory/config/usage-accounts.yaml}"``.
-    The reason is NOT worktree self-consistency, an argument this
-    docstring used to make and which does not hold: ``PROJECT_ROOT`` is
-    itself a constant hardcoded to the main checkout, so the value
-    exported here is byte-identical to that default and a
-    worktree-launched run rosters main's file either way. Two reasons
-    that do hold:
+    ``PROJECT_ROOT`` is the checkout this launcher ships in, so a run
+    launched from a worktree (which needs ``RUNPOD_TOOLKIT_PATH`` set)
+    rosters that checkout's tracked file and
+    reads that checkout's ``.env``; from the main checkout, as every
+    documented launch line runs, the value equals that default. Two
+    reasons for setting it:
 
     1. IT OVERRIDES AN AMBIENT VALUE. ``env`` starts as
        ``os.environ.copy()`` and the ``.env`` loader below writes into it
@@ -343,8 +365,8 @@ def orchestrator_config_for_spec(spec: dict) -> Path | None:
     The eval CLI requires ``--config`` (or ``ORCH_CONFIG_PATH``) so it
     knows which project's ``project_root`` and ``fused_memory.project_id``
     to use. Different task families target different projects:
-        df_task_*    → /home/leo/src/dark-factory/dark-factory-orchestrator.yaml
-        reify_task_* → /home/leo/src/reify/orchestrator.yaml
+        df_task_*    → <dark-factory checkout>/dark-factory-orchestrator.yaml
+        reify_task_* → <reify checkout>/orchestrator.yaml
 
     Resolves by checking known config-file names under ``spec['project_root']``.
     Returns ``None`` if nothing matches; the caller should fall back to the
@@ -409,8 +431,8 @@ def preflight_baseline(
     typecheck commands. Tests are deliberately skipped (slow + flaky on dev
     box). The throwaway worktree is removed before returning even on error.
 
-    The worktree is created against ``spec['project_root']`` (e.g.
-    ``/home/leo/src/reify`` for reify_task_*), falling back to the
+    The worktree is created against ``spec['project_root']`` (e.g. the
+    reify checkout for reify_task_*), falling back to the
     launcher's ``PROJECT_ROOT`` for backwards compatibility. An empty
     ``lint`` or ``typecheck`` command is treated as "no such step" and
     silently reported clean — reify tasks legitimately ship with an empty
@@ -715,7 +737,7 @@ def bring_up_pod(cfg: EvalConfig, args: argparse.Namespace) -> PodHandle:
 
     try:
         env_vars = {
-            "PUBLIC_KEY": SSH_PUBKEY,
+            "PUBLIC_KEY": read_ssh_pubkey(),
             "MODEL_NAME": hf_model,
             **extra_env,
         }

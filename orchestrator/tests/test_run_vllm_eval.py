@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import socket
 import subprocess
 import sys
@@ -444,12 +445,27 @@ class _FakeTunnel:
         return 0 if self.terminated else None
 
 
+def _seed_fake_credentials(monkeypatch) -> None:
+    """Give a run every credential it asks for, so none is read from a real ``.env`` or home.
+
+    ``PROJECT_ROOT`` is the launcher's own checkout, which holds no ``.env``
+    in a worktree or on a verify host, so the RunPod key and a pool OAuth
+    token come from the environment. The pod's public key is stubbed
+    because ``~/.ssh/id_runpod.pub`` exists only on the operator's machine.
+    """
+    monkeypatch.setenv("RUNPOD_API_KEY", "rpa_test_fake_key")
+    for letter in "ABCDEFGH":
+        monkeypatch.setenv(f"CLAUDE_OAUTH_TOKEN_{letter}", f"fake-pool-token-{letter}")
+    monkeypatch.setattr(launcher, "read_ssh_pubkey", lambda: "ssh-ed25519 fake-pod-key")
+
+
 def _patch_pod_infra(monkeypatch, *, vllm_healthy_first=True):
-    """Patch RunPodClient + SSH tunnel + wait_for_vllm so bring_up_pod returns fast.
+    """Patch credentials, RunPodClient, SSH tunnel and wait_for_vllm so bring_up_pod returns fast.
 
     Real ``subprocess.Popen`` is preserved for everything other than the SSH
     tunnel command, so preflight_baseline's git calls still work end-to-end.
     """
+    _seed_fake_credentials(monkeypatch)
     fake_client = _FakeClient()
     monkeypatch.setattr(launcher, "RunPodClient", lambda config: fake_client)
     monkeypatch.setattr(
@@ -654,6 +670,7 @@ class TestPodLifecycle:
         monkeypatch.setattr(launcher, "TASKS_DIR", fake_tasks)
 
         # Patch infra so wait_for_vllm fails (simulates vLLM never becoming healthy)
+        _seed_fake_credentials(monkeypatch)
         fake_client = _FakeClient()
         monkeypatch.setattr(launcher, "RunPodClient", lambda config: fake_client)
         monkeypatch.setattr(
@@ -2310,12 +2327,11 @@ class TestBuildEvalEnvSharedPool:
         """A tmp PROJECT_ROOT holding a shared pool config and a ``.env``.
 
         THE ``PROJECT_ROOT`` MONKEYPATCH IS HERMETICITY, NOT EVIDENCE OF
-        DYNAMISM. ``launcher.PROJECT_ROOT`` is a module constant hardcoded
-        to the main checkout; it is redirected here only so a test reads a
-        roster and a ``.env`` it owns instead of the real ones. Nothing in
-        this class should be read as a claim that the launcher resolves its
-        root at runtime — it does not, and ``build_eval_env``'s docstring
-        says so.
+        DYNAMISM. ``launcher.PROJECT_ROOT`` is a module constant fixed at
+        import to the launcher's own checkout; it is redirected here only so
+        a test reads a roster and a ``.env`` it owns instead of that
+        checkout's. Nothing in this class should be read as a claim that the
+        launcher resolves its root per call — it does not.
 
         A pool credential is seeded by default because ``build_eval_env``
         now ABORTS when the roster resolves none (see
@@ -2516,3 +2532,60 @@ class TestBuildEvalEnvSharedPool:
             "states the roster for the run it is launching, and the ambient "
             f"value here rosters the retired interactive account: {env['USAGE_ACCOUNTS_FILE']!r}"
         )
+
+
+LAUNCHER_IMPORT_TIMEOUT_SECONDS = 120
+
+_FAKE_TOOLKIT_MODULES = {
+    "__init__.py": "",
+    "compute.py": "class PodStatus:\n    RUNNING = 'RUNNING'\n\n\nclass RunPodClient:\n    pass\n",
+    "config.py": "class RunPodConfig:\n    pass\n",
+}
+
+_IMPORT_THEN_READ_THE_PUBLIC_KEY = """\
+import run_vllm_eval as launcher
+print(launcher.PROJECT_ROOT)
+try:
+    launcher.read_ssh_pubkey()
+except RuntimeError as exc:
+    print(exc)
+"""
+
+
+def test_the_launcher_imports_on_a_host_with_nothing_in_the_operators_home(tmp_path: Path) -> None:
+    """Importing reads no home file; the pod's public key is read only when asked for."""
+    home = tmp_path / "home"
+    home.mkdir()
+    toolkit = tmp_path / "toolkit"
+    (toolkit / "runpod_toolkit").mkdir(parents=True)
+    for name, text in _FAKE_TOOLKIT_MODULES.items():
+        (toolkit / "runpod_toolkit" / name).write_text(text)
+    proc = subprocess.run(
+        [sys.executable, "-c", _IMPORT_THEN_READ_THE_PUBLIC_KEY],
+        cwd=_SCRIPTS,
+        env={"HOME": str(home), "RUNPOD_TOOLKIT_PATH": str(toolkit), "PATH": os.environ["PATH"]},
+        capture_output=True,
+        text=True,
+        timeout=LAUNCHER_IMPORT_TIMEOUT_SECONDS,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    project_root, key_error = proc.stdout.splitlines()
+    assert Path(project_root) == Path(__file__).resolve().parents[2]
+    assert str(home / ".ssh" / "id_runpod.pub") in key_error
+
+
+def test_a_launcher_without_its_toolkit_names_the_variable_to_set(tmp_path: Path) -> None:
+    """From a checkout with no runpod-toolkit sibling the import says how to point at one."""
+    proc = subprocess.run(
+        [sys.executable, "-c", "import run_vllm_eval"],
+        cwd=_SCRIPTS,
+        env={"HOME": str(tmp_path), "RUNPOD_TOOLKIT_PATH": str(tmp_path), "PATH": os.environ["PATH"]},
+        capture_output=True,
+        text=True,
+        timeout=LAUNCHER_IMPORT_TIMEOUT_SECONDS,
+        check=False,
+    )
+    assert proc.returncode != 0
+    assert "ModuleNotFoundError" in proc.stderr
+    assert "RUNPOD_TOOLKIT_PATH" in proc.stderr

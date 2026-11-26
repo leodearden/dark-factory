@@ -506,23 +506,55 @@ before manually restarting anything.
 
 By default every merge verify runs locally, on the same host as the
 orchestrator. A project under enough load to want a second machine's CPU can
-instead register a `verify_runners` entry (workstation-side config — see
-"What stays on the workstation" below) that dispatches merge verification to
-a second host over ssh. This is an optional throughput lever, not a
-requirement for a working install — skip this section unless you need it.
+instead dispatch merge verification to a second host over ssh. This is an
+optional throughput lever, not a requirement for a working install — skip
+this section unless you need it.
+
+What a verify host must provide is written down once, as a table of
+requirements in `scripts/deploy/verify_host_contract.py`
+(`verify_host_contract.py requirements --titles` lists it; this section does
+not restate it). Two scripts read that table: `provision_verify_host.sh`
+converges a host onto it and `check_verify_host.py` checks a host against
+it. Neither names a machine. Everything specific to one host comes from a
+private roster file.
+
+### The roster file
+
+The roster names this workstation's verify hosts, their users and their
+paths, so it is never tracked. It lives at
+`$XDG_CONFIG_HOME/orchestrator/verify-hosts.yaml`
+(`~/.config/orchestrator/verify-hosts.yaml` when `XDG_CONFIG_HOME` is unset),
+or wherever `ORCH_VERIFY_HOSTS_FILE` points. Its shape is
+`config/verify-hosts.example.yaml`, with placeholder names: one entry per host
+(ssh alias, Dark-Factory checkout, gate root, wrapper defaults) and under it
+one entry per project (git remote, `config_path`, and `host_config`, the
+per-host YAML below). The parser,
+`orchestrator/src/orchestrator/verify_host_roster_file.py`, refuses an
+unknown key, a duplicated key or an empty document rather than reading fewer
+hosts. Anchors and merge keys (`<<: *anchor`) work as in plain YAML, so hosts
+can share a project block and override single keys.
+
+**Today only the two scripts read it.** Until task α2 lands, the orchestrator
+still takes its runner list from the inline `verify_runners` block or from
+`ORCH_VERIFY_RUNNERS` in its environment, which ranks above the yaml (see
+"What stays on the workstation" below). Keep that list and the roster in step
+by hand until then.
 
 ### What lives on the remote host
 
-- **The project checkout**, at a fixed path (e.g. `~/src/<project>`), kept in
-  sync with the dispatching workstation's `main` (see "Provisioning the
-  remote host" below for how it gets refreshed). It is an independent full
+- **The project checkout**, at the `project_root` its `host_config` names,
+  kept in sync with the dispatching workstation's `main` (see "Provisioning
+  the remote host" below for how it gets refreshed). It is an independent full
   clone, not a linked worktree of the dispatcher. Verify itself does not run
   directly in this clone — each `verify-merge` materialises a worktree under
   it (`GitOps.acquire_host_verify_worktree`), a fresh `_merge-<uuid>` per
   invocation or a reused warm one; see "Warm vs. ephemeral verify
   worktrees" below.
 - **`receive.denyCurrentBranch = updateInstead`**, set on that checkout
-  (`git config receive.denyCurrentBranch updateInstead`). This is required
+  (`git config receive.denyCurrentBranch updateInstead`; the provisioning
+  script's `checkouts` step sets it, and creates a missing checkout on the
+  branch its `host_config` names as `git.main_branch`, `main` by default).
+  This is required
   because the dispatcher's best-effort keep-alive push targets
   `<main-branch>:refs/heads/<main-branch>` — the configured `git.main_branch`
   (`str`, default `main` — it has no unset state) — which is the branch the
@@ -548,32 +580,29 @@ requirement for a working install — skip this section unless you need it.
   branch. The **load-bearing** push — the actual commit under verification —
   goes to a separate, namespaced ref instead, `refs/merge-verify/<request-id>`,
   which is never checked out and so needs no such configuration.
-- **A PATH wrapper** for the orchestrator CLI (e.g.
-  `/usr/local/bin/orchestrator`), needed because a non-interactive
+- **The orchestrator wrapper**, at `/usr/local/bin/orchestrator`
+  (`VERIFY_HOST_WRAPPER_PATH` moves it), needed because a non-interactive
   `ssh host cmd` does not source `~/.bashrc`/`~/.profile`, so a bare
-  `orchestrator` would not otherwise resolve on PATH. The wrapper only needs
-  to export the directories the verify subprocesses require (toolchain
-  bins, package-manager shims, …) and `exec` the checkout's own venv entry
-  point:
-  ```bash
-  #!/bin/bash
-  export PATH="<toolchain-bin-dirs>:$PATH"
-  exec <path-to-checkout>/.venv/bin/orchestrator "$@"
-  ```
-  **The shim contract (task 6565).** The `exec` line must be
-  `"${ORCH_GATE_BIN:-<path-to-checkout>/.venv/bin/orchestrator}" "$@"`
-  (a subshell-form call, not `exec`, if your wrapper logs an EXIT line).
+  `orchestrator` would not otherwise resolve on PATH. It is rendered from the
+  tracked template `scripts/deploy/verify-host-wrapper.template.sh`, never
+  hand-written: it exports the dispatcher's own tool PATH
+  (`verify_runner.py::REMOTE_TOOL_PATH_PRELUDE`) and the host's
+  `wrapper_env` defaults, logs a START and an EXIT line, and runs the
+  Dark-Factory checkout's venv entry point.
+  **The shim contract (task 6565).** The run line is
+  `"${ORCH_GATE_BIN:-<df_checkout_path>/.venv/bin/orchestrator}" "$@"`.
   The dispatcher prefixes every remote `orchestrator` call with
   `env ORCH_GATE_BIN=<gate checkout>/.venv/bin/orchestrator`, which is how a
   verify runs in the dispatcher's own immutable gate checkout rather than in
   whatever the shared tree holds; with `ORCH_GATE_BIN` unset the wrapper runs
   the shared tree exactly as before. A wrapper that ignores the variable is
-  caught by the handshake (below) and benches the host. Apply the edit with
-  `scripts/deploy/install_laptop_gate_shim.sh` (idempotent; `--check` is a
-  read-only contract check that exits 0 iff the installed wrapper honours
-  `ORCH_GATE_BIN`). Keep the PATH export and any wrapper-side logging in
-  place; the dispatcher's `ensure-gate` call resolves `orchestrator` through
-  this same wrapper.
+  caught by the handshake (below) and benches the host. The provisioning
+  script's `wrapper` step installs the render atomically and probes it with
+  `ORCH_GATE_BIN=/bin/echo`; a hand-written wrapper from before the template
+  is brought onto the contract in place by
+  `scripts/deploy/install_laptop_gate_shim.sh` (`--check` is read-only). The
+  dispatcher's `ensure-gate` call resolves `orchestrator` through this same
+  wrapper.
 
 **The shared Dark-Factory checkout on a verify host is no longer the code a
 verify runs.** It is the *source* the per-sha gate checkouts are cloned from
@@ -587,12 +616,27 @@ use different directories, at the same commit they share one.
 
 ### Provisioning the remote host
 
-The gate checkouts need no manual refresh. For the project checkout (and
-the shared Dark-Factory tree, if you keep it current as the shim fallback),
-after fast-forwarding to the workstation's `main` (a plain
-`git fetch && git reset --hard origin/main` — never `git clean`; leave
-whatever untracked paths are already on that host alone), re-provision the
-environment at the new commit:
+```bash
+scripts/deploy/provision_verify_host.sh <host>                # every step, then the checker
+scripts/deploy/provision_verify_host.sh <host> --dry-run      # print each step and its parameters; no ssh
+scripts/deploy/provision_verify_host.sh <host> --sync-config  # reinstall only the per-host YAML files
+```
+
+`--roster FILE` reads another roster. The steps are the contract's
+requirement ids in table order (`--list-steps` prints them), and the script
+refuses to run when any id lacks a step or any step lacks an id. Every step
+is idempotent, so a re-run is safe. Privilege
+goes through `sudo -n` only: a refusal stops the step and prints the command
+to run by hand. What no script can change (Landlock, free disk, an existing
+credential file) is left to the closing `check_verify_host.py` run, whose
+exit code a full run returns.
+
+The gate checkouts need no manual refresh, and the `checkouts` step pushes
+this checkout's `main` into the Dark-Factory tree and syncs it. To refresh a
+project checkout (or the Dark-Factory tree) by hand, fast-forward it to the
+workstation's `main` with a plain `git fetch && git reset --hard origin/main`
+— never `git clean`; leave whatever untracked paths are already on that host
+alone — then re-provision the environment at the new commit:
 
 ```bash
 <uv path> sync --all-packages
@@ -612,41 +656,38 @@ npm ci
   fail `rc=127` for a reason that has nothing to do with the command itself
   — a non-interactive, non-login ssh session does not source
   `~/.bashrc`/`~/.profile`, so a tool installed under, e.g., `~/.local/bin`
-  is simply not on `PATH` yet. Invoke it by absolute path (as above) or
-  export `PATH` first; don't mistake the resulting `127` for a broken
-  install. `node`/`npm` are commonly already on the default ssh `PATH` via
-  `/usr/bin`, so this trap tends to bite `uv` (or `cargo`, `~/.local/bin`
-  toolchains generally) more often than the Node half of this step.
+  is simply not on `PATH` yet. The scripts and the wrapper avoid it by
+  exporting `REMOTE_TOOL_PATH_PRELUDE` first. By hand, invoke the tool by
+  absolute path (as above) or export `PATH` first; don't mistake the
+  resulting `127` for a broken install.
 
 ### Checking the host answers
 
-Two probes, run with the same ssh options the dispatcher itself uses
-(`_SSH_BASE_OPTS`, `orchestrator/src/orchestrator/verify_runner.py`):
-
 ```bash
-ssh -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 \
-    -o ServerAliveCountMax=4 <host> true                                 # RemoteRunner.health()
-ssh -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 \
-    -o ServerAliveCountMax=4 <host> 'env ORCH_GATE_BIN=/bin/echo orchestrator gate-identity'
-                                                                          # the shim honours ORCH_GATE_BIN
+scripts/deploy/check_verify_host.py <host> [--roster FILE] [--json]
 ```
 
-- The second probe is the shim check: it must print `gate-identity` (what
-  `/bin/echo` answers when the wrapper really ran `$ORCH_GATE_BIN`). The
-  real handshake needs no hand-run: the dispatcher's `ensure-gate` publishes
-  its commit, builds or reuses the gate checkout, and compares the gate's
-  `gate-identity` (`code_sha` and a fingerprint of the verify wire shapes)
-  with its own before any verify is spent. It is spelled through the bare
-  `orchestrator` wrapper on purpose, so it exercises the same PATH
-  resolution a real dispatch does.
-- Assert exit code `0` on both. Hand-running a probe without the
-  `ConnectTimeout`/`ServerAlive*` options can hang on an unreachable host
-  instead of failing fast the way the dispatcher's own probe does — the
-  options above aren't cosmetic. `RemoteRunner.health()` also swallows
-  every exception and returns `False`, so a transport error and a
-  live-but-failing host look identical from the caller's side.
+It observes this workstation (the reference a host is held to: time zone,
+locale, uv and node versions) and then the host, over the dispatcher's own
+ssh options, and prints one row per contract requirement: `requirement`,
+`verdict` (`ok`, `fail` or `warn`), `observed` and `needed`. It exits 0 iff
+no row fails, 1 when one does, and 2 on a usage or roster error. Its
+`network` row is `RemoteRunner.health()`'s `ssh <host> true` under the same
+options, so it fails fast on an unreachable host where a hand-run ssh
+without `ConnectTimeout`/`ServerAlive*` would hang. Its `wrapper` row runs
+the shim probe: with `ORCH_GATE_BIN=/bin/echo` the wrapper must print its
+own argument back, which is what `/bin/echo` answers when the wrapper really
+ran `$ORCH_GATE_BIN`.
 
-**A passing probe proves the host answers, not that it runs your code.**
+The real handshake needs no hand-run: the dispatcher's `ensure-gate`
+publishes its commit, builds or reuses the gate checkout, and compares the
+gate's `gate-identity` (`code_sha` and a fingerprint of the verify wire
+shapes) with its own before any verify is spent. `RemoteRunner.health()`
+swallows every exception and returns `False`, so on the dispatcher's side a
+transport error and a live-but-failing host look identical; the checker's
+rows tell them apart.
+
+**A passing check proves the host is ready, not that it runs your code.**
 Code currency is no longer a property of the remote checkout: every verify
 runs in a gate checkout of the dispatcher's deployed commit, and the
 handshake above refuses a gate whose identity differs from the dispatcher's.
@@ -660,15 +701,23 @@ set over the remote's own discovery walk.)
 
 ### The per-host YAML
 
-The remote-side config conventionally lives at
-`~/.config/orchestrator/<project>-<host>.yaml`, but that path is **pure
-operator convention — nothing in the code discovers it.** It is threaded
-through explicitly: the workstation's `verify_runners[].config_path` names
-it, passes it as `orchestrator verify-merge --config <path>`, and the
-ordinary `load_config` resolution on the remote takes it from there
-(`--config` wins over `ORCH_CONFIG_PATH`, which is the fallback when
-`config_path` is left `None`). Name it however you like, or omit it and
-rely on the remote's own `ORCH_CONFIG_PATH`.
+The remote-side config is rendered from the roster, never hand-edited on the
+host. The provisioning script's `per_host_yaml` step writes each project's
+`host_config` mapping verbatim, under a header saying edits are overwritten,
+to that project's `config_path`. To change it, edit `host_config` in the
+roster and run `provision_verify_host.sh <host> --sync-config`; the
+checker's `per_host_yaml` row fails for a file that differs from a fresh
+render. `host_config` must carry an absolute `project_root`, and the verify
+scope's memory cap is its `verify_cgroup_memory.max_gib`.
+
+`config_path` conventionally names `~/.config/orchestrator/<project>-<host>.yaml`,
+but that path is **pure operator convention — nothing in the code discovers
+it.** It is threaded through explicitly: the workstation's
+`verify_runners[].config_path` names it, passes it as
+`orchestrator verify-merge --config <path>`, and the ordinary `load_config`
+resolution on the remote takes it from there (`--config` wins over
+`ORCH_CONFIG_PATH`). The roster requires it, because the render is installed
+there.
 
 **Load-bearing vs. inert.** The dispatcher's spec is applied onto this
 file by `orchestrator/src/orchestrator/verify_spec_shared.py::apply_spec_to_host_config`,
@@ -849,16 +898,22 @@ alone.
 
 ### What stays on the workstation
 
-The `verify_runners:` block lives in the **dispatching** project's own
-`dark-factory-orchestrator.yaml` — never on the remote host. The remote's
-per-host yaml (above) has no knowledge of the pool it belongs to; the
-workstation is what decides which hosts participate.
+The runner list the orchestrator dispatches to lives on the **dispatching**
+workstation, never on the remote host. The remote's per-host yaml (above) has
+no knowledge of the pool it belongs to; the workstation is what decides which
+hosts participate. Until task α2 lands, that list is the `verify_runners:`
+block in the dispatching project's own `dark-factory-orchestrator.yaml`, or
+`ORCH_VERIFY_RUNNERS` in the orchestrator's environment (the same entries as
+JSON). The environment ranks above the yaml
+(`config.py::OrchestratorConfig.settings_customise_sources`), and keeps a
+private host name out of a tracked file. Each entry carries the values of one
+host's project entry in the roster.
 
 Entry shape (`VerifyRunnerConfig`):
 
 ```yaml
 verify_runners:
-  - name: <short-id>              # e.g. "laptop"
+  - name: <short-id>              # the roster's host name
     ssh_host: <ssh-alias>         # used for git push and ssh invocations
     git_remote: <git-remote-name> # git remote pointing at the remote's PROJECT checkout
     config_path: <remote-path>    # passed as --config; omit (null) to let the
@@ -877,16 +932,17 @@ verify_drift_check_every_n_lands: 20   # companion setting: periodic remote/loca
                                         # verdict cross-check cadence
 ```
 
-Worked example, modelled on a live deployment (Dark Factory's own):
+Worked example, the `dark_factory` project of the example roster's
+`example-verify-host`:
 
 ```yaml
 verify_runners:
-  - name: laptop
-    ssh_host: leo-laptop
-    git_remote: leo-laptop
-    config_path: /home/leo/.config/orchestrator/dark-factory-laptop.yaml
-    df_checkout_path: /home/leo/src/dark-factory
-    gate_checkouts_path: /home/leo/src/dark-factory-gate
+  - name: example-verify-host
+    ssh_host: example-verify-host
+    git_remote: example-verify-host
+    config_path: /home/<user>/.config/orchestrator/dark_factory-example-verify-host.yaml
+    df_checkout_path: /home/<user>/src/dark-factory
+    gate_checkouts_path: /home/<user>/src/dark-factory-gate
     enabled: true
 verify_drift_check_every_n_lands: 20
 ```

@@ -2057,6 +2057,47 @@ held for as long as its request is live. The two-pass count starts only once
 the request resolves without landing (blocked, cancelled, or superseded into
 a train that derailed). Re-read the task after any non-landed outcome.
 
+### Bringing up or checking a verify host (roster file, task 11733)
+
+The roster file, the contract and both scripts are described in SETUP.md §12;
+this is the order to run them in. `<host>` is the host's name in the roster.
+
+1. **Write its roster entry** in `~/.config/orchestrator/verify-hosts.yaml`
+   (or the file `ORCH_VERIFY_HOSTS_FILE` names), shaped like
+   `config/verify-hosts.example.yaml`. Add the ssh alias first: the scripts
+   reach the host only through it.
+2. **Provision:** `scripts/deploy/provision_verify_host.sh <host>`. Run it
+   with `--dry-run` first to see each step and the parameters it resolved
+   without touching the host. A full run ends with the checker and returns
+   its exit code.
+3. **Check:** `scripts/deploy/check_verify_host.py <host>` on its own, at any
+   later time; `--json` for a record.
+4. **Wire the runner list.** Until task α2 lands, add the host to the
+   project's `verify_runners` block, or to `ORCH_VERIFY_RUNNERS` in the
+   orchestrator unit's environment to keep its name out of a tracked file.
+   Either is restart-tier.
+5. **Preflight** with `orchestrator verify-host-preflight --runner <host>`
+   once task β has landed: it runs the project's full gate on the host
+   through the production dispatch path.
+6. **After a `host_config` edit**, run
+   `provision_verify_host.sh <host> --sync-config`, which installs only the
+   re-rendered per-host YAML files. Never edit them on the host: the next
+   sync overwrites the edit, and the checker fails it until then.
+
+**Reading a row.** `observed` says what was found and `needed` what the
+contract wants. A `fail` makes the check exit 1. Most are fixed by
+re-running the provisioning script, whose steps are idempotent and named
+after the rows. Three rows have no step that can fix them, so fix those on
+the host by hand: `kernel` (Landlock off in the host's kernel), `disk` (too
+little free space) and `no_credentials` (a credential file in the verify
+user's home, which no script deletes). A `network` fail means the dispatcher
+could not reach the host either: add or repair the ssh alias and pin its host
+key. An `observed` of `not observed: <reason>` means the observation itself
+failed, not the requirement. A `warn` does not fail the check: `memory` warns
+when no project states `verify_cgroup_memory.max_gib`, and `disk` when no
+project states `disk_footprint_gib` or a synchronous write is slower than
+the contract's provisional threshold.
+
 ### Reading a verify-host bench (`quarantine_class`, task 6565)
 
 A remote verify host leaves the pool in one of three classes, shown per host

@@ -241,12 +241,14 @@ class TestParseResetsAt:
         assert (london.year, london.month, london.day, london.hour) == (2026, 1, 2, 21)
 
     def test_absolute_time_without_date_colon_minutes_am(self):
-        """'resets 3:00 AM (US/Pacific)' — the H:MM AM/PM-with-colon format,
-        the other example named in this function's docstring."""
+        """'resets 3:00 AM (America/Los_Angeles)' — the H:MM AM/PM-with-colon
+        format of the other example named in this function's docstring, with
+        the canonical zone name: the legacy 'US/Pacific' alias is absent from
+        a host without tzdata-legacy."""
         now = datetime(2026, 1, 1, 6, 0, tzinfo=UTC)  # 22:00 Pacific the prior day
-        result = _parse_resets_at('resets 3:00 AM (US/Pacific)', now=now)
+        result = _parse_resets_at('resets 3:00 AM (America/Los_Angeles)', now=now)
         assert result is not None
-        pacific = result.astimezone(zoneinfo.ZoneInfo('US/Pacific'))
+        pacific = result.astimezone(zoneinfo.ZoneInfo('America/Los_Angeles'))
         assert (pacific.month, pacific.day, pacific.hour, pacific.minute) == (1, 1, 3, 0)
 
     def test_default_now_reads_wall_clock_when_not_injected(self):
