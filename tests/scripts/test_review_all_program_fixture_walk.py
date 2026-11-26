@@ -5,11 +5,15 @@ the walk is stdlib-only.
 """
 from __future__ import annotations
 
+import contextlib
 import os
 import re
+import signal
 import subprocess
 import sys
 from pathlib import Path
+
+import pytest
 
 from df_pytest_isolation import run_in_new_session
 
@@ -58,6 +62,27 @@ def test_the_walk_holds_every_expected_scenario(tmp_path: Path) -> None:
         if not SCENARIO_LINE.match(line) and not line.startswith(SUMMARY_PREFIX)
     ]
     assert stray == [], _output(proc)
+
+
+def test_a_sigterm_mid_walk_leaves_no_process_in_its_group(tmp_path: Path) -> None:
+    cwd, env = _walk_cwd_env(tmp_path)
+    proc = subprocess.Popen(
+        [sys.executable, '-I', '-S', str(WALK)], cwd=cwd, env=env, start_new_session=True,
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+    )
+    pgid = proc.pid
+    try:
+        assert proc.stdout is not None
+        first = next((line for line in proc.stdout if SCENARIO_LINE.match(line)), None)
+        assert first is not None, 'the walk printed no scenario line'
+        os.kill(proc.pid, signal.SIGTERM)
+        proc.wait(timeout=60)
+        with pytest.raises(ProcessLookupError):
+            os.killpg(pgid, 0)
+    finally:
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(pgid, signal.SIGKILL)
+        proc.wait(timeout=60)
 
 
 def test_the_walk_runs_as_an_executable(tmp_path: Path) -> None:
