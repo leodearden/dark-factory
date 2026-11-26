@@ -1084,13 +1084,43 @@ class TestPanelCache:
             caplog.at_level(logging.INFO, logger='orchestrator.evals.reviewer_trial.runner'),
             _counted_reviewers() as dispatched,
         ):
-            result = await run_panel_cached(variant, diff, results_dir=results_dir, stagger_secs=0, **_full_style())
+            result = await run_panel_cached(
+                variant, diff, results_dir=results_dir, stagger_secs=0, **{**_full_style(), 'max_turns': 30},
+            )
 
         assert dispatched == []
         assert result == legacy
         infos = [r.getMessage() for r in caplog.records if r.levelno == logging.INFO]
         assert any(str(entry) in message for message in infos), infos
         assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
+
+    @pytest.mark.usefixtures('code_default_config')
+    @pytest.mark.parametrize(('change', 'expected_turns'), [
+        pytest.param({}, 90, id='production-default'),
+        pytest.param({'max_turns': 29}, 29, id='explicit-29'),
+    ])
+    @pytest.mark.asyncio
+    async def test_a_keyless_legacy_entry_is_rerun_at_any_other_turn_cap(
+        self, source: _Source, tmp_path: Path, caplog: pytest.LogCaptureFixture, change: dict, expected_turns: int,
+    ) -> None:
+        variant, diff, results_dir = _one_reviewer(), _diff_in(source), tmp_path / 'results'
+        entry = _write_legacy_panel(results_dir, PanelRunResult(
+            variant_name=variant.name, diff_id=diff.diff_id, reviews={'r1': _make_review('r1')},
+        ))
+        legacy_bytes = entry.read_bytes()
+
+        with (
+            caplog.at_level(logging.INFO, logger='orchestrator.evals.reviewer_trial.runner'),
+            _counted_reviewers() as dispatched,
+        ):
+            result = await run_panel_cached(variant, diff, results_dir=results_dir, stagger_secs=0, **change)
+
+        assert dispatched == ['ungated']
+        assert result.run_key is not None
+        assert result.run_key.max_turns == expected_turns
+        assert entry.read_bytes() == legacy_bytes
+        infos = [r.getMessage() for r in caplog.records if r.levelno == logging.INFO]
+        assert any(str(entry) in message for message in infos), infos
 
     @pytest.mark.usefixtures('code_default_config')
     @pytest.mark.asyncio
@@ -1164,7 +1194,9 @@ class TestPanelCache:
             caplog.at_level(logging.INFO, logger='orchestrator.evals.reviewer_trial.runner'),
             _counted_reviewers() as dispatched,
         ):
-            await run_trial([variant], CorpusManifest(diffs=diffs), results_dir=results_dir, stagger_secs=0)
+            await run_trial(
+                [variant], CorpusManifest(diffs=diffs), results_dir=results_dir, stagger_secs=0, max_turns=30,
+            )
 
         assert dispatched == []
         [warning] = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
@@ -1319,7 +1351,7 @@ class TestRunAndScore:
         with self._panels_and_matcher() as matched, _counted_reviewers() as dispatched:
             scores = await run_and_score(
                 [variant], CorpusManifest(diffs=[_scored_diff(source, 'd_ok', 'OK_MARKER')]),
-                results_dir=results_dir, score_dir=score_dir, stagger_secs=0,
+                results_dir=results_dir, score_dir=score_dir, stagger_secs=0, max_turns=30,
             )
 
         assert (dispatched, matched) == ([], [])
