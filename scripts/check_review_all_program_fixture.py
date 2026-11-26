@@ -14,6 +14,7 @@ import json
 import os
 import re
 import select
+import shlex
 import shutil
 import signal
 import subprocess
@@ -780,9 +781,9 @@ def b13_clerk_ingest(walk: Walk) -> str:
     return f'{applied} applied, {skipped} skipped, {UNKNOWN_ACTION} refused, dirtied paths printed'
 
 
-def _rule(run: ProgramRun, ruling: str, *extra: str) -> Invocation:
+def _rule(run: ProgramRun, ruling: str, *extra: str, by: str = 'human') -> Invocation:
     return run.run(
-        'record.py', 'rule', '--run', RUN_ID, '--by', 'human', '--question', 'Does alpha or beta own C1?',
+        'record.py', 'rule', '--run', RUN_ID, '--by', by, '--question', 'Does alpha or beta own C1?',
         '--ruling', ruling, '--source', 'fixture walk', '--option', 'a', '--option', 'b',
         '--consequence', 'c', *extra,
     )
@@ -805,6 +806,273 @@ def b12_rulings(walk: Walk) -> str:
     return 'D2 supersedes D1; D1 line unchanged; only D2 rendered'
 
 
+def same_bytes(path: Path, original: Path) -> bool:
+    return path.is_file() and path.read_bytes() == original.read_bytes()
+
+
+def _program_stream(stream_id: str) -> dict[str, Any]:
+    (stream,) = [stream for stream in read_json(FIXTURE_PROGRAM)['streams'] if stream['id'] == stream_id]
+    return stream
+
+
+def _brief(run: ProgramRun, *args: str) -> Invocation:
+    return run.run('gen_brief.py', '--run', RUN_ID, *args)
+
+
+def _json_objects(text: str) -> list[Any]:
+    objects = []
+    for line in text.splitlines():
+        with contextlib.suppress(ValueError):
+            if line.startswith('{'):
+                objects.append(json.loads(line))
+    return objects
+
+
+def _after(argv: Sequence[str], flag: str) -> str | None:
+    return argv[argv.index(flag) + 1] if flag in argv[:-1] else None
+
+
+def _expect_return_section(run: ProgramRun, text: str, stem: str, written: Invocation) -> None:
+    schema = fixture_return('S1.author.json')['schema']
+    inbox = run.home / 'inbox' / f'{stem}.json'
+    expect(schema in text and str(inbox) in text and '--check' in text,
+           f'the {stem} brief names schema {schema}, {inbox} and --check', written)
+
+
+S1_TITLE, S2_TITLE, S3_TITLE, Q2_TITLE = 'prd:fixture S1', 'prd:fixture S2', 'prd:fixture S3', 'team:fixture S1 Q2'
+# The filings row B9's record copy gains for S1: the fixture record files only routed key fk-…d1.
+S1_FILING = {
+    'key': 'fk-0000000000a1', 'sources': ['review-all'], 'step': 'open',
+    'ticket_or_task': None, 'disposition': 'open → deliberation',
+}
+
+
+def _expect_disputed_verdict_beside_its_dispute(text: str, written: Invocation) -> None:
+    (disputed,) = [finding for finding in read_json(FIXTURE_DIR / 'record.json')['findings']
+                   if 'calibration_disputes_verdict' in finding]
+    dispute = disputed['calibration_disputes_verdict']
+    expect(any(disputed['verdict'] in line and dispute['to'] in line and dispute['note'] in line
+               for line in text.splitlines()),
+           f"one line shows {disputed['key']}'s verdict beside its dispute to {dispute['to']}", written)
+
+
+def _expect_spawned_author_brief(run: ProgramRun) -> None:
+    spawned = expect_exit(_brief(run, 'S1', 'author', '--spawn', S1_TITLE), 0, 'gen_brief.py S1 author --spawn')
+    path = run.home / 'briefs' / 'S1.author.md'
+    text = path.read_text(encoding='utf-8')
+    _expect_return_section(run, text, 'S1.author', spawned)
+    stream = _program_stream('S1')
+    expect(stream['name'] in text and stream['remedy'] in text, "the author brief carries S1's name and remedy", spawned)
+    expect('D1' in '\n'.join(section(text, '## Rulings')), 'the author brief carries ruling D1', spawned)
+    _expect_disputed_verdict_beside_its_dispute(text, spawned)
+    expect(S1_FILING in _json_objects(text), "the author brief carries S1's filings row verbatim", spawned)
+    expect('## Spawn' in text.splitlines(), 'the spawned author brief has a ## Spawn section', spawned)
+    command = shlex.split(spawned.stdout.splitlines()[-1]) if spawned.stdout.strip() else []
+    expect(command[:1] == ['CLAUDE_SPAWN_SELF_EXIT=1'] and _after(command, '--prompt-file') == str(path),
+           f'the spawn command sets CLAUDE_SPAWN_SELF_EXIT=1 and --prompt-file {path}', spawned)
+    entry = read_json(run.home / 'sessions.json').get(S1_TITLE, {})
+    expect('record_dir' in entry and entry['record_dir'] is None,
+           f'sessions.json records {S1_TITLE!r} with record_dir null', spawned)
+
+
+def _expect_upstream_gate_and_duties(text: str, written: Invocation) -> None:
+    s1_prd = fixture_return('S1.author.json')['prd_path']
+    upstream = {task['id'] for task in read_json(FIXTURE_DIR / 'store.json')['tasks']
+                if task['metadata'].get('prd_path') == s1_prd}
+    listed = {line.split()[1] for line in section(text, '## Upstream program tasks') if line.startswith('- ')}
+    expect({str(task_id) for task_id in upstream} <= listed,
+           f"the decompose brief lists S1's store tasks {sorted(upstream)}", written)
+    expect(re.search(rf'\b{GATE}\b', '\n'.join(section(text, '## Gate'))) is not None,
+           f'the decompose brief names gate {GATE}', written)
+    duties = [leaf['task_id'] for leaf in fixture_return('S1.decompose.json')['held'] if leaf['release_owner'] == 'S2']
+    duty_lines = section(text, '## Release duties')
+    expect(bool(duties) and all(any(line.startswith(f'- {duty} ') for line in duty_lines) for duty in duties),
+           f'the decompose brief carries release duties {duties}', written)
+
+
+def _expect_decompose_brief(run: ProgramRun) -> None:
+    applied = ('S1.author.json', 'S1.decompose.json', 'S2.author.json')
+    run.applied(*applied)
+    written = expect_exit(_brief(run, 'S2', 'decompose'), 0, 'gen_brief.py S2 decompose')
+    text = (run.home / 'briefs' / 'S2.decompose.md').read_text(encoding='utf-8')
+    _expect_return_section(run, text, 'S2.decompose', written)
+    _expect_upstream_gate_and_duties(text, written)
+    xrefs = [xref['text'] for name in applied for xref in fixture_return(name)['xrefs'] if xref['to'] == 'S2']
+    expect(bool(xrefs) and all(xref in text for xref in xrefs), 'the decompose brief carries every xref to S2', written)
+    expect('## Spawn' not in text.splitlines(), 'the decompose brief has no ## Spawn section', written)
+    sessions = (run.home / 'sessions.json').read_bytes()
+    refused = expect_exit(_brief(run, 'S2', 'decompose', '--spawn', 'x'), 2, '--spawn on a decompose pass')
+    expect('--spawn' in refused.stderr, 'the usage error names --spawn', refused)
+    expect((run.home / 'sessions.json').read_bytes() == sessions, 'a refused --spawn leaves sessions.json', refused)
+
+
+def b9_brief(walk: Walk) -> str:
+    run = walk.new_run('b9-brief')
+    run.init()
+    run.record_copy(extra_filings=[S1_FILING])
+    ruled = expect_exit(_rule(run, 'alpha owns C1', '--stream', 'S1'), 0, 'record.py rule --stream S1')
+    expect('ruling D1' in ruled.stdout, 'the S1 ruling is D1', ruled)
+    _expect_spawned_author_brief(run)
+    _expect_decompose_brief(run)
+    return 'S1 author brief spawned and recorded; S2 decompose brief carries upstream, gate, duties, xrefs; --spawn refused'
+
+
+FIXTURE_SESSIONS = FIXTURE_DIR / 'sessions'
+S3_SLUG = 'fixture-s3-author'
+# Each session: its title, gen_brief's stream and pass, the fixture record dir standing for its
+# registry record, and that record's slug, named here because the unreadable record has none.
+B10_SESSIONS = (
+    (S3_TITLE, ('S3', 'author'), 'checkpoint-running', S3_SLUG),
+    (S2_TITLE, ('S2', 'author'), 'finished-idle', 'fixture-s2-author'),
+    (Q2_TITLE, ('S1', 'investigate', '--item', 'Q2'), 'checkpoint-exited', 'fixture-s1-q2-team'),
+    (S1_TITLE, ('S1', 'author'), 'unreadable', 'fixture-s1-author'),
+)
+B10_INBOX = ('S3.author.json', 'S2.author.json', 'S1.investigate-Q2.json')
+B10_FIRST_STANDINGS = (
+    (S3_TITLE, 'checkpoint'),
+    (S2_TITLE, 'finished, not exited'),
+    (Q2_TITLE, 'ended at checkpoint — relaunch or resume'),
+)
+
+
+def _registry(run: ProgramRun) -> Path:
+    return run.cwd / '.claude' / 'fleet' / 'sessions'
+
+
+def _put_record(run: ProgramRun, label: str, slug: str) -> None:
+    shutil.copytree(FIXTURE_SESSIONS / label, _registry(run) / slug, copy_function=shutil.copyfile,
+                    dirs_exist_ok=True)
+
+
+def _watch(run: ProgramRun) -> Invocation:
+    return run.run('watch_sessions.py', '--run', RUN_ID)
+
+
+def _standing(watched: Invocation, title: str) -> str:
+    """The one stdout line saying where *title* stands (not its ``record`` line), or ''."""
+    lines = [line for line in watched.stdout.splitlines()
+             if line.startswith(f'{title}: ') and not line.startswith(f'{title}: record ')]
+    return lines[0] if len(lines) == 1 else ''
+
+
+def _b10_spawned(walk: Walk) -> ProgramRun:
+    run = walk.new_run('b10-watch')
+    run.init()
+    run.record_copy()
+    run.applied('S1.author.json')
+    run.applied('S1.author.amend.json', amend=True)
+    for title, brief_args, _, _ in B10_SESSIONS:
+        expect_exit(_brief(run, *brief_args, '--spawn', title), 0, f'gen_brief.py --spawn {title!r}')
+    for _, _, label, slug in B10_SESSIONS:
+        _put_record(run, label, slug)
+    for name in B10_INBOX:
+        run.put_inbox(name)
+    return run
+
+
+def _expect_first_watch(run: ProgramRun) -> None:
+    watched = expect_exit(_watch(run), 0, 'watch pass 1')
+    record_dirs = {title: entry['record_dir'] for title, entry in read_json(run.home / 'sessions.json').items()}
+    expected = {title: None if label == 'unreadable' else str(_registry(run) / slug)
+                for title, _, label, slug in B10_SESSIONS}
+    expect(record_dirs == expected, f'pass 1 fills record_dir for each readable record: {record_dirs}', watched)
+    for title, standing in B10_FIRST_STANDINGS:
+        expect(_standing(watched, title).startswith(f'{title}: {standing}'), f'{title} is reported {standing!r}', watched)
+    expect(same_bytes(run.home / 'handbacks' / 'S3.author.checkpoint-1.md', FIXTURE_SESSIONS / 'checkpoint-running' / 'result.md'),
+           "S3's checkpoint is archived as handbacks/S3.author.checkpoint-1.md", watched)
+    expect(same_bytes(run.home / 'inbox' / 'S3.author.json', FIXTURE_RETURNS / 'S3.author.json')
+           and not (run.home / 'returns' / 'S3.author.json').exists(), 'a checkpoint applies nothing', watched)
+    unreadable = str(_registry(run) / 'fixture-s1-author' / 'record.json')
+    expect(unreadable in _standing(watched, S1_TITLE), f'the S1 line names the unreadable {unreadable}', watched)
+
+
+def _expect_final_watch(run: ProgramRun) -> None:
+    _put_record(run, 'final-exited', S3_SLUG)
+    before = len(run.ledger())
+    watched = expect_exit(_watch(run), 0, 'watch pass 2')
+    expect(_standing(watched, S3_TITLE).startswith(f'{S3_TITLE}: final'), f'{S3_TITLE} is reported final', watched)
+    expect(same_bytes(run.home / 'handbacks' / 'S3.author.md', FIXTURE_SESSIONS / 'final-exited' / 'result.md'),
+           "S3's final hand-back is archived as handbacks/S3.author.md", watched)
+    expect((run.home / 'returns' / 'S3.author.json').is_file() and not (run.home / 'inbox' / 'S3.author.json').exists(),
+           "S3's inbox return is applied", watched)
+    added = [(line.get('op'), line.get('stream'), line.get('status')) for line in run.ledger()[before:]]
+    expect(added == [('stream_status', 'S3', 'authored')], f'pass 2 appends only S3 authored, not {added}', watched)
+
+
+def b10_watch(walk: Walk) -> str:
+    run = _b10_spawned(walk)
+    _expect_first_watch(run)
+    _expect_final_watch(run)
+    third = expect_exit(_watch(run), 0, 'watch pass 3')
+    expect(third.stdout == 'nothing new\n', 'a pass after the final reports nothing new', third)
+    return 'four gen_brief sessions resolved; checkpoint, idle, exited and unreadable reported; final applied once'
+
+
+def _sitting(run: ProgramRun) -> Invocation:
+    return expect_exit(_render(run, '--sitting', '1'), 0, 'program_doc.py --sitting 1')
+
+
+SITTING_SCREEN = re.compile(r'^screen \d+ of \d+$')
+SITTING_CLOSING = 'lead_rulable — one uncontested yes/no block'
+SITTING_ITEM = re.compile(r'^(\S+:\S+) \[\w+\] ')
+
+
+def _sitting_blocks(stdout: str) -> list[tuple[str, dict[str, str]]]:
+    """Each screen or closing block: its header, and each item ref's line with its detail lines."""
+    blocks: list[tuple[str, dict[str, str]]] = []
+    ref = None
+    for line in stdout.splitlines():
+        if SITTING_SCREEN.match(line) or line == SITTING_CLOSING:
+            blocks.append((line, {}))
+            ref = None
+        elif blocks and (item := SITTING_ITEM.match(line)):
+            ref = item[1]
+            blocks[-1][1][ref] = line
+        elif blocks and ref is not None and line.startswith(' '):
+            blocks[-1][1][ref] += '\n' + line.strip()
+    return blocks
+
+
+def _pending_refs(sitting: Invocation) -> list[str]:
+    return [ref for header, items in _sitting_blocks(sitting.stdout) if header != SITTING_CLOSING for ref in items]
+
+
+def _expect_first_sitting(run: ProgramRun) -> None:
+    sitting = _sitting(run)
+    blocks = _sitting_blocks(sitting.stdout)
+    questions = fixture_return('S1.author.amend.json')['open_questions']
+    human = {f'S1:{q["id"]}': q for q in questions if q['needs_human']}
+    draft = f'draft: {run.home}/prds/S1/{Path(fixture_return("S1.author.json")["prd_path"]).name}'
+    screens = [items for header, items in blocks if header != SITTING_CLOSING]
+    expect(any(set(human) <= set(items) for items in screens), f'{sorted(human)} share one screen', sitting)
+    items = {ref: text for screen in screens for ref, text in screen.items()}
+    for ref, question in human.items():
+        expect(f'recommendation: {question["recommendation"]}' in items.get(ref, '') and draft in items.get(ref, ''),
+               f'{ref} shows its recommendation and {draft}', sitting)
+    closing = [ref for header, block in blocks if header == SITTING_CLOSING for ref in block]
+    lead = [f'S1:{q["id"]}' for q in questions if q.get('lead_rulable')]
+    expect(closing == lead, f'the closing lead_rulable block holds {lead}, not {closing}', sitting)
+
+
+def b16_sitting(walk: Walk) -> str:
+    run = walk.new_run('b16-sitting')
+    run.init()
+    run.applied('S1.author.json')
+    run.applied('S1.author.amend.json', amend=True)
+    _expect_first_sitting(run)
+    for ruling, by, extra in (('alpha owns C1', 'human', ('--answers', 'S1:Q1')),
+                              ('new_name.py', 'lead', ('--answers', 'S1:Q3')),
+                              ('probe it first', 'human', ('--answers', 'S1:Q2', '--reask'))):
+        expect_exit(_rule(run, ruling, *extra, by=by), 0, f'record.py rule {" ".join(extra)}')
+    ruled = _sitting(run)
+    expect(_pending_refs(ruled) == ['S1:Q2'], 'after the rulings only the re-asked S1:Q2 is pending', ruled)
+    expect_exit(run.run('apply_return.py', run.put_inbox('S1.investigate-Q2.json')), 0,
+                'apply_return.py applies S1.investigate-Q2')
+    settled = _sitting(run)
+    expect(settled.stdout == 'nothing pending\n', 'after the investigate return nothing is pending', settled)
+    return 'Q1+Q2 on one screen with recommendations and draft, Q3 closing; Q2 alone after rulings; then nothing'
+
+
 SCENARIOS = (
     Scenario('B1', 'init', b1_init),
     Scenario('B2', 'author return applied', b2_author_applied),
@@ -814,9 +1082,12 @@ SCENARIOS = (
     Scenario('B6', 'heading self-check and publish', b6_publish_and_heading_check),
     Scenario('B7', 'gate check, both forms', b7_gate_check),
     Scenario('B8', 'handoff', b8_handoff),
+    Scenario('B9', 'brief, both passes', b9_brief),
+    Scenario('B10', 'watch', b10_watch),
     Scenario('B11', 'reader refuses a server that dropped the argument', b11_reader_refuses),
     Scenario('B12', 'rulings', b12_rulings),
     Scenario('B13', 'clerk ingest', b13_clerk_ingest),
+    Scenario('B16', 'sitting', b16_sitting),
 )
 
 
