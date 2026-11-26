@@ -18,13 +18,13 @@ exercised here.
 
 from __future__ import annotations
 
-import dataclasses
 import logging
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
 from _workflow_helpers import FakeBriefing, FakeScheduler, _init_git_repo, fixed_prompt
+from _write_set_helpers import make_write_set
 
 from orchestrator.agents import sandbox_dispatch
 from orchestrator.agents.invoke import AgentResult
@@ -48,27 +48,9 @@ def _make_bare_workflow(
     return wf
 
 
-def _make_write_set(**overrides: Path | tuple[Path, ...]) -> WriteSet:
-    """A WriteSet from dummy Paths — digest() depends only on writable_paths()."""
-    base = WriteSet(
-        worktree=Path('/wt'),
-        task_meta=Path('/base/.task-meta/wt'),
-        task_root=Path('/base/.task-meta/task-2909'),
-        git_objects=Path('/main/.git/objects'),
-        git_task_refs=Path('/main/.git/refs/heads/task'),
-        git_task_reflogs=Path('/main/.git/logs/refs/heads/task'),
-        git_worktree_admin=Path('/main/.git/worktrees/wt'),
-        uv_cache=Path('/home/.cache/uv'),
-        tree_sitter_cache=Path('/home/.cache/tree-sitter'),
-        claude_fleet=Path('/home/.claude/fleet'),
-        tmp=Path('/tmp'),
-        dev=Path('/dev'),
-    )
-    return dataclasses.replace(base, **overrides)
-
-
-def _docs_grant_write_set() -> WriteSet:
-    return _make_write_set(
+def _docs_grant_write_set(root: Path) -> WriteSet:
+    return make_write_set(
+        root,
         docs_main_git=Path('/main/.git'),
         docs_main_paths=(Path('/main/docs/a.md'), Path('/main/CLAUDE.md')),
     )
@@ -89,7 +71,7 @@ class TestEmitSandboxApplied:
     invocation on the non-refusing guard path (β2)."""
 
     def test_real_backend_emits_one_row_with_backend_and_digest(self, tmp_path):
-        write_set = _make_write_set()
+        write_set = make_write_set(tmp_path)
 
         events = _sandbox_applied_events(tmp_path, 'implementer', 'landlock', write_set)
 
@@ -104,7 +86,7 @@ class TestEmitSandboxApplied:
         # The explicit backend=none escape hatch is deliberately-unsandboxed but
         # STILL emits sandbox_applied (data.backend lets γ1 distinguish it from
         # real containment) — every sandboxed invocation emits one of the two.
-        write_set = _make_write_set()
+        write_set = make_write_set(tmp_path)
 
         events = _sandbox_applied_events(tmp_path, 'debugger', 'none', write_set)
 
@@ -114,7 +96,7 @@ class TestEmitSandboxApplied:
         assert events[0]['role'] == 'debugger'
 
     def test_docs_main_grant_adds_its_paths_to_the_payload(self, tmp_path):
-        write_set = _docs_grant_write_set()
+        write_set = _docs_grant_write_set(tmp_path)
 
         events = _sandbox_applied_events(tmp_path, 'simple_task', 'landlock', write_set)
 
@@ -127,7 +109,7 @@ class TestEmitSandboxApplied:
 
     def test_no_event_store_is_a_noop(self, tmp_path):
         wf = _make_bare_workflow(event_store=None)
-        write_set = _make_write_set()
+        write_set = make_write_set(tmp_path)
         # Must not raise when there is no event store wired up.
         wf._emit_sandbox_applied('implementer', 'landlock', write_set)
 
@@ -139,142 +121,45 @@ def _blocking_file(tmp_path: Path) -> Path:
     return blocker
 
 
-def _warnings_during_ensure(
-    wf: TaskWorkflow, write_set: WriteSet, caplog: pytest.LogCaptureFixture,
-) -> list[str]:
-    with caplog.at_level(logging.WARNING):
-        wf._ensure_sandbox_dirs(write_set)
-    return [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+def _warnings_naming(caplog: pytest.LogCaptureFixture, path: Path) -> list[str]:
+    return [
+        r.getMessage() for r in caplog.records
+        if r.levelno == logging.WARNING and str(path) in r.getMessage()
+    ]
 
 
-class TestEnsureSandboxDirs:
-    """_ensure_sandbox_dirs pre-creates BOTH load-bearing carve-outs OUTSIDE the
-    sandbox before dispatch: claude_fleet (task 2996) and tree_sitter_cache
-    (task 3382). On success they exist for both backends to grant; for each
-    path that fails it WARNs with the task_id and THAT path, and continues —
-    best-effort, never raising.
-
-    Every test overrides BOTH carve-outs under tmp_path: ``_make_write_set``
-    defaults them to absolute dummies the wrapper would otherwise try to create.
-    """
-
-    def test_creates_both_carve_out_dirs(self, tmp_path):
-        wf = _make_bare_workflow()
-        claude_fleet = tmp_path / '.claude' / 'fleet'
-        tree_sitter_cache = tmp_path / '.cache' / 'tree-sitter'
-        write_set = _make_write_set(
-            claude_fleet=claude_fleet, tree_sitter_cache=tree_sitter_cache,
-        )
-        assert not claude_fleet.exists()
-        assert not tree_sitter_cache.exists()
-
-        wf._ensure_sandbox_dirs(write_set)
-
-        assert claude_fleet.is_dir()
-        assert tree_sitter_cache.is_dir()
-
-    def test_tree_sitter_failure_warns_with_task_id_and_that_path(
-        self, tmp_path, caplog,
-    ):
-        wf = _make_bare_workflow()
-        tree_sitter_cache = _blocking_file(tmp_path) / 'tree-sitter'
-        write_set = _make_write_set(
-            claude_fleet=tmp_path / '.claude' / 'fleet',
-            tree_sitter_cache=tree_sitter_cache,
-        )
-
-        warnings = _warnings_during_ensure(wf, write_set, caplog)
-
-        assert warnings, 'expected a loud WARNING when pre-creation fails'
-        rendered = ' '.join(warnings)
-        assert '2909' in rendered
-        assert str(tree_sitter_cache) in rendered
-
-    def test_only_the_failing_path_is_warned_about(self, tmp_path, caplog):
-        wf = _make_bare_workflow()
-        claude_fleet = tmp_path / '.claude' / 'fleet'
-        write_set = _make_write_set(
-            claude_fleet=claude_fleet,
-            tree_sitter_cache=_blocking_file(tmp_path) / 'tree-sitter',
-        )
-
-        warnings = _warnings_during_ensure(wf, write_set, caplog)
-
-        assert str(claude_fleet) not in ' '.join(warnings)
-        assert claude_fleet.is_dir()
-
-    def test_fleet_failure_warns_with_task_id_and_only_that_path(
-        self, tmp_path, caplog,
-    ):
-        wf = _make_bare_workflow()
-        claude_fleet = _blocking_file(tmp_path) / 'fleet'
-        tree_sitter_cache = tmp_path / '.cache' / 'tree-sitter'
-        write_set = _make_write_set(
-            claude_fleet=claude_fleet, tree_sitter_cache=tree_sitter_cache,
-        )
-
-        warnings = _warnings_during_ensure(wf, write_set, caplog)
-
-        rendered = ' '.join(warnings)
-        assert '2909' in rendered
-        assert str(claude_fleet) in rendered
-        assert str(tree_sitter_cache) not in rendered
-        assert tree_sitter_cache.is_dir()
-
-    def test_each_failing_path_gets_its_own_warning(self, tmp_path, caplog):
-        wf = _make_bare_workflow()
-        blocker = _blocking_file(tmp_path)
-        claude_fleet = blocker / 'fleet'
-        tree_sitter_cache = blocker / 'tree-sitter'
-        write_set = _make_write_set(
-            claude_fleet=claude_fleet, tree_sitter_cache=tree_sitter_cache,
-        )
-
-        warnings = _warnings_during_ensure(wf, write_set, caplog)
-
-        assert len(warnings) == 2, warnings
-        assert str(claude_fleet) in warnings[0]
-        assert str(tree_sitter_cache) in warnings[1]
+def _stub_compute_write_set(monkeypatch: pytest.MonkeyPatch, write_set: WriteSet) -> None:
+    monkeypatch.setattr(
+        'orchestrator.workflow.compute_write_set', lambda _cwd, **_kw: write_set,
+    )
 
 
 @pytest.mark.asyncio
 class TestInvokeWiresEnsureSandboxDirs:
-    """Pins the CALL-SITE wiring inside ``TaskWorkflow._invoke``: for a
-    sandboxed role the claude_fleet and tree_sitter_cache carve-outs are
-    pre-created AFTER ``compute_write_set`` and BEFORE
-    ``write_set.writable_paths()`` is consumed into ``sandbox_extras``
-    (tasks 2996, 3382).
+    """Pins ``ensure_sandbox_dirs`` as ``TaskWorkflow._invoke`` uses it for a
+    sandboxed role: the carve-outs are pre-created AFTER ``compute_write_set``
+    and BEFORE ``write_set.writable_paths()`` is consumed into
+    ``sandbox_extras``, and a carve-out that cannot be created costs one
+    WARNING naming the task and that path, never the dispatch.
 
-    The isolated ``TestEnsureSandboxDirs`` unit tests above cover the helper's
-    behaviour; this drives the REAL ``_invoke`` sandbox branch end-to-end so a
-    future refactor that drops the call — or reorders it AFTER the
-    ``writable_paths()`` consumption — fails loudly here (that ordering is the
-    behaviour that actually matters: the dir must exist before the sandbox is
-    built). Mirrors the full-``_invoke`` harness in
-    test_workflow_status_on_resume.py: a real worktree + a fully-constructed
-    TaskWorkflow with ``invoke_with_cap_retry`` mocked away.
+    ``TestEnsureSandboxDirs`` in test_write_set.py covers the helper itself.
+    This drives the REAL ``_invoke`` sandbox branch, so a refactor that drops
+    the call, reorders it after the ``writable_paths()`` consumption, or lets a
+    failed mkdir abort the dispatch fails here. Mirrors the full-``_invoke``
+    harness in test_workflow_status_on_resume.py: a real worktree + a
+    fully-constructed TaskWorkflow with ``invoke_with_cap_retry`` mocked away.
+    ``compute_write_set`` is stubbed with a ``make_write_set(tmp_path)`` set, so
+    nothing is created outside ``tmp_path``.
     """
 
     async def test_carve_outs_exist_before_sandbox_extras_built(
         self, tmp_path, monkeypatch,
     ):
         workflow, cwd = await _task42_workflow(tmp_path, metadata_files=['README'])
-
-        # Hermetic write-set: ONLY the two pre-created carve-outs are
-        # materialized on disk, under tmp_path — NEVER the real ~/.claude or
-        # ~/.cache. Patch compute_write_set so the sandbox branch consumes THIS
-        # set (the other, dummy paths are only stringified into the
-        # mocked-away sandbox_extras).
-        claude_fleet = tmp_path / '.claude' / 'fleet'
-        tree_sitter_cache = tmp_path / '.cache' / 'tree-sitter'
-        hermetic = _make_write_set(
-            claude_fleet=claude_fleet, tree_sitter_cache=tree_sitter_cache,
-        )
-        assert not claude_fleet.exists()
-        assert not tree_sitter_cache.exists()
-        monkeypatch.setattr(
-            'orchestrator.workflow.compute_write_set', lambda _cwd, **_kw: hermetic,
-        )
+        hermetic = make_write_set(tmp_path)
+        assert not hermetic.claude_fleet.exists()
+        assert not hermetic.tree_sitter_cache.exists()
+        _stub_compute_write_set(monkeypatch, hermetic)
 
         # Spy: record whether both carve-outs already exist on disk at the
         # moment writable_paths() is consumed into sandbox_extras. If
@@ -310,8 +195,45 @@ class TestInvokeWiresEnsureSandboxDirs:
             'consumption'
         )
         # And the dirs are actually materialized on disk after dispatch.
-        assert claude_fleet.is_dir()
-        assert tree_sitter_cache.is_dir()
+        assert hermetic.claude_fleet.is_dir()
+        assert hermetic.tree_sitter_cache.is_dir()
+
+    async def test_each_failed_carve_out_warns_once_and_dispatch_continues(
+        self, tmp_path, monkeypatch, caplog,
+    ):
+        workflow, cwd = await _task42_workflow(tmp_path, metadata_files=['README'])
+        blocker = _blocking_file(tmp_path)
+        write_set = make_write_set(
+            tmp_path,
+            claude_fleet=blocker / 'fleet',
+            tree_sitter_cache=blocker / 'tree-sitter',
+        )
+        _stub_compute_write_set(monkeypatch, write_set)
+
+        with caplog.at_level(logging.WARNING):
+            mock_cap_retry = await _invoke_unconfined(workflow, IMPLEMENTER, cwd)
+
+        assert mock_cap_retry.await_count == 1
+        for failed in (write_set.claude_fleet, write_set.tree_sitter_cache):
+            naming = _warnings_naming(caplog, failed)
+            assert len(naming) == 1, naming
+            assert 'task 42' in naming[0], naming
+
+    async def test_a_carve_out_that_was_created_is_not_warned_about(
+        self, tmp_path, monkeypatch, caplog,
+    ):
+        workflow, cwd = await _task42_workflow(tmp_path, metadata_files=['README'])
+        write_set = make_write_set(
+            tmp_path, tree_sitter_cache=_blocking_file(tmp_path) / 'tree-sitter',
+        )
+        _stub_compute_write_set(monkeypatch, write_set)
+
+        with caplog.at_level(logging.WARNING):
+            await _invoke_unconfined(workflow, IMPLEMENTER, cwd)
+
+        assert len(_warnings_naming(caplog, write_set.tree_sitter_cache)) == 1
+        assert _warnings_naming(caplog, write_set.claude_fleet) == []
+        assert write_set.claude_fleet.is_dir()
 
 
 async def _task42_workflow(
@@ -407,21 +329,14 @@ class TestInvokeForwardsDeclaredFiles:
         seen = await _declared_files_seen(
             tmp_path, monkeypatch, role=IMPLEMENTER,
             plan={'files': ['docs/a.md']}, metadata_files=['x.py'],
-            write_set=_make_write_set(
-                claude_fleet=tmp_path / 'fleet',
-                tree_sitter_cache=tmp_path / 'tree-sitter',
-            ),
+            write_set=make_write_set(tmp_path),
         )
         assert seen == [['docs/a.md']]
 
     async def test_simple_task_without_plan_falls_back_to_metadata_files(
         self, tmp_path, monkeypatch, caplog,
     ):
-        granted = dataclasses.replace(
-            _docs_grant_write_set(),
-            claude_fleet=tmp_path / 'fleet',
-            tree_sitter_cache=tmp_path / 'tree-sitter',
-        )
+        granted = _docs_grant_write_set(tmp_path)
         with caplog.at_level(logging.INFO, logger='orchestrator.workflow'):
             seen = await _declared_files_seen(
                 tmp_path, monkeypatch, role=SIMPLE_TASK,
