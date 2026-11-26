@@ -155,6 +155,7 @@ def read_fused_memory_unit_environment() -> UnitRead:
 # §"Experiment 1"). Matched by membership, never by prefix.
 LARGE_PLAN_RULE_IDS = frozenset({'large-plan-steps', 'large-plan-modules', 'large-plan-modules-4'})
 BLOCKED_OUTCOMES = frozenset({'blocked', 'escalated'})
+LANDED_OUTCOME = 'done'
 IMPLEMENTER_ROLE = 'implementer'
 CURATOR_HINT_KEY = 'x_curator_complexity_hint'
 _MS_PER_MINUTE = 60_000
@@ -601,20 +602,49 @@ def _curator_hint_simple(record: TaskRecord) -> float | None:
     return None if hint is None else _rate(hint == 'simple')
 
 
+def _every_task(record: TaskRecord) -> bool:
+    return True
+
+
+def _landed(record: TaskRecord) -> bool:
+    return record.final_outcome == LANDED_OUTCOME
+
+
+PER_LANDED_SUFFIX = '_per_landed'
+
+
 @dataclass(frozen=True)
 class Metric:
-    """One per-task metric; *value* is None when the task is not eligible for it."""
+    """One per-task metric; *value* is None when the task is not eligible for it.
+
+    An arm's figure is its eligible tasks' value total over how many of them
+    *counted* holds for: their mean by default, and per landed task when it
+    holds only for landed tasks.
+    """
 
     name: str
     headline: bool
     value: Callable[[TaskRecord], float | None]
+    counted: Callable[[TaskRecord], bool] = _every_task
 
+
+def _per_landed(metric: Metric) -> Metric:
+    """*metric*'s secondary per-landed-task form, the one the PRD's pre-registration names."""
+    return Metric(metric.name + PER_LANDED_SUFFIX, False, metric.value, _landed)
+
+
+_COST_USD = Metric('cost_usd', True, lambda record: record.cost_usd)
+_WORKFLOW_VERIFY_MINUTES = Metric(
+    'workflow_verify_minutes', True, lambda record: record.workflow_verify_minutes
+)
 
 METRICS = (
     Metric('blocked_or_escalated', True, lambda record: _rate(record.blocked_or_escalated)),
     Metric('review_cycles_ge1', True, lambda record: _rate(record.max_review_cycles >= 1)),
-    Metric('cost_usd', True, lambda record: record.cost_usd),
-    Metric('workflow_verify_minutes', True, lambda record: record.workflow_verify_minutes),
+    _COST_USD,
+    _WORKFLOW_VERIFY_MINUTES,
+    _per_landed(_COST_USD),
+    _per_landed(_WORKFLOW_VERIFY_MINUTES),
     Metric('max_execute_iterations', False, lambda record: float(record.max_execute_iterations)),
     Metric('max_review_cycles', False, lambda record: float(record.max_review_cycles)),
     Metric('merge_verify_minutes', False, lambda record: record.merge_verify_minutes),
@@ -686,7 +716,7 @@ def aa_verdict(comparisons: Iterable[Comparison]) -> AAVerdict:
     )
 
 
-_ArmSums = tuple[int, float]  # an arm's eligible task count and its value total
+_ArmSums = tuple[int, float]  # an arm's counted task count and its value total
 _T = TypeVar("_T")
 
 
@@ -706,28 +736,31 @@ def _picker(members: Sequence[int]) -> _Picker:
 
 @dataclass(frozen=True)
 class _Column:
-    """A metric's values over every task (None read as 0.0) and whether each task is eligible."""
+    """A metric's values over every task (None read as 0.0) and whether each counts in its arm's n."""
 
     values: tuple[float, ...]
-    eligible: tuple[int, ...]
-    fully_eligible: bool
+    counted: tuple[int, ...]
+    fully_counted: bool
 
     @classmethod
     def of(cls, metric: Metric, records: Sequence[TaskRecord]) -> _Column:
         raw = [metric.value(record) for record in records]
+        counted = [
+            value is not None and metric.counted(record) for value, record in zip(raw, records, strict=True)
+        ]
         return cls(
             tuple(0.0 if value is None else value for value in raw),
-            tuple(0 if value is None else 1 for value in raw),
-            all(value is not None for value in raw),
+            tuple(int(flag) for flag in counted),
+            all(counted),
         )
 
     def totals(self) -> _ArmSums:
-        return sum(self.eligible), math.fsum(self.values)
+        return sum(self.counted), math.fsum(self.values)
 
     def arm_sums(self, members: Sequence[int]) -> _ArmSums:
         pick = _picker(members)
-        eligible_n = len(members) if self.fully_eligible else sum(pick(self.eligible))
-        return eligible_n, math.fsum(pick(self.values))
+        counted_n = len(members) if self.fully_counted else sum(pick(self.counted))
+        return counted_n, math.fsum(pick(self.values))
 
 
 def _difference(base: _ArmSums, arm: _ArmSums) -> float | None:
@@ -975,7 +1008,10 @@ def _rule_line(report: Report) -> str:
         f'excluded {_listing(excluded)}',
         f'null = {settings.resamples} permutations of the observed arm labels (seed '
         f'{settings.seed}), arm sizes kept, one permutation shared by every metric',
-        'diff = mean(arm k) - mean(arm 0) in metric units over eligible tasks',
+        'diff = mean(arm k) - mean(arm 0) in metric units over eligible tasks, except '
+        f'*{PER_LANDED_SUFFIX} = total over eligible tasks / eligible tasks whose final outcome '
+        f'is {LANDED_OUTCOME} (the per-landed-task guard and cost of the pre-registration; n '
+        'counts those landed tasks)',
         'null p95/p99 = percentiles of |diff|',
         'mde = (z0.95 + z0.80) x sd(diff)',
         f'no null below {MIN_ELIGIBLE_PER_ARM} eligible tasks in an arm',
@@ -1009,7 +1045,7 @@ def _arm_sizes_line(report: Report) -> str:
 
 
 _TABLE_COLUMNS = (
-    '{marker} {metric:<26}{n0:>6}{n1:>6}{mean0:>10}{mean1:>10}{diff:>10}{p95:>10}{p99:>10}'
+    '{marker} {metric:<36}{n0:>6}{n1:>6}{mean0:>10}{mean1:>10}{diff:>10}{p95:>10}{p99:>10}'
     '{mde:>10}{over:>10}'
 )
 

@@ -600,6 +600,39 @@ def test_a_hand_checkable_fixture_gives_arm_means_and_their_absolute_difference(
     assert (blocked.base_mean, blocked.arm_mean, blocked.diff) == (0.5, 0.0, -0.5)
 
 
+def test_a_per_landed_metric_divides_every_task_s_total_by_the_landed_count():
+    records = _arm_records({
+        0: [
+            {'cost_usd': 1.0}, {'cost_usd': 2.0},
+            {'cost_usd': 3.0, 'final_outcome': 'blocked'}, {'cost_usd': 4.0},
+        ],
+        1: [{'cost_usd': 2.0}, {'cost_usd': 2.0, 'final_outcome': 'requeued'}],
+    })
+
+    (comparison,) = _compare(records)
+
+    row = _row(comparison, 'cost_usd_per_landed')
+    assert (row.base_n, row.arm_n) == (3, 1)
+    assert (row.base_mean, row.arm_mean) == (10.0 / 3, 4.0)
+    assert row.diff == pytest.approx(4.0 - 10.0 / 3)
+
+
+def test_unknown_verify_minutes_count_in_neither_part_of_the_per_landed_ratio():
+    records = _arm_records({
+        0: [
+            {'workflow_verify_minutes': 2.0},
+            {'workflow_verify_minutes': None},
+            {'workflow_verify_minutes': 4.0, 'final_outcome': 'blocked'},
+        ],
+        1: [{'workflow_verify_minutes': 1.0}],
+    })
+
+    (comparison,) = _compare(records)
+
+    row = _row(comparison, 'workflow_verify_minutes_per_landed')
+    assert (row.base_n, row.base_mean) == (1, 6.0)
+
+
 def test_one_comparison_per_treated_arm_against_arm_zero():
     records = _arm_records({0: [{}], 1: [{}], 2: [{}]})
 
@@ -736,6 +769,7 @@ def test_main_prints_the_rule_producers_arm_sizes_and_one_row_per_metric(
         'subset all',
         '400 permutations',
         f'seed {readout.DEFAULT_SEED}',
+        '*_per_landed = total over eligible tasks / eligible tasks whose final outcome is done',
     ):
         assert fragment in rule
     lines = out.splitlines()
