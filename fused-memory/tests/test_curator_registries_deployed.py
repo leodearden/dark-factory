@@ -1,61 +1,97 @@
 """The shipped curator registries load and decide when resolved as the deployed unit resolves them.
 
 The deployed fused-memory unit (scripts/fused-memory.service.template) runs
-with CONFIG_PATH at the shipped fused-memory/config/config.yaml and
-PROJECT_ROOT at the repo root, and the server builds its TaskCurator with
-cwd = taskmaster.project_root. This module composes exactly that: the shipped
-config, the template's PROJECT_ROOT and a real TaskCurator. It drives the
-public seams, curate_prepared and registry_health, with an LLM tripwire, so a
-registry that does not resolve fails the test instead of reaching the LLM.
+with the template's CONFIG_PATH and PROJECT_ROOT, and its TaskInterceptor
+builds the curator lazily, choosing the base the curator resolves relative
+registry paths against. This module composes exactly that: the rendered
+template's environment, the shipped config and a real TaskInterceptor that
+builds its own curator. Only the curator's LLM invoker and Qdrant client are
+swapped, for a tripwire and an in-memory store, so a registry that does not
+resolve fails the test instead of reaching the LLM.
 """
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import pytest
+import pytest_asyncio
 from _curator_helpers import escalator_double, must_not_invoke, prepared
+from _fm_helpers import load_script_module
+from qdrant_client import AsyncQdrantClient
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.config.schema import FusedMemoryConfig
+from fused_memory.middleware import task_interceptor
 from fused_memory.middleware.curator_registry import RegistryState
 from fused_memory.middleware.curator_types import CandidateTask
 from fused_memory.middleware.task_curator import TaskCurator
+from fused_memory.middleware.task_interceptor import TaskInterceptor
+from fused_memory.reconciliation.event_buffer import EventBuffer
 
 pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
-_SERVICE_TEMPLATE = _REPO_ROOT / 'scripts' / 'fused-memory.service.template'
-_PROJECT_ROOT_LINE = 'Environment=PROJECT_ROOT='
-_REPO_ROOT_PLACEHOLDER = '__REPO_ROOT__'
+_SCRIPTS = _REPO_ROOT / 'scripts'
+_SERVICE_TEMPLATE = _SCRIPTS / 'fused-memory.service.template'
+# Which config loads, and the base its relative registry paths resolve against.
+_RESOLUTION_VARIABLES = ('CONFIG_PATH', 'PROJECT_ROOT')
 _PROJECT_ID = 'dark_factory'
 
 
-def _deployed_project_root() -> str:
-    """The PROJECT_ROOT the rendered unit sets, with the repo-root placeholder filled in."""
-    found = [
-        line.strip()
-        for line in _SERVICE_TEMPLATE.read_text().splitlines()
-        if line.strip().startswith(_PROJECT_ROOT_LINE)
-    ]
-    assert len(found) == 1, (
-        f'{_SERVICE_TEMPLATE} must set PROJECT_ROOT exactly once; found {found!r}'
+def _deployed_environment() -> dict[str, str]:
+    """The [Service] environment of the unit setup-host.sh renders from the template for this checkout."""
+    unit_parity = load_script_module(_SCRIPTS / 'systemd_unit_parity.py')
+    renderer = load_script_module(_SCRIPTS / 'render_systemd_unit.py')
+    rendered = renderer.render_template(
+        _SERVICE_TEMPLATE.read_text(), repo_root=str(_REPO_ROOT), uv_path='uv',
     )
-    value = found[0].removeprefix(_PROJECT_ROOT_LINE)
-    return value.replace(_REPO_ROOT_PLACEHOLDER, str(_REPO_ROOT))
+    return unit_parity.environment_map(
+        unit_parity.parse_unit_directives(rendered), unit_parity.SERVICE_SECTION,
+    )
 
 
-def _deployed_curator(monkeypatch: pytest.MonkeyPatch) -> tuple[TaskCurator, Path]:
-    monkeypatch.setenv('PROJECT_ROOT', _deployed_project_root())
+@dataclass(frozen=True)
+class _Deployed:
+    interceptor: TaskInterceptor
+    curator: TaskCurator
+    project_root: str
+
+
+@pytest_asyncio.fixture
+async def deployed(monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[_Deployed]:
+    """A TaskInterceptor over the shipped config, and the curator it built for itself."""
+    environment = _deployed_environment()
+    for name in _RESOLUTION_VARIABLES:
+        monkeypatch.setenv(name, environment[name])
     config = FusedMemoryConfig()
     assert config.taskmaster is not None, 'the shipped config.yaml must carry a taskmaster section'
-    # Mirrors fused-memory/src/fused_memory/middleware/task_interceptor.py::TaskInterceptor._get_curator.
-    cwd = Path(config.taskmaster.project_root)
-    curator = TaskCurator(
-        config=config, taskmaster=None, cwd=cwd,
-        escalator=escalator_double(), invoke=must_not_invoke(),
+
+    built: list[TaskCurator] = []
+
+    def build_without_llm_or_live_qdrant(**kwargs: Any) -> TaskCurator:
+        curator = TaskCurator(
+            **kwargs, invoke=must_not_invoke(),
+            qdrant_client=AsyncQdrantClient(location=':memory:'),
+        )
+        built.append(curator)
+        return curator
+
+    monkeypatch.setattr(task_interceptor, 'TaskCurator', build_without_llm_or_live_qdrant)
+    interceptor = TaskInterceptor(
+        None, None, EventBuffer(db_path=None), config=config, escalator=escalator_double(),
     )
-    return curator, cwd
+    project_root = config.taskmaster.project_root
+    try:
+        # With no tasks to index, this public seam only builds the interceptor's lazy curator.
+        await interceptor.index_committed_tasks([], project_root)
+        assert len(built) == 1, 'the interceptor must build exactly one curator'
+        yield _Deployed(interceptor=interceptor, curator=built[0], project_root=project_root)
+    finally:
+        await interceptor.close()
 
 
 _OPERATIONAL_ASK = CandidateTask(
@@ -99,12 +135,11 @@ _GUARD_HITS: dict[str, tuple[CandidateTask, str, str]] = {
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize('guard', sorted(_GUARD_HITS))
-async def test_each_shipped_guard_decides_under_the_deployed_root(guard, monkeypatch):
+async def test_each_shipped_guard_decides_under_the_deployed_root(guard, deployed):
     candidate, expected_action, expected_prefix = _GUARD_HITS[guard]
-    curator, cwd = _deployed_curator(monkeypatch)
 
-    [decision] = await curator.curate_prepared(
-        [prepared(candidate.title, candidate=candidate)], _PROJECT_ID, str(cwd),
+    [decision] = await deployed.curator.curate_prepared(
+        [prepared(candidate.title, candidate=candidate)], _PROJECT_ID, deployed.project_root,
     )
 
     assert decision.action == expected_action, f'{guard}: got {decision!r}'
@@ -112,15 +147,15 @@ async def test_each_shipped_guard_decides_under_the_deployed_root(guard, monkeyp
 
 
 @pytest.mark.asyncio
-async def test_all_three_registries_load_under_the_deployed_root(monkeypatch):
-    """Pre-merge equivalent of esc-task-curator-37's post-restart "all three registries load"."""
-    curator, cwd = _deployed_curator(monkeypatch)
+async def test_all_three_registries_load_under_the_deployed_root(deployed):
+    """Pre-merge equivalent of esc-task-curator-37's post-restart "all three registries load".
 
-    await curator.curate_prepared(
-        [prepared(_OPERATIONAL_ASK.title, candidate=_OPERATIONAL_ASK)], _PROJECT_ID, str(cwd),
-    )
+    The startup self-check the interceptor schedules when it builds the curator
+    is what loads each registry; drain() awaits it.
+    """
+    await deployed.interceptor.drain()
 
-    health = curator.registry_health()
+    health = deployed.interceptor.curator_registry_health()
     wire = [h.to_wire() for h in health]
     assert len(health) == 3, wire
     for h in health:
