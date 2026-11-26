@@ -1067,6 +1067,13 @@ token (`migration`, `architecture`, `integration test`, `design ... new`,
 **Hard escape:** `metadata.force_full_path = true` always forces the full
 architect path regardless of `complexity`.
 
+**Curator complexity hint:** on every curated `create` the curator stamps
+`metadata.x_curator_complexity_hint` (`"simple"` or null) from the criteria
+above. On the treated arm of experiment `routing-exp-2` it also applies
+`metadata.complexity = "simple"` when the hint is `simple` and the task names
+files; the untreated arm records the hint only. A filer's own `complexity`
+always wins, and `planning_mode` batches are untouched.
+
 ### `execution_class` routes to a HUMAN — it is not "non-code work"
 
 `metadata.execution_class` answers **who executes the task at dispatch**, not

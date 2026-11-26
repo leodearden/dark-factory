@@ -3068,20 +3068,44 @@ In-workflow roles, the steward and unblock_auto also emit an
 `routing_decision` row is written before the lifetime-budget check, so the
 row also exists when that check skips the triage. Today this is
 what you read directly (`routing_decision` events, `metadata.routing` per
-task) — there is not
-yet an auto-escalating retry ladder or a rendered rollup panel; see below.
+task), alongside the per-(model×role) rollup described below.
 
-### Adaptive-routing substrate (not yet active)
+### Adaptive-routing and experiment substrate
 
-The resolver already supports the `min_routing_tier` and
-`simple_saturated` match conditions and ladder-relative bumps, and the
-`metadata.routing` mirror already stores the counters — this is
-substrate for a later automated fleet rule (retry-tier escalation,
-saturation → full-path). **Not yet live on main:** automatic retry-tier
-increment, an automatic "simple-task saturated" stamp, admission of any
-model beyond the stock `haiku`/`sonnet`/`opus` set, and a per-(model×role)
-rollup panel (done/blocked/cap-hit rates, cost-per-done) in the digest or
-dashboard.
+The resolver's `min_routing_tier` and `simple_saturated` match conditions,
+ladder-relative bumps and the `metadata.routing` counters are all driven
+automatically on main:
+
+- **Retry-tier increment.** A terminal failure bumps the task's routing tier
+  (`orchestrator/src/orchestrator/harness.py::_maybe_bump_routing_tier`), and
+  the `retry-tier-up` rule, kept last in the rule list, moves the retry of an
+  implementer, debugger or architect up the ladder.
+- **Simple-saturated stamp.** A `complexity=simple` task whose SIMPLE_TASK dispatch
+  exhausts its turn cap is stamped `simple_saturated` automatically
+  (`orchestrator/src/orchestrator/workflow.py::_stamp_simple_saturated`); its
+  later dispatches take the full architect path, and the
+  `simple-saturated-full-path` rule routes that architect to `opus`.
+- **Models beyond `haiku`/`sonnet`/`opus`.** dark-factory's `allowed_models`
+  admits `claude-fable-5-1`, capped by a `per_model_daily_ceiling_usd`.
+- **Per-(model×role) rollup.**
+  `orchestrator/src/orchestrator/digest.py::model_role_rollup` aggregates
+  invocation count, done, blocked and cap-hit rates, cost and cost-per-done
+  for each (model, role) cell, plus per-role turn-cap saturation. The digest
+  renders it and the dashboard serves it at `/costs/by_model_role`.
+
+**What the rollup does and does not attribute.** It counts per invocation: one
+row per invocation, joined to its run's `task_results` outcome, so a task's
+done or blocked outcome is credited to every role (and model) that touched
+that run, not only the one that decided it. It carries no plan-size covariate:
+a cell holding mostly large plans reads worse than one holding small ones
+regardless of the model. Read it as a descriptive cost and outcome table, not
+as a causal comparison of models.
+
+The `split` condition (see the condition table above) and the readout script
+`scripts/routing_experiment_readout.py` are the experiment substrate: the
+split assigns tasks to arms deterministically, and the readout computes
+per-task, per-arm metrics (with the plan-size covariates the rollup lacks)
+across every project ledger. Compare arms with the readout, not the rollup.
 
 ---
 
