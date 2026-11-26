@@ -5,14 +5,12 @@ is not the client's to see. client_feed.cli is imported here, at module level, s
 loaded before a recorded span opens.
 """
 
-import json
 import os
 import shutil
 import subprocess
-from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Final
+from typing import Final
 
 import pytest
 import yaml
@@ -20,6 +18,7 @@ from _audit_hook import AuditRecord, interpreter_roots, recording
 from _call_watch import watching
 from _git_repo import Repo, clone_of_checkout
 from _in_dir import request_reveals, write_engagement
+from _leaks import leaks
 from _live_slice import copy_live_slice, live_titles
 from _two_projects import CANARY_A_DESC, Project, TwoProjects, build_two_projects
 from shared.project_layout import (
@@ -52,7 +51,6 @@ from client_feed.publisher import PassReport
 from client_feed.redact import redact_paths
 
 CHECKOUT_ROOT = Path(__file__).resolve().parents[2]
-FORBIDDEN_KEYS: Final = frozenset({'description', 'details', 'test_strategy', 'metadata'})
 REQUESTED_AT: Final = datetime(2026, 10, 21, 11, 0, tzinfo=UTC)
 CLIENT_FEED_PRD: Final = 'plans/client-feed-prd.md'
 SNAPSHOT_PROJECT: Final = 'dark-factory'
@@ -156,42 +154,6 @@ def test_no_client_feed_source_names_default_project_root() -> None:
     assert (found.returncode, found.stdout) == (1, ''), found.stdout + found.stderr
 
 
-def _keys(value: Any) -> Iterator[str]:
-    if isinstance(value, dict):
-        for key, item in value.items():
-            yield key
-            yield from _keys(item)
-    elif isinstance(value, list):
-        for item in value:
-            yield from _keys(item)
-
-
-def _json_documents(path: Path, text: str) -> list[Any]:
-    if path.suffix == '.jsonl':
-        return [json.loads(line) for line in text.splitlines() if line.strip()]
-    return [json.loads(text)] if path.suffix == '.json' else []
-
-
-def _leaks(
-    out_dir: Path, *, needles: tuple[str, ...], forbidden_keys: frozenset[str] = FORBIDDEN_KEYS
-) -> list[tuple[str, str]]:
-    """(file, finding) for each needle in a file's name or text, and each forbidden key in its JSON documents.
-
-    Keys are walked, never grepped for: a tree path may well contain the word 'description'.
-    """
-    found: list[tuple[str, str]] = []
-    for path in sorted(item for item in out_dir.rglob('*') if item.is_file()):
-        name = path.relative_to(out_dir).as_posix()
-        text = path.read_bytes().decode('utf-8', errors='replace')
-        found += [(name, f'needle {needle!r}') for needle in needles if needle in name or needle in text]
-        found += [
-            (name, f'key {key!r}')
-            for document in _json_documents(path, text)
-            for key in sorted(forbidden_keys & set(_keys(document)))
-        ]
-    return found
-
-
 def test_b2_a_snapshot_of_a_carries_nothing_of_b_and_nothing_a_hides(
     projects: TwoProjects, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -199,7 +161,7 @@ def test_b2_a_snapshot_of_a_carries_nothing_of_b_and_nothing_a_hides(
 
     assert _snapshot(a.policy, capsys).degraded == ()
 
-    assert _leaks(a.out_dir, needles=(projects.canary_b, 'CANARY-B', CANARY_A_DESC)) == []
+    assert leaks(a.out_dir, needles=(projects.canary_b, 'CANARY-B', CANARY_A_DESC)) == []
     assert _snapshot(b.policy, capsys).degraded == ()
     assert projects.canary_b in (b.out_dir / FEED_FILENAME).read_text()
 
@@ -279,7 +241,7 @@ def test_b22_a_snapshot_of_this_checkout_over_its_live_slice_is_valid_and_leaks_
     trees = [line for line in lines if isinstance(line, TreeSnapshot)]
     assert trees and trees[-1].files
     assert all(matches_any(SNAPSHOT_VISIBLE_GLOBS, file.path) for tree in trees for file in tree.files)
-    assert _leaks(out_dir, needles=(*FIXTURE_LEAK_NEEDLES, str(tmp_path))) == []
+    assert leaks(out_dir, needles=(*FIXTURE_LEAK_NEEDLES, str(tmp_path))) == []
     if os.environ.get(REGENERATE_FIXTURE_ENV) == '1':
         FIXTURE_DIR.mkdir(parents=True, exist_ok=True)
         for name in FIXTURE_FILES:
@@ -292,7 +254,7 @@ def test_the_committed_dark_factory_snapshot_is_a_valid_bounded_leak_free_feed(
     assert {path.name for path in FIXTURE_DIR.iterdir()} == {*FIXTURE_FILES, 'README.md'}
     validated = main(['validate-feed', '--out-dir', str(FIXTURE_DIR), '--project-id', SNAPSHOT_PROJECT])
     assert validated == 0, capsys.readouterr().out
-    assert _leaks(FIXTURE_DIR, needles=FIXTURE_LEAK_NEEDLES) == []
+    assert leaks(FIXTURE_DIR, needles=FIXTURE_LEAK_NEEDLES) == []
     assert parse_state((FIXTURE_DIR / STATE_FILENAME).read_text()).prds
     lines = read_feed_lines(FIXTURE_DIR)
     for kind in (TaskUpserted, TreeSnapshot, FileRevealed):
