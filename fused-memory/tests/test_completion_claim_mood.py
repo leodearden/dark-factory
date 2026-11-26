@@ -101,6 +101,13 @@ _ESC_6670_1_CLAIM = (
 )
 
 
+# Verbatim from dark_factory esc-unverified-claim-9007-1: 10625 asked that 9007 be cancelled, pending when written.
+_ESC_9007_1_CLAIM = (
+    'Task 10625 (info-l0-router, esc-6646-3) asked only that task 9007 be cancelled or folded '
+    'into task 9631, which is a task-store disposition with no code left to change'
+)
+
+
 def _extract(text: str, default_project_id: str = 'reify') -> list[CompletionClaim]:
     return extract_completion_claims(
         text,
@@ -228,6 +235,41 @@ class TestModalFormsAreNotClaims:
     )
     def test_a_modal_elsewhere_leaves_the_claim(self, text):
         assert _triples(text) == [('applied_work', 'task', '5422')]
+
+    @pytest.mark.parametrize(
+        ('text', 'project'),
+        [
+            pytest.param(_ESC_9007_1_CLAIM, 'dark_factory', id='esc-unverified-claim-9007-1'),
+            pytest.param('requested that task 5422 be merged', 'reify', id='requested-merged'),
+            pytest.param(
+                'proposed that task 5422 be closed as duplicate', 'reify', id='proposed-closed-as',
+            ),
+            pytest.param('let task 5422 be merged first', 'reify', id='let-complement'),
+            pytest.param(
+                'asked that it be filed as tkt_0RRRC5AASJ9Z630VP4PCN9H376', 'reify',
+                id='asked-filed-as-ticket',
+            ),
+        ],
+    )
+    def test_a_subjunctive_be_is_not_a_claim(self, text, project):
+        assert _triples(text, project) == []
+
+    @pytest.mark.parametrize(
+        ('text', 'claim'),
+        [
+            pytest.param(
+                'asked that task 5422 be cancelled; task 5423 was cancelled',
+                ('disposition', 'task', '5423'),
+                id='indicative-clause-still-claims',
+            ),
+            pytest.param(
+                'task 5422 has been cancelled', ('disposition', 'task', '5422'),
+                id='been-is-not-be',
+            ),
+        ],
+    )
+    def test_a_subjunctive_be_elsewhere_leaves_the_claim(self, text, claim):
+        assert _triples(text) == [claim]
 
 
 class TestNonAssertiveScopes:
