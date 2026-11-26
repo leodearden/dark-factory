@@ -48,6 +48,7 @@ from orchestrator.evals.reviewer_trial.variants import (
     ReviewerSpec,
     VariantConfig,
     build_trial_reviewer_role,
+    trial_reviewer_max_turns,
 )
 from orchestrator.mcp_lifecycle import verdict_tools_mcp_server
 from orchestrator.review_inputs import gather_review_subject
@@ -105,6 +106,7 @@ class PanelRunKey:
     prices_sha256: str | None
     gated: bool
     diff_cap_chars: int
+    max_turns: int
 
     @classmethod
     def of(
@@ -113,6 +115,7 @@ class PanelRunKey:
         prices: dict | None,
         usage_gate: UsageGate | None,
         diff_cap_chars: int,
+        max_turns: int,
     ) -> PanelRunKey:
         prices_sha256 = None if prices is None else hashlib.sha256(
             json.dumps(prices, sort_keys=True, default=str).encode(),
@@ -121,6 +124,7 @@ class PanelRunKey:
             prices_sha256=prices_sha256,
             gated=usage_gate is not None,
             diff_cap_chars=diff_cap_chars,
+            max_turns=max_turns,
         )
 
     @classmethod
@@ -129,6 +133,7 @@ class PanelRunKey:
             prices_sha256=data['prices_sha256'],
             gated=data['gated'],
             diff_cap_chars=data['diff_cap_chars'],
+            max_turns=data['max_turns'],
         )
 
 
@@ -429,6 +434,7 @@ async def run_panel(
     prices: dict | None = None,
     usage_gate: UsageGate | None = None,
     diff_cap_chars: int = DIFF_CAP_CHARS,
+    max_turns: int | None = None,
 ) -> PanelRunResult:
     """Run one panel variant against one corpus diff, in a scratch clone of its reviewed tree.
 
@@ -444,9 +450,10 @@ async def run_panel(
     reviews: dict[str, dict] = {}
     errors: list[str] = []
     total_cost = 0.0
+    turns = trial_reviewer_max_turns(max_turns)
 
     async with fixture_checkout(corpus_diff) as checkout:
-        roles = [build_trial_reviewer_role(spec, variant.briefing) for spec in variant.reviewers]
+        roles = [build_trial_reviewer_role(spec, variant.briefing, turns) for spec in variant.reviewers]
         prompts = await _panel_prompts(variant, roles, corpus_diff, checkout, diff_cap_chars)
         tasks: list[asyncio.Task] = []
         for i, (spec, role, prompt) in enumerate(zip(variant.reviewers, roles, prompts, strict=True)):
@@ -483,7 +490,9 @@ async def run_panel(
         total_cost_usd=total_cost,
         wall_clock_ms=elapsed_ms,
         errors=errors,
-        run_key=PanelRunKey.of(prices=prices, usage_gate=usage_gate, diff_cap_chars=diff_cap_chars),
+        run_key=PanelRunKey.of(
+            prices=prices, usage_gate=usage_gate, diff_cap_chars=diff_cap_chars, max_turns=turns,
+        ),
     )
 
 
@@ -524,6 +533,7 @@ async def run_panel_cached(
     prices: dict | None = None,
     usage_gate: UsageGate | None = None,
     diff_cap_chars: int = DIFF_CAP_CHARS,
+    max_turns: int | None = None,
 ) -> PanelRunResult:
     """*variant*'s panel on *diff*, reused from *results_dir* only when stored under an equal PanelRunKey.
 
@@ -536,7 +546,8 @@ async def run_panel_cached(
     """
     out_dir = results_dir or _RESULTS_DIR
     out_dir.mkdir(parents=True, exist_ok=True)
-    wanted = PanelRunKey.of(prices=prices, usage_gate=usage_gate, diff_cap_chars=diff_cap_chars)
+    turns = trial_reviewer_max_turns(max_turns)
+    wanted = PanelRunKey.of(prices=prices, usage_gate=usage_gate, diff_cap_chars=diff_cap_chars, max_turns=turns)
     path = out_dir / _slot_filename(variant.name, diff.diff_id, wanted)
 
     cached = _load_entry(path, PanelRunResult.from_dict, variant.name, diff.diff_id)
@@ -554,7 +565,7 @@ async def run_panel_cached(
     logger.info('Running %s against %s', variant.name, diff.diff_id)
     result = await run_panel(
         variant, diff, stagger_secs=stagger_secs, prices=prices, usage_gate=usage_gate,
-        diff_cap_chars=diff_cap_chars,
+        diff_cap_chars=diff_cap_chars, max_turns=turns,
     )
     atomic_write_text(path, json.dumps(asdict(result), indent=2))
     logger.info(
@@ -574,6 +585,7 @@ async def run_trial(
     usage_gate: UsageGate | None = None,
     diff_cap_chars: int = DIFF_CAP_CHARS,
     stagger_secs: float = 2.0,
+    max_turns: int | None = None,
 ) -> list[PanelRunResult]:
     """Run all (variant x diff) pairs with bounded concurrency, each through run_panel_cached.
 
@@ -601,6 +613,7 @@ async def run_trial(
                 return await run_panel_cached(
                     variant, diff, results_dir=results_dir, stagger_secs=stagger_secs,
                     prices=prices, usage_gate=usage_gate, diff_cap_chars=diff_cap_chars,
+                    max_turns=max_turns,
                 )
             except FixtureNotMaterialisable as exc:
                 logger.warning(
@@ -663,6 +676,7 @@ async def run_and_score(
     prices: dict | None = None,
     usage_gate: UsageGate | None = None,
     diff_cap_chars: int = DIFF_CAP_CHARS,
+    max_turns: int | None = None,
     on_scored: Callable[[ScoringResult], None] | None = None,
 ) -> list[ScoringResult]:
     """Every reviewer-trial subcommand's score loop: run_trial's panels, each scored through *usage_gate*.
@@ -675,7 +689,7 @@ async def run_and_score(
     panels = await run_trial(
         list(variants), corpus, max_parallel_panels=max_parallel_panels, prices=prices,
         results_dir=results_dir, usage_gate=usage_gate, diff_cap_chars=diff_cap_chars,
-        stagger_secs=stagger_secs,
+        stagger_secs=stagger_secs, max_turns=max_turns,
     )
     scores: list[ScoringResult] = []
     for panel in panels:
