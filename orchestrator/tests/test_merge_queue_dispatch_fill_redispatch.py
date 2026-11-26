@@ -69,11 +69,11 @@ from _orch_helpers import MERGE_RESULT_TIMEOUT, wait_responsive
 from test_merge_queue_concurrent_verify import (
     _inject_host_allocator,
     _make_branch_with_file,
-    config,  # noqa: F401 — pytest fixture re-exported from γ harness
-    git_config,  # noqa: F401 — pytest fixture re-exported from γ harness
-    git_ops,  # noqa: F401 — pytest fixture re-exported from γ harness
-    git_repo,  # noqa: F401 — pytest fixture re-exported from γ harness
 )
+from test_merge_queue_concurrent_verify import config as config
+from test_merge_queue_concurrent_verify import git_config as git_config
+from test_merge_queue_concurrent_verify import git_ops as git_ops
+from test_merge_queue_concurrent_verify import git_repo as git_repo
 from test_merge_queue_rebased_landing_dead_base import _git_until_it_takes, _land_foreign_commit
 
 from orchestrator.config import MergeDeepConfig, OrchestratorConfig
