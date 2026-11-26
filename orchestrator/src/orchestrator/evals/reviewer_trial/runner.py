@@ -496,6 +496,10 @@ async def run_panel(
     )
 
 
+# The trial role's fixed turn cap from the module's birth until task 11728: every keyless panel ran at it.
+LEGACY_PANEL_MAX_TURNS = 30
+
+
 def _slot_filename(variant_name: str, diff_id: str, run_key: PanelRunKey | None) -> str:
     """The file holding the panel run under *run_key*, and its score; a keyless legacy panel has the bare name."""
     if run_key is None:
@@ -524,6 +528,22 @@ def _load_entry(
     return entry
 
 
+def _legacy_hit(out_dir: Path, variant: VariantConfig, diff: CorpusDiff, wanted: PanelRunKey) -> PanelRunResult | None:
+    """This cell's keyless legacy panel when *wanted* asks for the turn cap it ran at, else None."""
+    path = out_dir / _slot_filename(variant.name, diff.diff_id, None)
+    legacy = _load_entry(path, PanelRunResult.from_dict, variant.name, diff.diff_id)
+    if legacy is None or legacy.run_key is not None:
+        return None
+    if wanted.max_turns != LEGACY_PANEL_MAX_TURNS:
+        logger.info(
+            'Not reusing %s: a legacy panel ran at %d turns, wanted %d',
+            path, LEGACY_PANEL_MAX_TURNS, wanted.max_turns,
+        )
+        return None
+    logger.info('Reusing %s, a legacy panel that records no run key', path)
+    return legacy
+
+
 async def run_panel_cached(
     variant: VariantConfig,
     diff: CorpusDiff,
@@ -538,9 +558,10 @@ async def run_panel_cached(
     """*variant*'s panel on *diff*, reused from *results_dir* only when stored under an equal PanelRunKey.
 
     Each key has its own file. A keyless entry written before the key existed
-    is reused when the key's own file is absent. Why, and how to re-measure
-    one: docs/plan-scoring-and-judge.md, "Reviewer-trial panel cache and
-    score loop (task 6741)".
+    is reused only at the 30-turn cap every such panel ran at, and only when
+    the key's own file is absent. Why, and how to re-measure one:
+    docs/plan-scoring-and-judge.md, "Reviewer-trial panel cache and score
+    loop (task 6741)".
 
     Raises FixtureNotMaterialisable when the panel has to run and its clone cannot be built.
     """
@@ -554,10 +575,8 @@ async def run_panel_cached(
     if cached is not None and cached.run_key == wanted:
         logger.info('Reusing %s', path)
         return cached
-    legacy_path = out_dir / _slot_filename(variant.name, diff.diff_id, None)
-    legacy = _load_entry(legacy_path, PanelRunResult.from_dict, variant.name, diff.diff_id)
-    if legacy is not None and legacy.run_key is None:
-        logger.info('Reusing %s, a legacy panel that records no run key', legacy_path)
+    legacy = _legacy_hit(out_dir, variant, diff, wanted)
+    if legacy is not None:
         return legacy
     if cached is not None:
         logger.info('Re-running %s: stored under %s, wanted %s', path, cached.run_key, wanted)
@@ -639,9 +658,9 @@ async def run_trial(
     legacy = sum(1 for r in all_results if r.run_key is None)
     if legacy:
         logger.warning(
-            'Reused %d legacy panel(s) from %s that record no run key; see docs/plan-scoring-and-judge.md, '
-            '"Reviewer-trial panel cache and score loop (task 6741)"',
-            legacy, results_dir or _RESULTS_DIR,
+            'Reused %d legacy panel(s) from %s that record no run key (each ran at %d turns); '
+            'see docs/plan-scoring-and-judge.md, "Reviewer-trial panel cache and score loop (task 6741)"',
+            legacy, results_dir or _RESULTS_DIR, LEGACY_PANEL_MAX_TURNS,
         )
     return all_results
 
