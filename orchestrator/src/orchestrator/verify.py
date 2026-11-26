@@ -1466,6 +1466,14 @@ def _junit_testcase_id(testcase: ET.Element) -> str:
     return strip_xdist_group_suffix(f'{owner}::{name}' if owner else name)
 
 
+def _junit_dotted_path(path: str) -> str:
+    """A node id's file *path* as a junit classname spells it.
+
+    The path half of ``_pytest/junitxml.py::mangle_test_address``.
+    """
+    return path.replace('/', '.').removesuffix('.py')
+
+
 def _junit_spelling(node_id: str) -> str:
     """*node_id* as :func:`_junit_testcase_id` spells its testcase, when the rootdir is the id's root.
 
@@ -1473,15 +1481,15 @@ def _junit_spelling(node_id: str) -> str:
     """
     path, bracket, params = node_id.partition('[')
     names = path.split('::')
-    names[0] = names[0].replace('/', '.').removesuffix('.py')
+    names[0] = _junit_dotted_path(names[0])
     names[-1] += bracket + params
     return f"{'.'.join(names[:-1])}::{names[-1]}"
 
 
 def _junit_container(node_id: str) -> str:
     """The junit classname of *node_id* read as a module or class, when the rootdir is the id's root."""
-    path, *names = node_id.split('::')
-    return '.'.join([path.replace('/', '.').removesuffix('.py'), *names])
+    path, *names = node_id.partition('[')[0].split('::')
+    return '.'.join([_junit_dotted_path(path), *names])
 
 
 def _junit_classname_under(classname: str, containers: Collection[str]) -> bool:
