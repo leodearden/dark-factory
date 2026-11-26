@@ -7,7 +7,8 @@ Imported by bare module name (``from _script_survivor import ...``), like
 One copy of the survivor script and its pid helpers, used by
 ``test_before_done_script.py`` (the teardown disposition at the
 ``run_script`` seam) and by ``test_deterministic_runner.py`` (the deploy
-escalation text built from that disposition).
+escalation text built from that disposition).  ``needs_group_pidfd_signals``
+skips the tests that expect the survivor killed once its script is reaped.
 """
 
 from __future__ import annotations
@@ -17,17 +18,26 @@ import os
 import signal
 from pathlib import Path
 
-# The already-exited-script timeout shape (task 4252): the script exits while a
-# child it spawned keeps the merged stdout pipe open, so `terminate_process_tree`'s
-# pid-recycling guard dispatches NO signal and that child is still alive when
-# the test's assertions run — which is exactly what those tests assert.  Every such test must therefore reap it itself, or leak a live
-# `sleep 30` past pytest exit (measured by the reviewer on the first of them).
+import pytest
+from shared.testing_pidfd import group_pidfd_signals_unsupported_reason
+
+# The already-exited-script timeout shape (task 4252): the script exits with 7
+# only once its 4 MiB of output is being drained, while the child it
+# backgrounded keeps the merged stdout pipe open.  Every consumer must still
+# reap that child itself in a `finally`, so a failed teardown cannot leak a
+# `sleep 30` past pytest exit.
 SURVIVOR_SCRIPT = (
     '#!/bin/sh\n'
     'sleep 30 &\n'
     'echo $! > "$1"\n'
-    'echo started\n'
+    'head -c 4194304 /dev/zero\n'
     'exit 7\n'
+)
+
+_UNSUPPORTED_REASON = group_pidfd_signals_unsupported_reason()
+
+needs_group_pidfd_signals = pytest.mark.skipif(
+    _UNSUPPORTED_REASON is not None, reason=_UNSUPPORTED_REASON or '',
 )
 
 
