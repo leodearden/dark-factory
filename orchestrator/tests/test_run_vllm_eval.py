@@ -445,12 +445,27 @@ class _FakeTunnel:
         return 0 if self.terminated else None
 
 
+def _seed_fake_credentials(monkeypatch) -> None:
+    """Give a run every credential it asks for, so none is read from a real ``.env`` or home.
+
+    ``PROJECT_ROOT`` is the launcher's own checkout, which holds no ``.env``
+    in a worktree or on a verify host, so the RunPod key and a pool OAuth
+    token come from the environment. The pod's public key is stubbed
+    because ``~/.ssh/id_runpod.pub`` exists only on the operator's machine.
+    """
+    monkeypatch.setenv("RUNPOD_API_KEY", "rpa_test_fake_key")
+    for letter in "ABCDEFGH":
+        monkeypatch.setenv(f"CLAUDE_OAUTH_TOKEN_{letter}", f"fake-pool-token-{letter}")
+    monkeypatch.setattr(launcher, "read_ssh_pubkey", lambda: "ssh-ed25519 fake-pod-key")
+
+
 def _patch_pod_infra(monkeypatch, *, vllm_healthy_first=True):
-    """Patch RunPodClient + SSH tunnel + wait_for_vllm so bring_up_pod returns fast.
+    """Patch credentials, RunPodClient, SSH tunnel and wait_for_vllm so bring_up_pod returns fast.
 
     Real ``subprocess.Popen`` is preserved for everything other than the SSH
     tunnel command, so preflight_baseline's git calls still work end-to-end.
     """
+    _seed_fake_credentials(monkeypatch)
     fake_client = _FakeClient()
     monkeypatch.setattr(launcher, "RunPodClient", lambda config: fake_client)
     monkeypatch.setattr(
@@ -655,6 +670,7 @@ class TestPodLifecycle:
         monkeypatch.setattr(launcher, "TASKS_DIR", fake_tasks)
 
         # Patch infra so wait_for_vllm fails (simulates vLLM never becoming healthy)
+        _seed_fake_credentials(monkeypatch)
         fake_client = _FakeClient()
         monkeypatch.setattr(launcher, "RunPodClient", lambda config: fake_client)
         monkeypatch.setattr(
@@ -2311,12 +2327,11 @@ class TestBuildEvalEnvSharedPool:
         """A tmp PROJECT_ROOT holding a shared pool config and a ``.env``.
 
         THE ``PROJECT_ROOT`` MONKEYPATCH IS HERMETICITY, NOT EVIDENCE OF
-        DYNAMISM. ``launcher.PROJECT_ROOT`` is a module constant hardcoded
-        to the main checkout; it is redirected here only so a test reads a
-        roster and a ``.env`` it owns instead of the real ones. Nothing in
-        this class should be read as a claim that the launcher resolves its
-        root at runtime — it does not, and ``build_eval_env``'s docstring
-        says so.
+        DYNAMISM. ``launcher.PROJECT_ROOT`` is a module constant fixed at
+        import to the launcher's own checkout; it is redirected here only so
+        a test reads a roster and a ``.env`` it owns instead of that
+        checkout's. Nothing in this class should be read as a claim that the
+        launcher resolves its root per call — it does not.
 
         A pool credential is seeded by default because ``build_eval_env``
         now ABORTS when the roster resolves none (see
