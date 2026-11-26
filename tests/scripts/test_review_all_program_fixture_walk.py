@@ -19,7 +19,7 @@ from df_pytest_isolation import run_in_new_session
 
 REPO_ROOT = Path(__file__).parents[2]
 WALK = REPO_ROOT / 'scripts' / 'check_review_all_program_fixture.py'
-EXPECTED = ('B1', 'B2', 'B3', 'B4', 'B5', 'B6', 'B7', 'B8', 'B11', 'B12', 'B13')
+EXPECTED = ('B1', 'B2', 'B3', 'B4', 'B5', 'B6', 'B7', 'B8', 'B9', 'B10', 'B11', 'B12', 'B13', 'B16')
 SCENARIO_LINE = re.compile(r'^(B\d+) (ok|FAIL) ')
 SUMMARY_PREFIX = 'fixture walk: '
 WALK_TIMEOUT_SECS = 240
