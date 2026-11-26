@@ -17,12 +17,14 @@ value FAILs".
 from __future__ import annotations
 
 from collections import defaultdict
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from itertools import pairwise
 from typing import Any
+
+import merge_lane_throughput as mlt
 
 Event = Mapping[str, Any]
 
@@ -47,8 +49,11 @@ def _at(event: Event) -> datetime | None:
     return _instant(event.get('timestamp'))
 
 
-def _is_number(raw: object) -> bool:
-    return isinstance(raw, (int, float)) and not isinstance(raw, bool)
+def _number(raw: object) -> float | None:
+    """*raw* as a float, or None for a missing, bool or non-numeric value."""
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        return None
+    return float(raw)
 
 
 def _str_or_none(raw: object) -> str | None:
@@ -167,7 +172,7 @@ def _finalize_landings(finalized: Sequence[Event]) -> list[Landing]:
         rows.append(Landing(
             task_id=str(event.get('task_id')), at=moment,
             merge_sha=_str_or_none(data.get('merge_sha')),
-            via_chain=_is_number(data.get('landed_via_chain')),
+            via_chain=_number(data.get('landed_via_chain')) is not None,
         ))
     return rows
 
@@ -262,4 +267,110 @@ def gate_conditionals(
         gated=gated,
         p_gate_after_gate=_conditional(gated, previous=True),
         p_gate_after_ungated=_conditional(gated, previous=False),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Time-based figures. Rules: the merge-throughput report's C-laptop and
+# B-ledger §4b (heartbeat weighting) and D-regimes §3.2 (union-busy).
+# ---------------------------------------------------------------------------
+
+HEARTBEAT_GAP_CAP = timedelta(seconds=600)
+HOURS_PER_WEEK = 168.0
+
+Interval = tuple[datetime, datetime]
+
+
+def _weighted_heartbeats(heartbeats: Sequence[Event], hi: datetime) -> list[tuple[float, Event]]:
+    """Each heartbeat with the seconds to the next one (the last: to *hi*), capped at 600 s."""
+    timed = sorted(
+        ((moment, e) for e in heartbeats if (moment := _at(e)) is not None),
+        key=lambda pair: pair[0],
+    )
+    if not timed:
+        return []
+    following = [moment for moment, _ in timed[1:]] + [hi]
+    return [
+        (max(0.0, min(nxt - moment, HEARTBEAT_GAP_CAP).total_seconds()), event)
+        for (moment, event), nxt in zip(timed, following, strict=True)
+    ]
+
+
+def _holds_finished_lease(heartbeat: Event, host: str) -> bool:
+    occupancy = _data(heartbeat).get('occupancy')
+    leases = occupancy.get('leases') if isinstance(occupancy, Mapping) else None
+    return isinstance(leases, list) and any(
+        isinstance(lease, Mapping) and lease.get('host') == host and lease.get('activity') == 'finished'
+        for lease in leases
+    )
+
+
+def host_finished_share(heartbeats: Sequence[Event], hi: datetime, host: str) -> float | None:
+    """Heartbeat-weighted share of time *host* held a lease whose verify had finished."""
+    weighted = _weighted_heartbeats(heartbeats, hi)
+    finished = sum(weight for weight, e in weighted if _holds_finished_lease(e, host))
+    return _share(finished, sum(weight for weight, _ in weighted))
+
+
+def _interval(event: Event, duration_key: str) -> Interval | None:
+    """``[timestamp - data[duration_key] ms, timestamp]``: a verify event is stamped at its end."""
+    end, millis = _at(event), _number(_data(event).get(duration_key))
+    if end is None or millis is None:
+        return None
+    return (end - timedelta(milliseconds=millis), end)
+
+
+def _intervals(events: Sequence[Event], duration_key: str) -> list[Interval]:
+    return [span for e in events if (span := _interval(e, duration_key)) is not None]
+
+
+def _union_hours(intervals: Iterable[Interval], lo: datetime, hi: datetime) -> float:
+    """Hours of ``[lo, hi)`` covered by at least one interval; overlaps count once."""
+    covered = timedelta(0)
+    reach = lo
+    for start, end in sorted(intervals):
+        start, end = max(start, reach), min(end, hi)
+        if end > start:
+            covered += end - start
+            reach = end
+    return covered.total_seconds() / 3600.0
+
+
+@dataclass(frozen=True)
+class HostHours:
+    hours: float
+    per_week: float
+
+
+def host_verify_hours(
+    verify: Sequence[Event], cancelled: Sequence[Event], lo: datetime, hi: datetime, host: str,
+) -> HostHours:
+    """Union of *host*'s completed (``runner``) and cancelled (``host``) merge-verify time in ``[lo, hi)``."""
+    spans = [
+        *_intervals([e for e in verify if _data(e).get('runner') == host], 'duration_ms'),
+        *_intervals([e for e in cancelled if _data(e).get('host') == host], 'elapsed_ms'),
+    ]
+    hours = _union_hours(spans, lo, hi)
+    window_hours = (hi - lo).total_seconds() / 3600.0
+    return HostHours(hours=hours, per_week=hours * HOURS_PER_WEEK / window_hours)
+
+
+def union_busy_hours(verify: Sequence[Event], lo: datetime, hi: datetime) -> float:
+    """Hours in ``[lo, hi)`` during which any host ran a completed merge verify."""
+    return _union_hours(_intervals(verify, 'duration_ms'), lo, hi)
+
+
+@dataclass(frozen=True)
+class QueueToLand:
+    p50_hours: float | None
+    n: int
+    n_missing: int
+
+
+def queue_to_land(finalized: Sequence[Event]) -> QueueToLand:
+    """Median ``queue_to_land_secs`` of done landings, per merge_lane_throughput's policy signals."""
+    series = mlt.compute_policy_signals([], [], [], [dict(e) for e in finalized])['queue_to_land']
+    p50 = series['p50']
+    return QueueToLand(
+        p50_hours=None if p50 is None else p50 / 3600.0, n=series['n'], n_missing=series['n_missing'],
     )
