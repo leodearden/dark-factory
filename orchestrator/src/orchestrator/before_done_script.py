@@ -12,7 +12,12 @@ from enum import Enum
 from pathlib import Path
 from typing import assert_never
 
-from shared.proc_group import SigkillDispatch, sigkill_process_group
+from shared.proc_group import (
+    LeaderPidfd,
+    SigkillDispatch,
+    open_leader_pidfd,
+    sigkill_process_group,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -29,8 +34,8 @@ class ProcessTeardown(Enum):
 
     That distinction is the whole point of this type (task 4252 reviewer
     finding): the timeout branch used to describe its teardown as a
-    whole-group SIGKILL unconditionally, while the branch it takes MOST often
-    dispatches no signal at all, so the escalation told an operator a
+    whole-group SIGKILL unconditionally, while the branch it then took MOST
+    often dispatched no signal at all, so the escalation told an operator a
     surviving process was gone when it was still running.  A caller can only
     state what was dispatched if the teardown RETURNS it.
 
@@ -42,8 +47,9 @@ class ProcessTeardown(Enum):
     plain ``Enum`` rather than a ``StrEnum``.
     """
 
-    #: ``os.killpg`` reached the whole group, so processes the script spawned
-    #: died with it.
+    #: The whole group was signalled, by ``os.killpg`` or through the leader
+    #: pidfd held from spawn even after the script itself was reaped, so
+    #: processes the script spawned died with it.
     GROUP_KILLED = 'its whole process group was SIGKILLed'
     #: The whole-group signal was refused as unsafe
     #: (``shared.proc_group.unsafe_pgid_reason``) or the ``killpg`` itself
@@ -53,10 +59,12 @@ class ProcessTeardown(Enum):
         'only its direct child process was signalled — the whole-group signal '
         'was refused or failed, so nothing the script spawned was killed'
     )
-    #: ``proc`` was already reaped, so the pid-recycling guard dispatched
-    #: NOTHING and the whole tree below it SURVIVES.  See
-    #: ``shared/src/shared/proc_group.py::sigkill_process_group`` for why
-    #: refusing to signal beats reaping an orphan.
+    #: ``proc`` was already reaped and no held pidfd reached its group, so
+    #: NOTHING was dispatched and the whole tree below it SURVIVES: a script
+    #: reaped before ``run_script`` could take its pidfd (the fast exit
+    #: asyncio reaps inside ``create_subprocess_exec``), or a kernel before
+    #: Linux 6.9.  See ``shared/src/shared/proc_group.py::sigkill_process_group``
+    #: for why refusing to signal a reaped pid beats reaping an orphan.
     NOT_SIGNALLED = (
         'nothing was signalled at all — the script had already been reaped, so '
         'signalling its possibly-recycled pid was refused, and nothing the '
@@ -144,13 +152,13 @@ class ScriptTimeout(Exception):
       ``terminate_process_tree`` rather than re-derived here.
 
     ``exit_code`` is NOT a sound proxy for whether a kill was dispatched, in
-    EITHER direction.  The usual exited-script case above short-circuits the
-    ``killpg`` entirely (the pid-recycling guard refuses to signal a reaped
-    leader), so an exit code comes with NO signal at all; conversely a script
-    that exits in the narrow window between the timeout firing and the
-    ``killpg`` gets both an exit code AND a real whole-group kill.  That is
-    precisely why the disposition is measured and carried instead of inferred
-    by a caller.
+    EITHER direction.  The usual exited-script case above gets both an exit
+    code AND a whole-group kill, through the leader pidfd ``run_script`` holds
+    from spawn (``shared/src/shared/proc_group.py::sigkill_process_group``);
+    only a script reaped before that pidfd was taken, or a kernel before
+    Linux 6.9, yields an exit code with NO signal at all.  That is precisely
+    why the disposition is measured and carried instead of inferred by a
+    caller.
 
     Captured output is never carried in any case — that read was still in
     flight when the timeout fired.
@@ -267,10 +275,11 @@ async def run_script(
     Raises:
         ScriptTimeout — the script overran *timeout_secs*.  Task 2090's
             Layer-A teardown runs FIRST, before the raise, and the raise
-            carries WHICH signal that teardown dispatched — for an
-            already-reaped child, none at all.  An infra fault, not a
-            verdict; see the ``ScriptTimeout`` docstring for why it is
-            deliberately not a ``(1, tail)`` return.
+            carries WHICH signal that teardown dispatched — none at all only
+            for a child reaped before its leader pidfd was taken, or on a
+            kernel before Linux 6.9.  An infra fault, not a verdict; see the
+            ``ScriptTimeout`` docstring for why it is deliberately not a
+            ``(1, tail)`` return.
     """
     env = {**os.environ, **env_overrides} if env_overrides else None
     proc = await asyncio.create_subprocess_exec(
@@ -287,6 +296,24 @@ async def run_script(
     # group (task 845) — see shared/src/shared/proc_group.py's module
     # docstring, "Why the caller captures pgid".
     pgid = proc.pid
+    # Held from spawn so the timeout teardown still reaches the group once the
+    # script itself is reaped (task 10370).
+    with open_leader_pidfd(proc) as leader_pidfd:
+        return await _communicate_or_tear_down(
+            proc, pgid, leader_pidfd,
+            timeout_secs=timeout_secs, reap_grace_secs=reap_grace_secs,
+        )
+
+
+async def _communicate_or_tear_down(
+    proc: asyncio.subprocess.Process,
+    pgid: int,
+    leader_pidfd: LeaderPidfd | None,
+    *,
+    timeout_secs: float,
+    reap_grace_secs: float,
+) -> tuple[int, str]:
+    """Drain *proc* under *timeout_secs*; an overrun tears its tree down, then raises ScriptTimeout."""
     try:
         stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout_secs)
         tail = (stdout or b'').decode(errors='replace')[-2000:]
@@ -295,22 +322,24 @@ async def run_script(
         # Task 2090: the deploy script may spawn grandchildren (e.g.
         # restart-fused-memory.sh --drain forking systemctl/curl/journalctl/
         # sleep/the restarted daemon) that inherit the write end of the
-        # merged stdout pipe above.  Killing only this direct child leaves
-        # them alive as orphans — still holding that pipe open and still
-        # running indefinitely.  start_new_session=True (above) makes this
-        # process its own session/group leader so the WHOLE tree can be
-        # torn down together instead of leaking orphaned processes.
+        # merged stdout pipe.  Killing only this direct child leaves them
+        # alive as orphans — still holding that pipe open and still running
+        # indefinitely.  start_new_session=True makes the script its own
+        # session/group leader so the WHOLE tree can be torn down together.
         #
         # The teardown stays FIRST: task 4065 only changed how the timeout
         # is REPORTED, not the Layer-A guarantee that the process group is
         # dead before this frame unwinds.  `terminate_process_tree` never
         # raises (see its docstring), so the raise below is always reached.
-        teardown = await terminate_process_tree(proc, pgid, reap_grace_secs=reap_grace_secs)
+        teardown = await terminate_process_tree(
+            proc, pgid, leader_pidfd=leader_pidfd, reap_grace_secs=reap_grace_secs,
+        )
         # Both facts below are MEASURED here, not inferred: the script may
-        # already have exited while a grandchild held the pipe open, and that
-        # same case makes the teardown skip the killpg.  See ScriptTimeout's
-        # ``exit_code`` and ``teardown`` fields.  A negative returncode is a
-        # signal death and None an incomplete reap: neither is an exit code.
+        # already have exited while a grandchild held the pipe open, and then
+        # only the held leader pidfd can still reach its group.  See
+        # ScriptTimeout's ``exit_code`` and ``teardown`` fields.  A negative
+        # returncode is a signal death and None an incomplete reap: neither
+        # is an exit code.
         rc = proc.returncode
         raise ScriptTimeout(
             timeout_secs,
@@ -320,14 +349,19 @@ async def run_script(
 
 
 async def terminate_process_tree(
-    proc: asyncio.subprocess.Process, pgid: int, *, reap_grace_secs: float,
+    proc: asyncio.subprocess.Process,
+    pgid: int,
+    *,
+    leader_pidfd: LeaderPidfd | None,
+    reap_grace_secs: float,
 ) -> ProcessTeardown:
     """SIGKILL *proc*'s whole process group, then bound the reap (task 2090).
 
     The signal choice is
     ``shared/src/shared/proc_group.py::sigkill_process_group``'s: the whole
     group, a direct ``proc.kill()`` when the group kill is refused or
-    fails, or nothing once the leader is reaped.  This helper renders that
+    fails, or nothing once the leader is reaped and no held pidfd reaches
+    its group.  This helper renders that
     choice as a ``ProcessTeardown`` and bounds the reap by
     *reap_grace_secs*, so a process stuck in an uninterruptible
     state cannot hang it (and therefore ``run_script``) forever.
@@ -340,7 +374,7 @@ async def terminate_process_tree(
         (task 4252).  A caller may NOT conclude from this that anything
         actually DIED: the reap below is bounded and can be abandoned, and
         ``NOT_SIGNALLED``/``DIRECT_KILLED`` mean processes the script
-        spawned were deliberately left alone.
+        spawned were not signalled.
 
     Args:
         proc: the timed-out child, spawned with ``start_new_session=True``
@@ -351,9 +385,13 @@ async def terminate_process_tree(
             ``shared/src/shared/proc_group.py``'s module docstring ("Why
             the caller captures pgid") is the canonical statement of this
             contract.
+        leader_pidfd: what ``open_leader_pidfd`` yielded right after that
+            spawn, or None.
         reap_grace_secs: the bound on reaping *proc* after the signal.
     """
-    teardown = ProcessTeardown.from_dispatch(sigkill_process_group(proc, pgid))
+    teardown = ProcessTeardown.from_dispatch(
+        sigkill_process_group(proc, pgid, leader_pidfd=leader_pidfd),
+    )
 
     try:
         await asyncio.wait_for(proc.wait(), timeout=reap_grace_secs)

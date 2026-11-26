@@ -417,7 +417,7 @@ class TestBeforeDoneSubprocessTimeoutHardening:
         with patch(
             'os.killpg', side_effect=ProcessLookupError('no such process'),
         ) as mock_killpg:
-            result = await terminate_process_tree(mock_proc, pgid, reap_grace_secs=0.05)
+            result = await terminate_process_tree(mock_proc, pgid, leader_pidfd=None, reap_grace_secs=0.05)
 
         mock_killpg.assert_called_once_with(pgid, signal.SIGKILL)
         mock_proc.kill.assert_called_once()
@@ -459,7 +459,7 @@ class TestBeforeDoneSubprocessTimeoutHardening:
             # Hang tripwire: if reap_grace_secs stops bounding the wait, fail
             # loudly instead of stalling the suite.
             result = await asyncio.wait_for(
-                terminate_process_tree(mock_proc, pgid, reap_grace_secs=0.05), timeout=5,
+                terminate_process_tree(mock_proc, pgid, leader_pidfd=None, reap_grace_secs=0.05), timeout=5,
             )
 
         mock_killpg.assert_called_once()
@@ -492,7 +492,7 @@ class TestBeforeDoneSubprocessTimeoutHardening:
             patch('os.killpg', side_effect=lambda pgid, sig: killpg_calls.append((pgid, sig))),
             patch('os.getpgid', side_effect=lambda pid: getpgid_calls.append(pid) or 999),
         ):
-            result = await terminate_process_tree(mock_proc, 12345, reap_grace_secs=0.05)
+            result = await terminate_process_tree(mock_proc, 12345, leader_pidfd=None, reap_grace_secs=0.05)
         assert killpg_calls == [], f'must not killpg a reaped proc (task 845); got {killpg_calls}'
         assert getpgid_calls == [], f'must never re-derive the pgid at kill time; got {getpgid_calls}'
         mock_proc.kill.assert_not_called()
@@ -538,7 +538,7 @@ class TestBeforeDoneSubprocessTimeoutHardening:
 
         killpg_calls: list[tuple[int, int]] = []
         with patch('os.killpg', side_effect=lambda p, s: killpg_calls.append((p, s))):
-            result = await terminate_process_tree(mock_proc, pgid, reap_grace_secs=0.05)
+            result = await terminate_process_tree(mock_proc, pgid, leader_pidfd=None, reap_grace_secs=0.05)
 
         assert killpg_calls == [], (
             f'{scenario}: refused pgid must never be signalled -- killpg on our '
