@@ -63,7 +63,9 @@ def _task(task_id, status, metadata):
     return {'id': task_id, 'status': status, 'title': f'task {task_id}', 'metadata': metadata}
 
 
-def _make_service(resolvable=(SURVIVOR,), descendants=(), truncated=False, children=()):
+def _make_service(
+    resolvable=(SURVIVOR,), descendants=(), truncated=False, children=(), missing=(),
+):
     """MemoryService whose awaited children are EXPLICIT AsyncMocks.
 
     Required by tests/test_check_bare_magicmock_config.py and
@@ -81,6 +83,9 @@ def _make_service(resolvable=(SURVIVOR,), descendants=(), truncated=False, child
     gate ``delete_memory`` runs internally, exposed so the tool can ask
     "would this be refused?" BEFORE the citation gate mutates anything.
     *children* makes it raise, modelling a target that still has them.
+
+    ``memory_exists`` is the target-existence probe the tool asks before any
+    citation pass; *missing* names the ids it answers False for.
     """
     svc = AsyncMock()
     svc.delete_memory = AsyncMock(
@@ -103,6 +108,11 @@ def _make_service(resolvable=(SURVIVOR,), descendants=(), truncated=False, child
         return_value=DescendantScan(ids=list(descendants), truncated=truncated),
     )
     svc.refuse_if_children = AsyncMock(side_effect=_refuse_if_children)
+
+    async def _exists(memory_id, *, store, project_id):
+        return memory_id not in missing
+
+    svc.memory_exists = AsyncMock(side_effect=_exists)
     return svc
 
 
@@ -2207,3 +2217,143 @@ class TestCascadePreflightReadsTheTaskTreeOnce:
         # One pre-flight read, then one LIVE read per record on the pass.
         assert interceptor.get_tasks.await_count == 4
         service.delete_memory.assert_awaited_once()
+
+
+class TestMissingTargetIsRefusedBeforeAnyCitationPass:
+    """A delete whose target does not exist must not have mutated anything.
+
+    The service returns ``MemoryNotFound`` for a missing target, but only
+    after the tool layer's citation passes have run. A cascade aimed at a
+    missing parent whose orphaned children survive used to repoint and
+    tombstone the citers of those LIVE children, then delete nothing; the
+    override arm logged dangles for deletes that never ran.
+    """
+
+    @pytest.fixture
+    def interceptor(self):
+        return _make_interceptor([
+            _task('1801', 'pending', {'mem0_canonical_entry': CHILD}),
+            _task('1802', 'pending', {'mem0_canonical_entry': DOOMED}),
+        ])
+
+    def _server(self, service, interceptor):
+        return create_mcp_server(
+            service, task_interceptor=interceptor, known_projects=KNOWN_PROJECTS,
+        )
+
+    @pytest.mark.asyncio
+    async def test_cascade_on_a_missing_parent_rewrites_no_task(self, interceptor):
+        service = _make_service(descendants=[CHILD], missing=[DOOMED])
+        mcp_server = self._server(service, interceptor)
+
+        result = await _call_delete(
+            mcp_server, cascade=True, replacement_memory_id=SURVIVOR,
+        )
+
+        assert result['error_type'] == 'MemoryNotFound'
+        assert result['id'] == DOOMED
+        assert 'cascade_citation_repoint' not in result
+        interceptor.update_task.assert_not_awaited()
+        service.list_descendant_ids.assert_not_awaited()
+        service.delete_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_single_record_replacement_on_a_missing_target_rewrites_no_task(
+        self, interceptor,
+    ):
+        service = _make_service(missing=[DOOMED])
+        mcp_server = self._server(service, interceptor)
+
+        result = await _call_delete(mcp_server, replacement_memory_id=SURVIVOR)
+
+        assert result['error_type'] == 'MemoryNotFound'
+        interceptor.update_task.assert_not_awaited()
+        service.refuse_if_children.assert_not_awaited()
+        service.delete_memory.assert_not_awaited()
+
+    @pytest.mark.parametrize('cascade', [False, True])
+    @pytest.mark.asyncio
+    async def test_override_on_a_missing_target_claims_no_dangle(
+        self, interceptor, caplog, cascade,
+    ):
+        service = _make_service(descendants=[CHILD], missing=[DOOMED])
+        mcp_server = self._server(service, interceptor)
+
+        with caplog.at_level('WARNING'):
+            result = await _call_delete(
+                mcp_server, cascade=cascade,
+                metadata={'allow_dangling_citations': True},
+            )
+
+        assert result['error_type'] == 'MemoryNotFound'
+        assert 'dangled_citations' not in result
+        assert not [r for r in caplog.records if 'dangling' in r.getMessage()]
+        service.delete_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_an_existing_target_still_repoints_and_deletes(self, interceptor):
+        """Positive control: the probe answering True leaves the path as it was."""
+        service = _make_service()
+        mcp_server = self._server(service, interceptor)
+
+        result = await _call_delete(mcp_server, replacement_memory_id=SURVIVOR)
+
+        assert result['status'] == 'deleted'
+        service.memory_exists.assert_awaited_once()
+        interceptor.update_task.assert_awaited_once()
+        service.delete_memory.assert_awaited_once()
+
+
+class TestMissingParentCascadeOverARealService:
+    """The reviewer's probe, end to end: the real MCP tool over a real
+    MemoryService, DOOMED absent from Qdrant, CHILD an orphan still carrying
+    DOOMED as its ``parent_id`` and cited by a live task."""
+
+    @pytest.fixture
+    def service(self, mock_config):
+        from fused_memory.services.memory_service import MemoryService
+
+        svc = MemoryService(mock_config)
+        svc.graphiti = MagicMock()
+        svc.mem0 = MagicMock()
+
+        async def _point(*args, **kwargs):
+            if DOOMED in args or DOOMED in kwargs.values():
+                return None
+            return {'id': CHILD, 'memory': 'live child', 'metadata': {'parent_id': DOOMED}}
+
+        async def _count(*args, **kwargs):
+            return 1 if DOOMED in repr((args, kwargs)) else 0
+
+        svc.mem0.get_point_by_id = AsyncMock(side_effect=_point)
+        svc.mem0.count_by_metadata = AsyncMock(side_effect=_count)
+        svc.mem0.scroll_by_metadata = AsyncMock(
+            return_value=[{'id': CHILD, 'memory': 'live child', 'metadata': {'parent_id': DOOMED}}],
+        )
+        svc.mem0.delete = AsyncMock(return_value={'message': 'deleted'})
+        return svc
+
+    @pytest.mark.asyncio
+    async def test_no_citer_of_a_surviving_child_is_rewritten(self, service, caplog):
+        interceptor = _make_interceptor([
+            _task('1', 'pending', {'mem0_canonical_entry': CHILD}),
+        ])
+        mcp_server = create_mcp_server(
+            service, task_interceptor=interceptor, known_projects=KNOWN_PROJECTS,
+        )
+
+        with caplog.at_level('WARNING'):
+            result = await _call_delete(
+                mcp_server, cascade=True, replacement_memory_id=SURVIVOR,
+            )
+
+        assert result['error_type'] == 'MemoryNotFound'
+        assert 'cascade_citation_repoint' not in result
+        interceptor.update_task.assert_not_awaited()
+        service.mem0.delete.assert_not_awaited()
+        assert not [r for r in caplog.records if 'dangling' in r.getMessage()]
+        # Control: the miss was actually read from the store, not assumed.
+        assert any(
+            DOOMED in c.args or DOOMED in c.kwargs.values()
+            for c in service.mem0.get_point_by_id.await_args_list
+        )

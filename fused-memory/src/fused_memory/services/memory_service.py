@@ -1431,7 +1431,7 @@ class MemoryNotFoundError(Exception):
     """Raised when a mem0 memory id is not found."""
 
 
-def _memory_not_found(
+def memory_not_found(
     store: str, memory_id: str, project_id: str, *, nothing_was: str
 ) -> dict:
     """The RETURNED refusal for a mutation whose target id resolves to nothing."""
@@ -9419,15 +9419,20 @@ class MemoryService:
 
         return deleted
 
-    async def _memory_exists(
-        self, memory_id: str, *, source: SourceStore, project_id: str
+    async def memory_exists(
+        self, memory_id: str, *, store: str, project_id: str
     ) -> bool:
-        """Whether *memory_id* resolves in *source*; a read failure propagates.
+        """Whether *memory_id* resolves in *store*; a read failure propagates.
 
         Only a definite miss answers False, so an unknown (a ``TimeoutError``
         included) is never mistaken for an absent record.
+
+        PUBLIC and side-effect-free for the reason :meth:`refuse_if_children`
+        is: the MCP tool layer settles the target's existence BEFORE its
+        citation passes mutate task metadata, since the refusal below in
+        :meth:`delete_memory` fires only after them.
         """
-        if source == SourceStore.mem0:
+        if SourceStore(store) == SourceStore.mem0:
             return await self.get_memory_by_id(project_id, memory_id) is not None
         try:
             await self.graphiti.get_edge_text(memory_id, group_id=project_id)
@@ -9505,7 +9510,10 @@ class MemoryService:
         design. A raised read propagates, because an unknown is not a miss.
         ``GraphitiBackend.remove_edge`` stays idempotent for its other callers;
         the Graphiti read is ``get_edge_text``. In the mem0 arm the read runs
-        before the child gate.
+        before the child gate, so a ``cascade=True`` aimed at a missing parent
+        destroys NOTHING: children still carrying its dead ``parent_id`` are
+        not swept up. They are live records and the correct referents of
+        whatever cites them; deleting them is a separate, explicit call.
 
         Both guards sit above the store branch so ONE check covers both the
         Graphiti and Mem0 paths, and above the journal write and event emission
@@ -9544,8 +9552,8 @@ class MemoryService:
                 'cascade if a plain delete of this record is what was meant.'
             )
         require_full_uuid(memory_id, field_name='memory_id')
-        if not await self._memory_exists(memory_id, source=source, project_id=project_id):
-            return _memory_not_found(store, memory_id, project_id, nothing_was='deleted')
+        if not await self.memory_exists(memory_id, store=store, project_id=project_id):
+            return memory_not_found(store, memory_id, project_id, nothing_was='deleted')
 
         write_op_id = str(uuid_mod.uuid4())
         cascaded_child_ids: list[str] = []
@@ -9835,7 +9843,7 @@ class MemoryService:
         # distinction away at the one layer that still has it.
         existing = await self.get_memory_by_id(project_id=project_id, memory_id=memory_id)
         if existing is None:
-            return _memory_not_found('mem0', memory_id, project_id, nothing_was='updated')
+            return memory_not_found('mem0', memory_id, project_id, nothing_was='updated')
 
         # The FULL raw Qdrant payload — mem0-owned keys and custom provenance
         # keys alike. Copied so the arms below can compute a delta against it

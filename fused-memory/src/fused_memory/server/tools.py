@@ -254,7 +254,11 @@ from fused_memory.services.consolidation_ops import (
     read_topic_closure,
 )
 from fused_memory.services.id_resolver import IdResolver, is_uuid_prefix
-from fused_memory.services.memory_service import MemoryService, metadata_row_text
+from fused_memory.services.memory_service import (
+    MemoryService,
+    memory_not_found,
+    metadata_row_text,
+)
 from fused_memory.services.read_telemetry import (
     fallback_search_summary,
     summarize_search_query,
@@ -2433,6 +2437,24 @@ def create_mcp_server(
         record and the task DB, not of who asked.
         """
         return store == 'mem0' and _taskmaster_configured and project_id in _kp
+
+    async def _missing_target_refusal(
+        memory_id: str, store: str, project_id: str
+    ) -> dict[str, Any] | None:
+        """The service's ``MemoryNotFound`` refusal, asked BEFORE any citation pass.
+
+        The service checks existence itself, but only after this layer's
+        repoint pass has rewritten task metadata and its override arm has
+        logged citations as dangled. A cascade aimed at a missing parent
+        would otherwise repoint and tombstone the citers of its SURVIVING
+        children, then delete nothing. Same envelope builder as the service,
+        so the caller cannot tell which layer refused.
+        """
+        if await memory_service.memory_exists(
+            memory_id, store=store, project_id=project_id
+        ):
+            return None
+        return memory_not_found(store, memory_id, project_id, nothing_was='deleted')
 
     async def _citation_repoint_gate(
         memory_id: str,
@@ -5888,9 +5910,11 @@ def create_mcp_server(
             # destroy them in, so the set that is gated and the sequence that
             # runs are read the same way. A set that cannot be fully
             # enumerated refuses here and never reaches the pre-flight.
-            rejection, cascade_ids = await _cascade_enumerate(
-                resolved_id, project_id
-            )
+            rejection = await _missing_target_refusal(resolved_id, store, project_id)
+            if rejection is None:
+                rejection, cascade_ids = await _cascade_enumerate(
+                    resolved_id, project_id
+                )
             if rejection is None:
                 rejection = _cascade_replacement_outside_set(
                     cascade_ids, resolved_id, replacement_memory_id,
@@ -5926,20 +5950,27 @@ def create_mcp_server(
             #
             # Charged only where the gate has something to lose: the mutating
             # arm needs a replacement_memory_id, and the override arm logs a
-            # WARNING naming citations it claims to have dangled on a delete
-            # that then never happened. A plain uncited delete — the common
-            # path, and every one of the six in-repo recon callers — pays
-            # nothing extra.
+            # WARNING naming citations it claims to have dangled. Either would
+            # misfire on a delete the service then refuses, for children or
+            # for a missing target, so both refusals are asked first, in the
+            # service's own order. A plain uncited delete — the common path,
+            # and every one of the six in-repo recon callers — pays nothing
+            # extra.
             if _citation_gate_applies(store, project_id) and (
                 replacement_memory_id is not None or allow_dangling_citations
             ):
-                await memory_service.refuse_if_children(
-                    resolved_id, project_id=project_id
+                rejection = await _missing_target_refusal(
+                    resolved_id, store, project_id
                 )
-            rejection, repoint_stats = await _citation_repoint_gate(
-                resolved_id, store, project_id, agent_id, replacement_memory_id,
-                allow_dangling_citations=allow_dangling_citations,
-            )
+                if rejection is None:
+                    await memory_service.refuse_if_children(
+                        resolved_id, project_id=project_id
+                    )
+            if rejection is None:
+                rejection, repoint_stats = await _citation_repoint_gate(
+                    resolved_id, store, project_id, agent_id, replacement_memory_id,
+                    allow_dangling_citations=allow_dangling_citations,
+                )
         if rejection:
             # The `is True` strictness above is right, but dropping a
             # non-conforming value in SILENCE is not: the caller would get back
