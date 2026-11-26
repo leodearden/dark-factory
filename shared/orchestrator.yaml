@@ -77,8 +77,8 @@ type_check_command: "uv run --directory shared pyright --threads 8 src/ tests/"
 # Runs 2-10 below ran under a REAL NINE-WAY GATHER — the eight other
 # registered module test_commands running concurrently, reproducing
 # verify.run_full_verification's asyncio.gather over module_configs.values()
-# — which is the standard paragraph (1a) below prescribes for a re-measure;
-# run 1 predates the wave.
+# — the standard paragraph (1a) below then set for a hand re-measure,
+# superseded for shared by (1)'s dry-run; run 1 predates the wave.
 #
 #    141.81s wall / 129.51s pytest  architect run 1; rc=0, 4779p/14s/9d;
 #                                   loadavg  73.42 ->  81.93
@@ -122,16 +122,21 @@ type_check_command: "uv run --directory shared pyright --threads 8 src/ tests/"
 #
 # (1a) BE PRECISE ABOUT WHAT THAT GATHER IS. This paragraph is the full
 # statement; the other five module yamls this task closed carry a one-line
-# pointer here rather than a sixth copy of it.
+# pointer here rather than a sixth copy of it. For shared itself it is HISTORY
+# of the superseded task-5131 sweep since task 11824: an archive W comes from
+# a production verify run, so no gather is reproduced by hand, and (1)'s
+# dry-run is shared's only re-measure. It stays the full statement for the
+# siblings whose W is still a hand sweep.
 #   CORRECTED IN PLACE (task 5131): this paragraph used to open "it is a
 #   LOWER BOUND on the production shape, not a reproduction of it", reasoning
-#   from "the six-way wave measured above". Paragraph (1)'s ten runs are no
-#   longer that six-way wave — runs 2-10 ran under a REAL NINE-WAY gather,
-#   the eight other registered module configs launched concurrently exactly
-#   as verify.run_full_verification's asyncio.gather does — so W now reflects
-#   the full gather this paragraph calls for, rather than an extrapolation
-#   from a smaller one. The two mechanisms below still bound the residual gap
-#   to a true production run and are otherwise unaffected by this change.
+#   from "the six-way wave measured above". The superseded sweep's ten runs
+#   were no longer that six-way wave — runs 2-10 ran under a REAL NINE-WAY
+#   gather, the eight other registered module configs launched concurrently
+#   exactly as verify.run_full_verification's asyncio.gather does — so the
+#   sweep's W then reflected the full gather this paragraph calls for, rather
+#   than an extrapolation from a smaller one. The two mechanisms below still
+#   bound the residual gap to a true production run and are otherwise
+#   unaffected by this change.
 #
 # verify.run_full_verification asyncio.gathers over module_configs.values(),
 # which is NINE registered configs today — the six this task closed plus
@@ -163,17 +168,20 @@ type_check_command: "uv run --directory shared pyright --threads 8 src/ tests/"
 #       have contributed to esc-4502-1's starvation. Not measured; this
 #       corrects only the stale default-1 premise.
 #
-# What remains after those is what the 2.6x multiple absorbs. That is an
-# ASSUMPTION with an error bar, not a measurement, and false infra_timeout on
-# the honest green path is precisely the defect these blocks exist to avoid —
-# so if this suite ever does time out under a full nine-way gather,
-# RE-MEASURE with all nine in flight rather than assuming the multiple still
-# covers it. Task 5131 is the worked example of doing exactly that.
+# For a sibling still sized from a hand sweep, what remains after those is what
+# the 2.6x multiple absorbs. That is an ASSUMPTION with an error bar, not a
+# measurement, and false infra_timeout on the honest green path is precisely
+# the defect these blocks exist to avoid — so if such a suite ever does time
+# out under a full nine-way gather, RE-MEASURE with all nine in flight rather
+# than assuming the multiple still covers it. Task 5131 is the worked example
+# of doing exactly that, and HISTORY for shared: its budget no longer rests on
+# the multiple (see (3)), and its re-measure is (1)'s dry-run.
 #
 # (2) SIZING (task 11824). W is the archive figure of (1), the worst GREEN
-#     verbatim run on record, never the mean. The binding floor is
+#     verbatim run on record, never the mean. The key declares the larger of
+#     the two gated floors (see (7)); at this W that is
 #     min_leg_budget_for_family(W), the FAMILY-CEILING FLOOR stated just above
-#     the key, and the key declares exactly that floor.
+#     the key.
 #     HISTORY (task 5131 re-measurement): W = 296.88s, the WORST of the ten
 #     verbatim runs then on record; B ~= 2.6 x W = 771.9 -> rounded up to 800,
 #     the 2.6x-convention figure, until task 8402's FAMILY-CEILING FLOOR.
@@ -214,8 +222,8 @@ type_check_command: "uv run --directory shared pyright --threads 8 src/ tests/"
 # sentence that followed it, which was specific to shared: "For shared the
 # two agree: 2.6 x W rounds to exactly 600, so the floor is not doing the
 # work here." That coincidence is gone — shared's declared budget is now
-# derived (the FAMILY-CEILING FLOOR, min_leg_budget_for_family(W)), not the
-# ~600 that once happened to satisfy both the floor and the multiple at once.
+# derived from W (the larger gated floor, see (7)), not the ~600 that once
+# happened to satisfy both the floor and the multiple at once.
 #
 # (4) WHAT THIS ACTUALLY BUYS, stated plainly rather than oversold: a
 # narrowing from the repo-root warm ceiling
@@ -270,7 +278,8 @@ type_check_command: "uv run --directory shared pyright --threads 8 src/ tests/"
 # named below.
 #
 # (7) RAISE THEM TOGETHER. Whenever the re-measure of (1) moves W, raise BOTH
-# this value, to the FAMILY-CEILING FLOOR min_leg_budget_for_family(W), and
+# this value, to the larger of the two gated floors of (8),
+# max(min_leg_budget_for_family(W), min_budget(W)), and
 # MEASURED_MODULE_SUITE_WORST_SECS['shared'] in
 # tests/scripts/test_module_verify_budgets.py — never quietly widen one. That
 # exact pair has already rotted once undetected between the two sibling configs
@@ -354,8 +363,9 @@ type_check_command: "uv run --directory shared pyright --threads 8 src/ tests/"
 # members, whose per-test ceiling is
 # shared/src/shared/whole_tree_guard_family.py::WHOLE_TREE_SCAN_TEST_TIMEOUT.
 # A budget below W + that ceiling kills the leg before a member's backstop
-# fires, turning an attributable hang into a retried infra_timeout. So the
-# binding floor is min_leg_budget_for_family(W), above min_budget(W), and the
-# key below declares exactly that floor. Gated by
+# fires, turning an attributable hang into a retried infra_timeout. min_budget(W)
+# is ~2W and this floor ~W + that ceiling, so this floor binds only while W
+# stays below about that ceiling; the key below declares the larger of the two,
+# which at today's W is this one. Gated by
 # tests/scripts/test_module_verify_budgets.py::test_every_leg_running_the_family_outlasts_its_ceiling.
 verify_command_timeout_secs: 2300

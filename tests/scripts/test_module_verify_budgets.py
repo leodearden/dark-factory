@@ -136,8 +136,10 @@ pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 
-# MEASURED wall-clock, in seconds: the WORST run of each module's own VERBATIM
-# test_command, copied byte-for-byte out of that module's orchestrator.yaml.
+# MEASURED wall-clock, in seconds: the WORST run of a command each module's leg
+# runs — its own VERBATIM test_command, copied byte-for-byte out of that
+# module's orchestrator.yaml, unless the entry's caveat below or its inline
+# comment names a different command.
 #
 # WHERE THE PROVENANCE LIVES — deliberately NOT here. Each module's own
 # orchestrator.yaml carries the full per-run table (every run's wall-clock,
@@ -293,7 +295,8 @@ MEASURED_MODULE_SUITE_WORST_SECS: dict[str, float] = {
     'sampler': 22.49,
     'cockpit': 130.50,
     'client-feed': 140.89,
-    # Worst green archive run (timeout_headroom_selfcheck, task 11824); runs in its orchestrator.yaml.
+    # Worst green archive run, a NON-VERBATIM scoped run of one guard file
+    # (timeout_headroom_selfcheck, task 11824); runs in its orchestrator.yaml.
     'tests/repo_guards': 258.7740934025496,
     # REFRESHED 2026-09-14 from ORCHESTRATOR_BUDGET_CENSUS (5288.0 was a
     # RETIRED-REGIME figure — D17 orders the refresh). This is the prevailing

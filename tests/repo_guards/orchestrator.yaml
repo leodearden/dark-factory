@@ -41,8 +41,9 @@ type_check_command: "uv run --project shared pyright tests/repo_guards/"
 # guard family member, whose per-test ceiling is
 # shared/src/shared/whole_tree_guard_family.py::WHOLE_TREE_SCAN_TEST_TIMEOUT.
 # A budget below W + that ceiling kills the leg before a member's backstop
-# fires, turning an attributable hang into a retried infra_timeout. So the
-# binding floor is min_leg_budget_for_family(W), above min_budget(W), and the
-# key below declares exactly that floor. Gated by
+# fires, turning an attributable hang into a retried infra_timeout. min_budget(W)
+# is ~2W and this floor ~W + that ceiling, so this floor binds only while W
+# stays below about that ceiling; the key below declares the larger of the two,
+# which at today's W is this one. Gated by
 # tests/scripts/test_module_verify_budgets.py::test_every_leg_running_the_family_outlasts_its_ceiling.
 verify_command_timeout_secs: 1500

@@ -142,7 +142,7 @@ test_command: "uv run --project shared pytest tests/scripts/ --tb=short -q --tim
 #     = mc`), not by command, so a SCOPED verify whose touched files span both
 #     scripts/ and tests/scripts/ also runs it twice.
 #
-# That cuts against this file's own premise — the budget below was first sized
+# That cuts against this file's own premise — the budget below was re-sized
 # (task 4320; the FAMILY-CEILING FLOOR since task 8402) for a 2.91x
 # run-to-run spread attributed to host oversubscription, and duplicate
 # execution is itself a contributor to that oversubscription.
@@ -402,9 +402,10 @@ type_check_command: "uv run --project shared pyright tests/scripts/"
 #     105-127s                       four runs (task 3062, esc-3062-3)
 #
 # SIZING (task 11824). W is the largest figure across EVERY row above, either
-# form: since task 11824, the parallel-form archive run. The binding floor is
-# min_leg_budget_for_family(W), the FAMILY-CEILING FLOOR stated just above the
-# key, and the key declares exactly that floor. Task 4320's argument still
+# form: since task 11824, the parallel-form archive run. The key declares the
+# larger of the two gated floors (see the RAISE-TOGETHER RULE); at this W that
+# is min_leg_budget_for_family(W), the FAMILY-CEILING FLOOR stated just above
+# the key. Task 4320's argument still
 # bounds it from below: the serial form is what the ENV_TRANSIENT recovery runs
 # inside this budget, so the budget must never be sized below the serial worst
 # (sizing against a faster form would re-create the false-infra_timeout trap on
@@ -462,8 +463,10 @@ type_check_command: "uv run --project shared pyright tests/scripts/"
 # magnitude.
 #
 # RAISE-TOGETHER RULE. Whenever a re-measure (the selfcheck dry-run of the
-# ARCHIVE row above) moves W, raise BOTH the value declared below, to
-# min_leg_budget_for_family(W), and MEASURED_SUITE_WORST_SECS in
+# ARCHIVE row above) moves W, raise BOTH the value declared below, to the
+# larger of the two gated floors,
+# max(min_leg_budget_for_family(W), MIN_MODULE_BUDGET_SECS), and
+# MEASURED_SUITE_WORST_SECS in
 # tests/scripts/test_tests_scripts_module_config.py, from which
 # MIN_MODULE_BUDGET_SECS follows BY DERIVATION (min_budget: ~2x the worst run,
 # floored to the nearest 100s) — never quietly widen one without the other.
@@ -516,8 +519,9 @@ type_check_command: "uv run --project shared pyright tests/scripts/"
 # members, whose per-test ceiling is
 # shared/src/shared/whole_tree_guard_family.py::WHOLE_TREE_SCAN_TEST_TIMEOUT.
 # A budget below W + that ceiling kills the leg before a member's backstop
-# fires, turning an attributable hang into a retried infra_timeout. So the
-# binding floor is min_leg_budget_for_family(W), above the convention-sized
-# figure of SIZING, and the key below declares exactly that floor. Gated by
+# fires, turning an attributable hang into a retried infra_timeout. min_budget(W)
+# is ~2W and this floor ~W + that ceiling, so this floor binds only while W
+# stays below about that ceiling; the key below declares the larger of the two,
+# which at today's W is this one. Gated by
 # tests/scripts/test_module_verify_budgets.py::test_every_leg_running_the_family_outlasts_its_ceiling.
 verify_command_timeout_secs: 2000
