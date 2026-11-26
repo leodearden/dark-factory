@@ -98,9 +98,10 @@ _REVIEW_SUGGESTIONS_CONTEXT: Final = 'review_suggestions'
 _FINDING_KEY: Final = 'x_finding_key'
 _PRD_PATH_KEY: Final = 'prd_path'
 _CITATION_KEYS: Final = (_FINDING_KEY, _PRD_PATH_KEY)
-_CITED_KEYS: Final = (*_CITATION_KEYS, 'human_decomposed')
+_UNCITED_ARM_EXCLUSIONS: Final = (*_CITATION_KEYS, 'human_decomposed')
 _HOLD_SCOPE_KEYS: Final = (
-    'source', 'spawn_context', 'task_kind', 'execution_class', *_CITED_KEYS, FINDING_SET_HOLD_METADATA_KEY,
+    'source', 'spawn_context', 'task_kind', 'execution_class', *_UNCITED_ARM_EXCLUSIONS,
+    FINDING_SET_HOLD_METADATA_KEY,
 )
 _BACKFILL_FIELDS: Final = (
     'priority',
@@ -119,20 +120,34 @@ def is_holder(task: Mapping[str, object]) -> bool:
     return metadata is not None and metadata.get(FOLLOWUP_HOLDER_METADATA_KEY) is not None
 
 
-def hold_scope(metadata: object, priority: object) -> bool:
+def hold_scope(metadata: object, priority: object, *, task_id: object = None) -> bool:
     """Decision 9: a low task of the normal kind needing no human, in one of two arms.
 
     The uncited follow-up arm holds a follow-up or reviewer suggestion that nothing cites.
     ``human_decomposed`` is the mark every planning-mode birth carries, so this arm never holds a
     PRD decompose. The finding-set arm holds a task that cites a finding and carries a valid
     ``finding_set_hold`` marker, whatever its source, and even when it was born in planning mode.
+
+    A ``finding_set_hold`` marker that holds nothing, because it is malformed or because the task
+    fails the rule, logs one WARNING naming *task_id* (``None`` for a filing not yet created) and
+    why, so a ruling the hold does not enforce is never silent.
     """
-    if not isinstance(priority, str) or priority not in HELD_PRIORITIES:
-        return False
     fields = raw_metadata_dict(metadata, source=_METADATA_SOURCE)
-    if fields.get('task_kind') not in (None, 'normal') or fields.get('execution_class'):
-        return False
-    return _uncited_followup(fields) or _finding_set_member(fields)
+    gate_refusal = _gate_refusal(fields, priority)
+    if gate_refusal is None and _uncited_followup(fields):
+        return True
+    return _finding_set_member(fields, gate_refusal, task_id)
+
+
+def _gate_refusal(fields: Mapping[str, object], priority: object) -> str | None:
+    """Why the task fails the gate both arms share, or None when it passes."""
+    if not isinstance(priority, str) or priority not in HELD_PRIORITIES:
+        return f'priority {priority!r} is not low or polish'
+    if fields.get('task_kind') not in (None, 'normal'):
+        return f"task_kind {fields.get('task_kind')!r} is not normal"
+    if fields.get('execution_class'):
+        return f"it carries execution_class {fields.get('execution_class')!r}"
+    return None
 
 
 def _uncited_followup(fields: Mapping[str, object]) -> bool:
@@ -140,14 +155,26 @@ def _uncited_followup(fields: Mapping[str, object]) -> bool:
         fields.get('source') == _FOLLOWUP_SOURCE
         or fields.get('spawn_context') == _REVIEW_SUGGESTIONS_CONTEXT
     )
-    return filed_as_followup and not any(fields.get(key) for key in _CITED_KEYS)
+    return filed_as_followup and not any(fields.get(key) for key in _UNCITED_ARM_EXCLUSIONS)
 
 
-def _finding_set_member(fields: Mapping[str, object]) -> bool:
-    return bool(fields.get(_FINDING_KEY)) and _finding_set_hold(fields) is not None
+def _finding_set_member(fields: Mapping[str, object], gate_refusal: str | None, task_id: object) -> bool:
+    marker = _finding_set_hold(fields, task_id)
+    if marker is None:
+        return False
+    refusal = gate_refusal
+    if refusal is None and not fields.get(_FINDING_KEY):
+        refusal = f'it cites no finding: {_FINDING_KEY} is missing or empty'
+    if refusal is not None:
+        logger.warning(
+            'followup_hold: task %s carries finding_set_hold (ruling %r) but is not held: %s',
+            task_id, marker.ruling, refusal,
+        )
+        return False
+    return True
 
 
-def _finding_set_hold(fields: Mapping[str, object], task_id: object = None) -> FindingSetHold | None:
+def _finding_set_hold(fields: Mapping[str, object], task_id: object) -> FindingSetHold | None:
     raw = fields.get(FINDING_SET_HOLD_METADATA_KEY)
     if raw is None:
         return None
@@ -250,9 +277,10 @@ _HOLDER_WATCH = (
     'dependency edge until each is promoted (plans/follow-up-filing-shape-prd.md §4.3).'
 )
 _HOLDER_DESCRIPTION = (
-    "This project's follow-up holder. Low-priority agent follow-ups and reviewer suggestions are "
-    'filed depending on it, so they wait here until a citation, a combine, a pack or a human '
-    'promotes them.'
+    "This project's follow-up holder. Low-priority agent follow-ups, reviewer suggestions and "
+    'finding-set members carrying finding_set_hold are filed depending on it, so they wait here '
+    'until a citation, a combine, a pack or a human promotes them. A citation does not promote a '
+    'finding-set member; every other cause does.'
 )
 _HOLDER_DETAILS = (
     'Minted by fused-memory (plans/follow-up-filing-shape-prd.md §4.3). It is a deterministic pure '
@@ -387,8 +415,9 @@ _HOLDER_EDGE_STRIP_HINT = (
     'This task is a held follow-up: it depends on its project\'s follow-up holder, and a machine '
     'caller may not drop that edge with a dependencies replacement. Keep the holder id in the '
     'dependencies list. A held follow-up leaves the hold by promotion: cite it with x_finding_key '
-    'or prd_path, depend on it from a pending task, or have a human call '
-    'remove_dependency(task, holder). See docs/task-authoring.md §3.4.'
+    'or prd_path (unless it carries finding_set_hold, which a citation does not promote), depend '
+    'on it from a pending task, or have a human call remove_dependency(task, holder). See '
+    'docs/task-authoring.md §3.4.'
 )
 
 
@@ -950,12 +979,12 @@ async def _hold_stock(
 
 
 async def _unheld_stock(tm: TaskBackendProtocol, project_root: str) -> list[dict[str, Any]]:
-    """The pending tasks the hold rule matches that were never held."""
+    """The pending tasks never held that the hold rule matches; a row once held is never re-judged."""
     pending = await tm.get_tasks(project_root, statuses=[TaskStatus.PENDING], fields=_BACKFILL_FIELDS)
     return [
         task for task in pending['tasks']
-        if hold_scope(task.get('metadata'), task.get('priority'))
-        and FOLLOWUP_HOLD_METADATA_KEY not in raw_metadata_dict(task.get('metadata'), source=_METADATA_SOURCE)
+        if FOLLOWUP_HOLD_METADATA_KEY not in raw_metadata_dict(task.get('metadata'), source=_METADATA_SOURCE)
+        and hold_scope(task.get('metadata'), task.get('priority'), task_id=task.get('id'))
     ]
 
 

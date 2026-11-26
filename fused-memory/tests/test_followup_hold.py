@@ -166,6 +166,33 @@ def test_a_marked_task_outside_the_finding_set_arm_is_not_held(metadata: Any, pr
     assert not hold_scope(metadata, priority)
 
 
+@pytest.mark.parametrize(('metadata', 'priority', 'reason'), [
+    (_FINDING_SET, 'medium', "priority 'medium'"),
+    ({**_FINDING_SET, 'task_kind': 'deterministic'}, 'low', "task_kind 'deterministic'"),
+    ({**_FINDING_SET, 'execution_class': 'operational'}, 'low', "execution_class 'operational'"),
+    ({'source': 'review-all', FINDING_SET_HOLD_METADATA_KEY: _SET_MARKER}, 'low', 'x_finding_key'),
+    ({**_FINDING_SET, 'x_finding_key': []}, 'low', 'x_finding_key'),
+], ids=['medium', 'deterministic', 'execution-class', 'no-finding-key', 'empty-finding-key'])
+def test_a_valid_marker_the_rule_refuses_warns_naming_the_task_and_why(
+    metadata: Any, priority: str, reason: str, caplog: pytest.LogCaptureFixture,
+) -> None:
+    with caplog.at_level('WARNING', logger='fused_memory.middleware.followup_hold'):
+        assert not hold_scope(metadata, priority, task_id=42)
+
+    [message] = caplog.messages
+    assert 'task 42' in message and FINDING_SET_HOLD_METADATA_KEY in message, message
+    assert _SET_MARKER['ruling'] in message and reason in message, message
+
+
+def test_a_held_or_unmarked_task_logs_nothing(caplog: pytest.LogCaptureFixture) -> None:
+    with caplog.at_level('WARNING', logger='fused_memory.middleware.followup_hold'):
+        assert hold_scope(_FINDING_SET, 'low', task_id=42)
+        assert hold_scope(_FOLLOWUP, 'low', task_id=43)
+        assert not hold_scope(_FOLLOWUP, 'medium', task_id=44)
+
+    assert caplog.messages == []
+
+
 @pytest.mark.parametrize('marker', [
     {},
     {'ruling': ''},
@@ -176,9 +203,11 @@ def test_a_malformed_finding_set_marker_is_not_held_and_warns(
     marker: object, caplog: pytest.LogCaptureFixture,
 ) -> None:
     with caplog.at_level('WARNING', logger='fused_memory.middleware.followup_hold'):
-        assert not hold_scope({**_FINDING_SET, FINDING_SET_HOLD_METADATA_KEY: marker}, 'low')
+        assert not hold_scope({**_FINDING_SET, FINDING_SET_HOLD_METADATA_KEY: marker}, 'low', task_id=42)
 
-    assert any(FINDING_SET_HOLD_METADATA_KEY in record.getMessage() for record in caplog.records)
+    assert any(
+        FINDING_SET_HOLD_METADATA_KEY in message and 'task 42' in message for message in caplog.messages
+    ), caplog.messages
 
 
 _HELD_AT = '2026-11-19T04:30:00+00:00'

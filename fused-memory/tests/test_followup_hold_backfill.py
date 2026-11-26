@@ -96,6 +96,28 @@ async def test_the_backfill_holds_a_pending_marked_finding_set_member(stack: Sta
 
 
 @pytest.mark.asyncio
+async def test_the_backfill_leaves_a_refused_marked_member_unheld_and_names_it(
+    stack: Stack, caplog: pytest.LogCaptureFixture,
+) -> None:
+    marked = await stack.seed(
+        'Medium marked finding-set member',
+        {'source': 'review-all', 'x_finding_key': ['fk-1'], 'finding_set_hold': {'ruling': 'r'}},
+        priority='medium',
+    )
+    before = await stack.row(marked)
+
+    with caplog.at_level(logging.WARNING, logger='fused_memory.middleware.followup_hold'):
+        count = await stack.interceptor.backfill_followup_holds(stack.root, known_roots=[stack.root])
+
+    assert count == 0
+    assert await stack.row(marked) == before
+    assert any(
+        f'task {marked} carries finding_set_hold' in message and "priority 'medium'" in message
+        for message in caplog.messages
+    ), caplog.messages
+
+
+@pytest.mark.asyncio
 async def test_a_second_backfill_adds_nothing_and_still_reports(stack: Stack) -> None:
     matching, _untouched = await _seed_stock(stack)
     await stack.interceptor.backfill_followup_holds(stack.root, known_roots=[stack.root])
