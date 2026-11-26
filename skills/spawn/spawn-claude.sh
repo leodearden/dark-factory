@@ -1040,12 +1040,11 @@ _failed_to_start_pending() {
 # Exit via the distinct failed-to-start code. Deliberately does NOT call the
 # session-registry `exit` subcommand (unlike finish()) -- that would
 # overwrite the failed-to-start status the watchdog already wrote with
-# EXITED, destroying the signal this whole mechanism exists to produce.
+# EXITED, destroying the signal this whole mechanism exists to produce. The
+# marker's existence is the whole signal; the code is EXIT_FAILED_TO_START.
 finish_failed_to_start() {
-  local code
-  code=$(cat "$fts_marker" 2>/dev/null || echo "$EXIT_FAILED_TO_START")
   rm -f "$fts_marker" "$sentinel" "$sentinel.tmp"
-  exit "$code"
+  exit "$EXIT_FAILED_TO_START"
 }
 
 # Mirror of orchestrator.session_registry.encode_cwd, THE canonical cwd
@@ -1130,7 +1129,7 @@ _started_evidence() {
 #
 # On grace-expiry with no evidence, flags failed-to-start: best-effort marks
 # the session-registry record, emits a loud caller-visible stderr line, and
-# writes the fts_marker so await_sentinel/resolve_* can break out of what
+# creates the fts_marker so await_sentinel/resolve_* can break out of what
 # would otherwise be an unbounded wait.
 mark_record_failed_to_start() {
   if [ -n "$SESSION_RECORD_DIR" ] && command -v python3 >/dev/null 2>&1; then
@@ -1178,7 +1177,7 @@ _started_watchdog() {
   # the same underlying cause (see _reconcile_started_flag_with_launcher_failure
   # below), so this process may ultimately exit 127, not EXIT_FAILED_TO_START.
   echo "spawn-claude.sh: FAILED-TO-START — claude never started within ${SPAWN_STARTED_GRACE_SECS}s (no transcript, no claude process); registry marked failed-to-start (a more specific launcher-failure verdict may still override this)." >&2
-  echo "$EXIT_FAILED_TO_START" > "$fts_marker"
+  : > "$fts_marker"
   return 0
 }
 
