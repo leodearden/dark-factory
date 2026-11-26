@@ -69,8 +69,9 @@ class TestFetchStatusesPaging:
         documented-safe MCP response envelope — past it the response is
         rejected WHOLESALE while the caller believes it paged correctly.
         """
-        from dashboard.data.tasks import fetch_statuses
         from shared.status_paging import STATUSES_SAFE_PAGE_SIZE
+
+        from dashboard.data.tasks import fetch_statuses
 
         canned = CannedMCP(status_map={tid: 'pending' for tid in range(1, 4501)},
                            status_page_size=2000)
