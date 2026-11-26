@@ -136,8 +136,11 @@ class TestUnfiledDegradation:
         assert f' past {grace_seconds}s: ' in degradation.reason
 
 
+PASS_AT = at(500)
+
+
 def behind(
-    held: dict[str, datetime], waiting: AbstractSet[str] | None, *, now: datetime = at(500)
+    held: dict[str, datetime], waiting: AbstractSet[str] | None, *, now: datetime = PASS_AT
 ) -> dict[str, datetime]:
     return still_behind_deferred_gates(held, waiting, now=now)
 
