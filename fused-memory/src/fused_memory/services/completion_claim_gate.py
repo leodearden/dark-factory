@@ -33,7 +33,7 @@ would tag a large fraction of ordinary agent narration, and a tag that fires
 constantly stops being read.
 
 A claim must also be ASSERTED (task 6677). A marker inside a quotation,
-governed by a modal or a bare subjunctive 'be' (task 11770), inside a
+governed by a modal or a bare base-form 'be' (task 11770), inside a
 conditional/interrogative, present-tense temporal or imperative scope, or in
 attributive position is not a claim. Nor is
 a bare participle after a temporal cue ('until merged') a claim about an earlier
@@ -290,8 +290,16 @@ _NON_VERIDICAL_CUE: str = r'(?<![-\w])(?:if|whether|unless|in\s+case)'
 _TEMPORAL_CUE: str = (
     r'(?<![-\w])(?:when(?:ever)?|once|after|before|until|till|as\s+soon\s+as|the\s+day)'
 )
-# The cues opening a _MOOD_SCOPES scope; a governed-verb tail that swallowed one would lose it.
-_MOOD_CUE: str = r'(?:' + _NON_VERIDICAL_CUE + r'|' + _TEMPORAL_CUE + r')(?![-\w])'
+_PRESENT_AUXILIARY_RE: re.Pattern[str] = re.compile(
+    r'\b(?:has|have|is|are)\b', re.IGNORECASE,
+)
+# The (cue, tense gate) rows of _MOOD_SCOPES whose cue can open a scope mid-clause. A
+# governed-verb tail must not swallow one of these cues (_MOOD_CUE), or the scope is lost.
+_MID_CLAUSE_MOOD_CUES: tuple[tuple[str, re.Pattern[str] | None], ...] = (
+    (_NON_VERIDICAL_CUE, None),
+    (_TEMPORAL_CUE, _PRESENT_AUXILIARY_RE),
+)
+_MOOD_CUE: str = r'(?:' + r'|'.join(cue for cue, _gate in _MID_CLAUSE_MOOD_CUES) + r')(?![-\w])'
 
 # A modal or intention phrase, the filler run, then the verb it governs: "must
 # have landed", "won’t be merged", "is supposed to be filed as tkt_X next week".
@@ -299,13 +307,14 @@ _MOOD_CUE: str = r'(?:' + _NON_VERIDICAL_CUE + r'|' + _TEMPORAL_CUE + r')(?![-\w
 # word, or a two-word extension form swallowed whole ("re filed").
 # A bare 'be' governs too, since a base-form 'be' never asserts: an infinitive ('to be merged'), a
 # mandative subjunctive ('asked that task N be cancelled', esc-unverified-claim-9007-1, task 11770)
-# or a 'let' complement. The tail stops short of a mood cue: 'it'll be when task N has landed'
-# keeps its 'when' scope.
+# or a 'let' complement. Upper-case 'BE' is the acronym ("task N's BE landed"), so it does not
+# govern. The tail stops short of a mood cue: 'it'll be when task N has landed' keeps its
+# 'when' scope.
 # Pinned by tests/test_completion_claim_mood.py::TestModalFormsAreNotClaims.
 _GOVERNED_VERB_RE: re.Pattern[str] = re.compile(
     r'\b(?:going\s+to|plans?\s+to|planned\s+to|intends?\s+to|intended\s+to|'
     r'aims?\s+to|meant\s+to|hopes?\s+to|expects?\s+to|scheduled\s+to|slated\s+to|'
-    r'supposed\s+to|needs?\s+to|be|' + _MODAL + r')\b'
+    r'supposed\s+to|needs?\s+to|(?-i:[Bb]e)|' + _MODAL + r')\b'
     + _FILLER_RUN
     + r'\s+(?!' + _MOOD_CUE + r')(?:(?:' + _EXTENSION_ANY_FORM + r')\b|[\w-]+)',
     re.IGNORECASE,
@@ -400,13 +409,6 @@ def _blank_quotations(text: str) -> str:
     return _QUOTATION_RE.sub(blank_a_mention, text)
 
 
-_NON_VERIDICAL_CUE_RE: re.Pattern[str] = re.compile(
-    _NON_VERIDICAL_CUE + r'(?![-\w])', re.IGNORECASE,
-)
-_TEMPORAL_CUE_RE: re.Pattern[str] = re.compile(_TEMPORAL_CUE + r'(?![-\w])', re.IGNORECASE)
-_PRESENT_AUXILIARY_RE: re.Pattern[str] = re.compile(
-    r'\b(?:has|have|is|are)\b', re.IGNORECASE,
-)
 _IMPERATIVE_HEAD_RE: re.Pattern[str] = re.compile(
     r'(?:^|(?<=\()|(?<=:\s)|(?<=[—–]\s))\s*'
     r'(?:[-*•]\s+|\(?\d+[.)]\s+)?(?:please\s+)?'
@@ -422,24 +424,33 @@ _IMPERATIVE_HEAD_RE: re.Pattern[str] = re.compile(
 # present tense in a temporal clause is future reference ('once #N has
 # landed') while simple past is narrative and presupposes the event ('after
 # task 5 landed'). Each row is (cue, tense gate); None means always blank.
-# A verbless temporal clause ('holds once merged') has no tense to read; binding
-# handles it instead (_FORWARD_ONLY_LEAD_RE).
+# The imperative head is clause-initial, so it is the one row outside
+# _MID_CLAUSE_MOOD_CUES. A verbless temporal clause ('holds once merged') has no
+# tense to read; binding handles it instead (_FORWARD_ONLY_LEAD_RE).
 # Pinned by tests/test_completion_claim_mood.py::TestNonAssertiveScopes.
 _MOOD_SCOPES: tuple[tuple[re.Pattern[str], re.Pattern[str] | None], ...] = (
-    (_NON_VERIDICAL_CUE_RE, None),
+    *(
+        (re.compile(cue + r'(?![-\w])', re.IGNORECASE), tense_gate)
+        for cue, tense_gate in _MID_CLAUSE_MOOD_CUES
+    ),
     (_IMPERATIVE_HEAD_RE, None),
-    (_TEMPORAL_CUE_RE, _PRESENT_AUXILIARY_RE),
 )
 
 
-def _blank_mood_scopes(clause: str) -> str:
-    """*clause* with every non-assertive mood scope blanked, offsets preserved."""
-    chars = list(clause)
+def _blank_mood_scopes(stripped: str, clause: str) -> str:
+    """*stripped* with every non-assertive mood scope blanked, offsets preserved.
+
+    A scope's cue and tense are read from *stripped*, but the barrier ending it
+    from the unstripped *clause*: a governed-verb tail can swallow the barrier
+    word itself ('if we let it be and task N was merged'), and a scope that ran
+    past it would blank the asserted claim beyond.
+    """
+    chars = list(stripped)
     for cue_re, tense_gate in _MOOD_SCOPES:
-        for cue in cue_re.finditer(clause):
+        for cue in cue_re.finditer(stripped):
             barrier = _BINDING_BARRIER_RE.search(clause, cue.end())
             scope_end = barrier.start() if barrier else len(clause)
-            if tense_gate is None or tense_gate.search(clause, cue.end(), scope_end):
+            if tense_gate is None or tense_gate.search(stripped, cue.end(), scope_end):
                 chars[cue.start():scope_end] = ' ' * (scope_end - cue.start())
     return ''.join(chars)
 
@@ -454,9 +465,10 @@ def _strip_exemptions(clause: str) -> str:
     same number of spaces, so an offset in the result is an offset in
     *clause*, which is what lets a marker found here bind to a ref found there.
     """
+    stripped = clause
     for stripper in _EXEMPTION_STRIPPERS:
-        clause = stripper.sub(_blank, clause)
-    return _blank_mood_scopes(clause)
+        stripped = stripper.sub(_blank, stripped)
+    return _blank_mood_scopes(stripped, clause)
 
 
 @dataclass(frozen=True, slots=True)

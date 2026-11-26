@@ -255,7 +255,7 @@ class TestModalFormsAreNotClaims:
             ),
         ],
     )
-    def test_a_subjunctive_be_is_not_a_claim(self, text, project):
+    def test_a_marker_after_a_bare_be_is_not_a_claim(self, text, project):
         assert _triples(text, project) == []
 
     @pytest.mark.parametrize(
@@ -270,9 +270,17 @@ class TestModalFormsAreNotClaims:
                 'task 5422 has been cancelled', ('disposition', 'task', '5422'),
                 id='been-is-not-be',
             ),
+            pytest.param(
+                "task 5422's BE landed", ('applied_work', 'task', '5422'),
+                id='upper-case-BE-is-an-acronym',
+            ),
+            pytest.param(
+                'task 5422 BE merged into main', ('applied_work', 'task', '5422'),
+                id='upper-case-BE-before-the-marker',
+            ),
         ],
     )
-    def test_a_subjunctive_be_elsewhere_leaves_the_claim(self, text, claim):
+    def test_a_bare_be_elsewhere_leaves_the_claim(self, text, claim):
         assert _triples(text) == [claim]
 
     @pytest.mark.parametrize(
@@ -299,6 +307,30 @@ class TestModalFormsAreNotClaims:
     )
     def test_a_mood_cue_after_be_keeps_its_scope(self, text):
         assert _triples(text) == []
+
+    @pytest.mark.parametrize(
+        'text',
+        [
+            pytest.param("it'd be after task 5422 landed", id='would-after-simple-past'),
+            pytest.param("it'll be once task 5422 landed", id='will-once-simple-past'),
+        ],
+    )
+    def test_a_past_tense_cue_scope_after_be_still_claims(self, text):
+        assert _triples(text) == [('applied_work', 'task', '5422')]
+
+    @pytest.mark.parametrize(
+        'text',
+        [
+            pytest.param('if we let it be and task 5423 was merged', id='let-be-and'),
+            pytest.param('whether the plan be and task 5423 was merged', id='subjunctive-be-and'),
+            pytest.param('if it be while task 5423 has merged', id='subjunctive-be-while'),
+            pytest.param('if it be rather than task 5423 merged', id='be-rather-than'),
+            pytest.param('if it be - task 5423 was merged', id='be-spaced-dash'),
+            pytest.param('if it should be and task 5423 was merged', id='modal-be-and'),
+        ],
+    )
+    def test_a_barrier_after_be_still_ends_the_scope(self, text):
+        assert _triples(text) == [('applied_work', 'task', '5423')]
 
 
 class TestNonAssertiveScopes:
