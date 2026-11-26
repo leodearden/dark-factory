@@ -54,7 +54,7 @@ done
 [ -f "$ROOT/scripts/routing_experiment_readout.py" ] \
   || die "scripts/routing_experiment_readout.py is missing; land beta before arming"
 "$PY" "$ROOT/scripts/routing_experiment_readout.py" --aa --salt "$SALT" --buckets 2 --days "$DAYS" \
-  || die "A/A check failed for salt '$SALT': the split is skewed on an unchanged window; do not arm"
+  || { rc=$?; die "the readout's A/A check did not pass for salt '$SALT' (exit $rc: 1 = skewed, 3 = no ledger read, 4 = unproven; its own message above says which); do not arm"; }
 
 # 3. Reload every reachable unit; 4. record the flip.
 "$PY" - "$HERE" "$SALT" "$RULES" "$ROOT/data/orchestrator/routing_experiments.jsonl" $UNITS <<'PYEOF'

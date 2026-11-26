@@ -191,6 +191,7 @@ CREATE TABLE tasks (
     updated_at    TEXT NOT NULL,
     claimant_run_id TEXT,
     heartbeat_at    TEXT,
+    candidate_key   TEXT,
     PRIMARY KEY (tag, id)
 );
 """
@@ -203,8 +204,8 @@ def make_tasks_db(tmp_path):
     Each row is a dict of column -> value. ``id`` is required; ``tag``,
     ``title``, ``status``, ``priority`` and ``updated_at`` (the NOT NULL
     columns, plus priority) fall back to placeholders, and the nullable
-    columns — ``claimant_run_id`` and ``heartbeat_at`` included — stay NULL
-    when omitted.
+    columns — ``claimant_run_id``, ``heartbeat_at`` and ``candidate_key``
+    included — stay NULL when omitted.
 
     ``metadata`` is passed through VERBATIM when it is a str or None — so a
     test can insert deliberately malformed JSON to exercise a decoder's error
@@ -225,8 +226,8 @@ def make_tasks_db(tmp_path):
                 conn.execute(
                     'INSERT INTO tasks (tag, id, title, description, details, '
                     'test_strategy, status, priority, metadata, updated_at, '
-                    'claimant_run_id, heartbeat_at) '
-                    'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                    'claimant_run_id, heartbeat_at, candidate_key) '
+                    'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
                     (
                         row.get('tag', 'master'),
                         row['id'],
@@ -240,6 +241,7 @@ def make_tasks_db(tmp_path):
                         row.get('updated_at', '2026-07-30T00:00:00+00:00'),
                         row.get('claimant_run_id'),
                         row.get('heartbeat_at'),
+                        row.get('candidate_key'),
                     ),
                 )
             conn.commit()
@@ -585,6 +587,34 @@ class SeedingConnection(sqlite3.Connection):
         )
         self.commit()
 
+    def seed_task_result(
+        self,
+        *,
+        task_id,
+        outcome,
+        completed_at,
+        run_id='run-1',
+        project_id='dark_factory',
+        review_cycles=0,
+        execute_iterations=0,
+    ):
+        """Insert one `task_results` row: one task's outcome within one run."""
+        self.execute(
+            'INSERT INTO task_results (run_id, task_id, project_id, outcome, '
+            'review_cycles, execute_iterations, completed_at) '
+            'VALUES (?, ?, ?, ?, ?, ?, ?)',
+            (
+                run_id,
+                str(task_id),
+                project_id,
+                outcome,
+                review_cycles,
+                execute_iterations,
+                completed_at,
+            ),
+        )
+        self.commit()
+
 
 _DEFAULT_EVENTS_EPOCH = datetime(2026, 7, 30, tzinfo=UTC)
 
@@ -659,6 +689,29 @@ def runs_db(runs_db_path):
         yield conn
     finally:
         conn.close()
+
+
+@pytest.fixture
+def make_seeding_runs_db(make_runs_db):
+    """Factory: build ``<directory>/runs.db`` through :func:`make_runs_db`, return a
+    WRITABLE :class:`SeedingConnection` on it.
+
+    For tests that need one seeding connection per synthetic project root.
+    *directory* must already exist. Every connection handed out is closed at
+    teardown.
+    """
+    opened = []
+
+    def _make(directory):
+        conn = sqlite3.connect(make_runs_db(directory=directory), factory=SeedingConnection)
+        opened.append(conn)
+        return conn
+
+    try:
+        yield _make
+    finally:
+        for conn in opened:
+            conn.close()
 
 
 # ---------------------------------------------------------------------------
