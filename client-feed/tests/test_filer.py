@@ -330,6 +330,7 @@ SECRET_OBSERVED = 'SECRET-OBSERVED'
 MARKUP_OBSERVED = 'the page shows </description> verbatim'
 BACKLOG = {'error': 'busy', 'error_type': 'ReconciliationBacklogExceeded'}
 VALIDATION = {'error': SECRET_OBSERVED, 'error_type': 'ValidationError'}
+ODD = {'error': 'odd', 'error_type': 'SomethingOdd'}
 
 
 def _fallback_of(fix: dict[str, Any]) -> dict[str, str] | None:
@@ -474,6 +475,38 @@ def test_a_ref_whose_fallback_was_refused_files_the_fallback_directly_on_the_nex
     assert resubmitted and all(SECRET_OBSERVED not in arguments['description'] for arguments in resubmitted)
     fix, _ = gated.fix_and_gate()
     assert _fallback_of(fix) == {'kind': 'REPLY_CODE', 'code': 'ValidationError'}
+    _assert_filed_and_gated(gated)
+
+
+@pytest.mark.parametrize(
+    'tool',
+    ['lookup_defect_ref', 'get_task', 'find_tasks_by_metadata', 'submit_task', 'add_dependency', 'commit_planning'],
+)
+def test_a_refusal_at_any_filing_step_counts_one_attempt_and_takes_no_fallback(gated: World, tool: str) -> None:
+    append_inbox(gated.in_dir, reported(2, 3, at=AT))
+    gated.fake.crash_after('submit_task', 1)
+    with pytest.raises(SimulatedCrash):
+        gated.run()
+    gated.fake.refuse_next(tool, ODD)
+
+    stuck, cursor = gated.run()
+
+    [named] = stuck.unconverged
+    assert (named.ref, named.tool, named.code, named.disposition, named.attempts) == (
+        REF,
+        tool,
+        'SomethingOdd',
+        Disposition.RETRY_THEN_FALLBACK,
+        1,
+    )
+    record = cursor.refs[REF]
+    assert (record.attempts, record.last_tool, record.last_code, record.fallback) == (1, tool, 'SomethingOdd', None)
+    assert cursor.inbox_offset == 0
+    clean, after = gated.run(cursor)
+    assert clean.converged == (REF,)
+    assert REF not in after.refs
+    fix, _ = gated.fix_and_gate()
+    assert _fallback_of(fix) is None
     _assert_filed_and_gated(gated)
 
 
@@ -823,5 +856,23 @@ def test_a_refused_fix_step_leaves_the_gate_uncancelled_until_it_converges(
     [named] = stuck.unconverged
     assert (named.ref, named.tool, named.disposition) == (REF, 'declare_defect', disposition)
     assert stuck_cursor.inbox_offset == cursor.inbox_offset
+    gated.run(stuck_cursor)
+    _assert_withdrawn_and_cancelled(gated)
+
+
+@pytest.mark.parametrize(
+    'tool',
+    ['lookup_defect_ref', 'get_task', 'declare_defect', 'record_defect_outcome', 'set_task_status', 'find_tasks_by_metadata'],
+)
+def test_a_refusal_at_any_ruling_step_counts_one_attempt(gated: World, tool: str) -> None:
+    cursor = _file_then_rule(gated)
+    gated.fake.refuse_next(tool, ODD)
+
+    stuck, stuck_cursor = gated.run(cursor)
+
+    [named] = stuck.unconverged
+    assert (named.ref, named.tool, named.attempts) == (REF, tool, 1)
+    record = stuck_cursor.refs[REF]
+    assert (record.attempts, record.last_tool) == (1, tool)
     gated.run(stuck_cursor)
     _assert_withdrawn_and_cancelled(gated)
