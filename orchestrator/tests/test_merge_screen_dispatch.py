@@ -29,6 +29,7 @@ from _merge_lane_fakes import (
     running_lane,
 )
 from _orch_helpers import VERIFY_CLI_PER_TEST_TIMEOUT, git_env_with_ceiling
+from _screen_fixtures import lane_git_config
 
 from orchestrator.config import GitConfig, MergeScreenConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore
@@ -94,10 +95,7 @@ class ScriptedScreen:
 
 @pytest.fixture
 def git_config() -> GitConfig:
-    return GitConfig(
-        main_branch='main', branch_prefix='task/', remote='origin',
-        worktree_dir='.worktrees', push_after_advance=False,
-    )
+    return lane_git_config()
 
 
 @pytest.fixture

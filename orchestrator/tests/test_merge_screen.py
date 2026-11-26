@@ -13,19 +13,20 @@ red-base cases use the real pytest runner.
 from __future__ import annotations
 
 import asyncio
-import fcntl
 import logging
 import os
-import subprocess
 import sys
-from collections.abc import Collection, Iterator, Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import pytest
 from _git_fixtures import RepoSeed, _git, seed_repo
-from _orch_helpers import VERIFY_CLI_PER_TEST_TIMEOUT, git_env_with_ceiling
+from _orch_helpers import VERIFY_CLI_PER_TEST_TIMEOUT
+from _screen_fixtures import git_ops as git_ops
+from _screen_fixtures import head
+from _screen_fixtures import held_merger_lane as held_merger_lane
 from _verify_artifact_fixtures import registry_config
 from escalation.categories import EscalationCategory
 
@@ -50,7 +51,6 @@ from orchestrator.merge_lane.screen import (
 )
 from orchestrator.merge_lane.types import MergeOutcome
 from orchestrator.verify import NodeIdResult, NodeIdStatus
-from orchestrator.verify_cancel import lane_lock_path
 
 pytestmark = pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)
 
@@ -91,18 +91,11 @@ _SEED = RepoSeed(
 )
 
 
-def _head(cwd: Path) -> str:
-    return subprocess.run(
-        ['git', 'rev-parse', 'HEAD'], cwd=cwd, env=git_env_with_ceiling(cwd),
-        check=True, capture_output=True, text=True,
-    ).stdout.strip()
-
-
 def _commit_file(repo: Path, relpath: str, text: str, message: str) -> str:
     (repo / relpath).write_text(text, encoding='utf-8')
     _git(repo, 'add', relpath)
     _git(repo, 'commit', '-m', message)
-    return _head(repo)
+    return head(repo)
 
 
 @dataclass(frozen=True)
@@ -122,7 +115,7 @@ def repo(tmp_path: Path) -> Path:
 
 @pytest.fixture
 def history(repo: Path) -> History:
-    base = _head(repo)
+    base = head(repo)
     item = _commit_file(repo, 'DEFECT', 'defect\n', 'item: add defect')
     on_red = _commit_file(repo, 'unrelated.txt', 'x\n', 'on red: unrelated')
     _git(repo, 'checkout', '-q', '-b', 'second', base)
@@ -130,15 +123,6 @@ def history(repo: Path) -> History:
     item2 = _commit_file(repo, 'extra.txt', 'y\n', 'item2: extra')
     _git(repo, 'checkout', '-q', '-')
     return History(base=base, item=item, item2=item2, on_red=on_red)
-
-
-@pytest.fixture
-def git_ops(repo: Path) -> GitOps:
-    config = GitConfig(
-        main_branch='main', branch_prefix='task/', remote='origin',
-        worktree_dir='.worktrees', push_after_advance=False,
-    )
-    return GitOps(config, repo)
 
 
 def _module_config(prefix: str) -> ModuleConfig:
@@ -188,7 +172,7 @@ class ScriptedRunner:
         self, tree: Path, config: OrchestratorConfig, module_configs: Sequence[ModuleConfig],
         ids: Collection[str], *, concurrent_groups: bool = False,
     ) -> Mapping[str, NodeIdResult]:
-        sha = _head(tree) if (tree / '.git').exists() else ''
+        sha = head(tree) if (tree / '.git').exists() else ''
         self.calls.append(RunnerCall(
             tree, sha, tuple(ids), tuple(mc.prefix for mc in module_configs), concurrent_groups,
         ))
@@ -246,10 +230,10 @@ class RecordingEscalationQueue:
 
 
 def _screen(
-    git_ops: Any, *, run_ids: Any = None, escalations: Any = None,
+    git_ops: Any, *, run_ids: Any = None, escalations: Any = None, **seams: Any,
 ) -> tuple[MergeScreen, RecordingEvents]:
     events = RecordingEvents()
-    kwargs = {} if run_ids is None else {'run_ids': run_ids}
+    kwargs = seams if run_ids is None else {'run_ids': run_ids, **seams}
     screen = MergeScreen(git_ops, events, escalations or RecordingEscalationQueue(), **kwargs)
     return screen, events
 
@@ -260,18 +244,6 @@ async def _screen_item(
     return await screen.screen_item(
         task_id=task_id, merged_sha=merged, base_sha=base, config=config, site=ScreenSite.MERGER,
     )
-
-
-@pytest.fixture
-def held_merger_lane(git_ops: GitOps) -> Iterator[None]:
-    lock = lane_lock_path(git_ops.worktree_base / ScreenLane.MERGER.value)
-    lock.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(lock, os.O_CREAT | os.O_RDWR, 0o644)
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        yield
-    finally:
-        os.close(fd)
 
 
 @dataclass
@@ -424,6 +396,7 @@ async def test_an_unregistered_manifest_module_fails_open(
 
 
 @pytest.mark.asyncio
+@pytest.mark.timing(reason='the screen timeout is the behaviour under test')
 async def test_a_runner_past_the_timeout_fails_open(
     repo: Path, history: History, git_ops: GitOps,
 ) -> None:
@@ -506,6 +479,43 @@ async def test_kill_switch_runs_no_screen_code(repo: Path, history: History) -> 
     assert (runner.calls, trees.entered, events.emitted) == ([], [], [])
 
 
+@pytest.mark.asyncio
+async def test_switching_the_screen_off_closes_its_alarm_and_resets_the_streak(
+    repo: Path, history: History, git_ops: GitOps,
+) -> None:
+    escalations = RecordingEscalationQueue()
+    screen, events = _screen(
+        git_ops, run_ids=ScriptedRunner(verdict=_status_for_clean('error')), escalations=escalations,
+    )
+    switched_on = _config(repo, error_streak_alarm=1)
+    await _screen_item(screen, switched_on, history.item, history.base)
+    [alarm] = escalations.filed
+
+    for _ in range(2):
+        await _screen_item(screen, _config(repo, manifest=None), history.item, history.base)
+    assert escalations.resolved == [alarm.id]
+
+    await _screen_item(screen, switched_on, history.item, history.base)
+    assert [event['error_streak'] for event in events.screens()] == [1, 1]
+
+
+@pytest.mark.asyncio
+async def test_a_screen_switched_off_from_its_start_closes_an_alarm_it_inherited(
+    repo: Path, history: History, git_ops: GitOps,
+) -> None:
+    escalations = RecordingEscalationQueue()
+    before_restart, _ = _screen(
+        git_ops, run_ids=ScriptedRunner(verdict=_status_for_clean('error')), escalations=escalations,
+    )
+    await _screen_item(before_restart, _config(repo, error_streak_alarm=1), history.item, history.base)
+    [alarm] = escalations.filed
+
+    after_restart, _ = _screen(git_ops, escalations=escalations)
+    await _screen_item(after_restart, _config(repo, manifest=None), history.item, history.base)
+
+    assert escalations.resolved == [alarm.id]
+
+
 # ---------------------------------------------------------------------------
 # (g) fallback
 
@@ -516,7 +526,7 @@ async def test_a_held_lane_falls_back_to_an_ephemeral_worktree(
     repo: Path, history: History, git_ops: GitOps,
 ) -> None:
     runner = ScriptedRunner()
-    screen, events = _screen(git_ops, run_ids=runner)
+    screen, events = _screen(git_ops, run_ids=runner, lane_lock_wait_secs=0.0)
 
     decision = await _screen_item(screen, _config(repo), history.item, history.base)
 
@@ -609,10 +619,10 @@ async def test_run_screen_maps_id_statuses_to_check_statuses(mapping_tree: Path,
     assert statuses == {
         'finds': 'finding', 'errs': 'error', 'skips': 'error', 'vanishes': 'error', 'passes': 'pass',
     }
-    [finding] = verdict.findings
+    [finding] = verdict.finding_checks
     assert finding.id == 'finds'
     assert any('scripts/x.py:3' in text for text in finding.findings)
-    assert {check.id for check in verdict.errors} == {'errs', 'skips', 'vanishes'}
+    assert {check.id for check in verdict.error_checks} == {'errs', 'skips', 'vanishes'}
     [call] = runner.calls
     assert call.concurrent_groups is True
     assert sorted(call.ids) == sorted({*_MAPPING_RESULTS, 'lib/t.py::unreported'})

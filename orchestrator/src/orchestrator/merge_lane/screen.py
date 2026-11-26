@@ -15,7 +15,7 @@ import contextlib
 import logging
 import time
 from collections import OrderedDict
-from collections.abc import Awaitable, Collection, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -26,13 +26,14 @@ from escalation.models import Escalation
 
 from orchestrator.event_store import EventType
 from orchestrator.git_ops import (
+    SCREEN_LANE_LOCK_WAIT_SECS,
     EphemeralWorktreeError,
     GitOps,
     ScreenLane,
-    ScreenLaneUnavailable,
     WorktreeKind,
 )
 from orchestrator.merge_lane.outcome_facts import MergeBlockCategory
+from orchestrator.merge_lane.sentinel_alarm import PendingAlarmQueue, resolve_pending_alarm
 from orchestrator.merge_lane.types import MergeOutcome
 from orchestrator.screen_manifest import (
     MANIFEST_SENTINEL,
@@ -96,11 +97,11 @@ class ScreenVerdict:
     checks: tuple[ScreenCheck, ...]
 
     @property
-    def findings(self) -> tuple[ScreenCheck, ...]:
+    def finding_checks(self) -> tuple[ScreenCheck, ...]:
         return tuple(check for check in self.checks if check.status == 'finding')
 
     @property
-    def errors(self) -> tuple[ScreenCheck, ...]:
+    def error_checks(self) -> tuple[ScreenCheck, ...]:
         return tuple(check for check in self.checks if check.status == 'error')
 
 
@@ -234,7 +235,7 @@ class ScreenEventSink(Protocol):
     ) -> int | None: ...
 
 
-class ScreenAlarmQueue(Protocol):
+class ScreenAlarmQueue(PendingAlarmQueue, Protocol):
     """The calls the ``merge_screen_unavailable`` alarm makes on an escalation queue."""
 
     def make_id(self, key: str) -> str: ...
@@ -242,13 +243,6 @@ class ScreenAlarmQueue(Protocol):
     def submit(self, escalation: Escalation) -> object: ...
 
     def has_open_l1(self, task_id: str) -> bool: ...
-
-    def get_by_task(self, task_id: str, status: str | None = None) -> Sequence[Escalation]: ...
-
-    def resolve(
-        self, escalation_id: str, resolution: str, *,
-        resolved_by: str | None = None, resolution_class: str | None = None,
-    ) -> object: ...
 
 
 @dataclass(frozen=True)
@@ -261,7 +255,7 @@ class _ScreenOutcome:
     own: tuple[ScreenCheck, ...] = ()
 
 
-def _failed(*causes: str, checks: tuple[ScreenCheck, ...] = ()) -> _ScreenOutcome:
+def _errored(*causes: str, checks: tuple[ScreenCheck, ...] = ()) -> _ScreenOutcome:
     return _ScreenOutcome('error', checks=checks, causes=causes)
 
 
@@ -281,8 +275,9 @@ class MergeScreen:
     """The production :class:`ScreenPort`.
 
     It keeps only what must outlive one screen: a bounded per-base-sha cache
-    of pass/finding verdicts, and the consecutive-error streak behind the
-    ``merge_screen_unavailable`` alarm. The event sink and the alarm queue are
+    of pass/finding verdicts, the consecutive-error streak behind the
+    ``merge_screen_unavailable`` alarm, and whether the switched-off screen
+    has already closed that alarm. The event sink and the alarm queue are
     optional, and a fault in either is logged and swallowed: reporting never
     costs an item its decision.
     """
@@ -294,19 +289,23 @@ class MergeScreen:
         escalation_queue: ScreenAlarmQueue | None,
         *,
         run_ids: NodeIdRunner = run_node_id_results,
+        lane_lock_wait_secs: float = SCREEN_LANE_LOCK_WAIT_SECS,
     ) -> None:
         self._git_ops = git_ops
         self._event_store = event_store
         self._escalation_queue = escalation_queue
         self._run_ids = run_ids
+        self._lane_lock_wait_secs = lane_lock_wait_secs
         self._base_verdicts: OrderedDict[str, dict[str, ScreenCheckStatus]] = OrderedDict()
         self._error_streak = 0
+        self._stood_down = False
 
     async def screen_item(
         self, *, task_id: str, merged_sha: str, base_sha: str | None,
         config: OrchestratorConfig, site: ScreenSite,
     ) -> ScreenDecision:
         if config.merge_screen.manifest is None:
+            self._stand_down()
             return PROCEED
         started = time.monotonic()
         lane = _LaneChoice()
@@ -326,32 +325,32 @@ class MergeScreen:
             async with asyncio.timeout(timeout_secs):
                 return await self._screen(merged_sha, base_sha, config, lane)
         except TimeoutError:
-            return _failed(f'screen timed out after {timeout_secs}s')
+            return _errored(f'screen timed out after {timeout_secs}s')
         except EphemeralWorktreeError as exc:
-            return _failed(f'no screen tree: lane: {lane.fallback_reason}; fallback: {exc}')
+            return _errored(f'no screen tree: lane: {lane.fallback_reason}; fallback: {exc}')
         except Exception as exc:
             logger.warning('merge screen of %s raised; the item proceeds', merged_sha, exc_info=True)
-            return _failed(f'screen raised {type(exc).__name__}: {exc}')
+            return _errored(f'screen raised {type(exc).__name__}: {exc}')
 
     async def _screen(
         self, merged_sha: str, base_sha: str | None, config: OrchestratorConfig, lane: _LaneChoice,
     ) -> _ScreenOutcome:
         item = await self._verdict_at(merged_sha, config, lane, only=None)
-        if item.errors:
-            return _failed(*_error_causes(item.errors), checks=item.checks)
-        if not item.findings:
+        if item.error_checks:
+            return _errored(*_error_causes(item.error_checks), checks=item.checks)
+        if not item.finding_checks:
             return _ScreenOutcome('pass', checks=item.checks)
         if base_sha is None:
-            return _failed('no base sha to attribute the findings to', checks=item.checks)
-        red = frozenset(check.id for check in item.findings)
+            return _errored('no base sha to attribute the findings to', checks=item.checks)
+        red = frozenset(check.id for check in item.finding_checks)
         base = await self._base_statuses(base_sha, red, config, lane)
         base_errors = sorted(check_id for check_id, status in base.items() if status == 'error')
         if base_errors:
-            return _failed(
+            return _errored(
                 *(f'{check_id}: no verdict on base {base_sha}' for check_id in base_errors),
                 checks=item.checks,
             )
-        own = tuple(check for check in item.findings if base[check.id] == 'pass')
+        own = tuple(check for check in item.finding_checks if base[check.id] == 'pass')
         return _ScreenOutcome('bounce' if own else 'base_red', checks=item.checks, own=own)
 
     async def _verdict_at(
@@ -364,8 +363,10 @@ class MergeScreen:
     async def _enter_tree(self, stack: contextlib.AsyncExitStack, sha: str, lane: _LaneChoice) -> Path:
         if lane.kind == 'warm':
             try:
-                return await stack.enter_async_context(self._git_ops.screen_lane(ScreenLane.MERGER, sha))
-            except (ScreenLaneUnavailable, RuntimeError) as exc:
+                return await stack.enter_async_context(self._git_ops.screen_lane(
+                    ScreenLane.MERGER, sha, lock_wait_secs=self._lane_lock_wait_secs,
+                ))
+            except RuntimeError as exc:
                 lane.fall_back(str(exc))
         return await stack.enter_async_context(
             self._git_ops.ephemeral_worktree(WorktreeKind.MERGE_SCREEN, sha),
@@ -400,15 +401,34 @@ class MergeScreen:
     def _track_streak(self, outcome: _ScreenOutcome) -> None:
         self._error_streak = self._error_streak + 1 if outcome.status == 'error' else 0
 
+    def _stand_down(self) -> None:
+        """Close the alarm for a switched-off screen, which runs no clean screen to close it.
+
+        Once per switch-off: again only after a screen has errored since.
+        """
+        if self._stood_down and not self._error_streak:
+            return
+        self._stood_down = True
+        self._error_streak = 0
+        self._close_alarm('merge screen switched off (merge_screen.manifest: null)')
+
     def _sync_alarm(self, outcome: _ScreenOutcome, config: OrchestratorConfig) -> None:
+        if outcome.status != 'error':
+            self._close_alarm('merge screen ran clean again')
+        elif self._error_streak >= config.merge_screen.error_streak_alarm:
+            self._on_alarm_queue(lambda queue: self._raise_alarm(queue, outcome.causes))
+
+    def _close_alarm(self, resolution: str) -> None:
+        self._on_alarm_queue(lambda queue: resolve_pending_alarm(
+            queue, MERGE_SCREEN_ALARM_TASK_ID, resolution, resolved_by=_ALARM_ROLE,
+        ))
+
+    def _on_alarm_queue(self, act: Callable[[ScreenAlarmQueue], object]) -> None:
         queue = self._escalation_queue
         if queue is None:
             return
         try:
-            if outcome.status != 'error':
-                _close_alarm(queue)
-            elif self._error_streak >= config.merge_screen.error_streak_alarm:
-                self._raise_alarm(queue, outcome.causes)
+            act(queue)
         except Exception:
             logger.warning('merge screen alarm sync failed; the screen goes on', exc_info=True)
 
@@ -434,8 +454,9 @@ class MergeScreen:
             ),
             suggested_action=(
                 'Fix the cause named above, or switch the screen off with a config '
-                'reload setting merge_screen.manifest: null. The next clean screen '
-                'resolves this alarm.'
+                'reload setting merge_screen.manifest: null. The next clean screen, '
+                'or the first merge the switched-off screen lets through, resolves '
+                'this alarm.'
             ),
         ))
 
@@ -464,14 +485,6 @@ class MergeScreen:
             })
         except Exception:
             logger.warning('merge screen event emit failed; the screen goes on', exc_info=True)
-
-
-def _close_alarm(queue: ScreenAlarmQueue) -> None:
-    for esc in queue.get_by_task(MERGE_SCREEN_ALARM_TASK_ID, status='pending'):
-        queue.resolve(
-            esc.id, 'merge screen ran clean again', resolved_by=_ALARM_ROLE,
-            resolution_class='benign',
-        )
 
 
 def _error_causes(checks: tuple[ScreenCheck, ...]) -> tuple[str, ...]:
