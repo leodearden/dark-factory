@@ -908,7 +908,10 @@ class TestSeedRegistryRealSource:
         the follow-up carries no escalation id, not a claim that a gate's record is
         missing. "deterministic" matched the adverb "deterministically" in its title.
         So the bare "no escalation record exists" anchor became "that no escalation
-        record exists", and the title must also name the entry's subject, "gate".
+        record exists"; that description anchor is the real protection. The added
+        title anchor "gate" also rejects this title, but only as a weak secondary
+        filter: as a substring it matches "investigate", "mitigate", "propagate",
+        "delegate" and "aggregate", so it does not make a title name a gate.
         """
         from fused_memory.middleware.recon_code_fix_premise_guard import (
             match_candidate,

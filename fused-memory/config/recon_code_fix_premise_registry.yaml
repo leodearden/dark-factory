@@ -186,7 +186,7 @@
     that guidance remain in place. Anchored on assertion-of-absence phrasings
     only (NOT a bare "gate_escalated_at" token), so a legitimate proposal to
     improve this area still reaches the architect — pinned by
-    tests/test_recon_code_fix_premise_guard.py::TestSeedRegistryRealSource::
+    fused-memory/tests/test_recon_code_fix_premise_guard.py::TestSeedRegistryRealSource::
     test_legitimate_archive_inclusive_lookup_proposal_is_not_dropped, whose
     candidate title carries every title anchor by construction so the
     description anchor is genuinely exercised (match_candidate requires ALL
@@ -196,7 +196,7 @@
     token, and the inverse control
     test_absence_phrasing_with_same_title_does_match (same title, absence
     phrasing, matches). Why the bare "no escalation record exists" anchor
-    was dropped: tests/test_recon_code_fix_premise_guard.py::
+    was dropped: fused-memory/tests/test_recon_code_fix_premise_guard.py::
     TestSeedRegistryRealSource::
     test_task_8211_followup_is_not_refuted_as_a_gate_absence_claim.
   title_substrings:
