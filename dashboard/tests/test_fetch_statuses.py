@@ -69,8 +69,8 @@ class TestFetchStatusesPaging:
         documented-safe MCP response envelope — past it the response is
         rejected WHOLESALE while the caller believes it paged correctly.
         """
-        import dashboard.data.tasks as tasks_mod
         from dashboard.data.tasks import fetch_statuses
+        from shared.status_paging import STATUSES_SAFE_PAGE_SIZE
 
         canned = CannedMCP(status_map={tid: 'pending' for tid in range(1, 4501)},
                            status_page_size=2000)
@@ -82,7 +82,7 @@ class TestFetchStatusesPaging:
         assert [args.get('offset') for args in requests] == [0, 2000, 4000], (
             f'the walk must tile the population once, got {requests}'
         )
-        assert all(args['page_size'] <= tasks_mod.STATUSES_SAFE_PAGE_SIZE
+        assert all(args['page_size'] <= STATUSES_SAFE_PAGE_SIZE
                    for args in requests), (
             f'every page must stay inside the safe transport bound, got {requests}'
         )
@@ -185,6 +185,37 @@ class TestFetchStatusesPaging:
 
         assert result.get('offline') is True, (
             f'an inconsistent page must refuse the read, got a map of {len(result)}'
+        )
+
+    @pytest.mark.parametrize('pagination', [
+        pytest.param(['has_more', True], id='a-list'),
+        pytest.param('has_more=true', id='a-string'),
+    ])
+    async def test_a_page_whose_pagination_is_not_a_mapping_is_refused(
+        self, dummy_client, dummy_config, pagination,
+    ):
+        """An envelope that is present but unreadable is unverifiable, not absent.
+
+        Only an ABSENT envelope means the page is the whole map. Reading a
+        garbled one as absent would serve the first page's slice as if it
+        were complete (task 3396).
+        """
+        from dashboard.data.tasks import fetch_statuses
+
+        canned = CannedMCP(status_map={tid: 'done' for tid in range(1, 11)},
+                           status_page_size=4)
+
+        async def _garbled(client, url, tool, args, **kwargs):
+            page = await canned(client, url, tool, args, **kwargs)
+            if args.get('offset') == 0:
+                page = {**page, 'pagination': pagination}
+            return page
+
+        with patch('dashboard.data.tasks.mcp_tool_call', new=_garbled):
+            result = await fetch_statuses(dummy_client, dummy_config, '/proj/garbled')
+
+        assert result.get('offline') is True, (
+            f'an unreadable envelope must refuse the read, got a map of {len(result)}'
         )
 
     async def test_an_unparseable_id_is_dropped_without_refusing_the_read(
