@@ -153,9 +153,38 @@ _SUFFIX_GATE = (
 )
 _WIDENED_TO_EVERY_RESTATEMENT = [_SUFFIX_GATE]
 
+# Task 11350: S26 rho's codec checks after task 4857 made
+# fused_memory/utils/mem0_content_keys.py the content keys' one home; the
+# task-record half is operational ticket tkt_0RXDHPEK0BDQ0NYMRPNJSBTQJQ.
+_S26_SIDECAR = "plans/review-all-s26-memory-service-write-path-and-graph-client-prd.capability-manifest.yaml"
+_MEMORY_SERVICE = "fused-memory/src/fused_memory/services/memory_service.py"
+_STORE_RECORDS = "fused-memory/src/fused_memory/services/store_records.py"
+_TOOLS = "fused-memory/src/fused_memory/server/tools.py"
+_SPECIMEN_GUARD = "fused-memory/src/fused_memory/reconciliation/preservation_specimen_guard.py"
+_CODEC_READER_IMPORTS = {
+    _TOOLS: "from fused_memory.services.memory_service import MemoryService, metadata_row_text",
+    _SPECIMEN_GUARD: "from fused_memory.services.memory_service import metadata_row_text",
+}
+_STORE_RECORDS_MODULE = (
+    _S26_SIDECAR, 9243, "ρ", "store-records-module",
+    {"kind": "grep", "pattern": r"^def metadata_row_text\(", "expect": "present",
+     "paths": [_STORE_RECORDS]},
+)
+_CODEC_READERS_LEFT = (
+    _S26_SIDECAR, 9243, "ρ", "codec-readers-left-the-service",
+    {"kind": "grep", "pattern": r"memory_service import .*\bmetadata_row_text\b",
+     "expect": "absent", "paths": list(_CODEC_READER_IMPORTS)},
+)
+_CODEC_LEFT = (
+    _S26_SIDECAR, 9243, "ρ", "codec-left-the-service",
+    {"kind": "grep", "pattern": r"^def metadata_row_text\(", "expect": "absent",
+     "paths": [_MEMORY_SERVICE]},
+)
+_RETARGETED_AFTER_4857 = [_STORE_RECORDS_MODULE, _CODEC_READERS_LEFT, _CODEC_LEFT]
+
 _REPAIRED_DESCRIPTORS = [
     *_REANCHORED, *_RESYNCED_TO_TASK_RECORD, *_REPOINTED_AFTER_RENAME,
-    *_WIDENED_TO_EVERY_RESTATEMENT,
+    *_WIDENED_TO_EVERY_RESTATEMENT, *_RETARGETED_AFTER_4857,
 ]
 
 _RETIRED_TO_MANUAL = [
@@ -263,9 +292,9 @@ def test_repaired_sidecar_carries_the_repaired_descriptor(
     )
 
 
-# Rows whose producer is done. The rest of _REANCHORED and _SUFFIX_GATE are left
-# out: their producers (5324, 6764) are pending, so their forward-looking gates
-# legitimately fail at HEAD.
+# Rows whose producer is done. The rest of _REANCHORED, _SUFFIX_GATE and
+# _RETARGETED_AFTER_4857 are left out: their producers (5324, 6764, 9243) are
+# pending, so their forward-looking gates legitimately fail at HEAD.
 _DONE_PRODUCER_HEADS = [
     r[:4] for r in [*_RESYNCED_TO_TASK_RECORD, _QUALITY_BOUNDARY, *_REPOINTED_AFTER_RENAME]
 ]
@@ -406,4 +435,117 @@ def test_quality_boundary_gate_follows_the_test_file_not_the_prose(
         f"task 8461's delivered_check (kind={row.kind!r}) evaluates {outcome.value} "
         f"on a tree holding only {sorted(files)}; it must follow the test file's "
         f"existence, not any mention of its name."
+    )
+
+
+_METADATA_ROW_TEXT_DEF = "def metadata_row_text(row):\n    return ''\n"
+
+
+@pytest.mark.parametrize(
+    "files,expected",
+    [
+        pytest.param(
+            {_STORE_RECORDS: "MEM0_CONTENT_KEYS = ('data', 'memory', 'content')\n"},
+            CheckOutcome.FAIL, id="content-key-tuple-restated",
+        ),
+        pytest.param(
+            {_MEMORY_SERVICE: _METADATA_ROW_TEXT_DEF},
+            CheckOutcome.FAIL, id="helper-still-in-service",
+        ),
+        pytest.param(
+            {_STORE_RECORDS:
+                "from fused_memory.utils.mem0_content_keys import mem0_payload_text\n\n\n"
+                "def metadata_row_text(row):\n    return mem0_payload_text(row)\n"},
+            CheckOutcome.PASS, id="codec-moved",
+        ),
+    ],
+)
+def test_store_records_gate_follows_metadata_row_text_not_a_content_key_tuple(
+        tmp_path, sidecar_rows, files, expected):
+    """A restated content-key tuple must not deliver (task 4857 gave the keys one
+    home), and a store_records.py that defines metadata_row_text over the shared
+    keys must, so 9243 can finish without breaching SPOT."""
+    row = _sidecar_row(sidecar_rows, _STORE_RECORDS_MODULE)
+
+    outcome = evaluate_row(row, repo_root=committed_repo(tmp_path / "fm", files), ref="HEAD")
+    assert outcome is expected, (
+        f"task 9243's store-records-module check evaluates {outcome.value} on a tree "
+        f"holding only {sorted(files)}; it must follow metadata_row_text's move into "
+        f"{_STORE_RECORDS}, not a restated content-key tuple."
+    )
+
+
+_CODEC_READER_REPOINTED = "from fused_memory.services.store_records import metadata_row_text\n"
+
+
+@pytest.mark.parametrize(
+    "survivor,expected",
+    [
+        *(pytest.param(reader, CheckOutcome.FAIL, id=Path(reader).stem)
+          for reader in _CODEC_READER_IMPORTS),
+        pytest.param(None, CheckOutcome.PASS, id="no-survivor"),
+    ],
+)
+def test_codec_readers_gate_holds_until_both_readers_left_the_service(
+        tmp_path, sidecar_rows, survivor, expected):
+    """Each metadata_row_text reader 9243 repoints is gated, so the gate cannot pass
+    early, and a tree where both import from store_records delivers."""
+    row = _sidecar_row(sidecar_rows, _CODEC_READERS_LEFT)
+    files = dict.fromkeys(_CODEC_READER_IMPORTS, _CODEC_READER_REPOINTED)
+    if survivor is not None:
+        files[survivor] = f"{_CODEC_READER_IMPORTS[survivor]}\n"
+
+    outcome = evaluate_row(row, repo_root=committed_repo(tmp_path / "fm", files), ref="HEAD")
+    assert outcome is expected, (
+        f"task 9243's codec-readers-left-the-service check evaluates {outcome.value} on "
+        f"a tree where {survivor or 'no reader'} still imports metadata_row_text from "
+        f"memory_service; it must hold while either reader does and open once neither does."
+    )
+
+
+_WRAPPED_TOOLS_IMPORT = (
+    "from fused_memory.services.memory_service import (\n"
+    "    MemoryService,\n"
+    "    metadata_row_text,\n"
+    ")\n"
+)
+
+
+@pytest.mark.parametrize(
+    "files,expected",
+    [
+        pytest.param(
+            {_MEMORY_SERVICE: _METADATA_ROW_TEXT_DEF,
+             _TOOLS: _WRAPPED_TOOLS_IMPORT,
+             _SPECIMEN_GUARD: _CODEC_READER_REPOINTED},
+            {"codec-readers-left-the-service": CheckOutcome.PASS,
+             "codec-left-the-service": CheckOutcome.FAIL},
+            id="wrapped-survivor",
+        ),
+        pytest.param(
+            {_MEMORY_SERVICE: "class MemoryService:\n    pass\n",
+             _STORE_RECORDS: _METADATA_ROW_TEXT_DEF,
+             **dict.fromkeys(_CODEC_READER_IMPORTS, _CODEC_READER_REPOINTED)},
+            {"codec-readers-left-the-service": CheckOutcome.PASS,
+             "codec-left-the-service": CheckOutcome.PASS},
+            id="codec-moved",
+        ),
+    ],
+)
+def test_codec_left_gate_holds_where_the_readers_line_grep_cannot_see(
+        tmp_path, sidecar_rows, files, expected):
+    """codec-readers-left-the-service greps line by line, so a parenthesized import
+    escapes it; codec-left-the-service holds 9243's gate while memory_service.py
+    still defines the helper that import needs, and opens once the codec moved."""
+    repo = committed_repo(tmp_path / "fm", files)
+
+    outcomes = {
+        descriptor[3]: evaluate_row(
+            _sidecar_row(sidecar_rows, descriptor), repo_root=repo, ref="HEAD")
+        for descriptor in (_CODEC_READERS_LEFT, _CODEC_LEFT)
+    }
+    assert outcomes == expected, (
+        f"task 9243's codec checks evaluate {outcomes} on a tree holding "
+        f"{sorted(files)}; codec-left-the-service must hold the gate while "
+        f"memory_service.py defines metadata_row_text and open once it does not."
     )

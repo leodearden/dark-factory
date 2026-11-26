@@ -200,8 +200,9 @@ loading the twin with `shared.capability_manifest.CapabilityManifestDoc`: all 62
 | The block separates without stitching | substrate: the discussion round's AST measurement (2026-11-10) — the policy block (883 lines) and codec helpers (552 lines) are module-level functions taking their collaborators as arguments; `server/grouped_read.py` and `reconciliation/preservation_specimen_guard.py` already import from it | PASS |
 | The policy has its own module | producer (ρ): `fm/services/memory_metadata_policy.py::apply_memory_metadata_validation` (public) | PASS (ρ delivers) |
 | The policy left the service | producer (ρ): `^(async )?def _apply_memory_metadata_validation\b` absent from `memory_service.py` | PASS (ρ delivers) |
-| The codec has its own module | producer (ρ): `fm/services/store_records.py::MEM0_CONTENT_KEYS` (with `mem0_content`, `metadata_row_text`, the record decoders and store-error helpers) | PASS (ρ delivers) |
-| No private import of the codec | producer (ρ): `memory_service import _MEM0_CONTENT_KEYS` absent from `fm/server/grouped_read.py` | PASS (ρ delivers) |
+| The codec has its own module | producer (ρ): `fm/services/store_records.py::metadata_row_text` (with the record decoders and store-error helpers); it imports `mem0_payload_text` from `fm/utils/mem0_content_keys.py`, the content keys' one home since task 4857, and restates no content-key tuple | PASS (ρ delivers) |
+| The codec readers left the service | producer (ρ): `memory_service import .*\bmetadata_row_text\b` absent from `fm/server/tools.py` and `fm/reconciliation/preservation_specimen_guard.py` | PASS (ρ delivers) |
+| The codec left the service | producer (ρ): `^def metadata_row_text\(` absent from `memory_service.py`, so an import of it from there fails even when the readers' line-level grep cannot see it (a parenthesized multi-line import) | PASS (ρ delivers) |
 
 ## τ — Extract GraphMutations over a shared journaled-operations module (S26-2)
 
