@@ -14,17 +14,22 @@ import dataclasses
 import hashlib
 import json
 import os
+import re
 import shlex
 from collections.abc import Mapping
 from datetime import UTC, datetime
+from functools import partial
 from pathlib import Path
 from typing import Any
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
 import pytest_asyncio
 import yaml
 from _fm_helpers import load_script_module
+from _invocation_ledger import invocation_rows
+from _invocation_tokens import agent_result_with_tokens
 from _link_heal_harness import (
     ALL_LINK_HEAL_PREFIXES,
     COMPLETION_META,
@@ -41,8 +46,9 @@ from _link_heal_harness import (
     build_harness,
 )
 from escalation.queue import EscalationQueue
+from shared.cli_invoke import invoke_with_cap_retry
 
-from fused_memory.maintenance.link_adjudicator import AdjudicationFailure
+from fused_memory.maintenance.link_adjudicator import AdjudicationFailure, configured_adjudicator
 from fused_memory.maintenance.link_heal import RunCounts, Verdict
 from fused_memory.maintenance.link_heal_calibration import load_soak_population
 from fused_memory.maintenance.link_heal_executor import (
@@ -340,6 +346,17 @@ class TestStatus:
         lines = status_lines(capsys)
         assert 'writes no' in run_line(lines, planned['run_id'])
         assert NO_WRITING_RUN in lines
+
+    @pytest.mark.asyncio
+    async def test_a_run_that_asked_no_adjudicator_names_no_invocations_run(
+        self, harness, workspace, capsys,
+    ):
+        env = env_for(harness, workspace)
+        planned = await plan_from(env, workspace, seed_corpus(harness, workspace, 1), capsys)
+
+        assert await run_cli(env, workspace, 'status') == 0
+
+        assert 'invocations none' in run_line(status_lines(capsys), planned['run_id'])
 
     @pytest.mark.asyncio
     async def test_a_zero_action_apply_is_a_writing_run(self, harness, workspace, capsys):
@@ -725,6 +742,26 @@ async def plan_adjudicated(env: Any, workspace: Workspace, capsys, *argv: str) -
     return code, printed_report(capsys)
 
 
+def ledgered_adjudicator(answer: Verdict):
+    """An ``adjudicator_for`` building the production adjudicator over the run's ledger,
+    with only the CLI subprocess replaced: every one-pair shard is answered *answer*."""
+    served = agent_result_with_tokens(
+        success=True,
+        structured_output={'verdicts': [{'id': 'p1', 'verdict': answer.value, 'reason': 'r'}]},
+        cost_usd=0.1,
+    )
+
+    def adjudicator_for(config, ledger):
+        return configured_adjudicator(
+            config.link_heal,
+            brief_text='Judge each pair.',
+            invoke=partial(invoke_with_cap_retry, invoke_fn=AsyncMock(return_value=served)),
+            ledger=ledger,
+        )
+
+    return adjudicator_for
+
+
 class TestPlanFromAdjudicator:
     @pytest.mark.asyncio
     async def test_plan_ledgers_an_adjudicator_run_its_verdicts_and_its_document(
@@ -820,6 +857,29 @@ class TestPlanFromAdjudicator:
         assert ledger.run_id
         assert ledger.cost_store is not None
         assert invocations_ledger_path(workspace.ledger_dir).exists()
+
+    @pytest.mark.asyncio
+    async def test_a_plan_runs_invocations_rows_are_reachable_from_its_ledger_run_id(
+        self, harness, workspace, capsys,
+    ):
+        workspace.write_config(link_heal={'shard_size': 1})
+        seed_unrated_sightings(harness, 2)
+        env = dataclasses.replace(
+            env_for(harness, workspace), adjudicator_for=ledgered_adjudicator(Verdict.EXTENDS),
+        )
+        code, report = await plan_adjudicated(env, workspace, capsys, '--project', DF)
+        assert code == 0
+
+        assert await run_cli(env, workspace, 'status') == 0
+
+        named = re.search(r'invocations (\S+)', run_line(status_lines(capsys), report['run_id']))
+        assert named is not None
+        invocation_id = named.group(1)
+        rows = await invocation_rows(invocations_ledger_path(workspace.ledger_dir))
+        assert len(rows) == 2
+        assert {row['run_id'] for row in rows} == {invocation_id}
+        assert {row['role'] for row in rows} == {LedgerRole.LINK_ADJUDICATOR.value}
+        assert workspace.runs()[0].invocation_run_id == invocation_id
 
     @pytest.mark.asyncio
     async def test_project_defaults_to_the_home_project(self, harness, workspace, capsys):
