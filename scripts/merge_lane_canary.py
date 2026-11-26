@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import statistics
 from collections import Counter, defaultdict
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
@@ -563,3 +563,122 @@ def per_item_chain_wall(verify: Sequence[Event], min_items: int = 8) -> ChainWal
     if not per_item:
         return None
     return ChainWall(n=len(per_item), p50_secs=statistics.median(per_item), max_secs=max(per_item))
+
+
+# ---------------------------------------------------------------------------
+# The two invariant predicates whose producers write nothing to runs.db.
+# ---------------------------------------------------------------------------
+
+LIVE_TIP = 'live_tip'
+
+#: The text prefixes of the I4 speculation-accounting arm of the merge lane's
+#: resource audit; their producer is
+#: orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker.speculation_accounting_violations.
+SPECULATION_ACCOUNTING_PREFIXES = (
+    'speculation-slot conservation violated',
+    'merge-ahead-cap conservation violated',
+    'merge-ahead-cap handoff violated',
+    'speculation_accounting_violations:',
+)
+
+#: The I6 worktree-ledger arm of the same audit
+#: (worker.py::SpeculativeMergeWorker.worktree_ledger_violations): not an accounting violation.
+WORKTREE_LEDGER_PREFIX = 'unregistered on-disk merge worktree'
+
+Anchor = tuple[str, datetime, str]
+
+
+def _recorded_dead(
+    voided: Sequence[Event], discards: Sequence[Event], verify: Sequence[Event],
+) -> Iterator[tuple[object, datetime | None]]:
+    for event in (*voided, *discards):
+        data = _data(event)
+        yield data.get('dead_link'), _at(event)
+        yield data.get('item_commit'), _at(event)
+    for event in verify:
+        if _data(event).get('passed') is False:
+            yield _data(event).get('merge_sha'), _at(event)
+
+
+def _first_recorded_dead(
+    voided: Sequence[Event], discards: Sequence[Event], verify: Sequence[Event],
+) -> dict[str, datetime]:
+    first: dict[str, datetime] = {}
+    for sha, moment in _recorded_dead(voided, discards, verify):
+        if isinstance(sha, str) and sha and moment is not None:
+            first[sha] = min(first.get(sha, moment), moment)
+    return first
+
+
+def _anchors(rows: Iterable[Event]) -> list[Anchor]:
+    anchors = []
+    for event in rows:
+        data, moment = _data(event), _at(event)
+        base = data.get('anchor_base')
+        if data.get('anchor_reason') == LIVE_TIP and isinstance(base, str) and base and moment is not None:
+            anchors.append((str(event.get('task_id')), moment, base))
+    return sorted(anchors, key=lambda anchor: anchor[1])
+
+
+@dataclass(frozen=True)
+class FrozenTipResult:
+    anchors: int
+    violations: tuple[Anchor, ...]
+    died_after_anchor: int
+
+
+def frozen_tip_violations(
+    voided: Sequence[Event], discards: Sequence[Event], verify: Sequence[Event],
+) -> FrozenTipResult:
+    """New-class frozen-tip violations: a re-anchor onto a tip already recorded dead.
+
+    An anchor is a ``verdict_voided`` or ``speculative_discard`` row with
+    ``anchor_reason`` live_tip and a str ``anchor_base``. It violates when that
+    base was recorded dead STRICTLY EARLIER: a ``dead_link`` or ``item_commit``
+    of a void/discard row, or the ``merge_sha`` of a failed merge verify. A
+    base recorded dead only at or after the anchor is INV-3's adoption
+    backstop, counted in ``died_after_anchor``. The vacated-tip half of the
+    class has no event, so it is not measured here.
+    """
+    dead_at = _first_recorded_dead(voided, discards, verify)
+    anchors = _anchors((*voided, *discards))
+    violations = tuple(a for a in anchors if a[2] in dead_at and dead_at[a[2]] < a[1])
+    died_after = sum(1 for a in anchors if a[2] in dead_at and dead_at[a[2]] >= a[1])
+    return FrozenTipResult(anchors=len(anchors), violations=violations, died_after_anchor=died_after)
+
+
+class AuditLevel(StrEnum):
+    WARNING = 'WARNING'
+    INFO = 'INFO'
+
+
+@dataclass(frozen=True)
+class AuditRecord:
+    """One resource-audit journal line; a clear line carries no violation."""
+
+    at: datetime
+    level: AuditLevel
+    violations: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class AccountingTally:
+    distinct_texts: int
+    records_with_any: int
+    worktree_ledger_records: int
+
+
+def _is_accounting(text: str) -> bool:
+    return text.startswith(SPECULATION_ACCOUNTING_PREFIXES)
+
+
+def accounting_violations(records: Sequence[AuditRecord]) -> AccountingTally:
+    """Speculation-accounting violations among resource-audit records; worktree-ledger ones apart."""
+    texts = {text for record in records for text in record.violations if _is_accounting(text)}
+    return AccountingTally(
+        distinct_texts=len(texts),
+        records_with_any=sum(1 for r in records if any(map(_is_accounting, r.violations))),
+        worktree_ledger_records=sum(
+            1 for r in records if any(t.startswith(WORKTREE_LEDGER_PREFIX) for t in r.violations)
+        ),
+    )

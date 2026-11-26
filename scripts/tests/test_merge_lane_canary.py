@@ -445,7 +445,7 @@ def test_a_live_tip_anchor_onto_an_already_dead_tip_is_a_new_class_violation():
 def test_a_tip_recorded_dead_at_the_anchor_instant_is_not_earlier():
     voided = [anchor(5, 'x', 'tip'), anchor(5, 'k', None, reason='tip_dead', dead_link='tip')]
     result = canary.frozen_tip_violations(voided, [], [])
-    assert (result.anchors, result.violations, result.died_after_anchor) == (1, (), 0)
+    assert (result.anchors, result.violations, result.died_after_anchor) == (1, (), 1)
 
 
 def test_an_anchor_without_a_string_base_is_not_examined():
