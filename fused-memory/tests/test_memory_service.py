@@ -14528,6 +14528,42 @@ class TestDeleteMemoryCascade:
         ]
 
     @pytest.mark.asyncio
+    async def test_a_child_that_vanished_before_its_delete_is_not_reported_destroyed(
+        self, service
+    ):
+        """`cascaded_child_ids` names what THIS cascade destroyed, nothing more.
+
+        CHILD_B is deleted concurrently between the cascade's listing and its
+        own delete, so its existence read misses and nothing is destroyed
+        there. Reporting it would claim a deletion this call never made.
+        """
+        journal = _mm_install_journal(service)
+        graph = _DMGraph({_DM_PARENT: [_DM_CHILD_A, _DM_CHILD_B]}).install(service)
+
+        async def read_point(memory_id, scope):
+            if memory_id == _DM_CHILD_B:
+                for kids in graph.edges.values():
+                    if memory_id in kids:
+                        kids.remove(memory_id)
+                return None
+            return dict(DEFAULT_POINT_PAYLOAD)
+
+        service.mem0.get_point_by_id = AsyncMock(side_effect=read_point)
+
+        result = await service.delete_memory(
+            memory_id=_DM_PARENT, store='mem0', project_id='test', cascade=True
+        )
+
+        assert result['status'] == 'deleted'
+        assert graph.deleted == [_DM_CHILD_A, _DM_PARENT]
+        assert result['cascaded_child_ids'] == [_DM_CHILD_A]
+        parent_row = next(
+            call.kwargs for call in journal.log_write_op.call_args_list
+            if call.kwargs['params']['memory_id'] == _DM_PARENT
+        )
+        assert _DM_CHILD_B not in parent_row['result_summary']['cascaded_child_ids']
+
+    @pytest.mark.asyncio
     async def test_self_parent_terminates_and_deletes_once(self, service):
         """A record whose own parent_id points at itself.
 
