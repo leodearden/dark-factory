@@ -759,3 +759,101 @@ def test_aa_with_a_headline_metric_below_the_eligibility_floor_exits_unproven(
     (line,) = [line for line in err.splitlines() if 'workflow_verify_minutes' in line]
     assert 'eligible n0=25 n1=5' in line
     assert f'below {readout.MIN_ELIGIBLE_PER_ARM}' in line
+
+
+# --- producers (INV-13) and the exact-3-modules subset ----------------------
+
+
+def _producers_line(text):
+    (line,) = [line for line in text.splitlines() if line.startswith('producers:')]
+    return line
+
+
+@pytest.fixture
+def ruled_root(fleet_root):
+    return fleet_root(
+        'proj-a',
+        [
+            TaskSpec(1, events=(_routing_decision(_at(2), 'large-plan-modules'),)),
+            TaskSpec(2, events=(_routing_decision(_at(3), 'retry-tier-up', role='debugger'),)),
+        ],
+    )
+
+
+def test_an_expected_rule_id_absent_from_the_window_exits_unproven_but_prints_the_table(
+    ruled_root, capsys,
+):
+    assert _run_main([ruled_root], '--expect-rule', 'large-plan-modules-4') == readout.EXIT_UNPROVEN
+
+    out, err = capsys.readouterr()
+    assert "no routing_decision in the window carries rule id 'large-plan-modules-4'" in err
+    assert any('mean0' in line for line in out.splitlines())
+
+
+def test_an_expected_rule_id_present_in_the_window_exits_ok_and_rule_ids_are_counted(
+    ruled_root, capsys,
+):
+    assert _run_main([ruled_root], '--expect-rule', 'large-plan-modules') == readout.EXIT_OK
+
+    producers = _producers_line(capsys.readouterr().out)
+    assert 'large-plan-modules=1' in producers
+    assert 'retry-tier-up=1' in producers
+
+
+def test_without_a_plan_shape_producer_row_the_subset_is_refused_before_any_table(
+    ruled_root, capsys,
+):
+    assert _run_main([ruled_root], '--subset', 'exact-3-modules') == readout.EXIT_UNPROVEN
+
+    out, err = capsys.readouterr()
+    assert 'implementer decisions carrying plan shape: no producer row in window' in (
+        _producers_line(out)
+    )
+    assert 'plan_steps/plan_modules' in err
+    assert 'no producer row' in err
+    assert not any('mean0' in line for line in out.splitlines())
+
+
+def test_the_exact_3_modules_subset_keeps_only_three_module_plans_under_twelve_steps(
+    fleet_root, capsys,
+):
+    shapes = {1: (3, 5), 2: (3, 5), 3: (3, 12), 4: (4, 5), 5: (2, 3)}
+    root = fleet_root(
+        'proj-a',
+        [
+            *(
+                TaskSpec(task_id, events=(
+                    _routing_decision(_at(2), plan_modules=modules, plan_steps=steps),
+                ))
+                for task_id, (modules, steps) in shapes.items()
+            ),
+            TaskSpec(6),
+            TaskSpec(7),
+        ],
+    )
+
+    status = _run_main([root], '--subset', 'exact-3-modules', '--json')
+
+    assert status == readout.EXIT_OK
+    report = json.loads(capsys.readouterr().out)
+    assert sorted(task['task_id'] for task in report['tasks']) == ['1', '2']
+    assert report['exclusions'] == {
+        'no plan shape': 2, 'plan_modules != 3': 2, 'plan_steps >= 12': 1,
+    }
+
+    assert _run_main([root], '--subset', 'exact-3-modules') == readout.EXIT_OK
+    rule = _rule_line(capsys.readouterr().out)
+    assert 'subset exact-3-modules (plan_modules == 3 and plan_steps < 12)' in rule
+    assert 'excluded 2 no plan shape, 2 plan_modules != 3, 1 plan_steps >= 12' in rule
+
+
+def test_with_no_curator_hint_the_producers_line_says_so_and_its_row_has_no_null(
+    balanced_root, capsys,
+):
+    assert _run_main([balanced_root], '--resamples', '400') == readout.EXIT_OK
+
+    out = capsys.readouterr().out
+    assert 'tasks carrying x_curator_complexity_hint: no producer row in window' in (
+        _producers_line(out)
+    )
+    assert _table_line(out, 'curator_hint_simple').split()[-3:] == ['-', '-', '-']
