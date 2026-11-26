@@ -88,7 +88,6 @@ extend-select = ["TID251"]
 "asyncio.events.get_event_loop".msg = "Raises 'no current event loop' once asyncio.run() has cleared it (task 1711): use asyncio.get_running_loop() in an async body or helper, asyncio.run(coro) in a sync driver, or make_placeholder_future() from orchestrator/tests/_orch_helpers.py for a sync test's placeholder future."
 
 [tool.ruff.lint.per-file-ignores]
-"tests/**/*.py" = ["F811"]
 # src/ still calls asyncio.get_event_loop(), outside the retired AST guard's tests-only scope.
 # Its owner is recorded in shared/tests/test_shared_governed_lists.py::RUFF_CONFIG_SUPPRESSIONS.
 "src/**/*.py" = ["TID251"]

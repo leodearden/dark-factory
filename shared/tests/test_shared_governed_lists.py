@@ -140,7 +140,6 @@ RUFF_CONFIG_SUPPRESSIONS = governed_exceptions(
     ruff_suppression_keys(REPO_ROOT),
     dispositions={
         'tool.ruff.lint.ignore::E501': Policy('inv12-ruff-e501-line-length'),
-        'orchestrator/pyproject.toml::tool.ruff.lint.per-file-ignores::tests/**/*.py::F811': Debt(TaskRef(7137)),
         'orchestrator/pyproject.toml::tool.ruff.lint.per-file-ignores::src/**/*.py::TID251': Debt(TaskRef(8622)),
     },
 )
