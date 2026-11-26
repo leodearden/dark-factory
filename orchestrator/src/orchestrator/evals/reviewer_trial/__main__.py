@@ -35,6 +35,7 @@ from orchestrator.review_payload import Verdict, normalize_review
 if TYPE_CHECKING:
     from .corpus import CorpusDiff, CorpusManifest
     from .scorer import ScoringResult
+    from .variants import VariantConfig
 
 _PKG_DIR = Path(__file__).parent
 _CORPUS_PATH = _PKG_DIR / 'corpus' / 'manifest.json'
@@ -928,26 +929,46 @@ def _parse_briefings(
     return briefings
 
 
+def _parse_arms(
+    _ctx: click.Context, _param: click.Parameter, value: str | None,
+) -> list[VariantConfig]:
+    """The named campaign arms, in the order given; the evidence set when none is named."""
+    from .variants import CAMPAIGN_VARIANTS, FABLE_EVIDENCE_VARIANTS
+
+    if value is None:
+        return list(FABLE_EVIDENCE_VARIANTS)
+    names = [name.strip() for name in value.split(',') if name.strip()]
+    unknown = [name for name in names if name not in CAMPAIGN_VARIANTS]
+    if unknown or not names:
+        raise click.BadParameter(
+            f'{", ".join(unknown) or "(none)"}: each must be one of {", ".join(sorted(CAMPAIGN_VARIANTS))}',
+        )
+    return [CAMPAIGN_VARIANTS[name] for name in names]
+
+
 @cli.command('campaign')
 @click.option('--results-dir', required=True, type=click.Path(path_type=Path),
               help='Campaign root; per-trial panel results and scores checkpoint under it')
 @click.option('--trials', default=3, type=int, help='Independent repeats per arm (replication by fixture)')
 @click.option('--split', default='test', help='Corpus split to run (train|selection|test|all)')
-@click.option('--arms', default=None, help='Comma-separated variant names (default: FABLE_EVIDENCE_VARIANTS)')
+@click.option('--arms', default=None, callback=_parse_arms,
+              help='Comma-separated campaign arm names (default: FABLE_EVIDENCE_VARIANTS)')
 @click.option('--briefing', 'briefings', default=ReviewBriefing.DIFF_ONLY.value, callback=_parse_briefings,
               help='Comma-separated reviewer briefing generations, each run once for every arm '
                    '(diff-only | d2; default: diff-only; diff-only first when both are listed; '
                    "d2 alone pairs every arm against the first arm's d2 arm)")
 @click.option('--diff-cap', default=None, type=int,
               help='Diff truncation in chars (default: runner.DIFF_CAP_CHARS; 0 lifts the cap)')
+@click.option('--max-turns', default=None, type=click.IntRange(min=1),
+              help="Reviewer turn cap (default: production's max_turns.reviewer; 30 reproduces the D6/D7 campaign)")
 @click.option('--max-parallel', default=3, type=int, help='Max concurrent panel runs')
 @click.option('--pool/--no-pool', default=True,
               help='Draw on the shared OAuth account pool via a UsageGate (default) or the CLI default login')
 @click.option('--config', 'config_path', default=None, type=click.Path(path_type=Path),
               help="Orchestrator config supplying usage_cap accounts (default: the main checkout's)")
 def campaign(
-    results_dir: Path, trials: int, split: str, arms: str | None,
-    briefings: list[ReviewBriefing], diff_cap: int | None,
+    results_dir: Path, trials: int, split: str, arms: list[VariantConfig],
+    briefings: list[ReviewBriefing], diff_cap: int | None, max_turns: int | None,
     max_parallel: int, pool: bool, config_path: Path | None,
 ) -> None:
     """Run the Fable evidence campaign: every arm x every fixture x N trials.
@@ -968,18 +989,14 @@ def campaign(
 
         from . import campaign as reduce
         from .runner import DIFF_CAP_CHARS, run_and_score
-        from .variants import FABLE_EVIDENCE_VARIANTS, campaign_arms
+        from .variants import campaign_arms, trial_reviewer_max_turns
 
         manifest = _load_corpus()
         corpus = manifest if split == 'all' else _select_split(manifest, split)
-        by_name = {v.name: v for v in FABLE_EVIDENCE_VARIANTS}
-        variants = campaign_arms(
-            [by_name[a.strip()] for a in arms.split(',') if a.strip()]
-            if arms else FABLE_EVIDENCE_VARIANTS,
-            briefings,
-        )
+        variants = campaign_arms(arms, briefings)
         incumbent = variants[0].name
         cap = DIFF_CAP_CHARS if diff_cap is None else diff_cap
+        turns = trial_reviewer_max_turns(max_turns)
         prices = default_price_table()
 
         async with campaign_usage_gate(load_config(config_path) if pool else None) as usage_gate:
@@ -995,7 +1012,7 @@ def campaign(
 
             click.echo(click.style(
                 f'Campaign: {len(variants)} arms x {len(corpus.diffs)} diffs ({split}) x {trials} trials, '
-                f'briefings {",".join(briefings)}, diff cap {cap or "lifted"}, '
+                f'briefings {",".join(briefings)}, diff cap {cap or "lifted"}, turn cap {turns}, '
                 f'pool={"on" if usage_gate else "off"}',
                 bold=True,
             ))
@@ -1007,7 +1024,7 @@ def campaign(
                 scores = await run_and_score(
                     variants, corpus, results_dir=trial_dir, score_dir=trial_dir / 'scores',
                     max_parallel_panels=max_parallel, prices=prices, usage_gate=usage_gate,
-                    diff_cap_chars=cap, on_scored=_echo_cell,
+                    diff_cap_chars=cap, max_turns=turns, on_scored=_echo_cell,
                 )
                 records.extend({**asdict(s), 'trial': trial} for s in scores)
 
