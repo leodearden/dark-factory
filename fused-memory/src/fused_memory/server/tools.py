@@ -10672,8 +10672,13 @@ def create_mcp_server(
                   send back the ``done_provenance`` you just read, unchanged —
                   adding, changing or dropping it is rejected with
                   ``error == 'done_provenance_via_update_task'``. The same
-                  holds for ``defects`` and ``defect_test_retirements``,
-                  refused with ``error == 'defect_records_via_update_task'``:
+                  holds for ``declared_scope`` (refused with
+                  ``error == 'declared_scope_write_authority'``) and
+                  ``deferral`` (``error == 'deferral_write_authority'``): send
+                  each back exactly as read; every mode accepts an unchanged
+                  echo of either. It holds too for ``defects`` and
+                  ``defect_test_retirements``, refused with
+                  ``error == 'defect_records_via_update_task'``:
                   after creation only ``declare_defect`` and
                   ``record_defect_outcome`` write them, and every other mode
                   refuses either key outright, echo included.
