@@ -914,3 +914,113 @@ def chain_attributed_episodes(
     """
     landings_at = [ledger.landed_at.get(sha) for sha in chain_landing_shas]
     return sum(1 for ep in episodes if any(_in_candidate_range(ep, t) for t in landings_at))
+
+
+# ---------------------------------------------------------------------------
+# evaluate: the D12 table. Each limit, rule and baseline is written once, in
+# D12_ROWS; the baselines are the merge-throughput report's 2026-11-04 figures.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class CanaryFigures:
+    """The measured value behind each D12 row; None when it could not be measured."""
+
+    gates_per_landing: float | None
+    voids_per_landing: float | None
+    p_gate_after_gate: float | None
+    laptop_finished_share: float | None
+    frozen_tip_violations: int | None
+    speculation_accounting_violations: int | None
+    chain_attributed_red_main: int | None
+    queue_to_land_p50_hours: float | None
+    local_verify_hours_per_week: float | None
+    deep_chain_p90_secs: float | None
+
+
+@dataclass(frozen=True)
+class D12Row:
+    key: str
+    label: str
+    limit: float
+    comparison: Comparison
+    rule: str
+    baseline: str
+    chain_traced: bool = False
+
+
+D12_ROWS: tuple[D12Row, ...] = (
+    D12Row(
+        'gates_per_landing', 'gates per landing', 0.3, Comparison.LT,
+        'merge_reverify_gate rows with reverify=true / landings (merge_finalized done ∪ train_merged members)',
+        '0.84',
+    ),
+    D12Row(
+        'voids_per_landing', 'voids per landing', 0.1, Comparison.LT,
+        'verdict_voided rows / landings', '0.78',
+    ),
+    D12Row(
+        'p_gate_after_gate', 'P(gate | previous landing gated)', 0.3, Comparison.LT,
+        'consecutive landings in time order; a landing is gated iff a reverify=true gate row for its '
+        "task is stamped after the task's last merge_queued and at or before the landing",
+        '0.79',
+    ),
+    D12Row(
+        'laptop_finished_share', 'laptop finished-lease share', 0.1, Comparison.LT,
+        'merge_heartbeat weighted by the gap to the next (capped at 600 s); share with a laptop '
+        'lease whose activity is finished',
+        '33%',
+    ),
+    D12Row(
+        'frozen_tip_violations', 'new-class frozen-tip violations', 0, Comparison.EQ0,
+        'live_tip anchor (verdict_voided / speculative_discard anchor_base) onto a tip recorded dead '
+        'strictly earlier; dead tips only, a vacated tip has no event',
+        '—', chain_traced=True,
+    ),
+    D12Row(
+        'speculation_accounting_violations', 'speculation accounting violations', 0, Comparison.EQ0,
+        'distinct I4 speculation-accounting texts in the orchestrator journal resource-audit lines',
+        '—', chain_traced=True,
+    ),
+    D12Row(
+        'chain_attributed_red_main', 'chain-attributed red-main episodes', 0, Comparison.EQ0,
+        'confirmed (L1-filed) main-tip sweep episode with a chain landing after the last green and at '
+        'or before the first red swept SHA',
+        '—', chain_traced=True,
+    ),
+    D12Row(
+        'queue_to_land_p50_hours', 'median queue-to-land (h)', 1.0, Comparison.LT,
+        'p50 of merge_finalized done queue_to_land_secs', '5.4 h',
+    ),
+    D12Row(
+        'local_verify_hours_per_week', 'local merge-verify hours / week', 60.0, Comparison.LT,
+        'union of local completed (runner) and cancelled (host) merge-verify intervals, x 168 / window hours',
+        '~100 h',
+    ),
+    D12Row(
+        'deep_chain_p90_secs', 'deep-chain verify p90 (s)', 10800.0, Comparison.LE,
+        'nearest-rank p90 of merge_verify duration_ms with chain_items >= 2 (the 3190 rule)', '—',
+    ),
+)
+
+
+def evaluate(figures: CanaryFigures) -> tuple[Predicate, ...]:
+    """The ten D12 predicates, in D12_ROWS order."""
+    return tuple(
+        Predicate(
+            key=row.key, label=row.label, value=getattr(figures, row.key), limit=row.limit,
+            comparison=row.comparison, rule=row.rule, baseline=row.baseline,
+            chain_traced=row.chain_traced,
+        )
+        for row in D12_ROWS
+    )
+
+
+def false_predicates(rows: Sequence[Predicate]) -> tuple[Predicate, ...]:
+    """Every row that does not hold; an unmeasured row never holds."""
+    return tuple(row for row in rows if not row.holds)
+
+
+def recommends_chain_cap_zero(rows: Sequence[Predicate]) -> bool:
+    """Only a false chain-traced row recommends ``merge_deep.chain_cap: 0`` (2026-11-20 ruling, gate 10572)."""
+    return any(row.chain_traced for row in false_predicates(rows))
