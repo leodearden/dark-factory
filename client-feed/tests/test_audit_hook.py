@@ -1,14 +1,28 @@
-"""The audit-hook recorder B30 scopes the filer's effects with: what it records, and what it leaves out."""
+"""The audit-hook recorder B1 and B30 scope effects with: what it records, and what it leaves out."""
 
+import glob
 import json
 import os
+import site
 import socket
+import sqlite3
+import ssl
 import subprocess
 import sys
 from pathlib import Path
 
 import pytest
-from _audit_hook import Connected, Mutated, Opened, recording, runtime_roots
+from _audit_hook import (
+    Connected,
+    DatabaseOpened,
+    Listed,
+    Mutated,
+    Opened,
+    Spawned,
+    interpreter_roots,
+    recording,
+    runtime_roots,
+)
 
 
 def test_an_open_records_its_path_and_whether_it_writes(tmp_path: Path) -> None:
@@ -136,3 +150,131 @@ def test_a_nested_recording_sees_only_its_own_span(tmp_path: Path) -> None:
 
     assert [opened.path for opened in inner.opens] == [tmp_path / 'inner']
     assert [opened.path for opened in outer.opens] == [tmp_path / 'outer', tmp_path / 'inner']
+
+
+def test_a_sqlite_connect_records_its_path(tmp_path: Path) -> None:
+    database = tmp_path / 'a.db'
+
+    with recording() as rec:
+        sqlite3.connect(database).close()
+
+    assert rec.database_opens == (DatabaseOpened(database),)
+
+
+def test_a_read_only_uri_connect_records_the_decoded_path(tmp_path: Path) -> None:
+    database = tmp_path / 'with space' / 'b.db'
+    database.parent.mkdir()
+    sqlite3.connect(database).close()
+
+    with recording() as rec:
+        sqlite3.connect(f'{database.as_uri()}?mode=ro', uri=True).close()
+
+    assert rec.database_opens == (DatabaseOpened(database),)
+
+
+def test_an_in_memory_connect_records_no_path() -> None:
+    with recording() as rec:
+        sqlite3.connect(':memory:').close()
+
+    assert rec.database_opens == (DatabaseOpened(None),)
+
+
+def test_a_subprocess_spawn_records_its_cwd_and_args(tmp_path: Path) -> None:
+    with recording() as rec:
+        subprocess.run(['git', '--version'], cwd=tmp_path, check=True, capture_output=True)
+
+    popens = [spawn for spawn in rec.spawns if spawn.event == 'subprocess.Popen']
+    assert popens == [Spawned('subprocess.Popen', 'git', cwd=tmp_path, args=('git', '--version'))]
+
+
+def test_a_listing_records_its_directory_however_it_is_asked_for(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / 'a.json').write_text('{}')
+    monkeypatch.chdir(tmp_path)
+
+    with recording() as rec:
+        os.listdir()
+        list(tmp_path.iterdir())
+        list(tmp_path.glob('*.json'))
+        glob.glob(str(tmp_path / '*.json'))
+
+    assert rec.listings == (
+        Listed('os.listdir', tmp_path),
+        *(Listed('os.scandir', tmp_path) for _ in range(3)),
+    )
+
+
+def test_listings_outside_given_roots_keep_one_through_a_file_descriptor(tmp_path: Path) -> None:
+    descriptor = os.open(tmp_path, os.O_RDONLY)
+    try:
+        with recording() as rec:
+            os.listdir(Path(json.__file__).parent)
+            os.listdir(tmp_path)
+            os.listdir(descriptor)
+    finally:
+        os.close(descriptor)
+
+    assert rec.listings_outside(interpreter_roots()) == (
+        Listed('os.listdir', tmp_path), Listed('os.listdir', None),
+    )
+
+
+def _ca_bundles() -> set[Path]:
+    paths = ssl.get_default_verify_paths()
+    bundles = {Path(path) for path in (paths.cafile, paths.capath) if path}
+    try:
+        import certifi
+    except ImportError:
+        return bundles
+    return {*bundles, Path(certifi.where())}
+
+
+def _system_ca_file() -> Path:
+    paths = ssl.get_default_verify_paths()
+    if paths.cafile:
+        return Path(paths.cafile)
+    assert paths.capath, 'no system CA store'
+    return next(path for path in sorted(Path(paths.capath).iterdir()) if path.is_file())
+
+
+def test_the_interpreter_roots_are_the_prefixes_and_site_packages_without_a_ca_bundle() -> None:
+    roots = interpreter_roots()
+
+    assert Path(sys.prefix) in roots
+    assert {Path(path) for path in site.getsitepackages()} <= set(roots)
+    assert set(roots).isdisjoint(_ca_bundles())
+
+
+def test_opens_outside_the_interpreter_roots_keep_a_ca_bundle_read() -> None:
+    ca_file = _system_ca_file()
+
+    with recording() as rec:
+        Path(json.__file__).read_bytes()
+        ca_file.read_bytes()
+
+    assert rec.opens_outside_runtime() == ()
+    assert rec.opens_outside(interpreter_roots()) == (Opened(ca_file, writes=False),)
+
+
+def test_mutations_outside_given_roots_leave_out_only_their_bytecode_caches(tmp_path: Path) -> None:
+    runtime_cache = Path(json.__file__).with_name('no-such-package') / '__pycache__'
+    runtime_data = Path(json.__file__).with_name('no-such-package') / 'data'
+
+    with recording() as rec:
+        for absent in (runtime_cache, runtime_data):
+            with pytest.raises(FileNotFoundError):
+                os.mkdir(absent)
+        os.mkdir(tmp_path / '__pycache__')
+        os.mkdir(tmp_path / 'd')
+
+    assert rec.mutations_outside(interpreter_roots()) == (
+        Mutated('os.mkdir', (runtime_data,)),
+        Mutated('os.mkdir', (tmp_path / '__pycache__',)),
+        Mutated('os.mkdir', (tmp_path / 'd',)),
+    )
+    assert rec.mutations_outside((tmp_path,)) == (
+        Mutated('os.mkdir', (runtime_cache,)),
+        Mutated('os.mkdir', (runtime_data,)),
+        Mutated('os.mkdir', (tmp_path / 'd',)),
+    )
