@@ -468,9 +468,11 @@ class FakeAdjudicator:
         *,
         storm: Mapping[str, Any] | None = None,
         prompt_sha256: str = FAKE_PROMPT_SHA256,
+        invocation_run_id: str | None = None,
     ) -> None:
         self.model = FAKE_ADJUDICATOR_MODEL
         self.prompt_sha256 = prompt_sha256
+        self.invocation_run_id = invocation_run_id
         self.calls: list[list[LinkPair]] = []
         self._answer_for = answer_for
         self._storm = storm
