@@ -2,14 +2,16 @@
 plans/routing-experiment-substrate-prd.md (task 8375, amendment 2026-11-17).
 
 defaults.yaml carries the experiment's split rules; dark-factory-orchestrator.yaml
-keeps the pre-experiment table, because its configured implementer and debugger
-turn caps (160/100) would make arm 1 change turns as well as the model. Copying
-the split rules into dark-factory's yaml to "keep it in step" turns this red.
+keeps the pre-experiment table, because its configured turn caps
+(`max_turns.implementer`, `max_turns.debugger`) differ from the large-plan
+rules' 120, so arm 1 would change turns as well as the model. Copying the split
+rules into dark-factory's yaml to "keep it in step" turns this red.
 
 The file is loaded explicitly through ORCH_CONFIG_PATH, not through the autouse
-binding. Assertions are on rule semantics (opus, 120 turns) and on an ordered
-subsequence of today's rule ids, so rows another experiment inserts ahead of
-them with the same lift keep this green.
+binding. Assertions are on an ordered subsequence of today's rule ids and on
+every task id getting one and the same policy-rule decision for a 3-module plan,
+not on that decision's model or turns, so a retune of the lift, or rows another
+experiment inserts ahead of them with a uniform lift, keeps this green.
 """
 
 from __future__ import annotations
@@ -58,26 +60,25 @@ def test_carries_no_experiment_one_rule(dark_factory_config):
 
 
 @pytest.mark.parametrize('role_name', ['implementer', 'debugger'])
-def test_every_task_id_keeps_the_three_module_lift(dark_factory_config, role_name):
-    decisions = {
-        task_id: resolve_route(
-            RouteInputs(
-                role_name=role_name,
-                task_id=task_id,
-                task_metadata={},
-                plan_shape=PlanShape(5, ('a', 'b', 'c')),
-                routing_tier=0,
-                dispatch_count=0,
-                role_defaults=_SENTINEL_ROLE_DEFAULTS,
-            ),
-            dark_factory_config,
+def test_every_task_id_gets_one_policy_rule_decision(dark_factory_config, role_name):
+    outcomes = {
+        (d.source_layer, d.model, d.max_turns)
+        for d in (
+            resolve_route(
+                RouteInputs(
+                    role_name=role_name,
+                    task_id=str(i),
+                    task_metadata={},
+                    plan_shape=PlanShape(5, ('a', 'b', 'c')),
+                    routing_tier=0,
+                    dispatch_count=0,
+                    role_defaults=_SENTINEL_ROLE_DEFAULTS,
+                ),
+                dark_factory_config,
+            )
+            for i in range(1, 201)
         )
-        for task_id in (str(i) for i in range(1, 201))
     }
 
-    unlifted = {
-        task_id: (d.source_layer, d.model, d.max_turns)
-        for task_id, d in decisions.items()
-        if (d.source_layer, d.model, d.max_turns) != ('policy_rule', 'opus', 120)
-    }
-    assert unlifted == {}
+    assert len(outcomes) == 1, outcomes
+    assert {source_layer for source_layer, _, _ in outcomes} == {'policy_rule'}
