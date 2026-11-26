@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from typing import Any
 
@@ -9,6 +10,7 @@ import pytest
 
 from orchestrator.agents.token_pricing import FALLBACK_PRICE, TokenUsage, price_tokens
 from orchestrator.evals.metrics import (
+    EndpointKind,
     EvalMetrics,
     compute_composite,
     is_false_green,
@@ -197,7 +199,7 @@ class TestResolveCostUsd:
                        cache rate and were priced at input_per_1m (WARNING)
       - cli          → NATIVE cloud endpoint, model unlisted (CLI cost is
                        trustworthy for the real Anthropic API)
-      - unpriced_proxy → a PROXIED endpoint (is_local_model) whose model is
+      - unpriced_proxy → a PROXIED endpoint (cli_cost_untrusted) whose model is
                        unlisted → loud WARNING + a DEFINED fallback, never the
                        raw CLI number (which is wrong for proxied endpoints).
     """
@@ -211,7 +213,7 @@ class TestResolveCostUsd:
             model='model-x',
             prices={'model-x': {'input_per_1m': 2.0, 'output_per_1m': 8.0}},
             cli_cost_usd=99.0,          # must be IGNORED when the model is priced
-            is_local_model=False,
+            cli_cost_untrusted=False,
         )
         assert source == 'price_table'
         assert cost == pytest.approx(6.0)
@@ -226,7 +228,7 @@ class TestResolveCostUsd:
             model='model-x',
             prices={'model-x': PriceEntry(input_per_1m=2.0, output_per_1m=8.0)},
             cli_cost_usd=99.0,
-            is_local_model=False,
+            cli_cost_untrusted=False,
         )
         assert source == 'price_table'
         assert cost == pytest.approx(6.0)
@@ -239,7 +241,7 @@ class TestResolveCostUsd:
             model='claude-sonnet-4',    # not in prices
             prices={},
             cli_cost_usd=3.5,
-            is_local_model=False,       # NATIVE cloud → CLI cost is trustworthy
+            cli_cost_untrusted=False,       # NATIVE cloud → CLI cost is trustworthy
         )
         assert source == 'cli'
         assert cost == pytest.approx(3.5)
@@ -253,7 +255,7 @@ class TestResolveCostUsd:
                 model='local-llama-70b',    # not in prices
                 prices={},
                 cli_cost_usd=0.0,           # raw CLI cost is WRONG for proxied
-                is_local_model=True,        # PROXIED endpoint (ANTHROPIC_BASE_URL)
+                cli_cost_untrusted=True,        # PROXIED endpoint (ANTHROPIC_BASE_URL)
             )
 
         assert source == 'unpriced_proxy'
@@ -276,7 +278,7 @@ class TestResolveCostUsd:
             model='model-x',
             prices={'model-x': {'input_per_1m': 2.0, 'output_per_1m': 8.0}},
             cli_cost_usd=99.0,
-            is_local_model=True,        # proxied — but priced → price_table wins
+            cli_cost_untrusted=True,        # proxied — but priced → price_table wins
         )
         assert source == 'price_table'
         assert cost == pytest.approx(6.0)
@@ -303,7 +305,7 @@ class TestResolveCostUsd:
             model='glm-5.3',
             prices={'glm-5.3': self._GLM_RATES},
             cli_cost_usd=99.0,
-            is_local_model=True,
+            cli_cost_untrusted=True,
         )
         assert (cost, source) == (pytest.approx(0.43232032), 'price_table')
 
@@ -317,7 +319,7 @@ class TestResolveCostUsd:
                 model='mimo-pro',
                 prices={'mimo-pro': {'input_per_1m': 1.0, 'output_per_1m': 4.0}},
                 cli_cost_usd=0.0,
-                is_local_model=True,
+                cli_cost_untrusted=True,
             )
 
         assert source == 'price_table_no_cache_rate'
@@ -337,7 +339,7 @@ class TestResolveCostUsd:
                 model='mimo-pro',
                 prices={'mimo-pro': {'input_per_1m': 1.0, 'output_per_1m': 4.0}},
                 cli_cost_usd=0.0,
-                is_local_model=True,
+                cli_cost_untrusted=True,
             )
 
         assert source == 'price_table'
@@ -351,7 +353,7 @@ class TestResolveCostUsd:
             model='local-llama-70b',
             prices={},
             cli_cost_usd=0.0,
-            is_local_model=True,
+            cli_cost_untrusted=True,
         )
 
         assert source == 'unpriced_proxy'
@@ -447,6 +449,19 @@ class TestIsProxiedEndpoint:
         from orchestrator.evals import metrics, runner
 
         assert runner.is_proxied_endpoint is metrics.is_proxied_endpoint
+
+
+class TestEndpointKindAndCostTrustPersistence:
+    def test_the_endpoint_kind_survives_a_json_round_trip_as_the_member(self):
+        m = EvalMetrics(endpoint_kind=EndpointKind.VENDOR_CLOUD)
+        persisted = json.loads(json.dumps(m.to_dict()))
+        assert persisted['endpoint_kind'] == 'vendor_cloud'
+        assert EvalMetrics.from_dict(persisted).endpoint_kind is EndpointKind.VENDOR_CLOUD
+
+    def test_an_empty_record_has_no_endpoint_kind_and_trusts_the_cli_cost(self):
+        m = EvalMetrics.from_dict({})
+        assert m.endpoint_kind is None
+        assert m.cli_cost_untrusted is False
 
 
 # ---------------------------------------------------------------------------

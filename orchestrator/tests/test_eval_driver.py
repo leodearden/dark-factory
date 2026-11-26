@@ -66,14 +66,17 @@ def _judge_cfg() -> EvalConfig:
 
 
 def _fake_collect_metrics(collect_side_effect: BaseException | None) -> AsyncMock:
-    """A collect_metrics stand-in that honours its role/replay_frame/sandbox_backend keywords."""
+    """A collect_metrics stand-in that honours its executor-stamp keywords."""
 
-    async def fake_collect(_wf, _wt, _task, *, role, replay_frame=None, sandbox_backend=None):
+    async def fake_collect(
+        _wf, _wt, _task, *, role, replay_frame=None, sandbox_backend=None, endpoint_kind=None,
+    ):
         if collect_side_effect is not None:
             raise collect_side_effect
         return EvalMetrics(
             composite_score=0.9, tests_pass=True,
             role_under_test=role, replay_frame=replay_frame, sandbox_backend=sandbox_backend,
+            endpoint_kind=endpoint_kind,
         )
 
     return AsyncMock(side_effect=fake_collect)
@@ -1769,7 +1772,7 @@ class TestBuildEvalOrchConfigAutoSeedsProxiedPrices:
             model=cfg.models.implementer,
             prices=cfg.prices,
             cli_cost_usd=999.0,           # deliberately wrong CLI figure —
-            is_local_model=True,          # must be IGNORED once price_table hits
+            cli_cost_untrusted=True,          # must be IGNORED once price_table hits
         )
         assert source == 'price_table'
         assert cost != 999.0

@@ -145,9 +145,20 @@ def _role_under_test_from_legacy(metrics: dict[str, Any]) -> dict[str, Any]:
     return {**metrics, 'role_under_test': role}
 
 
+def _cli_cost_untrusted_from_legacy(metrics: dict[str, Any]) -> dict[str, Any]:
+    """A pre-9970 cell's cost-trust flag, stored as 'is_local_model'."""
+    if 'is_local_model' not in metrics:
+        return dict(metrics)
+    normalized = dict(metrics)
+    legacy = normalized.pop('is_local_model')
+    normalized.setdefault('cli_cost_untrusted', legacy)
+    return normalized
+
+
 LEGACY_METRIC_RULES: tuple[Callable[[dict[str, Any]], dict[str, Any]], ...] = (
     _invocation_errors_from_marker,
     _role_under_test_from_legacy,
+    _cli_cost_untrusted_from_legacy,
 )
 
 

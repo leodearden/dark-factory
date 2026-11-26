@@ -13,7 +13,7 @@ always loses to an existing ``config.prices`` entry).
 
 import logging
 import os
-from collections.abc import Callable
+from collections.abc import Iterator
 from dataclasses import dataclass, field, replace
 
 from orchestrator.agents.token_pricing import price_fields
@@ -21,7 +21,7 @@ from orchestrator.config import default_price_table
 from orchestrator.implementer_brief_variant import ImplementerBriefVariant
 from orchestrator.shadow_types import CostBasis
 
-from .metrics import CANDIDATE_ROLES, RoleUnderTest
+from .metrics import CANDIDATE_ROLES, EndpointKind, RoleUnderTest
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +43,7 @@ class EvalConfig:
     role: RoleUnderTest = RoleUnderTest.IMPLEMENTER
     max_budget_usd: float = 20.0
     env_overrides: dict[str, str] = field(default_factory=dict)
+    endpoint_kind: EndpointKind = EndpointKind.NATIVE_ANTHROPIC
     # The implementer brief variant this candidate runs under; becomes the
     # cell's OrchestratorConfig.implementer_brief_variant (task 5385).
     harness_variant: ImplementerBriefVariant = ImplementerBriefVariant.WHOLE_PLAN
@@ -113,7 +114,7 @@ def _vllm_config(
         env.update(extra_env)
     return EvalConfig(
         name=name, backend='claude', model='sonnet', effort=effort,
-        env_overrides=env,
+        env_overrides=env, endpoint_kind=EndpointKind.SELF_HOSTED_VLLM,
         image=image, gpu_type=gpu_type, gpu_count=gpu_count,
         container_disk_gb=container_disk_gb,
     )
@@ -529,19 +530,25 @@ def get_config_by_name(name: str) -> EvalConfig | None:
     return replace(base, name=name, harness_variant=variant)
 
 
+def registered_configs() -> Iterator[EvalConfig]:
+    """Every config ``get_config_by_name`` resolves by name, static families first.
+
+    A generator, so a candidate family is built only once the families before
+    it are exhausted: a lookup that stops at a static config never builds a ν
+    bundle or logs its missing-credential WARNING. Judge candidates are not
+    among these; ``get_config_by_name`` explains why.
+    """
+    yield from EVAL_CONFIGS
+    yield from FINAL_RUN_CONFIGS
+    yield from ARCHITECT_EVAL_CONFIGS
+    yield from claude_endpoint_candidates()
+    yield from codex_pi_candidates()
+    yield from zcode_candidates()
+    yield from mimo_code_candidates()
+
+
 def _find_registered(name: str) -> EvalConfig | None:
-    families: tuple[Callable[[], list[EvalConfig]], ...] = (
-        lambda: [*EVAL_CONFIGS, *FINAL_RUN_CONFIGS, *ARCHITECT_EVAL_CONFIGS],
-        claude_endpoint_candidates,
-        codex_pi_candidates,
-        zcode_candidates,
-        mimo_code_candidates,
-    )
-    for build_family in families:
-        for cfg in build_family():
-            if cfg.name == name:
-                return cfg
-    return None
+    return next((cfg for cfg in registered_configs() if cfg.name == name), None)
 
 
 # ===== μ OFAT→matrix→confirm driver substrate (eval-revival μ / C4) =====
@@ -756,6 +763,7 @@ def _claude_endpoint_config(
             'ANTHROPIC_BASE_URL': base_url,
             'ANTHROPIC_AUTH_TOKEN': auth_token,
         },
+        endpoint_kind=EndpointKind.VENDOR_CLOUD,
     )
 
 
@@ -933,12 +941,15 @@ def codex_pi_candidates() -> list[EvalConfig]:
     return [
         EvalConfig(
             'codex-gpt6-astra', 'codex', CODEX_ASTRA_MODEL, 'xhigh', role=RoleUnderTest.IMPLEMENTER,
+            endpoint_kind=EndpointKind.VENDOR_CLOUD,
         ),
         EvalConfig(
             'codex-gpt6.1-sol', 'codex', CODEX_SOL_MODEL, 'xhigh', role=RoleUnderTest.IMPLEMENTER,
+            endpoint_kind=EndpointKind.VENDOR_CLOUD,
         ),
         EvalConfig(
             'codex-gpt6.1-terra', 'codex', CODEX_TERRA_MODEL, 'xhigh', role=RoleUnderTest.IMPLEMENTER,
+            endpoint_kind=EndpointKind.VENDOR_CLOUD,
         ),
         # effort 'max' matches the claude-sonnet-max incumbent exactly (and is
         # a valid _pi_thinking level) — model+effort held constant, backend

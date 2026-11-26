@@ -73,6 +73,7 @@ from .hermeticity import (
     writers_held_by,
 )
 from .metrics import (
+    EndpointKind,
     EvalMetrics,
     RoleUnderTest,
     compute_composite,
@@ -350,7 +351,7 @@ def build_eval_orch_config(
     # claude_endpoint_price_table() into config.prices whenever THIS
     # candidate runs against a PROXIED endpoint — the SAME predicate
     # collect_metrics and run_architect_eval read before calling
-    # resolve_cost_usd(..., is_local_model=...), which is why it has one home
+    # resolve_cost_usd(..., cli_cost_untrusted=...), which is why it has one home
     # (metrics.is_proxied_endpoint) instead of three inline env reads: the
     # table that gets seeded and the flag that decides whether to trust the CLI
     # figure must never disagree. Without this, an operator who forgets to seed
@@ -455,6 +456,7 @@ async def run_eval(
         ),
         label=judge_config.name if judge_config is not None else config.name,
         role=RoleUnderTest.JUDGE if judge_config is not None else RoleUnderTest.IMPLEMENTER,
+        endpoint_kind=config.endpoint_kind,
         initial_plan=initial_plan,
         replay_framed=False,
         worktree=worktree_path,
@@ -567,6 +569,7 @@ async def run_end_to_end(
         ),
         label=f'{arch_config.name}+{impl_config.name}',
         role=RoleUnderTest.END_TO_END,
+        endpoint_kind=impl_config.endpoint_kind,
         initial_plan=None,
         replay_framed=True,
         worktree=None,
@@ -584,6 +587,7 @@ async def _run_workflow_cell(
     *,
     label: str,
     role: RoleUnderTest,
+    endpoint_kind: EndpointKind,
     initial_plan: dict | None,
     replay_framed: bool,
     worktree: Path | None,
@@ -619,7 +623,7 @@ async def _run_workflow_cell(
         wall_clock_ms = int(time.monotonic() * 1000) - start_ms
         metrics = await _cell_metrics(
             workflow, worktree, task, role=role, replay_frame=replay_frame,
-            sandbox_backend=sandbox_backend,
+            sandbox_backend=sandbox_backend, endpoint_kind=endpoint_kind,
         )
         result = EvalResult(
             task_id=address.task_id,
@@ -745,18 +749,19 @@ async def _cell_metrics(
     role: RoleUnderTest,
     replay_frame: str | None,
     sandbox_backend: CellSandbox,
+    endpoint_kind: EndpointKind,
 ) -> dict[str, Any]:
     """The cell's metrics; a collection that raised leaves only the stamps the executor knows."""
     try:
         metrics = await collect_metrics(
             workflow, worktree, task, role=role, replay_frame=replay_frame,
-            sandbox_backend=sandbox_backend,
+            sandbox_backend=sandbox_backend, endpoint_kind=endpoint_kind,
         )
     except Exception as e:
         logger.warning(f'Metric collection failed: {e}')
         return {
             'role_under_test': role, 'replay_frame': replay_frame,
-            'sandbox_backend': sandbox_backend,
+            'sandbox_backend': sandbox_backend, 'endpoint_kind': endpoint_kind,
         }
     return metrics.to_dict()
 
@@ -769,8 +774,9 @@ async def collect_metrics(
     role: RoleUnderTest,
     replay_frame: str | None = None,
     sandbox_backend: CellSandbox,
+    endpoint_kind: EndpointKind,
 ) -> EvalMetrics:
-    """Collect metrics from a completed workflow run, stamped with *role*, *replay_frame* and *sandbox_backend*."""
+    """Collect metrics from a completed workflow run, stamped with *role*, *replay_frame*, *sandbox_backend* and *endpoint_kind*."""
     wf_metrics = workflow.metrics
 
     # Plan completion
@@ -799,7 +805,7 @@ async def collect_metrics(
     # Via the shared predicate, NOT an inline env read: the same signal decides
     # whether build_eval_orch_config seeds the proxied price table, so the two
     # must not be able to drift apart (see is_proxied_endpoint).
-    is_local = is_proxied_endpoint(workflow.config.env_overrides)
+    cli_cost_untrusted = is_proxied_endpoint(workflow.config.env_overrides)
 
     # Cost provenance (Invariant P5): the CLI's own cost figure is wrong for a
     # proxied endpoint, so resolve cost from the config price table by the run's
@@ -824,7 +830,7 @@ async def collect_metrics(
         model=run_model,
         prices=workflow.config.prices,
         cli_cost_usd=wf_metrics.total_cost_usd,
-        is_local_model=is_local,
+        cli_cost_untrusted=cli_cost_untrusted,
     )
 
     m = EvalMetrics(
@@ -851,10 +857,11 @@ async def collect_metrics(
         lines_changed=lines_changed,
         files_changed=files_changed,
         tokens_per_second=round(tps, 2),
-        is_local_model=is_local,
+        cli_cost_untrusted=cli_cost_untrusted,
         role_under_test=role,
         replay_frame=replay_frame,
         sandbox_backend=sandbox_backend,
+        endpoint_kind=endpoint_kind,
     )
     # False-green guard — catches the 404-bug signature so the same class of
     # silent failure doesn't need manual quarantine in future runs.
