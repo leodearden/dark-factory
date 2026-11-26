@@ -14,6 +14,7 @@ import json
 import os
 import select
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -161,12 +162,17 @@ def _endpoint_line(proc: subprocess.Popen[str], stderr_path: Path) -> str:
 
 
 def _stop(proc: subprocess.Popen[str]) -> None:
-    proc.terminate()
+    """Terminate and reap *proc*; a SIGTERM arriving meanwhile is delivered once it is reaped."""
+    signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
     try:
-        proc.wait(timeout=STORE_STOP_GRACE_SECS)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.wait()
+        proc.terminate()
+        try:
+            proc.wait(timeout=STORE_STOP_GRACE_SECS)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+    finally:
+        signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGTERM})
 
 
 @contextlib.contextmanager
@@ -181,14 +187,16 @@ def serving(journal: Journal, store: Path, *flags: str, scratch: Path) -> Iterat
     argv = _isolated_argv(FAKE_STORE, args)
     env = {'PATH': os.environ.get('PATH', ''), 'HOME': str(cwd)}
     stderr_path = cwd / 'stderr.log'
-    with stderr_path.open('w', encoding='utf-8') as stderr:
-        proc = subprocess.Popen(argv, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=stderr, text=True)
+    proc: subprocess.Popen[str] | None = None
     try:
+        with stderr_path.open('w', encoding='utf-8') as stderr:
+            proc = subprocess.Popen(argv, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=stderr, text=True)
         url = _endpoint_line(proc, stderr_path)
         journal.record(Invocation(FAKE_STORE, args, argv, cwd, frozenset(env), None, url, ''))
         yield url
     finally:
-        _stop(proc)
+        if proc is not None:
+            _stop(proc)
 
 
 def edit_store(path: Path, changes: Mapping[int, Mapping[str, Any] | None]) -> None:
@@ -395,8 +403,15 @@ def _walk_scenarios(scratch: Path) -> int:
     return 0 if held == len(SCENARIOS) else 1
 
 
+def _exit_on_sigterm(signum: int, _frame: object) -> None:
+    """Unwind like an exception so every fake store and in-flight script is reaped; cleanup runs once."""
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    raise SystemExit(128 + signum)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     argparse.ArgumentParser(description=(__doc__ or '').splitlines()[0]).parse_args(argv)
+    signal.signal(signal.SIGTERM, _exit_on_sigterm)
     with tempfile.TemporaryDirectory(prefix=SCRATCH_PREFIX) as scratch_text:
         scratch = Path(scratch_text).resolve()
         if inside_checkout(scratch):
