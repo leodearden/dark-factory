@@ -132,51 +132,118 @@ class TestEmitSandboxApplied:
         wf._emit_sandbox_applied('implementer', 'landlock', write_set)
 
 
-class TestEnsureSandboxDirs:
-    """_ensure_sandbox_dirs pre-creates the load-bearing claude_fleet carve-out
-    OUTSIDE the sandbox before dispatch (task 2996). On success the dir exists
-    for both backends to grant; on failure it WARNs LOUDLY with the task_id +
-    fleet path (loud-over-silent) and continues — best-effort, never raising."""
+def _blocking_file(tmp_path: Path) -> Path:
+    """A regular FILE: mkdir of any path beneath it raises NotADirectoryError."""
+    blocker = tmp_path / 'blocker'
+    blocker.write_text('i am a regular file, not a directory\n')
+    return blocker
 
-    def test_creates_claude_fleet_dir(self, tmp_path):
-        # (a) Happy path: the claude_fleet dir is materialized and no exception
-        # escapes.
+
+def _warnings_during_ensure(
+    wf: TaskWorkflow, write_set: WriteSet, caplog: pytest.LogCaptureFixture,
+) -> list[str]:
+    with caplog.at_level(logging.WARNING):
+        wf._ensure_sandbox_dirs(write_set)
+    return [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+
+
+class TestEnsureSandboxDirs:
+    """_ensure_sandbox_dirs pre-creates BOTH load-bearing carve-outs OUTSIDE the
+    sandbox before dispatch: claude_fleet (task 2996) and tree_sitter_cache
+    (task 3382). On success they exist for both backends to grant; for each
+    path that fails it WARNs with the task_id and THAT path, and continues —
+    best-effort, never raising.
+
+    Every test overrides BOTH carve-outs under tmp_path: ``_make_write_set``
+    defaults them to absolute dummies the wrapper would otherwise try to create.
+    """
+
+    def test_creates_both_carve_out_dirs(self, tmp_path):
         wf = _make_bare_workflow()
         claude_fleet = tmp_path / '.claude' / 'fleet'
-        write_set = _make_write_set(claude_fleet=claude_fleet)
+        tree_sitter_cache = tmp_path / '.cache' / 'tree-sitter'
+        write_set = _make_write_set(
+            claude_fleet=claude_fleet, tree_sitter_cache=tree_sitter_cache,
+        )
         assert not claude_fleet.exists()
+        assert not tree_sitter_cache.exists()
 
         wf._ensure_sandbox_dirs(write_set)
 
         assert claude_fleet.is_dir()
+        assert tree_sitter_cache.is_dir()
 
-    def test_failure_warns_loudly_with_task_id_and_path(self, tmp_path, caplog):
-        # (b) Failure path: a regular FILE cannot be a parent dir, so mkdir
-        # raises OSError and the helper returns False. _ensure_sandbox_dirs must
-        # NOT raise (best-effort) and must emit a WARNING naming BOTH the task_id
-        # (_make_bare_workflow's default '2909') and the fleet path.
+    def test_tree_sitter_failure_warns_with_task_id_and_that_path(
+        self, tmp_path, caplog,
+    ):
         wf = _make_bare_workflow()
-        blocker = tmp_path / 'blocker'
-        blocker.write_text('i am a regular file, not a directory\n')
-        claude_fleet = blocker / 'fleet'
-        write_set = _make_write_set(claude_fleet=claude_fleet)
+        tree_sitter_cache = _blocking_file(tmp_path) / 'tree-sitter'
+        write_set = _make_write_set(
+            claude_fleet=tmp_path / '.claude' / 'fleet',
+            tree_sitter_cache=tree_sitter_cache,
+        )
 
-        with caplog.at_level(logging.WARNING):
-            wf._ensure_sandbox_dirs(write_set)
+        warnings = _warnings_during_ensure(wf, write_set, caplog)
 
-        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
         assert warnings, 'expected a loud WARNING when pre-creation fails'
-        rendered = ' '.join(r.getMessage() for r in warnings)
+        rendered = ' '.join(warnings)
+        assert '2909' in rendered
+        assert str(tree_sitter_cache) in rendered
+
+    def test_only_the_failing_path_is_warned_about(self, tmp_path, caplog):
+        wf = _make_bare_workflow()
+        claude_fleet = tmp_path / '.claude' / 'fleet'
+        write_set = _make_write_set(
+            claude_fleet=claude_fleet,
+            tree_sitter_cache=_blocking_file(tmp_path) / 'tree-sitter',
+        )
+
+        warnings = _warnings_during_ensure(wf, write_set, caplog)
+
+        assert str(claude_fleet) not in ' '.join(warnings)
+        assert claude_fleet.is_dir()
+
+    def test_fleet_failure_warns_with_task_id_and_only_that_path(
+        self, tmp_path, caplog,
+    ):
+        wf = _make_bare_workflow()
+        claude_fleet = _blocking_file(tmp_path) / 'fleet'
+        tree_sitter_cache = tmp_path / '.cache' / 'tree-sitter'
+        write_set = _make_write_set(
+            claude_fleet=claude_fleet, tree_sitter_cache=tree_sitter_cache,
+        )
+
+        warnings = _warnings_during_ensure(wf, write_set, caplog)
+
+        rendered = ' '.join(warnings)
         assert '2909' in rendered
         assert str(claude_fleet) in rendered
+        assert str(tree_sitter_cache) not in rendered
+        assert tree_sitter_cache.is_dir()
+
+    def test_each_failing_path_gets_its_own_warning(self, tmp_path, caplog):
+        wf = _make_bare_workflow()
+        blocker = _blocking_file(tmp_path)
+        claude_fleet = blocker / 'fleet'
+        tree_sitter_cache = blocker / 'tree-sitter'
+        write_set = _make_write_set(
+            claude_fleet=claude_fleet, tree_sitter_cache=tree_sitter_cache,
+        )
+
+        warnings = _warnings_during_ensure(wf, write_set, caplog)
+
+        assert len(warnings) == 2, warnings
+        assert str(claude_fleet) in warnings[0]
+        assert str(tree_sitter_cache) in warnings[1]
 
 
 @pytest.mark.asyncio
 class TestInvokeWiresEnsureSandboxDirs:
     """Pins the CALL-SITE wiring inside ``TaskWorkflow._invoke``: for a
-    sandboxed role the claude_fleet carve-out is pre-created AFTER
-    ``compute_write_set`` and BEFORE ``write_set.writable_paths()`` is consumed
-    into ``sandbox_extras`` (task 2996).
+    sandboxed role the claude_fleet and tree_sitter_cache carve-outs are
+    pre-created AFTER ``compute_write_set`` and BEFORE
+    ``write_set.writable_paths()`` is consumed into ``sandbox_extras``
+    (tasks 2996, 3382).
 
     The isolated ``TestEnsureSandboxDirs`` unit tests above cover the helper's
     behaviour; this drives the REAL ``_invoke`` sandbox branch end-to-end so a
@@ -188,31 +255,38 @@ class TestInvokeWiresEnsureSandboxDirs:
     TaskWorkflow with ``invoke_with_cap_retry`` mocked away.
     """
 
-    async def test_claude_fleet_exists_before_sandbox_extras_built(
+    async def test_carve_outs_exist_before_sandbox_extras_built(
         self, tmp_path, monkeypatch,
     ):
         workflow, cwd = await _task42_workflow(tmp_path, metadata_files=['README'])
 
-        # Hermetic write-set: ONLY claude_fleet is materialized on disk, under
-        # tmp_path — NEVER the real ~/.claude. Patch compute_write_set so the
-        # sandbox branch consumes THIS set (the other, dummy paths are only
-        # stringified into the mocked-away sandbox_extras).
+        # Hermetic write-set: ONLY the two pre-created carve-outs are
+        # materialized on disk, under tmp_path — NEVER the real ~/.claude or
+        # ~/.cache. Patch compute_write_set so the sandbox branch consumes THIS
+        # set (the other, dummy paths are only stringified into the
+        # mocked-away sandbox_extras).
         claude_fleet = tmp_path / '.claude' / 'fleet'
-        hermetic = _make_write_set(claude_fleet=claude_fleet)
+        tree_sitter_cache = tmp_path / '.cache' / 'tree-sitter'
+        hermetic = _make_write_set(
+            claude_fleet=claude_fleet, tree_sitter_cache=tree_sitter_cache,
+        )
         assert not claude_fleet.exists()
+        assert not tree_sitter_cache.exists()
         monkeypatch.setattr(
             'orchestrator.workflow.compute_write_set', lambda _cwd, **_kw: hermetic,
         )
 
-        # Spy: record whether claude_fleet already exists on disk at the moment
-        # writable_paths() is consumed into sandbox_extras. If pre-creation is
-        # dropped or reordered AFTER this consumption, the FIRST observation is
-        # False and the assertion below fails.
-        observations: list[bool] = []
+        # Spy: record whether both carve-outs already exist on disk at the
+        # moment writable_paths() is consumed into sandbox_extras. If
+        # pre-creation is dropped or reordered AFTER this consumption, the
+        # FIRST observation is not (True, True) and the assertion below fails.
+        observations: list[tuple[bool, bool]] = []
         orig_writable_paths = WriteSet.writable_paths
 
         def _recording_writable_paths(self):
-            observations.append(self.claude_fleet.is_dir())
+            observations.append(
+                (self.claude_fleet.is_dir(), self.tree_sitter_cache.is_dir()),
+            )
             return orig_writable_paths(self)
 
         monkeypatch.setattr(WriteSet, 'writable_paths', _recording_writable_paths)
@@ -226,15 +300,18 @@ class TestInvokeWiresEnsureSandboxDirs:
         assert observations, (
             'sandbox_extras must be built from write_set.writable_paths()'
         )
-        # ...and claude_fleet ALREADY existed on disk at that first consumption,
-        # i.e. _ensure_sandbox_dirs ran before it — the wiring under test.
-        assert observations[0] is True, (
-            'claude_fleet must be pre-created BEFORE sandbox_extras is built: '
-            '_ensure_sandbox_dirs is wired after compute_write_set and before '
-            'the write_set.writable_paths() consumption'
+        # ...and both carve-outs ALREADY existed on disk at that first
+        # consumption, i.e. _ensure_sandbox_dirs ran before it — the wiring
+        # under test.
+        assert observations[0] == (True, True), (
+            'claude_fleet and tree_sitter_cache must be pre-created BEFORE '
+            'sandbox_extras is built: _ensure_sandbox_dirs is wired after '
+            'compute_write_set and before the write_set.writable_paths() '
+            'consumption'
         )
-        # And the dir is actually materialized on disk after dispatch.
+        # And the dirs are actually materialized on disk after dispatch.
         assert claude_fleet.is_dir()
+        assert tree_sitter_cache.is_dir()
 
 
 async def _task42_workflow(
@@ -330,7 +407,10 @@ class TestInvokeForwardsDeclaredFiles:
         seen = await _declared_files_seen(
             tmp_path, monkeypatch, role=IMPLEMENTER,
             plan={'files': ['docs/a.md']}, metadata_files=['x.py'],
-            write_set=_make_write_set(claude_fleet=tmp_path / 'fleet'),
+            write_set=_make_write_set(
+                claude_fleet=tmp_path / 'fleet',
+                tree_sitter_cache=tmp_path / 'tree-sitter',
+            ),
         )
         assert seen == [['docs/a.md']]
 
@@ -338,7 +418,9 @@ class TestInvokeForwardsDeclaredFiles:
         self, tmp_path, monkeypatch, caplog,
     ):
         granted = dataclasses.replace(
-            _docs_grant_write_set(), claude_fleet=tmp_path / 'fleet',
+            _docs_grant_write_set(),
+            claude_fleet=tmp_path / 'fleet',
+            tree_sitter_cache=tmp_path / 'tree-sitter',
         )
         with caplog.at_level(logging.INFO, logger='orchestrator.workflow'):
             seen = await _declared_files_seen(
