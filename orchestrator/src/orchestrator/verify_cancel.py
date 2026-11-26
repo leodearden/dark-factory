@@ -261,7 +261,16 @@ def collect_descendants(root: int, ppid_map: dict[int, int]) -> set[int]:
 
 # ---------------------------------------------------------------------------
 # Cancellation
+#
+# The reap's lane-flock wait reads lane_lock_path / lane_lock_holder_pids from
+# the "Flock guard" section below.
 # ---------------------------------------------------------------------------
+
+#: How long a cancel waits for the run it SIGKILLed to drop its worktree's
+#: lane flock before reaping.
+KILLED_RUN_LOCK_RELEASE_SECS: float = 10.0
+
+_LOCK_RELEASE_POLL_SECS: float = 0.05
 
 
 def kill_process_tree(
@@ -491,6 +500,26 @@ def cancel_request(
     return 0
 
 
+def _wait_for_lock_release(
+    lock_path: Path,
+    holder_pid: int,
+    *,
+    monotonic: Callable[[], float],
+    sleep: Callable[[float], None],
+) -> bool:
+    """Wait, within the bound, until *holder_pid* no longer holds *lock_path*; True if it let go.
+
+    Reads the lock table, not process liveness: a SIGKILLed multithreaded
+    leader can read as a zombie while a sibling thread still holds the fd table.
+    """
+    deadline = monotonic() + KILLED_RUN_LOCK_RELEASE_SECS
+    while holder_pid in lane_lock_holder_pids(lock_path):
+        if monotonic() >= deadline:
+            return False
+        sleep(_LOCK_RELEASE_POLL_SECS)
+    return True
+
+
 def _reap_recorded_worktree(
     pgid_path: Path,
     remove_worktree: Callable[[Path], None] | None,
@@ -516,33 +545,6 @@ def _reap_recorded_worktree(
             )
         remove_worktree(worktree)
     remove_worktree_path(pgid_path)
-
-
-#: How long a cancel waits for the run it SIGKILLed to drop its worktree's
-#: lane flock before reaping.
-KILLED_RUN_LOCK_RELEASE_SECS: float = 10.0
-
-_LOCK_RELEASE_POLL_SECS: float = 0.05
-
-
-def _wait_for_lock_release(
-    lock_path: Path,
-    holder_pid: int,
-    *,
-    monotonic: Callable[[], float],
-    sleep: Callable[[float], None],
-) -> bool:
-    """Wait, within the bound, until *holder_pid* no longer holds *lock_path*; True if it let go.
-
-    Reads the lock table, not process liveness: a SIGKILLed multithreaded
-    leader can read as a zombie while a sibling thread still holds the fd table.
-    """
-    deadline = monotonic() + KILLED_RUN_LOCK_RELEASE_SECS
-    while holder_pid in lane_lock_holder_pids(lock_path):
-        if monotonic() >= deadline:
-            return False
-        sleep(_LOCK_RELEASE_POLL_SECS)
-    return True
 
 
 # ---------------------------------------------------------------------------
