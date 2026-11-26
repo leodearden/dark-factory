@@ -475,6 +475,35 @@
     ],
     "usage": "[OPTIONS]"
   },
+  "verify-host-preflight": {
+    "options": [
+      [
+        "--runner TEXT",
+        "A declared verify runner, enabled or not  [required]"
+      ],
+      [
+        "--sha TEXT",
+        "Commit to verify (default: the tip of git.main_branch)"
+      ],
+      [
+        "--reference TEXT",
+        "A second declared runner verifying the same commit, for skip parity"
+      ],
+      [
+        "--json",
+        "Print the runner's record as JSON"
+      ],
+      [
+        "--config PATH",
+        "Path to orchestrator config YAML (REQUIRED unless ORCH_CONFIG_PATH is set). Selects the target project \u2014 sets project_root and fused_memory.project_id."
+      ],
+      [
+        "--help",
+        "Show this message and exit."
+      ]
+    ],
+    "usage": "[OPTIONS]"
+  },
   "verify-merge": {
     "options": [
       [
