@@ -289,7 +289,7 @@ def _refused_detail_line(path: Path, line_number: int) -> str:
 def _assert_journal_pointer(line: str, hidden: int) -> None:
     assert line.startswith(f'... and {hidden} more line(s)')
     for fragment in (
-        'journalctl --user -u transcript-secret-sweep.service',
+        f'journalctl --user -u {sweep.JOURNAL_UNIT}',
         "--since '2026-10-21 02:30:00 UTC'",
         "--until '2026-10-22 02:30:00 UTC'",
         '--all',
@@ -299,7 +299,6 @@ def _assert_journal_pointer(line: str, hidden: int) -> None:
         'three weeks',
     ):
         assert fragment in line, fragment
-    assert (Path(sweep.__file__).parent / sweep.JOURNAL_UNIT).is_file()
 
 
 def _assert_no_further_line_fits(shown: Sequence[str], lines: Sequence[str]) -> None:
@@ -307,6 +306,10 @@ def _assert_no_further_line_fits(shown: Sequence[str], lines: Sequence[str]) -> 
     reserved_pointer = shown[-1].replace(f'... and {len(lines) - kept} more', f'... and {len(lines)} more', 1)
     one_more = '\n'.join([*lines[:kept + 1], reserved_pointer])
     assert kept == sweep.MAX_DETAIL_LINES or len(one_more.encode()) > sweep.MAX_DETAIL_BYTES
+
+
+def test_the_journal_pointer_names_the_committed_sweep_unit():
+    assert (Path(sweep.__file__).parent / sweep.JOURNAL_UNIT).is_file()
 
 
 def test_swept_trees_are_each_projects_transcripts_verify_logs_and_offline_lane_plus_the_claude_projects_dir(tree):
