@@ -68,9 +68,10 @@ imbalance table on an unchanged window and exits non-zero when the split is skew
   the blocked rate with no intervention). Only a concurrent split with an A/A check can; task-id
   parity is skewed (odd ids 11% cheaper in dark-factory), so the split must be a salted hash and
   must be checked on an unchanged window before arming.
-- Where the contrast lives: dark-factory's implementer is opus by config (`models.implementer:
-  opus`), so experiment 1 changes nothing there; reify restates the rule list and its scheduler is
-  halted (2026-11-02 ruling). The treated population is the five client/greenfield projects,
+- Where the contrast lives: dark-factory stays out of experiment 1 (its configured implementer
+  turn cap is 160, so arm 1 would change the affected subset's turns from 120 to 160, and its yaml
+  carries the effort experiment's own splits); its yaml keeps the pre-experiment table. Reify
+  restates the rule list and its scheduler is halted (2026-11-02 ruling). The treated population is the five client/greenfield projects,
   about 2,000 implementer-reaching tasks per month between them, so roughly 500 per arm per
   fortnight; the affected subset (plans with exactly 3 modules and fewer than 12 steps) is
   unknown until α records `plan_modules`, which is why the sample target is set on the affected
@@ -130,9 +131,9 @@ In `defaults.yaml` the rule table becomes, in order: `large-plan-steps` (unchang
 bucket: 1}` → opus, 120 turns); `large-plan-modules` (`plan_min_modules: 3`, `split: {…,
 bucket: 0}` → opus, 120 turns); then the unchanged `simple-saturated-full-path` and
 `retry-tier-up`. Arm 1 plans with exactly 3 modules and fewer than 12 steps fall through to the
-role's configured model (sonnet in the five treated projects). Dark-factory's yaml restates the
-list with the same two rules so its decisions carry the same rule ids (it contributes a null
-contrast, since its implementer is opus by config). Reify's list is left as is.
+role's configured model (sonnet in the five treated projects). Dark-factory's yaml keeps today's
+table, so dark-factory receives no treatment, and experiment 1 is read with dark-factory excluded
+from the readout's `--roots`. Reify's list is left as is.
 
 Pre-registration (written into γ's task text and η's gate text before δ fires): primary metric
 blocked-or-escalated on the affected subset; guard metric workflow-verify minutes per landed task
@@ -204,7 +205,7 @@ that already name the fast path (`skills/prd/references/decompose-mode.md`, `ski
 7. **Pre-registration lives in the task texts (γ, η), not only in the PRD**, so the gate's
    escalation text carries the stop rule the ruling is made against.
 8. **Treated population for experiment 1 is the five client/greenfield projects**; dark-factory
-   runs the same rules as a null contrast and reify is left out.
+   and reify are both left out (amendment 2026-11-17, task 8375).
 9. **Out of scope and deliberately so:** any architect model or effort change, the model
    registry, fable on the ladder, a tier change for any role other than the implementer and
    debugger on the arm rule (debugger follows the same rules as today).
@@ -268,8 +269,8 @@ Labels are PRD-internal; ids are assigned at decompose. Sizing per the overlay's
   trailing 30 days with salt `routing-exp-1` prints the imbalance table and exits 0; a fixture
   with a forced skew exits non-zero. Prereqs: α.
 - **γ — experiment-1 rule table** (normal, `complexity=simple`; `defaults.yaml`,
-  `dark-factory-orchestrator.yaml` rules block, `test_routing_byte_equivalence.py` or its
-  successor updated to the new table, pre-registration text in the task). Signal: the config
+  `test_routing_byte_equivalence.py` or its successor updated to the new table,
+  pre-registration text in the task). Signal: the config
   tests pass with the two split rules in the stated order; `resolve_route` on a 3-module plan
   yields opus for bucket 0 and the config model for bucket 1. Prereqs: α.
 - **δ — arm experiment 1** (deterministic; `before_done` = `scripts/routing_experiment_arm.sh`,
@@ -307,6 +308,6 @@ failures; a separate one-line ruling).
    split mechanism stays, add a per-task rollup to `digest.py` keyed by salt. Decide at η.
 2. **Interim read mechanics.** Suggested resolution: Leo runs the readout by hand at 14 days; no
    second gate. Decide during δ.
-3. **Whether the debugger should follow the arm rule.** Suggested resolution: yes, as today the
-   two roles share the rule; its decisions are 5% of the implementer's and do not move the
-   readout. Decide during γ.
+3. **Whether the debugger should follow the arm rule.** Decided in γ: yes, both split rules
+   match role `[implementer, debugger]`, as the two roles shared the rule before; its decisions
+   are 5% of the implementer's and do not move the readout.
