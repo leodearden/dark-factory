@@ -15101,10 +15101,10 @@ class TaskWorkflow:
                     'Task %s: %s granted the main checkout for its docs-only scope: %s',
                     self.task_id, role.name, [str(p) for p in write_set.docs_main_paths],
                 )
-            # Pre-create the load-bearing claude_fleet carve-out OUTSIDE the
-            # sandbox at this single INV-5/D11 write-set consumption point, so it
-            # exists before sandbox_extras (below) is built (task 2996) — see
-            # ensure_claude_fleet_dir for the full backend rationale.
+            # Pre-create the load-bearing carve-outs OUTSIDE the sandbox at this
+            # single INV-5/D11 write-set consumption point, so they exist before
+            # sandbox_extras (below) is built (tasks 2996, 3382) — see
+            # ensure_sandbox_dirs for the full backend rationale.
             self._ensure_sandbox_dirs(write_set)
             sandbox_extras = [str(p) for p in write_set.writable_paths()]
             # Fail-CLOSED (task 2908, PRD D4 / INV-4): refuse to dispatch this
@@ -17365,25 +17365,28 @@ class TaskWorkflow:
         )
 
     def _ensure_sandbox_dirs(self, write_set: WriteSet) -> None:
-        """Pre-create the load-bearing ``claude_fleet`` carve-out OUTSIDE the
-        sandbox before dispatch (task 2996) — see
-        ``orchestrator.agents.write_set.ensure_claude_fleet_dir`` for the full
-        backend rationale (why neither the pure ``compute_write_set`` nor either
-        backend can materialize this carve-out from inside the sandbox).
+        """Pre-create the load-bearing ``claude_fleet`` (task 2996) and
+        ``tree_sitter_cache`` (task 3382) carve-outs OUTSIDE the sandbox before
+        dispatch — see ``orchestrator.agents.write_set.ensure_sandbox_dirs`` for
+        the full backend rationale (why neither the pure ``compute_write_set``
+        nor either backend can materialize them from inside the sandbox).
 
         This wrapper owns the operator-facing failure posture: best-effort, so
-        on failure it WARNs LOUDLY (loud-over-silent) with the task_id + path
-        and CONTINUES — a missing fleet dir degrades only fleet session-registry
-        recording, not the agent's task, so aborting the whole dispatch would be
-        a disproportionate fail-closed.
+        for each path that could not be created it WARNs with the task_id and
+        THAT path, then CONTINUES. The backends' own notice of the dropped grant
+        names no task; this is the orchestrator-log signal an operator can
+        triage. A missing carve-out degrades one capability (fleet session
+        registry, tree-sitter grammar builds), not the agent's task, so
+        aborting the whole dispatch would be a disproportionate fail-closed.
         """
-        if ensure_sandbox_dirs(write_set):
+        for failed_path in ensure_sandbox_dirs(write_set):
             logger.warning(
                 'task %s: could not pre-create %s outside the sandbox — both '
-                'backends will skip the claude_fleet carve-out and in-sandbox '
-                'session-registry writes may fail',
+                'backends skip a nonexistent writable path, so this carve-out '
+                'will be dropped from the sandbox and in-sandbox writes beneath '
+                'it will fail with EACCES',
                 self.task_id,
-                write_set.claude_fleet,
+                failed_path,
             )
 
     def _guard_sandbox(self, role_name: str) -> str:
