@@ -6,7 +6,8 @@ import asyncio
 import json
 import logging
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -135,11 +136,18 @@ class ReviewReport:
         return self.outcome is ReviewOutcome.RAN
 
 
+def _modules_of(merges: Sequence[tuple[str, ...]]) -> list[str]:
+    """The modules the merges touched, each once, in first-merged order."""
+    return list(dict.fromkeys(module for merge in merges for module in merge))
+
+
 class ReviewCheckpoint:
     """Coordinates periodic deep review checkpoints during an orchestrator run.
 
     Tracks successful merges, triggers focused reviews every N merges, and
-    optionally runs a full review after all tasks complete.
+    optionally runs a full review after all tasks complete.  A review's merge
+    scope is fixed when it starts: merges recorded while it runs stay
+    unreviewed and count toward the next review.
     """
 
     def __init__(
@@ -164,43 +172,54 @@ class ReviewCheckpoint:
         self.event_store: EventStore | None = None
 
         self._merge_count = 0
-        self._last_review_at_merge = 0
-        self._merged_modules: list[str] = []
+        # The modules of each merge no review that ran has covered, oldest first.
+        self._unreviewed_merges: list[tuple[str, ...]] = []
+        self._review_in_flight = False
         self._reports: list[ReviewReport] = []
 
         # Full-review rate-limit state (run-forever idle path).  Kept SEPARATE
-        # from the focused counters above because run_focused() advances
-        # _last_review_at_merge on every focused checkpoint that ran; the
-        # full-review ceiling must not be perturbed by focused cadence.
+        # from the unreviewed merges above, which every focused checkpoint that
+        # ran trims; the full-review ceiling must not be perturbed by focused
+        # cadence.
         self._last_full_review_time: float | None = None
         self._last_full_review_at_merge: int = 0
 
     def record_merge(self, modules: list[str]) -> None:
         """Record a successful task merge. Called by the harness after a DONE result."""
         self._merge_count += 1
-        # Deduplicate as we accumulate
-        for m in modules:
-            if m not in self._merged_modules:
-                self._merged_modules.append(m)
+        self._unreviewed_merges.append(tuple(modules))
         logger.debug(
-            'Review checkpoint: merge %d recorded, %d modules accumulated',
-            self._merge_count, len(self._merged_modules),
+            'Review checkpoint: merge %d recorded, %d unreviewed merges over %d modules',
+            self._merge_count, len(self._unreviewed_merges),
+            len(_modules_of(self._unreviewed_merges)),
         )
 
     def should_trigger(self) -> bool:
         """Return True when enough merges have accumulated since the last review."""
-        return (
-            self._merge_count - self._last_review_at_merge
-            >= self.config.review.interval
-        )
+        return len(self._unreviewed_merges) >= self.config.review.interval
+
+    @contextmanager
+    def _sole_review(self) -> Iterator[None]:
+        """Hold the one review slot: a review marks reviewed the merges unreviewed when it started, so two must never overlap."""
+        if self._review_in_flight:
+            raise RuntimeError(
+                'a review checkpoint is already running; reviews must not overlap, '
+                'because each marks reviewed the merges unreviewed when it started'
+            )
+        self._review_in_flight = True
+        try:
+            yield
+        finally:
+            self._review_in_flight = False
 
     async def run_focused(self) -> ReviewReport:
-        """Run a focused review scoped to modules that merged since the last checkpoint."""
-        modules = list(self._merged_modules)
-        report = await self._run_review('focused', modules)
-        if report.ran:
-            self._last_review_at_merge = self._merge_count
-            self._merged_modules.clear()
+        """Run a focused review scoped to the modules of the merges unreviewed when it starts."""
+        with self._sole_review():
+            covered = len(self._unreviewed_merges)
+            modules = _modules_of(self._unreviewed_merges)
+            report = await self._run_review('focused', modules)
+            if report.ran:
+                del self._unreviewed_merges[:covered]
         self._reports.append(report)
         return report
 
@@ -230,14 +249,16 @@ class ReviewCheckpoint:
         return time_gate and task_gate
 
     async def run_full(self) -> ReviewReport:
-        """Run a full review of the entire project."""
-        report = await self._run_review('full', [])
-        if report.ran:
-            self._last_review_at_merge = self._merge_count
-            # Record full-review trackers so should_run_full() re-closes the gate.
-            self._last_full_review_time = self._clock()
-            self._last_full_review_at_merge = self._merge_count
-            self._merged_modules.clear()
+        """Run a full review of the entire project, covering the merges recorded when it starts."""
+        with self._sole_review():
+            covered = len(self._unreviewed_merges)
+            merges_at_start = self._merge_count
+            report = await self._run_review('full', [])
+            if report.ran:
+                del self._unreviewed_merges[:covered]
+                # Record full-review trackers so should_run_full() re-closes the gate.
+                self._last_full_review_time = self._clock()
+                self._last_full_review_at_merge = merges_at_start
         self._reports.append(report)
         return report
 

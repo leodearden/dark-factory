@@ -34,6 +34,7 @@ def _make_checkpoint(
 ) -> ReviewCheckpoint:
     config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
     config.project_root = Path('/tmp')
+    config.review.interval = 5
     config.review.full_review_min_interval_secs = min_interval
     config.review.full_review_min_tasks = min_tasks
     # deep_reviewer resolves via resolve_route (task η) — real config.routing.*.
@@ -94,7 +95,8 @@ class TestRunFullRecordsTrackers:
     async def test_run_full_records_time_and_merge(self):
         """run_full() stamps both full-review trackers (separate from focused)."""
         cp = _make_checkpoint(clock=lambda: 5000.0)
-        cp._merge_count = 25
+        for _ in range(25):
+            cp.record_merge([])
 
         cp._run_review = AsyncMock(  # type: ignore[method-assign]
             return_value=ReviewReport(
@@ -108,8 +110,8 @@ class TestRunFullRecordsTrackers:
         # Full-review trackers recorded.
         assert cp._last_full_review_time == 5000.0
         assert cp._last_full_review_at_merge == 25
-        # Existing focused-cadence reset is preserved (not perturbed).
-        assert cp._last_review_at_merge == 25
+        # The merges the full review covered no longer trigger a focused one.
+        assert not cp.should_trigger()
 
         # The gate now re-closes: no new merges, no elapsed time → False.
         assert cp.should_run_full(now=5000.0) is False
