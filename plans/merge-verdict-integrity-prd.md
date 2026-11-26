@@ -47,6 +47,10 @@ Incident anchors (all verified against `runs.db` + git forensics):
   for merge role it escalates to the full gate, and if no full-gate command
   exists it FAILS loud. Fail-open trivial passes are abolished for merge role
   on every host.
+  Amended 2026-11 by R4 (task 5411): a merge-role PASS from the
+  docs_gate/comments_gate narrow resolution is evidence-backed (non-empty,
+  positively classified command set run locally on the merged tree); evidence
+  absence still escalates to full_gate — see docs/narrow-merge-gate.md.
 - **INV-2 (contract currency).** A remote runner's verdict is adoptable only if
   the runner executed current gate logic. Operationally: RemoteRunner
   auto-syncs the remote DF checkout (fail-closed) before dispatch when stale
