@@ -1142,9 +1142,11 @@ Code: `reviewer_trial/runner.py::PanelRunKey`, `::run_panel_cached`,
 `orchestrator/src/orchestrator/evals/`).
 
 **One keyed panel cache.** `run_panel_cached` is the only panel cache, and
-`run_panel` stamps every result with a `PanelRunKey`. That key holds three
+`run_panel` stamps every result with a `PanelRunKey`. That key holds four
 things: a sha256 of the price table the caller passed (None when the call was
-unpriced), whether a usage gate was offered, and the diff cap. Each key has
+unpriced), whether a usage gate was offered, the diff cap, and the reviewer
+turn cap. The turn cap is production's `max_turns.reviewer` unless the caller
+overrides it (`reviewer_trial/variants.py::trial_reviewer_max_turns`). Each key has
 its own file, `<results_dir>/<variant>__<diff>__<key digest>.json`, written
 atomically. A stored panel is reused only when it records the requested
 variant and diff and an equal key. So an entry written by `smoke` or
@@ -1187,10 +1189,13 @@ stored, so a rerun measures that cell again.
 **Resuming a campaign.** Each trial directory's panels and scores are keyed by
 the invocation that wrote them. Resumed with the options it was started with,
 a campaign only reduces what is on disk. Resumed with a different
-`--pool`/`--no-pool` or `--diff-cap`, it runs and scores new panels beside the
-old ones, and the report reads only the new ones. A campaign whose panels
-predate the key only reduces, whatever options it is resumed with, because a
-legacy panel is reused under every key (see Backfill above).
+`--pool`/`--no-pool`, `--diff-cap` or `--max-turns`, it runs and scores new
+panels beside the old ones, and the report reads only the new ones. A campaign
+whose panels predate the key only reduces, whatever options it is resumed with,
+because a legacy panel is reused under every key (see Backfill above). Keyed
+panels written before the turn cap joined the key (task 11728) ran at the old
+fixed 30 turns and are not reused, because their key digest differs: rerun
+into a fresh `--results-dir`, or pass `--max-turns 30` and accept the re-run.
 
 ### Terminal outcome (`terminal_kind`, task 4760)
 
