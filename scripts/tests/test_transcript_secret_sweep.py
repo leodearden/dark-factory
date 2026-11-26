@@ -279,6 +279,10 @@ def _no_value_in(text: str) -> None:
         assert value not in text
 
 
+def _refused_detail_line(path: Path, line_number: int) -> str:
+    return f'{path}: refused (CLAUDE_OAUTH_TOKEN_B on line {line_number}), left un-redacted'
+
+
 def _assert_journal_pointer(line: str, hidden: int) -> None:
     assert line.startswith(f'... and {hidden} more line(s)')
     for fragment in (
@@ -364,8 +368,9 @@ def test_one_sweep_redacts_the_env_dumps_a_pytest_base_temp_holds(tmp_path):
         assert _identity(path) == identity
     assert result.deferred == (dumps.fresh,)
     (arguments,) = poster.findings
-    for path in expected:
-        assert f'{path}: ' in arguments['detail']
+    assert arguments['detail'].splitlines() == [
+        f'{dumps.root / "pytest-7"}: 8 file(s), 15 occurrence(s) of CLAUDE_OAUTH_TOKEN_A, OPENAI_API_KEY',
+    ]
     _no_value_in(json.dumps(arguments))
     _no_value_in(json.dumps(result.record()))
 
@@ -417,9 +422,11 @@ def test_one_sweep_redacts_verify_and_offline_lane_logs(logs):
     assert result.deferred == (logs.fresh,)
     assert result.unreadable == ()
     (arguments,) = poster.findings
-    for path, counts in expected.items():
-        ((var, n),) = counts.items()
-        assert f'{path}: {var}×{n}' in arguments['detail']
+    both = 'CLAUDE_OAUTH_TOKEN_A, OPENAI_API_KEY'
+    assert arguments['detail'].splitlines() == [
+        f'{verify_logs_dir(logs.project) / "6828"}: 3 file(s), 4 occurrence(s) of {both}',
+        f'{offline_lane_dir(logs.project) / "qdrant-integration"}: 2 file(s), 2 occurrence(s) of {both}',
+    ]
     _no_value_in(json.dumps(arguments))
     _no_value_in(json.dumps(result.record()))
 
@@ -495,9 +502,10 @@ def test_one_sweep_redacts_every_live_value_and_files_one_escalation(tree):
     assert arguments['category'] == 'risk_identified'
     assert arguments['task_id'] == 'transcript-secret-sweep'
     assert arguments['agent_role'] == 'transcript-secret-sweep'
-    assert f'{tree.pool_main}: CLAUDE_OAUTH_TOKEN_A×2' in arguments['detail']
-    assert f'{tree.pool_subagent}: CLAUDE_OAUTH_TOKEN_A×1' in arguments['detail']
-    assert f'{tree.openai}: OPENAI_API_KEY×1' in arguments['detail']
+    assert arguments['detail'].splitlines() == [
+        f'{agent_transcripts_dir(tree.project_a) / "6000"}: 2 file(s), 3 occurrence(s) of CLAUDE_OAUTH_TOKEN_A',
+        f'{tree.claude_projects / "-home-x-proj"}: 1 file(s), 1 occurrence(s) of OPENAI_API_KEY',
+    ]
     assert 'in 3 file(s) (4 occurrence(s))' in arguments['summary']
     assert '0 line(s) in 0 file(s) refused' in arguments['summary']
     (evidence,) = arguments['evidence']
@@ -658,10 +666,98 @@ def test_a_refused_line_is_escalated_and_the_rest_of_its_file_is_redacted(tmp_pa
     assert len(held_safe_line) == len(safe_line)
     (arguments,) = poster.findings
     assert '1 line(s) in 1 file(s) refused' in arguments['summary']
-    assert f'{held}: refused (CLAUDE_OAUTH_TOKEN_B on line 2), left un-redacted' in arguments['detail']
-    assert f'{held}: CLAUDE_OAUTH_TOKEN_B×1' in arguments['detail']
+    assert arguments['detail'].splitlines() == [
+        _refused_detail_line(held, 2),
+        f'{agent_transcripts_dir(project) / "7000"}: 1 file(s), 1 occurrence(s) of CLAUDE_OAUTH_TOKEN_B',
+    ]
     assert value not in json.dumps(arguments)
     assert value not in json.dumps(result.record())
+
+
+def test_an_800_file_sweep_is_summarised_per_directory_under_the_byte_bound(tmp_path):
+    project = tmp_path / 'proj'
+    claude = tmp_path / 'claude'
+    pytest_root = tmp_path / 'pytest-of-u'
+    agent_transcripts_dir(project).mkdir(parents=True)
+    claude.mkdir()
+    for d in range(4):
+        for i in range(100):
+            _write(verify_logs_dir(project) / f'{8000 + d}' / f'attempt-{i}.test-X.log', [f'E   {POOL_A}', f'E   {OPENAI}'])
+    for s in range(1, 5):
+        for i in range(100):
+            _write_raw(pytest_root / f'pytest-{s}' / f'test_x{i}' / 'env-dump', _env_minus_zero(ENVIRON))
+    config = sweep.SweepConfig(trees=sweep.swept_trees([project], claude, pytest_tmp_dir=pytest_root), now=NOW)
+    poster = Recorder()
+
+    result = sweep.run(config, environ=ENVIRON, post_escalation=poster)
+
+    assert len(result.redacted) == 800
+    (arguments,) = poster.findings
+    detail = arguments['detail']
+    assert len(detail.encode()) <= sweep.MAX_DETAIL_BYTES
+    groups = [verify_logs_dir(project) / f'{8000 + d}' for d in range(4)]
+    groups += [pytest_root / f'pytest-{s}' for s in range(1, 5)]
+    assert sorted(detail.splitlines()) == sorted(
+        f'{group}: 100 file(s), 200 occurrence(s) of CLAUDE_OAUTH_TOKEN_A, OPENAI_API_KEY' for group in groups
+    )
+    _no_value_in(json.dumps(arguments))
+
+
+def test_refused_lines_come_first_and_redacted_groups_overflow_to_the_journal_pointer(tmp_path):
+    value = '00e9' + 'X' * 44
+    project = tmp_path / 'proj'
+    held = _write(
+        agent_transcripts_dir(project) / '7000' / '-enc' / 'sid.jsonl',
+        [json.dumps({'text': 'café' + 'X' * 44})] * 5,
+    )
+    for d in range(60):
+        _write(verify_logs_dir(project) / f'{7100 + d}' / 'attempt-1.test-X.log', [f'E   plain {value}'])
+    config = sweep.SweepConfig(trees=sweep.swept_trees([project], tmp_path / 'no-claude'), now=NOW)
+    poster = Recorder()
+
+    sweep.run(config, environ={'CLAUDE_OAUTH_TOKEN_B': value}, post_escalation=poster)
+
+    (arguments,) = poster.findings
+    detail = arguments['detail']
+    shown = detail.splitlines()
+    assert len(detail.encode()) <= sweep.MAX_DETAIL_BYTES
+    assert shown[:5] == [_refused_detail_line(held, n) for n in range(1, 6)]
+    expected_groups = [
+        f'{verify_logs_dir(project) / f"{7100 + d}"}: 1 file(s), 1 occurrence(s) of CLAUDE_OAUTH_TOKEN_B'
+        for d in range(60)
+    ]
+    shown_groups = shown[5:-1]
+    assert 0 < len(shown_groups) < len(expected_groups)
+    assert shown_groups == expected_groups[:len(shown_groups)]
+    _assert_journal_pointer(shown[-1], 60 - len(shown_groups))
+    assert value not in json.dumps(arguments)
+
+
+def test_refused_lines_past_the_byte_bound_leave_no_room_for_a_redacted_group(tmp_path):
+    value = '00e9' + 'X' * 44
+    project = tmp_path / 'proj'
+    held = _write(
+        agent_transcripts_dir(project) / '7000' / '-enc' / 'sid.jsonl',
+        [json.dumps({'text': 'café' + 'X' * 44})] * 40,
+    )
+    group = verify_logs_dir(project) / '7100'
+    _write(group / 'attempt-1.test-X.log', [f'E   plain {value}'])
+    config = sweep.SweepConfig(trees=sweep.swept_trees([project], tmp_path / 'no-claude'), now=NOW)
+    poster = Recorder()
+
+    result = sweep.run(config, environ={'CLAUDE_OAUTH_TOKEN_B': value}, post_escalation=poster)
+
+    assert len(result.refused) == 40
+    assert len(result.redacted) == 1
+    (arguments,) = poster.findings
+    detail = arguments['detail']
+    shown = detail.splitlines()
+    kept = len(shown) - 1
+    assert len(detail.encode()) <= sweep.MAX_DETAIL_BYTES
+    assert shown[:-1] == [_refused_detail_line(held, n) for n in range(1, kept + 1)]
+    assert str(group) not in detail
+    _assert_journal_pointer(shown[-1], 41 - kept)
+    assert value not in json.dumps(arguments)
 
 
 def test_archive_staging_debris_is_swept_and_other_names_are_not(tmp_path):
