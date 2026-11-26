@@ -216,9 +216,11 @@ Phase γ **cross-unit** sub-path (`target_unit` ≠ own unit or `ORCH_UNIT` unse
   teardown found it already exited (else that none was produced), and
   WHICH signal that teardown dispatched.  The common already-exited shape
   gets a whole-group SIGKILL through the leader pidfd held from spawn
-  (task 10370).  No signal is sent, leaving the script's children running
-  and the operator told to go find them, only when the script was reaped
-  before that pidfd was taken or the kernel predates Linux 6.9.  Never a
+  (task 10370).  When no signal is sent, the script's children are left
+  running and the operator is told to go find them: for example when the
+  script was reaped before that pidfd was taken, when the host lacks
+  pidfds or predates Linux 6.9, or when the group was already empty
+  because whatever still holds the output pipe had left it.  Never a
   synthetic rc, and never an assumed kill.
 - Re-inspect and verify freshness (B7b), delegated to
   `proc_supervision.RestartPlan.execute()`'s `FreshPidVerify` check

@@ -59,16 +59,20 @@ class ProcessTeardown(Enum):
         'only its direct child process was signalled — the whole-group signal '
         'was refused or failed, so nothing the script spawned was killed'
     )
-    #: ``proc`` was already reaped and no held pidfd reached its group, so
-    #: NOTHING was dispatched and the whole tree below it SURVIVES: a script
-    #: reaped before ``run_script`` could take its pidfd (the fast exit
-    #: asyncio reaps inside ``create_subprocess_exec``), or a kernel before
-    #: Linux 6.9.  See ``shared/src/shared/proc_group.py::sigkill_process_group``
-    #: for why refusing to signal a reaped pid beats reaping an orphan.
+    #: ``proc`` was already reaped and no held pidfd reached a surviving
+    #: member of its group, so NOTHING was dispatched and whatever the script
+    #: spawned SURVIVES.  For example: the script was reaped before
+    #: ``run_script`` could take its pidfd (the fast exit asyncio reaps inside
+    #: ``create_subprocess_exec``); the host lacks pidfds or predates Linux
+    #: 6.9; or the pidfd send found the group already empty, because whatever
+    #: still holds the output pipe had left it (``setsid``/``setpgid``).
+    #: ``shared/src/shared/proc_group.py::sigkill_process_group`` owns the
+    #: full set, and why refusing to signal a reaped pid beats reaping an orphan.
     NOT_SIGNALLED = (
-        'nothing was signalled at all — the script had already been reaped, so '
-        'signalling its possibly-recycled pid was refused, and nothing the '
-        'script spawned was killed'
+        'nothing was signalled at all — the script had already been reaped, and '
+        'its process group was either already empty or out of safe reach (its '
+        'possibly-recycled pid is never signalled), so nothing the script '
+        'spawned was killed'
     )
 
     @property
@@ -154,9 +158,10 @@ class ScriptTimeout(Exception):
     ``exit_code`` is NOT a sound proxy for whether a kill was dispatched, in
     EITHER direction.  The usual exited-script case above gets both an exit
     code AND a whole-group kill, through the leader pidfd ``run_script`` holds
-    from spawn (``shared/src/shared/proc_group.py::sigkill_process_group``);
-    only a script reaped before that pidfd was taken, or a kernel before
-    Linux 6.9, yields an exit code with NO signal at all.  That is precisely
+    from spawn (``shared/src/shared/proc_group.py::sigkill_process_group``),
+    while each ``ProcessTeardown.NOT_SIGNALLED`` cause, such as a script
+    reaped before that pidfd was taken, yields an exit code with NO signal at
+    all.  That is precisely
     why the disposition is measured and carried instead of inferred by a
     caller.
 
@@ -216,11 +221,11 @@ class ScriptTimeout(Exception):
         reviewer finding).
 
         Deliberately does NOT offer the pid or pgid as something to kill: the
-        teardown declined to signal that id precisely because it may by now
-        belong to an unrelated group, so handing it to a human would be the
-        task-845 footgun the guard exists to prevent.  The script path is the
-        safe search key, and is the one thing the operator needs that this
-        text can supply.
+        script is reaped, or about to be, so that id may by now belong to an
+        unrelated group, and handing it to a human would be the task-845
+        footgun the guard exists to prevent.  The script path is the safe
+        search key, and is the one thing the operator needs that this text
+        can supply.
 
         Args:
             script: the absolute path that ran.  Not on the exception: it is
@@ -233,8 +238,8 @@ class ScriptTimeout(Exception):
             f'Whatever the script spawned was therefore NOT killed and may still be '
             f'running — including anything still holding the output pipe open. It '
             f'must be located and killed out-of-band before resolving: search by the '
-            f'script path ({script}), NOT by pid, since the pid the runner refused '
-            f'to signal may by now belong to an unrelated process group (task 845).'
+            f'script path ({script}), NOT by pid, since the script\'s pid may by '
+            f'now belong to an unrelated process group (task 845).'
         )
 
     @property
@@ -275,9 +280,10 @@ async def run_script(
     Raises:
         ScriptTimeout — the script overran *timeout_secs*.  Task 2090's
             Layer-A teardown runs FIRST, before the raise, and the raise
-            carries WHICH signal that teardown dispatched — none at all only
-            for a child reaped before its leader pidfd was taken, or on a
-            kernel before Linux 6.9.  An infra fault, not a verdict; see the
+            carries WHICH signal that teardown dispatched — none at all for
+            each ``ProcessTeardown.NOT_SIGNALLED`` cause, such as a child
+            reaped before its leader pidfd was taken.  An infra fault, not a
+            verdict; see the
             ``ScriptTimeout`` docstring for why it is deliberately not a
             ``(1, tail)`` return.
     """
@@ -290,11 +296,11 @@ async def run_script(
         stderr=asyncio.subprocess.STDOUT,
         start_new_session=True,
     )
-    # Capture the pgid NOW, while proc is guaranteed alive and unreaped: with
-    # start_new_session=True, pgid == proc.pid by POSIX guarantee.  Reading it
-    # later via os.getpgid could hit a recycled pid and signal a stranger's
-    # group (task 845) — see shared/src/shared/proc_group.py's module
-    # docstring, "Why the caller captures pgid".
+    # Capture the pgid from the spawn itself: with start_new_session=True,
+    # pgid == proc.pid by POSIX guarantee, reaped or not.  Reading it later
+    # via os.getpgid could hit a recycled pid and signal a stranger's group
+    # (task 845) — see shared/src/shared/proc_group.py's module docstring,
+    # "Why the caller captures pgid".
     pgid = proc.pid
     # Held from spawn so the timeout teardown still reaches the group once the
     # script itself is reaped (task 10370).
