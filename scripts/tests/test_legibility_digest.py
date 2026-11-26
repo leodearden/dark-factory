@@ -2823,6 +2823,25 @@ class TestClientRenderedTurnFilter:
 
         assert [t['text'] for t in turns] == [SLASH_COMMAND_WITH_ARGS_TURN]
 
+    def test_render_digest_heads_kept_turns_user_turns_not_user_corrections(self):
+        question = 'why did the lint run fail?'
+        records = [
+            _with_session_meta(_user_text(SLASH_COMMAND_WITH_ARGS_TURN)),
+            _with_session_meta(_user_text(question)),
+        ]
+
+        digest = mod.render_digest(records, agent_class='interactive')
+
+        frontmatter_yaml, body = _split_frontmatter(digest)
+        meta = yaml.safe_load(frontmatter_yaml)
+
+        assert '## User Turns' in body.splitlines()
+        assert 'User Corrections' not in digest
+        section_start = body.index('## User Turns')
+        assert body.index(SLASH_COMMAND_WITH_ARGS_TURN) > section_start
+        assert body.index(question) > section_start
+        assert meta['n_user_turns'] == 2
+
     def test_genuine_correction_between_client_rendered_turns_keeps_its_index(self):
         records = [
             _user_text(SLASH_COMMAND_ARGLESS_TURN),
