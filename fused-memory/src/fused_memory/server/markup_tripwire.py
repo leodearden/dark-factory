@@ -33,8 +33,9 @@ What remains here is what the boundary guard's escalation sink CALLS, plus the
 re-exports ``server/tools.py`` still imports:
 
 * :func:`emit_markup_storm_escalation` — one deduped record per burst (INV-4).
-* :func:`emit_markup_residue_escalation` — one record per unrepairable refusal,
-  deliberately NOT deduped, holding that caller's payload verbatim (INV-7).
+* :func:`emit_markup_residue_escalation` — one record per residue record of
+  either kind, deliberately NOT deduped, holding that caller's payload
+  verbatim (INV-7).
 * ``_MARKUP_STORM_THRESHOLD`` / ``_MARKUP_STORM_WINDOW_SECONDS`` — the ONE
   source for the tuning, read by the guard when it builds the middleware.
 * ``MARKUP_OVERRIDE_KEY``, ``markup_override_requested``,
@@ -55,9 +56,9 @@ import ast
 import logging
 from typing import Any
 
+from shared.markup_residue_custody import residue_prose
 from shared.mcp_markup_middleware import (
     MARKUP_RECURRENCE_ROUTING,
-    MARKUP_REFUSAL_CUSTODY_CAVEAT,
     residue_header_lines,
 )
 
@@ -465,7 +466,7 @@ def emit_markup_residue_escalation(
     *,
     anchor_task_id: str = _RESIDUE_ANCHOR_TASK_ID,
 ) -> str | None:
-    """Preserve the payload of ONE refused-as-unrepairable call (INV-7, B5).
+    """Preserve the payload of ONE residue record, of either kind (INV-7, B5).
 
     Returns the filed escalation id, or ``None`` when filing is impossible or
     fails. The id is what makes the caller-facing refusal HONEST: the shared
@@ -497,6 +498,7 @@ def emit_markup_residue_escalation(
     plus a log line rather than changing the call's outcome.
     """
     raw_value = record.get('raw_value')
+    prose = residue_prose(record)
     detail = '\n'.join([
         *residue_header_lines(record),
         f'tool={record.get("tool")!r}',
@@ -504,13 +506,9 @@ def emit_markup_residue_escalation(
         f'matched_pattern={record.get("matched_pattern")!r}',
         f'owner={record.get("owner")!r}',
         '',
-        'The MCP boundary markup guard REFUSED this call: the argument below '
-        'absorbed raw MCP tool-call envelope markup whose own boundary cannot '
-        'be determined, so no repair was attempted and NOTHING was written. '
-        'Guessing a boundary would silently drop whatever arguments hide in the '
-        'residue.',
+        prose.outcome,
         '',
-        MARKUP_REFUSAL_CUSTODY_CAVEAT,
+        prose.custody,
         '',
         'Recover the payload below for the caller if it is still needed, then '
         'chase the harness serialization leak that produced it and '
@@ -528,14 +526,14 @@ def emit_markup_residue_escalation(
         severity='blocking',
         summary=str(
             record.get('summary')
-            or f'Unrepairable MCP envelope markup in {record.get("tool")}'
+            or f'MCP envelope markup residue from {record.get("tool")}'
         ),
         detail=detail,
         suggested_action=str(record.get('suggested_action') or ''),
         logger=logger,
         log_label='markup_tripwire',
         context=(
-            f'the unrepairable payload of {record.get("tool")}.'
+            f'the {record.get("error_type")!r} residue of {record.get("tool")}.'
             f'{record.get("field")} ({len(raw_value or "")} chars)'
         ),
         level=int(record.get('level') or _RESIDUE_LEVEL),

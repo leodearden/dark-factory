@@ -6,7 +6,7 @@ import asyncio
 import contextlib
 import json
 import logging
-from collections.abc import Awaitable, Callable, Collection, Sequence
+from collections.abc import Awaitable, Callable, Collection, Mapping, Sequence
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -22,16 +22,16 @@ from shared.eval_lane import eval_lane_provenance
 # Fully qualified rather than `from shared import ...`: the module is
 # deliberately NOT re-exported from shared/__init__, so `import shared` does
 # not pull fastmcp into every consumer of the base layer.
+from shared.markup_residue_custody import (
+    ResidueCall,
+    log_unpreserved_residue,
+    residue_prose,
+)
 from shared.mcp_markup_middleware import (
     FACT_MARKUP_DETECTED,
     MARKUP_RECURRENCE_ROUTING,
-    MARKUP_REFUSAL_CUSTODY_CAVEAT,
     MARKUP_RESIDUE_ERROR_TYPES,
     MARKUP_STORM_ERROR_TYPE,
-    MARKUP_UNRECOVERED_PARAM_CUSTODY_CAVEAT,
-    MARKUP_UNRECOVERED_PARAM_ERROR_TYPE,
-    MARKUP_UNRECOVERED_PARAM_OUTCOME_CAVEAT,
-    MARKUP_UNREPAIRABLE_ERROR_TYPE,
     HostAttribution,
     MarkupGuardMiddleware,
     RepairPolicy,
@@ -1070,63 +1070,78 @@ def _emit_uuid_prefix_fact(fact: dict[str, Any]) -> None:
     logger.log(level, '%s %s', FACT_UUID_PREFIX_DETECTED, json.dumps(fact, sort_keys=True))
 
 
-def _markup_residue_prose(record: dict[str, Any]) -> str:
-    """What actually happened to the call, in the reader's own terms.
+def _markup_residue_prose(record: Mapping[str, Any]) -> str:
+    """What happened to the call, then a paragraph on who holds its payload.
 
-    DISPATCHED ON ``error_type``, never assumed, because this sink receives two
-    residue kinds whose triage is OPPOSITE and this server is the only site that
-    produces both.  ``MARKUP_UNREPAIRABLE_ERROR_TYPE`` means the call was
-    REFUSED — nothing was written, and the caller was told, so a human may
-    reasonably wait for it to resend.  ``MARKUP_UNRECOVERED_PARAM_ERROR_TYPE``
-    means the call was FORWARDED without the parameter, and nobody was bounced:
-    no retry is coming (``MARKUP_UNRECOVERED_PARAM_CUSTODY_CAVEAT``), and
-    whether the call then succeeded is unknown here
-    (``MARKUP_UNRECOVERED_PARAM_OUTCOME_CAVEAT`` says why).  One
-    hardcoded "the call was refused" sentence renders the second kind a record
-    that contradicts its own summary three lines above, and the false half is
-    the half that changes what an operator does.
-
-    ``shared.mcp_markup_middleware`` names the kinds precisely so a sink written
-    when only the refusal existed cannot silently mis-file the newer one; this
-    is that sink, matching the set rather than a single name.
-
-    An UNRECOGNISED kind is filed anyway, with a visibly-hedged body that
-    renders the middleware's own ``summary`` and ``suggested_action`` — the same
-    posture ``orchestrator.mcp.markup_sink`` takes.  Dropping a record kind is
-    the silent fail-soft this PRD exists to end, and an unfamiliar record in the
-    queue is a question an operator can answer.
+    The words are ``shared/src/shared/markup_residue_custody.py::residue_prose``'s.
+    A kind it has no text for is still filed, hedged, and also logged here, so
+    an unfamiliar record is visible in the log as well as in the queue.
     """
-    error_type = record.get('error_type')
-    if error_type == MARKUP_UNREPAIRABLE_ERROR_TYPE:
-        return (
-            'THE CALL WAS REFUSED. The leaked fragment\'s own boundary could '
-            'not be determined, so no repair was attempted and nothing was '
-            'guessed. ' + MARKUP_REFUSAL_CUSTODY_CAVEAT
+    prose = residue_prose(record)
+    if prose.call is ResidueCall.UNRECOGNISED:
+        logger.warning(
+            'markup guard: filing an unrecognised residue kind %r — the '
+            'middleware emits something this sink does not know about '
+            '(known: %s)',
+            record.get('error_type'), sorted(MARKUP_RESIDUE_ERROR_TYPES),
         )
-    if error_type == MARKUP_UNRECOVERED_PARAM_ERROR_TYPE:
-        return (
-            'THE CALL WAS FORWARDED WITHOUT THIS PARAMETER. The value below '
-            'was recovered from the leak but could not be typed against the '
-            'parameter\'s declared schema, so it was dropped from the call '
-            'rather than passed through untyped. '
-            f'{MARKUP_UNRECOVERED_PARAM_OUTCOME_CAVEAT} '
-            f'{MARKUP_UNRECOVERED_PARAM_CUSTODY_CAVEAT}'
-        )
-    logger.warning(
-        'markup guard: filing an unrecognised residue kind %r — the middleware '
-        'emits something this sink does not know about (known: %s)',
-        error_type, sorted(MARKUP_RESIDUE_ERROR_TYPES),
-    )
-    return '\n'.join([
-        f'UNRECOGNISED RESIDUE KIND {error_type!r}. This sink does not know '
-        'what this call\'s outcome was, so it states neither — the middleware '
-        'grew a record kind that escalation/src/escalation/server.py has not '
-        'been taught. Its own words for what happened follow; treat them, not '
-        'this paragraph, as the account of the call.',
+    return f'{prose.outcome}\n\n{prose.custody}'
+
+
+def _markup_residue_escalation(record: Mapping[str, Any], esc_id: str) -> Escalation:
+    """The queue record that holds one residue *record*'s payload, verbatim.
+
+    ``level`` and ``category`` are read from the RECORD rather than restated,
+    so the middleware stays the single source of the contract (INV-5). Their
+    fallbacks fail toward L2 rather than toward a silently-L0 record nobody
+    reads.
+    """
+    level = int(record.get('level') or 2)
+    subject_task_id = record.get('subject_task_id')
+    detail = '\n'.join([
+        # WHOSE call leaked, FIRST: the record's own `task_id` is the synthetic
+        # anchor, not the caller's. `agent_id` comes from the connection's
+        # identity header when a tool declares none.
+        *residue_header_lines(record),
+        # The OWNER that will exit this hold unprompted (INV-7), read off the
+        # record: the middleware names it.
+        f'owner={record.get("owner")!r}',
+        f'tool={record.get("tool")!r}',
+        f'field={record.get("field")!r}',
+        f'matched_pattern={record.get("matched_pattern")!r}',
+        f'raw_value_chars={len(record.get("raw_value") or "")}',
         '',
-        f'summary: {record.get("summary")!r}',
-        f'suggested_action: {record.get("suggested_action")!r}',
+        _markup_residue_prose(record),
+        '',
+        'RAW PAYLOAD, VERBATIM AND ENTIRE. '
+        'Recover it for the caller if it is still needed, then chase the '
+        'harness serialization leak that produced it and '
+        f'{MARKUP_RECURRENCE_ROUTING}.',
+        '',
+        str(record.get('raw_value') or ''),
     ])
+    # Task 3550 deliberately does NOT stamp filing_claimant_run_id here: filed
+    # under the synthetic _MARKUP_RESIDUE_ANCHOR_TASK_ID and bypassing
+    # _chokepoint_or_submit entirely, so no task-workflow incarnation filed it
+    # and there is no honest identity to record.
+    return Escalation(
+        id=esc_id,
+        task_id=_MARKUP_RESIDUE_ANCHOR_TASK_ID,
+        agent_role=_MARKUP_GUARD_AGENT_ROLE,
+        # Derived from `level`, never asserted beside it: the two are one
+        # decision (see _MARKUP_RESIDUE_SEVERITY).
+        severity=_MARKUP_RESIDUE_SEVERITY if level >= 2 else 'blocking',
+        category=str(record.get('category') or 'mcp_markup_residue'),
+        # The subject is PREFIXED: a reader scanning summaries alone, which is
+        # what the L2 watcher's notification shows, would otherwise have no way
+        # to tell whose call leaked.
+        summary=(
+            f'[{subject_task_id}] ' if subject_task_id else ''
+        ) + str(record.get('summary') or ''),
+        detail=detail,
+        suggested_action=str(record.get('suggested_action') or ''),
+        level=level,
+    )
 
 
 # INV-4 storm escape for root-cause OVER-FOLDING (task 3998).  Canonicalising
@@ -1474,12 +1489,15 @@ def create_server(
         logger.info('%s %s', FACT_MARKUP_DETECTED, json.dumps(fact, sort_keys=True))
 
     def _file_markup_residue(record: dict[str, Any]) -> str | None:
-        """Persist an unrepairable call's payload, or report a storm burst.
+        """Persist a residue record of either kind, or report a storm burst.
 
         The escalation channel the guard writes to (C2 L187 / INV-7).  Returns
-        the queued id as a ``str`` — the middleware propagates it into the
-        refusal payload so a bounced caller can point an operator at its own
-        preserved data, and treats a non-``str`` as reporting no id.
+        the queued id as a ``str`` — the middleware propagates it to the
+        caller so it can point an operator at its own preserved data, and
+        treats a non-``str`` as reporting no id.  A residue the queue cannot
+        take goes whole to
+        ``shared/src/shared/markup_residue_custody.py::log_unpreserved_residue``
+        and reports no id.
 
         THE QUEUE IS WRITTEN DIRECTLY, and both halves of that are deliberate:
 
@@ -1498,64 +1516,16 @@ def create_server(
         error_type = record.get('error_type')
         if error_type == MARKUP_STORM_ERROR_TYPE:
             return file_storm_once(queue, _MARKUP_STORM_ALARM, record)
-
-        # `level` and `category` are read from the RECORD rather than restated,
-        # so the middleware stays the single source of the contract (INV-5).
-        # The fallbacks matter only if that contract is ever violated, and they
-        # fail toward L2 rather than toward a silently-L0 record nobody reads.
-        level = int(record.get('level') or 2)
-        subject_task_id = record.get('subject_task_id')
-        detail = '\n'.join([
-            # WHOSE call leaked, FIRST: the record's own `task_id` is the
-            # synthetic anchor, not the caller's, so without these lines a
-            # critical L2 record names nobody at all. `agent_id` comes from the
-            # connection's identity header when a tool declares none.
-            *residue_header_lines(record),
-            # The OWNER that will exit this hold unprompted (INV-7), read off
-            # the record rather than restated: the middleware names it, and a
-            # second spelling here could name a consumer that no longer exists.
-            f'owner={record.get("owner")!r}',
-            f'tool={record.get("tool")!r}',
-            f'field={record.get("field")!r}',
-            f'matched_pattern={record.get("matched_pattern")!r}',
-            f'raw_value_chars={len(record.get("raw_value") or "")}',
-            '',
-            _markup_residue_prose(record),
-            '',
-            'RAW PAYLOAD, VERBATIM AND ENTIRE. '
-            'Recover it for the caller if it is still needed, then chase the '
-            'harness serialization leak that produced it and '
-            f'{MARKUP_RECURRENCE_ROUTING}.',
-            '',
-            str(record.get('raw_value') or ''),
-        ])
-        # Task 3550 deliberately does NOT stamp filing_claimant_run_id here:
-        # filed under the synthetic _MARKUP_RESIDUE_ANCHOR_TASK_ID and bypassing
-        # _chokepoint_or_submit entirely, so no task-workflow incarnation filed it
-        # and there is no honest identity to record.
-        esc = Escalation(
-            id=queue.make_id(_MARKUP_RESIDUE_ANCHOR_TASK_ID),
-            task_id=_MARKUP_RESIDUE_ANCHOR_TASK_ID,
-            agent_role=_MARKUP_GUARD_AGENT_ROLE,
-            # Derived from `level`, never asserted beside it: the two are one
-            # decision (see _MARKUP_RESIDUE_SEVERITY), so if the middleware ever
-            # lowers the level this record follows it down instead of writing a
-            # born-at-L2 severity onto an L0/L1 record.
-            severity=_MARKUP_RESIDUE_SEVERITY if level >= 2 else 'blocking',
-            category=str(record.get('category') or 'mcp_markup_residue'),
-            # The subject is PREFIXED rather than left to the detail: the
-            # record's own task_id is the synthetic anchor, so a reader
-            # scanning summaries alone — which is what the L2 watcher's
-            # notification shows — would otherwise have no way to tell whose
-            # call leaked. Same shape the sibling sink uses.
-            summary=(
-                f'[{subject_task_id}] ' if subject_task_id else ''
-            ) + str(record.get('summary') or ''),
-            detail=detail,
-            suggested_action=str(record.get('suggested_action') or ''),
-            level=level,
-        )
-        return queue.submit(esc)
+        try:
+            return queue.submit(_markup_residue_escalation(
+                record, queue.make_id(_MARKUP_RESIDUE_ANCHOR_TASK_ID),
+            ))
+        except Exception:
+            log_unpreserved_residue(
+                logger, record,
+                why='the escalation queue could not take it', exc_info=True,
+            )
+        return None
 
     mcp.add_middleware(MarkupGuardMiddleware(
         policy=RepairPolicy.FORWARD_REPAIR,

@@ -15,13 +15,16 @@ Either way the destination holds the clean value and the swallowed sibling.
 
 ATTRIBUTION: an unrepairable leak is refused, and the residue record filed for
 it names its caller through the one shared rendering, ``residue_header_lines``,
-and states ``MARKUP_REFUSAL_CUSTODY_CAVEAT`` rather than claiming to hold the
-only copy.
+and states the refused kind's outcome and custody from
+``shared/src/shared/markup_residue_custody.py::residue_prose``, the text every
+sink states, rather than claiming to hold the only copy.
 
 CUSTODY OF A DROP: on the FORWARD_REPAIR surfaces a swallowed value that cannot
 be typed is dropped from the forwarded call and filed instead. Nothing bounced
-that caller, so its record states ``MARKUP_UNRECOVERED_PARAM_CUSTODY_CAVEAT``
-beside ``MARKUP_UNRECOVERED_PARAM_OUTCOME_CAVEAT``, whichever sink filed it.
+that caller, so whichever sink filed it, its record states the dropped-slice
+kind's outcome and custody from
+``shared/src/shared/markup_residue_custody.py::residue_prose``, and none of the
+refused kind's.
 
 Every envelope specimen is built from ``_markup_helpers``, never spelled raw;
 that module's header says why.
@@ -42,10 +45,10 @@ from escalation.queue import EscalationQueue
 from escalation.server import create_server as create_escalation_server
 from fastmcp import Client, FastMCP
 from fastmcp.exceptions import ToolError
+from shared.markup_residue_custody import residue_prose
 from shared.mcp_markup_middleware import (
-    MARKUP_REFUSAL_CUSTODY_CAVEAT,
-    MARKUP_UNRECOVERED_PARAM_CUSTODY_CAVEAT,
-    MARKUP_UNRECOVERED_PARAM_OUTCOME_CAVEAT,
+    MARKUP_UNRECOVERED_PARAM_ERROR_TYPE,
+    MARKUP_UNREPAIRABLE_ERROR_TYPE,
     residue_header_lines,
 )
 from shared.project_layout import escalation_queue_dir
@@ -303,7 +306,9 @@ async def test_the_residue_states_what_its_custody_proves(
 ):
     detail = await refused_residue(surface(tmp_path), tool, field, sent)
 
-    assert MARKUP_REFUSAL_CUSTODY_CAVEAT in detail
+    prose = residue_prose({'error_type': MARKUP_UNREPAIRABLE_ERROR_TYPE})
+    assert prose.outcome in detail
+    assert prose.custody in detail
     assert 'only surviving copy' not in detail
 
 
@@ -333,6 +338,9 @@ async def test_a_dropped_value_states_what_its_custody_proves(
         await client.call_tool(tool, {**sent, field: swallowing(field, sibling, sibling_value)})
 
     [detail] = served.residue_details()
-    assert MARKUP_UNRECOVERED_PARAM_OUTCOME_CAVEAT in detail
-    assert MARKUP_UNRECOVERED_PARAM_CUSTODY_CAVEAT in detail
-    assert MARKUP_REFUSAL_CUSTODY_CAVEAT not in detail
+    dropped = residue_prose({'error_type': MARKUP_UNRECOVERED_PARAM_ERROR_TYPE})
+    refused = residue_prose({'error_type': MARKUP_UNREPAIRABLE_ERROR_TYPE})
+    assert dropped.outcome in detail
+    assert dropped.custody in detail
+    assert refused.outcome not in detail
+    assert refused.custody not in detail

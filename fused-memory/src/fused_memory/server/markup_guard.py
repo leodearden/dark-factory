@@ -51,6 +51,7 @@ import logging
 from collections.abc import Callable, Mapping
 from typing import Any
 
+from shared.markup_residue_custody import log_unpreserved_residue
 from shared.mcp_markup_middleware import (
     MARKUP_RECURRENCE_ROUTING,
     MarkupGuardMiddleware,
@@ -215,7 +216,7 @@ ResidueFloor = Callable[[dict[str, Any]], 'str | None']
 
 
 class ResidueTier(enum.StrEnum):
-    """Which tier held a refused payload.
+    """Which tier held a residue record's payload.
 
     Every residue outcome logs one ERROR record carrying this as
     ``extra={'residue_tier': ...}``, so an operator's log query, and a test,
@@ -258,10 +259,10 @@ def _queue_residue(
         return None
     if escalation_id is not None:
         logger.error(
-            'markup_guard_residue: refused an unrepairable %s.%s and '
-            'preserved its payload in %s (%d chars); %s',
-            record.get('tool'), record.get('field'), escalation_id,
-            residue_payload_length(record), MARKUP_RECURRENCE_ROUTING,
+            'markup_guard_residue: preserved the %r residue of %s.%s in %s '
+            '(%d chars); %s',
+            record.get('error_type'), record.get('tool'), record.get('field'),
+            escalation_id, residue_payload_length(record), MARKUP_RECURRENCE_ROUTING,
             extra={'residue_tier': ResidueTier.QUEUE, 'residue_locator': escalation_id},
         )
     return escalation_id
@@ -284,10 +285,9 @@ def _floor_residue(
     if path is None:
         return None
     logger.error(
-        'markup_guard_residue: refused an unrepairable %s.%s that no queue '
-        'took, and preserved its payload in the residue floor file %s (%d '
-        'chars); %s',
-        record.get('tool'), record.get('field'), path,
+        'markup_guard_residue: preserved the %r residue of %s.%s, which no '
+        'queue took, in the residue floor file %s (%d chars); %s',
+        record.get('error_type'), record.get('tool'), record.get('field'), path,
         residue_payload_length(record), MARKUP_RECURRENCE_ROUTING,
         extra={'residue_tier': ResidueTier.FLOOR, 'residue_locator': path},
     )
@@ -297,17 +297,10 @@ def _floor_residue(
 def _log_unpreserved(record: dict[str, Any], *, floor_wired: bool) -> None:
     """Tier 3: no tier held *record*, so this log line carries it."""
     floor = 'the residue floor failed' if floor_wired else 'no residue floor is wired'
-    logger.error(
-        'markup_guard_residue: refused an unrepairable %s.%s and preserved its '
-        'payload nowhere durable by this process: no queue took it '
-        '(project=%r) and %s. The caller was told to keep its own copy. '
-        'Record: %r; %s',
-        record.get('tool'), record.get('field'), record.get('project'), floor,
-        record, MARKUP_RECURRENCE_ROUTING,
-        extra={
-            'residue_tier': ResidueTier.UNPRESERVED,
-            'residue_floor_wired': floor_wired,
-        },
+    log_unpreserved_residue(
+        logger, record,
+        why=f'no queue took it (project={record.get("project")!r}) and {floor}',
+        extra={'residue_tier': ResidueTier.UNPRESERVED, 'residue_floor_wired': floor_wired},
     )
 
 
@@ -340,7 +333,7 @@ def build_markup_guard(
     """
 
     def _file_residue(record: dict[str, Any]) -> ResiduePreservation:
-        """Preserve one refused payload, and report where it went.
+        """Preserve one residue record's payload, of either kind, and report where it went.
 
         Queue, then floor, then log. The full record, which carries the
         caller's ``raw_value`` verbatim, reaches the log ONLY when neither the

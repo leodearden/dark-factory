@@ -37,16 +37,12 @@ from pathlib import Path
 from typing import Any
 
 from shared.eval_lane import eval_lane_provenance
+from shared.markup_residue_custody import ResidueCall, residue_prose
 from shared.mcp_markup_middleware import (
     MARKUP_BOUNDARY_STORM_CATEGORY,
     MARKUP_RECURRENCE_ROUTING,
-    MARKUP_REFUSAL_CUSTODY_CAVEAT,
     MARKUP_RESIDUE_ERROR_TYPES,
     MARKUP_STORM_ERROR_TYPE,
-    MARKUP_UNRECOVERED_PARAM_CUSTODY_CAVEAT,
-    MARKUP_UNRECOVERED_PARAM_ERROR_TYPE,
-    MARKUP_UNRECOVERED_PARAM_OUTCOME_CAVEAT,
-    MARKUP_UNREPAIRABLE_ERROR_TYPE,
     residue_header_lines,
 )
 from shared.project_layout import escalation_queue_dir
@@ -327,34 +323,22 @@ def open_escalation_channel(project_root: Path) -> tuple[Any, Any] | None:
         return None
 
 
-def _residue_outcome(record: Mapping[str, Any], spec: MarkupSinkSpec) -> str:
-    """What happened to the call, in the record kind's OWN terms."""
-    error_type = record.get('error_type')
-    if error_type == MARKUP_UNREPAIRABLE_ERROR_TYPE:
-        return (
-            f'The {spec.server_label} MCP boundary guard refused this tool call: '
-            'the value below carries raw tool-call envelope markup whose own '
-            'boundary cannot be determined, so no repair was attempted. '
-            + spec.refusal_consequence +
-            ' Guessing would have silently dropped whatever arguments hide in '
-            'the residue. ' + MARKUP_REFUSAL_CUSTODY_CAVEAT
-        )
-    if error_type == MARKUP_UNRECOVERED_PARAM_ERROR_TYPE:
-        return (
-            f'The {spec.server_label} MCP boundary guard FORWARDED this tool '
-            'call WITHOUT the field named above. The value below was recovered '
-            'from leaked tool-call envelope markup but could not be typed '
-            "against that parameter's declared schema, so it was dropped rather "
-            'than passed through untyped. '
-            + MARKUP_UNRECOVERED_PARAM_OUTCOME_CAVEAT + ' '
-            + MARKUP_UNRECOVERED_PARAM_CUSTODY_CAVEAT
-        )
-    return (
-        f'This sink does not recognise the record kind {error_type!r}, so it '
-        "states no outcome for the call. The record's summary and suggested "
-        "action, where the middleware supplied them, are the middleware's own "
-        'account of what happened.'
-    )
+def _residue_account(record: Mapping[str, Any], spec: MarkupSinkSpec) -> list[str]:
+    """Who filed the record, then what happened to the call and its payload.
+
+    The outcome and custody are :func:`shared.markup_residue_custody.residue_prose`'s;
+    only a REFUSED call adds what the refusal cost on this server.
+    """
+    prose = residue_prose(record)
+    consequence = [spec.refusal_consequence, ''] if prose.call is ResidueCall.REFUSED else []
+    return [
+        f'Filed by the {spec.server_label} MCP boundary guard.',
+        '',
+        prose.outcome,
+        '',
+        *consequence,
+        prose.custody,
+    ]
 
 
 def residue_detail(
@@ -364,8 +348,8 @@ def residue_detail(
 
     The raw value is rendered last, unquoted and unescaped, so it can be
     recovered byte for byte. Whether anyone else still holds it depends on the
-    kind, and the outcome paragraph between them (:func:`_residue_outcome`)
-    says which. Everything above it is diagnostic and is written with ``!r``
+    kind, and the account between them (:func:`_residue_account`) says
+    which. Everything above it is diagnostic and is written with ``!r``
     so an empty or ``None`` field reads as itself rather than as a blank line.
 
     The header lines are ``residue_header_lines``', the one rendering every
@@ -385,7 +369,7 @@ def residue_detail(
         f'field={record.get("field")!r}',
         f'matched_pattern={record.get("matched_pattern")!r}',
         '',
-        _residue_outcome(record, spec),
+        *_residue_account(record, spec),
         '',
         'Recover the payload below for the caller if it is still needed, then '
         'chase the harness serialization leak that produced it and '
