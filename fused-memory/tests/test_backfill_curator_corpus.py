@@ -105,13 +105,18 @@ class RecordingEmbedder:
 
     Each call yields to the event loop once while in flight, so concurrent
     calls overlap with no wall-clock wait. A text containing *fail_marker*
-    raises. Every component has a worst-case-length float repr, so a point
-    serialises as large as a real embedding's can.
+    raises. A text containing *abort_marker* raises ``asyncio.CancelledError``,
+    as an operator's Ctrl-C under ``asyncio.run`` does. Every component has a
+    worst-case-length float repr, so a point serialises as large as a real
+    embedding's can.
     """
 
-    def __init__(self, *, fail_marker: str | None = None) -> None:
+    def __init__(
+        self, *, fail_marker: str | None = None, abort_marker: str | None = None,
+    ) -> None:
         self._vector = [-0.0123456789012345] * make_config().embedder.dimensions
         self._fail_marker = fail_marker
+        self._abort_marker = abort_marker
         self.calls = 0
         self.in_flight = 0
         self.peak = 0
@@ -122,6 +127,8 @@ class RecordingEmbedder:
         self.peak = max(self.peak, self.in_flight)
         try:
             await asyncio.sleep(0)
+            if self._abort_marker is not None and self._abort_marker in input_data:
+                raise asyncio.CancelledError(f'run interrupted at {self._abort_marker!r}')
             if self._fail_marker is not None and self._fail_marker in input_data:
                 raise RuntimeError(f'embedder refused a text containing {self._fail_marker!r}')
             return self._vector
@@ -361,6 +368,22 @@ class TestBackfillBatching:
         assert persisted == 4
         assert qdrant.upsert_sizes == [3, 3, 1]
         assert embedder.calls == 7
+
+    @pytest.mark.asyncio
+    async def test_run_interrupted_in_the_last_batch_keeps_the_batches_before_it(self):
+        tasks = [*_titled_tasks(6), _make_task('abort', title='ABORT-RUN task')]
+        qdrant = RecordingQdrant()
+        curator = in_memory_corpus_curator(
+            RecordingEmbedder(abort_marker='ABORT-RUN'), qdrant_client=qdrant,
+        )
+        try:
+            with pytest.raises(asyncio.CancelledError):
+                await curator.backfill_corpus(tasks, 'proj', batch_size=3)
+
+            assert await curator.corpus_count('proj') == 6
+            assert qdrant.upsert_sizes == [3, 3]
+        finally:
+            await curator.close()
 
     @pytest.mark.asyncio
     async def test_batch_failure_counts_compose_with_skips_and_embed_failures(self):
