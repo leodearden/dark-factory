@@ -6,6 +6,8 @@ loaded before a recorded span opens.
 """
 
 import json
+import os
+import shutil
 import subprocess
 from collections.abc import Iterator
 from datetime import UTC, datetime
@@ -40,6 +42,7 @@ from client_feed.contract import (
     RevealRefused,
     TaskUpserted,
     TreeSnapshot,
+    VerifyTestResults,
     parse_state,
 )
 from client_feed.feed_io import read_feed_lines
@@ -56,6 +59,9 @@ SNAPSHOT_PROJECT: Final = 'dark-factory'
 SNAPSHOT_VISIBLE_GLOBS: Final = ('*/src/**', '*/tests/**')
 SNAPSHOT_FIXTURE_MAX_CASES: Final = 20
 SNAPSHOT_REVEALED: Final = 'client-feed/src/client_feed/envelope.py'
+FIXTURE_DIR: Final = Path(__file__).parent / 'fixtures' / 'snapshot-dark-factory'
+FIXTURE_FILES: Final = (FEED_FILENAME, STATE_FILENAME)
+REGENERATE_FIXTURE_ENV: Final = 'CLIENT_FEED_REGENERATE_SNAPSHOT_FIXTURE'
 
 
 @pytest.fixture
@@ -271,3 +277,22 @@ def test_b22_a_snapshot_of_this_checkout_over_its_live_slice_is_valid_and_leaks_
     assert trees and trees[-1].files
     assert all(matches_any(SNAPSHOT_VISIBLE_GLOBS, file.path) for tree in trees for file in tree.files)
     assert _leaks(out_dir, needles=(CANARY_A_DESC, '/home/', str(tmp_path))) == []
+    if os.environ.get(REGENERATE_FIXTURE_ENV) == '1':
+        FIXTURE_DIR.mkdir(parents=True, exist_ok=True)
+        for name in FIXTURE_FILES:
+            shutil.copyfile(out_dir / name, FIXTURE_DIR / name)
+
+
+def test_the_committed_dark_factory_snapshot_is_a_valid_bounded_leak_free_feed(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert {path.name for path in FIXTURE_DIR.iterdir()} == {*FIXTURE_FILES, 'README.md'}
+    validated = main(['validate-feed', '--out-dir', str(FIXTURE_DIR), '--project-id', SNAPSHOT_PROJECT])
+    assert validated == 0, capsys.readouterr().out
+    assert _leaks(FIXTURE_DIR, needles=('CANARY-', '/home/', '/tmp/', 'pytest-of-')) == []
+    assert parse_state((FIXTURE_DIR / STATE_FILENAME).read_text()).prds
+    lines = read_feed_lines(FIXTURE_DIR)
+    for kind in (TaskUpserted, TreeSnapshot, FileRevealed):
+        assert any(isinstance(line, kind) for line in lines), kind.__name__
+    results = [line for line in lines if isinstance(line, VerifyTestResults)]
+    assert all(len(line.cases) <= SNAPSHOT_FIXTURE_MAX_CASES for line in results)
