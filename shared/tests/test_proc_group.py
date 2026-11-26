@@ -1498,8 +1498,7 @@ class TestScanProcessGroupsUnderPath:
         a stat-format change, a ``_PROC_ROOT`` mishap or a permissions change
         would blow the walk up, get laundered into an empty set, and turn this
         test GREEN. The unexcluded ``keeper`` is the witness that separates
-        EXCLUDED from NEVER FOUND AT ALL. It costs a fork, not a second walk;
-        the walk count is the thing this test exists to keep at one.
+        EXCLUDED from NEVER FOUND AT ALL.
 
         The coverage that a single walk cannot carry is carried elsewhere,
         against the identical helper:
@@ -1636,12 +1635,9 @@ class TestScanProcessGroupsUnderPath:
 class TestScanProcessGroupsAgainstASyntheticProc:
     """The scan's branches, pinned against a FABRICATED /proc — no real walk.
 
-    A real-/proc walk cannot control its pid population: it reads 1100+ live
-    pids (23.3 MB of ``maps`` alone), it cannot assert that two pids sharing a
-    pgrp are de-duplicated, and it costs 0.8-1.5s that scales with host load —
-    which is how the two-walk ``test_scan_respects_exclude_pgids`` came to sit
-    against a 15s budget with thin headroom (task 4520). A fabricated tree
-    controls every pid, covers strictly more branches, and costs microseconds.
+    A fabricated tree controls every pid's CONTENT, which a walk over live
+    processes cannot: two pids sharing one pgrp, an unreadable or malformed
+    stat, a cwd equal to root.
 
     Points the module at the fake tree via ``shared.proc_group._PROC_ROOT``,
     the same monkeypatch-module-internals idiom
