@@ -306,6 +306,25 @@ class TestAReportBehindADeferredGateIsLoud:
         assert cursor.deferred_gate_reports == {FIX: seconds(GRACE + 2)}
         assert HELD in root.run(seconds(2 * GRACE + 3)).degraded
 
+    def test_one_heartbeat_names_both_filer_reasons_and_the_feed_stays_valid(
+        self, root: Root
+    ) -> None:
+        unfiled_elsewhere = Degradation(
+            source=Source.FILER, reason='1 defect report(s) unfiled past 600s: portal:acme:3:4'
+        )
+        append_inbox(root.in_dir, reported(3, 4, at=T))
+        hold_behind_a_deferred_gate(root)
+        root.run(T)
+
+        report = root.run(seconds(GRACE + 1))
+
+        assert unfiled_elsewhere in report.degraded
+        assert HELD in report.degraded
+        heartbeat = root.last_heartbeat()
+        assert unfiled_elsewhere in heartbeat.degraded
+        assert HELD in heartbeat.degraded
+        assert validate_out_dir(root.out_dir).ok
+
     def test_a_gate_held_again_after_its_release_is_named(self, root: Root) -> None:
         root.tasks.add(5, updated_at=UPDATED, metadata=gate_for(FIX))
         root.tasks.add(6, updated_at=UPDATED, metadata=carrying(FIX), depends_on=(5,))
