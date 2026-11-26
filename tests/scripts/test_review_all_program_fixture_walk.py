@@ -15,8 +15,11 @@ import sys
 from pathlib import Path
 
 import pytest
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from df_pytest_isolation import run_in_new_session
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 REPO_ROOT = Path(__file__).parents[2]
 WALK = REPO_ROOT / 'scripts' / 'check_review_all_program_fixture.py'

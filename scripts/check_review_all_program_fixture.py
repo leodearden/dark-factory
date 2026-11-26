@@ -1073,6 +1073,43 @@ def b16_sitting(walk: Walk) -> str:
     return 'Q1+Q2 on one screen with recommendations and draft, Q3 closing; Q2 alone after rulings; then nothing'
 
 
+def _entry_points() -> list[Path]:
+    """Every executable script directly under the program dir, plus the fake store: found by exec bit."""
+    return [*sorted(path for path in PROGRAM_DIR.glob('*.py') if os.access(path, os.X_OK)), FAKE_STORE]
+
+
+def _isolation_breach(invocation: Invocation) -> str | None:
+    if invocation.argv[:3] != (sys.executable, *ISOLATION_FLAGS):
+        return f'{invocation.describe()} ran as {" ".join(invocation.argv[:3])}'
+    if inside_checkout(invocation.cwd):
+        return f'{invocation.describe()} ran from {invocation.cwd}, inside the checkout'
+    if not invocation.env_names <= ISOLATED_ENV_NAMES:
+        return f'{invocation.describe()} saw {sorted(invocation.env_names - ISOLATED_ENV_NAMES)} in its env'
+    return None
+
+
+def _help_failure(run: ProgramRun, script: Path) -> str | None:
+    helped = run_script(run.journal, script, ['--help'], cwd=run.cwd,
+                        env=isolated_env(run.cwd, run.homes_root, run.store_url))
+    if helped.returncode == 0:
+        return None
+    last = (helped.stderr.strip().splitlines() or ['no stderr'])[-1]
+    return f'{script.name} --help exits {helped.returncode}: {last}'
+
+
+def b14_stdlib_and_any_cwd(walk: Walk) -> str:
+    """Runs last: every entry point ran, each loads under -I -S, and every invocation was isolated."""
+    scripts = _entry_points()
+    ran = {invocation.script for invocation in walk.journal.entries()}
+    problems = [f'{script.relative_to(PROGRAM_DIR)} never ran' for script in scripts if script not in ran]
+    helping = walk.new_run('b14-help')
+    problems += [failure for script in scripts if (failure := _help_failure(helping, script))]
+    entries = walk.journal.entries()
+    problems += [breach for invocation in entries if (breach := _isolation_breach(invocation))]
+    expect(not problems, '; '.join(problems))
+    return f'{len(scripts)} scripts, {len(entries)} invocations, all -I -S from outside {REPO_ROOT}'
+
+
 SCENARIOS = (
     Scenario('B1', 'init', b1_init),
     Scenario('B2', 'author return applied', b2_author_applied),
@@ -1088,6 +1125,7 @@ SCENARIOS = (
     Scenario('B12', 'rulings', b12_rulings),
     Scenario('B13', 'clerk ingest', b13_clerk_ingest),
     Scenario('B16', 'sitting', b16_sitting),
+    Scenario('B14', 'stdlib and any-cwd', b14_stdlib_and_any_cwd),
 )
 
 
