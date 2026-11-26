@@ -88,6 +88,8 @@ AGENT_ROLE = 'transcript-secret-sweep'
 DEFAULT_MIN_AGE_SECS = 900.0
 ESCALATION_TIMEOUT_SECS = 30.0
 MAX_DETAIL_LINES = 200
+MAX_DETAIL_BYTES = 4096
+JOURNAL_UNIT = 'transcript-secret-sweep.service'
 NO_SECRETS_CAUSE = 'no secret-bearing values in the environment'
 SHORTFALL_TASK_ID = 'transcript-secret-sweep-shortfall'
 TRANSCRIPT_SUFFIXES = ('.jsonl', '.jsonl' + STAGING_SUFFIX)
@@ -410,11 +412,30 @@ def _counts_label(counts: Mapping[str, int]) -> str:
     return ', '.join(f'{var}×{n}' for var, n in sorted(counts.items()))
 
 
-def _bounded(lines: list[str]) -> list[str]:
-    if len(lines) <= MAX_DETAIL_LINES:
-        return lines
-    overflow = len(lines) - MAX_DETAIL_LINES
-    return [*lines[:MAX_DETAIL_LINES], f'... and {overflow} more line(s): see the sweep\'s journal record']
+def _bounded(lines: Sequence[str], now: datetime.datetime) -> str:
+    whole = '\n'.join(lines)
+    if len(lines) <= MAX_DETAIL_LINES and len(whole.encode()) <= MAX_DETAIL_BYTES:
+        return whole
+    budget = MAX_DETAIL_BYTES - len(_overflow_line(len(lines), now).encode())
+    kept: list[str] = []
+    for line in lines[:MAX_DETAIL_LINES]:
+        budget -= len(line.encode()) + 1
+        if budget < 0:
+            break
+        kept.append(line)
+    return '\n'.join([*kept, _overflow_line(len(lines) - len(kept), now)])
+
+
+def _overflow_line(hidden: int, now: datetime.datetime) -> str:
+    since = now.astimezone(datetime.UTC)
+    until = since + datetime.timedelta(days=1)
+    return (
+        f"... and {hidden} more line(s) not shown. The full record is this run's JSON line in the journal, "
+        'kept about three weeks; journald splits it into 48 KB entries, which this command rejoins: '
+        f"journalctl --user -u {JOURNAL_UNIT} --since '{since:%Y-%m-%d %H:%M:%S} UTC' "
+        f"--until '{until:%Y-%m-%d %H:%M:%S} UTC' --all -o json | "
+        """jq -j '.MESSAGE + (if ._LINE_BREAK == "line-max" then "" else "\\n" end)' | grep '^{'"""
+    )
 
 
 def _escalation_arguments(result: SweepResult, now: datetime.datetime) -> dict[str, object]:
@@ -434,7 +455,7 @@ def _escalation_arguments(result: SweepResult, now: datetime.datetime) -> dict[s
         'agent_role': AGENT_ROLE,
         'category': 'risk_identified',
         'summary': summary,
-        'detail': '\n'.join(_bounded(lines)),
+        'detail': _bounded(lines, now),
         'suggested_action': (
             'These live credentials were on disk in agent transcripts or verify logs: consider rotating them. '
             'A refused line still holds its value and needs redacting by hand.'
@@ -450,7 +471,7 @@ def _shortfall_arguments(result: SweepResult, now: datetime.datetime) -> dict[st
         'agent_role': AGENT_ROLE,
         'category': 'infra_issue',
         'summary': summary,
-        'detail': '\n'.join(_bounded(list(result.shortfall))),
+        'detail': _bounded(result.shortfall, now),
         'suggested_action': (
             'Check that $REPO/.env exists and still defines the secret-bearing variables, and that the '
             'orchestrator unit files are readable and name each project. A missing transcript archive '
