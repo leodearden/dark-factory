@@ -2,7 +2,9 @@
 
 Defect entries fold through the real shared.defects rules, and submit_task's string arguments pass the real
 markup-guard predicate, so the filer meets the refusals fused-memory would give it. Faults are injected per tool:
-an error-dict reply, a raised McpCallError, or a SimulatedCrash before or after the nth call is applied.
+an error-dict reply, a raised McpCallError, or a SimulatedCrash before or after the nth call is applied. Two
+refusals are stateful and last until the state behind them changes: commit_planning will not release a task
+held under another kind of deferral, and set_task_status will not release a follow-up holder.
 """
 
 from __future__ import annotations
@@ -34,6 +36,16 @@ from client_feed.sources.tasks import TASK_TAG
 
 TERMINAL_STATUSES = frozenset({'done', 'cancelled'})
 _LOOKUP_LIMIT_CAP = 100
+_DEFERRAL_KEY = 'deferral'
+_PLANNING_HOLD = 'planning'
+_HOLDER_PROTECTED_STATUSES = frozenset({'done', 'cancelled', 'deferred'})
+_DEFERRAL_INVALID_HINT = (
+    'The `deferral` request was refused: reason_code names the rule, field the offending field and value what was sent.'
+)
+_HOLDER_PROTECTED_HINT = (
+    "This task is its project's follow-up holder: every held low follow-up depends on it. That release is a human "
+    'act: pass release_holder=True to set_task_status.'
+)
 
 Reply = dict[str, Any]
 
@@ -48,6 +60,29 @@ def _refused(code: str, detail: str, **fields: object) -> Reply:
 
 def _not_found(task_id: object) -> Reply:
     return {'error': f'Task {task_id} not found', 'error_type': 'TaskNotFound'}
+
+
+def _not_planning_hold(task: Mapping[str, Any], task_id: str) -> Reply | None:
+    """commit_planning's refusal of a task deferred under another kind of hold, shaped as deferral_gate.py::DeferralInvalidRefusal.to_error_dict."""
+    kind = (task['metadata'].get(_DEFERRAL_KEY) or {}).get('kind')
+    if task['status'] != 'deferred' or kind in (None, _PLANNING_HOLD):
+        return None
+    return {
+        'success': False,
+        'error': 'deferral_invalid',
+        'task_id': task_id,
+        'reason_code': 'not_planning_hold',
+        'field': 'deferral.kind',
+        'value': kind,
+        'hint': _DEFERRAL_INVALID_HINT,
+    }
+
+
+def _assign_status(task: dict[str, Any], status: str) -> None:
+    """A status change; leaving deferred clears the deferral record, as fused-memory's deferral gate does."""
+    task['status'] = status
+    if status != 'deferred':
+        task['metadata'].pop(_DEFERRAL_KEY, None)
 
 
 def _declarations(entries: object) -> list[DefectDeclaration] | None:
@@ -74,6 +109,7 @@ class FakeFusedMemory:
         self._failures: dict[str, list[McpCallError]] = {}
         self._crash_before: set[tuple[str, int]] = set()
         self._crash_after: set[tuple[str, int]] = set()
+        self._holders: dict[int, int] = {}
         self._tools: Mapping[str, Callable[[dict[str, Any]], Reply]] = {
             'submit_task': self._submit_task,
             'lookup_defect_ref': self._lookup_defect_ref,
@@ -146,7 +182,19 @@ class FakeFusedMemory:
     def set_status(self, task_id: int | str, status: str) -> None:
         """A status another actor gave a task (a worker started it, a merge landed it); no call is recorded."""
         with self._lock:
-            self._tasks[int(task_id)]['status'] = status
+            _assign_status(self._tasks[int(task_id)], status)
+
+    def hold(self, task_id: int | str, *, kind: str = 'held_by_session') -> None:
+        """The task deferred under another actor's hold, which commit_planning will not release; no call is recorded."""
+        with self._lock:
+            task = self._tasks[int(task_id)]
+            task['status'] = 'deferred'
+            task['metadata'][_DEFERRAL_KEY] = {'kind': kind}
+
+    def protect_holder(self, task_id: int | str, *, held_count: int = 1) -> None:
+        """The task made its project's follow-up holder, which set_task_status will not release; no call is recorded."""
+        with self._lock:
+            self._holders[int(task_id)] = held_count
 
     def set_metadata(self, task_id: int | str, key: str, value: object) -> None:
         """Metadata another writer gave a task (a hand edit, a schema change); no call is recorded."""
@@ -341,8 +389,12 @@ class FakeFusedMemory:
             if task is None:
                 results.append({'task_id': text, 'result': _not_found(text)})
                 continue
+            refusal = _not_planning_hold(task, text)
+            if refusal is not None:
+                results.append({'task_id': text, 'result': refusal})
+                continue
             if task['status'] == 'deferred':
-                task['status'] = 'pending'
+                _assign_status(task, 'pending')
             results.append({'task_id': text, 'result': {'success': True, 'status': task['status']}})
         return {
             'success': all('error' not in item['result'] for item in results),
@@ -396,5 +448,23 @@ class FakeFusedMemory:
         task = self._held(arguments['id'])
         if task is None:
             return _not_found(arguments['id'])
-        task['status'] = arguments['status']
+        status = arguments['status']
+        held_count = self._holders.get(task['id'])
+        if held_count is not None and status in _HOLDER_PROTECTED_STATUSES and arguments.get('release_holder') is not True:
+            return self._holder_protected(task['id'], status, held_count)
+        _assign_status(task, status)
         return {'success': True, 'task_id': str(task['id']), 'status': task['status']}
+
+    @staticmethod
+    def _holder_protected(task_id: int, status: str, held_count: int) -> Reply:
+        """set_task_status's refusal to release a follow-up holder, shaped as followup_hold.py::FollowupHolderProtectedError.to_error_dict."""
+        return {
+            'success': False,
+            'error': 'followup_holder_protected',
+            'error_type': 'FollowupHolderProtectedError',
+            'holder_id': str(task_id),
+            'attempted_status': status,
+            'protection': 'protected_status',
+            'held_count': held_count,
+            'hint': _HOLDER_PROTECTED_HINT,
+        }

@@ -28,7 +28,13 @@ from client_feed.filer import (
     run_pass,
     run_until_stopped,
 )
-from client_feed.filer_state import CURSOR_NAME, FilerCursor, FilerLockHeld, held_state_dir
+from client_feed.filer_state import (
+    CURSOR_NAME,
+    STALLED_AFTER_ATTEMPTS,
+    FilerCursor,
+    FilerLockHeld,
+    held_state_dir,
+)
 from client_feed.filer_tasks import (
     FIX_TITLE,
     GATE_TITLE,
@@ -87,6 +93,10 @@ class World:
     def fix_of(self, ref: str) -> dict[str, Any]:
         [fix] = [task for task in self.fixes() if task['metadata']['defects'][0]['ref'] == ref]
         return fix
+
+    def gate_of(self, ref: str) -> dict[str, Any]:
+        [gate] = [task for task in self.gates() if task['metadata']['x_client_defect_gate_for'] == ref]
+        return gate
 
     def fix_and_gate(self) -> tuple[dict[str, Any], dict[str, Any]]:
         [fix], [gate] = self.fixes(), self.gates()
@@ -562,6 +572,60 @@ def test_the_loop_stores_the_cursor_after_each_pass_and_backs_off_while_transien
     _assert_filed_and_gated(gated)
 
 
+def test_a_gate_held_by_another_hold_is_named_stalled_at_the_bound_and_converges_once_released(
+    gated: World, caplog: pytest.LogCaptureFixture
+) -> None:
+    other = portal_ref(PROJECT, 2, 4)
+    append_inbox(gated.in_dir, reported(2, 3, at=AT), reported(2, 4, at=AT, seq=2))
+    gated.fake.crash_before('commit_planning', 1)
+    with pytest.raises(SimulatedCrash):
+        gated.run()
+    gate_id = gated.gate_of(REF)['id']
+    gated.fake.hold(gate_id)
+    stop = threading.Event()
+    delays: list[float] = []
+    stored: list[FilerCursor] = []
+
+    def wait(delay: float) -> bool:
+        delays.append(delay)
+        stored.append(FilerCursor.model_validate_json((gated.state_dir / CURSOR_NAME).read_bytes()))
+        if len(stored) == STALLED_AFTER_ATTEMPTS:
+            stop.set()
+        return stop.is_set()
+
+    with caplog.at_level(logging.WARNING, logger='client_feed.filer'):
+        run_until_stopped(
+            gated.policy,
+            open_tools=lambda policy: _session(gated.fake, up=True),
+            stop=stop,
+            wait=wait,
+        )
+
+    assert delays == [next_delay(gated.policy.require_filer().interval_seconds, 0)] * STALLED_AFTER_ATTEMPTS
+    records = [cursor.refs[REF] for cursor in stored]
+    assert [(record.attempts, record.last_tool, record.last_code, record.fallback) for record in records] == [
+        (attempt, 'commit_planning', 'deferral_invalid', None) for attempt in range(1, STALLED_AFTER_ATTEMPTS + 1)
+    ]
+    assert [record.stalled for record in records] == [False] * (STALLED_AFTER_ATTEMPTS - 1) + [True]
+    assert {cursor.inbox_offset for cursor in stored} == {0}
+    naming_ref = [record for record in caplog.records if record.name == 'client_feed.filer' and REF in record.getMessage()]
+    assert [record.levelno for record in naming_ref] == [logging.WARNING] * (STALLED_AFTER_ATTEMPTS - 1) + [logging.ERROR]
+    stalled_line = naming_ref[-1].getMessage()
+    assert all(token in stalled_line for token in (REF, 'commit_planning', 'deferral_invalid', str(STALLED_AFTER_ATTEMPTS)))
+    assert (gated.fix_of(REF)['status'], gated.fake.task(gate_id)['status']) == ('pending', 'deferred')
+    other_fix, other_gate = gated.fix_of(other), gated.gate_of(other)
+    assert other_fix['dependencies'] == [other_gate['id']]
+    assert (other_fix['status'], other_gate['status']) == ('pending', 'pending')
+
+    gated.fake.set_status(gate_id, 'pending')
+    report, cursor = gated.run(stored[-1])
+
+    assert (report.converged, report.unconverged) == ((REF, other), ())
+    assert REF not in cursor.refs
+    assert cursor.inbox_offset == gated.inbox_size()
+    assert (gated.fix_of(REF)['status'], gated.fake.task(gate_id)['status']) == ('pending', 'pending')
+
+
 DEFECT_WRITES = ('declare_defect', 'record_defect_outcome')
 
 
@@ -876,3 +940,18 @@ def test_a_refusal_at_any_ruling_step_counts_one_attempt(gated: World, tool: str
     assert (record.attempts, record.last_tool) == (1, tool)
     gated.run(stuck_cursor)
     _assert_withdrawn_and_cancelled(gated)
+
+
+@pytest.mark.parametrize('which', ['fix', 'gate'])
+def test_a_refused_cancel_is_named_stalled_at_the_bound(gated: World, which: str) -> None:
+    cursor = _file_then_rule(gated)
+    fix, gate = gated.fix_and_gate()
+    protected = {'fix': fix, 'gate': gate}[which]['id']
+    gated.fake.protect_holder(protected)
+
+    for attempt in range(1, STALLED_AFTER_ATTEMPTS + 1):
+        report, cursor = gated.run(cursor)
+        [named] = report.unconverged
+        assert (named.tool, named.code, named.attempts) == ('set_task_status', 'FollowupHolderProtectedError', attempt)
+        assert named.stalled is (attempt >= STALLED_AFTER_ATTEMPTS)
+        assert gated.fake.task(protected)['status'] != 'cancelled'
