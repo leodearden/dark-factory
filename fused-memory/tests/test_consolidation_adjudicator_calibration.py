@@ -822,9 +822,14 @@ class TestCalibrationRun:
 
     @pytest.mark.asyncio
     async def test_two_concurrent_callers_produce_one_run(self, ledger) -> None:
-        double = ScriptedResponses(_key())
+        gate = asyncio.Event()
+        double = ScriptedResponses(_key(), gate=gate)
+        calls = [asyncio.create_task(_calibrate(ledger, double)) for _ in range(2)]
+        while not any(call.done() for call in calls) and double.in_flight <= CALLS_IN_FLIGHT:
+            await asyncio.sleep(0)
+        gate.set()
 
-        results = await asyncio.gather(_calibrate(ledger, double), _calibrate(ledger, double))
+        results = await asyncio.gather(*calls)
 
         assert len(double.requests) == 176
         assert sorted(result.ran for result in results) == [False, True]
