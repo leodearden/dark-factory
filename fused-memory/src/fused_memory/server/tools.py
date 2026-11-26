@@ -1929,7 +1929,10 @@ def create_mcp_server(
     # names escapes that apply to the whole subtree — and one that does not
     # require an escape at all. Same vocabulary as the _CITATION_*_HINT
     # constants above, so a caller reading either refusal learns the same
-    # remedies by the same names.
+    # remedies by the same names. The allow_dangling_citations sentence is
+    # CONDITIONAL (task 4859): _cascade_gate_rejection attaches this hint only
+    # when every blocked[] record is one the override clears, and
+    # _CASCADE_GATE_NO_ESCAPE_HINT below otherwise.
     _CASCADE_GATE_HINT = (
         'nothing was deleted and nothing was repointed. Every record listed in '
         'blocked[] carries its own error_type and citing_tasks, so fix them in '
@@ -1940,6 +1943,15 @@ def create_mcp_server(
         'listed citation deliberately. If neither fits, delete or reparent the '
         'named descendants individually first — each then pays its own gate — '
         'and retry the cascade once they are clear.'
+    )
+    _CASCADE_GATE_NO_ESCAPE_HINT = (
+        'nothing was deleted and nothing was repointed. Every record listed in '
+        'blocked[] carries its own error_type and hint, so fix them in one '
+        'pass rather than one refusal at a time. replacement_memory_id is '
+        'applied to the WHOLE cascade set, not just the target, so a wrong one '
+        'is wrong for every record: correct it. If that does not fit, delete '
+        'or reparent the named descendants individually first — each then pays '
+        'its own gate — and retry the cascade once they are clear.'
     )
     # (task 3197) The scan-incomplete refusals need their OWN hint. Reusing
     # _CASCADE_GATE_HINT above told the caller to read blocked[] — a key that
@@ -3046,14 +3058,19 @@ def create_mcp_server(
         would force every cascade error handler to handle both shapes
         anyway. ``blocked[0]`` still carries the verbatim per-id rejection,
         so nothing the single-record envelope reported is lost.
+
+        The hint is DERIVED from *blocked*, never passed in: it offers the
+        allow_dangling_citations escape only when every blocked record is one
+        the override is meant to clear.
         """
+        escape_is_the_remedy = all(_dangling_override_is_the_remedy(b) for b in blocked)
         return {
             'error': error,
             'error_type': 'CascadeCitationGateRejected',
             'memory_id': memory_id,
             'cascade_size': cascade_size,
             'blocked': blocked,
-            'hint': _CASCADE_GATE_HINT,
+            'hint': _CASCADE_GATE_HINT if escape_is_the_remedy else _CASCADE_GATE_NO_ESCAPE_HINT,
             **extra,
         }
 
