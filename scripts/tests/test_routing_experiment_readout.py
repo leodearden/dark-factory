@@ -213,7 +213,7 @@ def test_main_with_no_resolvable_root_exits_nothing_read_naming_both_remedies(ca
     err = capsys.readouterr().err
     assert 'DASHBOARD_KNOWN_PROJECT_ROOTS' in err
     assert '--roots' in err
-    assert 'fused-memory.service Environment= does not set it' in err
+    assert f'{readout.FUSED_MEMORY_UNIT} Environment= does not set it' in err
 
 
 def test_main_with_an_unreadable_unit_exits_nothing_read_naming_the_failure(capsys):
