@@ -205,7 +205,7 @@ tasks:
         verdict: PASS
         delivered_check:
           kind: grep
-          pattern: "addaudithook"
+          pattern: 'with recording\(\) as'
           paths: ["client-feed/tests/test_isolation.py"]
           expect: present
       - name: "default-project-root-banned"
