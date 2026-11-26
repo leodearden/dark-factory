@@ -350,11 +350,16 @@ def ledger(tmp_path: Path):
     opened.close()
 
 
-def _answering(population, overrides: dict[str, Answer] | None = None) -> FakeAdjudicator:
+def _answering(
+    population,
+    overrides: dict[str, Answer] | None = None,
+    *,
+    invocation_run_id: str | None = None,
+) -> FakeAdjudicator:
     """A fake adjudicator answering each child text with its final verdict, unless overridden."""
     answers: dict[str, Answer] = {item.child_text: item.final for item in population}
     answers.update(overrides or {})
-    return FakeAdjudicator(answers.__getitem__)
+    return FakeAdjudicator(answers.__getitem__, invocation_run_id=invocation_run_id)
 
 
 def _failing_alpha(population) -> dict[str, Answer]:
@@ -390,6 +395,17 @@ class TestRunCalibration:
         assert not run.writes
         assert run.kind is RunKind.PLAN
         assert run.finished_at is not None
+
+    @pytest.mark.asyncio
+    async def test_it_names_the_invocations_run_its_adjudicator_wrote_under(
+        self, ledger, tmp_path,
+    ):
+        population = _population()
+        adjudicate = _answering(population, invocation_run_id='inv-cal')
+
+        report = await _calibrate(population, adjudicate, ledger, tmp_path)
+
+        assert ledger.resolve_run(report.run_id).invocation_run_id == 'inv-cal'
 
     @pytest.mark.asyncio
     async def test_it_asks_about_the_rated_texts_only(self, ledger, tmp_path):
