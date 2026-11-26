@@ -295,10 +295,18 @@ def _assert_journal_pointer(line: str, hidden: int) -> None:
         '--all',
         '-o json',
         '_LINE_BREAK',
+        'head -n 1',
         'three weeks',
     ):
         assert fragment in line, fragment
     assert (Path(sweep.__file__).parent / sweep.JOURNAL_UNIT).is_file()
+
+
+def _assert_no_further_line_fits(shown: Sequence[str], lines: Sequence[str]) -> None:
+    kept = len(shown) - 1
+    reserved_pointer = shown[-1].replace(f'... and {len(lines) - kept} more', f'... and {len(lines)} more', 1)
+    one_more = '\n'.join([*lines[:kept + 1], reserved_pointer])
+    assert kept == sweep.MAX_DETAIL_LINES or len(one_more.encode()) > sweep.MAX_DETAIL_BYTES
 
 
 def test_swept_trees_are_each_projects_transcripts_verify_logs_and_offline_lane_plus_the_claude_projects_dir(tree):
@@ -602,14 +610,16 @@ def test_unswept_problems_are_a_shortfall(tree):
 
 
 @pytest.mark.parametrize(
-    'lines',
+    ('lines', 'kept_by_line_bound'),
     [
-        pytest.param([f'u{i:04d}' for i in range(300)], id='short-lines'),
-        pytest.param([f'{i:04d}: ' + 'x' * 100 for i in range(300)], id='long-ascii-lines'),
-        pytest.param([f'{i:02d} ' + 'é' * 100 for i in range(30)], id='multibyte-lines'),
+        pytest.param([f'u{i:04d}' for i in range(300)], True, id='short-lines'),
+        pytest.param([f'{i:04d}: ' + 'x' * 100 for i in range(300)], False, id='long-ascii-lines'),
+        pytest.param([f'{i:02d} ' + 'é' * 100 for i in range(30)], False, id='multibyte-lines'),
     ],
 )
-def test_a_shortfall_detail_is_bounded_in_lines_and_utf8_bytes_and_points_at_the_journal_record(tmp_path, lines):
+def test_a_shortfall_detail_is_bounded_in_lines_and_utf8_bytes_and_points_at_the_journal_record(
+    tmp_path, lines, kept_by_line_bound,
+):
     claude = tmp_path / 'claude'
     claude.mkdir()
     config = sweep.SweepConfig(trees=sweep.swept_trees([], claude), now=NOW, unswept=tuple(lines))
@@ -624,6 +634,8 @@ def test_a_shortfall_detail_is_bounded_in_lines_and_utf8_bytes_and_points_at_the
     assert len(shown) - 1 <= sweep.MAX_DETAIL_LINES
     assert shown[:-1] == lines[:len(shown) - 1]
     assert len(shown) > 1
+    assert (len(shown) - 1 == sweep.MAX_DETAIL_LINES) is kept_by_line_bound
+    _assert_no_further_line_fits(shown, lines)
     _assert_journal_pointer(shown[-1], len(lines) - (len(shown) - 1))
 
 
@@ -724,7 +736,8 @@ def test_refused_lines_come_first_and_redacted_groups_overflow_to_the_journal_po
     detail = arguments['detail']
     shown = detail.splitlines()
     assert len(detail.encode()) <= sweep.MAX_DETAIL_BYTES
-    assert shown[:5] == [_refused_detail_line(held, n) for n in range(1, 6)]
+    refused_lines = [_refused_detail_line(held, n) for n in range(1, 6)]
+    assert shown[:5] == refused_lines
     expected_groups = [
         f'{verify_logs_dir(project) / f"{7100 + d}"}: 1 file(s), 1 occurrence(s) of CLAUDE_OAUTH_TOKEN_B'
         for d in range(60)
@@ -732,6 +745,7 @@ def test_refused_lines_come_first_and_redacted_groups_overflow_to_the_journal_po
     shown_groups = shown[5:-1]
     assert 0 < len(shown_groups) < len(expected_groups)
     assert shown_groups == expected_groups[:len(shown_groups)]
+    _assert_no_further_line_fits(shown, [*refused_lines, *expected_groups])
     _assert_journal_pointer(shown[-1], 60 - len(shown_groups))
     assert value not in json.dumps(arguments)
 
@@ -757,8 +771,12 @@ def test_refused_lines_past_the_byte_bound_leave_no_room_for_a_redacted_group(tm
     shown = detail.splitlines()
     kept = len(shown) - 1
     assert len(detail.encode()) <= sweep.MAX_DETAIL_BYTES
-    assert shown[:-1] == [_refused_detail_line(held, n) for n in range(1, kept + 1)]
+    refused_lines = [_refused_detail_line(held, n) for n in range(1, 41)]
+    assert shown[:-1] == refused_lines[:kept]
     assert str(group) not in detail
+    _assert_no_further_line_fits(
+        shown, [*refused_lines, f'{group}: 1 file(s), 1 occurrence(s) of CLAUDE_OAUTH_TOKEN_B'],
+    )
     _assert_journal_pointer(shown[-1], 41 - kept)
     assert value not in json.dumps(arguments)
 

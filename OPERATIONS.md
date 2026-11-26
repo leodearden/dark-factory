@@ -5329,9 +5329,10 @@ everything already on disk.
   session dir), with its file count, occurrence count and variable names. The
   detail is bounded at `scripts/transcript_secret_sweep.py::MAX_DETAIL_BYTES`
   UTF-8 bytes and `MAX_DETAIL_LINES` lines. When it overflows, its last line
-  gives the `journalctl ... -o json | jq` command that rejoins the run's full
-  record: journald splits that line into 48 KB entries and keeps it about
-  three weeks. The record line names each path with its per-variable counts.
+  gives the `journalctl ... -o json | jq ... | head -n 1` command that rejoins
+  the run's full record and prints it alone, even when the next night's run
+  falls in the same window: journald splits that line into 48 KB entries and
+  keeps it about three weeks. The record line names each path with its per-variable counts.
   It prints one JSON record line to the journal, and never prints a value.
   A `*.xml.gz` that does not decompress is listed under `unreadable` in that
   record line and left as found.

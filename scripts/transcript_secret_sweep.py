@@ -434,15 +434,16 @@ def _overflow_line(hidden: int, now: datetime.datetime) -> str:
     until = since + datetime.timedelta(days=1)
     return (
         f"... and {hidden} more line(s) not shown. The full record is this run's JSON line in the journal, "
-        'kept about three weeks; journald splits it into 48 KB entries, which this command rejoins: '
+        'kept about three weeks; journald splits it into 48 KB entries, which this command rejoins, '
+        "printing the first record logged from this run's start: "
         f"journalctl --user -u {JOURNAL_UNIT} --since '{since:%Y-%m-%d %H:%M:%S} UTC' "
         f"--until '{until:%Y-%m-%d %H:%M:%S} UTC' --all -o json | "
-        """jq -j '.MESSAGE + (if ._LINE_BREAK == "line-max" then "" else "\\n" end)' | grep '^{'"""
+        """jq -j '.MESSAGE + (if ._LINE_BREAK == "line-max" then "" else "\\n" end)' | grep '^{' | head -n 1"""
     )
 
 
 def _escalation_arguments(result: SweepResult, now: datetime.datetime) -> dict[str, object]:
-    occurrences = sum(sum(f.counts.values()) for f in result.redacted)
+    occurrences = _occurrences(result.redacted)
     refused_files = len({line.path for line in result.refused})
     summary = (
         f'Transcript secret sweep redacted live secret values in {len(result.redacted)} file(s) '
@@ -475,9 +476,12 @@ def _group_lines(hits: Sequence[FileHits]) -> list[str]:
 
 
 def _group_line(group: Path, members: Sequence[FileHits]) -> str:
-    occurrences = sum(sum(member.counts.values()) for member in members)
     names = ', '.join(sorted({var for member in members for var in member.counts}))
-    return f'{group}: {len(members)} file(s), {occurrences} occurrence(s) of {names}'
+    return f'{group}: {len(members)} file(s), {_occurrences(members)} occurrence(s) of {names}'
+
+
+def _occurrences(hits: Iterable[FileHits]) -> int:
+    return sum(sum(hit.counts.values()) for hit in hits)
 
 
 def _shortfall_arguments(result: SweepResult, now: datetime.datetime) -> dict[str, object]:
