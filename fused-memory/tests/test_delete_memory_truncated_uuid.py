@@ -125,14 +125,14 @@ def _install_mock_journal(svc):
     journal = MagicMock()
     journal.log_write_op = AsyncMock()
     journal.log_backend_op = AsyncMock()
-    svc._write_journal = journal
+    svc.set_write_journal(journal)
     return journal
 
 
 def _install_event_buffer(svc):
     buffer = MagicMock()
     buffer.push = AsyncMock()
-    svc._event_buffer = buffer
+    svc.set_event_buffer(buffer)
     return buffer
 
 
@@ -253,25 +253,20 @@ class TestMemoryServiceDeleteMemoryRejectsTruncatedUuid:
     async def test_no_write_journal_entry_on_rejection(self, service):
         """The false audit trail is a distinct harm of the old behaviour: a
         rejected delete must leave no success=True write-op record."""
-        mock_journal = MagicMock()
-        mock_journal.log_write_op = AsyncMock()
-        mock_journal.log_backend_op = AsyncMock()
-        service._write_journal = mock_journal
+        journal = _install_mock_journal(service)
 
         with pytest.raises(InputValidationError):
             await service.delete_memory(
                 memory_id=TRUNCATED_PREFIX, store='mem0', project_id='test'
             )
 
-        mock_journal.log_write_op.assert_not_awaited()
-        mock_journal.log_backend_op.assert_not_awaited()
+        journal.log_write_op.assert_not_awaited()
+        journal.log_backend_op.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_no_memory_deleted_event_on_rejection(self, service):
         """A rejected delete must not announce a deletion to reconciliation."""
-        buffer = MagicMock()
-        buffer.push = AsyncMock()
-        service._event_buffer = buffer
+        buffer = _install_event_buffer(service)
 
         with pytest.raises(InputValidationError):
             await service.delete_memory(
