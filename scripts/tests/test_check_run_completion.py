@@ -10,7 +10,6 @@ import itertools
 import json
 import math
 import os
-import socket
 import subprocess
 import sys
 import threading
@@ -30,6 +29,7 @@ from fused_memory.reconciliation.event_buffer import EventBuffer
 from fused_memory.server.tools import RESULT_BYTE_BUDGET, create_mcp_server
 from shared.mcp_session import McpCallError, McpFailureKind
 from shared.testing_mcp_stub import StubAnswer, StubMcpServer
+from shared.testing_sockets import refused_port
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
@@ -579,11 +579,10 @@ def check(store: FixtureStore, run_id: str = RUN, *, root: str | None = None) ->
         return run_script('--run', run_id, '--threshold', '0.7', '--project-root', root or store.root, url=url)
 
 
-def _closed_port_url() -> str:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
-        probe.bind(('127.0.0.1', 0))
-        port = probe.getsockname()[1]
-    return f'http://127.0.0.1:{port}'
+@contextlib.contextmanager
+def _refused_url() -> Iterator[str]:
+    with refused_port() as port:
+        yield f'http://127.0.0.1:{port}'
 
 
 def _assert_could_not_check(run: ScriptRun, code: str) -> None:
@@ -669,7 +668,8 @@ def test_a_tool_error_payload_could_not_be_checked(store, tmp_path):
 
 
 def test_an_unreachable_store_could_not_be_checked(tmp_path):
-    run = run_script('--run', RUN, '--threshold', '0.7', '--project-root', str(tmp_path), url=_closed_port_url())
+    with _refused_url() as url:
+        run = run_script('--run', RUN, '--threshold', '0.7', '--project-root', str(tmp_path), url=url)
 
     _assert_could_not_check(run, 'store_unreachable')
     for key in NEVER_MEASURED:
@@ -708,7 +708,8 @@ def test_an_all_cancelled_run_passes_vacuously_on_the_cli(store):
     'run_with_pending', 'threshold_with_pending', 'json_in_check_mode',
 ])
 def test_a_usage_error_exits_two_with_no_verdict(args):
-    run = run_script(*args, url=_closed_port_url())
+    with _refused_url() as url:
+        run = run_script(*args, url=url)
 
     assert run.rc == COULD_NOT_CHECK
     assert run.lines == []
@@ -725,7 +726,8 @@ PENDING_OPTION_HELP = 'report the open trigger chains instead'
     ['--pending', '--help'],
 ], ids=['help', 'h', 'check_with_help', 'pending_with_help'])
 def test_help_runs_no_check_and_exits_two(args):
-    run = run_script(*args, url=_closed_port_url())
+    with _refused_url() as url:
+        run = run_script(*args, url=url)
 
     assert run.rc == COULD_NOT_CHECK
     assert run.lines == []

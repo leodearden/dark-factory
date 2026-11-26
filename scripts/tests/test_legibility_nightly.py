@@ -55,6 +55,7 @@ from quality_doc_texts import definition_body, heuristic_headlines
 from shared.cap_markers import REAL_CLI_CAP_HIT_MESSAGES
 from shared.cli_invoke import resolve_claude_binary
 from shared.testing_mcp_stub import StubMcpServer
+from shared.testing_sockets import refused_port
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
@@ -6321,12 +6322,13 @@ def test_main_run_fails_safe_when_the_completion_check_cannot_reach_fused_memory
     the real check always runs: it must degrade to a NO-FIRE plus one
     completion WARNING, never a non-zero exit and never a census launch."""
     config_path, projects_root = _completion_project(tmp_path)
-    with StubMcpServer(stateful=False) as fused_memory:
-        pass
-    monkeypatch.setenv('FUSED_MEMORY_MCP_URL', fused_memory.url)
     census_argvs = _spy_census_subprocess_and_stub_pool(monkeypatch)
 
-    with caplog.at_level(logging.INFO, logger='legibility.nightly'):
+    with (
+        refused_port() as port,
+        caplog.at_level(logging.INFO, logger='legibility.nightly'),
+    ):
+        monkeypatch.setenv('FUSED_MEMORY_MCP_URL', f'http://127.0.0.1:{port}')
         exit_code = _main_run(config_path, projects_root)
 
     messages = [r.getMessage() for r in caplog.records]
