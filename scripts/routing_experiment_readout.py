@@ -16,19 +16,26 @@ Exit codes:
 from __future__ import annotations
 
 import argparse
+import itertools
+import json
 import math
 import os
+import random
 import shlex
 import sqlite3
+import statistics
 import subprocess
 import sys
 from collections import Counter, defaultdict
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from contextlib import closing
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime, timedelta
 from enum import Enum
+from operator import itemgetter
 from pathlib import Path
+from statistics import NormalDist
+from typing import Any
 
 import _checkout as _checkout
 from _task_db_scan import UNREADABLE_STORE_ERRORS, decode_metadata
@@ -522,6 +529,225 @@ def load_fleet(
     return FleetLoad.combined(load_project(root, window, salt, buckets, key) for root in roots)
 
 
+MIN_ELIGIBLE_PER_ARM = 20  # seat N's prototype floor: below it an arm gets no null
+_MDE_Z = NormalDist().inv_cdf(0.95) + NormalDist().inv_cdf(0.80)
+
+
+def _rate(flag: bool) -> float:
+    return 1.0 if flag else 0.0
+
+
+def _curator_hint_simple(record: TaskRecord) -> float | None:
+    hint = record.curator_complexity_hint
+    return None if hint is None else _rate(hint == 'simple')
+
+
+@dataclass(frozen=True)
+class Metric:
+    """One per-task metric; *value* is None when the task is not eligible for it."""
+
+    name: str
+    headline: bool
+    value: Callable[[TaskRecord], float | None]
+
+
+METRICS = (
+    Metric('blocked_or_escalated', True, lambda record: _rate(record.blocked_or_escalated)),
+    Metric('review_cycles_ge1', True, lambda record: _rate(record.max_review_cycles >= 1)),
+    Metric('cost_usd', True, lambda record: record.cost_usd),
+    Metric('workflow_verify_minutes', True, lambda record: record.workflow_verify_minutes),
+    Metric('max_execute_iterations', False, lambda record: float(record.max_execute_iterations)),
+    Metric('max_review_cycles', False, lambda record: float(record.max_review_cycles)),
+    Metric('merge_verify_minutes', False, lambda record: record.merge_verify_minutes),
+    Metric('reviewer_blocking_count', False, lambda record: record.reviewer_blocking_count),
+    Metric('large_plan_rule_fired', False, lambda record: _rate(record.large_plan_rule_fired)),
+    Metric('declared_simple', False, lambda record: _rate(record.complexity == 'simple')),
+    Metric('curator_hint_simple', False, _curator_hint_simple),
+)
+
+
+@dataclass(frozen=True)
+class NullBand:
+    """The A/A null of one difference: percentiles of its magnitude, and the MDE."""
+
+    p95: float
+    p99: float
+    mde: float
+
+
+@dataclass(frozen=True)
+class MetricRow:
+    metric: str
+    headline: bool
+    base_n: int
+    arm_n: int
+    base_mean: float | None
+    arm_mean: float | None
+    diff: float | None
+    null: NullBand | None
+
+
+@dataclass(frozen=True)
+class Comparison:
+    """Arm *arm* against arm 0, one row per metric."""
+
+    arm: int
+    rows: tuple[MetricRow, ...]
+
+
+_ArmSums = tuple[int, float]  # an arm's eligible task count and its value total
+_Picker = Callable[[Sequence[Any]], tuple[Any, ...]]
+
+
+def _picker(members: Sequence[int]) -> _Picker:
+    """Select *members* from a column as a tuple, whatever their count."""
+    if not members:
+        return lambda column: ()
+    if len(members) == 1:
+        (only,) = members
+        return lambda column: (column[only],)
+    return itemgetter(*members)
+
+
+@dataclass(frozen=True)
+class _Column:
+    """A metric's values over every task (None read as 0.0) and whether each task is eligible."""
+
+    values: tuple[float, ...]
+    eligible: tuple[int, ...]
+    fully_eligible: bool
+
+    @classmethod
+    def of(cls, metric: Metric, records: Sequence[TaskRecord]) -> _Column:
+        raw = [metric.value(record) for record in records]
+        return cls(
+            tuple(0.0 if value is None else value for value in raw),
+            tuple(0 if value is None else 1 for value in raw),
+            all(value is not None for value in raw),
+        )
+
+    def totals(self) -> _ArmSums:
+        return sum(self.eligible), math.fsum(self.values)
+
+    def arm_sums(self, members: Sequence[int]) -> _ArmSums:
+        pick = _picker(members)
+        eligible_n = len(members) if self.fully_eligible else sum(pick(self.eligible))
+        return eligible_n, math.fsum(pick(self.values))
+
+
+def _difference(base: _ArmSums, arm: _ArmSums) -> float | None:
+    (base_n, base_total), (arm_n, arm_total) = base, arm
+    if not (base_n and arm_n):
+        return None
+    return arm_total / arm_n - base_total / base_n
+
+
+def _resampled_arm_sums(
+    column: _Column, totals: _ArmSums, drawn_arms: Sequence[Sequence[int]],
+) -> list[_ArmSums]:
+    """Every arm's sums, the last arm taken as the complement of the drawn ones."""
+    sums = [column.arm_sums(members) for members in drawn_arms]
+    last_n = totals[0] - sum(n for n, _ in sums)
+    last_total = totals[1] - math.fsum(total for _, total in sums)
+    return [*sums, (last_n, last_total)]
+
+
+def _null_diffs(
+    columns: Sequence[_Column],
+    sizes: Sequence[int],
+    testable: Sequence[tuple[int, int]],
+    resamples: int,
+    rng: random.Random,
+) -> dict[tuple[int, int], list[float]]:
+    """Signed differences per (arm, metric index) under random relabelling of the pooled tasks.
+
+    Each resample draws one random ordering of all but the last arm's worth of
+    tasks; every metric reads that same draw, sliced into consecutive arms of
+    the observed sizes, with the last arm as its complement. That is a
+    permutation of the observed labels at half a shuffle's cost. A resample in
+    which an arm has no eligible task is skipped for that metric.
+    """
+    diffs: dict[tuple[int, int], list[float]] = {pair: [] for pair in testable}
+    if not testable:
+        return diffs
+    population = range(sum(sizes))
+    bounds = list(itertools.accumulate(sizes[:-1], initial=0))
+    indices = sorted({index for _, index in testable})
+    totals = {index: columns[index].totals() for index in indices}
+    for _ in range(resamples):
+        order = rng.sample(population, bounds[-1])
+        drawn_arms = [order[low:high] for low, high in itertools.pairwise(bounds)]
+        sums = {
+            index: _resampled_arm_sums(columns[index], totals[index], drawn_arms)
+            for index in indices
+        }
+        for arm, index in testable:
+            diff = _difference(sums[index][0], sums[index][arm])
+            if diff is not None:
+                diffs[(arm, index)].append(diff)
+    return diffs
+
+
+def _null_band(diffs: Sequence[float]) -> NullBand | None:
+    if len(diffs) < 2:
+        return None
+    cuts = statistics.quantiles([abs(diff) for diff in diffs], n=100, method='inclusive')
+    return NullBand(p95=cuts[94], p99=cuts[98], mde=_MDE_Z * statistics.stdev(diffs))
+
+
+def _metric_row(
+    metric: Metric,
+    base: _ArmSums,
+    arm: _ArmSums,
+    null_diffs: Sequence[float] | None,
+) -> MetricRow:
+    (base_n, base_total), (arm_n, arm_total) = base, arm
+    return MetricRow(
+        metric=metric.name,
+        headline=metric.headline,
+        base_n=base_n,
+        arm_n=arm_n,
+        base_mean=base_total / base_n if base_n else None,
+        arm_mean=arm_total / arm_n if arm_n else None,
+        diff=_difference(base, arm),
+        null=None if null_diffs is None else _null_band(null_diffs),
+    )
+
+
+def compare_arms(
+    records: Sequence[TaskRecord],
+    metrics: Sequence[Metric],
+    buckets: int,
+    resamples: int,
+    rng: random.Random,
+) -> tuple[Comparison, ...]:
+    """Every arm k >= 1 against arm 0, each difference beside its permutation null.
+
+    A metric gets a null only when both arms hold at least
+    MIN_ELIGIBLE_PER_ARM eligible tasks.
+    """
+    columns = [_Column.of(metric, records) for metric in metrics]
+    members = [[i for i, record in enumerate(records) if record.bucket == arm] for arm in range(buckets)]
+    observed = [[column.arm_sums(arm) for arm in members] for column in columns]
+    testable = [
+        (arm, index)
+        for arm in range(1, buckets)
+        for index in range(len(metrics))
+        if min(observed[index][0][0], observed[index][arm][0]) >= MIN_ELIGIBLE_PER_ARM
+    ]
+    null_diffs = _null_diffs(columns, [len(arm) for arm in members], testable, resamples, rng)
+    return tuple(
+        Comparison(
+            arm,
+            tuple(
+                _metric_row(metric, observed[index][0], observed[index][arm], null_diffs.get((arm, index)))
+                for index, metric in enumerate(metrics)
+            ),
+        )
+        for arm in range(1, buckets)
+    )
+
+
 def _bucket_count(text: str) -> int:
     count = int(text)
     try:
@@ -602,6 +828,8 @@ class Settings:
     buckets: int
     key: KeyKind
     subset: Subset
+    resamples: int
+    seed: int
 
 
 @dataclass(frozen=True)
@@ -612,6 +840,7 @@ class Report:
     evidence: ProducerEvidence
     exclusions: dict[str, int]
     tasks: tuple[TaskRecord, ...]
+    comparisons: tuple[Comparison, ...]
 
 
 def _listing(items: Sequence[str]) -> str:
@@ -645,11 +874,90 @@ def _rule_line(report: Report) -> str:
         f'split salt {settings.salt!r} buckets {settings.buckets}',
         f'subset {settings.subset.value}',
         f'excluded {_listing(excluded)}',
+        f'null = {settings.resamples} permutations of the observed arm labels (seed '
+        f'{settings.seed}), arm sizes kept, one permutation shared by every metric',
+        'diff = mean(arm k) - mean(arm 0) in metric units over eligible tasks',
+        'null p95/p99 = percentiles of |diff|',
+        'mde = (z0.95 + z0.80) x sd(diff)',
+        f'no null below {MIN_ELIGIBLE_PER_ARM} eligible tasks in an arm',
     ])
 
 
+def _producers_line(evidence: ProducerEvidence) -> str:
+    rule_ids = [f'{rule_id}={count}' for rule_id, count in evidence.rule_id_counts.items()]
+    return 'producers: ' + '; '.join([
+        f'routing_decision rule ids {_listing(rule_ids)}',
+        f'implementer decisions carrying plan shape {evidence.plan_shape_decisions}',
+        f'tasks carrying {CURATOR_HINT_KEY} {evidence.hinted_tasks}',
+    ])
+
+
+def _arm_sizes_line(report: Report) -> str:
+    sizes = Counter(record.bucket for record in report.tasks)
+    return '; '.join(f'arm {arm}: {sizes[arm]} tasks' for arm in range(report.settings.buckets))
+
+
+_TABLE_COLUMNS = '{marker} {metric:<26}{n0:>6}{n1:>6}{mean0:>10}{mean1:>10}{diff:>10}{p95:>10}{p99:>10}{mde:>10}'
+
+
+def _number(value: float | None, sign: str = '') -> str:
+    return '-' if value is None else f'{value:{sign}.3f}'
+
+
+def _table_row(row: MetricRow) -> str:
+    null = row.null
+    return _TABLE_COLUMNS.format(
+        marker='*' if row.headline else '-',
+        metric=row.metric,
+        n0=row.base_n,
+        n1=row.arm_n,
+        mean0=_number(row.base_mean),
+        mean1=_number(row.arm_mean),
+        diff=_number(row.diff, '+'),
+        p95=_number(null and null.p95),
+        p99=_number(null and null.p99),
+        mde=_number(null and null.mde),
+    )
+
+
+def _comparison_table(comparison: Comparison) -> list[str]:
+    arm = comparison.arm
+    header = _TABLE_COLUMNS.format(
+        marker=' ', metric='metric', n0='n0', n1=f'n{arm}', mean0='mean0', mean1=f'mean{arm}',
+        diff='diff', p95='null_p95', p99='null_p99', mde='mde',
+    )
+    return [
+        '',
+        f'arm {arm} vs arm 0 (* headline metric, - secondary)',
+        header,
+        *(_table_row(row) for row in comparison.rows),
+    ]
+
+
 def render_text(report: Report) -> str:
-    return _rule_line(report) + '\n'
+    lines = [
+        _rule_line(report),
+        _producers_line(report.evidence),
+        _arm_sizes_line(report),
+        *(line for comparison in report.comparisons for line in _comparison_table(comparison)),
+    ]
+    return '\n'.join(lines) + '\n'
+
+
+def _json_value(value: object) -> object:
+    if isinstance(value, (set, frozenset)):
+        return sorted(value)
+    if isinstance(value, Enum):
+        return value.value
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, Path):
+        return str(value)
+    raise TypeError(f'{type(value).__name__} is not JSON serialisable')
+
+
+def render_json(report: Report) -> str:
+    return json.dumps(asdict(report), default=_json_value, indent=2) + '\n'
 
 
 def _warn(message: str) -> None:
@@ -687,6 +995,8 @@ def main(
         args.buckets,
         args.key,
         args.subset,
+        args.resamples,
+        args.seed,
     )
     load = load_fleet(selection.roots, settings.window, args.salt, args.buckets, args.key)
     _warn_unread_stores(load.roots)
@@ -696,10 +1006,19 @@ def main(
             f'{selection.source.value}'
         )
         return EXIT_NOTHING_READ
-    report = Report(
-        settings, selection.source, load.roots, load.evidence, load.exclusions, load.records,
+    comparisons = compare_arms(
+        load.records, METRICS, args.buckets, args.resamples, random.Random(args.seed)
     )
-    sys.stdout.write(render_text(report))
+    report = Report(
+        settings,
+        selection.source,
+        load.roots,
+        load.evidence,
+        load.exclusions,
+        load.records,
+        comparisons,
+    )
+    sys.stdout.write(render_json(report) if args.json else render_text(report))
     return EXIT_OK
 
 
