@@ -316,11 +316,15 @@ def _make_fixture_project(root: Path, *, registers_defect_marker: bool = False) 
     Without the plugin, its ``defect`` mark is unknown and ``filterwarnings =
     error`` makes that a collection error, so a run that injects nothing passes
     only when the project registers the marker itself, as every workspace member does.
+    Its sessions keep their basetemp inside the project, never in the host-wide pytest
+    temp root, whose exit-time cleanup of other sessions' dead dirs is unbounded; see
+    ``test_an_xdist_leg_leaves_the_hosts_default_pytest_temp_root_untouched``.
     """
     root.mkdir(parents=True)
     own_defect = '    defect(ref): registered by the project\n' if registers_defect_marker else ''
     (root / 'pytest.ini').write_text(
-        '[pytest]\nmarkers =\n    own: the project\'s own marker\n'
+        '[pytest]\naddopts = --basetemp=.fixture-basetemp\n'
+        'markers =\n    own: the project\'s own marker\n'
         f'{own_defect}filterwarnings = error\npythonpath = .\n',
         encoding='utf-8',
     )
