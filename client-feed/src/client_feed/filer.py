@@ -51,6 +51,7 @@ logger = logging.getLogger(__name__)
 FALLBACK_AFTER_ATTEMPTS: Final = 5
 MAX_BACKOFF_SECONDS: Final = 300
 
+_COUNTED: Final = frozenset({Disposition.FALLBACK, Disposition.RETRY_THEN_FALLBACK})
 _DEFERRED: Final = TaskStatus.DEFERRED
 _TERMINAL: Final = frozenset({TaskStatus.DONE, TaskStatus.CANCELLED})
 _CANCELLABLE_FIX: Final = frozenset({TaskStatus.PENDING, TaskStatus.DEFERRED})
@@ -102,7 +103,7 @@ class _Outcome:
 
 
 class _RefusedWithRecord(Exception):
-    """A refusal that leaves a ref unconverged, with the record the cursor keeps for the ref after it."""
+    """A refusal that leaves a ref unconverged, with the ref's record as it stood before this refusal is counted."""
 
     def __init__(self, refused: ToolRefused, record: RefRecord | None) -> None:
         self.refused = refused
@@ -233,14 +234,29 @@ def _gate_and_commit(
     tools.commit_planning(still_deferred)
 
 
-def _after_refusal(record: RefRecord | None, refused: ToolRefused) -> RefRecord | None:
-    """The record a refused restated fix leaves: a counted attempt, and the fallback once one applies."""
-    if refused.disposition not in (Disposition.FALLBACK, Disposition.RETRY_THEN_FALLBACK):
-        return record
-    attempts = 1 if record is None else record.attempts + 1
-    falls_back = refused.disposition is Disposition.FALLBACK or attempts >= FALLBACK_AFTER_ATTEMPTS
-    fallback = FilerFallback(kind=refused.kind, code=refused.code) if falls_back else None
-    return RefRecord(attempts=attempts, last_code=refused.code, fallback=fallback)
+def _with_attempt(record: RefRecord | None, refused: ToolRefused) -> RefRecord:
+    """`record` with one more attempt, naming the step and code that refused it; a fallback it holds is kept."""
+    return RefRecord(
+        attempts=1 if record is None else record.attempts + 1,
+        last_tool=refused.tool,
+        last_code=refused.code,
+        fallback=None if record is None else record.fallback,
+    )
+
+
+def _counted(record: RefRecord | None, refused: ToolRefused) -> RefRecord | None:
+    """The record a refusal leaves: one more attempt for a refusal a retry alone will not clear, else unchanged."""
+    return _with_attempt(record, refused) if refused.disposition in _COUNTED else record
+
+
+def _restatement_fallback(record: RefRecord | None, refused: ToolRefused) -> RefRecord | None:
+    """The counted record, with its typed-facts fallback, that a refused restatement resubmits under; None while it is only retried."""
+    if refused.disposition not in _COUNTED:
+        return None
+    counted = _with_attempt(record, refused)
+    if refused.disposition is not Disposition.FALLBACK and counted.attempts < FALLBACK_AFTER_ATTEMPTS:
+        return None
+    return counted.model_copy(update={'fallback': FilerFallback(kind=refused.kind, code=refused.code)})
 
 
 def _submitted(
@@ -262,9 +278,9 @@ def _submit_fix(
     try:
         return _submitted(tools, report, ref, filer, record)
     except _RefusedWithRecord as refusal:
-        record = _after_refusal(record, refusal.refused)
-        if record is None or record.fallback is None:
-            raise _RefusedWithRecord(refusal.refused, record) from None
+        record = _restatement_fallback(record, refusal.refused)
+        if record is None:
+            raise
     return _submitted(tools, report, ref, filer, record)
 
 
@@ -295,7 +311,8 @@ def converge_filing(
             with _keeping_record(filed.record):
                 _gate_and_commit(tools, report, ref, policy, filer, filed.fix, filed.facts)
     except _RefusedWithRecord as refusal:
-        return _Outcome(refused=_unconverged(ref, refusal.refused, refusal.record), record=refusal.record)
+        counted = _counted(refusal.record, refusal.refused)
+        return _Outcome(refused=_unconverged(ref, refusal.refused, counted), record=counted)
     return _Outcome()
 
 
@@ -362,7 +379,8 @@ def converge_ruling(tools: ClosedTools, ref: str, project_id: str, record: RefRe
             if gate.status not in _TERMINAL:
                 tools.cancel(gate.task_id)
     except ToolRefused as refused:
-        return _Outcome(refused=_unconverged(ref, refused, record), record=record)
+        counted = _counted(record, refused)
+        return _Outcome(refused=_unconverged(ref, refused, counted), record=counted)
     return _Outcome()
 
 
@@ -420,7 +438,7 @@ def run_pass(policy: Policy, tools: ClosedTools, cursor: FilerCursor) -> tuple[P
 def _log_unconverged(report: PassReport) -> None:
     for item in report.unconverged:
         logger.warning(
-            '%s not filed: %s refused (%s, %s), %s after %d attempts',
+            '%s not converged: %s refused (%s, %s), %s after %d attempts',
             item.ref,
             item.tool,
             item.kind,
