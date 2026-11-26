@@ -530,7 +530,8 @@ one entry per project (git remote, `config_path`, and `host_config`, the
 per-host YAML below). The parser,
 `orchestrator/src/orchestrator/verify_host_roster_file.py`, refuses an
 unknown key, a duplicated key or an empty document rather than reading fewer
-hosts.
+hosts. Anchors and merge keys (`<<: *anchor`) work as in plain YAML, so hosts
+can share a project block and override single keys.
 
 **Today only the two scripts read it.** Until task α2 lands, the orchestrator
 still takes its runner list from the inline `verify_runners` block or from
@@ -550,7 +551,9 @@ by hand until then.
   worktrees" below.
 - **`receive.denyCurrentBranch = updateInstead`**, set on that checkout
   (`git config receive.denyCurrentBranch updateInstead`; the provisioning
-  script's `checkouts` step sets it). This is required
+  script's `checkouts` step sets it, and creates a missing checkout on the
+  branch its `host_config` names as `git.main_branch`, `main` by default).
+  This is required
   because the dispatcher's best-effort keep-alive push targets
   `<main-branch>:refs/heads/<main-branch>` — the configured `git.main_branch`
   (`str`, default `main` — it has no unset state) — which is the branch the
