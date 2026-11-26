@@ -28,6 +28,7 @@ from orchestrator.evals.configs import (
     codex_pi_candidates,
     get_config_by_name,
     mimo_code_candidates,
+    registered_configs,
     zcode_candidates,
 )
 from orchestrator.evals.metrics import EndpointKind, EvalMetrics
@@ -60,16 +61,7 @@ def _self_hosted_vllm_configs() -> list[EvalConfig]:
 
 
 def _every_registered_config() -> list[EvalConfig]:
-    return [
-        *EVAL_CONFIGS,
-        *FINAL_RUN_CONFIGS,
-        *ARCHITECT_EVAL_CONFIGS,
-        *JUDGE_EVAL_CONFIGS,
-        *claude_endpoint_candidates(),
-        *codex_pi_candidates(),
-        *zcode_candidates(),
-        *mimo_code_candidates(),
-    ]
+    return [*registered_configs(), *JUDGE_EVAL_CONFIGS]
 
 
 def test_every_vllm_config_declares_a_self_hosted_endpoint_without_a_base_url():

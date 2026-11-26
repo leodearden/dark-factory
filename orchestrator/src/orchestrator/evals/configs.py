@@ -13,7 +13,7 @@ always loses to an existing ``config.prices`` entry).
 
 import logging
 import os
-from collections.abc import Callable
+from collections.abc import Iterator
 from dataclasses import dataclass, field, replace
 
 from orchestrator.agents.token_pricing import price_fields
@@ -530,19 +530,25 @@ def get_config_by_name(name: str) -> EvalConfig | None:
     return replace(base, name=name, harness_variant=variant)
 
 
+def registered_configs() -> Iterator[EvalConfig]:
+    """Every config ``get_config_by_name`` resolves by name, static families first.
+
+    A generator, so a candidate family is built only once the families before
+    it are exhausted: a lookup that stops at a static config never builds a ν
+    bundle or logs its missing-credential WARNING. Judge candidates are not
+    among these; ``get_config_by_name`` explains why.
+    """
+    yield from EVAL_CONFIGS
+    yield from FINAL_RUN_CONFIGS
+    yield from ARCHITECT_EVAL_CONFIGS
+    yield from claude_endpoint_candidates()
+    yield from codex_pi_candidates()
+    yield from zcode_candidates()
+    yield from mimo_code_candidates()
+
+
 def _find_registered(name: str) -> EvalConfig | None:
-    families: tuple[Callable[[], list[EvalConfig]], ...] = (
-        lambda: [*EVAL_CONFIGS, *FINAL_RUN_CONFIGS, *ARCHITECT_EVAL_CONFIGS],
-        claude_endpoint_candidates,
-        codex_pi_candidates,
-        zcode_candidates,
-        mimo_code_candidates,
-    )
-    for build_family in families:
-        for cfg in build_family():
-            if cfg.name == name:
-                return cfg
-    return None
+    return next((cfg for cfg in registered_configs() if cfg.name == name), None)
 
 
 # ===== μ OFAT→matrix→confirm driver substrate (eval-revival μ / C4) =====
