@@ -48,6 +48,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from fused_memory.models.reconciliation import EventType
 from fused_memory.server.tools import create_mcp_server
 from fused_memory.utils.validation import InputValidationError
 
@@ -305,6 +306,31 @@ class TestMemoryServiceDeleteMemoryRefusesNonexistentId:
         assert result['id'] == CANONICAL_UUID
         assert CANONICAL_UUID in result['error']
         assert 'status' not in result
+
+    @pytest.mark.parametrize('store', ['mem0', 'graphiti'])
+    @pytest.mark.asyncio
+    async def test_a_delete_that_lands_is_journaled_and_announced_through_the_same_installs(
+        self, service, store
+    ):
+        """The control that keeps this file's "leaves no trace" assertions honest:
+        the same installs DO observe a real delete, even after delete_memory moves
+        to the services/memory_mutations.py collaborator (task 9247, S26 υ)."""
+        journal = _install_mock_journal(service)
+        buffer = _install_event_buffer(service)
+
+        result = await service.delete_memory(
+            memory_id=CANONICAL_UUID, store=store, project_id='test'
+        )
+
+        assert result['status'] == 'deleted'
+        journal.log_write_op.assert_awaited_once()
+        assert journal.log_write_op.await_args.kwargs['success'] is True
+        assert journal.log_write_op.await_args.kwargs['operation'] == 'delete_memory'
+        journal.log_backend_op.assert_awaited()
+        buffer.push.assert_awaited_once()
+        event = buffer.push.await_args.args[0]
+        assert event.type == EventType.memory_deleted
+        assert event.payload['memory_id'] == CANONICAL_UUID
 
     @pytest.mark.asyncio
     async def test_mem0_miss_returns_not_found_and_leaves_no_trace(self, service):
