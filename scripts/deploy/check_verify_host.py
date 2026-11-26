@@ -121,10 +121,9 @@ def _parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
-    roster_path = args.roster or roster_file_path(os.environ)
     try:
         spec = contract.HostSpec.from_roster(
-            load_roster(roster_path), args.host,
+            load_roster(args.roster or roster_file_path(os.environ)), args.host,
             os.environ.get(contract.WRAPPER_PATH_ENV, contract.DEFAULT_WRAPPER_PATH),
         )
     except (contract.ContractError, RosterFileError) as exc:

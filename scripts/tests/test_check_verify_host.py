@@ -184,6 +184,13 @@ def test_an_unknown_host_exits_2_with_the_roster_error(host: Host) -> None:
     assert proc.stdout == ''
 
 
+def test_no_way_to_locate_the_roster_exits_2_naming_the_variables(host: Host) -> None:
+    proc = host.check('box', HOME='')
+    assert proc.returncode == 2
+    assert 'Traceback' not in proc.stderr
+    assert 'ORCH_VERIFY_HOSTS_FILE' in proc.stderr
+
+
 def test_a_malformed_roster_exits_2_rather_than_reporting_no_hosts(host: Host) -> None:
     host.roster.write_text('hosts: [unclosed\n')
     proc = host.check('box', '--roster', str(host.roster))

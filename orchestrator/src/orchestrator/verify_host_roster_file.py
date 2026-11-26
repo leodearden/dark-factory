@@ -30,7 +30,14 @@ def roster_file_path(env: Mapping[str, str]) -> Path:
     override = env.get(ROSTER_FILE_ENV)
     if override:
         return Path(override)
-    config_home = env.get('XDG_CONFIG_HOME') or os.path.join(env['HOME'], '.config')
+    config_home = env.get('XDG_CONFIG_HOME')
+    if not config_home:
+        home = env.get('HOME')
+        if not home:
+            raise RosterFileError(
+                f'cannot locate the verify-host roster: none of {ROSTER_FILE_ENV}, XDG_CONFIG_HOME and HOME is set'
+            )
+        config_home = os.path.join(home, '.config')
     return Path(config_home) / 'orchestrator' / 'verify-hosts.yaml'
 
 
@@ -122,12 +129,21 @@ def _runner(name: str, host: RosterHost, project: RosterProject) -> RosterRunner
     )
 
 
+_YAML_MERGE_TAG = 'tag:yaml.org,2002:merge'
+
+
 class _UniqueKeyLoader(yaml.SafeLoader):
-    """SafeLoader that refuses a repeated mapping key instead of keeping the last one."""
+    """SafeLoader that refuses a repeated mapping key instead of keeping the last one.
+
+    A merge key (`<<: *anchor`) is not a repeated key: SafeLoader flattens it,
+    and an explicit key overrides a merged one as YAML specifies.
+    """
 
     def construct_mapping(self, node: yaml.MappingNode, deep: bool = False) -> dict[Hashable, Any]:
         seen: set[Hashable] = set()
         for key_node, _ in node.value:
+            if key_node.tag == _YAML_MERGE_TAG:
+                continue
             key = self.construct_object(key_node, deep=deep)
             if isinstance(key, Hashable) and key in seen:
                 raise yaml.constructor.ConstructorError(

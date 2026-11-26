@@ -74,6 +74,13 @@ class TestRosterFilePath:
     def test_home_config_is_the_fallback(self) -> None:
         assert roster_file_path({'HOME': '/h'}) == Path('/h/.config/orchestrator/verify-hosts.yaml')
 
+    @pytest.mark.parametrize('env', [{}, {'HOME': '', 'XDG_CONFIG_HOME': ''}], ids=['unset', 'empty'])
+    def test_no_variable_to_resolve_from_names_all_three(self, env: dict[str, str]) -> None:
+        with pytest.raises(RosterFileError) as raised:
+            roster_file_path(env)
+        for name in (ROSTER_FILE_ENV, 'XDG_CONFIG_HOME', 'HOME'):
+            assert name in str(raised.value)
+
     def test_the_override_variable_is_named_orch_verify_hosts_file(self) -> None:
         assert ROSTER_FILE_ENV == 'ORCH_VERIFY_HOSTS_FILE'
 
@@ -164,6 +171,39 @@ class TestHostSideKeys:
             roster.host('box-z')
         assert 'box-z' in str(raised.value)
         assert str(path) in str(raised.value)
+
+
+class TestYamlMergeKeys:
+    """A roster sharing project blocks through anchors loads as plain YAML would."""
+
+    SHARED = """\
+        hosts:
+          a:
+            ssh_host: a
+            df_checkout_path: /srv/a/df
+            projects:
+              p: &p
+                git_remote: a
+                trust: trusted
+                host_config: {project_root: /srv/p}
+          b:
+            ssh_host: b
+            df_checkout_path: /srv/b/df
+            projects:
+              p:
+                <<: *p
+                git_remote: b
+        """
+
+    def test_merged_keys_load_and_an_explicit_key_overrides_a_merged_one(self, tmp_path: Path) -> None:
+        a, b = load_roster(_write(tmp_path, self.SHARED)).runners_for_project('p')
+        assert (a.git_remote, b.git_remote) == ('a', 'b')
+        assert b.trust == 'trusted'
+
+    def test_a_repeated_explicit_key_beside_a_merge_is_still_refused(self, tmp_path: Path) -> None:
+        path = _write(tmp_path, self.SHARED.rstrip(' ') + '                git_remote: c\n')
+        with pytest.raises(RosterFileError, match='duplicate key'):
+            load_roster(path)
 
 
 class TestTheConfigSeam:

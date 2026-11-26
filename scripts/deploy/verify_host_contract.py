@@ -536,10 +536,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == 'requirements':
         print('\n'.join(f'{row.id}\t{row.title}' if args.titles else row.id for row in REQUIREMENTS))
         return 0
-    roster_path = args.roster or roster_file_path(os.environ)
     try:
         spec = HostSpec.from_roster(
-            load_roster(roster_path), args.host, os.environ.get(WRAPPER_PATH_ENV, DEFAULT_WRAPPER_PATH),
+            load_roster(args.roster or roster_file_path(os.environ)), args.host,
+            os.environ.get(WRAPPER_PATH_ENV, DEFAULT_WRAPPER_PATH),
         )
         files = renders(spec, verify_host_observe.observe_environment(), os.environ.get(SSH_BIN_ENV, DEFAULT_SSH_BIN))
     except (ContractError, RosterFileError) as exc:
