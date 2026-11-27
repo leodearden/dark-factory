@@ -20,13 +20,16 @@ dispatched 2026-09-28 to 2026-11-08, 20,000 random splits, 185 tasks a week).
 Every option the look does not define passes through to
 ``routing_experiment_readout.py --throughput`` (see ``--throughput --help``),
 which computes R. --cohort-days and --read-at are set by the schedule: the
-cohort is 7 * min(k, last look week) days, read at now.
+cohort is 7 * min(k, last look week) days, read at now. A look before the
+first look week still reads the cohort, from since to now, so a broken arming
+fails compliance in its first week rather than at the first look.
 
 Exit codes (docs/task-authoring.md section 6):
   0   a verdict, printed as VERDICT gain (R's interval wholly above 1),
       VERDICT loss (wholly below 1) or VERDICT no-difference-at-cap (1 inside
       the interval at or past the last look week)
-  75  not yet: before the first look week, or undecided before the cap
+  75  not yet: compliant and before the first look week, or undecided before
+      the cap
   1   anything else: a COMPLIANCE FAILURE, no prefixed routing_decision, an
       unreadable store or history, an undefined interval, or a bad option
 Once since is resolved, stdout ends with one JSON object, the look's verdict.
@@ -36,6 +39,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import traceback
 from collections.abc import Callable, Sequence
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -119,9 +123,11 @@ def _warn(message: str) -> None:
     print(f'effort_experiment_look: {message}', file=sys.stderr)
 
 
-def _verdict(report: ThroughputReport, look_week: int, last_look_week: int) -> LookVerdict:
+def _verdict(report: ThroughputReport, look_week: int, args: argparse.Namespace) -> LookVerdict:
     if report.compliance.failures:
         return LookVerdict.COMPLIANCE_FAILURE
+    if look_week < args.first_look_week:
+        return LookVerdict.NOT_DUE
     side = report.interval_side
     if side is IntervalSide.ABOVE_1:
         return LookVerdict.GAIN
@@ -130,7 +136,14 @@ def _verdict(report: ThroughputReport, look_week: int, last_look_week: int) -> L
     if side is IntervalSide.UNDEFINED:
         _warn("R's interval is undefined: no control landing, or an arm costs nothing")
         return LookVerdict.ERROR
-    return LookVerdict.NO_DIFFERENCE_AT_CAP if look_week >= last_look_week else LookVerdict.UNDECIDED
+    return LookVerdict.NO_DIFFERENCE_AT_CAP if look_week >= args.last_look_week else LookVerdict.UNDECIDED
+
+
+def _cohort_days(look_week: int, args: argparse.Namespace) -> int | None:
+    """7 * min(k, last) days once due; before that None, a cohort to now, so compliance sees every dispatch."""
+    if look_week < args.first_look_week:
+        return None
+    return 7 * min(look_week, args.last_look_week)
 
 
 def _run_look(args: argparse.Namespace, rest: Sequence[str], now: datetime) -> int:
@@ -145,16 +158,11 @@ def _run_look(args: argparse.Namespace, rest: Sequence[str], now: datetime) -> i
         raise
     since = resolve_since(options)
     look_week = (now - timedelta(days=args.lag_days) - since) // LOOK_WEEK
-    if look_week < args.first_look_week:
-        print(json.dumps({
-            'salt': options.salt, 'since': since.astimezone(UTC).isoformat(),
-            'look_week': look_week, 'verdict': LookVerdict.NOT_DUE.value,
-        }))
-        return _EXIT[LookVerdict.NOT_DUE]
-    cohort_days = 7 * min(look_week, args.last_look_week)
-    report = throughput_report(replace(options, since=since, cohort_days=cohort_days))
+    report = throughput_report(
+        replace(options, since=since, cohort_days=_cohort_days(look_week, args)),
+    )
     sys.stdout.write(render_text(report))
-    verdict = _verdict(report, look_week, args.last_look_week)
+    verdict = _verdict(report, look_week, args)
     if verdict in _DECIDED:
         print(f'VERDICT {verdict.value}')
     print(json.dumps({**summary_record(report), 'look_week': look_week, 'verdict': verdict.value}))
@@ -177,8 +185,8 @@ def main(
         return _run_look(args, rest, clock())
     except ThroughputUnavailable as exc:
         _warn(str(exc))
-    except Exception as exc:
-        _warn(f'{type(exc).__name__}: {exc}')
+    except Exception:
+        _warn(f'unexpected error\n{traceback.format_exc()}')
     return _EXIT[LookVerdict.ERROR]
 
 

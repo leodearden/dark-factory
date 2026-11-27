@@ -95,6 +95,7 @@ def test_a_look_before_the_first_look_week_is_not_due(small_aa_root, capsys):
     assert summary['look_week'] == 1
     assert summary['verdict'] == 'not-due'
     assert summary['since'] == SINCE.isoformat()
+    assert summary['cohort_days'] is None
 
 
 def test_a_planted_cut_at_week_2_is_a_gain_with_the_readouts_json_line(cohort_root, capsys):
@@ -153,8 +154,9 @@ def test_identical_arms_before_the_cap_are_undecided(small_aa_root, capsys):
     assert (summary['look_week'], summary['verdict'], summary['cohort_days']) == (3, 'undecided', 21)
 
 
+@pytest.mark.parametrize('look_week', [0, 1, 2], ids=lambda k: f'week-{k}')
 def test_a_treated_dispatch_at_control_effort_fails_the_look_instead_of_waiting(
-    cohort_root, capsys,
+    cohort_root, capsys, look_week,
 ):
     root, conn = cohort_root(IDENTICAL_ARMS, SMALL_N_PER_ARM)
     (treated, *_), _ = arm_task_ids(SALT, 2, 1, SMALL_N_PER_ARM)
@@ -162,7 +164,7 @@ def test_a_treated_dispatch_at_control_effort_fails_the_look_instead_of_waiting(
         Dispatch(at=SINCE + timedelta(days=3), effort=CONTROL_EFFORT, rule_id=TREATED_RULE_ID),
     ))])
 
-    assert _look(_argv(root), _now_at_week(2)) == 1
+    assert _look(_argv(root), _now_at_week(look_week)) == 1
 
     out = capsys.readouterr().out
     assert [line for line in out.splitlines() if line.startswith('COMPLIANCE FAILURE')]
@@ -185,14 +187,33 @@ def test_a_ledger_without_a_prefixed_dispatch_fails_the_look_naming_the_prefix(
     assert PREFIX in err
 
 
-@pytest.mark.parametrize('bad', [('--treated-bucket', '5'), ('--lag-days', 'x')])
-def test_a_bad_option_fails_the_look_rather_than_exiting_as_usage(tmp_path, bad):
-    assert _look(_argv(tmp_path, *bad), _now_at_week(2)) == 1
+@pytest.mark.parametrize(('bad', 'named'), [
+    (('--treated-bucket', '5'), 'treated_bucket'),
+    (('--lag-days', 'x'), '--lag-days'),
+])
+def test_a_bad_option_fails_the_look_rather_than_exiting_as_usage(
+    small_aa_root, capsys, bad, named,
+):
+    assert _look(_argv(small_aa_root, *bad), _now_at_week(2)) == 1
+
+    assert named in capsys.readouterr().err
 
 
 def test_a_passthrough_read_at_is_overridden_by_the_clock(small_aa_root, capsys):
     now = _now_at_week(3)
 
-    _look(_argv(small_aa_root, '--read-at', '2026-01-01T00:00:00+00:00'), now)
+    assert _look(_argv(small_aa_root, '--read-at', '2026-01-01T00:00:00+00:00'), now) == UNDECIDED
 
     assert _last_json(capsys.readouterr().out)['read_at'] == now.isoformat()
+
+
+def _broken_clock() -> datetime:
+    raise RuntimeError('the clock broke')
+
+
+def test_an_unexpected_error_fails_the_look_with_its_traceback(small_aa_root, capsys):
+    assert look.main(_argv(small_aa_root), clock=_broken_clock) == 1
+
+    err = capsys.readouterr().err
+    assert 'Traceback (most recent call last)' in err
+    assert 'RuntimeError: the clock broke' in err
