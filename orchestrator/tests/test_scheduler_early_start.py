@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import dataclasses
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock
 
@@ -751,3 +751,144 @@ class TestRow11SystemHolds:
         assert rig.events() == events_before
         assert rig.session.calls == calls_before
         rig.status.assert_not_awaited()
+
+
+def _higher_tier_waiting(blocking_task: str = 'T', dependent: str = 'D') -> EarlyStartRefusal:
+    return EarlyStartRefusal(
+        Reason.HIGHER_TIER_WAITING, dependent=dependent, predecessor='P', blocking_task=blocking_task,
+    )
+
+
+class TestTierCondition:
+    """PRD section 5.1 "About the rest of the queue": a higher tier that could start once P lands wins.
+
+    D ('medium' unless stated) needs a.py and c.py; P holds a.py.
+    """
+
+    async def _select(self, rig: _Rig, *others: dict, d: dict | None = None, **reads_kw):
+        picture = await rig.picture(p_running(), d or task('D', deps=('P',)), *others)
+        return await rig.select(picture, reads_for(picture, **reads_kw))
+
+    async def test_row_3_a_higher_tier_that_could_start_on_a_shared_key_wins(
+        self, tmp_path, monkeypatch,
+    ):
+        rig = await _with_p_running(tmp_path, monkeypatch)
+
+        selection = await self._select(rig, task('T', 'high', ['c.py', 'e.py']))
+
+        assert selection == EarlyStartSelection(None, (_higher_tier_waiting(),))
+        rig.assert_untouched('D')
+
+    @pytest.mark.parametrize('t_read', [True, False], ids=['t-read-unstacked', 't-unread'])
+    async def test_row_4_a_higher_tier_waiting_on_the_same_predecessor_wins(
+        self, tmp_path, monkeypatch, t_read,
+    ):
+        rig = await _with_p_running(tmp_path, monkeypatch)
+        picture = await rig.picture(
+            p_running(), task('D', deps=('P',)), task('T', 'high', ['a.py'], deps=('P',)),
+        )
+        pairs = [pair_reads(picture, 'D')]
+        if t_read:
+            pairs.append(pair_reads(picture, 'T', branch=DependentBranch.UNSTACKED))
+
+        selection = await rig.select(picture, reads_of(*pairs))
+
+        assert selection.claim is None
+        assert _higher_tier_waiting() in selection.refusals
+        rig.assert_untouched('D', 'T')
+
+    async def test_row_5_a_higher_tier_also_held_by_an_unrelated_task_does_not_count(
+        self, tmp_path, monkeypatch,
+    ):
+        rig = await _with_p_running(tmp_path, monkeypatch)
+        rig.offer(p_running(), task('U', files=['u.py']))
+        assert (await rig.scheduler.acquire_next()).task_id == 'U'
+
+        selection = await self._select(
+            rig, task('U', files=['u.py'], status='in-progress'),
+            task('T', 'high', ['c.py', 'e.py', 'u.py']),
+        )
+
+        assert selection.claim is not None and selection.refusals == ()
+
+    @pytest.mark.parametrize(('y_status', 'claimed'), [('done', False), ('in-progress', True)])
+    async def test_row_6_the_statuses_just_read_decide_whether_a_higher_tier_could_start(
+        self, tmp_path, monkeypatch, y_status, claimed,
+    ):
+        rig = await _with_p_running(tmp_path, monkeypatch)
+
+        selection = await self._select(
+            rig, task('Y', files=['y.py'], status='in-progress'),
+            task('T', 'high', ['c.py'], deps=('Y',)),
+            statuses={'Y': y_status},
+        )
+
+        if claimed:
+            assert selection.claim is not None and selection.refusals == ()
+        else:
+            assert selection == EarlyStartSelection(None, (_higher_tier_waiting(),))
+
+    async def test_a_higher_tier_kept_off_its_key_by_another_reservation_does_not_count(
+        self, tmp_path, monkeypatch,
+    ):
+        rig = await _with_p_running(tmp_path, monkeypatch)
+        rig.scheduler.lock_table.install_parks('Z', ['e.py'], 'low')
+
+        selection = await self._select(rig, task('T', 'high', ['c.py', 'e.py']), task('Z', 'low', ['e.py']))
+
+        assert selection.claim is not None and selection.refusals == ()
+
+    @pytest.mark.parametrize('t_tier', ['medium', 'low'])
+    async def test_a_same_or_lower_tier_does_not_count(self, tmp_path, monkeypatch, t_tier):
+        rig = await _with_p_running(tmp_path, monkeypatch)
+
+        selection = await self._select(rig, task('T', t_tier, ['c.py']))
+
+        assert selection.claim is not None and selection.refusals == ()
+
+    @pytest.mark.parametrize(('t_order', 'd_order', 'claimed'), [(1, 2, False), (2, 1, True)])
+    async def test_between_pins_the_lower_pin_order_is_the_higher_tier(
+        self, tmp_path, monkeypatch, t_order, d_order, claimed,
+    ):
+        rig = await _with_p_running(tmp_path, monkeypatch)
+        rig.overrides.set_override(rig.project_root, 'T', pinned=True, pin_order=t_order)
+        rig.overrides.set_override(rig.project_root, 'D', pinned=True, pin_order=d_order)
+
+        selection = await self._select(rig, task('T', 'medium', ['c.py']))
+
+        if claimed:
+            assert selection.claim is not None and selection.refusals == ()
+        else:
+            assert selection == EarlyStartSelection(None, (_higher_tier_waiting(),))
+
+    async def test_a_watchdog_pin_outranks_an_unpinned_critical(self, tmp_path, monkeypatch):
+        rig = await _with_p_running(tmp_path, monkeypatch)
+        assert rig.overrides.create_watchdog_pin(
+            rig.project_root, 'T', ttl_until=datetime.now(UTC) + timedelta(days=30),
+        ) is not None
+
+        selection = await self._select(
+            rig, task('T', 'low', ['c.py']), d=task('D', 'critical', deps=('P',)),
+        )
+
+        assert selection == EarlyStartSelection(None, (_higher_tier_waiting(),))
+
+    async def test_a_higher_tier_already_started_does_not_count(self, tmp_path, monkeypatch):
+        rig = await _with_p_running(tmp_path, monkeypatch)
+        rig.offer(p_running(), task('T', 'high', ['two.py']))
+        assert (await rig.scheduler.acquire_next()).task_id == 'T'
+
+        selection = await self._select(
+            rig, task('T', 'high', ['two.py']), d=task('D', files=['a.py', 'two.py'], deps=('P',)),
+        )
+
+        assert selection.claim is not None and selection.refusals == ()
+
+    async def test_a_higher_tier_no_longer_pending_does_not_count(self, tmp_path, monkeypatch):
+        rig = await _with_p_running(tmp_path, monkeypatch)
+
+        selection = await self._select(
+            rig, task('T', 'high', ['c.py']), statuses={'T': 'in-progress'},
+        )
+
+        assert selection.claim is not None and selection.refusals == ()
