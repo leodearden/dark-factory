@@ -11,6 +11,7 @@ the operational yaml's own ``module_overrides`` into the test's holder limits.
 
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -21,13 +22,21 @@ from _orch_helpers import HermeticMcpSession
 from _park_test_helpers import make_task
 
 from orchestrator.config import OrchestratorConfig
+from orchestrator.delivered_checks import ChecksAtCommit
+from orchestrator.dispatch_row import FreshRow
 from orchestrator.early_start_selection import (
+    DependentBranch,
+    EarlyStartHolds,
     EarlyStartRefusal,
     EarlyStartRefusalReason,
+    EarlyStartSelection,
     EarlyStartShortlist,
+    PairReads,
+    StepReads,
 )
-from orchestrator.event_store import EventStore
+from orchestrator.event_store import EventStore, EventType
 from orchestrator.overrides import OverrideStore
+from orchestrator.pin_reservation import Blocker, BlockerKind
 from orchestrator.scheduler import Scheduler
 from orchestrator.task_picture import TaskPicture
 
@@ -36,8 +45,19 @@ pytestmark = [pytest.mark.usefixtures('code_default_config'), pytest.mark.asynci
 FIXED_DT = datetime(2026, 11, 22, 0, 0, 0, tzinfo=UTC)
 P_FILES = ['a.py', 'b.py']
 D_FILES = ['a.py', 'c.py']
+TIP = 'a' * 40
 
 Reason = EarlyStartRefusalReason
+
+
+class _RecordingSession(HermeticMcpSession):
+    def __init__(self) -> None:
+        super().__init__()
+        self.calls: list[str] = []
+
+    async def call_tool(self, name: str, arguments: dict, timeout: float = 30) -> dict:
+        self.calls.append(name)
+        return await super().call_tool(name, arguments, timeout)
 
 
 @dataclass(frozen=True)
@@ -45,7 +65,7 @@ class _Rig:
     scheduler: Scheduler
     store: EventStore
     overrides: OverrideStore
-    session: HermeticMcpSession
+    session: _RecordingSession
     status: AsyncMock
     project_root: str
 
@@ -67,6 +87,25 @@ class _Rig:
     def shortlist(self, picture: TaskPicture, *waiting: str) -> EarlyStartShortlist:
         return self.scheduler.early_start_shortlist(picture, waiting_predecessors=set(waiting or ('P',)))
 
+    async def select(
+        self, picture: TaskPicture, reads: StepReads, *,
+        waiting: frozenset[str] = frozenset({'P'}), holds: EarlyStartHolds | None = None,
+    ) -> EarlyStartSelection:
+        return await self.scheduler.select_early_start(
+            picture, reads, waiting, clear_holds() if holds is None else holds,
+        )
+
+    def events(self) -> list[dict]:
+        rows = [row for event_type in EventType for row in self.store.fetch_events_by_type(event_type)]
+        return sorted(rows, key=lambda row: row['id'])
+
+    def assert_untouched(self, *task_ids: str) -> None:
+        for tid in task_ids:
+            assert not self.scheduler.is_dispatched(tid), tid
+            assert not self.scheduler.lock_table.is_held(tid), tid
+            assert self.scheduler.lock_table.successor_relation(tid) is None, tid
+        assert self.scheduler.lock_table.snapshot_successor_of() == {}
+
 
 def _rig(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, **config_overrides: object) -> _Rig:
     config = OrchestratorConfig(
@@ -75,7 +114,7 @@ def _rig(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, **config_overrides: ob
     )
     store = EventStore(tmp_path / 'runs.db', 'run-1')
     overrides = OverrideStore(tmp_path / 'overrides.db')
-    session = HermeticMcpSession()
+    session = _RecordingSession()
     scheduler = Scheduler(
         config,
         store,
@@ -113,6 +152,49 @@ async def _with_p_running(tmp_path, monkeypatch, **config_overrides) -> _Rig:
 
 def _refusal(reason: Reason, dependent: str = 'D', predecessor: str = 'P') -> EarlyStartRefusal:
     return EarlyStartRefusal(reason, dependent=dependent, predecessor=predecessor)
+
+
+def clear_holds() -> EarlyStartHolds:
+    return EarlyStartHolds(
+        review_checkpoint=False, merge_queue_halted=False, usage_paused=False,
+        cost_ceiling_breached=False,
+    )
+
+
+def pair_reads(
+    picture: TaskPicture, dependent: str = 'D', predecessor: str = 'P', *,
+    tip: str = TIP, checks: ChecksAtCommit = ChecksAtCommit.PASSED,
+    branch: DependentBranch = DependentBranch.ABSENT, row: dict | None = None,
+    dep_statuses: dict[str, str] | None = None,
+) -> tuple[str, PairReads]:
+    fresh = FreshRow(
+        task=picture.tasks_by_id[dependent] if row is None else row,
+        dep_statuses=dep_statuses or {},
+    )
+    return dependent, PairReads(
+        predecessor=predecessor, predecessor_tip=tip, predecessor_checks=checks,
+        dependent_branch=branch, dependent_row=fresh,
+    )
+
+
+def reads_of(*pairs: tuple[str, PairReads], statuses: dict[str, str] | None = None) -> StepReads:
+    return StepReads(statuses=statuses or {}, pairs=dict(pairs))
+
+
+def reads_for(picture: TaskPicture, dependent: str = 'D', predecessor: str = 'P', **kw) -> StepReads:
+    statuses = kw.pop('statuses', None)
+    return reads_of(pair_reads(picture, dependent, predecessor, **kw), statuses=statuses)
+
+
+def _acquired_rows(store: EventStore, task_id: str) -> list[dict]:
+    return [
+        event['data'] for event in store.fetch_events_by_type(EventType.lock_acquired)
+        if event['task_id'] == task_id
+    ]
+
+
+def _held(module: str, *owners: str) -> list[Blocker]:
+    return [Blocker(module, owner, BlockerKind.HELD) for owner in owners]
 
 
 class TestShortlistQualifyingDependent:
@@ -278,3 +360,244 @@ class TestShortlistRanking:
         ranked = await self._ranked(rig, task('12', deps=('P',)), task('9', deps=('P',)))
 
         assert ranked == ['9', '12']
+
+
+class TestClaim:
+    async def test_a_qualifying_pair_is_claimed_with_an_ordinary_starts_bookkeeping(
+        self, tmp_path, monkeypatch,
+    ):
+        rig = await _with_p_running(tmp_path, monkeypatch)
+        picture = await rig.picture(
+            p_running(), task('D', deps=('P',)), task('H', 'high', ['b.py']),
+        )
+
+        selection = await rig.select(picture, reads_for(picture))
+
+        claim = selection.claim
+        assert claim is not None and selection.refusals == ()
+        assert (claim.dependent, claim.predecessor) == ('D', 'P')
+        assert claim.keys == ('a.py', 'c.py')
+        assert claim.stacked_commit == TIP
+        assert claim.tier == 'medium'
+        assert claim.task == picture.tasks_by_id['D']
+        scheduler = rig.scheduler
+        assert scheduler.is_dispatched('D')
+        relation = scheduler.lock_table.successor_relation('D')
+        assert relation is not None and relation.predecessor == 'P'
+        assert scheduler.lock_table.held_modules('D') == {'a.py', 'c.py'}
+        assert scheduler.lock_table.held_modules('P') == set(P_FILES)
+        assert _acquired_rows(rig.store, 'D') == [
+            {'modules': ['a.py', 'c.py'], 'priority': 'medium', 'successor_of': 'P'},
+        ]
+        assert scheduler.get_state_snapshot().successor_of == {'D': 'P'}
+        assert rig.store.fetch_events_by_type(EventType.task_skipped) == []
+
+    async def test_the_claim_carries_the_store_row(self, tmp_path, monkeypatch):
+        rig = await _with_p_running(tmp_path, monkeypatch)
+        picture = await rig.picture(p_running(), task('D', deps=('P',)))
+        fresh = task('D', deps=('P',), stamped_since_the_picture=True)
+
+        selection = await rig.select(picture, reads_for(picture, row=fresh))
+
+        assert selection.claim is not None
+        assert selection.claim.task['metadata']['stamped_since_the_picture'] is True
+
+    @pytest.mark.parametrize(('fresh', 'dep_statuses', 'reason'), [
+        (task('D', deps=('P', 'X')), {'X': 'pending'}, Reason.NOT_ONLY_DEPENDENCY),
+        (
+            task('D', deps=('P',), milestone={'mode': 'dated', 'at': '2026-11-01T00:00:00+00:00'}),
+            {}, Reason.HAS_MILESTONE,
+        ),
+        (task('D', deps=('P',), status='blocked'), {}, Reason.NOT_ELIGIBLE),
+    ], ids=['new-dependency', 'milestone', 'blocked'])
+    async def test_the_claim_judges_the_store_row_not_the_pictures(
+        self, tmp_path, monkeypatch, fresh, dep_statuses, reason,
+    ):
+        rig = await _with_p_running(tmp_path, monkeypatch)
+        picture = await rig.picture(p_running(), task('D', deps=('P',)))
+        assert [c.dependent for c in rig.shortlist(picture).candidates] == ['D']
+
+        selection = await rig.select(picture, reads_for(picture, row=fresh, dep_statuses=dep_statuses))
+
+        assert selection == EarlyStartSelection(claim=None, refusals=(_refusal(reason),))
+        rig.assert_untouched('D')
+
+    async def test_reads_keyed_by_another_task_than_their_row_are_refused(
+        self, tmp_path, monkeypatch,
+    ):
+        rig = await _with_p_running(tmp_path, monkeypatch)
+        picture = await rig.picture(p_running(), task('D', deps=('P',)), task('E', deps=('P',)))
+        _, pair = pair_reads(picture, 'E')
+
+        with pytest.raises(ValueError, match=r"(?s)(?=.*'D')(?=.*'E')"):
+            StepReads(statuses={}, pairs={'D': pair})
+
+    async def test_an_unread_pair_is_neither_claimed_nor_refused(self, tmp_path, monkeypatch):
+        rig = await _with_p_running(tmp_path, monkeypatch)
+        picture = await rig.picture(p_running(), task('D', deps=('P',)))
+
+        assert await rig.select(picture, reads_of()) == EarlyStartSelection(None, ())
+        rig.assert_untouched('D')
+
+    async def test_reads_for_another_predecessor_are_not_this_pairs(self, tmp_path, monkeypatch):
+        rig = await _with_p_running(tmp_path, monkeypatch)
+        picture = await rig.picture(p_running(), task('D', deps=('P',)))
+
+        selection = await rig.select(picture, reads_for(picture, predecessor='Q'))
+
+        assert selection == EarlyStartSelection(None, ())
+        rig.assert_untouched('D')
+
+    async def test_a_predecessor_no_longer_waiting_is_not_claimed_on(self, tmp_path, monkeypatch):
+        rig = await _with_p_running(tmp_path, monkeypatch)
+        picture = await rig.picture(p_running(), task('D', deps=('P',)))
+
+        selection = await rig.select(picture, reads_for(picture), waiting=frozenset())
+
+        assert selection.claim is None
+        rig.assert_untouched('D')
+
+    async def test_a_claim_that_claims_nobody_writes_nothing(self, tmp_path, monkeypatch):
+        rig = await _with_p_running(tmp_path, monkeypatch)
+        picture = await rig.picture(p_running(), task('D', deps=('P', 'X')))
+        events_before, calls_before = rig.events(), list(rig.session.calls)
+
+        selection = await rig.select(picture, reads_for(picture, dep_statuses={'X': 'pending'}))
+
+        assert selection.claim is None
+        assert rig.events() == events_before
+        assert rig.session.calls == calls_before
+        rig.status.assert_not_awaited()
+        assert rig.scheduler.is_dispatched('P')
+        rig.assert_untouched('D')
+
+
+class TestRow7Keys:
+    async def test_a_two_holder_key_already_full_is_key_unavailable(self, tmp_path, monkeypatch):
+        rig = _rig(tmp_path, monkeypatch)
+        await rig.dispatch(task('P', files=['two.py']))
+        rig.offer(task('P', files=['two.py'], status='in-progress'), task('U', files=['two.py']))
+        assert (await rig.scheduler.acquire_next()).task_id == 'U'
+        picture = await rig.picture(
+            task('P', files=['two.py'], status='in-progress'),
+            task('U', files=['two.py'], status='in-progress'),
+            task('D', files=['two.py'], deps=('P',)),
+        )
+
+        selection = await rig.select(picture, reads_for(picture))
+
+        assert selection == EarlyStartSelection(None, (_refusal(Reason.KEY_UNAVAILABLE),))
+        rig.assert_untouched('D')
+
+    async def test_a_two_holder_key_takes_the_successor_then_refuses_a_third(
+        self, tmp_path, monkeypatch,
+    ):
+        rig = _rig(tmp_path, monkeypatch)
+        await rig.dispatch(task('P', files=['two.py']))
+        picture = await rig.picture(
+            task('P', files=['two.py'], status='in-progress'),
+            task('D', files=['two.py'], deps=('P',)),
+        )
+
+        assert (await rig.select(picture, reads_for(picture))).claim is not None
+
+        rig.offer(
+            task('P', files=['two.py'], status='in-progress'),
+            task('D', files=['two.py'], status='in-progress', deps=('P',)),
+            task('X', 'high', ['two.py']),
+        )
+        assert await rig.scheduler.acquire_next() is None
+        assert rig.scheduler.lock_table.blockers('X', ['two.py']) == _held('two.py', 'D', 'P')
+
+    async def test_a_foreign_reservation_is_key_reserved(self, tmp_path, monkeypatch):
+        rig = await _with_p_running(tmp_path, monkeypatch)
+        rig.scheduler.lock_table.install_parks('Z', ['c.py'], 'low')
+        picture = await rig.picture(
+            p_running(), task('D', deps=('P',)), task('Z', 'low', ['c.py']),
+        )
+
+        selection = await rig.select(picture, reads_for(picture))
+
+        assert selection.claim is None
+        assert _refusal(Reason.KEY_RESERVED) in selection.refusals
+        rig.assert_untouched('D')
+
+
+class TestRow46OneDependentPerPredecessor:
+    def _dependents(self) -> tuple[dict, dict]:
+        return task('D1', 'high', ['a.py', 'c.py'], deps=('P',)), task('D2', 'medium', ['b.py', 'd.py'], deps=('P',))
+
+    async def test_the_higher_ranked_is_claimed_and_the_other_refused(self, tmp_path, monkeypatch):
+        rig = await _with_p_running(tmp_path, monkeypatch)
+        d1, d2 = self._dependents()
+        picture = await rig.picture(p_running(), d2, d1)
+
+        selection = await rig.select(picture, reads_of(pair_reads(picture, 'D1'), pair_reads(picture, 'D2')))
+
+        assert selection.claim is not None and selection.claim.dependent == 'D1'
+        assert selection.refusals == (_refusal(Reason.PREDECESSOR_HAS_DEPENDENT, 'D2'),)
+
+        later = await rig.select(picture, reads_of(pair_reads(picture, 'D2')))
+        assert later.claim is None
+        assert _refusal(Reason.PREDECESSOR_HAS_DEPENDENT, 'D2') in later.refusals
+
+        assert rig.scheduler.release_early_start_claim(selection.claim)
+        after = await rig.select(picture, reads_of(pair_reads(picture, 'D2')))
+        assert after.claim is not None and after.claim.dependent == 'D2'
+
+
+class TestReleasePath:
+    async def _claimed(self, tmp_path, monkeypatch):
+        rig = await _with_p_running(tmp_path, monkeypatch)
+        picture = await rig.picture(p_running(), task('D', deps=('P',)))
+        selection = await rig.select(picture, reads_for(picture))
+        assert selection.claim is not None
+        return rig, selection.claim
+
+    async def test_releasing_a_live_claim_drops_keys_relation_and_started_mark(
+        self, tmp_path, monkeypatch,
+    ):
+        rig, claim = await self._claimed(tmp_path, monkeypatch)
+
+        assert rig.scheduler.release_early_start_claim(claim) is True
+
+        rig.assert_untouched('D')
+        assert rig.scheduler.lock_table.held_modules('P') == set(P_FILES)
+        released = [e for e in rig.store.fetch_events_by_type(EventType.lock_released) if e['task_id'] == 'D']
+        assert len(released) == 1
+
+    async def test_a_second_release_or_a_stale_claim_changes_nothing(self, tmp_path, monkeypatch):
+        rig, claim = await self._claimed(tmp_path, monkeypatch)
+        assert rig.scheduler.release_early_start_claim(dataclasses.replace(claim, predecessor='Q')) is False
+        assert rig.scheduler.is_dispatched('D')
+
+        assert rig.scheduler.release_early_start_claim(claim) is True
+        events = rig.events()
+        assert rig.scheduler.release_early_start_claim(claim) is False
+        assert rig.events() == events
+
+
+class TestRow34NeverStartedTwice:
+    async def test_a_claimed_dependent_is_not_started_again_by_the_ordinary_pass(
+        self, tmp_path, monkeypatch,
+    ):
+        rig = await _with_p_running(tmp_path, monkeypatch)
+        picture = await rig.picture(p_running(), task('D', deps=('P',)))
+        assert (await rig.select(picture, reads_for(picture))).claim is not None
+
+        rig.offer(task('P', files=P_FILES, status='cancelled'), task('D', deps=('P',)))
+        assignment = await rig.scheduler.acquire_next()
+
+        assert assignment is None or assignment.task_id != 'D'
+        assert len(_acquired_rows(rig.store, 'D')) == 1
+
+    async def test_a_dependent_the_ordinary_pass_started_is_not_claimed(self, tmp_path, monkeypatch):
+        rig = await _with_p_running(tmp_path, monkeypatch)
+        rig.offer(task('P', files=P_FILES, status='done'), task('D', files=['c.py'], deps=('P',)))
+        assert (await rig.scheduler.acquire_next()).task_id == 'D'
+        picture = await rig.picture(p_running(), task('D', files=['c.py'], deps=('P',)))
+
+        selection = await rig.select(picture, reads_for(picture))
+
+        assert selection == EarlyStartSelection(None, (_refusal(Reason.NOT_ELIGIBLE),))
+        assert rig.scheduler.lock_table.snapshot_successor_of() == {}
