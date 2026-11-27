@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pytest
+from _cockpit_queue_settle import await_queue_settled, resize_terminal_and_settle
 from _cockpit_session_records import make_record
 from _cockpit_tree_snapshot import snapshot_tree
 from orchestrator import decision_registry as dr
@@ -1381,12 +1382,12 @@ class TestDecisionQueueRender:
             await pilot.pause()
 
             queue = app.query_one(DecisionQueue)
+            await await_queue_settled(queue)
             queue.scroll_to(y=10, animate=False)
             await pilot.pause()
             assert queue.scroll_y == 10
 
-            await pilot.resize_terminal(200, 15)
-            await pilot.pause()
+            await resize_terminal_and_settle(pilot, queue, 200, 15)
 
             # the bound did not move, so no reflow ran and the scroll survived
             assert queue.scrollable_content_region.width == 198
