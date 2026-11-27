@@ -7,10 +7,11 @@ seams against a real loopback socket, so the SDK's own timeout and retry run.
 
 from __future__ import annotations
 
+import asyncio
 import time
 from collections.abc import AsyncIterator, Callable, Iterator
 from contextlib import asynccontextmanager
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import openai
 import pytest
@@ -25,6 +26,9 @@ from fused_memory.backends.graphiti_client import GraphitiBackend
 from fused_memory.backends.mem0_client import Mem0Backend
 from fused_memory.config.request_attempts import RequestAttemptsConfig
 from fused_memory.config.schema import FusedMemoryConfig, OpenAIProviderConfig
+from fused_memory.maintenance.reindex import ReindexResult, run_reindex
+from fused_memory.middleware.curator_types import CandidateTask
+from fused_memory.middleware.task_curator import TaskCurator
 from fused_memory.models.scope import Scope
 from fused_memory.services.mem0_write_retry import (
     TransientProviderFailure,
@@ -45,6 +49,8 @@ WRITE_BUDGET_S = 5.0
 #: Just above the ceiling, so only a stall the per-attempt deadline cannot see reaches it.
 TRICKLE_BUDGET_S = 2.0
 SCOPE = Scope(project_id='bounded')
+#: Ends a call stuck on the SDK's 600 s default fast, rather than hanging the test.
+UNBOUNDED_GUARD_S = 10
 
 ConfigFactory = Callable[[float], FusedMemoryConfig]
 
@@ -203,3 +209,48 @@ async def test_a_trickling_embedding_still_ends_at_the_write_budget(bounded_conf
 
     assert str(raised.value) == f'Mem0 add timed out after {TRICKLE_BUDGET_S}s'
     assert TRICKLE_BUDGET_S <= elapsed < TRICKLE_BUDGET_S + 1.0
+
+
+async def test_a_reindex_embedding_survives_one_stalled_attempt(
+    bounded_config, endpoint, make_fake_maintenance_service,
+):
+    config = bounded_config(WRITE_BUDGET_S)
+    endpoint.stall('/embeddings', first=1)
+    service = AsyncMock()
+    service.durable_queue = MagicMock()
+    service.graphiti = MagicMock()
+
+    with (
+        patch(
+            'fused_memory.maintenance.reindex.maintenance_service',
+            side_effect=make_fake_maintenance_service(config, service),
+        ),
+        patch('fused_memory.maintenance.reindex.ReindexManager') as manager_cls,
+    ):
+        async def embed_during_the_run(*_args, **_kwargs):
+            await manager_cls.call_args.kwargs['embedder'].create(['stale content'])
+            return {'reindex_result': ReindexResult(), 'replay_count': 0}
+
+        manager_cls.return_value.reindex_and_replay = AsyncMock(side_effect=embed_during_the_run)
+
+        await asyncio.wait_for(run_reindex(), UNBOUNDED_GUARD_S)
+
+    assert len(endpoint.requests_to('/embeddings')) == 2
+
+
+async def test_the_task_curator_embedding_survives_one_stalled_attempt(bounded_config, endpoint):
+    """record_task logs and swallows a failure, so the request count is what shows the retry."""
+    config = bounded_config(WRITE_BUDGET_S)
+    endpoint.stall('/embeddings', first=1)
+
+    with stub_qdrant_server() as stub:
+        config.mem0.qdrant_url = stub.url
+        curator = TaskCurator(config)
+        try:
+            await asyncio.wait_for(
+                curator.record_task('t1', CandidateTask(title='x'), 'bounded'), UNBOUNDED_GUARD_S,
+            )
+        finally:
+            await curator.close()
+
+    assert len(endpoint.requests_to('/embeddings')) == 2
