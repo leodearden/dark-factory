@@ -29,6 +29,7 @@ import contextlib
 import dataclasses
 import logging
 import os
+import shlex
 import shutil
 import socket
 import tempfile
@@ -40,6 +41,9 @@ from pathlib import Path
 from shared.cgroup_stats import (
     CGROUP_ROOT,
     CPU_STAT,
+    MEMORY_EVENTS,
+    MEMORY_PEAK,
+    SWAP_PEAK,
     CgroupReading,
     PressureResource,
     Unreadable,
@@ -59,6 +63,13 @@ __all__ = [
 
 _CGROUP_FILE = 'cgroup'
 _COMPLETE_FILE = 'complete'
+_CAPTURED_FILES = (
+    CPU_STAT,
+    MEMORY_PEAK,
+    SWAP_PEAK,
+    MEMORY_EVENTS,
+    *(resource.file_name for resource in PressureResource),
+)
 
 
 class Capture(StrEnum):
@@ -311,9 +322,30 @@ class CommandCapture:
         self._relocated.update(scopes)
 
     def wrap(self, cmd: str) -> str:
+        """*cmd* in a subshell, with its scope's counters copied to the directory after it.
+
+        The subshell keeps ``exit`` and ``exec`` in *cmd* from skipping the
+        copy. *cmd* starts on the script's first line, so bash's line numbers
+        for it are unchanged. The script starts nothing but ``cat``, and its
+        own statements write nothing to the command's output.
+        """
         if self.directory is None:
             return cmd
-        raise NotImplementedError('the in-scope capture script is not written yet')
+        directory = shlex.quote(str(self.directory))
+        source = shlex.quote(str(self._cgroup_root)) + '"${__df_cg#0::}/$__df_f"'
+        files = ' '.join(shlex.quote(name) for name in _CAPTURED_FILES)
+        record_cgroup = (
+            '{ while read -r __df_cg; do case $__df_cg in 0::*) break;; esac; done'
+            f' < /proc/self/cgroup; printf \'%s\\n\' "$__df_cg" > {directory}/{_CGROUP_FILE}; }}'
+            ' 2>/dev/null'
+        )
+        copy_counters = (
+            f'{{ for __df_f in {files}; do [ -r {source} ] && cat {source}'
+            f' > {directory}/"$__df_f"; done; : > {directory}/{_COMPLETE_FILE}; }} 2>/dev/null'
+        )
+        return (
+            f'{record_cgroup}; ( {cmd}\n)\n__df_rc=$?\n{copy_counters}\nexit "$__df_rc"'
+        )
 
     def read_before_kill(self, relocated: Iterable[str]) -> None:
         """Read the live launch scope now; never raises, so it never costs the kill."""

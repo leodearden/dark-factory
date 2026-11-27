@@ -628,8 +628,8 @@ class TestWrapRunsTheCommandUnchanged:
 
 
 class TestWrapScriptText:
-    def test_it_starts_no_python(self, tmp_path):
-        capture = _FakeScope(tmp_path).capture(tmp_path)
+    def test_it_starts_no_python(self):
+        capture = CommandCapture(Path('/run/capture'), cgroup_root=Path('/sys/fs/cgroup'))
         assert 'python' not in capture.wrap('true')
 
     def test_it_copies_exactly_the_files_named_by_the_shared_constants(self, tmp_path):
