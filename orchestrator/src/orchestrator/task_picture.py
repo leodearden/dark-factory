@@ -19,6 +19,8 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 
 from orchestrator.overrides import OverrideRow
+from orchestrator.scheduler_priority_lookup import combine_priority, pin_orders
+from orchestrator.task_priority import TaskPriority
 
 
 @dataclass(frozen=True)
@@ -45,3 +47,9 @@ class TaskPicture:
     overrides: Mapping[str, OverrideRow]
     effective_priorities: Mapping[str, str]
     transitive_counts: Mapping[str, int]
+
+    def priority_of(self, task_id: str) -> TaskPriority:
+        """*task_id*'s base tier in this picture combined with the pins in force."""
+        return combine_priority(
+            task_id, self.effective_priorities.get(task_id), pin_orders(self.overrides),
+        )
