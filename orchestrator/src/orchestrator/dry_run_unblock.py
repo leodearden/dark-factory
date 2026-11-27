@@ -39,6 +39,7 @@ from shared.git_read_rules import git_read_rules
 from shared.transcript_archive import archive_task_transcripts
 
 from orchestrator.agents.invoke import invoke_agent
+from orchestrator.agents.lane_task_guidance import UNLINKED_TASK_STATE_GUIDANCE
 from orchestrator.agents.sandbox_dispatch import (
     SandboxUnavailable,
     get_backend,
@@ -330,6 +331,11 @@ _DISALLOWED_TOOLS: list[str] = [
 _GRANTED_TOOLS_LINE: str = (
     f'**Granted tools:** {", ".join(_ALLOWED_TOOLS)}. '
     'Every Bash command no rule above admits is denied permanently: a retry is denied again.'
+)
+
+_UNLINKED_TASK_STATE_SOURCES: str = (
+    'Read reviews at the Reviews directory path above, and task metadata with '
+    'mcp__fused-memory__get_task.'
 )
 
 _INVESTIGATION_ENV_OVERRIDES: Mapping[str, str] = MappingProxyType({
@@ -716,7 +722,8 @@ async def run_dry_run_unblock(
             f'Worktree: {worktree}\n'
             f'Block reason: {reason}\n'
             f'Detail: {detail or "(none)"}\n'
-            f'**Reviews directory:** {_reviews_directory(worktree, task_id, reviews_dir)}\n'
+            f'**Reviews directory:** {_reviews_directory(worktree, task_id, reviews_dir)}\n\n'
+            f'{UNLINKED_TASK_STATE_GUIDANCE} {_UNLINKED_TASK_STATE_SOURCES}\n\n'
             f'{_GRANTED_TOOLS_LINE}\n\n'
             f'{task_context.block}\n\n'
             'Investigate and emit your structured proposal.'

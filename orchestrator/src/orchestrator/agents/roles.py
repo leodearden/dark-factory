@@ -681,13 +681,9 @@ MANDATED_STAGING_COMMAND = 'git add -- .'
 # LANE_TASK_LINKS_SECTION, the links this opening refers back to.
 _TASK_DIR_NEVER_COMMITTED = """\
 `.task/` inside this worktree is orchestrator state: the two links described
-under "The .task/ links", plus the Claude config dir. Those links are the only
-task state exposed here: `metadata.json` and the `reviews/` and `verdicts/`
-directories stay in orchestrator storage outside this worktree, so a read of
-them under `.task/` fails by design — the task details you need are in your
-briefing. `.task/` must NEVER be committed. It is gitignored at the repo root,
-so an ordinary staging command already excludes it — no exclusion pathspec is
-needed. Never force-add `.task/` (`git add -f .task/...`). As a backstop, a
+under "The .task/ links", plus the Claude config dir. `.task/` must NEVER be
+committed. It is gitignored at the repo root, so an ordinary staging command
+already excludes it — no exclusion pathspec is needed. Never force-add `.task/` (`git add -f .task/...`). As a backstop, a
 pre-commit hook silently strips any `.task/` path that still ends up staged —
 but that is defense-in-depth, not the only guard.
 
