@@ -112,7 +112,9 @@ MARKUP_JOURNAL_MAX_LINE_BYTES = 8192
 
 #: The identity a line must carry even at the floor — who leaked, from which
 #: tool, into which parameter, when, and with what outcome. Exactly the question
-#: the storm escalation asks a human to answer and gives them no way to.
+#: the storm escalation asks a human to answer and gives them no way to. On a
+#: plan-tools stored-markup line, ``tool`` is the plan field's writer and ``ts``
+#: is when a read found the damage, not when it leaked.
 MARKUP_JOURNAL_FLOOR_KEYS = ('ts', 'server', 'subject_task_id', 'tool', 'param', 'outcome')
 
 #: The two disclosure keys, NAMESPACED under ``journal_`` because everything

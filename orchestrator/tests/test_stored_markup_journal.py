@@ -16,6 +16,8 @@ from fastmcp.exceptions import ToolError
 
 from orchestrator.mcp.plan_markup_repair import MARKUP_REPAIRS_KEY
 from orchestrator.mcp.stored_markup_journal import (
+    READ_BY_ROLE_KEY,
+    READ_BY_TOOL_KEY,
     STORED_MARKUP_FACT,
     StoredMarkupJournalMiddleware,
 )
@@ -63,17 +65,19 @@ class FirstLineRaisingJournal(RecordingJournal):
         return await super().__call__(line)
 
 
-def toy_server(journal: RecordingJournal, response: Any) -> FastMCP:
+def toy_server(
+    journal: RecordingJournal, response: Any, reader_role: str | None = None,
+) -> FastMCP:
     server = FastMCP('stored-markup-journal-harness')
-    server.add_middleware(StoredMarkupJournalMiddleware(journal))
+    server.add_middleware(StoredMarkupJournalMiddleware(journal, reader_role=reader_role))
 
     @server.tool
     def respond() -> dict[str, Any]:
         return response
 
     @server.tool
-    def say() -> str:
-        return 'plain text, no structured content to read'
+    def say():
+        return 'unannotated, so the result carries no structured content'
 
     @server.tool
     def refuse() -> dict[str, Any]:
@@ -87,8 +91,13 @@ async def call(server: FastMCP, tool: str) -> Any:
         return await client.call_tool(tool, {})
 
 
-def journalled(fact: dict[str, Any]) -> dict[str, Any]:
-    return {**fact, 'fact': STORED_MARKUP_FACT}
+def journalled(fact: dict[str, Any], reader_role: str | None = None) -> dict[str, Any]:
+    return {
+        **fact,
+        'fact': STORED_MARKUP_FACT,
+        READ_BY_TOOL_KEY: 'respond',
+        READ_BY_ROLE_KEY: reader_role,
+    }
 
 
 class TestDisclosedFactsAreJournalled:
@@ -103,12 +112,29 @@ class TestDisclosedFactsAreJournalled:
         assert result.structured_content == response
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize('tool', ['respond', 'say'], ids=['dict-without-key', 'unstructured'])
-    async def test_a_result_disclosing_nothing_journals_nothing(self, tool: str):
+    async def test_each_line_names_the_role_the_host_serves(self):
+        journal = RecordingJournal()
+        response = {'status': 'ok', MARKUP_REPAIRS_KEY: [UNREPAIRABLE_FACT]}
+
+        await call(toy_server(journal, response, reader_role='implementer'), 'respond')
+
+        assert journal.lines == [journalled(UNREPAIRABLE_FACT, reader_role='implementer')]
+
+    @pytest.mark.asyncio
+    async def test_a_dict_result_without_the_key_journals_nothing(self):
         journal = RecordingJournal()
 
-        await call(toy_server(journal, {'status': 'ok'}), tool)
+        await call(toy_server(journal, {'status': 'ok'}), 'respond')
 
+        assert journal.lines == []
+
+    @pytest.mark.asyncio
+    async def test_a_result_with_no_structured_content_journals_nothing(self):
+        journal = RecordingJournal()
+
+        result = await call(toy_server(journal, {}), 'say')
+
+        assert result.structured_content is None
         assert journal.lines == []
 
 

@@ -14,8 +14,10 @@ was shown keeps the response the single source of what was disclosed.
 
 Each line is the fact as disclosed, tagged :data:`STORED_MARKUP_FACT`, which
 says "damage already stored was found by this read", never "this call leaked".
-What a line may carry is ``orchestrator/src/orchestrator/mcp/markup_journal.py``'s
-rule.
+The fact's ``tool`` is the field's writer, so the read is named apart:
+:data:`READ_BY_TOOL_KEY` is the invoked tool and :data:`READ_BY_ROLE_KEY` the
+role the host serves, ``None`` when it was not told. What a line may carry is
+``orchestrator/src/orchestrator/mcp/markup_journal.py``'s rule.
 """
 
 from __future__ import annotations
@@ -33,11 +35,18 @@ from orchestrator.mcp.plan_markup_repair import MARKUP_REPAIRS_KEY
 logger = logging.getLogger(__name__)
 
 STORED_MARKUP_FACT = 'stored_markup_detected'
+READ_BY_TOOL_KEY = 'read_by_tool'
+READ_BY_ROLE_KEY = 'read_by_role'
 
 
 class StoredMarkupJournalMiddleware(Middleware):
-    def __init__(self, journal: Callable[[dict[str, Any]], Awaitable[object]]) -> None:
+    def __init__(
+        self,
+        journal: Callable[[dict[str, Any]], Awaitable[object]],
+        reader_role: str | None = None,
+    ) -> None:
         self._journal = journal
+        self._reader_role = reader_role
 
     async def on_call_tool(
         self,
@@ -45,9 +54,13 @@ class StoredMarkupJournalMiddleware(Middleware):
         call_next: CallNext[mt.CallToolRequestParams, ToolResult],
     ) -> ToolResult:
         result = await call_next(context)
+        reader = {
+            READ_BY_TOOL_KEY: context.message.name,
+            READ_BY_ROLE_KEY: self._reader_role,
+        }
         for fact in _disclosed_facts(result.structured_content):
             try:
-                await self._journal({**fact, 'fact': STORED_MARKUP_FACT})
+                await self._journal({**fact, 'fact': STORED_MARKUP_FACT, **reader})
             except Exception:
                 logger.exception(
                     'stored markup journal: could not journal the fact for %s.%s',

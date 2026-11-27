@@ -21,6 +21,7 @@ from typing import Any
 
 import pytest
 from _markup_helpers import INVOKE_CLOSER, closer, invoke_opener, param_opener
+from _markup_journal_reader import lines_of
 from _markup_sink_rig import RecordingQueue, seed_plan
 from escalation.models import Escalation
 from fastmcp import Client
@@ -28,9 +29,14 @@ from fastmcp.exceptions import ToolError
 
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.mcp import markup_journal, plan_markup_repair, plan_markup_stamp, plan_tools
-from orchestrator.mcp.stored_markup_journal import STORED_MARKUP_FACT
+from orchestrator.mcp.stored_markup_journal import (
+    READ_BY_ROLE_KEY,
+    READ_BY_TOOL_KEY,
+    STORED_MARKUP_FACT,
+)
 
 SUBJECT = '3382'
+READER_ROLE = 'implementer'
 
 _DECISION_PROSE = 'Carry the lane plan forward into the task meta directory untouched.'
 _ABSORBED_RATIONALE_PROSE = 'A re-dispatched lane must resume from the very plan it confirmed.'
@@ -81,7 +87,7 @@ class Lane:
         monkeypatch.setattr(
             plan_tools, '_escalation_channel', lambda root: (Escalation, RecordingQueue())
         )
-        self.server = plan_tools.create_server(self.artifacts)
+        self.server = plan_tools.create_server(self.artifacts, caller_role=READER_ROLE)
         self._steps = 0
 
     async def call(self, tool: str, arguments: dict[str, Any]) -> Any:
@@ -118,14 +124,7 @@ class Lane:
         return markup_journal.journal_path(self.root, 'plan-tools')
 
     def lines(self, fact: str) -> list[dict[str, Any]]:
-        if not self.journal_file.exists():
-            return []
-        parsed = [
-            json.loads(line)
-            for line in self.journal_file.read_text(encoding='utf-8').splitlines()
-            if line.strip()
-        ]
-        return [line for line in parsed if line.get('fact') == fact]
+        return lines_of(self.root, 'plan-tools', fact)
 
 
 @pytest.fixture()
@@ -169,6 +168,9 @@ class TestStoredDamageReadByAnAcceptedCallIsJournalled:
             ('design_decisions', 1, 'rationale', 'repaired'),
         ]
         assert {line['subject_task_id'] for line in stored} == {SUBJECT}
+        assert {(line[READ_BY_TOOL_KEY], line[READ_BY_ROLE_KEY]) for line in stored} == {
+            ('add_plan_step', READER_ROLE),
+        }
 
     @pytest.mark.asyncio
     async def test_a_second_accepted_call_journals_no_new_stored_line(self, lane: Lane):
