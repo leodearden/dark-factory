@@ -1603,6 +1603,9 @@ class RemoteRunner:
         # merge worker caches its runners for the process lifetime
         # (_ensure_host_allocator), so the push fires once per new main tip.
         self._last_pushed_main_sha: str | None = None
+        # Likewise the tag listing the last tag mirror delivered, so a cached merge
+        # runner pushes the tag set only when it changes.
+        self._last_mirrored_tags: tuple[str, ...] | None = None
         # β: the in-flight request-id, so cancel_verify() can issue a targeted cancel.
         # One slot: claimed by _dispatch before its first await, cleared when it unwinds.
         self._inflight_request_id: str | None = None
@@ -2092,7 +2095,8 @@ class RemoteRunner:
         verify does not run: a failed push raises RunnerUnavailable.  An
         unreadable listing is this dispatcher's fault, not the host's, so it is
         logged and skipped; an empty one is skipped because a glob refspec
-        matching nothing makes git push exit 1.
+        matching nothing makes git push exit 1, and so is the listing this
+        runner last mirrored successfully.
 
         INV-2 mirror semantics (task 2884, PRD §3.1), as for main: a refused
         push (typically a remote tag pointing elsewhere) is retried ONCE with a
@@ -2107,7 +2111,7 @@ class RemoteRunner:
                 self.name, self._cwd,
             )
             return
-        if not tags:
+        if not tags or tags == self._last_mirrored_tags:
             return
         try:
             await self._push(self._git_remote, _TAG_MIRROR_REFSPEC, cwd=self._cwd)
@@ -2127,6 +2131,7 @@ class RemoteRunner:
                     'to_head': None,
                     'forced': True,
                 })
+        self._last_mirrored_tags = tags
 
     async def _dispatch(
         self,
