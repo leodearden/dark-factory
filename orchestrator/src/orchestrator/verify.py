@@ -4484,7 +4484,9 @@ async def _narrow_merge_gate_decision_body(
     )
     if classification.miss is not None:
         return NarrowGateDecision.full(classification.miss, changed)
-    plan = narrow_gate_plan.narrow_gate_plan(
+    # The guard-family scan reads and parses thousands of test files: keep it off the event loop (INV-8).
+    plan = await asyncio.to_thread(
+        narrow_gate_plan.narrow_gate_plan,
         classification.resolution, changed, modules,
         list_pkg_tests=lister, worktree_reader=_worktree_reader(worktree, cache={}),
     )
@@ -4505,7 +4507,7 @@ async def _narrow_gate_evidence_miss(
     clobbered worktree (incident 83336a32) would otherwise shrink what the narrow gate runs.
     """
     present = [change.path for change in delta if change.status != 'D']
-    absent = next((path for path in (*present, *sorted(module_tests)) if not (worktree / path).is_file()), None)
+    absent = await asyncio.to_thread(_first_absent_file, worktree, (*present, *sorted(module_tests)))
     if absent is not None:
         return GateMiss(MissReason.EVIDENCE_ABSENT, absent)
     if _merge_config_only_diff_forces_full_gate(config, [change.path for change in delta]):
@@ -4513,6 +4515,11 @@ async def _narrow_gate_evidence_miss(
     if await _verify_pipeline_guard_requires_full_gate(worktree, present):
         return GateMiss(MissReason.FORCED_FULL_GATE)
     return None
+
+
+def _first_absent_file(worktree: Path, paths: Sequence[str]) -> str | None:
+    """The first of *paths* that is not a file under *worktree*; thousands of stats, so callers run it off the event loop (INV-8)."""
+    return next((path for path in paths if not (worktree / path).is_file()), None)
 
 
 def _single_subproject_prefix(files: list[str], worktree: Path | None) -> str | None:

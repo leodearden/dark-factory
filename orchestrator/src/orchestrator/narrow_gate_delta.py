@@ -64,7 +64,8 @@ async def classify_tree_delta(repo: Path, base: str, head: str, docs_paths: Sequ
         return full_gate(MissReason.DELTA_UNREADABLE)
     to_read = [c.path for c in delta if c.status == 'M' and not is_docs_path(c.path, docs_paths)]
     pairs = await _read_blob_pairs(repo, base, head, to_read) if to_read else {}
-    return classify_change(delta, docs_paths, lambda path: pairs.get(path, (None, None)))
+    # Parsing and dumping both sides of a large module costs over a second: keep it off the event loop (INV-8).
+    return await asyncio.to_thread(classify_change, delta, docs_paths, lambda path: pairs.get(path, (None, None)))
 
 
 async def classify_branch_change(

@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import ast
-import copy
 import functools
 import re
 from collections.abc import Callable, Mapping, Sequence
@@ -165,10 +164,9 @@ def python_comments_only(base_text: str, head_text: str) -> bool:
     if _interpreter_header(base_text) != _interpreter_header(head_text):
         return False
     try:
-        base_tree, head_tree = ast.parse(base_text), ast.parse(head_text)
+        return _docstring_free_dump(base_text) == _docstring_free_dump(head_text)
     except SyntaxError:
         return False
-    return _docstring_free_dump(base_tree) == _docstring_free_dump(head_tree)
 
 
 def _interpreter_header(text: str) -> tuple[str | None, str | None]:
@@ -178,12 +176,13 @@ def _interpreter_header(text: str) -> tuple[str | None, str | None]:
     return shebang, next(cookies, None)
 
 
-def _docstring_free_dump(tree: ast.Module) -> str:
-    stripped = copy.deepcopy(tree)
-    for node in ast.walk(stripped):
+def _docstring_free_dump(source: str) -> str:
+    """*source*'s AST dump with every docstring removed; the tree is parsed here and never escapes, so stripping it in place is safe."""
+    tree = ast.parse(source)
+    for node in ast.walk(tree):
         if isinstance(node, _DOCSTRING_OWNERS) and _starts_with_docstring(node.body):
             node.body = node.body[1:]
-    return ast.dump(stripped, include_attributes=False)
+    return ast.dump(tree, include_attributes=False)
 
 
 def _starts_with_docstring(body: Sequence[ast.stmt]) -> bool:
