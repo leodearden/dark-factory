@@ -24,7 +24,6 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
-from _host_pytest_temp_root import listing, seed_dead_session_dirs
 from _orch_helpers import VERIFY_CLI_PER_TEST_TIMEOUT
 from shared.defect_plugin_location import DEFECT_PLUGIN_DIR
 
@@ -318,7 +317,7 @@ def _make_fixture_project(root: Path, *, registers_defect_marker: bool = False) 
     only when the project registers the marker itself, as every workspace member does.
     Its sessions keep their basetemp inside the project, never in the host-wide pytest
     temp root, whose exit-time cleanup of other sessions' dead dirs is unbounded; see
-    ``test_an_xdist_leg_leaves_the_hosts_default_pytest_temp_root_untouched``.
+    ``test_an_xdist_leg_resolves_its_pytest_basetemp_inside_the_fixture_project``.
     """
     root.mkdir(parents=True)
     own_defect = '    defect(ref): registered by the project\n' if registers_defect_marker else ''
@@ -398,21 +397,20 @@ class TestVerifyLegInjectionEndToEnd:
         assert all(kw.get('defect_plugin') is True for _, kw in legs)
         assert json.loads(collection_map_path(report).read_text()) == _EXPECTED_FIXTURE_MAP
 
-    def test_an_xdist_leg_leaves_the_hosts_default_pytest_temp_root_untouched(
+    def test_an_xdist_leg_resolves_its_pytest_basetemp_inside_the_fixture_project(
         self, tmp_path, monkeypatch,
     ):
         monkeypatch.delenv('PYTHONPATH', raising=False)
-        host = tmp_path / 'host-temp'
-        seed_dead_session_dirs(host)
-        before = listing(host)
-        monkeypatch.setenv('PYTEST_DEBUG_TEMPROOT', str(host))
+        contained = tmp_path / 'contained-temproot'
+        contained.mkdir()
+        monkeypatch.setenv('PYTEST_DEBUG_TEMPROOT', str(contained))
         worktree = _make_fixture_project(tmp_path / 'worktree')
-        recorded = worktree / 'pkg' / 'tests' / 'inherited-env.json'
-        (recorded.parent / 'test_session_env.py').write_text(
-            'import json\nimport os\nimport pathlib\n\nfrom xdist import get_xdist_worker_id\n\n\n'
-            'def test_records_its_session_env(request):\n'
-            "    pathlib.Path(__file__).with_name('inherited-env.json').write_text(json.dumps({\n"
-            "        'temproot': os.environ.get('PYTEST_DEBUG_TEMPROOT', ''),\n"
+        recorded = worktree / 'pkg' / 'tests' / 'session.json'
+        (recorded.parent / 'test_session.py').write_text(
+            'import json\nimport pathlib\n\nfrom xdist import get_xdist_worker_id\n\n\n'
+            'def test_records_its_session(request, tmp_path_factory):\n'
+            "    pathlib.Path(__file__).with_name('session.json').write_text(json.dumps({\n"
+            "        'basetemp': str(tmp_path_factory.getbasetemp()),\n"
             "        'xdist_workerid': get_xdist_worker_id(request),\n"
             "    }), encoding='utf-8')\n",
             encoding='utf-8',
@@ -423,24 +421,27 @@ class TestVerifyLegInjectionEndToEnd:
         )
 
         assert result.passed, result.test_output
-        session_env = json.loads(recorded.read_text(encoding='utf-8'))
-        assert session_env['temproot'] == str(host), (
-            'the nested session never inherited PYTEST_DEBUG_TEMPROOT, so it would '
-            'use the real host temp root and leave the stand-in untouched with or '
-            'without --basetemp: the assertion below would pass vacuously'
+        session = json.loads(recorded.read_text(encoding='utf-8'))
+        worker_id = session['xdist_workerid']
+        assert worker_id.startswith('gw'), (
+            'the recorder ran outside any xdist worker, so the leg was not the xdist '
+            "leg this test is about, and `.parent` below would name the session "
+            "basetemp's parent, not an xdist controller's basetemp "
+            f'(worker id {worker_id!r})'
         )
-        assert session_env['xdist_workerid'].startswith('gw'), (
-            'the recorder ran outside any xdist worker, so the leg had no xdist '
-            'controller, which is what resolves a basetemp and arms the exit-time '
-            'sweep: the assertion below would pass vacuously '
-            f"(worker id {session_env['xdist_workerid']!r})"
+        worker_basetemp = Path(session['basetemp'])
+        assert worker_basetemp.name == f'popen-{worker_id}', (
+            "xdist no longer lays out a worker's basetemp as "
+            '<controller basetemp>/popen-<worker id>, so `.parent` below no longer '
+            f"names the controller's basetemp\nworker basetemp: {worker_basetemp}"
         )
-        after = listing(host)
-        assert after == before, (
-            "a nested xdist verify leg must not create, lock or clean dirs in the "
-            "host's default pytest temp root: its exit-time cleanup of other "
-            "sessions' dead dirs is unbounded and runs before the leg's child exits\n"
-            f'before: {before}\nafter:  {after}'
+        controller_basetemp = worker_basetemp.parent
+        assert controller_basetemp.is_relative_to(worktree.resolve()), (
+            'a nested xdist verify leg must resolve its basetemp inside the fixture '
+            'project: a basetemp under PYTEST_DEBUG_TEMPROOT makes a numbered dir '
+            "there and arms pytest's unbounded exit-time sweep of other sessions' "
+            f'dead dirs\ncontroller basetemp: {controller_basetemp}\n'
+            f'fixture project:     {worktree.resolve()}'
         )
 
     def test_task_cost_archive_carries_the_map(self, tmp_path, monkeypatch):
