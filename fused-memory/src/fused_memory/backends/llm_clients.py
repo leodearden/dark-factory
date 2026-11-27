@@ -9,8 +9,13 @@ from contextvars import ContextVar
 from typing import Any
 
 from graphiti_core.llm_client.config import DEFAULT_MAX_TOKENS, ModelSize
+from graphiti_core.llm_client.openai_client import OpenAIClient
 from graphiti_core.llm_client.openai_generic_client import OpenAIGenericClient
 from graphiti_core.prompts.models import Message
+from openai.types.chat import ChatCompletionMessageParam
+from openai.types.responses import EasyInputMessageParam, ResponseInputParam
+from openai.types.shared import ReasoningEffort
+from openai.types.shared_params import Reasoning
 from pydantic import BaseModel
 
 # Prefixed to the inlined schema. Phrased as an instruction rather than a bare
@@ -232,3 +237,59 @@ class ForceJsonObjectOpenAIGenericClient(TokenRecordingOpenAIGenericClient):
         # that silently read it as empty.
         response_model.model_validate(result)
         return result
+
+
+def _responses_input(messages: list[ChatCompletionMessageParam]) -> ResponseInputParam:
+    """graphiti's converted messages as Responses input. graphiti emits only system and user
+    messages with text content, so anything else is a defect, refused before it is sent."""
+    converted: ResponseInputParam = []
+    for message in messages:
+        role, content = message['role'], message.get('content')
+        if role not in ('system', 'user') or not isinstance(content, str):
+            raise TypeError(f'a {role} message with {type(content).__name__} content is not Responses input')
+        converted.append(EasyInputMessageParam(role=role, content=content))
+    return converted
+
+
+class ExplicitEffortOpenAIClient(OpenAIClient):
+    """graphiti's OpenAIClient for a reasoning model graphiti_core 0.28.2 does not recognise by name.
+
+    graphiti treats only gpt-5, o1 and o3 names as reasoning models: any other
+    model is sent temperature and never sent reasoning, and gpt-6.1-sol answers
+    a temperature with HTTP 400. This client sends no temperature, and exactly
+    the chosen reasoning effort (esc-9065-2). It wraps an already-built client,
+    reusing its SDK client, config, max_tokens and token tracker. graphiti's own
+    ``reasoning`` stays at its default and is never read: ``reasoning_effort``
+    is the one copy.
+    """
+
+    def __init__(self, built: OpenAIClient, effort: ReasoningEffort) -> None:
+        if effort is None:
+            raise ValueError('an effort client sends a chosen effort; build the configured client instead')
+        super().__init__(config=built.config, client=built.client, max_tokens=built.max_tokens)
+        self.token_tracker = built.token_tracker
+        self._reasoning_effort: ReasoningEffort = effort
+
+    @property
+    def reasoning_effort(self) -> ReasoningEffort:
+        """The effort every structured call sends."""
+        return self._reasoning_effort
+
+    async def _create_structured_completion(
+        self, model: str, messages: list[ChatCompletionMessageParam], temperature: float | None,
+        max_tokens: int, response_model: type[BaseModel], reasoning: str | None = None,
+        verbosity: str | None = None,
+    ) -> Any:
+        return await self.client.responses.parse(
+            model=model, input=_responses_input(messages), max_output_tokens=max_tokens,
+            text_format=response_model, reasoning=Reasoning(effort=self._reasoning_effort),
+        )
+
+    async def _create_completion(
+        self, model: str, messages: list[ChatCompletionMessageParam], temperature: float | None,
+        max_tokens: int, response_model: type[BaseModel] | None = None, reasoning: str | None = None,
+        verbosity: str | None = None,
+    ) -> Any:
+        raise NotImplementedError(
+            'a JSON-mode chat completion cannot carry reasoning.effort, so it is never sent without it',
+        )

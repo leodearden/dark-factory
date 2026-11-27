@@ -96,15 +96,12 @@ from graphiti_core.search.search_utils import RELEVANT_SCHEMA_LIMIT
 from graphiti_core.utils.maintenance.dedup_helpers import _normalize_string_exact
 from graphiti_core.utils.maintenance.edge_operations import extract_edges
 from graphiti_core.utils.maintenance.node_operations import extract_nodes
-from openai.types.chat import ChatCompletionMessageParam
-from openai.types.responses import EasyInputMessageParam, ResponseInputParam
 from openai.types.shared import ReasoningEffort
-from openai.types.shared_params import Reasoning
-from pydantic import BaseModel
 
 from fused_memory.backends.falkor_read_only import ReadOnlyGraphReader
 from fused_memory.backends.falkor_string_bounds import exact_string_upper_bound
 from fused_memory.backends.graphiti_client import build_llm_client
+from fused_memory.backends.llm_clients import ExplicitEffortOpenAIClient
 from fused_memory.backends.llm_token_usage import (
     LlmTokenUsage,
     TokenMeasurement,
@@ -269,67 +266,19 @@ class ArmClientMismatch(ValueError):
     that the configured client class cannot send, or an endpoint whose variables are unset."""
 
 
-def _responses_input(messages: list[ChatCompletionMessageParam]) -> ResponseInputParam:
-    """graphiti's converted messages as Responses input. graphiti emits only system and user
-    messages with text content, so anything else is a defect, refused before it is sent."""
-    converted: ResponseInputParam = []
-    for message in messages:
-        role, content = message['role'], message.get('content')
-        if role not in ('system', 'user') or not isinstance(content, str):
-            raise TypeError(f'a {role} message with {type(content).__name__} content is not Responses input')
-        converted.append(EasyInputMessageParam(role=role, content=content))
-    return converted
-
-
-class ExplicitEffortOpenAIClient(OpenAIClient):
-    """graphiti's OpenAIClient for a reasoning model graphiti_core 0.28.2 does not recognise by name.
-
-    graphiti treats only gpt-5, o1 and o3 names as reasoning models: any other
-    model is sent temperature and never sent reasoning. This client sends no
-    temperature, and exactly the arm's reasoning effort (esc-9065-2). It wraps
-    the client build_llm_client built, reusing its SDK client, config,
-    max_tokens and token tracker. graphiti's own ``reasoning`` stays at its
-    default and is never read: ``reasoning_effort`` is the one copy.
-    """
+class ArmEffortClient(ExplicitEffortOpenAIClient):
+    """An ExplicitEffortOpenAIClient labelled with the arm endpoint build_arm_llm built it on."""
 
     def __init__(
         self, built: OpenAIClient, effort: ReasoningEffort, endpoint: ArmEndpoint = ArmEndpoint.configured,
     ) -> None:
-        if effort is None:
-            raise ValueError('an effort client sends a chosen effort; build the configured client instead')
-        super().__init__(config=built.config, client=built.client, max_tokens=built.max_tokens)
-        self.token_tracker = built.token_tracker
-        self._reasoning_effort: ReasoningEffort = effort
+        super().__init__(built, effort)
         self._endpoint = endpoint
-
-    @property
-    def reasoning_effort(self) -> ReasoningEffort:
-        """The effort every structured call sends."""
-        return self._reasoning_effort
 
     @property
     def endpoint(self) -> ArmEndpoint:
         """The endpoint build_arm_llm built the wrapped client on."""
         return self._endpoint
-
-    async def _create_structured_completion(
-        self, model: str, messages: list[ChatCompletionMessageParam], temperature: float | None,
-        max_tokens: int, response_model: type[BaseModel], reasoning: str | None = None,
-        verbosity: str | None = None,
-    ) -> Any:
-        return await self.client.responses.parse(
-            model=model, input=_responses_input(messages), max_output_tokens=max_tokens,
-            text_format=response_model, reasoning=Reasoning(effort=self._reasoning_effort),
-        )
-
-    async def _create_completion(
-        self, model: str, messages: list[ChatCompletionMessageParam], temperature: float | None,
-        max_tokens: int, response_model: type[BaseModel] | None = None, reasoning: str | None = None,
-        verbosity: str | None = None,
-    ) -> Any:
-        raise NotImplementedError(
-            'a JSON-mode chat completion cannot carry reasoning.effort, so it is never sent without it',
-        )
 
 
 def client_reasoning_effort(llm: LLMClient) -> str | None:
@@ -377,7 +326,7 @@ def build_arm_llm(
             f'reasoning effort {llm.reasoning_effort} is sent on the Responses API, which the '
             f'{cfg.llm.provider}/{cfg.llm.client_class} client ({type(client).__name__}) does not serve',
         )
-    return ExplicitEffortOpenAIClient(client, llm.reasoning_effort, llm.endpoint)
+    return ArmEffortClient(client, llm.reasoning_effort, llm.endpoint)
 
 
 def in_batch_dedupe(edges: Iterable[EntityEdge]) -> list[EntityEdge]:
