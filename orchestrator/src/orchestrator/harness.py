@@ -12746,6 +12746,7 @@ class Harness:
             task_client=SchedulerChronicFlakeTaskClient(self.scheduler, self.config.project_root),
             escalation_queue=self._escalation_queue,
             pass_outcome_hooks=lane_pass_outcome_hooks(self.config, self._escalation_queue),
+            stopping=lambda: self._draining,
         )
         if not worker.acquire_lock():
             logger.warning(
