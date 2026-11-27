@@ -138,7 +138,11 @@ from orchestrator.verify_cmd import (
     with_junitxml,
     with_pytest_timeout,
 )
-from orchestrator.verify_command_resources import CommandCapture, watch_relocations
+from orchestrator.verify_command_resources import (
+    CommandCapture,
+    CommandResources,
+    watch_relocations,
+)
 from orchestrator.verify_event_channel import VerifyEventChannel, allocate_verify_event_log
 
 logger = logging.getLogger(__name__)
@@ -3259,6 +3263,9 @@ def _build_summary_payload(
     read with ``.get`` like ``segments``, so a hand-built remote run reads
     None: not recorded.
 
+    ``resources`` (task 6355) is the command's C4 record, which the budget
+    census reads; ``.get`` serves hand-built remote runs, which read None.
+
     A NEGATIVE rc is not a quiet outcome — it is asyncio reporting that the
     process was terminated by signal ``-rc`` and never got to exit at all, so
     it is the LOUDEST possible outcome and sorts above every non-negative rc
@@ -3297,6 +3304,7 @@ def _build_summary_payload(
                 'load': r.get('load'),
                 'slot_wait_secs': r.get('slot_wait_secs'),
                 'carried_over': r.get('carried_over'),
+                'resources': r.get('resources'),
             }
             for r in active_runs
         ],
@@ -5089,6 +5097,9 @@ class CheckRun:
     # True when verify's scope launcher refused to start this leg's command
     # (task 7339). LAST field, as above, and kept out of ``to_dict``.
     scope_launch_refused: bool = False
+    # C4 (task 6355): shape and states at verify_command_resources.py::CommandResources.
+    # None when no single command ran (skipped, or segmented: see segments[].resources).
+    resources: 'CommandResources | None' = None
 
     def __post_init__(self) -> None:
         if self.carried_over and self.cmd is None:
@@ -5115,9 +5126,9 @@ class CheckRun:
     def to_dict(self) -> dict:
         """Serialise to the runs-dict schema consumed by ``_persist_attempt_logs``/
         ``_build_summary_payload``/``archive_verify_logs``
-        (all take ``list[dict]``) — the exact 12-key shape (label/cmd/rc/output/
+        (all take ``list[dict]``) — the exact 13-key shape (label/cmd/rc/output/
         timed_out/started_at/duration_secs/segments/load/slot_wait_secs/admission/
-        carried_over), 7 of which were previously hand-built inline in
+        carried_over/resources), 7 of which were previously hand-built inline in
         ``run_verification``.
 
         ``started_at`` is normalised via ``or ''``: a skipped check's
@@ -5143,6 +5154,9 @@ class CheckRun:
 
         ``carried_over`` (task 5624) is emitted unconditionally as well: True
         marks a leg whose timing belongs to the attempt's first pass.
+
+        ``resources`` (task 6355) is emitted unconditionally: absent means the
+        run predates the C4 record, ``None`` means no single command ran.
         """
         return {
             'label': self.label,
@@ -5157,6 +5171,7 @@ class CheckRun:
             'slot_wait_secs': self.slot_wait_secs,
             'admission': None if self.admission is None else self.admission.to_dict(),
             'carried_over': self.carried_over,
+            'resources': None if self.resources is None else self.resources.to_dict(),
         }
 
 

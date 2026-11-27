@@ -147,6 +147,7 @@ class TestCheckRun:
             'slot_wait_secs': None,
             'admission': None,
             'carried_over': False,
+            'resources': None,
         }
 
     def test_carried_over_defaults_to_false(self):
