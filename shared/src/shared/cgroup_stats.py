@@ -30,6 +30,8 @@ from shared.psi import parse_pressure_totals
 
 __all__ = [
     'CGROUP_ROOT',
+    'MEMORY_PEAK',
+    'SWAP_PEAK',
     'CgroupReading',
     'PressureResource',
     'PressureTotals',
@@ -46,6 +48,8 @@ MEMORY_STAT = 'memory.stat'
 MEMORY_EVENTS = 'memory.events'
 MEMORY_CURRENT = 'memory.current'
 SWAP_CURRENT = 'memory.swap.current'
+MEMORY_PEAK = 'memory.peak'
+SWAP_PEAK = 'memory.swap.peak'
 
 _T = TypeVar('_T')
 
@@ -78,6 +82,8 @@ class CgroupReading:
     memory_current: int | None
     swap_current: int | None
     pressure: Mapping[PressureResource, PressureTotals]
+    memory_peak: int | None
+    swap_peak: int | None
 
 
 @dataclass(frozen=True)
@@ -167,6 +173,8 @@ def read_cgroup(
             memory_current=files.parse(MEMORY_CURRENT, parse_single_value),
             swap_current=files.parse(SWAP_CURRENT, parse_single_value),
             pressure=files.pressure(),
+            memory_peak=files.parse(MEMORY_PEAK, parse_single_value),
+            swap_peak=files.parse(SWAP_PEAK, parse_single_value),
         )
     except _UnreadableFile as failure:
         return failure.unreadable
