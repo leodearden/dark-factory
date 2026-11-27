@@ -353,7 +353,6 @@ def _refuse_the_operators_roster_file(monkeypatch) -> None:
     The ORCH_VERIFY_HOSTS_FILE pin alone cannot see a test that rebuilds the
     environment (stripping every ORCH_ variable) before calling load_config.
     """
-    import orchestrator.config as config_module
     from orchestrator.verify_host_roster_file import RosterFileError, roster_file_path
 
     try:
@@ -370,7 +369,7 @@ def _refuse_the_operators_roster_file(monkeypatch) -> None:
             )
         return resolved
 
-    monkeypatch.setattr(config_module, "roster_file_path", guarded_roster_file_path)
+    monkeypatch.setattr("orchestrator.config.roster_file_path", guarded_roster_file_path)
 
 
 @pytest.fixture(autouse=True)
