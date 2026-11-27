@@ -31,6 +31,7 @@ from _verify_cache_fixtures import (
     cache_module,
     put_pytest_on_path,
 )
+from shared.testing_virtual_clock import virtual_clock_test
 
 from orchestrator.config import GitConfig, ModuleConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore, EventType
@@ -8047,7 +8048,6 @@ async def _open_hangs():
     return (0, '', '')
 
 
-@pytest.mark.asyncio
 class TestRemoteRunnerEnvProbeRun:
     """``await env_probe_run()`` opens (or reuses) a multiplexed ssh master,
     then returns a capture_env_fingerprint-compatible adapter whose probes
@@ -8055,13 +8055,12 @@ class TestRemoteRunnerEnvProbeRun:
     REMOTE_TOOL_PATH_PRELUDE (task 7097) so the non-login ssh shell finds
     ~/.local/bin tools the way RemoteRunner's own `uv sync` does."""
 
-    def _make_runner(self, *, responses=None, delay=0.0, open_reply=None):
+    def _make_runner(self, *, responses=None, open_reply=None):
         calls = []
         queue = list(responses or [])
 
         async def fake_run(argv, *, cwd=None):
             calls.append(argv[:])
-            await asyncio.sleep(delay)
             if argv[-1] == 'true':
                 return await open_reply() if open_reply is not None else (0, '', '')
             if queue:
@@ -8087,6 +8086,7 @@ class TestRemoteRunnerEnvProbeRun:
             '-o', 'ControlPath=~/.df-env-probe-%C',
         ]
 
+    @pytest.mark.asyncio
     async def test_opens_the_probe_master_then_probes_over_it(self):
         """The probe-only option set is spelled literally; the open is a bare `true`."""
         from orchestrator import verify_runner as vr
@@ -8101,6 +8101,7 @@ class TestRemoteRunnerEnvProbeRun:
             ['ssh', *opts, 'laptop.local', f'{vr.REMOTE_TOOL_PATH_PRELUDE} uv --version'],
         ]
 
+    @pytest.mark.asyncio
     async def test_one_open_serves_every_probe_of_an_adapter(self):
         runner, calls = self._make_runner()
         adapter = await runner.env_probe_run()
@@ -8113,6 +8114,7 @@ class TestRemoteRunnerEnvProbeRun:
         assert len(remote_cmds) == 4
 
     @pytest.mark.timing(reason='the per-call ssh probe budget is the behaviour under test; the blocking stall is deliberate')
+    @virtual_clock_test
     async def test_master_establishment_does_not_eat_the_first_probes_budget(self, monkeypatch):
         """The open and the first probe each spend 0.6s under their own 1.0s bound,
         where one shared budget would have timed the probe out.  The blocking sleep
@@ -8139,6 +8141,7 @@ class TestRemoteRunnerEnvProbeRun:
 
         assert await adapter(['uv', '--version']) == (0, 'uv 0.11.6\n', '')
 
+    @pytest.mark.asyncio
     async def test_a_hung_open_raises_runner_unavailable_and_issues_no_probe(self, monkeypatch):
         from orchestrator import verify_runner as vr
         monkeypatch.setattr(vr, '_SSH_PROBE_TIMEOUT_SECS', 0.05)
@@ -8157,6 +8160,7 @@ class TestRemoteRunnerEnvProbeRun:
             pytest.param(_open_cannot_spawn_ssh, id='ssh_spawn_oserror'),
         ],
     )
+    @pytest.mark.asyncio
     async def test_open_transport_failures_are_runner_unavailable(self, open_reply):
         from orchestrator.verify_runner import RunnerUnavailable
 
@@ -8165,6 +8169,7 @@ class TestRemoteRunnerEnvProbeRun:
             await runner.env_probe_run()
         assert len(calls) == 1
 
+    @pytest.mark.asyncio
     async def test_remote_command_leads_with_the_unquoted_path_prelude(self):
         """Task 7097: a non-login ssh shell lacks ~/.local/bin, so a bare
         `uv --version` exits 127 on a host where uv IS installed — a false
@@ -8182,12 +8187,14 @@ class TestRemoteRunnerEnvProbeRun:
         assert '$HOME/.local/bin' in remote_cmd
         assert remote_cmd.removeprefix(f'{REMOTE_TOOL_PATH_PRELUDE} ') == "sh -c 'echo a b'"
 
+    @pytest.mark.asyncio
     async def test_returns_run_result_tuple_unchanged(self):
         """(rc, stdout, stderr) passes through — satisfies capture's run contract."""
         runner, _ = self._make_runner(responses=[(0, 'uv 0.10.6\n', 'warn')])
         adapter = await runner.env_probe_run()
         assert await adapter(['uv', '--version']) == (0, 'uv 0.10.6\n', 'warn')
 
+    @pytest.mark.asyncio
     async def test_argv_elements_are_shlex_quoted(self):
         """An argv element needing quoting is quoted into the remote command string."""
         from orchestrator.verify_runner import REMOTE_TOOL_PATH_PRELUDE
@@ -8198,6 +8205,7 @@ class TestRemoteRunnerEnvProbeRun:
 
         assert calls[-1][-1] == f"{REMOTE_TOOL_PATH_PRELUDE} sh -c 'echo a b'"
 
+    @pytest.mark.asyncio
     async def test_capture_env_fingerprint_drives_probes_over_ssh(self):
         """End-to-end: capture_env_fingerprint(adapter) populates extra_probes."""
         from orchestrator.verify_runner import REMOTE_TOOL_PATH_PRELUDE, capture_env_fingerprint
@@ -8221,6 +8229,7 @@ class TestRemoteRunnerEnvProbeRun:
         assert calls[-2][-1] == f'{REMOTE_TOOL_PATH_PRELUDE} npx pyright --version'
         assert calls[-1][-1] == f'{REMOTE_TOOL_PATH_PRELUDE} uv --version'
 
+    @pytest.mark.asyncio
     async def test_check_env_opens_one_master_then_one_ssh_per_declared_probe(self):
         """Through DriftDetector.check_env and a REAL RemoteRunner: the remote
         side costs one handshake, not one per probe."""
