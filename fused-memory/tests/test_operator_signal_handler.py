@@ -296,7 +296,7 @@ class TestOperatorStopCallbackForceExit:
     """The first stop signal drains; a repeat inside the window is the same stop
     delivered twice (task 9493); a later second signal still forces exit, which
     is uvicorn's deliberate-second-Ctrl-C escape hatch, lost otherwise because
-    ``install_signal_handlers`` is neutered.
+    EmbeddedUvicornServer disables uvicorn's signal capture.
 
     The policy tests pass an explicit window, so they pin the behaviour rather
     than the production value; the ``default`` tests pin that value.

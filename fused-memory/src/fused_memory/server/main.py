@@ -528,16 +528,6 @@ class _ASGIExceptionShield:
             return
 
 
-def configure_uvicorn_logging():
-    for logger_name in ['uvicorn', 'uvicorn.error', 'uvicorn.access']:
-        uv_logger = logging.getLogger(logger_name)
-        uv_logger.handlers.clear()
-        handler = logging.StreamHandler(sys.stderr)
-        handler.setFormatter(logging.Formatter(LOG_FORMAT, datefmt=DATE_FORMAT))
-        uv_logger.addHandler(handler)
-        uv_logger.propagate = False
-
-
 def _require_http_transport_for_reconciliation(config: Any) -> None:
     """Guard: raise if reconciliation is enabled but transport is not 'http'.
 
@@ -1226,11 +1216,10 @@ async def run_server():
         elif transport == 'sse':
             await mcp.run_sse_async()
         elif transport == 'http':
-            import uvicorn
+            from fused_memory.server.embedded_uvicorn import EmbeddedUvicornServer
 
             display_host = 'localhost' if config.server.host == '0.0.0.0' else config.server.host
             logger.info(f'  MCP Endpoint: http://{display_host}:{config.server.port}/mcp/')  # mcp-url-sweep: allow display string in a startup log line, never fetched
-            configure_uvicorn_logging()
             starlette_app = mcp.streamable_http_app()
 
             # Return JSON (not plain-text) for 404s so that MCP SDK
@@ -1249,7 +1238,7 @@ async def run_server():
                 graceful_shutdown_timeout=config.server.graceful_shutdown_timeout,
                 keepalive_timeout=config.server.keepalive_timeout,
             )
-            server = uvicorn.Server(uv_config)
+            server = EmbeddedUvicornServer(uv_config)
             primary_socket = _claim_listener(systemd_listeners, config.server.port)
             if systemd_listeners:
                 logger.warning(
@@ -1278,14 +1267,12 @@ async def run_server():
                     task_interceptor=task_interceptor,
                     known_projects=_known_projects_map,
                 )
-            recon_server = uvicorn.Server(_pre_recon_uv_config)
-            recon_server.install_signal_handlers = lambda: None  # type: ignore[attr-defined]
+            recon_server = EmbeddedUvicornServer(_pre_recon_uv_config)
 
-            # Take ownership of SIGTERM/SIGINT before uvicorn's serve() can
-            # install its own handlers. We need to differentiate operator-stop
+            # EmbeddedUvicornServer leaves SIGTERM/SIGINT to
+            # _install_operator_stop_handler, which differentiates operator-stop
             # (clean exit 0, do not restart) from cascade-shutdown (exit 1, do
             # restart) — uvicorn's default handlers don't expose that distinction.
-            server.install_signal_handlers = lambda: None  # type: ignore[attr-defined]  # uvicorn stubs don't declare this as writable
             _install_operator_stop_handler(
                 _make_operator_stop_callback(server, recon_server),
             )
@@ -2297,7 +2284,7 @@ def _build_uvicorn_config(
     graceful_shutdown_timeout: int,
     keepalive_timeout: int | None = None,
 ) -> Any:  # uvicorn.Config
-    """Construct a uvicorn.Config with a bounded graceful-shutdown wait.
+    """Construct a uvicorn.Config with a bounded graceful-shutdown wait that leaves process logging alone.
 
     Single tested seam for both uvicorn.Config construction sites (primary
     server and recon-report server) so timeout_graceful_shutdown is always
@@ -2306,21 +2293,23 @@ def _build_uvicorn_config(
     in-flight request hang server.shutdown() indefinitely and starve the
     downstream _graceful_shutdown cleanup and force-exit watchdog.
 
+    The config is built by embedded_uvicorn_config, so uvicorn's records
+    propagate to this module's logging.basicConfig handler.
+
     keepalive_timeout is optional: when omitted, uvicorn's own
     timeout_keep_alive default applies unchanged (matches the pre-existing
     recon-report site, which never set it).
     """
-    import uvicorn
+    from fused_memory.server.embedded_uvicorn import embedded_uvicorn_config
 
     kwargs: dict[str, Any] = {
         'host': host,
         'port': port,
-        'log_level': 'info',
         'timeout_graceful_shutdown': graceful_shutdown_timeout,
     }
     if keepalive_timeout is not None:
         kwargs['timeout_keep_alive'] = keepalive_timeout
-    return uvicorn.Config(app, **kwargs)
+    return embedded_uvicorn_config(app, **kwargs)
 
 
 def _claim_listener(listeners: dict[int, socket.socket], port: int) -> socket.socket | None:
@@ -2431,7 +2420,7 @@ def _make_operator_stop_callback(
     arriving within ``repeat_window_secs`` of the FIRST signal is the same stop
     delivered twice and is ignored. A later signal also sets ``force_exit``,
     keeping uvicorn's deliberate-second-Ctrl-C escape hatch, which is otherwise
-    lost because ``install_signal_handlers`` is neutered. Contract pinned by
+    lost because EmbeddedUvicornServer disables uvicorn's signal capture. Contract pinned by
     fused-memory/tests/test_operator_signal_handler.py::TestOperatorStopCallbackForceExit.
     """
     first_signal_at: float | None = None
@@ -2471,9 +2460,10 @@ def _install_operator_stop_handler(on_operator_stop: Callable[[], None]) -> None
     Mirrors :func:`_register_drain_signal_handler`'s loop / signal.signal
     fallback pattern.
 
-    Must be called BEFORE ``uvicorn.Server.serve()`` and uvicorn's
-    ``install_signal_handlers`` must be neutered, otherwise uvicorn replaces
-    our handlers from inside ``serve()`` and we never observe SIGTERM.
+    The servers must be EmbeddedUvicornServer instances, which disable
+    uvicorn's signal capture: a plain ``uvicorn.Server.serve()`` replaces
+    these handlers for its lifetime and re-raises each caught signal when
+    it returns.
     """
     try:
         loop = asyncio.get_running_loop()
