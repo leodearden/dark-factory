@@ -8112,14 +8112,29 @@ class TestRemoteRunnerEnvProbeRun:
         assert remote_cmds[0] == 'true'
         assert len(remote_cmds) == 4
 
+    @pytest.mark.timing(reason='the per-call ssh probe budget is the behaviour under test; the blocking stall is deliberate')
     async def test_master_establishment_does_not_eat_the_first_probes_budget(self, monkeypatch):
-        """Open and first probe are bounded separately: 0.6s + 0.6s under a 1.0s bound
-        each passes, where one shared budget would have timed the probe out.  A sleep
-        never ends early, so only the 0.4s per-call headroom is load-sensitive."""
+        """The open and the first probe each spend 0.6s under their own 1.0s bound,
+        where one shared budget would have timed the probe out.  The blocking sleep
+        inside the open is a host stall, not a slow server."""
         from orchestrator import verify_runner as vr
         monkeypatch.setattr(vr, '_SSH_PROBE_TIMEOUT_SECS', 1.0)
 
-        runner, _ = self._make_runner(responses=[(0, 'uv 0.11.6\n', '')], delay=0.6)
+        async def slow_ssh(argv, *, cwd=None):
+            if argv[-1] == 'true':
+                time.sleep(0.5)
+                await asyncio.sleep(0.6)
+                return (0, '', '')
+            await asyncio.sleep(0.6)
+            return (0, 'uv 0.11.6\n', '')
+
+        runner = gated_remote_runner(
+            name='laptop',
+            ssh_host='laptop.local',
+            git_remote='origin',
+            cwd='/repo',
+            run=slow_ssh,
+        )
         adapter = await runner.env_probe_run()
 
         assert await adapter(['uv', '--version']) == (0, 'uv 0.11.6\n', '')
