@@ -100,6 +100,42 @@ async def test_scenario_02_a_signal_ended_sub_run_is_unconfirmable(tmp_path, mon
 
 @pytest.mark.asyncio
 @pytest.mark.timeout(lane_test_timeout(drives=1))
+@pytest.mark.parametrize('phase', ['detect', 'confirm'])
+async def test_a_sub_run_killed_while_the_lane_stops_leaves_its_pass_with_no_effect(tmp_path, monkeypatch, phase):
+    lane = await RedPathLane.open(tmp_path, monkeypatch, stopping=True)
+    killed = Run(failed={A: 'AssertionError: a'}, signal=signal.SIGTERM, junit=False, complete=False)
+    runs = (killed,) if phase == 'detect' else (RED_A, killed)
+
+    record = await lane.advance(*runs)
+
+    run = record.detect if phase == 'detect' else record.confirm
+    assert run is not None
+    assert run.ended_by == 'signal'
+    assert run.returncode in (-signal.SIGTERM, 128 + signal.SIGTERM)
+    assert (record.outcome, record.effect) == (None, None)
+    if phase == 'detect':
+        assert record.confirm is None
+    assert lane.episode(unconfirmable_node(lane.command_name)) is None
+    assert lane.episode(A) is None
+    assert lane.store.lane_tasks() == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(lane_test_timeout(drives=1))
+async def test_a_stopping_lane_still_records_an_exit_ended_pass(tmp_path, monkeypatch):
+    lane = await RedPathLane.open(tmp_path, monkeypatch, stopping=True)
+
+    record = await lane.advance(RED_A, RED_A)
+
+    assert record.outcome == {
+        'arm': 'confirmed', 'mode': 'narrowed', 'reproduced': [A], 'cleared': [], 'inconclusive': [],
+    }
+    assert effect_of(record)['tests_counted'] == [A]
+    assert lane.episode(A) is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(lane_test_timeout(drives=1))
 async def test_scenario_03_a_test_reproduced_on_pass_1_is_held_without_a_task(tmp_path, monkeypatch):
     lane = await RedPathLane.open(tmp_path, monkeypatch)
 
