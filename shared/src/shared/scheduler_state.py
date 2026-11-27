@@ -251,9 +251,9 @@ class _PauseRowRead:
     row: PauseRow | None = None
 
 
-_LATEST_PAUSE_ROW = (
-    'SELECT pause_reason, pause_at, pause_class FROM scheduler_state '
-    'ORDER BY pause_at DESC LIMIT 1'
+_PAUSE_ROWS_LATEST_FIRST = (
+    'SELECT project_id, pause_reason, pause_at, pause_class FROM scheduler_state '
+    'ORDER BY pause_at DESC'
 )
 
 
@@ -314,15 +314,21 @@ def _read_pause_row(path: Path) -> _PauseRowRead:
     try:
         conn = sqlite3.connect(f'{path.resolve().as_uri()}?mode=ro', uri=True)
         try:
-            found = conn.execute(_LATEST_PAUSE_ROW).fetchone()
+            found = conn.execute(_PAUSE_ROWS_LATEST_FIRST).fetchall()
         finally:
             conn.close()
     except sqlite3.Error as exc:
         logger.warning('runs.db %s pause row is unreadable: %s', path, exc)
         return _PauseRowRead(readable=False)
-    if found is None:
+    if not found:
         return _PauseRowRead(readable=True)
-    reason, pause_at, pause_class = found
+    if len(found) > 1:
+        logger.warning(
+            'runs.db %s holds pause rows for several project_ids %s; serving the latest, '
+            'though the orchestrator restores and clears only the row keyed on its configured project_id',
+            path, [project_id for project_id, *_ in found],
+        )
+    _, reason, pause_at, pause_class = found[0]
     try:
         row = PauseRow(reason=reason, pause_at=pause_at, pause_class=pause_class)
     except ValidationError as exc:

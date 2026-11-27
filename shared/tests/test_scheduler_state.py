@@ -370,8 +370,14 @@ def _write_snapshot_body(root: Path, body: str) -> None:
     path.write_text(body)
 
 
-def _seed_runs_db(root: Path, *rows: tuple[str, str, str, str | None], with_table: bool = True) -> None:
-    """Create runs.db; each row is (project_id, pause_reason, pause_at, pause_class)."""
+def _seed_runs_db(
+    root: Path, *rows: tuple[str, str | bytes, str, str | None], with_table: bool = True,
+) -> None:
+    """Create runs.db; each row is (project_id, pause_reason, pause_at, pause_class).
+
+    A bytes pause_reason is stored as a BLOB: TEXT affinity converts a number
+    to text, but keeps a BLOB a BLOB.
+    """
     path = runs_db(root)
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(path)
@@ -491,15 +497,45 @@ class TestCheckedReaderRow:
         assert view.pause_row.pause_class is None
         assert view.pause_class is None
 
-    def test_the_latest_row_is_served(self, tmp_path: Path) -> None:
+    def test_the_latest_of_several_rows_is_served_and_warns_naming_every_project_id(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ) -> None:
         _seed_runs_db(
             tmp_path,
             ('a', 'older', '2026-11-27T10:00:00+00:00', 'operator'),
             ('b', 'newer', '2026-11-27T11:00:00+00:00', 'cost_ceiling'),
         )
-        view = read_scheduler_state_checked(tmp_path, now=_NOW)
+        with caplog.at_level(logging.WARNING, logger='shared.scheduler_state'):
+            view = read_scheduler_state_checked(tmp_path, now=_NOW)
         assert view.pause_row == PauseRow(
             reason='newer', pause_at='2026-11-27T11:00:00+00:00', pause_class='cost_ceiling',
+        )
+        warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1
+        assert "'a'" in warnings[0]
+        assert "'b'" in warnings[0]
+
+    def test_a_single_row_does_not_warn(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        _seed_runs_db(tmp_path, ('dark_factory', 'halted', _ROW_PAUSE_AT, 'cost_ceiling'))
+        with caplog.at_level(logging.WARNING, logger='shared.scheduler_state'):
+            read_scheduler_state_checked(tmp_path, now=_NOW)
+        assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
+
+    def test_a_row_that_is_not_a_pause_row_reads_as_unreadable_and_warns(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        _write_snapshot(tmp_path, _paused_snapshot('halted', 'operator'))
+        _seed_runs_db(tmp_path, ('dark_factory', b'\xff', _ROW_PAUSE_AT, 'cost_ceiling'))
+        with caplog.at_level(logging.WARNING, logger='shared.scheduler_state'):
+            view = read_scheduler_state_checked(tmp_path, now=_NOW)
+        assert (view.is_paused, view.pause_reason, view.pause_class) == (True, 'halted', 'operator')
+        assert view.pause_row is None
+        assert view.pause_disagreement is False
+        assert any(
+            record.levelno == logging.WARNING and 'malformed' in record.getMessage()
+            for record in caplog.records
         )
 
     def test_the_reader_never_creates_runs_db(self, tmp_path: Path) -> None:
