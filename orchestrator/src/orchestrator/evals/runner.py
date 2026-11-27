@@ -866,7 +866,7 @@ async def collect_metrics(
         cli_cost_usd=wf_metrics.total_cost_usd,
         cli_cost_untrusted=cli_cost_untrusted,
     )
-    dispatched = dispatched_models(wf_metrics.dispatched_routes)
+    dispatched = dispatched_models(wf_metrics.dispatched_routes, workflow.config.models)
 
     m = EvalMetrics(
         tests_pass=verification.passed if verification else False,
@@ -959,17 +959,18 @@ async def collect_metrics(
 
 
 def _warn_off_pin_dispatch(task_id: str, dispatched: Mapping[str, list[DispatchRecord]]) -> None:
-    """One WARNING naming every role whose dispatches left its cell's pinned model."""
+    """One WARNING naming every role whose config seats one model and that ran another."""
     roles = off_pin_roles(dispatched)
     if not roles:
         return
     logger.warning(
-        'Eval cell %s did not run the models its config pins: %s',
+        'Eval cell %s ran models other than the ones its config seats: %s',
         task_id,
         '; '.join(
             f'{role}: ' + ', '.join(
-                f"{r['model']} (source_layer={r['source_layer']}, rule_id={r['rule_id']}, "
-                f"served_model_id={r['served_model_id']})"
+                f"{r['model']} (configured_model={r['configured_model']}, "
+                f"source_layer={r['source_layer']}, rule_id={r['rule_id']}, "
+                f"served_model_id={r['served_model_id']}, rejected={r['rejected']})"
                 for r in dispatched[role]
             )
             for role in roles

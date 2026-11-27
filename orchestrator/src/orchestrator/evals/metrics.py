@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, Any, TypedDict
 # agents.token_pricing, a leaf module that invoke._estimate_cost prices through
 # too, so runtime and eval figures cannot drift apart.
 from orchestrator.agents.token_pricing import FALLBACK_PRICE, TokenUsage, price_tokens
-from orchestrator.routing import CONFIG_SOURCE_LAYER
+from orchestrator.routing import configured_model
 from orchestrator.shadow_types import ReferenceKind
 
 from .cell_sandbox import CellSandbox
@@ -28,6 +28,7 @@ if TYPE_CHECKING:
     # the readers by getattr, so it needs the NAME for the signature and
     # nothing at import time.
     from orchestrator.artifacts import TaskArtifacts
+    from orchestrator.config import ModelsConfig
     from orchestrator.routing import DispatchedRoute
 
 logger = logging.getLogger(__name__)
@@ -100,6 +101,11 @@ class DispatchRecord(TypedDict):
     served_model_id: str | None
     source_layer: str
     rule_id: str | None
+    # The model the cell config seats for the role (routing.configured_model);
+    # None: the config seats none.
+    configured_model: str | None
+    # The decision's rejected reasons; forensic only, nothing parses them.
+    rejected: list[str]
 
 
 @dataclass
@@ -380,8 +386,11 @@ def terminal_kind_of(metrics: dict[str, Any]) -> str | None:
     return metrics.get('terminal_kind')
 
 
-def dispatched_models(routes: Iterable[DispatchedRoute]) -> dict[str, list[DispatchRecord]]:
-    """Per role, the distinct :class:`DispatchRecord` of *routes*, in first-dispatch order."""
+def dispatched_models(
+    routes: Iterable[DispatchedRoute], models: ModelsConfig,
+) -> dict[str, list[DispatchRecord]]:
+    """Per role, the distinct :class:`DispatchRecord` of *routes*, in first-dispatch
+    order, each stamped with the model *models* seats for that role."""
     by_role: dict[str, list[DispatchRecord]] = {}
     for route in routes:
         record = DispatchRecord(
@@ -389,6 +398,8 @@ def dispatched_models(routes: Iterable[DispatchedRoute]) -> dict[str, list[Dispa
             served_model_id=route.served_model_id,
             source_layer=route.decision.source_layer,
             rule_id=route.decision.rule_id,
+            configured_model=configured_model(route.role_name, models),
+            rejected=list(route.decision.rejected),
         )
         records = by_role.setdefault(route.role_name, [])
         if record not in records:
@@ -399,15 +410,21 @@ def dispatched_models(routes: Iterable[DispatchedRoute]) -> dict[str, list[Dispa
 def off_pin_roles(dispatched: Mapping[str, list[DispatchRecord]] | None) -> list[str] | None:
     """THE consumer accessor for :attr:`EvalMetrics.dispatched_models`.
 
-    The sorted roles that ran a model their cell's config did not pin: any record
-    whose model came from a layer other than ``routing.CONFIG_SOURCE_LAYER``.
-    ``None`` when the dispatches were not recorded.
+    In an eval cell the config pins a role's model only through its ModelsConfig
+    seat, so the off-pin roles are the sorted roles with a seat that ran any model
+    other than the seated one. A role with no seat (e.g.
+    workflow.py::_RESETTLED_ADJUDICATOR) runs its role default and is never
+    off-pin. ``None`` when the dispatches were not recorded.
     """
     if dispatched is None:
         return None
     return sorted(
         role for role, records in dispatched.items()
-        if any(record['source_layer'] != CONFIG_SOURCE_LAYER for record in records)
+        if any(
+            record['configured_model'] is not None
+            and record['model'] != record['configured_model']
+            for record in records
+        )
     )
 
 
