@@ -5182,6 +5182,13 @@ entries:
     manifested_phase: unknown
     note: The get_tasks schema was not in the prompt when the call was made, and the call guessed an 'ids' parameter and failed validation. The error output directs the agent to ToolSearch, which is the deferred-tool pattern the entry describes.
     evidence_quote: This tool's input schema was not in your prompt when you called it.
+  - date: '2026-11-26'
+    project: dark_factory
+    session: 01cfb78b-ac4c-4a25-aa06-4ef35b2e7613
+    origin_phase: recon
+    manifested_phase: recon
+    note: The agent called the deferred MCP tool get_memory_by_id before loading its schema via ToolSearch, guessed the parameter name 'id', and the call failed validation. This is the mechanism the entry names.
+    evidence_quote: This tool's input schema was not in your prompt when you called it.
   last_seen_runs:
   - census-dark_factory-20261024
   - census-dark_factory-20261031
@@ -14279,6 +14286,31 @@ entries:
     manifested_phase: ops
     note: Guard trips and not-found signals render as bare templates with the matched substring missing. Both guard entries show an empty 'blocked:' field, and the not-found entries show only the generic error text.
     evidence_quote: '- (record 60) blocked:'
+  - date: '2026-11-26'
+    project: dark_factory
+    session: e838027c-5e8e-40d8-870e-faf2b81036e4
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: 'Digest renders guard and not-found signals as bare templates with the matched substring dropped: the ''blocked:'' guard lines have no detail, and the not-found lines show only the generic phrase.'
+    evidence_quote: '- (record 219) blocked:
+
+      - (record 1077) blocked:
+
+      - (record 32) does not exist'
+  - date: '2026-11-26'
+    project: dark_factory
+    session: 8bc6140a-f6cc-4355-a7a5-434712db08af
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: The Guard Trips section renders the blocked call as a bare label with no matched substring or guard text. The guard text appears only in the Error Neighborhoods section, so the trip line itself drops the matched content.
+    evidence_quote: '- (record 100) blocked:'
+  - date: '2026-11-26'
+    project: dark_factory
+    session: 069acbb8-de7e-489e-ad80-74a4662934c7
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: The guard trip is rendered as a bare template with the matched substring missing, so it reads only 'blocked:' with no detail.
+    evidence_quote: '- (record 315) blocked:'
   last_seen_runs:
   - census-dark_factory-20261017
   - census-dark_factory-20261024
@@ -24954,6 +24986,29 @@ entries:
     manifested_phase: unknown
     note: The digest shows an orchestrated-task session in a worktree cwd with four not_found signals and no tool_error, self_correct, or interrupt signals. The phase is not stated in the digest, so both phases are unknown.
     evidence_quote: '- (record 61) no such file or directory'
+  - date: '2026-11-26'
+    project: dark_factory
+    session: 605e02ad-975e-451e-821c-fb34b472c522
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: Orchestrated worktree session (cwd .worktrees/8374) with repeated 'no such file or directory' not_found signals at records 35, 75 and 1041, and tool_error 0, so no other diagnostic signal accompanies them. The digest does not establish the phase.
+    evidence_quote: (record 35) no such file or directory / (record 75) no such file or directory / (record 1041) no such file or directory
+  - date: '2026-11-26'
+    project: dark_factory
+    session: e838027c-5e8e-40d8-870e-faf2b81036e4
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: Orchestrated task in a worktree (cwd .worktrees/8532) shows repeated 'no such file or directory' failures (records 35 and 181), with tool_error at 0 and no other diagnostic signal in the digest.
+    evidence_quote: '- (record 35) no such file or directory
+
+      - (record 181) no such file or directory'
+  - date: '2026-11-26'
+    project: dark_factory
+    session: 353881af-04aa-49b5-8ecd-abad6d6d6faf
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: Orchestrated worktree session (cwd .worktrees/11875) logs two 'no such file or directory' not_found signals with no other diagnostic signal in the digest, matching the repeated-ENOENT-without-diagnostics mechanism the title names.
+    evidence_quote: (record 31) no such file or directory
   last_seen_runs:
   - census-dark_factory-20261017
   - census-dark_factory-20261024
@@ -25871,6 +25926,15 @@ entries:
     manifested_phase: ops
     note: The 'Retry Loops' bucket flagged 34 calls to the watcher re-arm script, which is the watcher's designed re-arm cycle rather than a retry loop.
     evidence_quote: 'Bash x34: {"command": "DARK_FACTORY_ROOT=/home/leo/src/dark-factory scripts/watcher-rearm.sh --queue-dir /home/leo/src/dark-factory/data/escalations --level 2 --timeout 3600", "description": "Re-arm the L2 escalation watcher"'
+  - date: '2026-11-26'
+    project: dark_factory
+    session: 069acbb8-de7e-489e-ad80-74a4662934c7
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: The digest's Retry Loops bucket lists the watcher's designed watcher-rearm.sh calls (Bash x9, with designed-outcome results) as retry loops, which is the mechanism the entry title names.
+    evidence_quote: '## Retry Loops
+
+      - Bash x9 (1 designed-outcome results: [exit 124] [watcher-rearm-declared])'
   last_seen_runs:
   - census-dark_factory-20261017
   - census-dark_factory-20261024
@@ -29475,6 +29539,13 @@ entries:
     manifested_phase: unknown
     note: Orchestrated-task session's read-only Bash inspection (git ls-tree on main) was denied under don't-ask mode, matching the entry's mechanism. The digest does not show the resulting blind guesses, and the phase is not stated.
     evidence_quote: Permission to use Bash has been denied because Claude Code is running in don't ask mode.
+  - date: '2026-11-26'
+    project: dark_factory
+    session: d2bc7c89-0e99-4c53-91ce-0bbf7f551379
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: Orchestrated-task session in a task worktree had a read-only Bash inspection (git merge-base --is-ancestor) denied because the session runs in don't-ask mode. This is the mechanism the entry title names. The digest does not show the phase.
+    evidence_quote: Permission to use Bash has been denied because Claude Code is running in don't ask mode.
   filed_tickets:
   - ticket: null
     project_root: /home/leo/src/dark-factory
@@ -29933,6 +30004,13 @@ entries:
     manifested_phase: unknown
     note: A fused-memory read (get_tasks) was called with an undeclared 'ids' argument, which the server rejected as unknown_argument. This is the same undeclared-argument mechanism the entry names, on a different tool.
     evidence_quote: 'get_tasks was called with argument(s) it does not declare: ids'
+  - date: '2026-11-26'
+    project: dark_factory
+    session: 01cfb78b-ac4c-4a25-aa06-4ef35b2e7613
+    origin_phase: recon
+    manifested_phase: recon
+    note: A recon agent passed an undeclared argument name ('id') instead of the declared 'memory_id', and the schema rejected it. The guessed-argument mechanism matches, though this digest shows a single occurrence.
+    evidence_quote: 'get_memory_by_id was called with argument(s) it does not declare: id'
   filed_tickets:
   - ticket: null
     project_root: /home/leo/src/dark-factory
@@ -47826,6 +47904,19 @@ candidates:
     origin_phase: unknown
     manifested_phase: unknown
     evidence_quote: '**Misleading failure message:** the `len(orphans) == 1` assertion says "no late win to settle" in two cases where that''s wrong. One is a product regression that drops the `asyncio.shield`. The other is the follow-up ticket turning the inner acquire into a plain Future.'
+- id: cand-20261126-1
+  title: Hand-maintained baseline provenance comment in code goes stale when a new row is added, contradicting the comment
+  cause: A section comment asserts every baseline in a block derives from one report's figure; adding a new row breaks that claim. The agent only noticed by chance mid-edit, so a later reader or agent trusting the comment would be misled.
+  area: unknown
+  first_seen: '2026-11-26'
+  disposition: pending
+  sightings:
+  - date: '2026-11-26'
+    project: dark_factory
+    session: 353881af-04aa-49b5-8ecd-abad6d6d6faf
+    origin_phase: unknown
+    manifested_phase: unknown
+    evidence_quote: '[let me fix] The section comment above `CanaryFigures` says every baseline is the 2026-11-04 report''s figure, which the new row breaks. Let me fix it.'
 historical_backfill:
   run_id: census-dark_factory-20261024
   unmatched_task_ids:
