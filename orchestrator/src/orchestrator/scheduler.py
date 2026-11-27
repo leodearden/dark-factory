@@ -37,6 +37,7 @@ from shared.locking import (
     normalize_lock,
 )
 from shared.mcp_envelope import (
+    EnvelopeParseError,
     EnvelopeShape,
     parse_tool_result,
     tool_error_text,
@@ -51,6 +52,12 @@ from shared.scheduler_state import (
     PinQueueEntry,
     RequeueCooldown,
     SchedulerStateSnapshot,
+)
+from shared.status_paging import (
+    StatusPage,
+    read_status_page,
+    status_page_arguments,
+    walk_status_pages,
 )
 from shared.task_claimant import has_live_claimant, is_stranded_blocked
 from shared.task_metadata import Milestone
@@ -2873,17 +2880,25 @@ class Scheduler:
             A ``(statuses, error)`` tuple.  On success: ``({id: status}, None)``.
             On any failure: ``({}, exception)``.  Error state lives on the stack
             — no shared mutable attribute, safe under concurrent callers.
+
+        The first request is unpaged.  A reply whose ``pagination`` says more
+        remains is walked to the whole map by
+        ``shared/src/shared/status_paging.py::walk_status_pages``, and any
+        failure mid-walk is ``({}, err)``: a partial map is never returned.
         """
+        arguments: dict = {'project_root': self._project_root}
+        if ids is not None:
+            arguments['ids'] = list(ids)
+
+        async def _page(offset: int) -> StatusPage[str]:
+            return read_status_page(await self.dispatch_tool(
+                'get_statuses', status_page_arguments(arguments, offset), timeout=15,
+            ))
+
         try:
-            arguments: dict = {'project_root': self._project_root}
-            if ids is not None:
-                arguments['ids'] = list(ids)
-            result = await self.dispatch_tool('get_statuses', arguments, timeout=15)
-            statuses, err = parse_tool_result(result, 'statuses', dict)
-            if err is not None:
-                return {}, err
-            assert statuses is not None  # invariant: parse_tool_result → (None, err) | (value, None)
-            return statuses, None
+            return await walk_status_pages(_page, self._project_root), None
+        except EnvelopeParseError as e:
+            return {}, e
         except Exception as e:
             logger.exception(
                 'Failed to fetch task statuses: %s: %s', type(e).__name__, e,

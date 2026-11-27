@@ -38,15 +38,15 @@ Caching: none. Every read here is live; staleness is owned by
 from __future__ import annotations
 
 import functools
-import math
 import os
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from types import MappingProxyType
 from typing import Any, TypeVar
 
 import httpx
+from shared.status_paging import STATUSES_SAFE_PAGE_SIZE, StatusPage, walk_status_pages
 from shared.task_claimant import DEFAULT_CLAIMANT_HEARTBEAT_TTL, is_stranded
 
 from dashboard.config import DashboardConfig
@@ -203,32 +203,6 @@ class _TasksRead:
         return arguments
 
 
-# ---------------------------------------------------------------------------
-# Safe page size for the fetch_statuses walk
-# ---------------------------------------------------------------------------
-#
-# NO CACHE sits here, deliberately.  The only consumer,
-# ``task_snapshot.acquire_snapshot``, owns a 15 s TTL over the whole snapshot
-# unit — a second, shorter TTL layered under that one is the duplicated
-# staleness the one-datum-one-path PRD removes, and it would let the unit
-# stamp an ``as_of`` newer than the map it is stamping.  The row reads are
-# uncached for the same reason.
-
-STATUSES_SAFE_PAGE_SIZE = 2000
-"""How many statuses one ``get_statuses`` page may carry.
-
-The server's own documented bound (``_STATUSES_AUTO_PAGE_LIMIT``), and a
-measured one rather than a round number: 2 000 entries is ~46 KB against the
-~62 KB documented-safe MCP tool-response envelope, while 3 000 is ~69 KB —
-past the wall.  An oversized page is NOT clamped server-side; it is rejected
-WHOLESALE, which is the incident paging exists to close.
-
-Restated here rather than imported because the dashboard does not depend on
-the fused-memory package — this is the wire contract's value, held at the
-seam that speaks it.
-"""
-
-
 SHAPED_ROW_FIELDS: tuple[str, ...] = (
     'id', 'title', 'status', 'priority', 'dependencies', 'updatedAt',
     'claimant_run_id', 'heartbeat_at', 'created_at', 'created_at_source',
@@ -305,138 +279,6 @@ def _shape_task(task: dict) -> dict | None:
         'created_at': task.get('created_at'),
         'created_at_source': task.get('created_at_source'),
     }
-
-
-@dataclass(frozen=True, slots=True)
-class _StatusPage:
-    """One ``get_statuses`` response: the slice it carried, and its envelope.
-
-    ``pagination`` is None when the response carried no envelope, which the
-    tool's contract defines as a COMPLETE answer rather than a missing field.
-
-    *statuses* may be SHORTER than *delivered*: an entry whose id is not an
-    integer is dropped. The walk's ``returned`` cross-check must count
-    *delivered*, what the server actually sent: counting the parsed entries
-    would turn one unparseable id into an offline marker for the whole
-    project.
-    """
-
-    statuses: dict[int, str]
-    delivered: int
-    pagination: dict | None
-
-
-async def _walk_statuses(
-    page_fn: Callable[[int], Awaitable[_StatusPage]],
-    project_root: str,
-) -> dict[int, str]:
-    """Assemble the COMPLETE status map from repeated *page_fn* calls.
-
-    *page_fn* is injected and already bound to ONE url: ``first_success``
-    tries urls in order, and a walk free to fan out mid-walk would tile pages
-    from two different states of the world.
-
-    ADVANCE BY ``returned``, THE COUNT SERVED.  The envelope comes from
-    ``fused_memory/server/tools.py::_pagination_meta``.  It passes the
-    caller's REQUESTED ``page_size`` through verbatim, sets ``returned`` to
-    the number of entries it actually sliced, and derives
-    ``has_more = offset + returned < total``.  That identity is why
-    ``offset + returned`` is the only advance that tiles the population
-    without gaps: a walk that stops on the server's ``has_more`` has to step
-    exactly as the server counted.  Advancing by the requested size would skip
-    the difference whenever a server serves fewer entries than asked, which
-    produces a silently incomplete census.
-
-    ``get_statuses``' own docstring says the opposite: "Advance by
-    ``pagination['page_size']`` (what was actually served)".  Its
-    implementation does not do that.  Do not switch this walk back to
-    ``page_size`` because of that docstring.
-
-    ``returned`` is cross-checked against the entries the page actually
-    delivered, because it is the counter the walk advances on.  A page
-    clipped in flight that still claims its full count would skip the clipped
-    entries and terminate normally.  A page that under-reports would re-read
-    entries already held.  Neither is detectable afterwards, so the read is
-    refused.
-
-    TRUNCATION IS LOUD: every failure below raises
-    ``ValueError`` and discards the pages in hand.  ``fetch_statuses``'
-    contract distinguishes only a map (complete) from the offline marker, so a
-    short map is indistinguishable from a full one at the call site, and
-    ``census.build_census`` would tally it into a confident under-report of
-    ``total`` — the uniform lie that module exists to refuse.  ``ValueError``
-    is ``first_success``'s soft-failure signal, so the fan-out tries the next
-    url and, on exhaustion, yields the marker.
-
-    There is no changed-``total`` coherence check, because this walk stops on
-    the SERVER's ``has_more``, computed against the population at the instant
-    of each page, not on a client-side ``offset >= total`` comparison that a
-    shrinking total would silently satisfy early.
-    """
-    merged: dict[int, str] = {}
-    offset = 0
-    pages = 0
-    page_budget: int | None = None
-    while True:
-        page = await page_fn(offset)
-        merged.update(page.statuses)
-        pages += 1
-
-        meta = page.pagination
-        if meta is None:
-            # No envelope: the response IS the whole map.  Looping blind here
-            # would re-request the same entries forever.
-            break
-
-        has_more = meta.get('has_more')
-        returned = meta.get('returned')
-        total = meta.get('total')
-        if not isinstance(has_more, bool) or not isinstance(returned, int):
-            # Without these two, completeness is UNVERIFIABLE — and an
-            # unverifiable read must not be reported as a complete one.
-            raise ValueError(
-                f'get_statuses pagination for {project_root} is unverifiable at '
-                f'offset {offset}: has_more={has_more!r}, returned={returned!r}'
-            )
-        if returned != page.delivered:
-            raise ValueError(
-                f'get_statuses pagination for {project_root} inconsistent at '
-                f'offset {offset}: server claims returned={returned} but sent '
-                f'{page.delivered} status(es)'
-            )
-        if not has_more:
-            break
-        if returned <= 0:
-            # More entries are owed, but the page that would carry them cannot
-            # advance the offset, so this server cannot be paged past.
-            raise ValueError(
-                f'get_statuses pagination for {project_root} cannot advance at '
-                f'offset {offset}: more entries remain but returned={returned}'
-            )
-
-        if page_budget is None:
-            # BOUND THE WALK.  ``has_more`` is the loop's only terminator and
-            # it is server-reported, so a server that never lowers it would
-            # spin here on the same httpx client the render polls share.
-            # Derived from the FIRST page's ``returned`` because that is the
-            # rate the walk actually advances at; the +2 covers the final
-            # partial page plus one page of slack.
-            if not isinstance(total, int):
-                raise ValueError(
-                    f'get_statuses pagination for {project_root} reports no usable '
-                    f'total at offset {offset}: total={total!r}'
-                )
-            page_budget = math.ceil(total / returned) + 2
-        if pages >= page_budget:
-            raise ValueError(
-                f'get_statuses pagination for {project_root} exceeded its '
-                f'{page_budget}-page budget at offset {offset} '
-                f'(total={total}); refusing to keep walking'
-            )
-        offset += returned
-    return merged
-
-
 
 
 async def _fanout_read(
@@ -711,17 +553,19 @@ async def fetch_statuses(
 
     Returns ``{'offline': True, 'error': str}`` if every server fails, or if
     any page of the walk does — a partial map is never served as a complete
-    one (see :func:`_walk_statuses`).
+    one (see ``shared/src/shared/status_paging.py::walk_status_pages``).
 
     **Paging.** The map is assembled by walking
-    :data:`STATUSES_SAFE_PAGE_SIZE`-sized pages, because an unpaginated read
+    ``shared/src/shared/status_paging.py::STATUSES_SAFE_PAGE_SIZE``-sized
+    pages, because an unpaginated read
     of a large population is rejected wholesale by the MCP transport.  Each
     page is one HTTP request; the WALK is one operation, and the caller bounds
     it as one — see ``task_snapshot.PER_PROJECT_MCP_CALLS``.
 
     **No cache.** Reads are live.  The consumer above owns a 15 s TTL over the
-    whole snapshot unit, and a second TTL under it would let that unit serve a
-    map older than the ``as_of`` it stamps.  The returned mapping is freshly
+    whole snapshot unit, and a second TTL under it is the duplicated staleness
+    the one-datum-one-path PRD removes: it would let that unit serve a map
+    older than the ``as_of`` it stamps.  The returned mapping is freshly
     built by the walk, so a caller may mutate it freely.
 
     **Per-request budget.** *timeout* bounds ONE page request and is threaded
@@ -736,7 +580,7 @@ async def fetch_statuses(
     """
     project_root_str = str(project_root)
 
-    async def _page(url: str, offset: int) -> _StatusPage:
+    async def _page(url: str, offset: int) -> StatusPage[int]:
         """Read ONE page from *url*, shaped and with its envelope kept."""
         result = await mcp_tool_call(
             client, url, 'get_statuses',
@@ -757,14 +601,11 @@ async def fetch_statuses(
                 out[int(raw_id)] = status
             except (TypeError, ValueError):
                 continue
-        meta = result.get('pagination')
-        return _StatusPage(out, len(raw), meta if isinstance(meta, dict) else None)
+        return StatusPage(out, len(raw), result.get('pagination'))
 
     async def _call(url: str) -> dict[int, str]:
         """Read the whole map from ONE url, pinned for the duration of the walk."""
-        return await _walk_statuses(
-            functools.partial(_page, url), project_root_str,
-        )
+        return await walk_status_pages(functools.partial(_page, url), project_root_str)
 
     return await first_success(
         config.fused_memory_urls,

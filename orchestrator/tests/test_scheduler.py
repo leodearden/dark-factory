@@ -11,8 +11,11 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 from _orch_helpers import HermeticMcpSession
+from _paging_statuses_session import PagingStatusesSession, numbered_statuses
 from _recording_event_store import _RecordingEventStore
 from shared.locking import directory_locks
+from shared.mcp_envelope import resolver_failed
+from shared.status_paging import STATUSES_SAFE_PAGE_SIZE, StatusPagingError
 from shared.task_metadata_wire import coerce_task_metadata
 
 from orchestrator.already_landed_tick_view import AlreadyLandedTickView
@@ -6065,6 +6068,93 @@ class TestGetStatusesFailsLoud:
         stat_ok, err_ok = await scheduler.get_statuses()
         assert err_ok is None
         assert stat_ok == {'1': 'done'}
+
+
+# ---------------------------------------------------------------------------
+# TestGetStatusesPaging (task 3396)
+# ---------------------------------------------------------------------------
+
+class TestGetStatusesPaging:
+    """``Scheduler.get_statuses`` walks a paged answer to the whole map, or fails (task 3396).
+
+    A truncated first reply read as complete would come back as
+    ``(partial, None)``: ``resolver_failed`` would be False, and a harness
+    caller would read every missing id as deleted.  So a paged reply is
+    walked to completion through ``shared.status_paging``, and any failure
+    mid-walk is ``({}, err)``, never a partial map.
+    """
+
+    @staticmethod
+    def _scheduler(session: PagingStatusesSession) -> Scheduler:
+        return Scheduler(OrchestratorConfig(), mcp_session=session)
+
+    @pytest.mark.asyncio
+    async def test_a_truncated_answer_is_walked_to_the_whole_map(self):
+        population = numbered_statuses(10)
+        session = PagingStatusesSession(population, cap=3)
+
+        assert await self._scheduler(session).get_statuses() == (population, None)
+
+        first, *continuations = session.requests
+        assert 'page_size' not in first and 'offset' not in first, first
+        assert [request['page_size'] for request in continuations] == [STATUSES_SAFE_PAGE_SIZE] * 3
+        assert [request['offset'] for request in continuations] == [3, 6, 9], (
+            'each continuation must start at the previous offset plus what that page served'
+        )
+
+    @pytest.mark.asyncio
+    async def test_every_continuation_keeps_the_ids_filter_and_project_root(self):
+        population = numbered_statuses(10)
+        named = ['2', '4', '6', '8', '10']
+        session = PagingStatusesSession(population, cap=2)
+
+        statuses, err = await self._scheduler(session).get_statuses(ids=named)
+
+        assert err is None
+        assert statuses == {tid: population[tid] for tid in named}
+        assert len(session.requests) == 3, session.requests
+        first_root = session.requests[0]['project_root']
+        for request in session.requests:
+            assert request['ids'] == named, request
+            assert request['project_root'] == first_root, request
+
+    @pytest.mark.asyncio
+    async def test_a_transport_failure_mid_walk_is_an_error_not_a_partial_map(self):
+        session = PagingStatusesSession(numbered_statuses(10), cap=3, fail_at_offset=3)
+
+        statuses, err = await self._scheduler(session).get_statuses()
+
+        assert statuses == {}
+        assert isinstance(err, OSError)
+        assert resolver_failed(statuses, err)
+
+    @pytest.mark.asyncio
+    async def test_an_envelope_that_miscounts_its_page_is_refused(self):
+        session = PagingStatusesSession(
+            numbered_statuses(10), cap=3, first_page_claims_returned=2,
+        )
+
+        statuses, err = await self._scheduler(session).get_statuses()
+
+        assert statuses == {}
+        assert isinstance(err, StatusPagingError), repr(err)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('cap', [pytest.param(None, id='no-cap'), pytest.param(10, id='within-cap')])
+    @pytest.mark.parametrize('ids', [pytest.param(None, id='all'), pytest.param(['1', '7'], id='by-ids')])
+    async def test_a_complete_answer_costs_one_unpaged_call(self, cap, ids):
+        population = numbered_statuses(10)
+        session = PagingStatusesSession(population, cap=cap)
+
+        statuses, err = await self._scheduler(session).get_statuses(ids=ids)
+
+        expected = population if ids is None else {tid: population[tid] for tid in ids}
+        assert (statuses, err) == (expected, None)
+        assert len(session.requests) == 1, session.requests
+        expected_keys = {'project_root'} if ids is None else {'project_root', 'ids'}
+        assert set(session.requests[0]) == expected_keys, session.requests[0]
+        if ids is not None:
+            assert session.requests[0]['ids'] == ids
 
 
 class TestFairnessConfigSchema:
