@@ -992,7 +992,7 @@ class _TagScene:
     def tag_pushes(self) -> list[str]:
         return [spec for spec in map(_tag_refspec, self.argvs) if spec is not None]
 
-    async def run(self, argv: list[str], *, cwd: object = None) -> tuple[int, str, str]:
+    async def run(self, argv: list[str], *, cwd: str | None = None) -> tuple[int, str, str]:
         self.argvs.append(list(argv))
         if is_gate_publish(argv):
             return (0, '', '')
