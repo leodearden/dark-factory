@@ -324,10 +324,7 @@ def tree_pass(request: pytest.FixtureRequest) -> TreePass:
 def briefing(tmp_path: Path) -> BriefingAssembler:
     """Minimal BriefingAssembler over a stub OrchestratorConfig (no I/O).
 
-    Shared by ``test_roles_wait_pattern.py`` and
-    ``test_roles_background_warning.py`` (task 3747 — the two files were
-    forked from a common ancestor and carried byte-identical copies of this
-    fixture until they were consolidated here).
+    The suite's one shared ``briefing``, so no test module imports one.
     """
     config = OrchestratorConfig(
         project_root=tmp_path,
@@ -580,16 +577,17 @@ def df_warm_lane_script_dir(monkeypatch, tmp_path: Path):
 
 
 def pytest_configure(config: pytest.Config) -> None:
-    """Refuse an unsafe ``--basetemp``, arm the suite-wide defences, register the opt-out markers.
+    """Refuse an unsafe ``--basetemp``, arm the suite-wide defences, register plugins and markers.
 
     The ``reject_unsafe_basetemp`` call comes FIRST and is unrelated to the
     marker below: it aborts collection when ``--basetemp`` points inside a live
     task worktree, where every git command this suite runs would resolve against
     the enclosing worktree's repo (task 3355, incident esc-3072-3).
 
-    It also arms the UsageGate probe-dir sweep confinement (task 6275),
-    importing ``shared.usage_gate`` here because a module-level import after
-    this file's ``sys.path`` setup would need a new ``E402`` suppression.
+    It also arms the UsageGate probe-dir sweep confinement (task 6275) and
+    registers the ``_orch_suite_fixtures`` fixture plugin, importing both here
+    because a module-level import after this file's ``sys.path`` setup would
+    need a new ``E402`` suppression.
 
     ``orchestrator/pyproject.toml``'s ``[tool.pytest.ini_options] markers``
     list is outside this task's locked scope, so the marker used by the
@@ -608,6 +606,7 @@ def pytest_configure(config: pytest.Config) -> None:
     from shared import usage_gate
 
     arm_usage_gate_sweep_confinement(config, usage_gate)
+    config.pluginmanager.import_plugin('_orch_suite_fixtures')
     config.addinivalue_line(
         'markers',
         'real_psi_reader: opt a test OUT of the autouse `_hermetic_psi_reader` '

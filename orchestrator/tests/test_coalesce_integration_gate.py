@@ -37,11 +37,13 @@ from test_merge_queue_coalesce import (
     _gated_verify,
     _make_branch_with_file,
     _make_req,
-    coalesce_config,  # noqa: F401 — re-export: pytest fixture used by test methods
-    git_config,  # noqa: F401 — re-export: transitive fixture dep of coalesce_config/git_ops
-    git_ops,  # noqa: F401 — re-export: pytest fixture used by test methods
-    git_repo,  # noqa: F401 — re-export: transitive fixture dep of coalesce_config/git_ops
 )
+
+# git_config and git_repo are requested by the coalesce_config and git_ops fixtures, not by tests.
+from test_merge_queue_coalesce import coalesce_config as coalesce_config
+from test_merge_queue_coalesce import git_config as git_config
+from test_merge_queue_coalesce import git_ops as git_ops
+from test_merge_queue_coalesce import git_repo as git_repo
 
 if TYPE_CHECKING:
     from collections.abc import Iterator

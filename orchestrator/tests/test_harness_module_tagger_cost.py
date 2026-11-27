@@ -14,8 +14,8 @@ unblock_auto site (shared/src/shared/cli_invoke.py's
 ``invoke_with_cap_retry`` records via ``cost_store.save_invocation`` whenever
 ``cost_store`` is supplied).
 
-Reuses the ``_cost_store_factory`` fixture from test_harness_park_stop.py
-(step-19/20) for a real temp CostStore, and the SAMPLE_TASKS /
+Uses the suite-wide ``_cost_store_factory`` fixture
+(``_orch_suite_fixtures.py``) for a real temp CostStore, and the SAMPLE_TASKS /
 AGENT_MODULE_RESPONSE / invoke_agent-patch pattern from
 test_harness_module_tagging.py.
 """
@@ -29,7 +29,6 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 from shared.config_models import UsageCapConfig
-from test_harness_park_stop import _cost_store_factory  # noqa: F401 -- reused cross-module fixture
 
 from orchestrator.agents.invoke import AgentResult
 from orchestrator.config import OrchestratorConfig

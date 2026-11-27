@@ -19,7 +19,6 @@ from _briefing_helpers import (
     _mcp_search_envelope,
     _result,
     _search_arguments,
-    briefing,  # noqa: F401 — re-export: pytest fixture used by test methods
     memory_transport,
 )
 from _prompt_action_items import action_items

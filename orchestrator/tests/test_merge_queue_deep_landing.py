@@ -91,8 +91,8 @@ from _merge_deep_scene import (
     _spy_advance_main,
     _spy_chain_lane_release,
     _verify_row,
-    git_repo,  # noqa: F401 — pytest fixture used by name, resolved from the shared deep scene
 )
+from _merge_deep_scene import git_repo as git_repo
 from _merge_lane_census import (
     ALL_LANES,
     lanes_by_task,

@@ -29,7 +29,6 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from _workflow_helpers import _build_harness
 from test_harness_park_stop import (
-    _cost_store_factory,  # noqa: F401 -- reused cross-module pytest fixture
     _make_harness_with_mocks,
 )
 

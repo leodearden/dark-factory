@@ -18,7 +18,6 @@ from unittest.mock import AsyncMock
 
 import pytest
 from _briefing_helpers import _mcp_search_envelope, memory_transport
-from _briefing_helpers import briefing as briefing
 from shared.defects import (
     DEFECTS_METADATA_KEY,
     DefectDeclaration,
