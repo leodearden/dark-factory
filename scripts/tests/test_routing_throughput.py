@@ -14,7 +14,9 @@ import routing_throughput
 from routing_throughput import (
     Arm,
     ArmTotals,
+    ComplianceFailure,
     IntervalSide,
+    RoleCompliance,
     ThroughputOptions,
     ThroughputUnavailable,
     Unavailable,
@@ -552,3 +554,97 @@ def test_an_unreadable_main_history_is_refused_naming_the_root(tmp_path, make_se
 
     assert excinfo.value.kind is Unavailable.HISTORY_UNREADABLE
     assert str(root) in str(excinfo.value)
+
+
+COMPLIANCE_N_PER_ARM = 5
+
+
+@pytest.fixture
+def compliance_root(tmp_path, make_seeding_runs_db):
+    """A planted A/A cohort of 5 per arm, and its open seeding connection."""
+    root = tmp_path / 'df'
+    conn = build_cohort_root(root, make_seeding_runs_db, planted_cohort(
+        SALT, SINCE, n_per_arm=COMPLIANCE_N_PER_ARM, treated_cost_factor=IDENTICAL_ARMS,
+    ))
+    return root, conn
+
+
+def _dispatch(conn, task_id, at: datetime, *, role: str, effort: str, rule_id: str | None) -> None:
+    seed_tasks(conn, [CohortTask(task_id=task_id, dispatches=(
+        Dispatch(at=at, role=role, effort=effort, rule_id=rule_id),
+    ))])
+
+
+def test_a_compliant_cohort_has_no_deviation_and_no_failure(compliance_root):
+    root, _ = compliance_root
+
+    compliance = throughput_report(_options(root), SINCE).compliance
+
+    assert compliance.roles['implementer'] == RoleCompliance(
+        dispatches=2 * COMPLIANCE_N_PER_ARM, effort_deviations=0, treated_without_rule=0,
+    )
+    assert compliance.roles['debugger'] == RoleCompliance(
+        dispatches=0, effort_deviations=0, treated_without_rule=0,
+    )
+    assert compliance.failures == ()
+
+
+def test_a_control_dispatch_at_treated_effort_is_a_deviation_and_not_a_failure(compliance_root):
+    root, conn = compliance_root
+    (control, *_) = arm_task_ids(SALT, 2, 1, COMPLIANCE_N_PER_ARM)[1]
+    _dispatch(conn, control, _hours(150), role='debugger', effort=TREATED_EFFORT, rule_id=None)
+
+    compliance = throughput_report(_options(root), SINCE).compliance
+
+    assert compliance.roles['debugger'] == RoleCompliance(
+        dispatches=1, effort_deviations=1, treated_without_rule=0,
+    )
+    assert compliance.failures == ()
+
+
+def test_a_treated_dispatch_without_the_rule_is_counted_and_not_a_failure(compliance_root):
+    root, conn = compliance_root
+    (treated, *_), _ = arm_task_ids(SALT, 2, 1, COMPLIANCE_N_PER_ARM)
+    _dispatch(conn, treated, _hours(150), role='implementer', effort=TREATED_EFFORT, rule_id=None)
+
+    compliance = throughput_report(_options(root), SINCE).compliance
+
+    assert compliance.roles['implementer'] == RoleCompliance(
+        dispatches=2 * COMPLIANCE_N_PER_ARM + 1, effort_deviations=0, treated_without_rule=1,
+    )
+    assert compliance.failures == ()
+
+
+def test_a_treated_dispatch_at_control_effort_is_a_compliance_failure(compliance_root):
+    root, conn = compliance_root
+    (treated, *_), _ = arm_task_ids(SALT, 2, 1, COMPLIANCE_N_PER_ARM)
+    at = _hours(150)
+    _dispatch(conn, treated, at, role='implementer', effort=CONTROL_EFFORT, rule_id=TREATED_RULE_ID)
+
+    compliance = throughput_report(_options(root), SINCE).compliance
+
+    assert compliance.roles['implementer'] == RoleCompliance(
+        dispatches=2 * COMPLIANCE_N_PER_ARM + 1, effort_deviations=1, treated_without_rule=0,
+    )
+    assert compliance.failures == (ComplianceFailure(
+        project=root.name, task_id=str(treated), role='implementer', at=at, effort=CONTROL_EFFORT,
+    ),)
+
+
+def test_dispatches_outside_the_window_roles_or_cohort_are_not_counted(compliance_root):
+    root, conn = compliance_root
+    (treated, *_), _ = arm_task_ids(SALT, 2, 1, COMPLIANCE_N_PER_ARM)
+    (before_since, after_cohort), _ = arm_task_ids(SALT, 2, 1, 2, start=10_000)
+    violation = dict(effort=CONTROL_EFFORT, rule_id=TREATED_RULE_ID)
+    _dispatch(conn, before_since, SINCE - timedelta(hours=1), role='implementer', **violation)
+    _dispatch(conn, treated, READ_AT, role='implementer', **violation)
+    _dispatch(conn, treated, _hours(150), role='architect', **violation)
+    _dispatch(conn, after_cohort, COHORT_END + timedelta(hours=1), role='implementer', **violation)
+
+    compliance = throughput_report(_options(root), SINCE).compliance
+
+    assert compliance.roles['implementer'] == RoleCompliance(
+        dispatches=2 * COMPLIANCE_N_PER_ARM, effort_deviations=0, treated_without_rule=0,
+    )
+    assert 'architect' not in compliance.roles
+    assert compliance.failures == ()
