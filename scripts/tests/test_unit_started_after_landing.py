@@ -14,7 +14,10 @@ import pytest
 import unit_started_after_landing as predicate
 from committed_git_repo import committed_repo
 from shared.testing_own_time import run_on_own_time
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 from throughput_cohort_fixtures import land_branch
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 UNIT = 'fused-memory.service'
 LANDED = datetime(2026, 11, 20, 12, 0, tzinfo=UTC)
