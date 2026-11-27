@@ -4,6 +4,7 @@ full-suite legs cost, read from each command's C4 ``resources`` record.
 The record's shape and the meaning of each capture state live in
 orchestrator/src/orchestrator/verify_command_resources.py; the census reads the
 summary JSON and imports none of it, so the records here are built by hand.
+Only the pin on the census's restated capture states imports the record's own.
 
 The synthetic-corpus norm lives in tests/scripts/verify_budget_census_fixture.py.
 """
@@ -13,6 +14,7 @@ import json
 from typing import Any
 
 import pytest
+import verify_budget_census
 from verify_budget_census_fixture import (
     command_entry,
     run_main,
@@ -75,6 +77,15 @@ def _three_exit_legs() -> tuple[dict[str, Any], ...]:
             resources=_resources(cpu_usec=1_800_000_000, memory_peak_bytes=7 * GIB // 2),
         ),
     )
+
+
+class TestTheCaptureStates:
+
+    def test_the_census_copy_of_the_states_matches_the_record(self):
+        """A state the census does not know reads as malformed."""
+        from orchestrator.verify_command_resources import Capture
+
+        assert set(verify_budget_census.C4_CAPTURE_STATES) == {c.value for c in Capture}
 
 
 class TestCleanLegsCapturedAtExitMakeTheSeries:

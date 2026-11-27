@@ -837,7 +837,7 @@ def _is_clean(leg: Leg) -> bool:
 # The C4 capture states, restated because this script imports no orchestrator
 # code. Their one home and meaning:
 # orchestrator/src/orchestrator/verify_command_resources.py::Capture, which
-# orchestrator/tests/test_verify_command_resources.py pins this copy against.
+# tests/scripts/test_verify_budget_census_cost.py pins this copy against.
 C4_CAPTURE_STATES = ('exit', 'before_kill', 'relocated', 'unavailable')
 UNRECORDED = 'unrecorded'
 MALFORMED = 'malformed'
