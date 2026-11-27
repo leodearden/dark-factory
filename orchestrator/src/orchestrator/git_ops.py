@@ -103,7 +103,12 @@ from orchestrator.branch_stack import (
     foreign_commit_cut,
     rebase_own_delta,
 )
-from orchestrator.config import TASK_META_DIRNAME, GitConfig, TranscriptArchiveConfig
+from orchestrator.config import (
+    TASK_META_DIRNAME,
+    GitConfig,
+    TranscriptArchiveConfig,
+    WarmLaneWrapperScript,
+)
 from orchestrator.index_lock_liveness import (
     GitProcessScan,
     IndexLockHolderScanner,
@@ -6236,7 +6241,7 @@ class GitOps:
         return None
 
     def _resolve_warm_lane_script_logged(
-        self, name: str, method: str,
+        self, name: WarmLaneWrapperScript, method: str,
     ) -> tuple[Path, str] | None:
         """:meth:`_resolve_warm_lane_script`, plus the operator-facing log line.
 
@@ -6267,7 +6272,10 @@ class GitOps:
         call so a skip stays attributable to the real cause.
 
         Args:
-            name: Bare script filename, e.g. ``'warm-lane-gc.sh'``.
+            name: Bare script filename, e.g. ``'warm-lane-gc.sh'``. Typed
+                as the vocabulary ``git.warm_lane_df_preferred_scripts``
+                accepts, so a renamed or added wrapper cannot fall out
+                of the set an operator's yaml can name.
             method: Calling method name, prefixed onto both log lines.
 
         Returns:

@@ -87,7 +87,7 @@ VerifyHostPolicy = Literal['prefer_local', 'prefer_remote']
 # eligibility match share one vocabulary.
 VerifyTaskHostPolicy = Literal['local', 'remote_modules', 'remote_all']
 
-#: The script names GitOps's warm-lane wrappers resolve (git_ops.py::GitOps._warm_lane_script_candidates).
+#: The script names GitOps's warm-lane wrappers resolve (git_ops.py::GitOps._resolve_warm_lane_script_logged).
 WarmLaneWrapperScript = Literal[
     'warm-lane-disk-guard.sh',
     'warm-lane-audit.sh',
