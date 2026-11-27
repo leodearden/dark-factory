@@ -1497,6 +1497,7 @@ class TestPanelCache:
         [warning] = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
         assert 'Not reusing 2 legacy panel' in warning and str(results_dir) in warning, warning
         assert 'ran at 30 turns, this run uses 90' in warning, warning
+        assert "production's budget" not in warning, warning
 
     @pytest.mark.usefixtures('code_default_config')
     @pytest.mark.asyncio
@@ -1528,7 +1529,26 @@ class TestPanelCache:
         assert warned_before_dispatch == [True, True]
         [warning] = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
         assert 'Not reusing 2 legacy panel' in warning and str(results_dir) in warning, warning
-        assert '$5.00' in warning and '$12.00' in warning, warning
+        assert "arms taking production's budget ran at $5.00, this run uses $12.00" in warning, warning
+        assert 'turns' not in warning, warning
+
+    @pytest.mark.usefixtures('code_default_config')
+    @pytest.mark.asyncio
+    async def test_run_trial_names_both_mismatches_when_both_pass_a_legacy_panel_over(
+        self, source: _Source, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        variant, diff, results_dir = _unpinned_reviewer(), _diff_in(source), tmp_path / 'results'
+        _write_legacy_panel(results_dir, PanelRunResult(variant_name=variant.name, diff_id=diff.diff_id))
+
+        with (
+            caplog.at_level(logging.WARNING, logger='orchestrator.evals.reviewer_trial.runner'),
+            _counted_reviewers(),
+        ):
+            await run_trial([variant], CorpusManifest(diffs=[diff]), results_dir=results_dir, stagger_secs=0)
+
+        [warning] = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert 'they ran at 30 turns, this run uses 90' in warning, warning
+        assert "arms taking production's budget ran at $5.00, this run uses $12.00" in warning, warning
 
     @pytest.mark.asyncio
     async def test_run_trial_at_the_legacy_turns_and_budget_reuses_every_legacy_panel(

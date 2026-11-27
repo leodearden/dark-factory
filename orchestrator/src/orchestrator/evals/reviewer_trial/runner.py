@@ -759,20 +759,30 @@ def _warn_of_passed_over_legacy_panels(
     variants: Sequence[VariantConfig], diffs: Sequence[CorpusDiff], out_dir: Path, turns: int,
     production_budget: float,
 ) -> None:
-    passed_over = sum(
-        1 for variant in variants
+    passed_over = [
+        variant for variant in variants
         if not _ran_like_legacy(variant, turns, panel_budgets(variant, production_budget))
         for diff in diffs
         if (out_dir / _slot_filename(variant.name, diff.diff_id, None)).exists()
-    )
-    if passed_over:
-        logger.warning(
-            'Not reusing %d legacy panel(s) from %s: they ran at %d turns, this run uses %d; '
-            "arms taking production's budget ran at $%.2f, this run uses $%.2f; "
-            'see docs/plan-scoring-and-judge.md, "Reviewer-trial panel cache and score loop (task 6741)"',
-            passed_over, out_dir, LEGACY_PANEL_MAX_TURNS, turns,
-            LEGACY_PRODUCTION_BUDGET_USD, production_budget,
+    ]
+    if not passed_over:
+        return
+    mismatches = []
+    if turns != LEGACY_PANEL_MAX_TURNS:
+        mismatches.append(f'they ran at {LEGACY_PANEL_MAX_TURNS} turns, this run uses {turns}')
+    if any(
+        panel_budgets(variant, production_budget) != panel_budgets(variant, LEGACY_PRODUCTION_BUDGET_USD)
+        for variant in passed_over
+    ):
+        mismatches.append(
+            f"arms taking production's budget ran at ${LEGACY_PRODUCTION_BUDGET_USD:.2f}, "
+            f'this run uses ${production_budget:.2f}',
         )
+    logger.warning(
+        'Not reusing %d legacy panel(s) from %s: %s; '
+        'see docs/plan-scoring-and-judge.md, "Reviewer-trial panel cache and score loop (task 6741)"',
+        len(passed_over), out_dir, '; '.join(mismatches),
+    )
 
 
 async def run_and_score(

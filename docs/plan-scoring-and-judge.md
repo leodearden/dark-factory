@@ -1186,7 +1186,8 @@ file and the legacy one is left in place. Each hit and each pass-over is
 logged at INFO naming the file. `run_trial` also logs one WARNING per call
 naming the directory. When its cap and budgets match the legacy ones, it
 counts the legacy panels it reused. Otherwise it counts, before any reviewer
-runs, the legacy panels that cap or budget passes over. The packaged results
+runs, the legacy panels that cap or budget passes over, and names each of the
+two that differs from its legacy value. The packaged results
 directory and finished campaign directories hold such entries. Only `campaign`
 takes `--max-turns` and `--production-budget`: `smoke`, `calibrate`,
 `corpus-sanity`, `full`, `sweep` and `refresh` run at production's cap and
