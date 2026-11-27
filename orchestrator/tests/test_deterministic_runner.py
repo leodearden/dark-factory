@@ -2082,14 +2082,28 @@ class TestHumanCuratorGateAdjudicationGuard:
         )
 
 
-async def _headerless_resolve(queue: EscalationQueue, escalation_id: str, **kwargs) -> dict:
+async def _headerless_resolve(
+    queue: EscalationQueue, escalation_id: str, *, resolution_class: str = 'actionable', **kwargs,
+) -> dict:
     """Close *escalation_id* through the real ``resolve_issue`` tool, header-less."""
     from escalation.server import create_server
     from fastmcp.tools.function_tool import FunctionTool
 
     tool = await create_server(queue, startup_sweep=False).get_tool('resolve_issue')
     assert isinstance(tool, FunctionTool)
-    return tool.fn(escalation_id=escalation_id, resolution_class='actionable', **kwargs)
+    return tool.fn(escalation_id=escalation_id, resolution_class=resolution_class, **kwargs)
+
+
+def _resolve_issue_snippets(detail: str) -> list[dict]:
+    """Every pasteable ``resolve_issue(...)`` call in *detail*, as its keyword values."""
+    snippets = []
+    for line in detail.splitlines():
+        if 'resolve_issue(' not in line:
+            continue
+        call = ast.parse(line[line.index('resolve_issue('):].strip(), mode='eval').body
+        assert isinstance(call, ast.Call) and call.args == [], line
+        snippets.append({k.arg: ast.literal_eval(k.value) for k in call.keywords})
+    return snippets
 
 
 async def _file_first_gate(queue: EscalationQueue, task: dict) -> Escalation:
@@ -2177,6 +2191,30 @@ class TestCuratorGateEscalationIsPinned:
 
         assert result['code'] == 'declared_pin_refused'
         assert [e.id for e in queue.get_by_task('3181', status='pending')] == [reask.id]
+
+    async def test_curator_adjudication_missing_reask_remediation_names_its_own_pin(
+        self, tmp_path: Path,
+    ):
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        task = _curator_gate_task(
+            task_id='3181', gate_escalated_at='2026-07-30T16:30:28.993178+00:00',
+        )
+        queue = EscalationQueue(tmp_path)
+        _seed_resolved_gate(queue, '3181')
+        runner = DeterministicRunner(scheduler=_mock_scheduler(task), escalation_queue=queue)
+        await runner.run(_make_assignment(task))
+        (reask,) = queue.get_by_task('3181', status='pending')
+
+        resume, abandon = _resolve_issue_snippets(reask.detail)
+
+        assert (resume['action'], abandon['action']) == ('resume', 'abandon')
+        for snippet in (resume, abandon):
+            assert snippet['escalation_id'] == reask.id
+            assert snippet['acknowledge_declared_pins'] == [reask.id]
+        result = await _headerless_resolve(queue, **resume)
+        assert 'error' not in result, result
+        assert queue.get_by_task('3181', status='pending') == []
 
 
 # ---------------------------------------------------------------------------

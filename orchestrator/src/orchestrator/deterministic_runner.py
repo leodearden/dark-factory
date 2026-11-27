@@ -1552,6 +1552,7 @@ class DeterministicRunner:
         # its actual target project via --config, so a cwd-derived value would
         # silently aim most operators at the wrong project.
         project_root = _snippet_project_root(self.scheduler)
+        escalation_id = self.escalation_queue.make_id(task_id)
         detail = (
             f"Task {task_id} ({title!r}) is a deterministic pure gate marked "
             f"`metadata.{HUMAN_CURATOR_GATE_KEY}`, meaning it closes only when a "
@@ -1574,8 +1575,15 @@ class DeterministicRunner:
             f"'<ISO-8601 timestamp>'}}, metadata_mode='merge')\n"
             f"      The stamp must be a non-empty string; a bare `true` is NOT "
             f"accepted (it asserts the conclusion without recording when the "
-            f"review happened).\n"
-            f"  (b) Cancel the task, if the content work is no longer wanted.\n\n"
+            f"review happened). This record is filed with the gate's declared "
+            f"pin, so the resolve must name it:\n"
+            f"      resolve_issue(escalation_id={escalation_id!r}, action='resume', "
+            f"acknowledge_declared_pins=[{escalation_id!r}], "
+            f"resolution_class='actionable', resolution='<what was reviewed>')\n"
+            f"  (b) Cancel the task, if the content work is no longer wanted: "
+            f"resolve_issue(escalation_id={escalation_id!r}, action='abandon', "
+            f"acknowledge_declared_pins=[{escalation_id!r}], "
+            f"resolution_class='actionable', resolution='<why it is cancelled>')\n\n"
             f"Resolving THIS escalation without doing (a) or (b) will simply "
             f"re-file it on the next dispatch."
         )
@@ -1586,7 +1594,7 @@ class DeterministicRunner:
         # construction.
         pin = curator_gate_pin(task_id, metadata)
         esc = Escalation(
-            id=self.escalation_queue.make_id(task_id),
+            id=escalation_id,
             task_id=task_id,
             agent_role=DETERMINISTIC_AGENT_ROLE,
             severity='critical',
