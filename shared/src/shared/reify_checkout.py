@@ -5,11 +5,11 @@ The single source of reify-checkout resolution in dark-factory.  Promoted here
 3843 first established the semantics, so the cross-repo call sites share one
 implementation instead of drifting apart.  The one consumer is
 ``scripts/check_lock_charter_drift.py``, the off-gate lock-charter drift check,
-which gates on reify's ``scripts/lock-charter-guard.sh``.  No merge-gate test
-reads a reify checkout (tasks 11623, 11630).  Both the resolution AND the skip
-wording live here: a call site that hand-rolled its own "reify checkout not
-discoverable" string would re-open exactly the conflation `reify_skip_reason`
-exists to prevent.
+which gates on reify's ``scripts/lock-charter-guard.sh``.  Whether the merge
+gate reads a reify checkout is stated in ``OPERATIONS.md`` §9a.  Both the
+resolution AND the skip wording live here: a call site that hand-rolled its own
+"reify checkout not discoverable" string would re-open exactly the conflation
+`reify_skip_reason` exists to prevent.
 
 Consumers import from this module directly::
 

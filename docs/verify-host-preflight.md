@@ -156,8 +156,8 @@ a test id in junit spelling, the task or ticket that will remove it, and why:
 ```yaml
 exceptions:
   - test_id: "tests.test_example::test_needs_a_host_tool[merge]"
-    owner: {type: task, id: 1234}
-    reason: Needs a tool only the reference host has, which task 1234 installs on verify hosts.
+    owner: {type: task, id: <n>}
+    reason: Needs a tool only the reference host has, which task <n> installs on verify hosts.
 ```
 
 Every entry must be owned (INV-12). `owner` is the house owner record,
