@@ -15,6 +15,7 @@ import contextlib
 import dataclasses
 import importlib.util
 import json
+import re
 import shutil
 import socket
 import subprocess
@@ -620,6 +621,43 @@ class TestWrapRunsTheCommandUnchanged:
 
         assert _outcome(wrapped) == _outcome(bare)
         assert launcher_exited_before_exec is False
+
+    @pytest.mark.parametrize(
+        ('cmd', 'signal_number'),
+        [
+            ("sh -c 'kill -KILL $$'", 9),
+            ('kill -TERM $BASHPID', 15),
+            ("true && sh -c 'kill -KILL $$'", 9),
+        ],
+    )
+    def test_a_signal_death_adds_nothing_to_the_output(self, tmp_path, cmd, signal_number):
+        capture = _FakeScope(tmp_path).capture(tmp_path)
+        assert capture.directory is not None
+
+        wrapped, _ = _run_payload(capture.wrap(cmd))
+        bare, _ = _run_payload(cmd)
+
+        assert (wrapped.stdout, wrapped.stderr) == (bare.stdout, bare.stderr) == ('', '')
+        assert bare.returncode == -signal_number
+        assert wrapped.returncode == 128 + signal_number
+        assert (capture.directory / 'complete').exists()
+        assert capture.record(**IDENTITY).capture is Capture.EXIT
+
+    def test_the_command_keeps_its_own_signal_death_reports(self, tmp_path):
+        capture = _FakeScope(tmp_path).capture(tmp_path)
+        cmd = "sh -c 'kill -KILL $$'; echo after"
+
+        wrapped, _ = _run_payload(capture.wrap(cmd))
+        bare, _ = _run_payload(cmd)
+
+        def without_line_and_pid(stderr: str) -> str:
+            return re.sub(r'line \d+: \d+ Killed', 'line N: PID Killed', stderr)
+
+        assert without_line_and_pid(wrapped.stderr) == without_line_and_pid(bare.stderr)
+        assert 'line 2:' in bare.stderr
+        assert 'Killed' in bare.stderr
+        assert wrapped.stdout == bare.stdout == 'after\n'
+        assert wrapped.returncode == bare.returncode == 0
 
     @pytest.mark.parametrize('cmd', ['echo bye; exit 5', 'exec true'])
     def test_exit_and_exec_cannot_skip_the_capture(self, tmp_path, cmd):
