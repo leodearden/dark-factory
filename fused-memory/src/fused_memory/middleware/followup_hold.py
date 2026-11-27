@@ -51,6 +51,7 @@ __all__ = [
     'HOLDER_GATE_KEYS',
     'HOLDER_MINT_SOURCE',
     'PROTECTED_STATUSES',
+    'WAITING_STATUSES',
     'DuplicateFollowupHolderError',
     'FollowupHolderProtectedError',
     'FollowupHolders',
@@ -83,15 +84,16 @@ __all__ = [
     'release_held',
     'releases_holder',
     'remove_holder_edge',
+    'starts_waiting',
     'unregister_promotion_guard',
+    'waits_on_its_dependencies',
 ]
 
 HELD_PRIORITIES: Final = frozenset({'low', 'polish'})
 PROTECTED_STATUSES: Final = frozenset({TaskStatus.DONE, TaskStatus.CANCELLED, TaskStatus.DEFERRED})
 HOLDER_GATE_KEYS: Final = frozenset({FOLLOWUP_HOLDER_METADATA_KEY, 'deferred_watch', 'trigger_met'})
 HOLDER_MINT_SOURCE: Final = 'followup-holder-mint'
-
-_WAITING_STATUSES: Final = frozenset(ACTIVE - {TaskStatus.DEFERRED})
+WAITING_STATUSES: Final = frozenset(ACTIVE - {TaskStatus.DEFERRED})
 
 _FOLLOWUP_SOURCE: Final = 'agent-followup'
 _REVIEW_SUGGESTIONS_CONTEXT: Final = 'review_suggestions'
@@ -228,6 +230,16 @@ def held_by(task: Mapping[str, object]) -> int | None:
     """
     record = _current_hold(task)
     return None if record is None else record.holder
+
+
+def waits_on_its_dependencies(task: Mapping[str, object]) -> bool:
+    """The dependent a held dependency must not be left behind (PRD §3 decision 14, §9 open question 7)."""
+    return task.get('status') in WAITING_STATUSES and held_by(task) is None
+
+
+def starts_waiting(old_status: str | None, status: str) -> bool:
+    """A status landing that starts a task waiting on its dependencies."""
+    return old_status not in WAITING_STATUSES and status in WAITING_STATUSES
 
 
 def _current_hold(task: Mapping[str, object]) -> FollowupHold | None:
@@ -416,8 +428,8 @@ _HOLDER_EDGE_STRIP_HINT = (
     'caller may not drop that edge with a dependencies replacement. Keep the holder id in the '
     'dependencies list. A held follow-up leaves the hold by promotion: cite it with x_finding_key '
     'or prd_path (unless it carries finding_set_hold, which a citation does not promote), depend '
-    'on it from a pending task, or have a human call remove_dependency(task, holder). See '
-    'docs/task-authoring.md §3.4.'
+    'on it from an unheld task that is neither deferred nor settled, or have a human call '
+    'remove_dependency(task, holder). See docs/task-authoring.md §3.4.'
 )
 
 
@@ -741,12 +753,12 @@ async def _stamp_human_release(
 async def promote_dependencies_of(
     tm: TaskBackendProtocol, project_root: str, task_id: int, *, emit: HoldEmit,
 ) -> tuple[int, ...]:
-    """An edge onto a held task promotes it once its dependent is pending and not itself held.
+    """An edge onto a held task promotes it once its dependent waits on its dependencies and is not itself held.
 
     So an edge between two held tasks keeps both held. Same precondition as :func:`promote`.
     """
     row = await _live_row(tm, project_root, task_id)
-    if row is None or row.get('status') != TaskStatus.PENDING or held_by(row) is not None:
+    if row is None or not waits_on_its_dependencies(row):
         return ()
     seeds = _dependent_seeds(task_id, _local_dependencies(row))
     return (await _promote_frontier(tm, project_root, seeds, emit)).promoted
@@ -938,8 +950,8 @@ async def backfill(
 
     Each task's edge and record land in one backend write under the interceptor's write lock, with
     no journal row and no ``task_modified`` event. A task that already carries a ``followup_hold``
-    record was promoted or released and is never re-held. A pending follow-up that an active,
-    non-deferred task outside the stock waits on, directly or through other stock tasks, is left
+    record was promoted or released and is never re-held. A pending follow-up that a task in
+    :data:`WAITING_STATUSES` outside the stock waits on, directly or through other stock tasks, is left
     unheld, because nothing would promote it; ``known_roots`` are the projects whose
     ``external_deps`` can cite this one. One ``followup_hold_backfilled`` event is emitted per
     call, its count possibly 0, so a reader can tell the backfill ran.
@@ -1018,7 +1030,7 @@ async def _cited_by_waiting_dependents(
     statuses = await tm.get_statuses(project_root, ids=[str(dependent) for dependent in cited_by])
     return frozenset(
         candidate
-        for dependent, cited in cited_by.items() if statuses.get(str(dependent)) in _WAITING_STATUSES
+        for dependent, cited in cited_by.items() if statuses.get(str(dependent)) in WAITING_STATUSES
         for candidate in cited
     )
 
@@ -1035,7 +1047,7 @@ async def _cited_by_other_projects(
     for root in known_roots:
         if resolve_project_id(root) == project_id:
             continue
-        waiting = await tm.get_tasks(root, statuses=sorted(_WAITING_STATUSES), fields=_EXTERNAL_DEPS_FIELDS)
+        waiting = await tm.get_tasks(root, statuses=sorted(WAITING_STATUSES), fields=_EXTERNAL_DEPS_FIELDS)
         cited.update(
             task_id for task in waiting['tasks'] for task_id in _external_citations(task, project_id)
         )
