@@ -5,11 +5,14 @@ throughput_cohort_fixtures builders; no test reads a live store.
 """
 from __future__ import annotations
 
+import json
+import sys
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
+import routing_experiment_readout as readout
 import routing_throughput
 from routing_throughput import (
     Arm,
@@ -24,6 +27,7 @@ from routing_throughput import (
     throughput_report,
 )
 from shared.routing_split import split_bucket
+from shared.testing_own_time import run_on_own_time
 from throughput_cohort_fixtures import (
     CONTROL_EFFORT,
     TREATED_EFFORT,
@@ -648,3 +652,175 @@ def test_dispatches_outside_the_window_roles_or_cohort_are_not_counted(complianc
     )
     assert 'architect' not in compliance.roles
     assert compliance.failures == ()
+
+
+# --- the readout's --throughput command line ---------------------------------
+
+CLI_RESAMPLES = 500
+CLI_SEED = 7
+SUMMARY_KEYS = {
+    'salt', 'since', 'cohort_days', 'read_at', 'n_treated', 'landed_treated', 'cost_treated',
+    'n_control', 'landed_control', 'cost_control', 'ratio', 'interval_level', 'interval_low',
+    'interval_high', 'compliance_failures',
+}
+
+
+def _cli(root: Path, *extra: str) -> list[str]:
+    return [
+        '--throughput', '--salt', SALT, '--rule-prefix', PREFIX, '--roots', str(root),
+        '--read-at', READ_AT.isoformat(), '--cohort-days', str(COHORT_DAYS),
+        '--resamples', str(CLI_RESAMPLES), '--seed', str(CLI_SEED), *extra,
+    ]
+
+
+def _cli_options(root: Path) -> ThroughputOptions:
+    return _options(root, resamples=CLI_RESAMPLES, seed=CLI_SEED)
+
+
+def _summary(out: str) -> dict:
+    return json.loads(out.splitlines()[-1])
+
+
+def _sections(out: str) -> list[list[str]]:
+    """stdout less its JSON last line, in blocks that each open at a ``rule:`` line."""
+    sections: list[list[str]] = []
+    for line in out.splitlines()[:-1]:
+        if line.startswith('rule:'):
+            sections.append([line])
+        elif sections:
+            sections[-1].append(line)
+    return sections
+
+
+@pytest.fixture
+def violated_root(tmp_path, make_seeding_runs_db) -> Path:
+    """The planted cut, plus one treated implementer dispatch at the control effort."""
+    root = tmp_path / 'df-violated'
+    conn = build_cohort_root(root, make_seeding_runs_db, planted_cohort(
+        SALT, SINCE, n_per_arm=40, treated_cost_factor=PLANTED_CUT,
+    ))
+    (treated, *_), _ = arm_task_ids(SALT, 2, 1, 40)
+    _dispatch(conn, treated, _hours(150), role='implementer', effort=CONTROL_EFFORT,
+              rule_id=TREATED_RULE_ID)
+    return root
+
+
+def test_throughput_on_the_planted_cut_prints_three_ruled_tables(planted_root, capsys):
+    root = planted_root(PLANTED_CUT)
+
+    assert readout.main(_cli(root)) == 0
+
+    ratio, secondary, compliance = _sections(capsys.readouterr().out)
+    for section in (ratio, secondary, compliance):
+        rule = section[0]
+        assert f'[{SINCE.isoformat()}, {COHORT_END.isoformat()})' in rule
+        assert f'read_at {READ_AT.isoformat()}' in rule
+        assert 'population' in rule
+        assert str(root) in rule
+        assert 'excluded' in rule
+        assert len(section) > 1
+    assert any('wholly above 1' in line for line in ratio)
+    assert any('null p95' in line and 'p99' in line for line in ratio)
+    assert any('verify_attempts_per_landing' in line for line in secondary)
+    assert any('effort_deviations' in line for line in compliance)
+
+
+def test_throughput_ends_with_a_json_line_agreeing_with_the_report(planted_root, capsys):
+    root = planted_root(PLANTED_CUT)
+    options = _cli_options(root)
+    report = throughput_report(options, resolve_since(options))
+
+    assert readout.main(_cli(root)) == 0
+
+    summary = _summary(capsys.readouterr().out)
+    assert set(summary) == SUMMARY_KEYS
+    treated, control = report.totals[Arm.TREATED], report.totals[Arm.CONTROL]
+    assert report.interval is not None
+    assert summary == {
+        'salt': SALT,
+        'since': SINCE.isoformat(),
+        'cohort_days': COHORT_DAYS,
+        'read_at': READ_AT.isoformat(),
+        'n_treated': treated.n,
+        'landed_treated': treated.landed,
+        'cost_treated': treated.cost_usd,
+        'n_control': control.n,
+        'landed_control': control.landed,
+        'cost_control': control.cost_usd,
+        'ratio': report.ratio,
+        'interval_level': 0.90,
+        'interval_low': report.interval[0],
+        'interval_high': report.interval[1],
+        'compliance_failures': 0,
+    }
+
+
+def test_throughput_since_defaults_to_the_first_prefixed_dispatch(planted_root, capsys):
+    assert readout.main(_cli(planted_root(PLANTED_CUT))) == 0
+
+    assert _summary(capsys.readouterr().out)['since'] == SINCE.isoformat()
+
+
+def test_throughput_since_given_explicitly_is_reported_as_given(planted_root, capsys):
+    explicit = SINCE + timedelta(days=1)
+
+    assert readout.main(_cli(planted_root(PLANTED_CUT), '--since', explicit.isoformat())) == 0
+
+    assert _summary(capsys.readouterr().out)['since'] == explicit.isoformat()
+
+
+def test_throughput_with_a_treated_dispatch_at_control_effort_exits_3(violated_root, capsys):
+    assert readout.main(_cli(violated_root)) == 3
+
+    out = capsys.readouterr().out
+    assert [line for line in out.splitlines() if line.startswith('COMPLIANCE FAILURE')]
+    assert _summary(out)['compliance_failures'] == 1
+
+
+def test_throughput_without_a_prefixed_dispatch_exits_4_naming_the_prefix(
+    tmp_path, make_seeding_runs_db, capsys,
+):
+    root = tmp_path / 'df'
+    build_cohort_root(root, make_seeding_runs_db, [
+        CohortTask(task_id=1, dispatches=(_control(_hours(1)),)),
+    ])
+
+    assert readout.main(_cli(root)) == 4
+
+    err = capsys.readouterr().err
+    assert 'no routing_decision carries' in err
+    assert PREFIX in err
+
+
+def test_throughput_over_a_root_without_runs_db_exits_5(tmp_path, capsys):
+    root = tmp_path / 'empty'
+    root.mkdir()
+
+    assert readout.main(_cli(root)) == 5
+
+    assert str(root) in capsys.readouterr().err
+
+
+@pytest.mark.parametrize('bad', [
+    ('--interval-level', '1.5'),
+    ('--treated-bucket', '2'),
+    ('--read-at', '2026-11-22T00:00:00'),
+])
+def test_throughput_refuses_a_bad_option_as_a_usage_error(tmp_path, bad):
+    with pytest.raises(SystemExit) as excinfo:
+        readout.main(_cli(tmp_path, *bad))
+
+    assert excinfo.value.code == 2
+
+
+_CHILD_READOUT_BUDGET_S = 60.0  # own time; the child needs about a second
+
+
+def test_throughput_compliance_failure_exits_3_from_a_real_child_process(violated_root):
+    completed = run_on_own_time(
+        [sys.executable, readout.__file__, *_cli(violated_root)],
+        budget=_CHILD_READOUT_BUDGET_S,
+    )
+
+    assert completed.returncode == 3, completed.stderr
+    assert 'COMPLIANCE FAILURE' in completed.stdout
