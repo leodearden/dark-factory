@@ -29,12 +29,13 @@ response one small chunk at a time.  Both wait on
 from __future__ import annotations
 
 import json
-import sys
 import threading
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler
 from typing import Any
+
+from _quiet_http_server import QuietHTTPServer
 
 CannedResponse = tuple[int, dict[str, Any]] | tuple[int, dict[str, Any], Mapping[str, str]]
 """``(status, body)`` or ``(status, body, extra_headers)``."""
@@ -333,17 +334,6 @@ def _make_handler(state: MockOpenAIServer) -> type[BaseHTTPRequestHandler]:
     return Handler
 
 
-class _QuietServer(ThreadingHTTPServer):
-    # Don't let a still-open client connection block shutdown().
-    daemon_threads = True
-
-    def handle_error(self, request: Any, client_address: Any) -> None:
-        """Stay quiet for a client that hung up mid-stall; report any other handler fault."""
-        if isinstance(sys.exc_info()[1], (BrokenPipeError, ConnectionResetError)):
-            return
-        super().handle_error(request, client_address)
-
-
 @contextmanager
 def mock_openai_server() -> Iterator[MockOpenAIServer]:
     """Run a recording OpenAI-compatible server on an ephemeral local port."""
@@ -351,7 +341,7 @@ def mock_openai_server() -> Iterator[MockOpenAIServer]:
     # free port and then rebinding it would be a TOCTOU race against any other
     # process (or xdist worker) on the box.
     state = MockOpenAIServer('127.0.0.1', 0)
-    httpd = _QuietServer(('127.0.0.1', 0), _make_handler(state))
+    httpd = QuietHTTPServer(('127.0.0.1', 0), _make_handler(state))
     state.host, state.port = str(httpd.server_address[0]), int(httpd.server_address[1])
 
     thread = threading.Thread(target=httpd.serve_forever, daemon=True)
