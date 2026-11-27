@@ -42,7 +42,7 @@ if TYPE_CHECKING:
     from shared.cli_invoke import AgentResult
     from shared.config_models import AccountConfig
 
-    from orchestrator.config import OrchestratorConfig, RoutingRule
+    from orchestrator.config import ModelsConfig, OrchestratorConfig, RoutingRule
 
 logger = logging.getLogger(__name__)
 
@@ -398,6 +398,12 @@ def _config_key(role_name: str) -> str:
     return 'reviewer' if role_name.startswith('reviewer') else role_name
 
 
+def configured_model(role_name: str, models: ModelsConfig) -> str | None:
+    """The model *models* seats for *role_name* (resolve_route's layer 3),
+    or None when ModelsConfig has no seat for the role."""
+    return getattr(models, _config_key(role_name), None)
+
+
 def _task_simple_saturated(task_metadata: Mapping[str, Any]) -> bool:
     """Read ``metadata.routing.simple_saturated``, defaulting to False.
 
@@ -619,8 +625,8 @@ def resolve_route(inputs: RouteInputs, config: OrchestratorConfig) -> RoutingDec
     # Layer 3: static per-role config. Only `model` is fail-safe validated
     # (invariants 2/6) -- effort/budget_usd/max_turns apply unconditionally,
     # they carry no allowlist/ceiling concept.
-    if hasattr(config.models, key):
-        candidate = getattr(config.models, key)
+    candidate = configured_model(inputs.role_name, config.models)
+    if candidate is not None:
         reason = (
             _model_rejection_reason(
                 candidate, config, inputs.spend_by_model, inputs.scope_capacity,
