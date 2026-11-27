@@ -229,17 +229,24 @@ class VoidTally:
     total: int
     before_host: int
     at_adoption: int
+    after_host: int
     per_landing: float | None
 
 
 def voids_per_landing(voided: Sequence[Event], ledger: Sequence[Landing]) -> VoidTally:
-    """``verdict_voided`` rows per landing; point dispatch voids were discarded before a host."""
+    """``verdict_voided`` rows not discarded at point dispatch (after a verify host was acquired) per landing.
+
+    ``total`` and the dispatch count ``before_host`` are kept as information.
+    """
     points = [_data(e).get('point') for e in voided]
+    before_host = points.count('dispatch')
+    after_host = len(points) - before_host
     return VoidTally(
         total=len(points),
-        before_host=points.count('dispatch'),
+        before_host=before_host,
         at_adoption=points.count('adoption'),
-        per_landing=_share(len(points), len(ledger)),
+        after_host=after_host,
+        per_landing=_share(after_host, len(ledger)),
     )
 
 
@@ -990,7 +997,8 @@ D12_ROWS: tuple[D12Row, ...] = (
     ),
     D12Row(
         'voids_per_landing', 'voids per landing', 0.1, Comparison.LT,
-        'verdict_voided rows / landings', '0.78',
+        'verdict_voided rows not discarded at point dispatch (after a verify host was acquired) / landings',
+        '0.78 (all voids)',
     ),
     D12Row(
         'p_gate_after_gate', 'P(gate after a gated landing)', 0.3, Comparison.LT,

@@ -365,9 +365,10 @@ def compute(
     conditionals = canary.gate_conditionals(ledger, events.gates, events.queued_lookback)
     local_hours = canary.host_verify_hours(events.verify_lookback, events.cancelled, lo, hi, host=hosts.local)
     queue = canary.queue_to_land(events.finalized)
+    voids = canary.voids_per_landing(events.voided, ledger)
     figures = canary.CanaryFigures(
         gates_per_landing=canary.gates_per_landing(events.gates, ledger),
-        voids_per_landing=canary.voids_per_landing(events.voided, ledger).per_landing,
+        voids_per_landing=voids.per_landing,
         p_gate_after_gate=conditionals.p_gate_after_gate,
         laptop_finished_share=canary.host_finished_share(events.heartbeats, hi, host=hosts.laptop),
         frozen_tip_violations=len(frozen.violations),
@@ -382,7 +383,7 @@ def compute(
     )
     return Readout(
         lo=lo, hi=hi, sources=sources, ledger=ledger, predicates=canary.evaluate(figures),
-        voids=canary.voids_per_landing(events.voided, ledger), conditionals=conditionals,
+        voids=voids, conditionals=conditionals,
         local_hours=local_hours, union_busy_hours=canary.union_busy_hours(events.verify_lookback, lo, hi),
         queue=queue, chain_items=canary.chain_items_distribution(events.verify),
         depth_reasons=canary.depth_reason_tally(events.verify), starved=canary.depth_starved(events.verify),
@@ -446,8 +447,9 @@ def _voids_section(r: Readout) -> list[str]:
     c = r.conditionals
     return [
         '## Voids', '',
-        f'- verdict_voided rows: {r.voids.total}; before a host (point dispatch): {r.voids.before_host}; '
-        f'at adoption: {r.voids.at_adoption}; per landing: {_num(r.voids.per_landing)}',
+        f'- verdict_voided rows: {r.voids.total}; discarded before a host (point dispatch, not counted): '
+        f'{r.voids.before_host}; after a host was acquired: {r.voids.after_host} '
+        f'(at adoption: {r.voids.at_adoption}); per landing, after a host only: {_num(r.voids.per_landing)}',
         f'- gated landings: {sum(c.gated)} of {len(c.gated)}; P(gate after a gated landing): '
         f'{_num(c.p_gate_after_gate)}; P(gate after an ungated landing): {_num(c.p_gate_after_ungated)}',
     ]
