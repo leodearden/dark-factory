@@ -9,7 +9,12 @@ import pytest
 import yaml
 from pydantic import ValidationError
 
-from orchestrator.config import OrchestratorConfig, VerifyRunnerConfig, load_config
+from orchestrator.config import (
+    OrchestratorConfig,
+    VerifyRunnerConfig,
+    VerifyRunnersDeclaredTwiceError,
+    load_config,
+)
 from orchestrator.verify_host_roster_file import ROSTER_FILE_ENV, RosterFileError
 
 PROJECT = 'p'
@@ -203,3 +208,57 @@ class TestRosterFileIsRead:
 
         with pytest.raises(RosterFileError, match=re.escape(str(roster_path))):
             load_config(_write_yaml(tmp_path, 'bare.yaml'))
+
+
+def _roster_with_one_host(name: str, *, df_checkout_path: str = '/srv/x/dark-factory', enabled: bool = True) -> str:
+    return yaml.safe_dump({
+        'hosts': {
+            name: {
+                'ssh_host': f'{name}-ssh',
+                'df_checkout_path': df_checkout_path,
+                'enabled': enabled,
+                'projects': {PROJECT: {'git_remote': f'{name}-p'}},
+            },
+        },
+    })
+
+
+class TestOneHome:
+    @pytest.mark.parametrize('inline_source', ['yaml', 'env'])
+    def test_inline_runners_and_a_roster_entry_fail_the_load(self, inline_source, tmp_path, monkeypatch):
+        yaml_path = _declare_inline(inline_source, tmp_path, monkeypatch, INLINE_LAPTOP)
+        roster_path = _write_roster(tmp_path, monkeypatch, ROSTER)
+
+        with pytest.raises(VerifyRunnersDeclaredTwiceError) as caught:
+            load_config(yaml_path)
+
+        message = str(caught.value)
+        for expected in (str(yaml_path), 'ORCH_VERIFY_RUNNERS', str(roster_path), repr(PROJECT),
+                         'laptop', 'box-a', 'box-b'):
+            assert expected in message
+
+    def test_a_disabled_roster_host_still_counts_as_an_entry(self, tmp_path, monkeypatch):
+        yaml_path = _declare_inline('yaml', tmp_path, monkeypatch, INLINE_LAPTOP)
+        _write_roster(tmp_path, monkeypatch, _roster_with_one_host('box-off', enabled=False))
+
+        with pytest.raises(VerifyRunnersDeclaredTwiceError):
+            load_config(yaml_path)
+
+    @pytest.mark.parametrize(
+        'roster_text',
+        [
+            pytest.param(_roster_with_one_host('box-rel', df_checkout_path='srv/df'), id='relative-checkout-path'),
+            pytest.param(_roster_with_one_host('local'), id='local-slot-name'),
+        ],
+    )
+    def test_a_roster_runner_that_breaks_the_runner_rules_names_the_roster_file(
+        self, roster_text, tmp_path, monkeypatch,
+    ):
+        roster_path = _write_roster(tmp_path, monkeypatch, roster_text)
+        host_name = next(iter(yaml.safe_load(roster_text)['hosts']))
+
+        with pytest.raises(RosterFileError) as caught:
+            load_config(_write_yaml(tmp_path, 'bare.yaml'))
+
+        assert str(roster_path) in str(caught.value)
+        assert host_name in str(caught.value)
