@@ -55,6 +55,7 @@ def _look(argv: list[str], now: datetime) -> int:
     try:
         return look.main(argv, clock=lambda: now)
     except SystemExit as exc:
+        assert isinstance(exc.code, int)
         return exc.code
 
 

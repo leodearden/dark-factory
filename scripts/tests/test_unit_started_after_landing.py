@@ -61,6 +61,7 @@ def _run(*argv: str) -> int:
     try:
         return predicate.main(list(argv))
     except SystemExit as exc:
+        assert isinstance(exc.code, int)
         return exc.code
 
 
