@@ -13,6 +13,14 @@ landing datum (shared.quality_series.landings.recorded_landings) records it
 before read_at, and its cost is every invocation of any role started before
 read_at. R is (landed_t / cost_t) / (landed_c / cost_c).
 
+Secondary measures, per arm: verify attempts (task_results.verify_attempts
+plus the task's own verify_failed merge_attempt rows), review cycles and
+failures after merge, each per landing; the share of tasks with a blocked or
+escalated outcome; and cost per task by role. A failure after merge is an
+integration_skew merge_attempt implicating a commit the merge brought
+(``git rev-list sha^1..sha``), or a main commit saying ``This reverts commit
+<sha>``, inside [landed_at, min(landed_at + AFTER_MERGE_WINDOW, read_at)).
+
 R's interval resamples tasks with replacement within each arm, as a percentile
 interval at the options' level. Its A/A null permutes the observed arm labels
 at the observed sizes and reports the p95 and p99 of max(R, 1/R). One
@@ -23,19 +31,23 @@ Reads runs.db read-only; never imports the readout or the look.
 from __future__ import annotations
 
 import math
+import os
 import random
+import re
+import subprocess
 from collections import defaultdict
 from collections.abc import Iterable, Mapping, Sequence
 from contextlib import closing
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from enum import Enum
 from pathlib import Path
 from sqlite3 import Connection
 from types import MappingProxyType
 
 import _checkout as _checkout
-from _task_db_scan import UNREADABLE_STORE_ERRORS
+from _task_db_scan import UNREADABLE_STORE_ERRORS, decode_metadata
+from git_env import scrubbed_git_env
 from shared.project_layout import runs_db
 from shared.quality_series.landings import UnrecognisedTrainEvent, parse_utc, recorded_landings
 from shared.routing_split import split_bucket
@@ -43,7 +55,9 @@ from shared.sqlite_readonly import connect_readonly
 from split_resampling import bootstrap_arms, null_cuts, percentile_interval, permuted_arms
 
 __all__ = [
+    'AFTER_MERGE_WINDOW',
     'Arm',
+    'ArmSecondary',
     'ArmTotals',
     'BLOCKED_OUTCOMES',
     'CohortRecord',
@@ -58,8 +72,15 @@ __all__ = [
 ]
 
 BLOCKED_OUTCOMES = frozenset({'blocked', 'escalated'})
+AFTER_MERGE_WINDOW = timedelta(days=7)
 
 _ROUTING_DECISION = 'routing_decision'
+_MERGE_ATTEMPT = 'merge_attempt'
+_VERIFY_FAILED = 'verify_failed'
+_INTEGRATION_SKEW = 'integration_skew'
+_GIT_TIMEOUT_S = 60
+_REVERT_MARKER = 'This reverts commit'
+_REVERTED_SHA = re.compile(rf'{_REVERT_MARKER} ([0-9a-f]{{40}})')
 
 
 class Arm(Enum):
@@ -163,7 +184,7 @@ class ThroughputOptions:
 
 @dataclass(frozen=True)
 class CohortRecord:
-    """One cohort task: its arm, first dispatch, landing (None when none before read_at) and cost."""
+    """One cohort task: its arm, first dispatch, landing (None when none before read_at), cost and secondaries."""
 
     project: str
     task_id: str
@@ -173,6 +194,22 @@ class CohortRecord:
     merge_sha: str | None
     cost_usd: float
     cost_by_role: Mapping[str, float]
+    verify_attempts: int
+    review_cycles: int
+    failures_after_merge: int
+    blocked_or_escalated: bool
+
+
+@dataclass(frozen=True)
+class ArmSecondary:
+    """One arm's secondary measures; a per-landing figure or a share is None when its denominator is 0."""
+
+    n: int
+    verify_attempts_per_landing: float | None
+    review_cycles_per_landing: float | None
+    failures_after_merge_per_landing: float | None
+    blocked_or_escalated_share: float | None
+    cost_per_task_by_role: Mapping[str, float]
 
 
 @dataclass(frozen=True)
@@ -199,6 +236,7 @@ class ThroughputReport:
     interval: tuple[float, float] | None
     interval_side: IntervalSide
     null: tuple[float, float] | None
+    secondary: Mapping[Arm, ArmSecondary]
 
 
 def _placeholders(values: Sequence[object]) -> str:
@@ -250,12 +288,31 @@ def resolve_since(options: ThroughputOptions) -> datetime:
 
 
 @dataclass(frozen=True)
+class _Result:
+    outcome: str
+    verify_attempts: int
+    review_cycles: int
+
+
+@dataclass(frozen=True)
+class _Skew:
+    at: datetime
+    implicated: frozenset[str]
+
+
+@dataclass(frozen=True)
 class _Ledger:
-    """One root's rows for its cohort tasks, every instant aware and before read_at."""
+    """One root's rows for its cohort tasks, every instant aware and before read_at.
+
+    *skews* are every task's integration_skew merge_attempts that implicate a commit.
+    """
 
     first_dispatch: Mapping[str, datetime]
     costs: Mapping[str, Mapping[str, float]]
     landings: Mapping[str, tuple[datetime, str]]
+    results: Mapping[str, tuple[_Result, ...]]
+    own_verify_failures: Mapping[str, int]
+    skews: tuple[_Skew, ...]
 
 
 def _first_dispatches(
@@ -267,10 +324,10 @@ def _first_dispatches(
         f'AND task_id IS NOT NULL AND role IN ({_placeholders(options.roles)})',
         options.roles,
     )
-    for task_id, timestamp in rows:
-        at = parse_utc(timestamp)
+    for raw_task_id, timestamp in rows:
+        task_id, at = str(raw_task_id), parse_utc(timestamp)
         if task_id not in earliest or at < earliest[task_id]:
-            earliest[str(task_id)] = at
+            earliest[task_id] = at
     return {task_id: at for task_id, at in earliest.items() if since <= at < cohort_end}
 
 
@@ -300,16 +357,58 @@ def _landings(conn: Connection, cohort: Iterable[str], read_at: datetime) -> dic
     return first
 
 
+def _results(
+    conn: Connection, cohort: Iterable[str], read_at: datetime,
+) -> dict[str, tuple[_Result, ...]]:
+    wanted = set(cohort)
+    found: dict[str, list[_Result]] = defaultdict(list)
+    rows = conn.execute(
+        'SELECT task_id, outcome, verify_attempts, review_cycles, completed_at FROM task_results '
+        'WHERE completed_at IS NOT NULL'
+    )
+    for task_id, outcome, verify_attempts, review_cycles, completed_at in rows:
+        if str(task_id) in wanted and parse_utc(completed_at) < read_at:
+            found[str(task_id)].append(_Result(outcome, verify_attempts or 0, review_cycles or 0))
+    return {task_id: tuple(results) for task_id, results in found.items()}
+
+
+def _merge_attempts(
+    conn: Connection, cohort: Iterable[str], read_at: datetime,
+) -> tuple[dict[str, int], tuple[_Skew, ...]]:
+    """Each cohort task's own verify_failed attempts, and every task's skews implicating a commit."""
+    wanted = set(cohort)
+    own_failures: dict[str, int] = defaultdict(int)
+    skews: list[_Skew] = []
+    rows = conn.execute(
+        f"SELECT timestamp, task_id, data FROM events WHERE event_type = '{_MERGE_ATTEMPT}'"
+    )
+    for timestamp, task_id, raw in rows:
+        at = parse_utc(timestamp)
+        if at >= read_at:
+            continue
+        data = decode_metadata(raw)
+        if str(task_id) in wanted and data.get('outcome') == _VERIFY_FAILED:
+            own_failures[str(task_id)] += 1
+        implicated = data.get('implicated_commits')
+        if data.get('disposition') == _INTEGRATION_SKEW and isinstance(implicated, list) and implicated:
+            skews.append(_Skew(at, frozenset(sha for sha in implicated if isinstance(sha, str))))
+    return dict(own_failures), tuple(skews)
+
+
 def _read_ledger(
     root: Path, options: ThroughputOptions, since: datetime, cohort_end: datetime,
 ) -> _Ledger:
     with closing(_open_runs_db(root)) as conn:
         try:
             first_dispatch = _first_dispatches(conn, options, since, cohort_end)
+            own_verify_failures, skews = _merge_attempts(conn, first_dispatch, options.read_at)
             return _Ledger(
                 first_dispatch=first_dispatch,
                 costs=_costs(conn, first_dispatch, options.read_at),
                 landings=_landings(conn, first_dispatch, options.read_at),
+                results=_results(conn, first_dispatch, options.read_at),
+                own_verify_failures=own_verify_failures,
+                skews=skews,
             )
         except UnrecognisedTrainEvent as exc:
             raise _unreadable(root, exc) from exc
@@ -317,20 +416,97 @@ def _read_ledger(
             raise _unreadable(root, exc) from exc
 
 
+@dataclass(frozen=True)
+class _Revert:
+    committed_at: datetime
+    reverted: frozenset[str]
+
+
+def _git(root: Path, args: Sequence[str]) -> str:
+    argv = ['git', '-C', str(root), *args]
+    try:
+        completed = subprocess.run(
+            argv, capture_output=True, text=True, timeout=_GIT_TIMEOUT_S,
+            env=scrubbed_git_env(os.environ),
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ThroughputUnavailable(Unavailable.HISTORY_UNREADABLE, f'{root}: {exc}') from exc
+    if completed.returncode != 0:
+        raise ThroughputUnavailable(
+            Unavailable.HISTORY_UNREADABLE,
+            f'{root}: {" ".join(argv[3:])} exited {completed.returncode}: {completed.stderr.strip()}',
+        )
+    return completed.stdout
+
+
+def _parse_revert(record: str) -> _Revert:
+    _, committed, body = record.split('\x1f', 2)
+    return _Revert(
+        datetime.fromtimestamp(int(committed), UTC), frozenset(_REVERTED_SHA.findall(body)),
+    )
+
+
+@dataclass(frozen=True)
+class MainHistory:
+    """main's revert commits in one root, read once; a merge's own commits are read on demand."""
+
+    root: Path
+    reverts: tuple[_Revert, ...]
+
+    @classmethod
+    def read(cls, root: Path) -> MainHistory:
+        stdout = _git(root, [
+            'log', 'main', '-F', f'--grep={_REVERT_MARKER}', '--format=%H%x1f%ct%x1f%B%x1e',
+        ])
+        records = (record.strip() for record in stdout.split('\x1e'))
+        return cls(root, tuple(_parse_revert(record) for record in records if record))
+
+    def revert_count(self, merge_sha: str, after: datetime, until: datetime) -> int:
+        return sum(
+            1 for revert in self.reverts
+            if after <= revert.committed_at < until and merge_sha in revert.reverted
+        )
+
+    def commits_of_merge(self, merge_sha: str) -> frozenset[str]:
+        return frozenset(_git(self.root, ['rev-list', f'{merge_sha}^1..{merge_sha}']).split())
+
+
+def _failures_after_merge(
+    landed_at: datetime, merge_sha: str, ledger: _Ledger, history: MainHistory, read_at: datetime,
+) -> int:
+    until = min(landed_at + AFTER_MERGE_WINDOW, read_at)
+    skews = [skew for skew in ledger.skews if landed_at <= skew.at < until]
+    skew_count = 0
+    if skews:
+        brought = history.commits_of_merge(merge_sha)
+        skew_count = sum(1 for skew in skews if skew.implicated & brought)
+    return skew_count + history.revert_count(merge_sha, landed_at, until)
+
+
 def _records(root: Path, ledger: _Ledger, options: ThroughputOptions) -> list[CohortRecord]:
+    history = MainHistory.read(root) if ledger.landings else None
     records: list[CohortRecord] = []
     for task_id, first_dispatch_at in ledger.first_dispatch.items():
         cost_by_role = ledger.costs.get(task_id, {})
-        landed_at, merge_sha = ledger.landings.get(task_id, (None, None))
+        landing = ledger.landings.get(task_id)
+        results = ledger.results.get(task_id, ())
+        failures = 0
+        if landing is not None and history is not None:
+            failures = _failures_after_merge(*landing, ledger, history, options.read_at)
         records.append(CohortRecord(
             project=root.name,
             task_id=task_id,
             arm=options.arm_of(task_id),
             first_dispatch_at=first_dispatch_at,
-            landed_at=landed_at,
-            merge_sha=merge_sha,
+            landed_at=None if landing is None else landing[0],
+            merge_sha=None if landing is None else landing[1],
             cost_usd=math.fsum(cost_by_role.values()),
             cost_by_role=MappingProxyType(dict(cost_by_role)),
+            verify_attempts=sum(result.verify_attempts for result in results)
+            + ledger.own_verify_failures.get(task_id, 0),
+            review_cycles=sum(result.review_cycles for result in results),
+            failures_after_merge=failures,
+            blocked_or_escalated=any(result.outcome in BLOCKED_OUTCOMES for result in results),
         ))
     return records
 
@@ -405,11 +581,35 @@ def _aa_null(
     return null_cuts(magnitudes)
 
 
+def _per(total: float, denominator: int) -> float | None:
+    return total / denominator if denominator else None
+
+
+def _arm_secondary(records: Sequence[CohortRecord], arm: Arm) -> ArmSecondary:
+    members = [record for record in records if record.arm is arm]
+    landed = sum(1 for record in members if record.landed_at is not None)
+    by_role: dict[str, list[float]] = defaultdict(list)
+    for record in members:
+        for role, cost in record.cost_by_role.items():
+            by_role[role].append(cost)
+    return ArmSecondary(
+        n=len(members),
+        verify_attempts_per_landing=_per(sum(r.verify_attempts for r in members), landed),
+        review_cycles_per_landing=_per(sum(r.review_cycles for r in members), landed),
+        failures_after_merge_per_landing=_per(sum(r.failures_after_merge for r in members), landed),
+        blocked_or_escalated_share=_per(sum(r.blocked_or_escalated for r in members), len(members)),
+        cost_per_task_by_role=MappingProxyType({
+            role: math.fsum(costs) / len(members) for role, costs in sorted(by_role.items())
+        }),
+    )
+
+
 def throughput_report(options: ThroughputOptions, since: datetime) -> ThroughputReport:
     """The cohort dispatched from *since* (see :func:`resolve_since`), read across options.roots.
 
-    Raises ThroughputUnavailable(STORE_UNREADABLE) naming the root whose runs.db
-    or landing datum cannot be read.
+    Raises ThroughputUnavailable naming the root: STORE_UNREADABLE when its
+    runs.db or landing datum cannot be read, HISTORY_UNREADABLE when main's git
+    history is needed for a landing and cannot be read.
     """
     cohort_end = options.cohort_end(since)
     records = sorted(
@@ -437,4 +637,5 @@ def throughput_report(options: ThroughputOptions, since: datetime) -> Throughput
         interval=interval,
         interval_side=side_of(interval),
         null=_aa_null(columns, treated.n, control.n, options.resamples, rng),
+        secondary=MappingProxyType({arm: _arm_secondary(records, arm) for arm in Arm}),
     )
