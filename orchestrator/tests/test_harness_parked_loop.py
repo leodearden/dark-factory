@@ -291,8 +291,9 @@ async def _run_driven(
     async def driver() -> None:
         try:
             await drive()
-        finally:
+        except BaseException:
             slots.open_all()
+            raise
 
     steering = asyncio.create_task(driver())
     report = await h.run(until_idle=until_idle)
@@ -363,6 +364,7 @@ class TestParkedLoop:
             clock.now += _FORCE_FIRE_AFTER_SECS
             await _until(fired.is_set, 'owed restart force-fired while parked')
             assert dispatch.calls == 1, 'the loop must still be parked when it fires'
+            slots.open_all()
 
         await _run_driven(h, slots, drive)
 
@@ -378,6 +380,7 @@ class TestParkedLoop:
             first = _heartbeat_ts(fleet_dir) or 0.0
             await _until(lambda: (_heartbeat_ts(fleet_dir) or 0.0) > first, 'heartbeat advanced')
             assert dispatch.calls == 1, 'the loop must still be parked'
+            slots.open_all()
 
         await _run_driven(h, slots, drive)
 
@@ -390,7 +393,7 @@ class TestParkedLoop:
         assert main is not None
 
         async def sigterm_while_parked() -> None:
-            await _until(lambda: dispatch.calls >= 1, 'loop parked on slot 1')
+            await _until(lambda: '1' in slots.started, 'slot 1 running, loop parked')
             main.cancel()
 
         with pytest.raises(asyncio.CancelledError):
@@ -432,7 +435,7 @@ class TestParkedLoop:
         bystanders: list[asyncio.Task] = []
 
         async def sigterm_beside_an_immune_bystander() -> None:
-            await _until(lambda: dispatch.calls >= 1, 'loop parked on slot 1')
+            await _until(lambda: '1' in slots.started, 'slot 1 running, loop parked')
             bystanders.append(asyncio.create_task(ignore_cancels_until(release), name='immune-bystander'))
             await asyncio.sleep(0)
             guard.arm()
@@ -508,7 +511,7 @@ class TestParkedLoop:
         assert main is not None
 
         async def sigterm_while_parked() -> None:
-            await _until(lambda: dispatch.calls >= 1, 'loop parked on slot 1')
+            await _until(lambda: '1' in slots.started, 'slot 1 running, loop parked')
             main.cancel()
 
         with pytest.raises(asyncio.CancelledError):
