@@ -26,8 +26,6 @@ __all__ = [
 class TestedTreeViolation(ValueError):
     """A tested tree breaks an invariant; the message names it and the values."""
 
-    __test__ = False
-
     def __init__(self, invariant: str, what: str, values: str) -> None:
         super().__init__(f'{invariant}: {what} ({values})')
 
@@ -76,8 +74,6 @@ class TestedTree:
     ``members`` lists the built-on members first, then the own members in
     land order. ``root_commit`` is None when the base cannot be resolved.
     """
-
-    __test__ = False  # pytest never collects a value imported into a test module
 
     base_commit: str
     root_commit: str | None

@@ -53,7 +53,7 @@ class TestT1HeldAtConstruction:
             _tree(_member('a', 'c1'), _member('b', 'c2', own=False))
         assert str(caught.value).startswith('T1')
         assert 'r-b' in str(caught.value)
-        assert '1' in str(caught.value)
+        assert 'position 1' in str(caught.value)
 
     def test_the_violation_is_a_value_error(self) -> None:
         assert issubclass(tested_tree.TestedTreeViolation, ValueError)
