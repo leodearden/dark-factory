@@ -9,6 +9,7 @@ import os
 import posixpath
 import re
 import stat
+from collections.abc import Sequence
 from dataclasses import dataclass
 from itertools import pairwise
 from pathlib import Path, PurePosixPath
@@ -3420,6 +3421,28 @@ class RemoteGatePaths(NamedTuple):
     root: str
 
 
+# The name the merge lane and the task-side pool give the local slot
+# (verify_runner.py::HostAllocator, verify_hosts.py::HostPool).
+LOCAL_VERIFY_HOST_NAME = 'local'
+
+
+def require_distinct_runner_names(names: Sequence[str]) -> None:
+    """Raise ValueError unless every name is unique and none is the local slot's."""
+    duplicated = sorted({name for name in names if names.count(name) > 1})
+    reserved = LOCAL_VERIFY_HOST_NAME in names
+    if not duplicated and not reserved:
+        return
+    found = []
+    if duplicated:
+        found.append(f'duplicated {duplicated}')
+    if reserved:
+        found.append(f'reserved {[LOCAL_VERIFY_HOST_NAME]}')
+    raise ValueError(
+        f'verify_runners: runner names must be unique and none may be '
+        f'{LOCAL_VERIFY_HOST_NAME!r}; {", ".join(found)}'
+    )
+
+
 class VerifyRunnerConfig(BaseModel):
     """Configuration for a single remote verify runner (Lever C).
 
@@ -6165,6 +6188,14 @@ class OrchestratorConfig(BaseSettings):
     @classmethod
     def _resolve_project_root(cls, v: Path) -> Path:
         return v.resolve()
+
+    @field_validator('verify_runners', mode='after')
+    @classmethod
+    def _require_distinct_runner_names(
+        cls, v: list[VerifyRunnerConfig],
+    ) -> list[VerifyRunnerConfig]:
+        require_distinct_runner_names([runner.name for runner in v])
+        return v
 
     @field_validator('verify_env_probes', mode='after')
     @classmethod
