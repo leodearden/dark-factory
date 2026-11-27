@@ -37,6 +37,7 @@ from typing import Protocol, TypeVar
 
 import _checkout as _checkout
 from _task_db_scan import UNREADABLE_STORE_ERRORS, decode_metadata
+from routing_throughput import BLOCKED_OUTCOMES
 from shared.project_layout import KNOWN_PROJECT_ROOTS_ENV, known_project_roots, runs_db, tasks_db
 from shared.routing_split import split_bucket
 from shared.sqlite_readonly import connect_readonly
@@ -166,7 +167,6 @@ def read_fused_memory_unit_environment() -> UnitRead:
 # plus experiment 1's large-plan-modules-4 (plans/routing-experiment-substrate-prd.md
 # §"Experiment 1"). Matched by membership, never by prefix.
 LARGE_PLAN_RULE_IDS = frozenset({'large-plan-steps', 'large-plan-modules', 'large-plan-modules-4'})
-BLOCKED_OUTCOMES = frozenset({'blocked', 'escalated'})
 LANDED_OUTCOME = 'done'
 IMPLEMENTER_ROLE = 'implementer'
 CURATOR_HINT_KEY = 'x_curator_complexity_hint'

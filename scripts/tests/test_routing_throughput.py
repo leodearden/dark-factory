@@ -5,6 +5,7 @@ throughput_cohort_fixtures builders; no test reads a live store.
 """
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -38,25 +39,26 @@ COHORT_END = SINCE + timedelta(days=COHORT_DAYS)
 READ_AT = SINCE + timedelta(days=20)
 
 
+BASE_OPTIONS = ThroughputOptions(
+    salt=SALT,
+    buckets=2,
+    treated_bucket=1,
+    roles=('implementer', 'debugger'),
+    rule_prefix=PREFIX,
+    treated_effort=TREATED_EFFORT,
+    control_effort=CONTROL_EFFORT,
+    since=None,
+    cohort_days=COHORT_DAYS,
+    read_at=READ_AT,
+    roots=(),
+    interval_level=0.90,
+    seed=7,
+    resamples=200,
+)
+
+
 def _options(*roots: Path, **overrides) -> ThroughputOptions:
-    fields = dict(
-        salt=SALT,
-        buckets=2,
-        treated_bucket=1,
-        roles=('implementer', 'debugger'),
-        rule_prefix=PREFIX,
-        treated_effort=TREATED_EFFORT,
-        control_effort=CONTROL_EFFORT,
-        since=None,
-        cohort_days=COHORT_DAYS,
-        read_at=READ_AT,
-        roots=tuple(roots),
-        interval_level=0.90,
-        seed=7,
-        resamples=200,
-    )
-    fields.update(overrides)
-    return ThroughputOptions(**fields)
+    return replace(BASE_OPTIONS, roots=tuple(roots), **overrides)
 
 
 def _treated(at: datetime, role: str = 'implementer') -> Dispatch:
