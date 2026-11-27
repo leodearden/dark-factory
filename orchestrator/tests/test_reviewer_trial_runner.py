@@ -124,6 +124,14 @@ def _one_reviewer(name: str = 'r1_panel') -> VariantConfig:
     )
 
 
+def _unpinned_reviewer(name: str = 'r1_unpinned') -> VariantConfig:
+    """A one-reviewer panel that pins no budget, so it runs at production's."""
+    return VariantConfig(
+        name=name, description='Test',
+        reviewers=[ReviewerSpec(name='r1', model='opus', specialization='Testing.', budget=None)],
+    )
+
+
 def _make_review(name: str = 'test', verdict: str = 'PASS') -> dict:
     return {
         'reviewer': name,
@@ -252,7 +260,10 @@ def _full_panel_result(run_key: PanelRunKey | None) -> PanelRunResult:
 
 class TestPanelRunResultFromDict:
     @pytest.mark.parametrize('run_key', [
-        PanelRunKey.of(prices=default_price_table(), usage_gate=None, diff_cap_chars=0, max_turns=90),
+        PanelRunKey.of(
+            prices=default_price_table(), usage_gate=None, diff_cap_chars=0, max_turns=90,
+            reviewer_budgets_usd=(12.0,),
+        ),
         None,
     ])
     def test_round_trips_asdict(self, run_key: PanelRunKey | None) -> None:
@@ -276,9 +287,11 @@ class TestPanelRunKey:
     def test_equal_price_tables_give_equal_keys(self) -> None:
         first = PanelRunKey.of(
             prices=default_price_table(), usage_gate=None, diff_cap_chars=DIFF_CAP_CHARS, max_turns=90,
+            reviewer_budgets_usd=(12.0,),
         )
         second = PanelRunKey.of(
             prices=default_price_table(), usage_gate=None, diff_cap_chars=DIFF_CAP_CHARS, max_turns=90,
+            reviewer_budgets_usd=(12.0,),
         )
         assert first == second
 
@@ -296,18 +309,32 @@ class TestPanelRunKey:
         pytest.param(lambda: {'usage_gate': cast(UsageGate, object())}, id='gated'),
         pytest.param(lambda: {'diff_cap_chars': 0}, id='cap-lifted'),
         pytest.param(lambda: {'max_turns': 30}, id='turn-cap'),
+        pytest.param(lambda: {'reviewer_budgets_usd': (5.0,)}, id='reviewer-budget'),
     ])
     def test_each_component_changes_the_key(self, change) -> None:
         baseline = {
             'prices': default_price_table(), 'usage_gate': None, 'diff_cap_chars': DIFF_CAP_CHARS, 'max_turns': 90,
+            'reviewer_budgets_usd': (12.0,),
         }
         assert PanelRunKey.of(**{**baseline, **change()}) != PanelRunKey.of(**baseline)
 
     def test_round_trips_asdict(self) -> None:
         key = PanelRunKey.of(
             prices=default_price_table(), usage_gate=cast(UsageGate, object()), diff_cap_chars=0, max_turns=30,
+            reviewer_budgets_usd=(12.0,),
         )
         assert PanelRunKey.from_dict(asdict(key)) == key
+
+    def test_round_trips_through_json(self) -> None:
+        key = PanelRunKey.of(
+            prices=None, usage_gate=None, diff_cap_chars=DIFF_CAP_CHARS, max_turns=90,
+            reviewer_budgets_usd=(4.0, 2.0),
+        )
+
+        loaded = PanelRunKey.from_dict(json.loads(json.dumps(asdict(key))))
+
+        assert loaded == key
+        assert hash(loaded) == hash(key)
 
 
 class TestRunSingleReviewerLiveTransport:
@@ -509,7 +536,9 @@ class TestRunPanel:
                 _one_reviewer(), _diff_in(source), stagger_secs=0, diff_cap_chars=123, max_turns=30,
             )
 
-        assert result.run_key == PanelRunKey.of(prices=None, usage_gate=None, diff_cap_chars=123, max_turns=30)
+        assert result.run_key == PanelRunKey.of(
+            prices=None, usage_gate=None, diff_cap_chars=123, max_turns=30, reviewer_budgets_usd=(2.0,),
+        )
 
     @pytest.mark.asyncio
     async def test_its_turn_cap_reaches_every_reviewer_dispatch(self, source: _Source) -> None:
@@ -543,6 +572,41 @@ class TestRunPanel:
         assert mock_invoke.call_args.kwargs['max_turns'] == 90
         assert result.run_key is not None
         assert result.run_key.max_turns == 90
+
+    @pytest.mark.asyncio
+    async def test_each_reviewer_dispatches_and_is_keyed_at_its_own_budget(self, source: _Source) -> None:
+        variant = VariantConfig(
+            name='pinned_and_unpinned',
+            description='Test',
+            reviewers=[
+                ReviewerSpec(name='r1', model='opus', specialization='S1.', budget=4.0),
+                ReviewerSpec(name='r2', model='opus', specialization='S2.', budget=None),
+            ],
+        )
+        with patch(
+            'orchestrator.evals.reviewer_trial.runner.invoke_agent',
+            new=AsyncMock(side_effect=_make_verdict_writing_invoke()),
+        ) as mock_invoke:
+            result = await run_panel(variant, _diff_in(source), stagger_secs=0, production_budget=7.0)
+
+        assert [call.kwargs['max_budget_usd'] for call in mock_invoke.call_args_list] == [4.0, 7.0]
+        assert result.run_key is not None
+        assert result.run_key.reviewer_budgets_usd == (4.0, 7.0)
+
+    @pytest.mark.usefixtures('code_default_config')
+    @pytest.mark.asyncio
+    async def test_with_no_override_an_unpinned_reviewer_runs_and_is_keyed_at_production_s_12(
+        self, source: _Source,
+    ) -> None:
+        with patch(
+            'orchestrator.evals.reviewer_trial.runner.invoke_agent',
+            new=AsyncMock(side_effect=_make_verdict_writing_invoke()),
+        ) as mock_invoke:
+            result = await run_panel(_unpinned_reviewer(), _diff_in(source), stagger_secs=0)
+
+        assert mock_invoke.call_args.kwargs['max_budget_usd'] == 12.0
+        assert result.run_key is not None
+        assert result.run_key.reviewer_budgets_usd == (12.0,)
 
     @pytest.mark.asyncio
     async def test_multiple_reviewers(self, source: _Source) -> None:
@@ -1011,7 +1075,9 @@ def _only_entry(directory: Path) -> Path:
     return entry
 
 
-_SMOKE_KEY = PanelRunKey.of(prices=None, usage_gate=None, diff_cap_chars=DIFF_CAP_CHARS, max_turns=90)
+_SMOKE_KEY = PanelRunKey.of(
+    prices=None, usage_gate=None, diff_cap_chars=DIFF_CAP_CHARS, max_turns=90, reviewer_budgets_usd=(2.0,),
+)
 
 
 def _write_legacy_panel(results_dir: Path, legacy: PanelRunResult) -> Path:
@@ -1037,7 +1103,9 @@ class TestPanelCache:
             await run_panel_cached(variant, diff, results_dir=results_dir, stagger_secs=0, **_full_style())
 
         assert dispatched == ['ungated', 'gated']
-        assert {p.run_key for p in _stored_panels(results_dir)} == {_SMOKE_KEY, PanelRunKey.of(**_full_style())}
+        assert {p.run_key for p in _stored_panels(results_dir)} == {
+            _SMOKE_KEY, PanelRunKey.of(**_full_style(), reviewer_budgets_usd=(2.0,)),
+        }
 
     @pytest.mark.asyncio
     async def test_each_key_keeps_its_own_slot(self, source: _Source, tmp_path: Path) -> None:
@@ -1077,6 +1145,34 @@ class TestPanelCache:
             await run_panel_cached(variant, diff, results_dir=results_dir, stagger_secs=0, **change())
 
         assert len(dispatched) == 2
+
+    @pytest.mark.usefixtures('code_default_config')
+    @pytest.mark.asyncio
+    async def test_an_unpinned_panel_reruns_when_production_s_budget_changes(
+        self, source: _Source, tmp_path: Path,
+    ) -> None:
+        variant, diff, results_dir = _unpinned_reviewer(), _diff_in(source), tmp_path / 'results'
+
+        with _counted_reviewers() as dispatched:
+            await run_panel_cached(variant, diff, results_dir=results_dir, stagger_secs=0)
+            await run_panel_cached(variant, diff, results_dir=results_dir, stagger_secs=0, production_budget=5.0)
+
+        assert dispatched == ['ungated', 'ungated']
+        assert {p.run_key.reviewer_budgets_usd for p in _stored_panels(results_dir) if p.run_key is not None} == {
+            (12.0,), (5.0,),
+        }
+
+    @pytest.mark.asyncio
+    async def test_a_pinned_panel_is_reused_whatever_production_s_budget(
+        self, source: _Source, tmp_path: Path,
+    ) -> None:
+        variant, diff, results_dir = _one_reviewer(), _diff_in(source), tmp_path / 'results'
+
+        with _counted_reviewers() as dispatched:
+            await run_panel_cached(variant, diff, results_dir=results_dir, stagger_secs=0, production_budget=5.0)
+            await run_panel_cached(variant, diff, results_dir=results_dir, stagger_secs=0, production_budget=9.0)
+
+        assert dispatched == ['ungated']
 
     @pytest.mark.asyncio
     async def test_a_keyless_legacy_entry_is_honoured_and_named_quietly(
@@ -1144,7 +1240,7 @@ class TestPanelCache:
 
         assert dispatched == ['ungated']
         assert result.run_key == PanelRunKey.of(
-            prices=None, usage_gate=None, diff_cap_chars=DIFF_CAP_CHARS, max_turns=30,
+            prices=None, usage_gate=None, diff_cap_chars=DIFF_CAP_CHARS, max_turns=30, reviewer_budgets_usd=(2.0,),
         )
 
     @pytest.mark.parametrize('stored', [
