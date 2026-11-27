@@ -718,7 +718,7 @@ class GateEscalationFields:
     detail: str
     options: tuple[str, ...]
     review_due: ReviewDueState | None
-    pin: GatePin = GatePin()
+    pin: GatePin
 
 
 def gate_escalation_category(metadata: dict) -> str:
