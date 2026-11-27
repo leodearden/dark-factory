@@ -250,9 +250,10 @@ def build_llm_client(
     its calls, or None when that URL is not gated (MemoryService binds
     ``PlanRoute.http_client_for`` to ``PlanRouteSite.GRAPHITI``, task 9944). An
     OpenAI-shaped default arm rides the gated client for its own api_url; the
-    anthropic arm ignores it. Each ``cfg.llm.extraction_routes`` category is
-    built only on a gated client (_build_extraction_route), and the result is
-    then a CategoryRoutedLLMClient over the default.
+    anthropic arm ignores it. A caller that passes no gate builds no extraction
+    routes, silently: the overreach shadow, the arm harness and the scripts
+    never ride the plan. A caller that passes a gate gets one WARNING per route
+    it cannot build (_build_extraction_route).
     """
     routed = _extraction_route_categories(cfg)
     provider = cfg.llm.providers.openai
@@ -265,6 +266,8 @@ def build_llm_client(
     if llm_client is None:
         return None
     llm_client.token_tracker = AttributingTokenUsageTracker(model=cfg.llm.model)
+    if gated_http_client_for is None:
+        return llm_client
     routes = {
         category: client for category, route in routed.items()
         if (client := _build_extraction_route(cfg, category, route, gated_http_client_for)) is not None
@@ -291,7 +294,7 @@ def _build_extraction_route(
     cfg: FusedMemoryConfig,
     category: MemoryCategory,
     route: ExtractionRouteConfig,
-    gated_http_client_for: Callable[[str], httpx.AsyncClient | None] | None,
+    gated_http_client_for: Callable[[str], httpx.AsyncClient | None],
 ) -> LLMClient | None:
     """*category*'s extraction client on the gated plan proxy, or None (logged) when it cannot be built.
 
@@ -301,8 +304,6 @@ def _build_extraction_route(
         reason = f'llm.provider is {cfg.llm.provider!r}'
     elif route.api_url is None or route.api_key is None:
         reason = 'its api_url and api_key are not both set'
-    elif gated_http_client_for is None:
-        reason = 'no plan-route gate was given'
     elif (http_client := gated_http_client_for(route.api_url)) is None:
         reason = f'{route.api_url} is not the gated plan proxy (plan_route.proxy_url)'
     else:
