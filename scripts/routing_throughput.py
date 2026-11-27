@@ -21,6 +21,11 @@ integration_skew merge_attempt implicating a commit the merge brought
 (``git rev-list sha^1..sha``), or a main commit saying ``This reverts commit
 <sha>``, inside [landed_at, min(landed_at + AFTER_MERGE_WINDOW, read_at)).
 
+Compliance reads every cohort task's routing_decision in --roles inside
+[since, read_at): a row whose effort is not its arm's expected effort is a
+deviation, a treated row whose rule_id lacks the prefix is treated without the
+rule, and a treated row at the control effort is a COMPLIANCE FAILURE.
+
 R's interval resamples tasks with replacement within each arm, as a percentile
 interval at the options' level. Its A/A null permutes the observed arm labels
 at the observed sizes and reports the p95 and p99 of max(R, 1/R). One
@@ -61,10 +66,13 @@ __all__ = [
     'ArmTotals',
     'BLOCKED_OUTCOMES',
     'CohortRecord',
+    'Compliance',
+    'ComplianceFailure',
     'IntervalSide',
     'ThroughputOptions',
     'ThroughputReport',
     'ThroughputUnavailable',
+    'RoleCompliance',
     'Unavailable',
     'resolve_since',
     'side_of',
@@ -220,6 +228,32 @@ class ArmTotals:
 
 
 @dataclass(frozen=True)
+class RoleCompliance:
+    dispatches: int
+    effort_deviations: int
+    treated_without_rule: int
+
+
+@dataclass(frozen=True)
+class ComplianceFailure:
+    """A treated task dispatched at the control effort."""
+
+    project: str
+    task_id: str
+    role: str
+    at: datetime
+    effort: str
+
+
+@dataclass(frozen=True)
+class Compliance:
+    """Per-role counts, keyed by every role in options.roles, and each failure oldest first."""
+
+    roles: Mapping[str, RoleCompliance]
+    failures: tuple[ComplianceFailure, ...]
+
+
+@dataclass(frozen=True)
 class ThroughputReport:
     """The cohort's records, each arm's totals, R, its interval and its A/A null.
 
@@ -237,6 +271,7 @@ class ThroughputReport:
     interval_side: IntervalSide
     null: tuple[float, float] | None
     secondary: Mapping[Arm, ArmSecondary]
+    compliance: Compliance
 
 
 def _placeholders(values: Sequence[object]) -> str:
@@ -301,13 +336,24 @@ class _Skew:
 
 
 @dataclass(frozen=True)
+class _Dispatch:
+    task_id: str
+    at: datetime
+    role: str
+    data: Mapping[str, object]
+
+
+@dataclass(frozen=True)
 class _Ledger:
     """One root's rows for its cohort tasks, every instant aware and before read_at.
 
-    *skews* are every task's integration_skew merge_attempts that implicate a commit.
+    *dispatches* are the cohort's routing_decisions in the options' roles from
+    since; *skews* are every task's integration_skew merge_attempts that
+    implicate a commit.
     """
 
     first_dispatch: Mapping[str, datetime]
+    dispatches: tuple[_Dispatch, ...]
     costs: Mapping[str, Mapping[str, float]]
     landings: Mapping[str, tuple[datetime, str]]
     results: Mapping[str, tuple[_Result, ...]]
@@ -315,20 +361,31 @@ class _Ledger:
     skews: tuple[_Skew, ...]
 
 
-def _first_dispatches(
-    conn: Connection, options: ThroughputOptions, since: datetime, cohort_end: datetime,
-) -> dict[str, datetime]:
-    earliest: dict[str, datetime] = {}
+def _role_dispatches(conn: Connection, roles: Sequence[str]) -> list[tuple[str, datetime, str, object]]:
     rows = conn.execute(
-        f"SELECT task_id, timestamp FROM events WHERE event_type = '{_ROUTING_DECISION}' "
-        f'AND task_id IS NOT NULL AND role IN ({_placeholders(options.roles)})',
-        options.roles,
+        f"SELECT task_id, timestamp, role, data FROM events WHERE event_type = '{_ROUTING_DECISION}' "
+        f'AND task_id IS NOT NULL AND role IN ({_placeholders(roles)})',
+        tuple(roles),
     )
-    for raw_task_id, timestamp in rows:
-        task_id, at = str(raw_task_id), parse_utc(timestamp)
+    return [(str(task_id), parse_utc(timestamp), role, raw) for task_id, timestamp, role, raw in rows]
+
+
+def _cohort_dispatches(
+    conn: Connection, options: ThroughputOptions, since: datetime, cohort_end: datetime,
+) -> tuple[dict[str, datetime], tuple[_Dispatch, ...]]:
+    """Each cohort task's first dispatch, and every cohort dispatch in [since, read_at)."""
+    rows = _role_dispatches(conn, options.roles)
+    earliest: dict[str, datetime] = {}
+    for task_id, at, _, _ in rows:
         if task_id not in earliest or at < earliest[task_id]:
             earliest[task_id] = at
-    return {task_id: at for task_id, at in earliest.items() if since <= at < cohort_end}
+    cohort = {task_id: at for task_id, at in earliest.items() if since <= at < cohort_end}
+    dispatches = tuple(
+        _Dispatch(task_id, at, role, decode_metadata(raw))
+        for task_id, at, role, raw in rows
+        if task_id in cohort and since <= at < options.read_at
+    )
+    return cohort, dispatches
 
 
 def _costs(
@@ -400,10 +457,11 @@ def _read_ledger(
 ) -> _Ledger:
     with closing(_open_runs_db(root)) as conn:
         try:
-            first_dispatch = _first_dispatches(conn, options, since, cohort_end)
+            first_dispatch, dispatches = _cohort_dispatches(conn, options, since, cohort_end)
             own_verify_failures, skews = _merge_attempts(conn, first_dispatch, options.read_at)
             return _Ledger(
                 first_dispatch=first_dispatch,
+                dispatches=dispatches,
                 costs=_costs(conn, first_dispatch, options.read_at),
                 landings=_landings(conn, first_dispatch, options.read_at),
                 results=_results(conn, first_dispatch, options.read_at),
@@ -581,6 +639,54 @@ def _aa_null(
     return null_cuts(magnitudes)
 
 
+def _expected_effort(arm: Arm, options: ThroughputOptions) -> str:
+    return options.treated_effort if arm is Arm.TREATED else options.control_effort
+
+
+@dataclass(frozen=True)
+class _DispatchCheck:
+    role: str
+    deviation: bool
+    without_rule: bool
+    failure: ComplianceFailure | None
+
+
+def _dispatch_checks(root: Path, ledger: _Ledger, options: ThroughputOptions) -> list[_DispatchCheck]:
+    checks: list[_DispatchCheck] = []
+    for dispatch in ledger.dispatches:
+        arm = options.arm_of(dispatch.task_id)
+        effort = dispatch.data.get('effort')
+        rule_id = dispatch.data.get('rule_id')
+        treated = arm is Arm.TREATED
+        checks.append(_DispatchCheck(
+            role=dispatch.role,
+            deviation=effort != _expected_effort(arm, options),
+            without_rule=treated and not (
+                isinstance(rule_id, str) and rule_id.startswith(options.rule_prefix)
+            ),
+            failure=ComplianceFailure(
+                root.name, dispatch.task_id, dispatch.role, dispatch.at, options.control_effort,
+            ) if treated and effort == options.control_effort else None,
+        ))
+    return checks
+
+
+def _compliance(checks: Sequence[_DispatchCheck], roles: Sequence[str]) -> Compliance:
+    by_role = {
+        role: RoleCompliance(
+            dispatches=sum(1 for check in checks if check.role == role),
+            effort_deviations=sum(1 for check in checks if check.role == role and check.deviation),
+            treated_without_rule=sum(1 for check in checks if check.role == role and check.without_rule),
+        )
+        for role in roles
+    }
+    failures = sorted(
+        (check.failure for check in checks if check.failure is not None),
+        key=lambda failure: (failure.at, failure.project, failure.task_id),
+    )
+    return Compliance(MappingProxyType(by_role), tuple(failures))
+
+
 def _per(total: float, denominator: int) -> float | None:
     return total / denominator if denominator else None
 
@@ -612,13 +718,14 @@ def throughput_report(options: ThroughputOptions, since: datetime) -> Throughput
     history is needed for a landing and cannot be read.
     """
     cohort_end = options.cohort_end(since)
+    unordered: list[CohortRecord] = []
+    checks: list[_DispatchCheck] = []
+    for root in options.roots:
+        ledger = _read_ledger(root, options, since, cohort_end)
+        unordered.extend(_records(root, ledger, options))
+        checks.extend(_dispatch_checks(root, ledger, options))
     records = sorted(
-        (
-            record
-            for root in options.roots
-            for record in _records(root, _read_ledger(root, options, since, cohort_end), options)
-        ),
-        key=lambda record: (record.project, record.first_dispatch_at, record.task_id),
+        unordered, key=lambda record: (record.project, record.first_dispatch_at, record.task_id),
     )
     totals = {arm: _arm_totals(records, arm) for arm in Arm}
     treated, control = totals[Arm.TREATED], totals[Arm.CONTROL]
@@ -638,4 +745,5 @@ def throughput_report(options: ThroughputOptions, since: datetime) -> Throughput
         interval_side=side_of(interval),
         null=_aa_null(columns, treated.n, control.n, options.resamples, rng),
         secondary=MappingProxyType({arm: _arm_secondary(records, arm) for arm in Arm}),
+        compliance=_compliance(checks, options.roles),
     )
