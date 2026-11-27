@@ -299,6 +299,7 @@ class TestGetSchedulerStateTool:
         """PRD boundary row 3: pause, flush, persist the row; the reply agrees and is fresh."""
         scheduler = Scheduler(OrchestratorConfig(project_root=tmp_path, max_per_module=1))
         scheduler.finish_startup()
+        before = datetime.now(UTC)
         scheduler.pause('cost_ceiling_orch_exceeded', PauseClass.COST_CEILING)
         await scheduler.flush_state_snapshot()
         pause_at = _save_pause_row(tmp_path, 'cost_ceiling_orch_exceeded', PauseClass.COST_CEILING)
@@ -307,7 +308,8 @@ class TestGetSchedulerStateTool:
 
         assert result['is_paused'] is True
         assert result['pause_disagreement'] is False
-        assert result['snapshot_age_s'] < 60
+        assert datetime.fromisoformat(result['snapshot_at']) >= before
+        assert result['snapshot_age_s'] is not None
         assert result['pause_row'] == {
             'reason': 'cost_ceiling_orch_exceeded',
             'pause_at': pause_at,
@@ -812,8 +814,12 @@ class TestSnapshotPerformance:
         )
 
         # served_scheduler_state is the helper the get_scheduler_state tool runs in
-        # asyncio.to_thread, so it carries the same budget.
-        assert len(served_scheduler_state(tmp_path).skip_counts) == n
+        # asyncio.to_thread, so it carries the same budget. The seeded pause row
+        # makes the timed read open runs.db and SELECT it, not stop at a missing file.
+        _save_pause_row(tmp_path, 'cost_ceiling_orch_exceeded', PauseClass.COST_CEILING)
+        served = served_scheduler_state(tmp_path)
+        assert len(served.skip_counts) == n
+        assert served.pause_row is not None
         served_median_ms = _median_thread_cpu_ms(
             lambda: served_scheduler_state(tmp_path), warmup=2, samples=20,
         )
