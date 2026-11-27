@@ -702,16 +702,32 @@ class TestUnitActive:
         assert UNIT in measurement.source
         assert measurement.measured_at == NOW.isoformat()
 
-    def test_a_root_no_unit_names_is_not_active_and_carries_the_scan_problems(self, df, tmp_path):
+    def test_a_root_no_unit_names_is_unreadable_while_the_scan_has_problems(self, df, tmp_path):
         other = tmp_path / 'src' / 'reify'
         other.mkdir(parents=True)
         problems = ('/units/orchestrator-x.service: no ExecStart',)
 
         measurement = mod.unit_active(other, _units(df, {UNIT: 'active'}.__getitem__, problems=problems), now=NOW)
 
-        assert (measurement.value, measurement.status) == (False, 'ok')
+        assert (measurement.value, measurement.status) == (False, 'unreadable')
         assert 'no orchestrator unit' in measurement.source
         assert [gap.reason for gap in measurement.shortfalls] == list(problems)
+
+    def test_a_clean_scan_naming_no_unit_for_the_root_is_a_measured_not_running(self, df, tmp_path):
+        other = tmp_path / 'src' / 'reify'
+        other.mkdir(parents=True)
+
+        measurement = mod.unit_active(other, _units(df, {UNIT: 'active'}.__getitem__), now=NOW)
+
+        assert (measurement.value, measurement.status, measurement.shortfalls) == (False, 'ok', ())
+
+    def test_an_inactive_named_unit_is_unreadable_while_the_scan_has_problems(self, df):
+        problems = ('/units/orchestrator-x.service: no ExecStart',)
+
+        measurement = mod.unit_active(df, _units(df, {UNIT: 'inactive'}.__getitem__, problems=problems), now=NOW)
+
+        assert (measurement.value, measurement.status) == (False, 'unreadable')
+        assert set(problems) <= {gap.reason for gap in measurement.shortfalls}
 
     def test_a_probe_that_raises_is_unreadable_naming_the_unit_and_exception(self, df):
         def probe(_unit: str) -> str:
@@ -845,6 +861,16 @@ class TestActivity:
         state = _measure(_quiet_root(tmp_path, git=False), 'inactive')
 
         assert state.landed.status == 'unreadable'
+        assert state.active and state.inactive_reason is None
+
+    def test_an_unlistable_units_dir_never_hides_a_quiet_project(self, tmp_path):
+        quiet = _quiet_root(tmp_path)
+        units = mod.OrchestratorUnits(orchestrator_projects.scan_units(tmp_path / 'no-such-units'),
+                                      lambda _unit: 'inactive')
+
+        (state,) = mod.measure_projects([quiet], {}, window=WINDOW, now=NOW, units=units).values()
+
+        assert state.unit_active.status == 'unreadable'
         assert state.active and state.inactive_reason is None
 
     def test_activity_is_derived_from_the_measurements_of_a_frozen_state(self, tmp_path):

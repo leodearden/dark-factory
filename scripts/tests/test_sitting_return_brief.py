@@ -1155,6 +1155,19 @@ class TestActivityRendering:
         assert f'reify ({reify}): {fleet_state.INACTIVE_REASON}' in naming
         assert 'dark_factory' not in naming
 
+    def test_an_unlistable_units_dir_keeps_a_quiet_project_listed_with_the_shortfall(self, env):
+        reify = _idle_root(env)
+        units = fleet_state.OrchestratorUnits(
+            orchestrator_projects.scan_units(env.tmp / 'no-such-units'), self.WITH_IDLE_REIFY.__getitem__)
+
+        text = mod.render(env.build(env.df, reify, units=units))
+
+        sections = _sections(text)
+        for title in TITLES[1:5]:
+            assert '### reify' in sections[title].splitlines(), title
+        assert any('cannot list units' in line for line in _project_block(sections[TITLES[2]], 'reify'))
+        assert 'reify' not in _line_naming(text, INACTIVE_FOOTER)
+
     def test_with_no_inactive_project_the_footer_reads_none(self, env):
         text = mod.render(env.build(units=_units(env, self.ACTIVE)))
 
