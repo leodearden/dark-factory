@@ -796,8 +796,18 @@ async def _cell_metrics(
         return {
             'role_under_test': role, 'replay_frame': replay_frame,
             'sandbox_backend': sandbox_backend, 'endpoint_kind': endpoint_kind,
+            'dispatched_models': _dispatched_models_or_none(workflow),
         }
     return metrics.to_dict()
+
+
+def _dispatched_models_or_none(workflow: TaskWorkflow) -> dict[str, list[DispatchRecord]] | None:
+    """The workflow's dispatched models, or None (not recorded) when summarising them raised."""
+    try:
+        return dispatched_models(workflow.metrics.dispatched_routes, workflow.config.models)
+    except Exception as e:
+        logger.warning(f'Dispatched-model summary failed: {e}')
+        return None
 
 
 async def collect_metrics(

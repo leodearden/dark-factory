@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import functools
 import json
+from collections.abc import Iterable, Iterator
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -49,7 +50,7 @@ from _campaign_gate_helpers import (
 from orchestrator.evals.configs import EvalConfig
 from orchestrator.evals.metrics import EvalMetrics, RoleUnderTest, dispatched_models, off_pin_roles
 from orchestrator.evals.results import EvalResult, ResultStore
-from orchestrator.routing import DispatchedRoute, PlanShape
+from orchestrator.routing import DispatchedRoute, PlanShape, RoutingDecision
 from orchestrator.workflow import WorkflowOutcome
 
 
@@ -611,6 +612,7 @@ async def _run_eval_hermetic(
     run_side_effect: BaseException | None = None,
     collect_side_effect: BaseException | None = None,
     worktree_path: Path | None = None,
+    dispatched_routes: Iterable[DispatchedRoute] = (),
 ):
     """Drive run_eval with the worktree/workflow/metrics boundaries mocked.
 
@@ -639,6 +641,9 @@ async def _run_eval_hermetic(
     / ``collect_metrics`` raise, the two ways a cell can fail after the gate is
     resolved — which is what proves the owned teardown really is in a
     ``finally``.
+
+    The fake workflow carries the cell config build_workflow received and
+    ``dispatched_routes=`` as the routes its invocations ran on.
     """
     from orchestrator.evals import eval_gate, runner
 
@@ -649,9 +654,11 @@ async def _run_eval_hermetic(
     fake_wf.run = AsyncMock(
         return_value=SimpleNamespace(outcome=outcome), side_effect=run_side_effect,
     )
+    fake_wf.metrics.dispatched_routes = dispatched_routes
 
     def fake_build_workflow(**kwargs):
         captured['build_workflow'] = kwargs
+        fake_wf.config = kwargs['config']
         return fake_wf
 
     mock_collect = _fake_collect_metrics(collect_side_effect)
@@ -756,6 +763,7 @@ async def _run_end_to_end_hermetic(
     injected_gate=_NO_INJECTED_GATE,
     run_side_effect: BaseException | None = None,
     collect_side_effect: BaseException | None = None,
+    dispatched_routes: Iterable[DispatchedRoute] = (),
 ):
     """Drive run_end_to_end with the worktree/workflow/metrics boundaries mocked.
 
@@ -765,9 +773,9 @@ async def _run_end_to_end_hermetic(
     ``owned_usage_gate`` was bound to.
 
     The gate knobs (``gate`` / ``injected_gate`` / ``run_side_effect`` /
-    ``collect_side_effect``) mean exactly what they mean in
-    :func:`_run_eval_hermetic` — see its docstring for why the builder is
-    replaced unconditionally.
+    ``collect_side_effect``) and ``dispatched_routes`` mean exactly what they
+    mean in :func:`_run_eval_hermetic` — see its docstring for why the builder
+    is replaced unconditionally.
     """
     from orchestrator.evals import eval_gate, runner
 
@@ -778,9 +786,11 @@ async def _run_end_to_end_hermetic(
     fake_wf.run = AsyncMock(
         return_value=SimpleNamespace(outcome=outcome), side_effect=run_side_effect,
     )
+    fake_wf.metrics.dispatched_routes = dispatched_routes
 
     def fake_build_workflow(**kwargs):
         captured['build_workflow'] = kwargs
+        fake_wf.config = kwargs['config']
         return fake_wf
 
     mock_collect = _fake_collect_metrics(collect_side_effect)
@@ -1047,6 +1057,45 @@ class TestWorkflowCellContract:
         assert result.run_id == run_id
         assert result.worktree_path == str(worktree)
         assert result.wall_clock_ms >= 0
+
+    async def test_a_failed_collection_still_records_the_dispatched_models(
+        self, drive, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        decision = RoutingDecision(
+            model='sonnet', effort='max', budget_usd=10.0, max_turns=120,
+            source_layer='config', rule_id=None,
+        )
+        route = DispatchedRoute('implementer', decision, 'claude-sonnet-5-5')
+
+        result, _captured = await drive(
+            tmp_path, monkeypatch, dispatched_routes=[route],
+            collect_side_effect=RuntimeError('x'),
+        )
+
+        assert result.metrics['dispatched_models'] == {'implementer': [{
+            'model': 'sonnet', 'served_model_id': 'claude-sonnet-5-5',
+            'source_layer': 'config', 'rule_id': None,
+            'configured_model': 'sonnet', 'rejected': [],
+        }]}
+
+    async def test_an_unreadable_dispatch_record_still_saves_the_failed_cell(
+        self, drive, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        result, captured = await drive(
+            tmp_path, monkeypatch, dispatched_routes=_UnreadableRoutes(),
+            collect_side_effect=RuntimeError('x'),
+        )
+
+        assert captured['save'].call_args.args[0] is result
+        assert result.metrics['dispatched_models'] is None
+        assert 'role_under_test' in result.metrics
+
+
+class _UnreadableRoutes:
+    """A dispatched-route record that raises when read."""
+
+    def __iter__(self) -> Iterator[DispatchedRoute]:
+        raise RuntimeError('unreadable')
 
 
 @pytest.mark.asyncio

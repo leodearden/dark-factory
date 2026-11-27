@@ -335,7 +335,8 @@ class EvalMetrics:
     sandbox_backend: CellSandbox | None = None
 
     # Per role, the distinct routes its invocations ran on. None means not
-    # recorded (a cell before task 8499, or collection failed); off_pin_roles reads it.
+    # recorded (a cell before task 8499, or summarising the routes failed);
+    # off_pin_roles reads it.
     dispatched_models: dict[str, list[DispatchRecord]] | None = None
 
     # Live shadow eval (plans/live-shadow-eval-prd.md C1/C4): the shadow_cells row
