@@ -87,6 +87,15 @@ VerifyHostPolicy = Literal['prefer_local', 'prefer_remote']
 # eligibility match share one vocabulary.
 VerifyTaskHostPolicy = Literal['local', 'remote_modules', 'remote_all']
 
+#: The script names GitOps's warm-lane wrappers resolve (git_ops.py::GitOps._warm_lane_script_candidates).
+WarmLaneWrapperScript = Literal[
+    'warm-lane-disk-guard.sh',
+    'warm-lane-audit.sh',
+    'warm-lane-gc.sh',
+    'warm-lane-degenerate-ref-check.sh',
+    'thin-warm-lane.sh',
+]
+
 
 # --- Priority-tier constants (value/h scheduler) ---
 #
@@ -2846,6 +2855,19 @@ class GitConfig(BaseModel):
             'Default False → byte-identical and revertible, mirroring the '
             'warm_lane_disk_guard convention; reify enables it in its own '
             'orchestrator.yaml.'
+        ),
+    )
+    warm_lane_df_preferred_scripts: list[WarmLaneWrapperScript] = Field(
+        default_factory=list,
+        description=(
+            "Warm-lane wrapper scripts that resolve dark-factory's copy "
+            '(orchestrator/scripts/warm-lane/<name>) first and the '
+            "project's scripts/<name> second. Default [] keeps project-first "
+            'for every script. warm-lane-disk-guard.sh covers both the hard '
+            'and the soft guard wrapper. Green tier: removing an entry and '
+            'calling reload_config reverts it. See '
+            'git_ops.py::GitOps._warm_lane_script_candidates and '
+            'plans/warm-lane-infra-repatriation-prd.md D3.'
         ),
     )
     warm_lane_min_free_gib: int = Field(
@@ -7411,6 +7433,9 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
         # captured at startup), so a reload takes effect on the very next
         # advance and an operator can retune the stand-off live.
         'git.merge_park_lock_grace_seconds',
+        # GitOps reads it per resolution off this same GitConfig object (I3): a reload applies
+        # from the next wrapper invocation, never to a run already spawned. List leaf, compared by equality.
+        'git.warm_lane_df_preferred_scripts',
         # Generic per-project offline-lane commands + legacy-numeric gate (task
         # 2789, D6 green-tier): the worker re-reads config.git each _run_once,
         # so the command list, per-command priorities, and the legacy-numeric
