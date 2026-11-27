@@ -14806,7 +14806,8 @@ class TaskWorkflow:
         parse_spawn_identity) so every orchestrator-launched agent's registry
         record carries an accurate role/project/task and a non-null parent
         (task 2512). Built for EVERY role — unlike _build_agent_env, which
-        returns None for merger/judge/reviewer.
+        returns None by default for merger/judge/reviewer (i.e. absent a
+        role_env_overrides entry).
 
         CLAUDE_SPAWN_PARENT_ID defaults to the workflow-root self.session_id
         (used for the architect itself, and as the fallback for any role
@@ -15459,8 +15460,8 @@ class TaskWorkflow:
                     resume_prompt=resume_prompt,
                     # Judge gets no ENDPOINT env by default: it is absent from
                     # config.role_env_overrides (the per-role OPT-IN map, task 2460).
-                    # Giving it ANTHROPIC_BASE_URL / ANTHROPIC_AUTH_TOKEN there would
-                    # route it through vLLM, where max_model_len causes
+                    # Giving it ANTHROPIC_BASE_URL / ANTHROPIC_AUTH_TOKEN there for a
+                    # vLLM endpoint hits max_model_len, causing
                     # ServerDisconnectedError after 2 tool-use rounds (3cd380a079)
                     # — do not give 'judge' endpoint env unless that endpoint is
                     # confirmed to handle its tool-use pattern.  A judge entry of
