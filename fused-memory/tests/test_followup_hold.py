@@ -33,6 +33,8 @@ from fused_memory.middleware.followup_hold import (
     protected_status,
     protected_update,
     releases_holder,
+    starts_waiting,
+    waits_on_its_dependencies,
 )
 
 _MARKER = {'project_id': 'dark_factory', 'minted_at': '2026-11-08T00:00:00+00:00'}
@@ -395,6 +397,44 @@ def test_a_promoted_row_keeps_its_record_but_is_not_held() -> None:
     promoted = {**_HOLD_RECORD, 'promoted': {'by': 'citation', 'at': _HELD_AT, 'ref': 'fk-1'}}
 
     assert held_by(_held_row(dependencies=[3], record=promoted)) is None
+
+
+@pytest.mark.parametrize('status', ['pending', 'in-progress', 'blocked', 'review', 'merge-deferred', 'infra-hold'])
+def test_an_unheld_row_in_a_waiting_status_waits_on_its_dependencies(status: str) -> None:
+    assert waits_on_its_dependencies({'id': 12, 'status': status, 'dependencies': [3], 'metadata': {}})
+
+
+def test_a_promoted_row_waits_on_its_dependencies() -> None:
+    promoted = {**_HOLD_RECORD, 'promoted': {'by': 'citation', 'at': _HELD_AT, 'ref': 'fk-1'}}
+
+    assert waits_on_its_dependencies(_held_row(dependencies=[3], record=promoted))
+
+
+@pytest.mark.parametrize('status', ['deferred', 'done', 'cancelled'])
+def test_an_unheld_row_that_is_deferred_or_settled_does_not_wait(status: str) -> None:
+    assert not waits_on_its_dependencies({'id': 12, 'status': status, 'dependencies': [3], 'metadata': {}})
+
+
+@pytest.mark.parametrize('status', ['pending', 'in-progress'])
+def test_a_held_row_does_not_wait_on_its_dependencies(status: str) -> None:
+    assert not waits_on_its_dependencies(_held_row(status))
+
+
+@pytest.mark.parametrize(('old_status', 'status'), [
+    ('deferred', 'pending'), ('deferred', 'blocked'), ('done', 'pending'), ('cancelled', 'pending'),
+])
+def test_a_landing_from_deferred_or_settled_into_a_waiting_status_starts_waiting(old_status: str, status: str) -> None:
+    assert starts_waiting(old_status, status)
+
+
+@pytest.mark.parametrize(('old_status', 'status'), [
+    ('in-progress', 'pending'), ('blocked', 'pending'), ('pending', 'in-progress'),
+    ('pending', 'deferred'), ('pending', 'done'), ('pending', 'pending'),
+])
+def test_a_landing_that_was_already_waiting_or_stops_waiting_does_not_start_waiting(
+    old_status: str, status: str,
+) -> None:
+    assert not starts_waiting(old_status, status)
 
 
 @pytest.mark.parametrize('record', [

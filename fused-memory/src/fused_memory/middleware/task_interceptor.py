@@ -134,6 +134,7 @@ from fused_memory.middleware.followup_hold import (
     release_held,
     releases_holder,
     remove_holder_edge,
+    starts_waiting,
 )
 from fused_memory.middleware.live_task_write_guard import (
     FileFindingFn,
@@ -2362,13 +2363,13 @@ class TaskInterceptor:
     ) -> None:
         """Decision 14 at the status chokepoint; the caller holds the write lock and the write landed.
 
-        An explicit release promotes every held follow-up; a task landing on pending from deferred
-        promotes the held tasks it depends on.
+        An explicit release promotes every held follow-up; a landing that starts a task waiting
+        (:func:`followup_hold.starts_waiting`) promotes the held tasks it depends on.
         """
         emit = self.hold_emit(project_root)
         if releases_holder(before, status, release_holder=release_holder):
             await release_held(tm, project_root, int(task_id), emit=emit)
-        elif old_status == TaskStatus.DEFERRED and status == TaskStatus.PENDING:
+        elif starts_waiting(old_status, status):
             await promote_dependencies_of(tm, project_root, int(task_id), emit=emit)
 
     async def _repeat_release(
@@ -6476,7 +6477,8 @@ class TaskInterceptor:
           unchanged from the original behavior. An edge that would close a cycle
           comes back as the :class:`DependencyCycle` refusal dict, nothing written.
 
-        Once the edge lands, a pending, non-held dependent promotes every held
+        Once the edge lands, a dependent that
+        :func:`followup_hold.waits_on_its_dependencies` promotes every held
         follow-up it depends on (``by='dependent'``,
         :func:`followup_hold.promote_dependencies_of`; docs/task-authoring.md
         §3.4).  The journal and ``task_modified`` event are emitted regardless of

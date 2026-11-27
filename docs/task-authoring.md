@@ -980,15 +980,19 @@ write has landed (`followup_hold.py::promote_after_update`). It never writes
 contract is `plans/follow-up-filing-shape-prd.md` §3 decision 14 and §4.3.
 Every trigger runs under the project's write lock:
 
-- **An edge from a pending, unheld task** (`by: dependent`, `ref`: the
+- **An edge from a waiting, unheld task** (waiting: any active status but
+  `deferred`, the set the startup backfill uses,
+  `followup_hold.py::WAITING_STATUSES`; `by: dependent`, `ref`: the
   dependent's id): `add_dependency`, a task born with the edge through
   `submit_task`, or an `update_task` `dependencies` replacement. An edge
   between two held tasks promotes neither.
-- **A landing on `pending` from `deferred`** promotes the held tasks the
-  landing task depends on, the same way: `commit_planning` of a batch task,
-  a plain `set_task_status`, or the deferral-expiry sweep, which flips
-  through the same chokepoint. A held task landing back on `pending` stays
-  held.
+- **A landing that starts a task waiting**, from `deferred`, `done` or
+  `cancelled` into any waiting status (`followup_hold.py::starts_waiting`),
+  promotes the held tasks the landing task depends on, the same way:
+  `commit_planning` of a batch task, a plain `set_task_status` (including a
+  reopen, or a `deferred → blocked` landing), or the deferral-expiry sweep,
+  which flips through the same chokepoint. A held task landing back on
+  `pending` stays held.
 - **A citation** (`by: citation`, `ref`: the first finding key, else the PRD
   path): an `update_task` on a held task whose metadata payload carries
   `x_finding_key` or `prd_path`, the keys that keep a filing out of the hold.

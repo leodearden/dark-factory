@@ -245,12 +245,15 @@ Lead's decisions under those rulings:
     class Leo's 2026-08-06 continuity ruling protects, `stamp_pending_since`'s transition table has
     no `pending → pending` row, and a task waiting weeks on an ordinary dependency already scores as
     weeks old when it lands, so a promoted task is treated the same. Triggers: a dependent edge
-    inserted from a pending, non-held task; the interceptor's status chokepoint
-    `TaskInterceptor._apply_status_transition` (it serves the comma-separated loop and the
-    single-id path, hence `commit_planning`, a plain `set_task_status`, and the deferral-expiry
-    sweep the deferral PRD routes through an interceptor `client_op_id`), for every
-    `deferred → pending` landing, promoting the held dependencies of the task that just became
-    pending;
+    inserted from a waiting, non-held task (waiting is every active status but `deferred`:
+    `followup_hold.py::WAITING_STATUSES`, the set the backfill of decision 12 also reads); the
+    interceptor's status chokepoint `TaskInterceptor._apply_status_transition` (it serves the
+    comma-separated loop and the single-id path, hence `commit_planning`, a plain
+    `set_task_status`, and the deferral-expiry sweep the deferral PRD routes through an interceptor
+    `client_op_id`), for every landing that starts a task waiting (`deferred → pending` is the
+    common case; `deferred → blocked` and a reopen of a `done` or `cancelled` task count too,
+    `followup_hold.py::starts_waiting`), promoting the held dependencies of the task that just
+    started waiting (amended 2026-11-27, §9 open question 7);
     `update_task` adding `x_finding_key` or `prd_path`, except a task carrying `finding_set_hold`:
     its citation is deferred (`followup_promotion_deferred`, guard `finding_set_hold`) and it stays
     held; every other cause promotes it as usual; `_execute_combine` absorbing a candidate
@@ -377,7 +380,12 @@ def promote(tm, project_root, held_id: int, *, by, ref=None, emit: HoldEmit) -> 
     # removes the holder edge, stamps, emits, then recurses into the held dependencies of held_id
     # (by='dependent', ref=held_id); returns every id promoted
 def promote_dependencies_of(tm, project_root, task_id: int, *, emit: HoldEmit) -> tuple[int, ...]
-    # the status-chokepoint and edge-insert entry: promotes held deps of a task that is pending
+    # the status-chokepoint and edge-insert entry: promotes held deps of a task that waits on its
+    # dependencies (waits_on_its_dependencies)
+WAITING_STATUSES: frozenset[TaskStatus]         # ACTIVE minus deferred; the backfill reads it too
+def waits_on_its_dependencies(task) -> bool     # status in WAITING_STATUSES and held_by(task) is None
+def starts_waiting(old_status: str | None, status: str) -> bool
+    # old_status not in WAITING_STATUSES and status in it: the chokepoint's promotion rule
 class FollowupHolderProtectedError(TaskBackendError)
 ```
 
@@ -410,8 +418,10 @@ interfaces `submit_task`, `resolve_ticket`, `get_task`, `add_dependency`, `remov
 | 7 | a medium follow-up, a PRD leaf (planning_mode), and a task with `x_finding_key` and no `finding_set_hold` are filed | holder exists | none of the three carries the holder edge |
 | 7b | a low finding-set member carrying `finding_set_hold` is filed by the ticket path, and another by `planning_mode` | any | both carry the holder edge and a `followup_held` event, and stay held after `commit_planning` |
 | 8 | `add_dependency(new_task, held)` from a pending task | scenario 1 | `held` is ready next tick; `followup_hold.promoted.by == 'dependent'`; `pending_since` unchanged; event emitted |
+| 8b | `add_dependency(task, held)` from an in-progress or blocked task | scenario 1 | `held` promoted at the edge, `by == 'dependent'` |
 | 9 | `add_dependency(deferred_batch_task, held)` then the batch task reaches pending by `commit_planning`, by a plain `set_task_status`, or by the deferral-flip path | planning batch | not promoted at the edge; promoted at the flip by every one of the three paths, `by == 'dependent'` |
 | 9b | X is held, X depends on held H, X is promoted by citation | both held; X has no other unmet dependency | H is promoted too, `by == 'dependent'`, `ref == X`; X is a dispatch candidate next tick |
+| 9c | a done or cancelled task gains `add_dependency(task, held)`, then is reopened to pending | scenario 1 | not promoted at the edge; promoted at the reopen, `by == 'dependent'` |
 | 10 | a parent edge is added between two held follow-ups (6072 shape) | both held | neither promoted on insert |
 | 11 | `update_task(held, metadata gains x_finding_key)` on a held task without `finding_set_hold` | scenario 1 | promoted `by == 'citation'`, `ref == the key` |
 | 11b | `update_task(held finding-set member, metadata gains x_finding_key)` | scenario 7b | still held; `followup_promotion_deferred{guard: finding_set_hold, by: citation}`; a human `remove_dependency(held, holder)` then promotes it `by == 'human'` |
@@ -525,6 +535,16 @@ allowlist test greps real imports.
    `deferred`, or fire the chokepoint on every landing on `pending`. Either way, the edge-insert
    rule and the backfill would share one definition of waiting. Raised by ζ's review (task 8418),
    which kept the decided trigger set.
+   *Resolved in task 11407 (2026-11-27):* the first option, (a), was taken:
+   `promote_dependencies_of` accepts every active status except `deferred`
+   (`followup_hold.py::WAITING_STATUSES`, the backfill's existing set). The chokepoint was
+   completed to every landing that starts a task waiting (`followup_hold.py::starts_waiting`), so
+   a `deferred → blocked` landing and a reopen of a `done` or `cancelled` task promote too. The
+   second option, (b), was rejected: sharing one definition would narrow the backfill to
+   `pending` and newly hold follow-ups that an in-progress or blocked task, or another project's
+   task, waits on. Those would rely on every later landing passing the chokepoint, and the
+   cross-project ones strand until task 11541. The backfill still counts an already-held
+   dependent as waiting. That can only leave a follow-up unheld, never strand one.
 8. **The release storm.** Row 15 journals one `followup_promoted` per held task, and
    `storm-escape-required` binds only the backfill. Measured 2026-11-22: df's holder had 2,903
    held follow-ups, and releasing that many on a test SQLite store took 22.6 s under the project
