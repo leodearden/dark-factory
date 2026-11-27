@@ -241,6 +241,7 @@ _ADDED_COLUMNS = (
     ('actions', 'before_child_snapshot_id', 'INTEGER'),
     ('actions', 'before_parent_snapshot_id', 'INTEGER'),
     ('actions', 'after_child_snapshot_id', 'INTEGER'),
+    ('runs', 'invocation_run_id', 'TEXT'),
 )
 
 _ACTION_COLUMNS = (
@@ -296,6 +297,11 @@ class AmbiguousRun(LookupError):
 
 @dataclass(frozen=True)
 class RunRow:
+    """One run; ``invocation_run_id`` is the invocations-ledger run id its adjudicator wrote
+    under (``models/invocation_ledger.py::invocations_ledger_path``), which can hold no rows,
+    as when every verdict was reused; None for a run with no adjudicator, or one whose calls
+    are written nowhere."""
+
     run_id: str
     source: RunSource
     writes: bool
@@ -304,6 +310,7 @@ class RunRow:
     counts: Mapping[str, Any] | None
     plan_sha256: str | None
     plan_path: Path | None
+    invocation_run_id: str | None
 
     @property
     def kind(self) -> RunKind:
@@ -570,12 +577,15 @@ class LinkHealLedger:
         """Truncate the WAL into the main database file."""
         return CheckpointResult.from_pragma_rows(self._conn.execute('PRAGMA wal_checkpoint(TRUNCATE)'))
 
-    def start_run(self, source: RunSource, *, writes: bool) -> str:
+    def start_run(
+        self, source: RunSource, *, writes: bool, invocation_run_id: str | None = None,
+    ) -> str:
         run_id = new_run_id()
         with self._conn:
             self._conn.execute(
-                'INSERT INTO runs (run_id, source, writes, started_at) VALUES (?, ?, ?, ?)',
-                (run_id, source.value, int(writes), _now()),
+                'INSERT INTO runs (run_id, source, writes, started_at, invocation_run_id) '
+                'VALUES (?, ?, ?, ?, ?)',
+                (run_id, source.value, int(writes), _now(), invocation_run_id),
             )
         return run_id
 
@@ -1208,6 +1218,7 @@ def _run_row(row: sqlite3.Row) -> RunRow:
         counts=_loads_or_none(row['counts_json']),
         plan_sha256=row['plan_sha256'],
         plan_path=None if row['plan_path'] is None else Path(row['plan_path']),
+        invocation_run_id=row['invocation_run_id'],
     )
 
 

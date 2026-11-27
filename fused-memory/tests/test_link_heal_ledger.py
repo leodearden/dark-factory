@@ -190,6 +190,32 @@ class TestSchema:
         }
         LinkHealLedger(db).close()
 
+    def test_a_ledger_written_before_invocation_run_ids_gains_the_column(self, tmp_path):
+        db = tmp_path / 'link_heal.db'
+        old_id = 'c' * 32
+        conn = sqlite3.connect(db)
+        try:
+            conn.executescript(_SCHEMA_BEFORE_RECORDS)
+            conn.execute(
+                'INSERT INTO runs (run_id, source, writes, started_at) VALUES (?, ?, ?, ?)',
+                (old_id, RunSource.ADJUDICATOR.value, 0, '2026-11-01T00:00:00+00:00'),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        ledger = LinkHealLedger(db)
+        try:
+            assert _columns(db, 'runs') >= {'invocation_run_id'}
+            assert ledger.resolve_run(old_id).invocation_run_id is None
+            new_id = ledger.start_run(
+                RunSource.ADJUDICATOR, writes=False, invocation_run_id='link-heal-plan-x',
+            )
+            assert ledger.resolve_run(new_id).invocation_run_id == 'link-heal-plan-x'
+        finally:
+            ledger.close()
+        LinkHealLedger(db).close()
+
 
 class TestDurability:
     def test_the_ledger_file_is_in_wal_mode(self, tmp_path):
@@ -466,6 +492,21 @@ class TestRuns:
         ledger.finish_run(run_id, counts={'applied': 0})
 
         assert ledger.resolve_run(run_id).plan_path is None
+
+    def test_a_run_records_the_invocations_run_its_adjudicator_wrote_under(self, ledger):
+        invocations = 'link-heal-plan-20261126T134104Z-4242'
+
+        run_id = ledger.start_run(
+            RunSource.ADJUDICATOR, writes=False, invocation_run_id=invocations,
+        )
+
+        assert ledger.resolve_run(run_id).invocation_run_id == invocations
+        assert ledger.recent_runs(1)[0].invocation_run_id == invocations
+
+    def test_a_run_started_without_an_invocations_run_names_none(self, ledger):
+        run_id = ledger.start_run(RunSource.CORPUS, writes=True)
+
+        assert ledger.resolve_run(run_id).invocation_run_id is None
 
     def test_latest_plan_run_is_the_newest_non_writing_run_of_its_source(self, ledger, tmp_path):
         assert ledger.latest_plan_run(RunSource.CORPUS) is None

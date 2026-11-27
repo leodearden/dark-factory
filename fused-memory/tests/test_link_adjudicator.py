@@ -712,6 +712,34 @@ class TestAdjudicatorInvocationLedger:
         assert reply.success is False
         assert len(await invocation_rows(db_path)) == 1
 
+    @pytest.mark.asyncio
+    async def test_it_names_the_run_its_ledger_writes_under(self, tmp_path):
+        async with CostStore(tmp_path / 'curator_events.db') as store:
+            adjudicate = configured_adjudicator(
+                LinkHealConfig(),
+                brief_text=FIXED_BRIEF,
+                ledger=InvocationLedger(store, LedgerRole.LINK_ADJUDICATOR, 'lh-run', 'proj-h'),
+            )
+
+        assert adjudicate.invocation_run_id == 'lh-run'
+
+    def test_without_a_ledger_it_names_no_run(self):
+        adjudicate = configured_adjudicator(LinkHealConfig(), brief_text=FIXED_BRIEF)
+
+        assert adjudicate.invocation_run_id is None
+
+    @pytest.mark.asyncio
+    async def test_with_its_own_asker_it_names_no_run_since_the_ledger_is_unused(self, tmp_path):
+        async with CostStore(tmp_path / 'curator_events.db') as store:
+            adjudicate = configured_adjudicator(
+                LinkHealConfig(),
+                ask=FakeAsker(),
+                brief_text=FIXED_BRIEF,
+                ledger=InvocationLedger(store, LedgerRole.LINK_ADJUDICATOR, 'lh-run', 'proj-h'),
+            )
+
+        assert adjudicate.invocation_run_id is None
+
 
 _LIVE_PAIR = LinkPair(
     key='live',
