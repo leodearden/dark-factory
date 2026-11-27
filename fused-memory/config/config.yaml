@@ -37,6 +37,18 @@ llm:
   # response_format (llama.cpp#21228).
   # structured_output_mode: "json_object"
 
+  # graphiti's extract_nodes/extract_edges prompts for decisions_and_rationale
+  # episodes ride the ChatGPT plan through the plan_route proxy (ruling
+  # esc-9522-1, task 9943). A cap parks the write (task 9944) and never falls
+  # back onto OPENAI_API_KEY. Every other call and the embedders stay on
+  # providers.openai. Restart-tier.
+  extraction_routes:
+    decisions_and_rationale:
+      model: "gpt-6.1-sol"
+      reasoning_effort: "low"
+      api_url: ${OPENAI_PLAN_PROXY_URL}
+      api_key: ${OPENAI_PLAN_PROXY_KEY}
+
   # NOTE: api_url below is always passed explicitly to the LLM/embedder
   # clients, so this config WINS over the ambient OPENAI_BASE_URL /
   # OPENAI_API_BASE environment variables that the openai SDK and mem0 would

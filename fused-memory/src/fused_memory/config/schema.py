@@ -313,6 +313,28 @@ class LLMProvidersConfig(BaseModel):
     anthropic: AnthropicProviderConfig | None = None
 
 
+class ExtractionRouteConfig(BaseModel):
+    """One category's graphiti extraction route: the model, effort, endpoint and key it rides."""
+
+    model: str = Field(description='Model the routed extract_nodes/extract_edges calls are sent to.')
+    reasoning_effort: Literal['low', 'medium', 'high'] = Field(
+        description='reasoning.effort sent on every routed call, with no temperature.',
+    )
+    api_url: str | None = Field(
+        default=None,
+        description=(
+            'Base URL of the route; it is built only when this is the plan proxy the plan-route gate '
+            'gates and both api_url and api_key are set (graphiti_client.py::build_llm_client).'
+        ),
+    )
+    api_key: str | None = Field(default=None, description='Bearer key for api_url; blank is unset.')
+
+    @field_validator('api_url', 'api_key')
+    @classmethod
+    def _blank_is_unset(cls, value: str | None) -> str | None:
+        return blank_means_inherit(value)
+
+
 class LLMConfig(BaseModel):
     """LLM configuration — shared by both backends."""
 
@@ -345,6 +367,14 @@ class LLMConfig(BaseModel):
     # restart-tier — absent from config/reload.py's RELOADABLE_FIELDS).
     max_tokens: int = Field(default=4096)
     providers: LLMProvidersConfig = Field(default_factory=LLMProvidersConfig)
+    extraction_routes: dict[str, ExtractionRouteConfig] = Field(
+        default_factory=dict,
+        description=(
+            'Keyed by a graphiti-routed MemoryCategory value, validated where consumed '
+            '(graphiti_client.py::build_llm_client): schema.py cannot import fused_memory.models '
+            'without an import cycle.'
+        ),
+    )
 
     # Which graphiti-core LLM client to construct on the `provider='openai'`
     # branch (it does NOT affect the anthropic branch).
