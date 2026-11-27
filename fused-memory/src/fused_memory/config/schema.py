@@ -23,6 +23,7 @@ from fused_memory.config.overlay import (
     load_overlay,
     merge_overlay,
 )
+from fused_memory.config.request_attempts import RequestAttemptsConfig
 from fused_memory.config.retired_keys import drop_retired_keys
 
 # The ONE topic-slug namespace (task 3198, PRD D4). Imported from the
@@ -420,6 +421,15 @@ class EmbedderConfig(BaseModel):
     model: str = Field(default='text-embedding-3-small')
     dimensions: int = Field(default=1536)
     providers: EmbedderProvidersConfig = Field(default_factory=EmbedderProvidersConfig)
+    request_attempts: RequestAttemptsConfig = Field(
+        default_factory=RequestAttemptsConfig,
+        description=(
+            'Per-attempt deadline and attempt count of every embedder client. '
+            'FusedMemoryConfig rejects a schedule whose stalled ceiling reaches '
+            'queue.backend_write_timeout_seconds. Read at client construction, '
+            'so a change needs a restart.'
+        ),
+    )
 
 
 # --- Graphiti backend ---
@@ -587,6 +597,7 @@ class QueueConfig(BaseModel):
         'ConnectionResetError',
         'ServerDisconnectedError',
         'OperationalError',
+        'APITimeoutError',
     ])
     write_timeout_seconds: float = Field(default=120.0)
     backend_read_timeout_seconds: float = Field(default=30.0)
@@ -4159,6 +4170,15 @@ class FusedMemoryConfig(BaseSettings):
                 f'({self.queue.backend_write_timeout_seconds}): otherwise a slow Cypher '
                 'call fails on a socket error instead of its named budget.'
             )
+        return self
+
+    @model_validator(mode='after')
+    def _validate_embedder_attempts_fit_write_budget(self) -> 'FusedMemoryConfig':
+        self.embedder.request_attempts.check_fits_within(
+            self.queue.backend_write_timeout_seconds,
+            owner='embedder.request_attempts',
+            budget_name='queue.backend_write_timeout_seconds',
+        )
         return self
 
     model_config = SettingsConfigDict(

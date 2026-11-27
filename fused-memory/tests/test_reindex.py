@@ -1080,7 +1080,7 @@ class TestRunReindex:
                 'fused_memory.maintenance.reindex.maintenance_service',
                 side_effect=make_fake_maintenance_service(standard_mock_config, mock_service),
             ),
-            patch('fused_memory.maintenance.reindex.OpenAIEmbedder'),
+            patch('fused_memory.maintenance.reindex.bounded_openai_embedder'),
             patch('fused_memory.maintenance.reindex.ReindexManager') as mock_mgr_cls,
         ):
             mock_mgr = MagicMock()
@@ -1108,7 +1108,7 @@ class TestRunReindex:
                 'fused_memory.maintenance.reindex.maintenance_service',
                 side_effect=make_fake_maintenance_service(standard_mock_config, mock_service),
             ),
-            patch('fused_memory.maintenance.reindex.OpenAIEmbedder'),
+            patch('fused_memory.maintenance.reindex.bounded_openai_embedder'),
             patch('fused_memory.maintenance.reindex.ReindexManager') as mock_mgr_cls,
         ):
             mock_mgr = MagicMock()
@@ -1135,7 +1135,7 @@ class TestRunReindex:
                 'fused_memory.maintenance.reindex.maintenance_service',
                 side_effect=make_fake_maintenance_service(standard_mock_config, mock_service),
             ),
-            patch('fused_memory.maintenance.reindex.OpenAIEmbedder'),
+            patch('fused_memory.maintenance.reindex.bounded_openai_embedder'),
             patch('fused_memory.maintenance.reindex.ReindexManager') as mock_mgr_cls,
         ):
             mock_mgr = MagicMock()
@@ -1166,7 +1166,7 @@ class TestRunReindex:
                 side_effect=make_fake_maintenance_service(standard_mock_config, mock_service),
             ),
             patch('fused_memory.maintenance.reindex.OpenAIEmbedderConfig') as mock_cfg_cls,
-            patch('fused_memory.maintenance.reindex.OpenAIEmbedder'),
+            patch('fused_memory.maintenance.reindex.bounded_openai_embedder'),
             patch('fused_memory.maintenance.reindex.ReindexManager') as mock_mgr_cls,
         ):
             mock_mgr = MagicMock()
@@ -1215,7 +1215,7 @@ class TestRunReindex:
                 side_effect=make_fake_maintenance_service(standard_mock_config, mock_service),
             ),
             patch('fused_memory.maintenance.reindex.OpenAIEmbedderConfig') as mock_cfg_cls,
-            patch('fused_memory.maintenance.reindex.OpenAIEmbedder'),
+            patch('fused_memory.maintenance.reindex.bounded_openai_embedder'),
             patch('fused_memory.maintenance.reindex.ReindexManager') as mock_mgr_cls,
         ):
             mock_mgr = MagicMock()
@@ -1262,7 +1262,7 @@ class TestRunReindex:
                 side_effect=make_fake_maintenance_service(standard_mock_config, mock_service),
             ),
             patch('fused_memory.maintenance.reindex.OpenAIEmbedderConfig'),
-            patch('fused_memory.maintenance.reindex.OpenAIEmbedder'),
+            patch('fused_memory.maintenance.reindex.bounded_openai_embedder'),
             patch('fused_memory.maintenance.reindex.ReindexManager') as mock_mgr_cls,
             caplog.at_level(logging.WARNING),
         ):
@@ -1304,7 +1304,7 @@ class TestRunReindex:
                 side_effect=make_fake_maintenance_service(standard_mock_config, mock_service),
             ),
             patch('fused_memory.maintenance.reindex.OpenAIEmbedderConfig') as mock_cfg_cls,
-            patch('fused_memory.maintenance.reindex.OpenAIEmbedder'),
+            patch('fused_memory.maintenance.reindex.bounded_openai_embedder'),
             patch('fused_memory.maintenance.reindex.ReindexManager') as mock_mgr_cls,
         ):
             mock_mgr = MagicMock()
@@ -1349,7 +1349,7 @@ class TestRunReindex:
                 side_effect=make_fake_maintenance_service(standard_mock_config, mock_service),
             ),
             patch('fused_memory.maintenance.reindex.OpenAIEmbedderConfig'),
-            patch('fused_memory.maintenance.reindex.OpenAIEmbedder'),
+            patch('fused_memory.maintenance.reindex.bounded_openai_embedder'),
             patch(
                 'fused_memory.maintenance.reindex.ReindexManager',
                 side_effect=RuntimeError('manager init failed'),
@@ -1385,7 +1385,7 @@ class TestRunReindexDelegation:
                 side_effect=make_fake_maintenance_service(standard_mock_config, mock_service),
             ),
             patch('fused_memory.maintenance.reindex.OpenAIEmbedderConfig'),
-            patch('fused_memory.maintenance.reindex.OpenAIEmbedder') as mock_embedder_cls,
+            patch('fused_memory.maintenance.reindex.bounded_openai_embedder') as mock_build_embedder,
             patch('fused_memory.maintenance.reindex.ReindexManager') as mock_mgr_cls,
         ):
             mock_mgr = MagicMock()
@@ -1396,7 +1396,7 @@ class TestRunReindexDelegation:
 
         mock_mgr_cls.assert_called_once_with(
             backend=mock_service.graphiti,
-            embedder=mock_embedder_cls.return_value,
+            embedder=mock_build_embedder.return_value,
             expected_dim=1536,
         )
         assert result is mock_result

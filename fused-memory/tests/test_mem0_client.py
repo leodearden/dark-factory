@@ -19,6 +19,8 @@ from _qdrant_responses import missing_collection_404
 from _stub_qdrant_server import StubQdrantServer, stub_qdrant_server
 from mem0 import AsyncMemory
 from mem0.configs.base import MemoryConfig
+from mem0.configs.embeddings.base import BaseEmbedderConfig
+from mem0.embeddings.openai import OpenAIEmbedding
 from qdrant_client import QdrantClient
 from qdrant_client.http.exceptions import ResponseHandlingException, UnexpectedResponse
 
@@ -3408,11 +3410,15 @@ def mem0_built_from(monkeypatch) -> list[dict]:
     """Every config dict mem0 is built from, captured at mem0's own boundary.
 
     The recorder hands back a double whose ``add`` answers the way mem0's does,
-    so the public ``Mem0Backend.add`` runs end to end with no OpenAI.
+    and whose ``embedding_model`` is mem0's own OpenAI embedder, so the public
+    ``Mem0Backend.add`` runs end to end with no OpenAI.
     """
     captured: list[dict] = []
 
     class _BuiltInstance:
+        def __init__(self) -> None:
+            self.embedding_model = OpenAIEmbedding(BaseEmbedderConfig(api_key='test-key'))
+
         async def add(self, **kwargs):
             return {'results': [{'id': 'm1'}]}
 

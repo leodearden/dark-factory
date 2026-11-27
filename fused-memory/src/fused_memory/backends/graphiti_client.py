@@ -110,6 +110,7 @@ from fused_memory.backends.paged_read import (
 from fused_memory.backends.recent_episodes import read_recent_group_episodes
 from fused_memory.backends.relates_to_schema import ACTIVE_EDGE_PREDICATE, active_edge_filter
 from fused_memory.backends.sdk_client_lifecycle import close_wrapped_sdk_clients
+from fused_memory.backends.sdk_request_timeout import bounded_openai_embedder
 from fused_memory.backends.timeout_budget import await_within
 from fused_memory.config.env_precedence import warn_if_ambient_base_url_is_overridden
 from fused_memory.config.schema import FusedMemoryConfig, OpenAIProviderConfig
@@ -253,13 +254,14 @@ def build_embedder(cfg: FusedMemoryConfig) -> OpenAIEmbedder | None:
     provider = cfg.embedder.providers.openai
     if cfg.embedder.provider != 'openai' or provider is None or not provider.api_key:
         return None
-    embedder = OpenAIEmbedder(
-        config=OpenAIEmbedderConfig(
+    embedder = bounded_openai_embedder(
+        OpenAIEmbedderConfig(
             api_key=provider.api_key,
             embedding_model=cfg.embedder.model,
             base_url=provider.api_url,
             embedding_dim=cfg.embedder.dimensions,
-        )
+        ),
+        cfg.embedder.request_attempts,
     )
     logger.info(f'Graphiti embedder: {cfg.embedder.provider}/{cfg.embedder.model}')
     return embedder

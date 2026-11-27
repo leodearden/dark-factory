@@ -7,10 +7,13 @@ from contextlib import aclosing
 from typing import Any, TypeVar
 
 from mem0 import AsyncMemory
+from mem0.embeddings.openai import OpenAIEmbedding
 from qdrant_client import QdrantClient
 
+from fused_memory.backends.sdk_request_timeout import bounded_attempts
 from fused_memory.backends.timeout_budget import await_within, socket_timeout_outlasting
 from fused_memory.config.env_precedence import warn_if_ambient_base_url_is_overridden
+from fused_memory.config.request_attempts import RequestAttemptsConfig
 from fused_memory.config.schema import FusedMemoryConfig
 from fused_memory.models.scope import Scope
 from fused_memory.utils.mem0_content_keys import MEM0_TEXT_KEY, mem0_payload_text
@@ -231,6 +234,17 @@ def build_vector_store_client(qdrant_url: str, *, read_budget_s: float, write_bu
     return QdrantClient(url=qdrant_url, timeout=socket_timeout_outlasting(read_budget_s, write_budget_s))
 
 
+def _bound_embedder_attempts(instance: AsyncMemory, attempts: RequestAttemptsConfig) -> None:
+    """mem0 builds its embedder's ``OpenAI(api_key, base_url)`` with no timeout or retry option, so its client is the only seam.
+
+    with_options keeps mem0's own endpoint resolution; any other embedder class fails loudly rather than unbounded.
+    """
+    embedder = instance.embedding_model
+    if not isinstance(embedder, OpenAIEmbedding):
+        raise TypeError(f'mem0 built a {type(embedder).__name__} embedder; only an OpenAIEmbedding can be bounded')
+    embedder.client = embedder.client.with_options(**bounded_attempts(attempts))
+
+
 class Mem0Backend:
     """Lazily creates AsyncMemory instances keyed by project_id.
 
@@ -405,6 +419,7 @@ class Mem0Backend:
         instance = await self._timed_write(asyncio.to_thread(AsyncMemory.from_config, config_dict), 'create_instance')
         if client is not self._vector_store_client:
             return await self._create_instance(scope)
+        _bound_embedder_attempts(instance, self.config.embedder.request_attempts)
         self._instances[scope.project_id] = instance
         logger.info(f'Mem0 instance created for project {scope.project_id} (collection: {collection_name})')
         return instance

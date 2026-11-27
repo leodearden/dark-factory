@@ -18,6 +18,12 @@ A plain importable module, not a conftest fixture, following the
 
 Binds 127.0.0.1 on port 0 (ephemeral) — never a fixed port, so ``-n auto``
 xdist workers cannot collide.
+
+Two opt-in failure modes, switchable on a live server: :meth:`MockOpenAIServer.stall`
+withholds any response, and :meth:`MockOpenAIServer.trickle` writes a valid
+response one small chunk at a time.  Both wait on
+:attr:`MockOpenAIServer.release_event` rather than sleeping, as
+``_stub_qdrant_server.py`` does, so no handler thread outlives the server.
 """
 
 from __future__ import annotations
@@ -26,13 +32,18 @@ import json
 import threading
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler
 from typing import Any
+
+from _quiet_http_server import QuietHTTPServer
 
 CannedResponse = tuple[int, dict[str, Any]] | tuple[int, dict[str, Any], Mapping[str, str]]
 """``(status, body)`` or ``(status, body, extra_headers)``."""
 
 _Canned = tuple[int, dict[str, Any], Mapping[str, str]]
+
+#: The bytes a trickled response writes per ``interval_s``.
+TRICKLE_CHUNK_BYTES = 64
 
 # Long enough to survive graphiti's OpenAIEmbedder, which TRUNCATES the vector
 # to embedding_dim — a short vector would surface as a length mismatch and be
@@ -140,6 +151,10 @@ class MockOpenAIServer:
         self.embedding_len = DEFAULT_EMBEDDING_LEN
         self.served_models: list[str] = [DEFAULT_SERVED_MODEL]
         """The ids GET /models lists."""
+        self.release_event = threading.Event()
+        """Set it to end every pending and future stall or trickle gap at once."""
+        self._stalls: dict[str, int | None] = {}
+        self._trickles: dict[str, float] = {}
 
     @property
     def base_url(self) -> str:
@@ -176,7 +191,39 @@ class MockOpenAIServer:
         with self._lock:
             self._responses[path_suffix] = canned
 
+    def stall(self, path_suffix: str, *, first: int | None = None) -> None:
+        """Send no response at all to the next ``first`` requests to ``path_suffix``.
+
+        ``first=None`` stalls every request.  A stalled request is still recorded.
+        """
+        with self._lock:
+            self._stalls[path_suffix] = first
+
+    def trickle(self, path_suffix: str, *, interval_s: float) -> None:
+        """Answer requests to ``path_suffix`` in full, one small chunk per ``interval_s``."""
+        with self._lock:
+            self._trickles[path_suffix] = interval_s
+
     # -- internals used by the handler --
+
+    def _take_stall(self, path: str) -> bool:
+        with self._lock:
+            for suffix, remaining in self._stalls.items():
+                if not path.endswith(suffix):
+                    continue
+                if remaining is None:
+                    return True
+                if remaining > 0:
+                    self._stalls[suffix] = remaining - 1
+                    return True
+        return False
+
+    def _trickle_interval(self, path: str) -> float | None:
+        with self._lock:
+            for suffix, interval_s in self._trickles.items():
+                if path.endswith(suffix):
+                    return interval_s
+        return None
 
     def _record(self, entry: dict[str, Any]) -> None:
         with self._lock:
@@ -207,7 +254,22 @@ def _make_handler(state: MockOpenAIServer) -> type[BaseHTTPRequestHandler]:
             for name, value in (extra_headers or {}).items():
                 self.send_header(name, value)
             self.end_headers()
-            self.wfile.write(payload)
+            interval_s = state._trickle_interval(self.path)
+            if interval_s is None:
+                self.wfile.write(payload)
+                return
+            for start in range(0, len(payload), TRICKLE_CHUNK_BYTES):
+                if start:
+                    state.release_event.wait(interval_s)
+                self.wfile.write(payload[start:start + TRICKLE_CHUNK_BYTES])
+
+        def _stalled(self) -> bool:
+            """Withhold any response until the server is released, then hang up."""
+            if not state._take_stall(self.path):
+                return False
+            state.release_event.wait()
+            self.close_connection = True
+            return True
 
         def do_GET(self) -> None:  # stdlib naming
             state._record({
@@ -216,6 +278,8 @@ def _make_handler(state: MockOpenAIServer) -> type[BaseHTTPRequestHandler]:
                 'headers': dict(self.headers),
                 'json_body': None,
             })
+            if self._stalled():
+                return
 
             canned = state._canned(self.path)
             if canned is not None:
@@ -242,6 +306,8 @@ def _make_handler(state: MockOpenAIServer) -> type[BaseHTTPRequestHandler]:
                 'headers': dict(self.headers),
                 'json_body': json_body,
             })
+            if self._stalled():
+                return
 
             canned = state._canned(self.path)
             if canned is not None:
@@ -275,16 +341,15 @@ def mock_openai_server() -> Iterator[MockOpenAIServer]:
     # free port and then rebinding it would be a TOCTOU race against any other
     # process (or xdist worker) on the box.
     state = MockOpenAIServer('127.0.0.1', 0)
-    httpd = ThreadingHTTPServer(('127.0.0.1', 0), _make_handler(state))
+    httpd = QuietHTTPServer(('127.0.0.1', 0), _make_handler(state))
     state.host, state.port = str(httpd.server_address[0]), int(httpd.server_address[1])
-    # Don't let a still-open client connection block shutdown().
-    httpd.daemon_threads = True
 
     thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     thread.start()
     try:
         yield state
     finally:
+        state.release_event.set()
         httpd.shutdown()
         httpd.server_close()
         thread.join(timeout=5)
