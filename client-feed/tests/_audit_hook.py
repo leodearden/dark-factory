@@ -1,4 +1,4 @@
-"""A recorder of the process's file and database opens, directory listings, filesystem mutations, socket connects and spawns, from every thread.
+"""A recorder of the process's file and database opens, directory listings, filesystem mutations, socket connects, spawns and thread starts, from every thread.
 
 B1 (plans/client-feed-prd.md §8) confines the publisher with it: every effect of a pass lies under its project root,
 its out and in dirs and its policy, or in the interpreter. B30 (§14.5) scopes the filer with it: every effect of a
@@ -45,7 +45,9 @@ _SPAWNS: Final = frozenset({
     'os.fork',
     'os.forkpty',
 })
-_RECORDED: Final = frozenset({_OPEN, _CONNECT, _DATABASE, *_LISTINGS, *_MUTATIONS, *_SPAWNS})
+# CPython <=3.12 raises the first from Thread.start, 3.13+ the second.
+_THREAD_STARTS: Final = frozenset({'_thread.start_new_thread', '_thread.start_joinable_thread'})
+_RECORDED: Final = frozenset({_OPEN, _CONNECT, _DATABASE, *_LISTINGS, *_MUTATIONS, *_SPAWNS, *_THREAD_STARTS})
 _BYTECODE_CACHE: Final = '__pycache__'
 _URI_SCHEME: Final = 'file:'
 _PATHLESS_DATABASES: Final = frozenset({'', ':memory:'})
@@ -97,6 +99,14 @@ class Spawned:
     target: str | None
     cwd: Path | None = None
     args: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class ThreadStarted:
+    """A new thread; `target` is the repr of the callable it runs, which for a threading.Thread names the Thread."""
+
+    event: str
+    target: str
 
 
 def _hook(event: str, args: tuple[Any, ...]) -> None:
@@ -176,6 +186,10 @@ def _spawned(event: str, args: tuple[Any, ...]) -> Spawned:
     return Spawned(spawned.event, spawned.target, cwd=_path(cwd), args=_argv(argv))
 
 
+def _thread_started(event: str, args: tuple[Any, ...]) -> ThreadStarted:
+    return ThreadStarted(event, repr(args[0]) if args else '')
+
+
 def _ca_bundles() -> list[str]:
     paths = ssl.get_default_verify_paths()
     bundles = [path for path in (paths.cafile, paths.capath) if path]
@@ -245,6 +259,10 @@ class AuditRecord:
     def spawns(self) -> tuple[Spawned, ...]:
         return tuple(_spawned(event, args) for event, args in self._raw() if event in _SPAWNS)
 
+    @property
+    def thread_starts(self) -> tuple[ThreadStarted, ...]:
+        return tuple(_thread_started(event, args) for event, args in self._raw() if event in _THREAD_STARTS)
+
     def opens_outside(self, roots: tuple[Path, ...]) -> tuple[Opened, ...]:
         """Leaves out reads under `roots` and writes into a bytecode cache under them; any other write is kept."""
         resolved = _resolved(roots)
@@ -283,7 +301,7 @@ def _resolved(roots: tuple[Path, ...]) -> tuple[Path, ...]:
 
 @contextmanager
 def recording() -> Iterator[AuditRecord]:
-    """Record every open, database open, listing, mutation, connect and spawn raised in this process until the block exits."""
+    """Record every open, database open, listing, mutation, connect, spawn and thread start raised in this process until the block exits."""
     global _active
     _install()
     events: list[tuple[str, tuple[Any, ...]]] = []
