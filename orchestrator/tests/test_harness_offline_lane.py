@@ -98,7 +98,7 @@ class TestOfflineLaneWiring:
     async def test_the_harness_built_lane_is_stopping_once_the_harness_drains(
         self, harness: Harness
     ):
-        """The worker's stop predicate tracks the drain flag ``Harness.run``'s finally sets on SIGTERM (task 11974)."""
+        """The worker's stop predicate is ``Harness.draining``, which ``Harness.run``'s finally sets on SIGTERM (task 11974)."""
         harness.config.git.offline_lane_enabled = True
         harness.config.git.persistent_offline_deep_worktree = True
 
@@ -107,9 +107,9 @@ class TestOfflineLaneWiring:
         try:
             worker = harness._offline_lane_worker
             assert isinstance(worker, OfflineLaneWorker)
-            assert worker.stopping() is False
+            assert (worker.stopping(), harness.draining) == (False, False)
             harness._draining = True
-            assert worker.stopping() is True
+            assert (worker.stopping(), harness.draining) == (True, True)
         finally:
             await harness._stop_offline_lane()
 
