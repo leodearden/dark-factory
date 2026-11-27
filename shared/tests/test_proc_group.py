@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import NamedTuple, cast
 
 import pytest
-from _synthetic_proc import synthetic_stat_line
+from _synthetic_proc import real_proc_view, synthetic_stat_line
 
 import shared.proc_group as proc_group_module
 from shared.proc_group import (
@@ -1423,15 +1423,28 @@ class TestScanProcessGroupsUnderPath:
     worktree of a *previous* orchestrator run.  Like snapshot_process_group it
     must never raise, even on vanished/permission-denied pids.
 
-    Every test here pays for a walk of the real /proc, whose cost scales with
-    the host's process count (task 4520). So each makes one walk and keeps
-    only what a fabricated /proc cannot show; the rest belongs in
+    These tests read real kernel-written per-pid entries, but only for the
+    children they spawn, through :func:`_synthetic_proc.real_proc_view`.
+    ``test_scan_never_raises_on_real_proc`` is the one whole-host walk. What a
+    fabricated /proc can show belongs in
     :class:`TestScanProcessGroupsAgainstASyntheticProc`.
     """
 
+    @pytest.fixture
+    def restrict_proc_to(self, tmp_path_factory, monkeypatch):
+        """Point the scan at a /proc holding only the given pids' real entries."""
+
+        def restrict(*pids: int) -> None:
+            view = real_proc_view(tmp_path_factory.mktemp('proc') / 'proc', pids)
+            monkeypatch.setattr('shared.proc_group._PROC_ROOT', view)
+
+        return restrict
+
     @pytest.mark.asyncio
     @pytest.mark.timeout(15)
-    async def test_scan_matches_cwd_under_root_and_respects_boundary(self, tmp_path):
+    async def test_scan_matches_cwd_under_root_and_respects_boundary(
+        self, tmp_path, restrict_proc_to
+    ):
         """A process whose cwd is under root is returned; sibling/outside are not.
 
         Three real subprocesses:
@@ -1455,6 +1468,7 @@ class TestScanProcessGroupsUnderPath:
         sib = await _spawn_sleeper_in(sibling)
         out = await _spawn_sleeper_in(outside)
         try:
+            restrict_proc_to(under.pid, sib.pid, out.pid)
             found = scan_process_groups_under_path(root)
             assert under.pid in found, (
                 f'expected pgid {under.pid} (cwd under {root}) in {found}'
@@ -1474,16 +1488,8 @@ class TestScanProcessGroupsUnderPath:
 
     @pytest.mark.asyncio
     @pytest.mark.timeout(15)
-    async def test_scan_respects_exclude_pgids(self, tmp_path):
+    async def test_scan_respects_exclude_pgids(self, tmp_path, restrict_proc_to):
         """END TO END: a REAL pgid under root is dropped, its neighbour kept.
-
-        ONE /proc walk, deliberately (task 4520). Each walk reads every live
-        pid on the host — 1100+ pids and 23.3 MB of ``maps`` when this was
-        measured — so its cost scales with the machine's process count and CPU
-        contention, and this was the only test in the class paying for that
-        twice. It is the file's slowest item against a 15s budget that (per
-        pytest-timeout's ``func_only=False``) also covers setup and teardown.
-        The bound is untouched; the WORK is halved.
 
         TWO sleepers, ONE walk — and the second one is load-bearing, not
         decoration. ``scan_process_groups_under_path`` wraps the entire walk in
@@ -1492,8 +1498,7 @@ class TestScanProcessGroupsUnderPath:
         a stat-format change, a ``_PROC_ROOT`` mishap or a permissions change
         would blow the walk up, get laundered into an empty set, and turn this
         test GREEN. The unexcluded ``keeper`` is the witness that separates
-        EXCLUDED from NEVER FOUND AT ALL. It costs a fork, not a second walk;
-        the walk count is the thing this test exists to keep at one.
+        EXCLUDED from NEVER FOUND AT ALL.
 
         The coverage that a single walk cannot carry is carried elsewhere,
         against the identical helper:
@@ -1503,8 +1508,8 @@ class TestScanProcessGroupsUnderPath:
         * the cwd == root EQUALITY branch, selective exclusion across several
           groups, and same-pgrp de-duplication —
           :class:`TestScanProcessGroupsAgainstASyntheticProc`, exhaustively and
-          deterministically, because it controls the whole pid population,
-          which a walk over 1100 uncontrolled pids cannot.
+          deterministically, because it controls every pid's content, which a
+          walk over live processes cannot.
 
         What only a REAL walk can prove, and what this test therefore keeps:
         genuinely live process groups under root are told apart — one named in
@@ -1517,6 +1522,7 @@ class TestScanProcessGroupsUnderPath:
         excluded = await _spawn_sleeper_in(root)
         keeper = await _spawn_sleeper_in(keeper_cwd)
         try:
+            restrict_proc_to(excluded.pid, keeper.pid)
             found = scan_process_groups_under_path(
                 root, exclude_pgids=frozenset({excluded.pid})
             )
@@ -1536,7 +1542,9 @@ class TestScanProcessGroupsUnderPath:
                     await p.wait()
 
     @pytest.mark.timeout(15)
-    def test_a_pid_with_an_undecodable_mmapd_path_under_root_is_still_found(self, tmp_path):
+    def test_a_pid_with_an_undecodable_mmapd_path_under_root_is_still_found(
+        self, tmp_path, restrict_proc_to
+    ):
         """maps pathnames are raw bytes; a non-UTF-8 one must not empty the scan.
 
         The child maps the file through libc directly (``mmap.mmap`` would
@@ -1586,6 +1594,7 @@ class TestScanProcessGroupsUnderPath:
                 assert not [t for t in fd_targets if t.startswith(f'{root}{os.sep}')], (
                     fd_targets
                 )
+                restrict_proc_to(pgid)
                 found = scan_process_groups_under_path(root)
                 assert pgid in found, (
                     f'pgid {pgid} is missing from {found}; its only reference '
@@ -1594,46 +1603,46 @@ class TestScanProcessGroupsUnderPath:
             finally:
                 _kill_group(pgid)
 
-    def test_scan_never_raises_on_unreadable_pid(self, monkeypatch, tmp_path):
-        """A readlink that raises (vanished / permission-denied pid) is swallowed.
-
-        Force every ``os.readlink`` to raise ProcessLookupError, simulating a
-        pid that vanishes mid-walk.  The scan must still return a set and never
-        propagate the error (mirrors snapshot_process_group's never-raise
-        invariant).
-        """
-        def boom(*_a, **_k):
-            raise ProcessLookupError('pid vanished mid-scan')
-
-        monkeypatch.setattr('shared.proc_group.os.readlink', boom)
-        result = scan_process_groups_under_path(tmp_path / '_merge-verify')
-        assert isinstance(result, set)
-
     def test_scan_never_raises_on_real_proc(self, tmp_path):
-        """Scanning the real /proc never raises and returns a set.
+        """A whole-host walk swallows every per-pid failure and still finds its child.
 
         On a non-root runner, ``/proc/1/cwd`` (and other root-owned pids) raise
-        PermissionError, and pids vanish mid-walk (ProcessLookupError); the scan
-        must swallow both.  A fresh, never-created root matches nothing.
+        PermissionError, and pids vanish mid-walk (ProcessLookupError). The
+        public wrapper launders any raise into an empty set, so the witness is
+        a positive find: one sleeper whose cwd is a fresh root, picked out of
+        every pid on the host.
         """
-        result = scan_process_groups_under_path(tmp_path / 'never-created')
-        assert isinstance(result, set)
-        assert result == set()
+        root = tmp_path.resolve() / '_merge-verify'
+        root.mkdir()
+        with subprocess.Popen(
+            ['sleep', str(WHOLE_TREE_SCAN_TEST_TIMEOUT)],
+            cwd=root,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        ) as sleeper:
+            try:
+                found = scan_process_groups_under_path(root)
+                assert found == {sleeper.pid}, (
+                    f'expected exactly the sleeper {sleeper.pid} (cwd {root}); '
+                    f'got {found}. An empty set means a per-pid error escaped '
+                    f'the walk and the wrapper laundered it'
+                )
+            finally:
+                _kill_group(sleeper.pid)
 
 
 class TestScanProcessGroupsAgainstASyntheticProc:
     """The scan's branches, pinned against a FABRICATED /proc — no real walk.
 
-    A real-/proc walk cannot control its pid population: it reads 1100+ live
-    pids (23.3 MB of ``maps`` alone), it cannot assert that two pids sharing a
-    pgrp are de-duplicated, and it costs 0.8-1.5s that scales with host load —
-    which is how the two-walk ``test_scan_respects_exclude_pgids`` came to sit
-    against a 15s budget with thin headroom (task 4520). A fabricated tree
-    controls every pid, covers strictly more branches, and costs microseconds.
+    A fabricated tree controls every pid's CONTENT, which a walk over live
+    processes cannot: two pids sharing one pgrp, an unreadable or malformed
+    stat, a cwd equal to root.
 
     Points the module at the fake tree via ``shared.proc_group._PROC_ROOT``,
     the same monkeypatch-module-internals idiom
-    ``test_scan_never_raises_on_unreadable_pid`` (``os.readlink``) and
+    ``test_a_raising_readlink_skips_cwd_and_fds_but_maps_still_match``
+    (``os.readlink``) and
     ``test_reap_refuses_unsafe_pgids`` (``os.killpg``) already use — rather
     than adding a test-only parameter to the public function.
     """
@@ -1817,6 +1826,50 @@ class TestScanProcessGroupsAgainstASyntheticProc:
         monkeypatch.setattr('shared.proc_group._PROC_ROOT', proc_root)
 
         assert scan_process_groups_under_path(os.fsdecode(root_bytes)) == {900}
+
+    @pytest.mark.parametrize(
+        'error',
+        [
+            pytest.param(ProcessLookupError, id='vanished-pid'),
+            pytest.param(PermissionError, id='permission-denied-pid'),
+        ],
+    )
+    def test_a_raising_readlink_skips_cwd_and_fds_but_maps_still_match(
+        self, tmp_path, monkeypatch, error
+    ):
+        """A raising readlink is swallowed and the walk goes on to maps.
+
+        Pid 100 references root through cwd, an fd and maps; pid 200 through
+        cwd alone. With every readlink raising, only maps can find 100 and
+        nothing can find 200, so ``{100}`` shows both the swallow-and-continue
+        and that the patch is in force. A raise would be laundered into
+        ``set()``.
+        """
+        proc_root = tmp_path / 'proc'
+        root = tmp_path.resolve() / '_merge-verify'
+        root.mkdir()
+        mapped = proc_root / '100'
+        (mapped / 'fd').mkdir(parents=True)
+        (mapped / 'stat').write_text(synthetic_stat_line(100, 100))
+        (mapped / 'cwd').symlink_to(root)
+        (mapped / 'fd' / '3').symlink_to(root / 'lock')
+        (mapped / 'maps').write_bytes(
+            b'7f0a1d000000-7f0a1d002000 r-xp 00000000 08:01 4242       '
+            + os.fsencode(root / 'lib.so')
+            + b'\n'
+        )
+        cwd_only = proc_root / '200'
+        cwd_only.mkdir()
+        (cwd_only / 'stat').write_text(synthetic_stat_line(200, 200))
+        (cwd_only / 'cwd').symlink_to(root)
+
+        def raising_readlink(*_args, **_kwargs):
+            raise error('readlink refused mid-scan')
+
+        monkeypatch.setattr('shared.proc_group._PROC_ROOT', proc_root)
+        monkeypatch.setattr('shared.proc_group.os.readlink', raising_readlink)
+
+        assert scan_process_groups_under_path(root) == {100}
 
     def test_a_missing_proc_root_yields_an_empty_set(self, tmp_path, monkeypatch):
         """The `not proc_dir.exists()` branch — an empty result, not a raise.
