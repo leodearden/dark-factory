@@ -3,6 +3,8 @@
 PRD ``plans/per-consumer-resource-recording-prd.md`` C4 and leaf 4. The pure
 surface (record, invariants, the reading map, the capture decision) is tested
 over hand-filled capture directories holding kernel-format fixture files.
+The in-scope script (``CommandCapture.wrap``) is run for real, unscoped, against
+a fake cgroup root that mirrors this process's own unified cgroup path.
 """
 
 from __future__ import annotations
@@ -10,12 +12,23 @@ from __future__ import annotations
 import dataclasses
 import json
 import socket
+import subprocess
 import tempfile
 from pathlib import Path
 
 import pytest
-from shared.cgroup_stats import CgroupReading, read_cgroup
+from shared.cgroup_stats import (
+    CPU_STAT,
+    MEMORY_EVENTS,
+    MEMORY_PEAK,
+    SWAP_PEAK,
+    CgroupReading,
+    PressureResource,
+    read_cgroup,
+)
+from shared.proc_group import unified_cgroup_path
 
+from orchestrator.scope_launch_handshake import ScopeLaunchHandshake
 from orchestrator.verify_command_resources import (
     Capture,
     CommandCapture,
@@ -501,3 +514,141 @@ class TestAllocateCommandCapture:
 
         assert record.capture is Capture.UNAVAILABLE
         assert 'No space left on device' in record.capture_reason
+
+
+CAPTURED_FILES = frozenset(
+    {CPU_STAT, MEMORY_PEAK, SWAP_PEAK, MEMORY_EVENTS, *(r.file_name for r in PressureResource)}
+)
+
+
+def _own_unified_line() -> str:
+    lines = Path('/proc/self/cgroup').read_text().splitlines()
+    return next(line for line in lines if line.startswith('0::'))
+
+
+class _FakeScope:
+    """A fake cgroup root whose directory at this process's own cgroup holds fixture files."""
+
+    def __init__(self, tmp_path: Path, files: dict[str, str] | None = None) -> None:
+        self.root = tmp_path / 'sysfs'
+        unified = unified_cgroup_path(_own_unified_line())
+        assert unified is not None
+        self.unit = unified.rsplit('/', 1)[-1]
+        self.directory = _write(
+            self.root / unified.lstrip('/'), SCOPE_FILES if files is None else files
+        )
+
+    def capture(self, tmp_path: Path) -> CommandCapture:
+        directory = tmp_path / 'capture'
+        directory.mkdir()
+        capture = CommandCapture(directory, cgroup_root=self.root)
+        capture.launched(self.unit)
+        return capture
+
+
+def _run_payload(cmd: str) -> tuple[subprocess.CompletedProcess[str], bool]:
+    with ScopeLaunchHandshake() as handshake:
+        try:
+            proc = subprocess.run(
+                ['/bin/bash', '-c', handshake.payload(cmd)],
+                pass_fds=handshake.pass_fds,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=30,
+            )
+        finally:
+            handshake.release_writer()
+        return proc, handshake.launcher_exited_before_exec()
+
+
+def _outcome(proc: subprocess.CompletedProcess[str]) -> tuple[int, str, str]:
+    return proc.returncode, proc.stdout, proc.stderr
+
+
+HEREDOC_CMD = "cat <<'EOF'\nline one\n  $NOT_EXPANDED\nEOF\necho after"
+
+
+class TestWrapRunsTheCommandUnchanged:
+    @pytest.mark.parametrize(
+        'cmd',
+        ['echo out; echo err >&2; exit 3', 'echo x; exec true', 'exit 0', HEREDOC_CMD],
+    )
+    def test_output_and_rc_are_those_of_the_unwrapped_payload(self, tmp_path, cmd):
+        capture = _FakeScope(tmp_path).capture(tmp_path)
+
+        wrapped, launcher_exited_before_exec = _run_payload(capture.wrap(cmd))
+        bare, _ = _run_payload(cmd)
+
+        assert _outcome(wrapped) == _outcome(bare)
+        assert launcher_exited_before_exec is False
+
+    @pytest.mark.parametrize('cmd', ['echo bye; exit 5', 'exec true'])
+    def test_exit_and_exec_cannot_skip_the_capture(self, tmp_path, cmd):
+        scope = _FakeScope(tmp_path)
+        capture = scope.capture(tmp_path)
+        assert capture.directory is not None
+
+        proc, _ = _run_payload(capture.wrap(cmd))
+
+        assert proc.returncode == (5 if cmd.startswith('echo') else 0)
+        assert (capture.directory / 'complete').exists()
+        assert (capture.directory / CPU_STAT).read_bytes() == (
+            scope.directory / CPU_STAT
+        ).read_bytes()
+        assert (capture.directory / 'cgroup').read_text() == _own_unified_line() + '\n'
+        assert capture.record(**IDENTITY).capture is Capture.EXIT
+
+    def test_a_syntax_error_still_proves_the_launch_and_reads_unavailable(self, tmp_path):
+        capture = _FakeScope(tmp_path).capture(tmp_path)
+        assert capture.directory is not None
+
+        proc, launcher_exited_before_exec = _run_payload(capture.wrap('if then fi'))
+
+        assert proc.returncode == 2
+        assert 'syntax error' in proc.stderr
+        assert launcher_exited_before_exec is False
+        assert not (capture.directory / 'complete').exists()
+        assert capture.record(**IDENTITY).capture is Capture.UNAVAILABLE
+
+    def test_an_unreadable_sysfs_keeps_the_command_and_reads_unavailable(self, tmp_path):
+        scope = _FakeScope(tmp_path, files={})
+        capture = scope.capture(tmp_path)
+        assert capture.directory is not None
+        cmd = 'echo out; echo err >&2; exit 4'
+
+        wrapped, _ = _run_payload(capture.wrap(cmd))
+        bare, _ = _run_payload(cmd)
+
+        assert _outcome(wrapped) == _outcome(bare)
+        assert (capture.directory / 'complete').exists()
+        record = capture.record(**IDENTITY)
+        assert record.capture is Capture.UNAVAILABLE
+        assert CPU_STAT in record.capture_reason
+
+
+class TestWrapScriptText:
+    def test_it_starts_no_python(self, tmp_path):
+        capture = _FakeScope(tmp_path).capture(tmp_path)
+        assert 'python' not in capture.wrap('true')
+
+    def test_it_copies_exactly_the_files_named_by_the_shared_constants(self, tmp_path):
+        scope = _FakeScope(tmp_path, files={**SCOPE_FILES, 'memory.stat': 'anon 1\n'})
+        capture = scope.capture(tmp_path)
+        assert capture.directory is not None
+
+        _run_payload(capture.wrap('true'))
+
+        assert frozenset(p.name for p in capture.directory.iterdir()) == (
+            CAPTURED_FILES | {'cgroup', 'complete'}
+        )
+
+    def test_the_command_stays_on_payload_line_two(self, tmp_path):
+        capture = _FakeScope(tmp_path).capture(tmp_path)
+
+        wrapped, _ = _run_payload(capture.wrap('nosuchcommand_xyz'))
+        bare, _ = _run_payload('nosuchcommand_xyz')
+
+        assert 'line 2:' in bare.stderr
+        assert wrapped.stderr == bare.stderr
+        assert wrapped.returncode == bare.returncode == 127
