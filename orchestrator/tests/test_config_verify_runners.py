@@ -3,6 +3,7 @@
 import json
 import re
 import textwrap
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 import pytest
@@ -82,14 +83,14 @@ INLINE_LAPTOP = [
 ]
 
 
-def _runner(name: str, *, enabled: bool = True) -> dict[str, object]:
-    return {
-        'name': name,
-        'ssh_host': f'{name}-ssh',
-        'git_remote': f'{name}-remote',
-        'df_checkout_path': '/df',
-        'enabled': enabled,
-    }
+def _runner(name: str, *, enabled: bool = True) -> VerifyRunnerConfig:
+    return VerifyRunnerConfig(
+        name=name,
+        ssh_host=f'{name}-ssh',
+        git_remote=f'{name}-remote',
+        df_checkout_path='/df',
+        enabled=enabled,
+    )
 
 
 class TestRunnerNames:
@@ -111,7 +112,7 @@ class TestRunnerNames:
         assert config.verify_runners == original
 
 
-def _write_yaml(tmp_path: Path, name: str, runners: list[dict[str, object]] | None = None) -> Path:
+def _write_yaml(tmp_path: Path, name: str, runners: Sequence[Mapping[str, object]] | None = None) -> Path:
     document: dict[str, object] = {'fused_memory': {'project_id': PROJECT}}
     if runners is not None:
         document['verify_runners'] = runners
@@ -131,7 +132,7 @@ def _point_at_an_absent_roster(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv(ROSTER_FILE_ENV, str(tmp_path / 'absent-roster.yaml'))
 
 
-def _declare_inline(source: str, tmp_path: Path, monkeypatch, runners: list[dict[str, object]]) -> Path:
+def _declare_inline(source: str, tmp_path: Path, monkeypatch, runners: Sequence[Mapping[str, object]]) -> Path:
     """Declare *runners* inline through *source* and return the yaml path to load."""
     if source == 'yaml':
         monkeypatch.delenv('ORCH_VERIFY_RUNNERS', raising=False)
@@ -163,7 +164,7 @@ class TestRosterFileIsRead:
 
         config = load_config(_write_yaml(tmp_path, 'inline.yaml', INLINE_LAPTOP))
 
-        assert config.verify_runners == [VerifyRunnerConfig(**runner) for runner in INLINE_LAPTOP]
+        assert config.verify_runners == [VerifyRunnerConfig.model_validate(runner) for runner in INLINE_LAPTOP]
 
     def test_a_roster_naming_only_other_projects_changes_nothing(self, tmp_path, monkeypatch):
         _write_roster(tmp_path, monkeypatch, ROSTER_OF_OTHER_PROJECTS)
@@ -171,7 +172,7 @@ class TestRosterFileIsRead:
 
         config = load_config(_write_yaml(tmp_path, 'inline.yaml', INLINE_LAPTOP))
 
-        assert config.verify_runners == [VerifyRunnerConfig(**runner) for runner in INLINE_LAPTOP]
+        assert config.verify_runners == [VerifyRunnerConfig.model_validate(runner) for runner in INLINE_LAPTOP]
 
     def test_an_empty_environment_list_lets_the_roster_supply_the_runners(self, tmp_path, monkeypatch):
         monkeypatch.setenv('ORCH_VERIFY_RUNNERS', '[]')
@@ -180,7 +181,7 @@ class TestRosterFileIsRead:
         config = load_config(_write_yaml(tmp_path, 'shadowed-inline.yaml', INLINE_LAPTOP))
 
         assert config.verify_runners == [
-            VerifyRunnerConfig(**runner) for runner in INLINE_EQUIVALENT_OF_ROSTER
+            VerifyRunnerConfig.model_validate(runner) for runner in INLINE_EQUIVALENT_OF_ROSTER
         ]
 
     @pytest.mark.parametrize(
