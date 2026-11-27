@@ -22,6 +22,9 @@ import pytest
 from cli_subprocess_timeout import cli_timeout_from_env
 from committed_git_repo import committed_repo
 from git_env import scrubbed_git_env
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 SCRIPT = Path(__file__).parent.parent / 'routing_experiment_arm.sh'
 BASH = shutil.which('bash') or '/bin/bash'
