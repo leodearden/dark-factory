@@ -189,23 +189,51 @@ to the study session.
 Count, per arm, the reviewer attempts a configured ceiling ended. Since task
 11912 every panel records them in
 `orchestrator/src/orchestrator/evals/reviewer_trial/runner.py::PanelRunResult`'s
-`ceiling_kills`. Panels written earlier record none, so their ERROR reviews
-count under `none`. It spends nothing:
+`ceiling_kills`. A campaign resumed with other options writes its keyed panels
+beside the old ones, and the keyless D6/D7 panels stay in place (§1, item 3),
+so one `$RESULTS` can hold several invocations' panels of one cell. The snippet
+therefore counts one invocation. Pass it the `--max-turns` and
+`--production-budget` that invocation ran at, which are 90 and 12 when it
+passed neither. It counts a panel only when the panel's run key records that
+turn cap and the budgets
+`orchestrator/src/orchestrator/evals/reviewer_trial/variants.py::panel_budgets`
+gives its arm. It skips, and counts as skipped, every keyless panel, every
+keyed panel from before task 11912 (whose key records no budgets) and every
+panel of another turn cap or budget. Keyless panels record no ceilings anyway.
+Panels with the same turn cap and budgets but another price table or usage
+gate are still counted. So a campaign whose counts must stand alone runs into a
+fresh `--results-dir`. The snippet spends nothing:
 
 ```bash
-uv run python - "$RESULTS" <<'PY'
+uv run python - "$RESULTS" 90 12 <<'PY'
 import json
 import sys
 from collections import Counter
 from pathlib import Path
 from shared.cost_store import CapReason
+from orchestrator.agents.review_briefing import ReviewBriefing
 from orchestrator.evals.reviewer_trial.runner import PanelRunResult
+from orchestrator.evals.reviewer_trial.variants import CAMPAIGN_VARIANTS, campaign_arms, panel_budgets
 
+results, turns, production_budget = Path(sys.argv[1]), int(sys.argv[2]), float(sys.argv[3])
+wanted = {
+    arm.name: (turns, panel_budgets(arm, production_budget))
+    for arm in campaign_arms(list(CAMPAIGN_VARIANTS.values()), list(ReviewBriefing))
+}
 arms: set[str] = set()
+skipped = 0
 errors_by_ceiling: Counter[tuple[str, str]] = Counter()
 budget_kills: Counter[str] = Counter()
-for path in sorted(Path(sys.argv[1]).glob('trial-*/*.json')):
-    panel = PanelRunResult.from_dict(json.loads(path.read_text()))
+for path in sorted(results.glob('trial-*/*.json')):
+    try:
+        panel = PanelRunResult.from_dict(json.loads(path.read_text()))
+    except KeyError:
+        skipped += 1
+        continue
+    key = panel.run_key
+    if key is None or (key.max_turns, key.reviewer_budgets_usd) != wanted.get(panel.variant_name):
+        skipped += 1
+        continue
     arms.add(panel.variant_name)
     for ceilings in panel.ceiling_kills.values():
         budget_kills[panel.variant_name] += ceilings.count(CapReason.BUDGET)
@@ -216,6 +244,7 @@ for path in sorted(Path(sys.argv[1]).glob('trial-*/*.json')):
 for arm in sorted(arms):
     split = {ceiling: errors_by_ceiling[arm, ceiling] for ceiling in ('budget', 'turns', 'none')}
     print(f'{arm}: ERROR reviews by last ceiling {split}; attempts a budget ended: {budget_kills[arm]}')
+print(f'skipped {skipped} panel(s): keyless, keyed before task 11912, or another invocation')
 PY
 ```
 
