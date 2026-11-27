@@ -534,7 +534,7 @@ class TestPostMergeVerify:
         assert verifier.verified == ['vd-1']
 
 
-def _recorded_per_call(dispatcher: VerifyDispatcher) -> list[dict[str, Any]]:
+def _recorded_per_call(dispatcher: VerifyDispatcher, monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
     """Each post_merge_verify call's per-call keywords, recorded on the way into the real one."""
     calls: list[dict[str, Any]] = []
     real = dispatcher.post_merge_verify
@@ -543,7 +543,7 @@ def _recorded_per_call(dispatcher: VerifyDispatcher) -> list[dict[str, Any]]:
         calls.append(per_call)
         return real(git_ops, req, merge_wt, **per_call)
 
-    dispatcher.post_merge_verify = recording  # type: ignore[method-assign]
+    monkeypatch.setattr(dispatcher, 'post_merge_verify', recording)
     return calls
 
 
@@ -551,18 +551,18 @@ def _recorded_per_call(dispatcher: VerifyDispatcher) -> list[dict[str, Any]]:
 class TestNarrowGateBase:
     """Task 5411: an in-flight verify offers the narrow gate its item's frozen merge-time base."""
 
-    async def test_a_local_verify_offers_the_items_base(self, scene: _Scene) -> None:
+    async def test_a_local_verify_offers_the_items_base(self, scene: _Scene, monkeypatch: pytest.MonkeyPatch) -> None:
         dispatcher = scene.dispatcher(FakeVerifier(passes()))
-        calls = _recorded_per_call(dispatcher)
+        calls = _recorded_per_call(dispatcher, monkeypatch)
         item = await scene.merged_item()
 
         await _verify(dispatcher, item, _local_lease())
 
         assert [call['narrow_gate_base'] for call in calls] == [item.base_sha]
 
-    async def test_a_remote_verify_offers_the_items_base(self, scene: _Scene) -> None:
+    async def test_a_remote_verify_offers_the_items_base(self, scene: _Scene, monkeypatch: pytest.MonkeyPatch) -> None:
         dispatcher = scene.dispatcher(FakeVerifier(passes()))
-        calls = _recorded_per_call(dispatcher)
+        calls = _recorded_per_call(dispatcher, monkeypatch)
         item = await scene.merged_item()
         lease = HostLease(name='laptop', runner=cast(Any, FakeRemoteRunner('laptop')), is_local=False)
 
@@ -570,9 +570,9 @@ class TestNarrowGateBase:
 
         assert [call['narrow_gate_base'] for call in calls] == [item.base_sha]
 
-    async def test_a_probe_base_relabels_attribution_but_not_the_gate_base(self, scene: _Scene) -> None:
+    async def test_a_probe_base_relabels_attribution_but_not_the_gate_base(self, scene: _Scene, monkeypatch: pytest.MonkeyPatch) -> None:
         dispatcher = scene.dispatcher(FakeVerifier(passes()))
-        calls = _recorded_per_call(dispatcher)
+        calls = _recorded_per_call(dispatcher, monkeypatch)
         item = await scene.merged_item()
         probe_base = 'e' * 40
 
@@ -583,9 +583,9 @@ class TestNarrowGateBase:
         [call] = calls
         assert (call['narrow_gate_base'], call['main_sha']) == (item.base_sha, probe_base)
 
-    async def test_a_gate_history_leg_offers_no_base(self, scene: _Scene) -> None:
+    async def test_a_gate_history_leg_offers_no_base(self, scene: _Scene, monkeypatch: pytest.MonkeyPatch) -> None:
         dispatcher = scene.dispatcher(FakeVerifier(passes()))
-        calls = _recorded_per_call(dispatcher)
+        calls = _recorded_per_call(dispatcher, monkeypatch)
         item = await scene.merged_item()
 
         await dispatcher.gate_history_leg(

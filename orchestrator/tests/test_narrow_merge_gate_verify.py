@@ -13,7 +13,7 @@ from _narrow_gate_fixtures import REGISTERED_MODULE
 from _narrow_gate_fixtures import SOURCE as _SOURCE
 
 from orchestrator.config import OrchestratorConfig, load_config
-from orchestrator.event_store import EventType
+from orchestrator.event_store import EventStore, EventType
 from orchestrator.narrow_gate_class import GateMiss, MergeGateResolution, MissReason
 from orchestrator.narrow_gate_plan import NarrowGateDecision
 from orchestrator.verify import VerifyResult, narrow_merge_gate_decision, run_scoped_verification
@@ -182,23 +182,12 @@ class TestNarrowMergeGateDecision:
         assert decision.resolution is MergeGateResolution.FULL
 
 
-class _RecordingEventStore:
-    def __init__(self) -> None:
-        self.events: list[tuple[Any, dict[str, Any]]] = []
-
-    def emit(self, event_type: Any, *, data: dict[str, Any] | None = None, **_kw: Any) -> None:
-        self.events.append((event_type, dict(data or {})))
-
-    def of(self, event_type: EventType) -> list[dict[str, Any]]:
-        return [data for kind, data in self.events if kind == event_type]
-
-
 class _Execution:
     """One merge-role run_scoped_verification over a merge, with every command recorded instead of run."""
 
-    def __init__(self) -> None:
+    def __init__(self, tmp_path: Path) -> None:
         self.calls: list[str] = []
-        self.events = _RecordingEventStore()
+        self.events = EventStore(tmp_path / 'runs.db', run_id='narrow-gate')
 
     async def _record(self, cmd: str, *_args: Any, **_kwargs: Any) -> tuple[int, str, bool]:
         self.calls.append(cmd)
@@ -210,12 +199,12 @@ class _Execution:
         with patch('orchestrator.verify._run_cmd', side_effect=self._record):
             return await run_scoped_verification(
                 worktree, config, list(config.module_configs_or_empty.values()), task_files,
-                role='merge', is_merge_verify=True, event_store=self.events,  # type: ignore[arg-type]
+                role='merge', is_merge_verify=True, event_store=self.events,
                 **narrow,
             )
 
     def escalations(self) -> list[str]:
-        return [data['resolution'] for data in self.events.of(EventType.trivial_pass_escalated)]
+        return [row['data']['resolution'] for row in self.events.fetch_events_by_type(EventType.trivial_pass_escalated)]
 
 
 def _invocation(cmd: VerifyCmd) -> tuple[object, ...]:
@@ -253,7 +242,7 @@ class TestNarrowGateExecution:
     ) -> None:
         worktree, config, decision = await _merged_decision(scene, files)
         assert decision.resolution is resolution and decision.plan is not None
-        execution = _Execution()
+        execution = _Execution(scene.tmp_path)
 
         result = await execution.verify(worktree, config, list(decision.changed_paths), narrow_gate=decision)
 
@@ -264,7 +253,7 @@ class TestNarrowGateExecution:
 
     async def test_without_a_decision_a_docs_merge_still_escalates_to_the_full_gate(self, scene: _Scene) -> None:
         worktree, config, decision = await _merged_decision(scene, {'docs/x.md': 'x\n'})
-        execution = _Execution()
+        execution = _Execution(scene.tmp_path)
 
         result = await execution.verify(worktree, config, list(decision.changed_paths))
 
@@ -273,7 +262,7 @@ class TestNarrowGateExecution:
 
     async def test_a_full_decision_is_not_narrowed_on(self, scene: _Scene) -> None:
         worktree, config, _decision = await _merged_decision(scene, {'docs/x.md': 'x\n'})
-        execution = _Execution()
+        execution = _Execution(scene.tmp_path)
 
         result = await execution.verify(
             worktree, config, ['docs/x.md'], narrow_gate=NarrowGateDecision.full(GateMiss(MissReason.DISABLED)),
