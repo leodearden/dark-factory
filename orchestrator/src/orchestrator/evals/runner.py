@@ -27,6 +27,7 @@ from orchestrator.config import (
     OrchestratorConfig,
     PriceEntry,
     RoutingConfig,
+    RoutingRule,
 )
 from orchestrator.git_ops import GitOps
 from orchestrator.implementer_brief_variant import execute_iteration_cap
@@ -136,12 +137,12 @@ def load_task(task_path: Path) -> dict:
     return task
 
 
-def _admit_claude_role_models(
-    routing: RoutingConfig,
+def _admitted_claude_role_models(
+    allowed_models: list[str],
     models: ModelsConfig,
     backends: BackendsConfig,
-) -> RoutingConfig:
-    """Return *routing* with every claude-backend role's model in ``allowed_models``.
+) -> list[str]:
+    """*allowed_models* extended with every claude-backend role's model.
 
     Restores, for one eval cell, the invariant
     ``orchestrator/config.py::OrchestratorConfig._validate_models_in_allowlist``
@@ -149,15 +150,44 @@ def _admit_claude_role_models(
     model outside the project allowlist (a proxied-endpoint implementer, a
     fable architect) is rejected by ``resolve_route``'s allowlist layer and
     the cell silently dispatches the role default under the candidate's label.
-    Only ``allowed_models`` changes; the ladder, ceilings and rules are kept.
     """
     claude_role_models = [
         getattr(models, role)
         for role in type(models).model_fields
         if getattr(backends, role, 'claude') == 'claude'
     ]
-    admitted = list(dict.fromkeys([*routing.allowed_models, *claude_role_models]))
-    return routing.model_copy(update={'allowed_models': admitted})
+    return list(dict.fromkeys([*allowed_models, *claude_role_models]))
+
+
+def _without_rule_models(rules: list[RoutingRule]) -> list[RoutingRule]:
+    """*rules* in the same order, each with ``set.model`` cleared and all else kept."""
+    return [
+        rule.model_copy(update={'set': rule.set.model_copy(update={'model': None})})
+        for rule in rules
+    ]
+
+
+def _cell_routing(
+    routing: RoutingConfig,
+    models: ModelsConfig,
+    backends: BackendsConfig,
+) -> RoutingConfig:
+    """The eval cell's routing: *models* is the only source of every role's model.
+
+    Every claude-backend role's model is admitted into ``allowed_models``, and
+    every policy rule loses its ``set.model``. A rule keeps its id, match, list
+    position and other set fields, so the cell resolves effort, budget and
+    max_turns exactly as production does (a large plan still gets max_turns
+    120), first-match-wins picks the same rule, and ``rule_id`` still records
+    it. A rule-set model would make the cell measure a model its label does
+    not name (large-plan-steps, large-plan-modules, retry-tier-up), and a
+    non-claude backend would receive the rule's literal unvalidated. See
+    ``orchestrator/tests/test_eval_driver.py::TestCellRoutingPinsEveryRoleModel``.
+    """
+    return routing.model_copy(update={
+        'allowed_models': _admitted_claude_role_models(routing.allowed_models, models, backends),
+        'rules': _without_rule_models(routing.rules),
+    })
 
 
 def build_eval_orch_config(
@@ -177,6 +207,7 @@ def build_eval_orch_config(
     via 594658fbe3 / 2c26a30bca).
     Only the implementer varies per eval config, and the implementer candidate's
     ``harness_variant`` becomes the cell's ``implementer_brief_variant``.
+    The cell's routing pins every role's model to these settings (see ``_cell_routing``).
 
     ``architect_config`` (eval-revival μ) drives the both-live end-to-end matrix
     /confirm runs (``run_end_to_end``): when supplied, the architect's
@@ -317,7 +348,7 @@ def build_eval_orch_config(
         'type_check_command': task.get('verify_commands', {}).get('typecheck', base.type_check_command),
         'env_overrides': config.env_overrides,
         'implementer_brief_variant': config.harness_variant,
-        'routing': _admit_claude_role_models(profiled.routing, models, backends),
+        'routing': _cell_routing(profiled.routing, models, backends),
     }
     # BUG 2a: pin the eval verify interpreter to the target's own
     # .python-version (via verify_env['UV_PYTHON']) so `uv run pytest/ruff/
