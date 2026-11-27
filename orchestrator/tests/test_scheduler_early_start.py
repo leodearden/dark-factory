@@ -508,6 +508,28 @@ class TestClaim:
         rig.assert_untouched('D')
 
 
+class TestTheSelectionFixesNoTasksKeys:
+    """A task's lock keys are derived from its files at its own dispatch, not when a selection weighed it."""
+
+    async def test_tasks_a_selection_weighed_dispatch_on_their_later_files(self, tmp_path, monkeypatch):
+        rig = await _with_p_running(tmp_path, monkeypatch)
+        picture = await rig.picture(
+            p_running(), task('E', files=['e_old.py'], deps=('P',)), task('T', files=['t_old.py']),
+        )
+        assert [c.dependent for c in rig.shortlist(picture).candidates] == ['E']
+        assert await rig.select(picture, reads_of()) == EarlyStartSelection(None, ())
+
+        rig.offer(
+            task('P', files=P_FILES, status='done'),
+            task('E', files=['e_new.py'], deps=('P',)),
+            task('T', files=['t_new.py']),
+        )
+        assert {await rig.acquire(), await rig.acquire()} == {'E', 'T'}
+
+        assert rig.scheduler.lock_table.held_modules('E') == {'e_new.py'}
+        assert rig.scheduler.lock_table.held_modules('T') == {'t_new.py'}
+
+
 class TestRow7Keys:
     async def test_a_two_holder_key_already_full_is_key_unavailable(self, tmp_path, monkeypatch):
         rig = _rig(tmp_path, monkeypatch)

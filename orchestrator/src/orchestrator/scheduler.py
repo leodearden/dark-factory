@@ -1420,6 +1420,11 @@ def _park_records(parks_by_owner: Mapping[str, Mapping[str, Any]]) -> dict[str, 
     return {owner: ParkRecord.model_validate(rec) for owner, rec in parks_by_owner.items()}
 
 
+def _fallback_modules(task_id: str) -> list[str]:
+    """The lock key of a task whose files derive none: one generic key named for the task."""
+    return [f'task-{task_id or "unknown"}']
+
+
 def _psi_degradations(sample: PsiSample, cfg: PsiAdmissionConfig) -> dict[str, str]:
     """Map each degraded load component whose loss disables a LIVE gate arm
     to the operator-facing description of that loss.
@@ -8568,7 +8573,7 @@ class Scheduler:
                     dependent=tid,
                     predecessor=predecessor,
                     task=row,
-                    keys=tuple(self._get_modules(row)),
+                    keys=tuple(self._peek_modules(row)),
                     priority=picture.priority_of(tid),
                 ))
         candidates.sort(key=lambda candidate: candidate.rank_key)
@@ -8678,7 +8683,7 @@ class Scheduler:
                 continue
             row = judged_row(picture_row, status_map, rows)
             competitors.append(Competitor(
-                task_id=tid, task=row, keys=tuple(self._get_modules(row)),
+                task_id=tid, task=row, keys=tuple(self._peek_modules(row)),
                 priority=picture.priority_of(tid),
             ))
         return tuple(competitors)
@@ -10076,18 +10081,12 @@ class Scheduler:
             return []
 
         task_id = str(task.get('id', ''))
-        depth = self.config.lock_depth
         # Check in-memory cache first (survives metadata update failures)
         if task_id in self._module_cache:
             return self._module_cache[task_id]
-        metadata = task.get('metadata') or {}
-        if isinstance(metadata, dict):
-            files = metadata.get('files', [])
-            if isinstance(files, list) and files:
-                derived = derive_modules(files, depth, task_id=task_id)
-                if derived:
-                    return self._write_module_cache(task_id, derived)
-        # Fallback: use a generic module name based on task id
+        derived = self._modules_from_files(task)
+        if derived:
+            return self._write_module_cache(task_id, derived)
         if task_id not in self._fallback_warned:
             logger.warning(
                 'Task %s: no module metadata found — using fallback lock task-%s',
@@ -10095,7 +10094,30 @@ class Scheduler:
                 task_id or 'unknown',
             )
             self._fallback_warned.add(task_id)
-        return [f'task-{task_id or "unknown"}']
+        return _fallback_modules(task_id)
+
+    def _peek_modules(self, task: dict) -> list[str]:
+        """:meth:`_get_modules`'s answer, writing neither its memo nor its fallback warning.
+
+        For the early-start selection, which writes nothing but its claim (PRD
+        invariant 12): a memo written for a task the ordinary pass never
+        derived would fix its keys against a later ``metadata.files`` change.
+        """
+        if self.is_deterministic(task):
+            return []
+        task_id = str(task.get('id', ''))
+        if task_id in self._module_cache:
+            return self._module_cache[task_id]
+        return self._modules_from_files(task) or _fallback_modules(task_id)
+
+    def _modules_from_files(self, task: dict) -> list[str]:
+        """*task*'s lock keys derived from ``metadata.files``; empty when it lists none that derive."""
+        metadata = task.get('metadata') or {}
+        files = metadata.get('files', []) if isinstance(metadata, dict) else []
+        if not isinstance(files, list) or not files:
+            return []
+        task_id = str(task.get('id', ''))
+        return derive_modules(files, self.config.lock_depth, task_id=task_id)
 
     def seed_modules(self, task_id: str, files: list[str]) -> list[str]:
         """Public entry point for the harness module-tagger.
