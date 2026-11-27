@@ -1506,6 +1506,10 @@ def _task_pass_summary_payload(
     }
 
 
+# What a runner_synced event says was brought current (event_store.py::EventType.runner_synced).
+_SyncedKind = Literal['gate_checkout', 'project_main_mirror', 'project_tag_mirror']
+
+
 class RemoteRunner:
     """Runs a verify on a remote host via git push + ssh, in a gate built from this process's sha.
 
@@ -1794,9 +1798,21 @@ class RemoteRunner:
         event_store.emit(EventType.runner_stale, task_id=task_id, data={
             'runner': self.name, 'local_head': sha, 'remote_head': self._ensured_sha,
         })
+        self._announce_synced(
+            event_store, task_id,
+            kind='gate_checkout', from_head=self._ensured_sha, to_head=sha, forced=False,
+        )
+
+    def _announce_synced(
+        self, event_store: Any, task_id: str | None, *,
+        kind: _SyncedKind, from_head: str | None, to_head: str | None, forced: bool,
+    ) -> None:
+        """Emit runner_synced to the None-safe *event_store*: the remote was brought current with this dispatcher."""
+        if event_store is None:
+            return
         event_store.emit(EventType.runner_synced, task_id=task_id, data={
-            'runner': self.name, 'kind': 'gate_checkout',
-            'from_head': self._ensured_sha, 'to_head': sha, 'forced': False,
+            'runner': self.name, 'kind': kind,
+            'from_head': from_head, 'to_head': to_head, 'forced': forced,
         })
 
     def _gate_command(self, args: Sequence[str]) -> str:
@@ -2058,14 +2074,11 @@ class RemoteRunner:
         prior_main_sha = self._last_pushed_main_sha
         if resolved_main_sha is not None:
             self._last_pushed_main_sha = resolved_main_sha
-        if forced and event_store is not None:
-            event_store.emit(EventType.runner_synced, task_id=task_id, data={
-                'runner': self.name,
-                'kind': 'project_main_mirror',
-                'from_head': prior_main_sha,
-                'to_head': resolved_main_sha,
-                'forced': True,
-            })
+        if forced:
+            self._announce_synced(
+                event_store, task_id, kind='project_main_mirror',
+                from_head=prior_main_sha, to_head=resolved_main_sha, forced=True,
+            )
 
     async def _local_branch_sha(self, branch: str) -> str | None:
         """*branch*'s local tip by a network-free ``git rev-parse``, or None when unreadable."""
@@ -2129,14 +2142,9 @@ class RemoteRunner:
             self.name, refused,
         )
         await self._push(self._git_remote, f'+{_TAG_MIRROR_REFSPEC}', cwd=self._cwd)
-        if event_store is not None:
-            event_store.emit(EventType.runner_synced, task_id=task_id, data={
-                'runner': self.name,
-                'kind': 'project_tag_mirror',
-                'from_head': None,
-                'to_head': None,
-                'forced': True,
-            })
+        self._announce_synced(
+            event_store, task_id, kind='project_tag_mirror', from_head=None, to_head=None, forced=True,
+        )
 
     async def _refused_tag_push(self) -> RunnerUnavailable | None:
         """The plain tag push's refusal by a reached host, or None once pushed; a transport failure raises."""
