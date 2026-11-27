@@ -2084,7 +2084,7 @@ class RemoteRunner:
             return None
         return tuple(line for line in stdout.splitlines() if line.strip())
 
-    async def _mirror_tags(self) -> None:
+    async def _mirror_tags(self, *, task_id: str | None, event_store: Any) -> None:
         """Push every local tag of the project checkout to the remote before a verify.
 
         Unlike main's freshness, the tag set is an INPUT to the verdict (a test
@@ -2093,6 +2093,12 @@ class RemoteRunner:
         unreadable listing is this dispatcher's fault, not the host's, so it is
         logged and skipped; an empty one is skipped because a glob refspec
         matching nothing makes git push exit 1.
+
+        INV-2 mirror semantics (task 2884, PRD §3.1), as for main: a refused
+        push (typically a remote tag pointing elsewhere) is retried ONCE with a
+        force refspec, and a forced success emits
+        runner_synced(kind='project_tag_mirror').  A transport failure is
+        re-raised unforced: the host was not reached, so forcing cannot help.
         """
         tags = await self._local_tag_refs()
         if tags is None:
@@ -2103,7 +2109,24 @@ class RemoteRunner:
             return
         if not tags:
             return
-        await self._push(self._git_remote, _TAG_MIRROR_REFSPEC, cwd=self._cwd)
+        try:
+            await self._push(self._git_remote, _TAG_MIRROR_REFSPEC, cwd=self._cwd)
+        except RunnerUnavailable as refused:
+            if refused.kind == 'transport':
+                raise
+            logger.warning(
+                'RemoteRunner %r: tag mirror push refused (%s), force-mirroring tags',
+                self.name, refused,
+            )
+            await self._push(self._git_remote, f'+{_TAG_MIRROR_REFSPEC}', cwd=self._cwd)
+            if event_store is not None:
+                event_store.emit(EventType.runner_synced, task_id=task_id, data={
+                    'runner': self.name,
+                    'kind': 'project_tag_mirror',
+                    'from_head': None,
+                    'to_head': None,
+                    'forced': True,
+                })
 
     async def _dispatch(
         self,
@@ -2142,7 +2165,7 @@ class RemoteRunner:
         ref = f'refs/merge-verify/{request_id}'
         try:
             await self.ensure_gate(event_store=event_store, task_id=task_id)
-            await self._mirror_tags()
+            await self._mirror_tags(task_id=task_id, event_store=event_store)
             await self._push(self._git_remote, f'{sha}:{ref}', cwd=self._cwd)
             try:
                 outcome = await self._run_gate_verify(sha, subcommand, spec_json, request_id)

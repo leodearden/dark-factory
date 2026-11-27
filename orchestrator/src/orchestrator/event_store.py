@@ -450,10 +450,12 @@ class EventType(StrEnum):
     #
     # runner_synced: emitted when the remote was brought current with the
     # dispatcher — a gate checkout built for the deployed sha (right after
-    # runner_stale, kind='gate_checkout'), or the project checkout's main ref
-    # mirror-forced after a non-fast-forward (kind='project_main_mirror').  data
-    # carries {runner, kind, from_head, to_head, forced}; forced is True only on
-    # the project-main mirror arm.
+    # runner_stale, kind='gate_checkout'), the project checkout's main ref
+    # mirror-forced after a non-fast-forward (kind='project_main_mirror'), or
+    # the project checkout's tags force-mirrored after a refused tag push
+    # (kind='project_tag_mirror'; from_head/to_head null, a tag set has no
+    # single head).  data carries {runner, kind, from_head, to_head, forced};
+    # forced is True on both project mirror arms and False on gate_checkout.
     runner_stale = 'runner_stale'
     runner_synced = 'runner_synced'
     # Task 6565 (design D1): the process's deployed sha is flagged — HEAD moved
