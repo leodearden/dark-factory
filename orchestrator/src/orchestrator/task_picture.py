@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+from functools import cached_property
 
 from orchestrator.overrides import OverrideRow
 from orchestrator.scheduler_priority_lookup import combine_priority, pin_orders
@@ -50,6 +51,8 @@ class TaskPicture:
 
     def priority_of(self, task_id: str) -> TaskPriority:
         """*task_id*'s base tier in this picture combined with the pins in force."""
-        return combine_priority(
-            task_id, self.effective_priorities.get(task_id), pin_orders(self.overrides),
-        )
+        return combine_priority(task_id, self.effective_priorities.get(task_id), self._pin_orders)
+
+    @cached_property
+    def _pin_orders(self) -> dict[str, int]:
+        return pin_orders(self.overrides)
