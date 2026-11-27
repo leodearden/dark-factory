@@ -13,14 +13,17 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import importlib.util
 import json
 import shutil
 import socket
 import subprocess
+import sys
 import tempfile
 import uuid
 from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 
 import pytest
 from _fake_systemd_run import fake_systemd_run as fake_systemd_run
@@ -171,6 +174,25 @@ class TestCapture:
             'unavailable',
         }
         assert Capture('before_kill') is Capture.BEFORE_KILL
+
+    def test_the_census_copy_of_the_states_matches(self):
+        """scripts/verify_budget_census.py imports no orchestrator code, so it
+        restates the states; a state it does not know reads as malformed."""
+        census = _load_script('verify_budget_census')
+
+        assert set(census.C4_CAPTURE_STATES) == {c.value for c in Capture}
+
+
+def _load_script(name: str) -> Any:
+    """A scripts/ module by path; registered so its dataclasses resolve."""
+    path = Path(__file__).resolve().parents[2] / 'scripts' / f'{name}.py'
+    spec = importlib.util.spec_from_file_location(f'_scripts_{name}', path)
+    assert spec is not None and spec.loader is not None, path
+    module: Any = importlib.util.module_from_spec(spec)
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setitem(sys.modules, spec.name, module)
+        spec.loader.exec_module(module)
+    return module
 
 
 class TestCommandResourcesRecord:
