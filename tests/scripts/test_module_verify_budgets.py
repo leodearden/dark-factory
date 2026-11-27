@@ -870,11 +870,14 @@ KNOWN_MODULE_CONFIG_PREFIXES = frozenset(
 # task 3703 fixed the owner, and now records the repair as history instead.
 MEASURED_BY_SIBLING_GUARD: dict[str, str] = {
     'scripts': (
-        'MEASURED_SUITE_WORST_SECS = 930.59 in '
-        'tests/scripts/test_scripts_module_config.py (task 3458), sourced from '
-        "scripts/orchestrator.yaml's own PER-MODULE VERIFY BUDGET block, whose "
-        'floor is DERIVED from that constant by module_budget_family.min_budget, '
-        'the family\'s one implementation of that expression.'
+        'The measured worst run is recorded in scripts/orchestrator.yaml, '
+        'whose PER-MODULE VERIFY BUDGET block carries every run behind it; the '
+        'owning guard is tests/scripts/test_scripts_module_config.py (task '
+        '3458), which pins MEASURED_SUITE_WORST_SECS with '
+        'MIN_MODULE_BUDGET_SECS DERIVED from it by '
+        'module_budget_family.min_budget, the family\'s one implementation of '
+        'that expression. NO FIGURE IS QUOTED HERE, for the reason the '
+        'tests/scripts entry gives.'
     ),
     'tests/scripts': (
         'The measured worst run is recorded in tests/scripts/orchestrator.yaml, '
