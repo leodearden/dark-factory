@@ -58,7 +58,7 @@ BASE_OPTIONS = ThroughputOptions(
     rule_prefix=PREFIX,
     treated_effort=TREATED_EFFORT,
     control_effort=CONTROL_EFFORT,
-    since=None,
+    since=SINCE,
     cohort_days=COHORT_DAYS,
     read_at=READ_AT,
     roots=(),
@@ -122,7 +122,7 @@ def known_root(tmp_path, make_seeding_runs_db) -> Path:
 
 
 def test_the_known_ratio_ledger_reads_as_landed_per_dollar_by_arm(known_root):
-    report = throughput_report(_options(known_root), SINCE)
+    report = throughput_report(_options(known_root))
 
     assert report.totals[Arm.TREATED] == ArmTotals(n=3, landed=2, cost_usd=4.0)
     assert report.totals[Arm.CONTROL] == ArmTotals(n=2, landed=1, cost_usd=4.0)
@@ -132,7 +132,7 @@ def test_the_known_ratio_ledger_reads_as_landed_per_dollar_by_arm(known_root):
 
 
 def test_each_cohort_task_sits_in_the_arm_its_split_bucket_names(known_root):
-    report = throughput_report(_options(known_root), SINCE)
+    report = throughput_report(_options(known_root))
 
     assert len(report.records) == 5
     for record in report.records:
@@ -143,7 +143,7 @@ def test_each_cohort_task_sits_in_the_arm_its_split_bucket_names(known_root):
 def test_cost_counts_every_role_with_no_lower_bound(known_root):
     (t0, _, _), _ = arm_task_ids(SALT, 2, 1, 3)
 
-    record = _by_task(throughput_report(_options(known_root), SINCE))[str(t0)]
+    record = _by_task(throughput_report(_options(known_root)))[str(t0)]
 
     assert record.cost_usd == 1.5
     assert dict(record.cost_by_role) == {'architect': 1.0, 'implementer': 0.5}
@@ -163,7 +163,7 @@ def test_tasks_outside_the_cohort_are_in_neither_arm(tmp_path, make_seeding_runs
     ]
     build_cohort_root(root, make_seeding_runs_db, tasks)
 
-    report = throughput_report(_options(root), SINCE)
+    report = throughput_report(_options(root))
 
     assert {'9001', '9002', '9003'}.isdisjoint(_by_task(report))
     assert report.ratio == 2.0
@@ -177,7 +177,7 @@ def test_a_debugger_only_first_dispatch_inside_the_window_is_in_the_cohort(
         CohortTask(task_id=9004, dispatches=(_control(_hours(4), role='debugger'),)),
     ])
 
-    report = throughput_report(_options(root), SINCE)
+    report = throughput_report(_options(root))
 
     assert set(_by_task(report)) == {'9004'}
 
@@ -192,7 +192,7 @@ def test_an_invocation_started_at_or_after_read_at_adds_no_cost(tmp_path, make_s
         )),
     ])
 
-    record = _by_task(throughput_report(_options(root), SINCE))['9005']
+    record = _by_task(throughput_report(_options(root)))['9005']
 
     assert record.cost_usd == 2.0
 
@@ -203,7 +203,7 @@ def test_a_landing_at_or_after_read_at_does_not_count_as_landed(tmp_path, make_s
         CohortTask(task_id=9006, dispatches=(_control(_hours(4)),), landed_at=READ_AT),
     ])
 
-    record = _by_task(throughput_report(_options(root), SINCE))['9006']
+    record = _by_task(throughput_report(_options(root)))['9006']
 
     assert record.landed_at is None
     assert record.merge_sha is None
@@ -225,19 +225,19 @@ def test_a_train_member_superseded_in_merge_finalized_counts_as_landed(
         'merge_commit_sha': 'train-sha', 'base_sha': 'base-sha',
     })
 
-    record = _by_task(throughput_report(_options(root), SINCE))['9007']
+    record = _by_task(throughput_report(_options(root)))['9007']
 
     assert (record.landed_at, record.merge_sha) == (train_at, 'train-sha')
 
 
 def test_a_cohort_without_cohort_days_runs_to_read_at(known_root):
-    report = throughput_report(_options(known_root, cohort_days=None), SINCE)
+    report = throughput_report(_options(known_root, cohort_days=None))
 
     assert report.cohort_end == READ_AT
 
 
 def test_a_cohort_longer_than_the_read_window_ends_at_read_at(known_root):
-    report = throughput_report(_options(known_root, cohort_days=60), SINCE)
+    report = throughput_report(_options(known_root, cohort_days=60))
 
     assert report.cohort_end == READ_AT
 
@@ -258,7 +258,7 @@ def test_since_resolves_to_the_first_prefixed_dispatch_of_any_role_across_roots(
         )),
     ])
 
-    assert resolve_since(_options(first, second)) == SINCE
+    assert resolve_since(_options(first, second, since=None)) == SINCE
 
 
 def test_an_explicit_since_is_returned_as_given(known_root):
@@ -267,8 +267,9 @@ def test_an_explicit_since_is_returned_as_given(known_root):
     assert resolve_since(_options(known_root, since=explicit)) == explicit
 
 
+@pytest.mark.parametrize('read', [resolve_since, throughput_report])
 def test_a_ledger_without_a_prefixed_dispatch_cannot_resolve_since(
-    tmp_path, make_seeding_runs_db,
+    tmp_path, make_seeding_runs_db, read,
 ):
     root = tmp_path / 'df'
     build_cohort_root(root, make_seeding_runs_db, [
@@ -279,10 +280,12 @@ def test_a_ledger_without_a_prefixed_dispatch_cannot_resolve_since(
     ])
 
     with pytest.raises(ThroughputUnavailable) as excinfo:
-        resolve_since(_options(root))
+        read(_options(root, since=None))
 
     assert excinfo.value.kind is Unavailable.NO_TREATED_DISPATCH
-    assert PREFIX in str(excinfo.value)
+    assert str(excinfo.value) == (
+        f"{Unavailable.NO_TREATED_DISPATCH.value}: prefix {PREFIX!r} in {root}"
+    )
 
 
 def test_a_root_without_runs_db_is_an_unreadable_store_naming_the_root(tmp_path):
@@ -290,7 +293,7 @@ def test_a_root_without_runs_db_is_an_unreadable_store_naming_the_root(tmp_path)
     root.mkdir()
 
     with pytest.raises(ThroughputUnavailable) as excinfo:
-        throughput_report(_options(root), SINCE)
+        throughput_report(_options(root))
 
     assert excinfo.value.kind is Unavailable.STORE_UNREADABLE
     assert str(root) in str(excinfo.value)
@@ -335,7 +338,7 @@ def planted_root(tmp_path, make_seeding_runs_db):
 
 
 def _planted_report(root: Path, **overrides):
-    return throughput_report(_options(root, resamples=2000, seed=20261117, **overrides), SINCE)
+    return throughput_report(_options(root, resamples=2000, seed=20261117, **overrides))
 
 
 def test_a_planted_cost_cut_is_an_interval_wholly_above_1(planted_root):
@@ -399,7 +402,7 @@ def test_an_undefined_ratio_has_no_interval_and_an_undefined_side(tmp_path, make
                    invocations=(('implementer', 1.0, _hours(1)),)),
     ])
 
-    report = throughput_report(_options(root), SINCE)
+    report = throughput_report(_options(root))
 
     assert report.ratio is None
     assert report.interval is None
@@ -422,7 +425,7 @@ def test_verify_attempts_and_review_cycles_are_counted_per_landing(tmp_path, mak
         CohortTask(task_id=control, dispatches=(_control(_hours(1)),), landed_at=_hours(48)),
     ])
 
-    report = throughput_report(_options(root), SINCE)
+    report = throughput_report(_options(root))
 
     treated_secondary = report.secondary[Arm.TREATED]
     assert treated_secondary.n == 1
@@ -439,7 +442,7 @@ def test_a_per_landing_figure_is_none_when_nothing_landed(tmp_path, make_seeding
                    results=(('blocked', _hours(40), 1, 1),)),
     ])
 
-    treated_secondary = throughput_report(_options(root), SINCE).secondary[Arm.TREATED]
+    treated_secondary = throughput_report(_options(root)).secondary[Arm.TREATED]
 
     assert treated_secondary.verify_attempts_per_landing is None
     assert treated_secondary.review_cycles_per_landing is None
@@ -460,7 +463,7 @@ def test_the_blocked_or_escalated_share_counts_any_outcome_before_read_at(
                    results=(('done', _hours(10), 0, 0),)),
     ])
 
-    report = throughput_report(_options(root), SINCE)
+    report = throughput_report(_options(root))
 
     assert report.secondary[Arm.TREATED].blocked_or_escalated_share == 0.5
     assert report.secondary[Arm.CONTROL].blocked_or_escalated_share == 0.0
@@ -481,7 +484,7 @@ def test_cost_per_task_by_role_divides_each_roles_arm_cost_by_arm_n(
         )),
     ])
 
-    treated_secondary = throughput_report(_options(root), SINCE).secondary[Arm.TREATED]
+    treated_secondary = throughput_report(_options(root)).secondary[Arm.TREATED]
 
     assert dict(treated_secondary.cost_per_task_by_role) == {'implementer': 3.0, 'reviewer': 0.5}
 
@@ -539,7 +542,7 @@ def test_failures_after_merge_count_skews_and_reverts_within_seven_days_of_landi
     ])
     plant(root, conn, merge_sha, branch_commit)
 
-    report = throughput_report(_options(root), SINCE)
+    report = throughput_report(_options(root))
 
     assert _by_task(report)[str(treated)].failures_after_merge == failures
     assert report.secondary[Arm.TREATED].failures_after_merge_per_landing == failures
@@ -554,7 +557,7 @@ def test_an_unreadable_main_history_is_refused_naming_the_root(tmp_path, make_se
     _skew(conn, LANDED + timedelta(days=2), [UNRELATED_SHA])
 
     with pytest.raises(ThroughputUnavailable) as excinfo:
-        throughput_report(_options(root), SINCE)
+        throughput_report(_options(root))
 
     assert excinfo.value.kind is Unavailable.HISTORY_UNREADABLE
     assert str(root) in str(excinfo.value)
@@ -582,7 +585,7 @@ def _dispatch(conn, task_id, at: datetime, *, role: str, effort: str, rule_id: s
 def test_a_compliant_cohort_has_no_deviation_and_no_failure(compliance_root):
     root, _ = compliance_root
 
-    compliance = throughput_report(_options(root), SINCE).compliance
+    compliance = throughput_report(_options(root)).compliance
 
     assert compliance.roles['implementer'] == RoleCompliance(
         dispatches=2 * COMPLIANCE_N_PER_ARM, effort_deviations=0, treated_without_rule=0,
@@ -598,7 +601,7 @@ def test_a_control_dispatch_at_treated_effort_is_a_deviation_and_not_a_failure(c
     (control, *_) = arm_task_ids(SALT, 2, 1, COMPLIANCE_N_PER_ARM)[1]
     _dispatch(conn, control, _hours(150), role='debugger', effort=TREATED_EFFORT, rule_id=None)
 
-    compliance = throughput_report(_options(root), SINCE).compliance
+    compliance = throughput_report(_options(root)).compliance
 
     assert compliance.roles['debugger'] == RoleCompliance(
         dispatches=1, effort_deviations=1, treated_without_rule=0,
@@ -611,7 +614,7 @@ def test_a_treated_dispatch_without_the_rule_is_counted_and_not_a_failure(compli
     (treated, *_), _ = arm_task_ids(SALT, 2, 1, COMPLIANCE_N_PER_ARM)
     _dispatch(conn, treated, _hours(150), role='implementer', effort=TREATED_EFFORT, rule_id=None)
 
-    compliance = throughput_report(_options(root), SINCE).compliance
+    compliance = throughput_report(_options(root)).compliance
 
     assert compliance.roles['implementer'] == RoleCompliance(
         dispatches=2 * COMPLIANCE_N_PER_ARM + 1, effort_deviations=0, treated_without_rule=1,
@@ -625,7 +628,7 @@ def test_a_treated_dispatch_at_control_effort_is_a_compliance_failure(compliance
     at = _hours(150)
     _dispatch(conn, treated, at, role='implementer', effort=CONTROL_EFFORT, rule_id=TREATED_RULE_ID)
 
-    compliance = throughput_report(_options(root), SINCE).compliance
+    compliance = throughput_report(_options(root)).compliance
 
     assert compliance.roles['implementer'] == RoleCompliance(
         dispatches=2 * COMPLIANCE_N_PER_ARM + 1, effort_deviations=1, treated_without_rule=0,
@@ -645,7 +648,7 @@ def test_dispatches_outside_the_window_roles_or_cohort_are_not_counted(complianc
     _dispatch(conn, treated, _hours(150), role='architect', **violation)
     _dispatch(conn, after_cohort, COHORT_END + timedelta(hours=1), role='implementer', **violation)
 
-    compliance = throughput_report(_options(root), SINCE).compliance
+    compliance = throughput_report(_options(root)).compliance
 
     assert compliance.roles['implementer'] == RoleCompliance(
         dispatches=2 * COMPLIANCE_N_PER_ARM, effort_deviations=0, treated_without_rule=0,
@@ -674,7 +677,7 @@ def _cli(root: Path, *extra: str) -> list[str]:
 
 
 def _cli_options(root: Path) -> ThroughputOptions:
-    return _options(root, resamples=CLI_RESAMPLES, seed=CLI_SEED)
+    return _options(root, since=None, resamples=CLI_RESAMPLES, seed=CLI_SEED)
 
 
 def _summary(out: str) -> dict:
@@ -725,8 +728,7 @@ def test_throughput_on_the_planted_cut_prints_three_ruled_tables(planted_root, c
 def test_throughput_json_line_agrees_with_the_report_since_at_the_first_prefixed_dispatch(
     known_root, capsys,
 ):
-    options = _cli_options(known_root)
-    report = throughput_report(options, resolve_since(options))
+    report = throughput_report(_cli_options(known_root))
 
     assert readout.main(_cli(known_root)) == 0
 

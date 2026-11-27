@@ -152,7 +152,7 @@ def _run_look(args: argparse.Namespace, rest: Sequence[str], now: datetime) -> i
         }))
         return _EXIT[LookVerdict.NOT_DUE]
     cohort_days = 7 * min(look_week, args.last_look_week)
-    report = throughput_report(replace(options, since=since, cohort_days=cohort_days), since)
+    report = throughput_report(replace(options, since=since, cohort_days=cohort_days))
     sys.stdout.write(render_text(report))
     verdict = _verdict(report, look_week, args.last_look_week)
     if verdict in _DECIDED:

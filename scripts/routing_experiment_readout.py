@@ -52,7 +52,6 @@ from routing_throughput import (
     ThroughputOptions,
     ThroughputUnavailable,
     Unavailable,
-    resolve_since,
     summary_record,
     throughput_report,
 )
@@ -1362,7 +1361,7 @@ _UNAVAILABLE_EXIT = {
 def _throughput_main(argv: Sequence[str]) -> int:
     options = throughput_options(argv)
     try:
-        report = throughput_report(options, resolve_since(options))
+        report = throughput_report(options)
     except ThroughputUnavailable as exc:
         _warn(str(exc))
         return _UNAVAILABLE_EXIT[exc.kind]

@@ -138,6 +138,11 @@ class ThroughputUnavailable(Exception):
         super().__init__(f'{kind.value}: {detail}')
 
 
+def _refuse_a_bucket_count_split_bucket_refuses(buckets: int) -> None:
+    """Raise split_bucket's own ValueError now, at construction, rather than at the first arm read."""
+    split_bucket('', '', buckets)
+
+
 @dataclass(frozen=True)
 class ThroughputOptions:
     """Every input of one throughput report.
@@ -166,7 +171,7 @@ class ThroughputOptions:
     resamples: int
 
     def __post_init__(self) -> None:
-        split_bucket(self.salt, '', self.buckets)
+        _refuse_a_bucket_count_split_bucket_refuses(self.buckets)
         if not 0 <= self.treated_bucket < self.buckets:
             raise ValueError(
                 f'treated_bucket lies in range(buckets={self.buckets}), got {self.treated_bucket!r}'
@@ -284,7 +289,7 @@ def _placeholders(values: Sequence[object]) -> str:
 
 
 def _unreadable(root: Path, exc: Exception) -> ThroughputUnavailable:
-    return ThroughputUnavailable(Unavailable.STORE_UNREADABLE, f'{root}: runs.db unreadable: {exc}')
+    return ThroughputUnavailable(Unavailable.STORE_UNREADABLE, f'{root}: {exc}')
 
 
 def _open_runs_db(root: Path) -> Connection:
@@ -321,8 +326,7 @@ def resolve_since(options: ThroughputOptions) -> datetime:
     if not found:
         raise ThroughputUnavailable(
             Unavailable.NO_TREATED_DISPATCH,
-            f'no routing_decision carries the rule prefix {options.rule_prefix!r} in '
-            f'{", ".join(str(root) for root in options.roots)}',
+            f'prefix {options.rule_prefix!r} in {", ".join(str(root) for root in options.roots)}',
         )
     return min(found)
 
@@ -715,13 +719,16 @@ def _arm_secondary(records: Sequence[CohortRecord], arm: Arm) -> ArmSecondary:
     )
 
 
-def throughput_report(options: ThroughputOptions, since: datetime) -> ThroughputReport:
-    """The cohort dispatched from *since* (see :func:`resolve_since`), read across options.roots.
+def throughput_report(options: ThroughputOptions) -> ThroughputReport:
+    """The cohort dispatched from :func:`resolve_since` of *options*, read across options.roots.
 
-    Raises ThroughputUnavailable naming the root: STORE_UNREADABLE when its
-    runs.db or landing datum cannot be read, HISTORY_UNREADABLE when main's git
-    history is needed for a landing and cannot be read.
+    Raises ThroughputUnavailable: NO_TREATED_DISPATCH when options.since is
+    None and no routing_decision carries the prefix; otherwise naming the root,
+    STORE_UNREADABLE when its runs.db or landing datum cannot be read,
+    HISTORY_UNREADABLE when main's git history is needed for a landing and
+    cannot be read.
     """
+    since = resolve_since(options)
     cohort_end = options.cohort_end(since)
     unordered: list[CohortRecord] = []
     checks: list[_DispatchCheck] = []
