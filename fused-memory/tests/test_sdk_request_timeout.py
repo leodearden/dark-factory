@@ -5,13 +5,13 @@ from __future__ import annotations
 import httpx
 import openai
 import pytest
+from graphiti_core.embedder.openai import OpenAIEmbedder, OpenAIEmbedderConfig
+
 from fused_memory.backends.sdk_request_timeout import (
     bounded_attempts,
     bounded_openai_embedder,
     request_timeout_within,
 )
-from graphiti_core.embedder.openai import OpenAIEmbedder, OpenAIEmbedderConfig
-
 from fused_memory.config.request_attempts import RequestAttemptsConfig
 
 _URL = 'http://127.0.0.1:9/v1'
