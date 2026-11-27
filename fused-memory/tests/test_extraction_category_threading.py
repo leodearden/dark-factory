@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock
@@ -141,10 +142,29 @@ class TestCloseReleasesEveryRoutesSdkClient:
         assert (default.client.closed, route.client.closed) == (True, True)
 
 
+@dataclass(frozen=True)
+class _QueuedService:
+    svc: MemoryService
+    graphiti_initialize: AsyncMock
+    graphiti_add_episode: AsyncMock
+
+    def injected_llm_client(self) -> Any:
+        injected = self.graphiti_initialize.await_args
+        return injected.kwargs.get('llm_client') if injected else None
+
+    async def landed_extraction_category(self) -> MemoryCategory | None:
+        await poll_until(lambda: self.graphiti_add_episode.await_count, message='no graphiti write landed')
+        assert self.graphiti_add_episode.await_args is not None
+        return self.graphiti_add_episode.await_args.kwargs['extraction_category']
+
+
 @asynccontextmanager
-async def _queued_service(config: FusedMemoryConfig, tmp_path: Path) -> AsyncIterator[MemoryService]:
+async def _queued_service(config: FusedMemoryConfig, tmp_path: Path) -> AsyncIterator[_QueuedService]:
     """A MemoryService over a real durable queue whose graphiti backend is an AsyncMock."""
     svc = mock_memory_backends(MemoryService(config))
+    queued = _QueuedService(svc, AsyncMock(), AsyncMock(return_value=None))
+    svc.graphiti.initialize = queued.graphiti_initialize
+    svc.graphiti.add_episode = queued.graphiti_add_episode
     svc.graphiti.list_graphs = AsyncMock(return_value=[])
     svc.graphiti.read_server_settings = AsyncMock(return_value=FalkorServerSettings(
         expected_graph_timeout_ms=30000, graph_timeout_ms=30000, appendonly='yes',
@@ -152,18 +172,10 @@ async def _queued_service(config: FusedMemoryConfig, tmp_path: Path) -> AsyncIte
     await svc.initialize()
     svc.set_known_projects({'main': str(tmp_path)})
     try:
-        yield svc
+        yield queued
     finally:
         await svc.close()
-        injected = svc.graphiti.initialize.await_args
-        await close_wrapped_sdk_clients(
-            wrapped_llm_clients(injected.kwargs.get('llm_client') if injected else None),
-        )
-
-
-async def _landed_extraction_category(svc: MemoryService) -> MemoryCategory | None:
-    await poll_until(lambda: svc.graphiti.add_episode.await_count, message='no graphiti write landed')
-    return svc.graphiti.add_episode.await_args.kwargs['extraction_category']
+        await close_wrapped_sdk_clients(wrapped_llm_clients(queued.injected_llm_client()))
 
 
 class TestMemoryServicePassesTheWritesCategory:
@@ -172,20 +184,20 @@ class TestMemoryServicePassesTheWritesCategory:
     async def test_an_add_memory_write_carries_its_category(
         self, mock_config, tmp_path: Path, category: MemoryCategory,
     ) -> None:
-        async with _queued_service(mock_config, tmp_path) as svc:
-            await svc.add_memory(
+        async with _queued_service(mock_config, tmp_path) as queued:
+            await queued.svc.add_memory(
                 content='Leo decided the plan route parks capped writes',
                 category=category.value, project_id='main',
             )
 
-            assert await _landed_extraction_category(svc) is category
+            assert await queued.landed_extraction_category() is category
 
     @pytest.mark.asyncio
     async def test_an_add_episode_write_carries_none(self, mock_config, tmp_path: Path) -> None:
-        async with _queued_service(mock_config, tmp_path) as svc:
-            await svc.add_episode(content='Alice met Bob.', project_id='main')
+        async with _queued_service(mock_config, tmp_path) as queued:
+            await queued.svc.add_episode(content='Alice met Bob.', project_id='main')
 
-            assert await _landed_extraction_category(svc) is None
+            assert await queued.landed_extraction_category() is None
 
 
 class _Edge(BaseModel):
@@ -208,8 +220,8 @@ class TestInitializeBuildsTheGatedRoute:
                 ),
             }
 
-            async with _queued_service(mock_config, tmp_path) as svc:
-                client = svc.graphiti.initialize.await_args.kwargs['llm_client']
+            async with _queued_service(mock_config, tmp_path) as queued:
+                client = queued.injected_llm_client()
                 assert isinstance(client, CategoryRoutedLLMClient)
                 with extraction_category_scope(_DECISIONS):
                     await client.generate_response(

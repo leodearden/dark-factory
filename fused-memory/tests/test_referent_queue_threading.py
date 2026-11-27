@@ -697,6 +697,7 @@ _TODAYS_BACKEND_KWARGS = {
     'temporal_context': None,
     'reference_time': None,
     'unverified_claim': False,
+    'extraction_category': None,
 }
 
 

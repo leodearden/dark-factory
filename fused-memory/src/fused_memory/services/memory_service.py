@@ -6063,6 +6063,7 @@ class MemoryService:
                     temporal_context=temporal_context,
                     reference_time=reference_time,
                     unverified_claim=value.unverified_claim,
+                    extraction_category=memory_category,
                 ),
                 # The only LLM-bearing graphiti path. Deletes and edge updates
                 # spend no LLM, so they stay unprobed rather than journaling a

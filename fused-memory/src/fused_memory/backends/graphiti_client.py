@@ -76,6 +76,7 @@ from fused_memory.backends.llm_clients import (
     ExplicitEffortOpenAIClient,
     ForceJsonObjectOpenAIGenericClient,
     TokenRecordingOpenAIGenericClient,
+    extraction_category_scope,
     wrapped_llm_clients,
 )
 from fused_memory.backends.llm_token_usage import (
@@ -1727,8 +1728,13 @@ class GraphitiBackend:
         uuid: str | None = None,
         temporal_context: str | None = None,
         unverified_claim: bool = False,
+        *,
+        extraction_category: MemoryCategory | None = None,
     ) -> Any:
         """Add an episode to Graphiti and return the result.
+
+        ``extraction_category`` selects the extraction route of the backend's
+        LLM client (llm_clients.py::CategoryRoutedLLMClient).
 
         ``unverified_claim`` (task 3142) prefixes ``source_description`` with
         ``'[unverified_claim] '``, exactly as ``temporal_context`` prefixes it
@@ -1766,19 +1772,20 @@ class GraphitiBackend:
         if unverified_claim:
             source_description = f'[unverified_claim] {source_description}'
         try:
-            return await self._timed_write(
-                client.add_episode(
-                    name=name,
-                    episode_body=content,
-                    source=source,
-                    group_id=group_id,
-                    source_description=source_description,
-                    reference_time=ref_time,
-                    entity_types=entity_types,
-                    uuid=uuid,
-                ),
-                'add_episode',
-            )
+            with extraction_category_scope(extraction_category):
+                return await self._timed_write(
+                    client.add_episode(
+                        name=name,
+                        episode_body=content,
+                        source=source,
+                        group_id=group_id,
+                        source_description=source_description,
+                        reference_time=ref_time,
+                        entity_types=entity_types,
+                        uuid=uuid,
+                    ),
+                    'add_episode',
+                )
         except GraphitiCoreNodeNotFoundError as exc:
             # Translate only a not-found provably about the caller's own uuid —
             # graphiti_core raises the same class from entity/edge resolution
