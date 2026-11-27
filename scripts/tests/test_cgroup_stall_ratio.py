@@ -21,7 +21,7 @@ REPO_ROOT = Path(__file__).parents[2]
 SCRIPT = REPO_ROOT / 'scripts' / 'cgroup-stall-ratio.py'
 
 APP_SLICE = '0::/user.slice/user-1000.slice/user@1000.service/app.slice'
-# Scope unit-name shape owner: orchestrator/src/orchestrator/verify.py::_verify_scope_name / ::_scope_tag_for.
+# Scope unit-name shape owner: shared/src/shared/verify_scope_tag.py.
 # orchestrator/tests/test_verify_scope_name_stall_ratio_drift.py ties bucket() to that owner.
 DF_SCOPE = f'{APP_SLICE}/df-verify-dark-factory-c889f090-a3825b3fefa0.scope'
 REIFY_SCOPE = f'{APP_SLICE}/df-verify-reify-4ae45bbd-d3b5fc367ef0.scope'

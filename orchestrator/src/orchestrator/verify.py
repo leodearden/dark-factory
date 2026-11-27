@@ -49,6 +49,7 @@ from shared.psi import cpu_some10_or_none, read_psi_sample
 from shared.python_env import without_python_env_selection
 from shared.secret_env import without_account_pool
 from shared.verify_admission import acquire_task_slot, is_gated_role, nice_prefix
+from shared.verify_scope_tag import scope_tag_for, verify_scope_unit_name
 
 from orchestrator import (
     narrow_gate_delta,
@@ -5617,48 +5618,15 @@ class VerifyResult:
         return '\n\n'.join(sections) if sections else self.summary
 
 
-def _scope_tag_for(project_root: Path) -> str:
-    """Derive a deterministic, systemd-name-safe per-project scope tag.
-
-    All ``orchestrator-*.service`` units (reify, dark-factory, know-live, …)
-    run the SAME orchestrator package under ONE shared ``systemctl --user``
-    session, so ``df-verify-*.scope`` is a single per-user namespace shared
-    across projects.  Embedding this tag in the verify-scope unit name
-    (``df-verify-{tag}-{uuid}.scope``) lets each orchestrator's startup sweep
-    reap ONLY its own leftovers — a bare-glob sweep would reap a sibling
-    project's LIVE in-flight verify scope during a rolling fleet restart.
-
-    The tag is ``{basename-slug}-{path-hash}``:
-
-    - the ``project_root`` basename, lowercased and sanitized to ``[a-z0-9-]``
-      (operator-legible), bounded in length to keep the total unit name within
-      systemd's limit; and
-    - the first 8 hex chars of ``sha1(str(resolved_path))`` so two projects
-      that share a basename but live at different absolute paths still get
-      distinct tags (collision-resistant disambiguation).
-
-    Pure and deterministic: the same ``project_root`` always yields the same
-    tag, so a fresh boot reaps its dead predecessor's same-tagged scopes.
-    """
-    resolved = Path(project_root).resolve()
-    slug = re.sub(r'[^a-z0-9-]+', '-', resolved.name.lower()).strip('-')
-    # Bound the slug so the whole df-verify-{slug}-{hash}-{uuid}.scope name
-    # stays well within systemd's unit-name length limit.
-    slug = slug[:32] or 'proj'
-    digest = hashlib.sha1(str(resolved).encode()).hexdigest()[:8]
-    return f'{slug}-{digest}'
-
-
 def _verify_scope_name(scope_tag: str) -> str:
-    """Build a per-project, uuid-unique transient verify-scope unit name.
+    """A uuid-unique transient verify-scope unit name for *scope_tag*.
 
-    Shape: ``df-verify-{scope_tag}-{uuid}.scope``.  The ``df-verify-`` prefix
-    is preserved (existing prefix matchers are unaffected); ``scope_tag`` (see
-    ``_scope_tag_for``) confines the leftover-scope startup sweep to THIS
-    project; the 12-hex uuid segment keeps concurrent verifies from colliding
-    on a unit name.
+    The 12-hex instance keeps concurrent verifies from colliding on a unit
+    name. The ``df-verify-<tag>-<instance>.scope`` shape and the per-project
+    tag rule have one home, ``shared/src/shared/verify_scope_tag.py``, so the
+    load recorder parses exactly what this builds.
     """
-    return f'df-verify-{scope_tag}-{uuid.uuid4().hex[:12]}.scope'
+    return verify_scope_unit_name(scope_tag, uuid.uuid4().hex[:12])
 
 
 async def _kill_cgroup_scope(unit: str) -> None:
@@ -5724,8 +5692,9 @@ async def reap_leftover_verify_scopes(project_root: Path) -> list[str]:
     Cross-project safety: every ``orchestrator-*.service`` unit shares ONE
     per-user ``systemctl --user`` session, so ``df-verify-*.scope`` is a single
     shared namespace.  The enumeration is TAG-SCOPED to
-    ``df-verify-{tag}-*.scope`` (see ``_scope_tag_for``) AND the returned names
-    are DEFENSIVELY re-filtered to the same ``df-verify-{tag}-…\\.scope`` shape,
+    ``df-verify-{tag}-*.scope`` (``shared.verify_scope_tag.scope_tag_for``) AND
+    the returned names are DEFENSIVELY re-filtered to the same
+    ``df-verify-{tag}-…\\.scope`` shape,
     so a sibling project's LIVE in-flight verify scope can never be reaped even
     if the ``systemctl`` glob were to over-return.  systemd guarantees one
     incarnation per unit, and this runs before this incarnation's first
@@ -5737,7 +5706,7 @@ async def reap_leftover_verify_scopes(project_root: Path) -> list[str]:
     """
     if shutil.which('systemctl') is None or shutil.which('systemd-run') is None:
         return []
-    tag = _scope_tag_for(project_root)
+    tag = scope_tag_for(project_root)
     pattern = f'df-verify-{tag}-*.scope'
     listing = ''
     with contextlib.suppress(Exception):
@@ -8326,7 +8295,7 @@ async def run_verification(
             _scope_kw: _ScopeKw = (
                 {
                     'use_cgroup_scope': True,
-                    'scope_tag': _scope_tag_for(config.project_root),
+                    'scope_tag': scope_tag_for(config.project_root),
                     'slice_name': project_slice_name(config.fused_memory.project_id),
                     'cpu_weight': _resolve_scope_cpu_weight(config, role),
                     'memory_properties': config.verify_cgroup_memory.systemd_properties(),

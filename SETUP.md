@@ -1023,8 +1023,9 @@ Before a project flips its policy:
   do.** A process that cannot resolve its deployed commit offers no remote
   host to task verifies, and every one runs locally.
 - **Task-verify scopes share the project's systemd drop-in.** The scope name
-  is `df-verify-<tag>-<uuid>.scope`, and `verify.py::_scope_tag_for` derives
-  `<tag>` from the project root, not the verify role. So a
+  is `df-verify-<tag>-<uuid>.scope`, and
+  `shared/src/shared/verify_scope_tag.py::scope_tag_for` derives `<tag>` from
+  the project root, not the verify role. So a
   `df-verify-<tag>-.scope.d/` memory drop-in written for the project's merge
   verifies caps its task-verify scopes as well. Size it for both lanes
   running at once.
