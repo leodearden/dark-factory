@@ -36,6 +36,7 @@ from pydantic_core import PydanticCustomError
 
 from shared.cancel_dispositions import CancelDispositionEntry
 from shared.declared_scope import DECLARED_SCOPE_METADATA_KEY, DeclaredScope
+from shared.early_start_mark import EARLY_START_METADATA_KEY, EarlyStartMark
 from shared.followup_hold_records import (
     FINDING_SET_HOLD_METADATA_KEY,
     FOLLOWUP_HOLD_METADATA_KEY,
@@ -1229,6 +1230,9 @@ register_metadata_submodel(FINDING_SET_HOLD_METADATA_KEY, FindingSetHold, cardin
 
 # trigger_chain: plans/completion-driven-triggers-prd.md C2.
 register_metadata_submodel(TRIGGER_CHAIN_KEY, TriggerChain, cardinality='dict')
+
+# early_start: plans/early-start-on-predecessor-branch-prd.md §5.3.
+register_metadata_submodel(EARLY_START_METADATA_KEY, EarlyStartMark, cardinality='dict')
 
 # The metadata capabilities this schema's submit guard enforces; the running
 # fused-memory reports it through get_status (PRD C2 "Capability report").
