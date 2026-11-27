@@ -193,6 +193,12 @@ class TestExemptions:
                 _RESET_DESCRIPTION,
                 id='nominal-verb-after-article',
             ),
+            pytest.param(
+                'Human action needed: re-pin task 3105 rather than a reset out of '
+                'in-progress',
+                _RESET_DESCRIPTION,
+                id='negated-nominal-verb',
+            ),
         ],
     )
     async def test_gate_that_does_not_request_a_reset_is_not_enforced(
@@ -310,6 +316,16 @@ class TestPreservedSpecimenRefused:
                 'Human action needed: urgently reset task 3105 out of in-progress',
                 _RESET_DESCRIPTION,
                 id='adverb-without-negation',
+            ),
+            pytest.param(
+                'Request a reset of task 3105 out of in-progress',
+                _RESET_DESCRIPTION,
+                id='nominal-request-esc-5456-2',
+            ),
+            pytest.param(
+                'Human action needed: perform a reset of task 3105 out of in-progress',
+                _RESET_DESCRIPTION,
+                id='nominal-request-after-imperative',
             ),
         ],
     )
