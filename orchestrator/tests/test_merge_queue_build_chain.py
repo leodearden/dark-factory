@@ -184,6 +184,7 @@ class TestChainResultContract:
         assert res.truncated_reason is None
         assert res.lane is None
         assert res.lane_warm is False
+        assert res.link_tips == ()
 
     def test_depth_is_link_count(self):
         """.depth == len(links) — the value γ will emit as chain_items."""
@@ -1100,6 +1101,28 @@ class TestBuildChainClean:
         assert [tid for tid, _ in res.links] == ['101', '102']
         assert res.truncated_at is None
         assert res.truncated_reason is None
+        await release_chain_build_lane(git_ops, res.lane, warm=res.lane_warm)
+
+    async def test_each_link_records_the_branch_tip_it_merged(self, git_repo: Path):
+        """link_tips is parallel to links: each link's branch tip, its merge's ^2."""
+        from orchestrator.merge_lane.liveness import release_chain_build_lane
+        from orchestrator.merge_lane.worker import build_chain
+
+        git_ops = _make_git_ops(git_repo)
+        config = _make_config(git_repo)
+        await self._three_disjoint_branches(git_repo)
+        head = await _rev_parse(git_repo)
+        snap = tuple(
+            _make_req(str(i), str(i), config, git_repo) for i in (101, 102, 103)
+        )
+
+        res = await build_chain(git_ops, snap, head, cap=6, target_depth=3)
+
+        assert isinstance(res.link_tips, tuple)
+        assert len(res.link_tips) == len(res.links)
+        for (task_id, merge_commit), tip in zip(res.links, res.link_tips, strict=True):
+            assert tip == await _rev_parse(git_repo, f'task/{task_id}')
+            assert tip == await _rev_parse(git_repo, f'{merge_commit}^2')
         await release_chain_build_lane(git_ops, res.lane, warm=res.lane_warm)
 
 
