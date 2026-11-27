@@ -8,6 +8,9 @@ is active.
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
+
+import pytest
 
 from fused_memory.models.reconciliation import StageId
 from fused_memory.server.recon_report import ReconReportState
@@ -17,14 +20,13 @@ PROJECT_ID = 'dark_factory'
 
 
 def _make_state() -> ReconReportState:
-    t = [0.0]
-    return ReconReportState(ttl_seconds=300, clock=lambda: t[0])
+    return ReconReportState(ttl_seconds=300, clock=lambda: 0.0)
 
 
-def _file(state: ReconReportState, *, project_id: str = PROJECT_ID) -> None:
+def _file(state: ReconReportState) -> None:
     file_stage2_finding(
         state,
-        project_id=project_id,
+        project_id=PROJECT_ID,
         task_id='42',
         flag_type='some_flag',
         description='D',
@@ -48,8 +50,30 @@ def test_files_one_finding_on_the_active_stage2_run():
     assert row['actionable'] is True
 
 
-def test_drops_with_a_warning_when_no_run_is_active(caplog):
+def _start_no_run(state: ReconReportState) -> None:
+    pass
+
+
+def _start_a_run_on_another_stage(state: ReconReportState) -> None:
+    state.start_report(run_id='run-1', stage=StageId.memory_consolidator, project_id=PROJECT_ID)
+
+
+def _start_the_stage2_run_of_another_project(state: ReconReportState) -> None:
+    state.start_report(
+        run_id='run-1', stage=StageId.task_knowledge_sync, project_id='other_project',
+    )
+
+
+@pytest.mark.parametrize(
+    'start_runs',
+    [_start_no_run, _start_a_run_on_another_stage, _start_the_stage2_run_of_another_project],
+    ids=['no_run', 'another_stage', 'another_project'],
+)
+def test_drops_with_one_warning_when_the_project_has_no_active_stage2_run(
+    caplog, start_runs: Callable[[ReconReportState], None],
+):
     state = _make_state()
+    start_runs(state)
 
     with caplog.at_level(logging.WARNING):
         _file(state)
@@ -58,25 +82,4 @@ def test_drops_with_a_warning_when_no_run_is_active(caplog):
     assert 'some_flag' in record.getMessage()
     assert '42' in record.getMessage()
     assert PROJECT_ID in record.getMessage()
-    state.start_report(run_id='run-1', stage=StageId.task_knowledge_sync, project_id=PROJECT_ID)
-    assert state.get_findings_for_run('run-1') == []
-
-
-def test_ignores_a_run_active_on_another_stage():
-    state = _make_state()
-    state.start_report(run_id='run-1', stage=StageId.memory_consolidator, project_id=PROJECT_ID)
-
-    _file(state)
-
-    assert state.get_findings_for_run('run-1') == []
-
-
-def test_ignores_the_active_run_of_another_project():
-    state = _make_state()
-    state.start_report(
-        run_id='run-1', stage=StageId.task_knowledge_sync, project_id='other_project',
-    )
-
-    _file(state, project_id=PROJECT_ID)
-
     assert state.get_findings_for_run('run-1') == []

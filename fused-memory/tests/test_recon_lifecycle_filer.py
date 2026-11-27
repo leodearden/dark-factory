@@ -108,16 +108,12 @@ class TestBuildLifecycleResetFiler:
 
         await filer(_finding())
 
-        rows = state.get_findings_for_run('run-1')
-        assert len(rows) == 1
-        row = rows[0]
+        (row,) = state.get_findings_for_run('run-1')
         assert row['flag_type'] == LIFECYCLE_RESET_FLAG_TYPE
         assert row['task_id'] == '42'
-        assert row['description']
+        assert "'update_task'" in row['description']
+        assert 'claimant_run_id, status' in row['description']
         assert row['suggested_action']
-        assert row['severity'] == 'serious'
-        assert row['category'] == 'task_memory_mismatch'
-        assert row['actionable'] is True
 
     @pytest.mark.asyncio
     async def test_drops_with_a_warning_when_no_run_is_active(self, caplog):
@@ -132,16 +128,4 @@ class TestBuildLifecycleResetFiler:
         assert LIFECYCLE_RESET_FLAG_TYPE in record.getMessage()
         assert '42' in record.getMessage()
         state.start_report(run_id='run-1', stage=STAGE, project_id=PROJECT_ID)
-        assert state.get_findings_for_run('run-1') == []
-
-    @pytest.mark.asyncio
-    async def test_no_op_when_active_run_is_for_a_different_project(self):
-        from fused_memory.server.recon_lifecycle_filer import build_lifecycle_reset_filer
-
-        state = _make_state()
-        state.start_report(run_id='run-1', stage=STAGE, project_id='other_project')
-        filer = build_lifecycle_reset_filer(state)
-
-        await filer(_finding(project_id=PROJECT_ID))
-
         assert state.get_findings_for_run('run-1') == []
