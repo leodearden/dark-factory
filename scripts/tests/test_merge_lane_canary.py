@@ -291,6 +291,26 @@ def test_union_busy_hours_counts_two_hosts_verifying_at_once_once():
     assert canary.union_busy_hours(verify, at(0), at(600)) == pytest.approx(1.5)
 
 
+def test_verify_hours_per_landing_sums_every_hosts_completed_and_cancelled_time():
+    verify = [
+        completed(120, 'local', 60),    # [60, 120]
+        completed(150, 'laptop', 60),   # [90, 150], overlaps: a union would be 1.5 h
+        ev(160, 'x', runner='local'),   # no duration_ms: skipped
+    ]
+    cancelled = [cancelled_verify(200, 'laptop', 30)]
+
+    result = canary.verify_hours_per_landing(verify, cancelled, two_landings())
+
+    assert result.completed == pytest.approx(2.0)
+    assert result.cancelled == pytest.approx(0.5)
+    assert result.total == pytest.approx(2.5)
+    assert result.per_landing == pytest.approx(1.25)
+
+
+def test_verify_hours_per_landing_is_unmeasured_without_a_landing():
+    assert canary.verify_hours_per_landing([completed(120, 'local', 60)], [], ()).per_landing is None
+
+
 def test_queue_to_land_is_the_median_of_done_landings_in_hours():
     finalized = [
         ev(1, 'a', state='done', queue_to_land_secs=3600.0),
@@ -642,7 +662,7 @@ def test_chain_attributed_episodes_need_a_chain_landing_in_the_candidate_range()
 D12_KEYS = (
     'gates_per_landing', 'voids_per_landing', 'p_gate_after_gate', 'laptop_finished_share',
     'frozen_tip_violations', 'speculation_accounting_violations', 'chain_attributed_red_main',
-    'queue_to_land_p50_hours', 'local_verify_hours_per_week', 'deep_chain_p90_secs',
+    'queue_to_land_p50_hours', 'verify_hours_per_landing', 'deep_chain_p90_secs',
 )
 
 
@@ -651,7 +671,7 @@ def healthy_figures(**overrides: Any) -> canary.CanaryFigures:
         'gates_per_landing': 0.2, 'voids_per_landing': 0.05, 'p_gate_after_gate': 0.1,
         'laptop_finished_share': 0.05, 'frozen_tip_violations': 0,
         'speculation_accounting_violations': 0, 'chain_attributed_red_main': 0,
-        'queue_to_land_p50_hours': 0.5, 'local_verify_hours_per_week': 40.0,
+        'queue_to_land_p50_hours': 0.5, 'verify_hours_per_landing': 0.5,
         'deep_chain_p90_secs': 10800.0,
     }
     return canary.CanaryFigures(**{**values, **overrides})
@@ -661,7 +681,7 @@ def test_evaluate_returns_the_ten_d12_rows_in_order_with_their_values():
     rows = canary.evaluate(healthy_figures())
 
     assert tuple(row.key for row in rows) == D12_KEYS
-    assert [row.value for row in rows] == [0.2, 0.05, 0.1, 0.05, 0, 0, 0, 0.5, 40.0, 10800.0]
+    assert [row.value for row in rows] == [0.2, 0.05, 0.1, 0.05, 0, 0, 0, 0.5, 0.5, 10800.0]
     assert all(row.holds for row in rows)
     assert all(row.rule and row.label for row in rows)
 
@@ -679,7 +699,7 @@ def test_evaluate_carries_each_limit_comparison_and_baseline():
         'speculation_accounting_violations': (0, eq0, '—'),
         'chain_attributed_red_main': (0, eq0, '—'),
         'queue_to_land_p50_hours': (1.0, lt, '5.4 h'),
-        'local_verify_hours_per_week': (60.0, lt, '~100 h'),
+        'verify_hours_per_landing': (0.75, lt, '0.83–1.24 h (weekly, 10-22..11-12)'),
         'deep_chain_p90_secs': (10800.0, le, '—'),
     }
 
