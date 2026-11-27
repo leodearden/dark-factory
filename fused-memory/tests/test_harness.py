@@ -2632,16 +2632,17 @@ class TestStage2CycleSummaryHarnessBackstop:
 # ReconLedgerStore.get_by_identity), and its prompt rules
 # `present:false, expected:true` (reason='missing') GENUINELY ABSENT ->
 # missing_knowledge / actionable / carry_forward_ledger_write_gap — which
-# _maybe_remediate turns into a real Stage 1 + Stage 2 LLM pass. Today the
-# re-attempt that would have landed the row runs in the driver's `finally`,
-# i.e. AFTER Stage 3 and after remediation, so a transient in-stage write
-# failure burns a whole remediation pass for a row that was there for the
-# taking.
+# _maybe_remediate turns into a real Stage 1 + Stage 2 LLM pass. Before task
+# 4186 the re-attempt that would have landed the row ran in the driver's
+# `finally`, i.e. AFTER Stage 3 and after remediation, so a transient
+# in-stage write failure burned a whole remediation pass for a row that was
+# there for the taking.
 #
 # These tests observe the ledger AT STAGE 3'S DISPATCH — the exact row the
 # production presence check would see — rather than asserting on call order.
 #
-# RED — the flush does not exist yet, so Stage 3 observes None.
+# The flush lives in run_full_cycle and _run_remediation_pass via
+# _flush_cycle_summaries.
 # ---------------------------------------------------------------------------
 
 
