@@ -8,6 +8,7 @@ where CategoryRoutedLLMClient reads it.
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -204,6 +205,15 @@ class _Edge(BaseModel):
     fact: str
 
 
+def _route_decisions_through(config: FusedMemoryConfig, proxy_url: str) -> None:
+    config.plan_route = PlanRouteConfig(proxy_url=proxy_url)
+    config.llm.extraction_routes = {
+        'decisions_and_rationale': ExtractionRouteConfig(
+            model='gpt-6.1-sol', reasoning_effort='low', api_url=proxy_url, api_key='plan-key',
+        ),
+    }
+
+
 class TestInitializeBuildsTheGatedRoute:
     @pytest.mark.asyncio
     async def test_the_injected_client_routes_decisions_to_the_plan_proxy(
@@ -213,12 +223,7 @@ class TestInitializeBuildsTheGatedRoute:
             monkeypatch.delenv(name, raising=False)
         with mock_openai_server() as proxy:
             proxy.set_response('/responses', responses_body(json.dumps({'fact': 'f'})))
-            mock_config.plan_route = PlanRouteConfig(proxy_url=proxy.base_url)
-            mock_config.llm.extraction_routes = {
-                'decisions_and_rationale': ExtractionRouteConfig(
-                    model='gpt-6.1-sol', reasoning_effort='low', api_url=proxy.base_url, api_key='plan-key',
-                ),
-            }
+            _route_decisions_through(mock_config, proxy.base_url)
 
             async with _queued_service(mock_config, tmp_path) as queued:
                 client = queued.injected_llm_client()
@@ -231,3 +236,29 @@ class TestInitializeBuildsTheGatedRoute:
 
             [sent] = proxy.requests_to('/responses')
             assert sent['json_body']['model'] == 'gpt-6.1-sol'
+
+    @pytest.mark.asyncio
+    async def test_startup_logs_the_active_route_once_and_nothing_off(
+        self, mock_config, tmp_path: Path, monkeypatch, caplog,
+    ) -> None:
+        for name in ('OPENAI_BASE_URL', 'OPENAI_API_BASE', 'OPENAI_API_URL'):
+            monkeypatch.delenv(name, raising=False)
+        with mock_openai_server() as proxy:
+            _route_decisions_through(mock_config, proxy.base_url)
+
+            with caplog.at_level(logging.DEBUG):
+                async with _queued_service(mock_config, tmp_path):
+                    pass
+
+        messages = [(r.levelno, r.getMessage()) for r in caplog.records]
+        [(level, line)] = [
+            (level, message) for level, message in messages
+            if message.startswith('Graphiti LLM:') and 'decisions_and_rationale' in message
+        ]
+        assert level == logging.INFO
+        assert 'gpt-6.1-sol' in line
+        assert 'effort low' in line
+        assert proxy.base_url in line
+        assert 'plan-key' not in line
+        assert [m for lv, m in messages if lv >= logging.WARNING and 'decisions_and_rationale' in m] == []
+        assert [m for _, m in messages if 'is OFF' in m] == []

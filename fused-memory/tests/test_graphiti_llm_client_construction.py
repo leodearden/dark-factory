@@ -985,10 +985,6 @@ class TestAnUnbuildableRouteIsOff:
         assert rig.nothing_carried_the_route_model()
 
     @pytest.mark.asyncio
-    async def test_without_a_gate(self, rig: _RouteRig, caplog) -> None:
-        await self._assert_off(rig, caplog)
-
-    @pytest.mark.asyncio
     async def test_when_the_gate_does_not_gate_the_routes_url(self, rig: _RouteRig, caplog) -> None:
         rig.set_route(api_url='http://127.0.0.1:9/v1')
         await self._assert_off(rig, caplog, gated_http_client_for=rig.gate())
@@ -1000,11 +996,29 @@ class TestAnUnbuildableRouteIsOff:
         await self._assert_off(rig, caplog, gated_http_client_for=rig.gate())
 
 
+class TestACallerWithoutAGateBuildsNoRoute:
+    @pytest.mark.asyncio
+    async def test_it_gets_the_default_client_and_no_route_log(self, rig: _RouteRig, caplog) -> None:
+        with caplog.at_level(logging.DEBUG):
+            async with _built(rig.cfg) as client:
+                assert type(client) is OpenAIClient
+                with extraction_category_scope(_DECISIONS):
+                    await _call(client, 'extract_edges.edge')
+
+        [sent] = rig.api.requests_to('/responses')
+        assert sent['json_body']['model'] == 'gpt-4o-mini'
+        assert rig.proxy_saw_nothing()
+        assert [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING] == []
+        assert [r.getMessage() for r in caplog.records if 'is OFF' in r.getMessage()] == []
+
+
 class TestARouteKeyMustBeAGraphitiCategory:
+    @pytest.mark.parametrize('gated', [True, False])
     @pytest.mark.parametrize('key', ['not_a_category', 'procedural_knowledge'])
-    def test_any_other_key_is_refused_by_name(self, rig: _RouteRig, key: str) -> None:
+    def test_any_other_key_is_refused_by_name(self, rig: _RouteRig, key: str, gated: bool) -> None:
         route = rig.cfg.llm.extraction_routes.pop('decisions_and_rationale')
         rig.cfg.llm.extraction_routes[key] = route
+        gate = {'gated_http_client_for': rig.gate()} if gated else {}
 
         with pytest.raises(ValueError, match=key):
-            build_llm_client(rig.cfg, gated_http_client_for=rig.gate())
+            build_llm_client(rig.cfg, **gate)
