@@ -38,8 +38,12 @@ def _open_fds() -> list[str]:
     return sorted(os.listdir('/proc/self/fd'))
 
 
+# A tag of the shape shared.verify_scope_tag builds; _run_cmd refuses any other.
+_SCOPE_TAG = 't7339-00007339'
+
+
 async def _scoped_leg(cmd: str, cwd: Path, timeout: float = 30.0) -> tuple[int, str, bool]:
-    return await _run_cmd(cmd, cwd, timeout=timeout, use_cgroup_scope=True, scope_tag='t7339')
+    return await _run_cmd(cmd, cwd, timeout=timeout, use_cgroup_scope=True, scope_tag=_SCOPE_TAG)
 
 
 async def _exits_red(cwd: Path, argv_dir: Path) -> None:

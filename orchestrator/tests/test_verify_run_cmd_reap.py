@@ -26,6 +26,8 @@ from df_pytest_isolation import wait_pids_exited
 from orchestrator.verify import _run_cmd
 
 _DEV_FULL = Path('/dev/full')
+# A tag of the shape shared.verify_scope_tag builds; _run_cmd refuses any other.
+_SCOPE_TAG = 't6595-00006595'
 _LEAKER = (
     'sleep 60 >/dev/null 2>&1 & echo $! > child.pid; '
     'echo $$ > leader.pid; echo go; wait'
@@ -115,13 +117,13 @@ async def test_log_flush_failure_under_cgroup_scope_kills_scope_then_group(
 ):
     rc, out, timed_out = await _run_cmd(
         _LEAKER, tmp_path, timeout=30.0, log_path=_DEV_FULL,
-        use_cgroup_scope=True, scope_tag='t6595',
+        use_cgroup_scope=True, scope_tag=_SCOPE_TAG,
     )
     leader, child = _leaker_pids(tmp_path)
     try:
         _assert_command_failed(rc, out, timed_out)
         unit = fake_scope_tools.unit.read_text().strip()
-        assert unit.startswith('df-verify-t6595-'), unit
+        assert unit.startswith(f'df-verify-{_SCOPE_TAG}-'), unit
         assert unit.endswith('.scope'), unit
         assert fake_scope_tools.systemctl.exists(), 'no systemctl call recorded'
         assert fake_scope_tools.systemctl.read_text().splitlines() == [
@@ -145,7 +147,7 @@ async def test_clean_exit_under_cgroup_scope_runs_no_teardown(
 ):
     rc, _, _ = await _run_cmd(
         'echo ok', tmp_path, timeout=30.0, log_path=tmp_path / 'ok.log',
-        use_cgroup_scope=True,
+        use_cgroup_scope=True, scope_tag=_SCOPE_TAG,
     )
     assert rc == 0
     assert fake_scope_tools.unit.exists(), 'the scope launch path was not taken'
@@ -166,6 +168,7 @@ async def test_spawn_failure_under_cgroup_scope_runs_no_teardown(
 ):
     rc, out, timed_out = await _run_cmd(
         'true', tmp_path / 'absent', timeout=5.0, use_cgroup_scope=True,
+        scope_tag=_SCOPE_TAG,
     )
     _assert_command_failed(rc, out, timed_out)
     assert not fake_scope_tools.unit.exists(), 'systemd-run ran despite the spawn failing'

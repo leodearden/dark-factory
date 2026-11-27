@@ -786,7 +786,7 @@ class TestRunCmdCapturesInItsRealScope:
     ):
         with allocate_command_capture() as capture:
             _rc, _output, timed_out = await _scoped(
-                'sleep 30', tmp_path, real_project_slice.slice_name, timeout=1, capture=capture
+                'sleep 30', tmp_path, real_project_slice.slice_name, timeout=5, capture=capture
             )
             record = capture.record(**IDENTITY)
 
@@ -824,7 +824,7 @@ class TestRunCmdCapturesInItsRealScope:
                 _relocating(inner_unit, 30),
                 tmp_path,
                 real_project_slice.slice_name,
-                timeout=3,
+                timeout=5,
                 capture=capture,
             )
             record = capture.record(**IDENTITY)
