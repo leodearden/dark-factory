@@ -120,6 +120,7 @@ queue:
   backend_read_timeout_seconds: ${BACKEND_READ_TIMEOUT:30}
   backend_write_timeout_seconds: ${BACKEND_WRITE_TIMEOUT:120}
   search_timeout_seconds: ${SEARCH_TIMEOUT:30}
+  # A relative value is anchored at the checkout holding fused-memory/, not the process CWD (fused_memory/config/checkout_anchor.py).
   data_dir: "${QUEUE_DATA_DIR:./data/queue}"
   # Error-aware retry budget (task 1936, membership revised by task 3585).
   # Errors whose class name matches any entry below — walked over the raised

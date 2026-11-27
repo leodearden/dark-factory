@@ -592,7 +592,14 @@ class QueueConfig(BaseModel):
     backend_read_timeout_seconds: float = Field(default=30.0)
     backend_write_timeout_seconds: float = Field(default=120.0)
     search_timeout_seconds: float = Field(default=15.0)
-    data_dir: str = Field(default='./data/queue')
+    # A relative value is anchored at the checkout root at load
+    # (config/checkout_anchor.py::anchor_at_checkout), never the process CWD (task 10210).
+    data_dir: str = Field(default='./data/queue', validate_default=True)
+
+    @field_validator('data_dir')
+    @classmethod
+    def _anchor_data_dir(cls, value: str) -> str:
+        return anchor_at_checkout(value)
 
     @model_validator(mode='after')
     def _validate_transient_max_attempts(self) -> 'QueueConfig':
