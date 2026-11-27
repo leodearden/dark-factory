@@ -31,6 +31,8 @@ def _workflow() -> MagicMock:
         setattr(wf.metrics, name, 0)
     wf.metrics.total_cost_usd = 0.0
     wf.metrics.judge_cost_usd = 0.0
+    wf.metrics.dispatched_routes = []
+    wf.config.models = ModelsConfig()
     wf.config.env_overrides = {}
     wf.config.max_execute_iterations = 20
     wf.artifacts.read_plan.return_value = {'steps': []}
