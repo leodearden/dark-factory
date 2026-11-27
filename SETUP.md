@@ -580,6 +580,14 @@ by hand until then.
   branch. The **load-bearing** push — the actual commit under verification —
   goes to a separate, namespaced ref instead, `refs/merge-verify/<request-id>`,
   which is never checked out and so needs no such configuration.
+  Before that push, every remote verify (merge and task alike) also mirrors
+  the project checkout's local tags (`refs/tags/*:refs/tags/*`) to the
+  runner's `git_remote` (`verify_runner.py::RemoteRunner._mirror_tags`), so a
+  test that gates on a release tag sees the same tag set on both hosts. A
+  remote tag pointing elsewhere is force-mirrored and announced with a
+  `runner_synced` event of kind `project_tag_mirror`; a host that refuses the
+  tags is benched rather than verifying with a lagging tag set. Tags that
+  exist only on the remote are left in place, not pruned.
 - **The orchestrator wrapper**, at `/usr/local/bin/orchestrator`
   (`VERIFY_HOST_WRAPPER_PATH` moves it), needed because a non-interactive
   `ssh host cmd` does not source `~/.bashrc`/`~/.profile`, so a bare

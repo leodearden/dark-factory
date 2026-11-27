@@ -24,7 +24,8 @@ It verifies one commit. The default is the tip of `git.main_branch`, and
   checkout's own sha as the gate and checks the gate's handshake. It then calls
   `RemoteRunner.run_merge_verify`. That first pushes the project's local
   `main` to the runner's `git_remote`, force-mirroring it when the host's
-  `main` has diverged. It then pushes `refs/merge-verify/<id>` and runs
+  `main` has diverged. The dispatch then mirrors the project's tags to that
+  remote, and only then pushes `refs/merge-verify/<id>` and runs
   `orchestrator verify-merge` over ssh in that gate.
 - **Where it runs on the host.** `verify-merge` makes its own ephemeral
   `_merge-<uuid>` worktree. It runs as its own process, separate from any

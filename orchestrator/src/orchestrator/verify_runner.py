@@ -1521,8 +1521,10 @@ class RemoteRunner:
     other parseable VerifyResult is returned unchanged, even passed=False or
     timed_out=True (PRD §A Invariant 5).
 
-    The pushed ref ``refs/merge-verify/<request_id>`` is pruned best-effort on
-    return (step-10).
+    Every dispatch mirrors the project's tags to its git remote
+    (:meth:`_mirror_tags`) before pushing the verified sha as
+    ``refs/merge-verify/<request_id>``, which is pruned best-effort on return
+    (step-10).
     """
 
     is_local: ClassVar[bool] = False
@@ -1959,7 +1961,8 @@ class RemoteRunner:
     ) -> VerifyResult:
         """Run a task-role verify of ``spec.tip_sha`` on the remote host (PRD §5.2).
 
-        ``_dispatch('verify-task')``, with no main-mirror push.  With
+        ``_dispatch('verify-task')``, whose tag mirror runs as for a merge;
+        there is no main-mirror push.  With
         *archive_root*, a red archives the remote stderr, the
         ``attempt-<spec.attempt_id>.remote-<name>.{test,lint,type}-<stamp>.log``
         streams and their ``.summary-<stamp>.json`` (role 'task'); a green archives
