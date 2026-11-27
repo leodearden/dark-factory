@@ -1800,18 +1800,14 @@ def test_root_fleet_chain_and_scripts_module_agree_on_the_scripts_suites(
 
 # The WORST GREEN test command on record for this leg in the verify archive.
 # Since task 11825 it is a scoped task-role leg over scripts/tests/ files, not
-# the verbatim union test_command: task 5296 attempt 1, role task, rc=0,
-# xdist -n 8, loadavg1 154->191, started 2026-11-22T17:55:14Z, summary
-# data/verify-logs/5296/attempt-1.scripts.summary-20261122T181534_082242Z.json.
-# A non-verbatim run is the right sizing input because the family floor sizes
-# against the leg's longest green test command of any role and any command
-# (scripts/timeout_headroom_selfcheck.py module docstring, LEG BUDGET): the
-# per-command budget must outlast whatever the leg actually runs. Every run
-# behind this figure and the sizing rule are recorded ONCE, in the PER-MODULE
-# VERIFY BUDGET block above verify_command_timeout_secs in
-# scripts/orchestrator.yaml. Read them there rather than copying them here.
-# HISTORY: task 3458 sized this floor against 930.59s, the worst of six runs of
-# the verbatim union test_command, which that same block still records.
+# the verbatim union test_command. It is the right sizing input all the same,
+# because the family floor sizes against the leg's longest green test command
+# of any role and any command (scripts/timeout_headroom_selfcheck.py module
+# docstring, LEG BUDGET): the per-command budget must outlast whatever the leg
+# actually runs. Every run behind this figure, the earlier figures it replaced,
+# and the sizing rule are recorded ONCE, in the PER-MODULE VERIFY BUDGET block
+# above verify_command_timeout_secs in scripts/orchestrator.yaml. Read them
+# there rather than copying them here.
 MEASURED_SUITE_WORST_SECS = 1219.3075953563675
 # DERIVED from MEASURED_SUITE_WORST_SECS, not hand-set, so the two cannot
 # silently diverge — that exact pair has already rotted once, in the sibling
