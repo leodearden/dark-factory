@@ -292,8 +292,13 @@ def _measured(
 
 
 def _read_directory(directory: Path) -> CgroupReading | _Gap:
+    """Read the C4 files of *directory*: the capture copy and the live scope alike.
+
+    Any other listed file is never opened, so it can neither fail the reading
+    nor cost the kill path a ``memory.stat`` flush.
+    """
     try:
-        present = frozenset(os.listdir(directory))
+        present = frozenset(os.listdir(directory)) & frozenset(_CAPTURED_FILES)
     except OSError as exc:
         return _Gap(f'{directory} could not be listed: {exc}')
     reading = read_cgroup(directory, present=present)

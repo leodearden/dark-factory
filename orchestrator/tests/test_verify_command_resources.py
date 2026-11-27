@@ -495,6 +495,18 @@ class TestReadBeforeKill:
         assert record.relocated_scopes == frozenset({'run-u7.scope'})
         assert record.cpu_usec == 4200000
 
+    @pytest.mark.parametrize('unused', ['memory.stat', 'memory.current', 'memory.swap.current'])
+    def test_a_garbage_file_the_record_does_not_use_is_never_read(self, tmp_path, unused):
+        cgroup_root = tmp_path / 'sysfs'
+        _live_scope(cgroup_root, {**SCOPE_FILES, unused: 'not a counter file\n'})
+        capture = _launched_with_cgroup(tmp_path, cgroup_root)
+
+        capture.read_before_kill(frozenset())
+        record = capture.record(**IDENTITY)
+
+        assert record.capture is Capture.BEFORE_KILL, record.capture_reason
+        assert record.cpu_usec == 4200000
+
     def test_a_missing_live_directory_is_unavailable_and_never_raises(self, tmp_path):
         capture = _launched_with_cgroup(tmp_path, tmp_path / 'sysfs')
 
