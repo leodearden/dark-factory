@@ -8,9 +8,10 @@
 #    cannot silently arm an older table. Main's copy is read once and each id is
 #    tested against it.
 # 2. Runs scripts/routing_experiment_readout.py --aa (leaf beta) over the trailing
-#    window with the experiment salt: the A/A check that seat N showed is required
-#    before any split is read (task-id parity skew, drift). Non-zero there stops here.
-# 3. Calls reload_config on every unit listed in UNITS through the shared transport
+#    window with the experiment salt, reading only the experiment units' roots: the
+#    A/A check that seat N showed is required before any split is read (task-id
+#    parity skew, drift). Non-zero there stops here.
+# 3. Calls reload_config on every experiment unit through the shared transport
 #    (scripts/_config_reload_gate.py). A unit whose MCP is not listening is SKIPPED
 #    with a warning, never a failure: defaults.yaml is re-read at its next start, so
 #    a halted or idle unit arms itself when it comes back. A unit that answers with
@@ -19,7 +20,8 @@
 #    the salt, rule ids, flip time and per-unit dispositions: the readout gate's
 #    anchor for "when did arm 1 start".
 #
-# Usage: routing_experiment_arm.sh <salt> <rule_id_csv> [days]
+# Usage: [ROUTING_EXPERIMENT_UNITS='<project_root>:<port> ...'] \
+#          routing_experiment_arm.sh <salt> <rule_id_csv> [days]
 #   e.g. routing_experiment_arm.sh routing-exp-1 large-plan-modules-4,large-plan-modules 30
 set -euo pipefail
 
@@ -31,8 +33,9 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
 PY="$ROOT/.venv/bin/python3"; [ -x "$PY" ] || PY=python3
 
-# Fleet units: <project_root>:<escalation_port>. Idle or halted units are skipped
-# when their MCP does not answer (see header). Override with ROUTING_EXPERIMENT_UNITS.
+# The experiment's units, <project_root>:<escalation_port>, whitespace-separated.
+# Step 2's A/A reads exactly their roots and step 3 reloads exactly them. The
+# default is the whole fleet; ROUTING_EXPERIMENT_UNITS names a subset.
 UNITS="${ROUTING_EXPERIMENT_UNITS:-\
 /home/leo/src/dark-factory:8102 \
 /home/leo/src/reify:8100 \
@@ -43,6 +46,16 @@ UNITS="${ROUTING_EXPERIMENT_UNITS:-\
 /home/leo/src/pump-web-ui:8108 \
 /home/leo/src/know-live:8105 \
 /home/leo/src/autopilot-video:8101}"
+
+IFS=$' \t\n' read -r -d '' -a UNIT_LIST <<< "$UNITS" || true
+[ "${#UNIT_LIST[@]}" -gt 0 ] \
+  || die "ROUTING_EXPERIMENT_UNITS names no unit; an experiment needs at least one <project_root>:<port>"
+ROOTS=()
+for unit in "${UNIT_LIST[@]}"; do
+  [[ "$unit" =~ ^(.+):([0-9]+)$ ]] || die "unit '${unit}' is not <project_root>:<port>"
+  ROOTS+=("${BASH_REMATCH[1]}")
+done
+ROOTS_CSV="$(IFS=,; printf '%s' "${ROOTS[*]}")"
 
 # 1. The rule ids must be on main's defaults.yaml (the editable install every unit reads).
 RULES_FILE=orchestrator/src/orchestrator/defaults.yaml
@@ -58,10 +71,11 @@ done
 [ -f "$ROOT/scripts/routing_experiment_readout.py" ] \
   || die "scripts/routing_experiment_readout.py is missing; land beta before arming"
 "$PY" "$ROOT/scripts/routing_experiment_readout.py" --aa --salt "$SALT" --buckets 2 --days "$DAYS" \
+    --roots "$ROOTS_CSV" \
   || { rc=$?; die "the readout's A/A check did not pass for salt '$SALT' (exit $rc: 1 = skewed, 3 = no ledger read, 4 = unproven; its own message above says which); do not arm"; }
 
 # 3. Reload every reachable unit; 4. record the flip.
-"$PY" - "$HERE" "$SALT" "$RULES" "$ROOT/data/orchestrator/routing_experiments.jsonl" $UNITS <<'PYEOF'
+"$PY" - "$HERE" "$SALT" "$RULES" "$ROOT/data/orchestrator/routing_experiments.jsonl" "${UNIT_LIST[@]}" <<'PYEOF'
 import json, sys, datetime, pathlib
 here, salt, rules, ledger, *units = sys.argv[1:]
 sys.path.insert(0, here)
