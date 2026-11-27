@@ -907,6 +907,8 @@ class _Scripted:
         self.replies: dict[str, _Reply] = {
             'publish': (0, '', ''),
             'ensure': (0, json.dumps({'built': False, 'identity': identity}), ''),
+            'tag_list': (0, '', ''),
+            'tag_push': (0, '', ''),
             'verify_push': (0, '', ''),
             'delete': (0, '', ''),
             'verify': (0, result_to_json(_VERDICT), ''),
@@ -921,6 +923,10 @@ class _Scripted:
     @staticmethod
     def role(argv: list[str]) -> str:
         plain = without_push_ssh_config(argv)
+        if plain[:2] == ['git', 'for-each-ref']:
+            return 'tag_list'
+        if plain[:2] == ['git', 'push'] and any('refs/tags/' in word for word in plain[3:]):
+            return 'tag_push'
         if plain[:2] == ['git', 'push']:
             if '--delete' in plain:
                 return 'delete'
@@ -974,19 +980,19 @@ async def test_publish_pushes_the_deployed_sha_by_url_from_the_code_checkout():
 
     await _scripted_runner(transport).run_merge_verify('mergesha', _spec())
 
-    assert transport.roles() == ['publish', 'ensure', 'verify_push', 'verify', 'delete']
+    assert transport.roles() == ['publish', 'ensure', 'tag_list', 'verify_push', 'verify', 'delete']
     _, publish, cwd = transport.calls[0]
     assert publish == [
         'git', *GIT_PUSH_SSH_CONFIG, 'push',
         'leo-laptop:/laptop/dark-factory', f'{_SHA}:refs/gate/{_SHA}',
     ]
     assert cwd == '/dispatcher/checkout'
-    _, verify_push, _ = transport.calls[2]
+    _, verify_push, _ = transport.calls[3]
     assert verify_push[:1 + len(GIT_PUSH_SSH_CONFIG)] == ['git', *GIT_PUSH_SSH_CONFIG]
     ensure = transport.calls[1][1][-1]
     assert ensure.startswith(f'{REMOTE_TOOL_PATH_PRELUDE} env GATE_ROOT=/gates SHA={_SHA} ')
     assert 'SOURCE=/laptop/dark-factory bash -c ' in ensure
-    assert gate_argv_for(transport.calls[3][1][-1])[:3] == ['verify-merge', '--sha', 'mergesha']
+    assert gate_argv_for(transport.calls[4][1][-1])[:3] == ['verify-merge', '--sha', 'mergesha']
 
 
 def gate_argv_for(remote_cmd: str) -> list[str]:
@@ -1312,7 +1318,9 @@ async def test_a_publish_colliding_on_the_gate_ref_is_retried_once():
     result = await _scripted_runner(transport).run_merge_verify('mergesha', _spec())
 
     assert result == _VERDICT
-    assert transport.roles() == ['publish', 'publish', 'ensure', 'verify_push', 'verify', 'delete']
+    assert transport.roles() == [
+        'publish', 'publish', 'ensure', 'tag_list', 'verify_push', 'verify', 'delete',
+    ]
 
 
 @pytest.mark.asyncio

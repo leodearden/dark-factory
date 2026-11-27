@@ -1076,6 +1076,10 @@ _SSH_PROBE_OPTS = (
 # its ssh commands do instead of riding ~/.ssh/config (task 6565).
 GIT_PUSH_SSH_CONFIG = ('-c', f'core.sshCommand=ssh {" ".join(_SSH_BASE_OPTS)}')
 
+# Every tag of the project checkout, to the same name on the runner's git_remote
+# (task 11840, RemoteRunner._mirror_tags).
+_TAG_MIRROR_REFSPEC = 'refs/tags/*:refs/tags/*'
+
 # Exit status ssh reserves for its OWN errors rather than the remote command's:
 # "ssh exits with the exit status of the remote command or with 255 if an error
 # occurred" (ssh(1), EXIT STATUS).  A sleeping host, a refused connection, a
@@ -2067,6 +2071,40 @@ class RemoteRunner:
             return None
         return (stdout.strip() or None) if rc == 0 else None
 
+    async def _local_tag_refs(self) -> tuple[str, ...] | None:
+        """The local ``<object> <refname>`` tag lines by a network-free ``git for-each-ref``, or None when unreadable."""
+        try:
+            rc, stdout, _ = await self._run(
+                ['git', 'for-each-ref', '--format=%(objectname) %(refname)', 'refs/tags'],
+                cwd=self._cwd,
+            )
+        except OSError:
+            return None
+        if rc != 0:
+            return None
+        return tuple(line for line in stdout.splitlines() if line.strip())
+
+    async def _mirror_tags(self) -> None:
+        """Push every local tag of the project checkout to the remote before a verify.
+
+        Unlike main's freshness, the tag set is an INPUT to the verdict (a test
+        may gate on a release tag), so it is synced before every verify or the
+        verify does not run: a failed push raises RunnerUnavailable.  An
+        unreadable listing is this dispatcher's fault, not the host's, so it is
+        logged and skipped; an empty one is skipped because a glob refspec
+        matching nothing makes git push exit 1.
+        """
+        tags = await self._local_tag_refs()
+        if tags is None:
+            logger.warning(
+                'RemoteRunner %r: local tags of %s unreadable, so its tag set was not mirrored',
+                self.name, self._cwd,
+            )
+            return
+        if not tags:
+            return
+        await self._push(self._git_remote, _TAG_MIRROR_REFSPEC, cwd=self._cwd)
+
     async def _dispatch(
         self,
         sha: str,
@@ -2078,14 +2116,15 @@ class RemoteRunner:
         event_store: Any = None,
         task_id: str | None = None,
     ) -> _DispatchOutcome:
-        """Ensure the gate, push *sha* to ``refs/merge-verify/<request_id>``, run *subcommand* over ssh, parse the verdict.
+        """Ensure the gate, mirror the project's tags, push *sha* to ``refs/merge-verify/<request_id>``, run *subcommand* over ssh, parse the verdict.
 
         The one transport every remote verify shares (PRD §4.3).  It claims the
         runner's single in-flight slot synchronously, before its first await,
         and clears it on unwind; a claim while another is live breaks the
         exclusive-use invariant and raises ConcurrentDispatchError, leaving
         the live claim untouched.  :meth:`ensure_gate` runs on every call, so
-        every verify runs the deployed sha's gate.  After a successful push the
+        every verify runs the deployed sha's gate, and :meth:`_mirror_tags`
+        then gives the remote the project's tag set.  After a successful push the
         ref is deleted best-effort on every exit.  A :meth:`cancel_verify`
         before the verify ssh starts makes it raise RunnerUnavailable
         ('transport') instead of starting the verify.
@@ -2103,6 +2142,7 @@ class RemoteRunner:
         ref = f'refs/merge-verify/{request_id}'
         try:
             await self.ensure_gate(event_store=event_store, task_id=task_id)
+            await self._mirror_tags()
             await self._push(self._git_remote, f'{sha}:{ref}', cwd=self._cwd)
             try:
                 outcome = await self._run_gate_verify(sha, subcommand, spec_json, request_id)
