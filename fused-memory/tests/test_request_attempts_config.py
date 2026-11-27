@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
@@ -14,6 +15,8 @@ from fused_memory.config.request_attempts import (
     RequestAttemptsConfig,
 )
 from fused_memory.config.schema import EmbedderConfig, FusedMemoryConfig, QueueConfig
+
+SHIPPED_CONFIG_PATH = Path(__file__).resolve().parent.parent / 'config' / 'config.yaml'
 
 
 def _config(attempts: RequestAttemptsConfig, *, write_budget_s: float) -> FusedMemoryConfig:
@@ -97,7 +100,7 @@ class TestTheScheduleMustFitTheWriteBudget:
         with pytest.raises(ValidationError, match='120.5'):
             _config(attempts, write_budget_s=120.0)
 
-    def test_a_reload_revalidates_the_schedule(self):
+    def test_revalidating_a_mutated_config_rejects_the_schedule(self):
         config = _config(RequestAttemptsConfig(), write_budget_s=120.0)
         config.embedder.request_attempts.per_attempt_timeout_seconds = 40.0
 
@@ -107,6 +110,8 @@ class TestTheScheduleMustFitTheWriteBudget:
 
 def test_the_shipped_schedule_fits_both_backend_budgets(monkeypatch):
     """A stalled search embed is retried too, not only a stalled write's."""
+    assert SHIPPED_CONFIG_PATH.is_file()
+    monkeypatch.setenv('CONFIG_PATH', str(SHIPPED_CONFIG_PATH))
     monkeypatch.delenv('EMBEDDER_ATTEMPT_TIMEOUT', raising=False)
     monkeypatch.delenv('EMBEDDER_MAX_ATTEMPTS', raising=False)
 
