@@ -13,11 +13,17 @@ landing datum (shared.quality_series.landings.recorded_landings) records it
 before read_at, and its cost is every invocation of any role started before
 read_at. R is (landed_t / cost_t) / (landed_c / cost_c).
 
+R's interval resamples tasks with replacement within each arm, as a percentile
+interval at the options' level. Its A/A null permutes the observed arm labels
+at the observed sizes and reports the p95 and p99 of max(R, 1/R). One
+``random.Random(seed)`` draws the bootstrap first, then the null.
+
 Reads runs.db read-only; never imports the readout or the look.
 """
 from __future__ import annotations
 
 import math
+import random
 from collections import defaultdict
 from collections.abc import Iterable, Mapping, Sequence
 from contextlib import closing
@@ -34,17 +40,20 @@ from shared.project_layout import runs_db
 from shared.quality_series.landings import UnrecognisedTrainEvent, parse_utc, recorded_landings
 from shared.routing_split import split_bucket
 from shared.sqlite_readonly import connect_readonly
+from split_resampling import bootstrap_arms, null_cuts, percentile_interval, permuted_arms
 
 __all__ = [
     'Arm',
     'ArmTotals',
     'BLOCKED_OUTCOMES',
     'CohortRecord',
+    'IntervalSide',
     'ThroughputOptions',
     'ThroughputReport',
     'ThroughputUnavailable',
     'Unavailable',
     'resolve_since',
+    'side_of',
     'throughput_report',
 ]
 
@@ -64,6 +73,26 @@ class Unavailable(Enum):
     NO_TREATED_DISPATCH = 'no routing_decision carries the rule prefix'
     STORE_UNREADABLE = 'a runs.db or its landing datum is unreadable'
     HISTORY_UNREADABLE = "main's git history is unreadable"
+
+
+class IntervalSide(Enum):
+    """Where R's interval lies against 1."""
+
+    ABOVE_1 = 'wholly above 1'
+    BELOW_1 = 'wholly below 1'
+    INCLUDES_1 = 'includes 1'
+    UNDEFINED = 'undefined'
+
+
+def side_of(interval: tuple[float, float] | None) -> IntervalSide:
+    if interval is None:
+        return IntervalSide.UNDEFINED
+    low, high = interval
+    if low > 1:
+        return IntervalSide.ABOVE_1
+    if high < 1:
+        return IntervalSide.BELOW_1
+    return IntervalSide.INCLUDES_1
 
 
 class ThroughputUnavailable(Exception):
@@ -155,7 +184,11 @@ class ArmTotals:
 
 @dataclass(frozen=True)
 class ThroughputReport:
-    """The cohort's records, each arm's totals and R; ratio is None when undefined."""
+    """The cohort's records, each arm's totals, R, its interval and its A/A null.
+
+    ratio and interval are None when undefined; null is the (p95, p99) of
+    max(R, 1/R) under relabelling, None when fewer than 2 relabellings define R.
+    """
 
     options: ThroughputOptions
     since: datetime
@@ -163,6 +196,9 @@ class ThroughputReport:
     records: tuple[CohortRecord, ...]
     totals: Mapping[Arm, ArmTotals]
     ratio: float | None
+    interval: tuple[float, float] | None
+    interval_side: IntervalSide
+    null: tuple[float, float] | None
 
 
 def _placeholders(values: Sequence[object]) -> str:
@@ -315,6 +351,60 @@ def _arm_totals(records: Sequence[CohortRecord], arm: Arm) -> ArmTotals:
     )
 
 
+@dataclass(frozen=True)
+class _Columns:
+    """Each record's landed flag and cost, by record index."""
+
+    landed: tuple[int, ...]
+    cost: tuple[float, ...]
+
+    @classmethod
+    def of(cls, records: Sequence[CohortRecord]) -> _Columns:
+        return cls(
+            tuple(int(record.landed_at is not None) for record in records),
+            tuple(record.cost_usd for record in records),
+        )
+
+    def sums(self, members: Iterable[int]) -> tuple[int, float]:
+        picked = list(members)
+        return sum(self.landed[i] for i in picked), math.fsum(self.cost[i] for i in picked)
+
+
+def _bootstrap_interval(
+    columns: _Columns, treated: Sequence[int], control: Sequence[int],
+    options: ThroughputOptions, rng: random.Random,
+) -> tuple[float, float] | None:
+    draws = [
+        _ratio(*columns.sums(drawn_treated), *columns.sums(drawn_control))
+        for drawn_treated, drawn_control in bootstrap_arms([treated, control], options.resamples, rng)
+    ]
+    defined = [draw for draw in draws if draw is not None]
+    if len(defined) < 2:
+        return None
+    return percentile_interval(defined, options.interval_level)
+
+
+def _magnitude(ratio: float | None) -> float | None:
+    if not ratio:
+        return None
+    return max(ratio, 1 / ratio)
+
+
+def _aa_null(
+    columns: _Columns, n_treated: int, n_control: int, resamples: int, rng: random.Random,
+) -> tuple[float, float] | None:
+    total_landed, total_cost = columns.sums(range(n_treated + n_control))
+    magnitudes: list[float] = []
+    for (drawn_control,) in permuted_arms([n_control, n_treated], resamples, rng):
+        landed_c, cost_c = columns.sums(drawn_control)
+        magnitude = _magnitude(_ratio(total_landed - landed_c, total_cost - cost_c, landed_c, cost_c))
+        if magnitude is not None:
+            magnitudes.append(magnitude)
+    if len(magnitudes) < 2:
+        return None
+    return null_cuts(magnitudes)
+
+
 def throughput_report(options: ThroughputOptions, since: datetime) -> ThroughputReport:
     """The cohort dispatched from *since* (see :func:`resolve_since`), read across options.roots.
 
@@ -332,6 +422,11 @@ def throughput_report(options: ThroughputOptions, since: datetime) -> Throughput
     )
     totals = {arm: _arm_totals(records, arm) for arm in Arm}
     treated, control = totals[Arm.TREATED], totals[Arm.CONTROL]
+    columns = _Columns.of(records)
+    treated_members = [i for i, record in enumerate(records) if record.arm is Arm.TREATED]
+    control_members = [i for i, record in enumerate(records) if record.arm is Arm.CONTROL]
+    rng = random.Random(options.seed)
+    interval = _bootstrap_interval(columns, treated_members, control_members, options, rng)
     return ThroughputReport(
         options=options,
         since=since,
@@ -339,4 +434,7 @@ def throughput_report(options: ThroughputOptions, since: datetime) -> Throughput
         records=tuple(records),
         totals=MappingProxyType(totals),
         ratio=_ratio(treated.landed, treated.cost_usd, control.landed, control.cost_usd),
+        interval=interval,
+        interval_side=side_of(interval),
+        null=_aa_null(columns, treated.n, control.n, options.resamples, rng),
     )
