@@ -33,6 +33,10 @@ FLIP_LEDGER = 'data/orchestrator/routing_experiments.jsonl'
 TIMEOUT = cli_timeout_from_env('ROUTING_EXPERIMENT_ARM_TEST_TIMEOUT')
 RULE_A_RULES = 'routing:\n  rules:\n    - id: rule-a\n'
 READOUT_UNPROVEN = 4
+RULES_FILE_ENV = 'ROUTING_EXPERIMENT_RULES_FILE'
+PROJECT_RULES = 'projects/effort.yaml'
+EFFORT_RULE_ID = 'effort-impl-high-implementer'
+EFFORT_RULES = f'routing:\n  rules:\n    - id: {EFFORT_RULE_ID}\n'
 
 _STUB_RELOAD_GATE = """\
 import enum
@@ -89,10 +93,15 @@ def _install_reload_gate_stub(repo: Path) -> Path:
 
 
 def _run_arm(
-    repo: Path, *args: str, units: str = '/srv/untreated-a:1',
+    repo: Path, *args: str, units: str = '/srv/untreated-a:1', rules_file: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
+    """Run the copied script; *rules_file* None removes any ambient rules-file override."""
     env = scrubbed_git_env(os.environ)
     env['ROUTING_EXPERIMENT_UNITS'] = units
+    if rules_file is None:
+        env.pop(RULES_FILE_ENV, None)
+    else:
+        env[RULES_FILE_ENV] = rules_file
     return subprocess.run(
         [BASH, str(repo / 'scripts' / SCRIPT.name), *args],
         env=env, capture_output=True, text=True, timeout=TIMEOUT,
@@ -198,3 +207,82 @@ def test_reload_and_flip_record_cover_exactly_the_validated_units(arm_repo, sepa
         ('/srv/exp-a', '1', 'reloaded'),
         ('/srv/exp-b', '2', 'reloaded'),
     ]
+
+
+def _commit_on_side_branch(repo: Path, path: str, text: str) -> None:
+    """Commit *path* on a new branch `side`, left checked out: HEAD and the tree carry it, main does not."""
+    target = repo / path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(text, encoding='utf-8')
+    env = scrubbed_git_env(os.environ)
+    for args in (
+        ('checkout', '-q', '-b', 'side'),
+        ('add', path),
+        ('-c', 'user.email=t@e', '-c', 'user.name=t', '-c', 'commit.gpgsign=false',
+         'commit', '-q', '-m', 'side'),
+    ):
+        subprocess.run(['git', '-C', str(repo), *args], check=True, capture_output=True,
+                       env=env, timeout=TIMEOUT)
+
+
+def test_a_named_rules_file_on_main_passes_step_1_without_defaults_yaml(arm_repo):
+    repo, readout = arm_repo({PROJECT_RULES: EFFORT_RULES})
+
+    result = _run_arm(repo, 'exp-salt', EFFORT_RULE_ID, rules_file=PROJECT_RULES)
+
+    calls = readout.calls()
+    assert len(calls) == 1, result.stderr
+    argv = calls[0]
+    assert '--aa' in argv
+    assert argv[argv.index('--salt') + 1] == 'exp-salt'
+    assert result.returncode == 1
+    assert "the readout's A/A check did not pass" in result.stderr
+
+
+def test_without_the_override_the_rules_file_is_still_defaults_yaml(arm_repo):
+    repo, readout = arm_repo({PROJECT_RULES: EFFORT_RULES})
+
+    result = _run_arm(repo, 'exp-salt', EFFORT_RULE_ID)
+
+    assert result.returncode == 1
+    assert 'cannot read' in result.stderr
+    assert RULES_FILE in result.stderr
+    assert readout.calls() == []
+
+
+def test_a_named_rules_file_lacking_the_id_fails_naming_file_and_id(arm_repo):
+    repo, readout = arm_repo({PROJECT_RULES: RULE_A_RULES})
+
+    result = _run_arm(repo, 'exp-salt', EFFORT_RULE_ID, rules_file=PROJECT_RULES)
+
+    assert result.returncode == 1
+    assert PROJECT_RULES in result.stderr
+    assert EFFORT_RULE_ID in result.stderr
+    assert "is not in main's" in result.stderr
+    assert readout.calls() == []
+
+
+def test_a_named_rules_file_absent_from_main_is_a_read_error_naming_the_override(arm_repo):
+    missing = 'projects/missing.yaml'
+    repo, readout = arm_repo({PROJECT_RULES: EFFORT_RULES})
+
+    result = _run_arm(repo, 'exp-salt', EFFORT_RULE_ID, rules_file=missing)
+
+    assert result.returncode == 1
+    assert 'cannot read' in result.stderr
+    assert missing in result.stderr
+    assert RULES_FILE_ENV in result.stderr
+    assert "is not in main's" not in result.stderr
+    assert readout.calls() == []
+
+
+def test_a_rules_file_only_on_another_branch_is_not_read(arm_repo):
+    repo, readout = arm_repo({'README.md': 'fixture\n'})
+    _commit_on_side_branch(repo, PROJECT_RULES, EFFORT_RULES)
+
+    result = _run_arm(repo, 'exp-salt', EFFORT_RULE_ID, rules_file=PROJECT_RULES)
+
+    assert result.returncode == 1
+    assert 'cannot read' in result.stderr
+    assert PROJECT_RULES in result.stderr
+    assert readout.calls() == []
