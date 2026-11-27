@@ -802,9 +802,10 @@ it, and the gate slug where one corresponds:
   main checkout" says when one may land.
 - Behavioural config: concurrency, timeouts, thresholds, alarm retunes, merge breadth, scheduler.
 - A record whose `pin_declared_by` field is set, that is under a Leo HOLD, or that names Leo's
-  other session or his personal backlog. The runner's `task-<id>-human-curator-gate` pin is not a
-  Leo signal and does not by itself put a gate in this class: the milestone-gate bullet above and
-  its exceptions decide whether to ask.
+  other session or his personal backlog. The runner's `task-<id>-human-curator-gate` pin
+  (`shared/src/shared/human_curator_gate.py::curator_gate_declarer`) is not a Leo signal and does
+  not by itself put a gate in this class: the milestone-gate bullet above and its exceptions decide
+  whether to ask. Any other declarer beside it does.
 - Priority, pin-queue placement, cross-cluster dependency sequencing.
 - Scope changes: acceptance criteria, cancel-and-refile or re-scope. **Except** cancelling a task
   that a PRD decision Leo ruled has superseded (Leo, 2026-10-22; ratified 2026-10-26), which is

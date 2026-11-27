@@ -368,14 +368,20 @@ For each gate with real work, in this order:
    slip silently loses text.
 3. **Close the gate by RESOLVING ITS ESCALATION — never by `set_task_status`**:
    first stamp the content-adjudication proof,
-   `update_task(id=<gate>, metadata={'human_curator_adjudicated_at': '<ISO-8601 now>'}, metadata_mode='merge')`;
+   `update_task(id=<gate>, project_root=<absolute project root>, metadata={'human_curator_adjudicated_at': '<ISO-8601 now>'}, metadata_mode='merge')`;
    without it the runner re-blocks the gate with `curator_adjudication_missing`
    on resume (task 3341). Then
-   `resolve_issue(escalation_id=<gate esc>, action='resume', acknowledge_declared_pins=[<gate esc>], resolution_class='actionable', ...)`:
-   a curator gate's escalation is filed with a declared pin (task 3346), so a
-   resume that does not name it is refused with `declared_pin_refused`. A record
-   filed before task 3346 carries no pin, and acknowledging it is a harmless
-   no-op. Measured
+   `resolve_issue(escalation_id=<gate esc>, action='resume', resolution_class='actionable', ...)`,
+   with no acknowledgement. A curator gate's escalation is filed with a
+   declared pin (task 3346), so expect `declared_pin_refused`; read its
+   `declared_pins`. If the only `declared_by` entry is the runner's own,
+   `task-<gate>-human-curator-gate`
+   (`shared/src/shared/human_curator_gate.py::curator_gate_declarer`), your
+   review is what that pin waits for: re-issue the same call adding
+   `acknowledge_declared_pins=[<gate esc>]`. Any other declarer is a separate
+   dependency on the same record, and acknowledging the record would spend it
+   unread, so stop and consult what it names first. A record filed before task
+   3346 carries no pin, and the first call closes it. Measured
    2026-09-03: `set_task_status(id=<gate>, status='done')` REFUSES with
    `error=done_provenance_required` (`reconciliation.require_done_provenance` is
    enabled), and the hint offers only `merged` / `found_on_main` — both false for
