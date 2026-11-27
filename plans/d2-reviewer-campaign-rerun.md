@@ -21,12 +21,14 @@ below is one action.
    ```bash
    RESULTS=/home/leo/src/dark-factory/plans/fable-evidence-package-2026-09-10/campaign-d2
    ```
-3. This runbook's campaign ran its reviewers at a fixed 30 turns. Since task
-   11728 the CLI defaults to production's `max_turns.reviewer`, so to
-   reproduce it, add `--max-turns 30` to every invocation below. With
-   `--max-turns 30` the keyless panels already in `$RESULTS` are reused.
-   Without it, every incumbent panel is re-run at production's cap, beside
-   them.
+3. This runbook's campaign ran its reviewers at a fixed 30 turns, and its
+   incumbent arms (`variant_a`, `variant_a_xhigh`) at a pinned $5. Since task
+   11728 the CLI defaults to production's `max_turns.reviewer`, and since
+   task 11912 those two arms default to production's `budgets.reviewer`. To
+   reproduce the campaign, add `--max-turns 30 --production-budget 5` to every
+   invocation below. That pair reuses the keyless panels already in
+   `$RESULTS`. Without it, the incumbent panels are re-run at production's 90
+   turns and $12, beside them.
 
 The evidence package (`plans/fable-evidence-package-2026-09-10/` and
 its `.md`) is untracked and lives only in the main checkout. That covers its
@@ -181,3 +183,42 @@ Read the three verdicts. Each rule lives in
 
 After the run, `add_memory` the headline numbers and hand the three verdicts
 to the study session.
+
+## 7. After any campaign: ceiling kills
+
+Count, per arm, the reviewer attempts a configured ceiling ended. Since task
+11912 every panel records them in
+`orchestrator/src/orchestrator/evals/reviewer_trial/runner.py::PanelRunResult`'s
+`ceiling_kills`. Panels written earlier record none, so their ERROR reviews
+count under `none`. It spends nothing:
+
+```bash
+uv run python - "$RESULTS" <<'PY'
+import json
+import sys
+from collections import Counter
+from pathlib import Path
+from shared.cost_store import CapReason
+from orchestrator.evals.reviewer_trial.runner import PanelRunResult
+
+arms: set[str] = set()
+errors_by_ceiling: Counter[tuple[str, str]] = Counter()
+budget_kills: Counter[str] = Counter()
+for path in sorted(Path(sys.argv[1]).glob('trial-*/*.json')):
+    panel = PanelRunResult.from_dict(json.loads(path.read_text()))
+    arms.add(panel.variant_name)
+    for ceilings in panel.ceiling_kills.values():
+        budget_kills[panel.variant_name] += ceilings.count(CapReason.BUDGET)
+    for name, review in panel.reviews.items():
+        if review['verdict'] == 'ERROR':
+            ceilings = panel.ceiling_kills.get(name, [])
+            errors_by_ceiling[panel.variant_name, ceilings[-1].value if ceilings else 'none'] += 1
+for arm in sorted(arms):
+    split = {ceiling: errors_by_ceiling[arm, ceiling] for ceiling in ('budget', 'turns', 'none')}
+    print(f'{arm}: ERROR reviews by last ceiling {split}; attempts a budget ended: {budget_kills[arm]}')
+PY
+```
+
+Task 11727's round-2 campaign reports these counts with its results. Since
+task 11912 the incumbent runs at production's $12, so a budget kill on any arm
+is a finding to report, not noise.
