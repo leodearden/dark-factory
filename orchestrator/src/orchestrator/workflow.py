@@ -15457,19 +15457,21 @@ class TaskWorkflow:
                     session_id=session_id_val,
                     resume_session_id=resume_session_id,
                     resume_prompt=resume_prompt,
-                    # Judge is safe by OMISSION from config.role_env_overrides (the
-                    # per-role OPT-IN endpoint-env map, task 2460) — _build_agent_env
-                    # no longer gates roles by a hardcoded allow-list, so the judge
-                    # simply must not be named there.  Opting it in would propagate
-                    # ANTHROPIC_BASE_URL and route it through vLLM, where
-                    # max_model_len causes ServerDisconnectedError after 2 tool-use
-                    # rounds (3cd380a079) — do not add 'judge' to role_env_overrides
-                    # unless that endpoint is confirmed to handle its tool-use
-                    # pattern.  Cap hits on Claude API are handled by UsageGate
-                    # account failover (wired in runner.py for eval mode).
+                    # Judge gets no ENDPOINT env by default: it is absent from
+                    # config.role_env_overrides (the per-role OPT-IN map, task 2460).
+                    # Giving it ANTHROPIC_BASE_URL / ANTHROPIC_AUTH_TOKEN there would
+                    # route it through vLLM, where max_model_len causes
+                    # ServerDisconnectedError after 2 tool-use rounds (3cd380a079)
+                    # — do not give 'judge' endpoint env unless that endpoint is
+                    # confirmed to handle its tool-use pattern.  A judge entry of
+                    # non-routing keys only (e.g. CARGO_HOME, npm_config_cache) is
+                    # safe: _build_agent_env merges the global config.env_overrides
+                    # only for implementer/debugger, so a judge entry contributes
+                    # only its own literal keys.  Cap hits on Claude API are handled
+                    # by UsageGate account failover (wired in runner.py for eval mode).
                     env_overrides=self._build_agent_env(role),
                     # Spawn-identity env for the SessionStart hook (task 2512) —
-                    # independent of env_overrides (which is None for
+                    # independent of env_overrides (None by default for
                     # merger/judge/reviewer); spawn_env is built for every role.
                     spawn_env=self._build_spawn_env(role),
                 )
