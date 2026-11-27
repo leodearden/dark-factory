@@ -382,6 +382,37 @@ def union_busy_hours(verify: Sequence[Event], lo: datetime, hi: datetime) -> flo
 
 
 @dataclass(frozen=True)
+class VerifyHostHours:
+    """Merge-verify host-hours summed over every host, so two hosts verifying at once count twice."""
+
+    completed: float
+    cancelled: float
+    per_landing: float | None
+
+    @property
+    def total(self) -> float:
+        return self.completed + self.cancelled
+
+
+def _summed_hours(events: Sequence[Event], duration_key: str) -> float:
+    durations = (_number(_data(e).get(duration_key)) for e in events)
+    return sum(millis for millis in durations if millis is not None) / 3_600_000.0
+
+
+def verify_hours_per_landing(
+    verify: Sequence[Event], cancelled: Sequence[Event], ledger: Sequence[Landing],
+) -> VerifyHostHours:
+    """Host-hours of every completed and cancelled merge verify passed in, per landing.
+
+    A sum (cost), not a union (occupancy); the caller passes the window's rows.
+    """
+    completed, aborted = _summed_hours(verify, 'duration_ms'), _summed_hours(cancelled, 'elapsed_ms')
+    return VerifyHostHours(
+        completed=completed, cancelled=aborted, per_landing=_share(completed + aborted, len(ledger)),
+    )
+
+
+@dataclass(frozen=True)
 class QueueToLand:
     p50_hours: float | None
     n: int
@@ -958,7 +989,8 @@ def chain_attributed_episodes(
 
 # ---------------------------------------------------------------------------
 # evaluate: the D12 table. Each limit, rule and baseline is written once, in
-# D12_ROWS; the baselines are the merge-throughput report's 2026-11-04 figures.
+# D12_ROWS; the baselines are the merge-throughput report's 2026-11-04 figures,
+# except merge-verify hours per landing's weekly series (2026-11-26 ruling).
 # ---------------------------------------------------------------------------
 
 
@@ -974,7 +1006,7 @@ class CanaryFigures:
     speculation_accounting_violations: int | None
     chain_attributed_red_main: int | None
     queue_to_land_p50_hours: float | None
-    local_verify_hours_per_week: float | None
+    verify_hours_per_landing: float | None
     deep_chain_p90_secs: float | None
 
 
@@ -1034,9 +1066,11 @@ D12_ROWS: tuple[D12Row, ...] = (
         'p50 of merge_finalized done queue_to_land_secs', '5.4 h',
     ),
     D12Row(
-        'local_verify_hours_per_week', 'local merge-verify hours / week', 60.0, Comparison.LT,
-        'union of local completed (runner) and cancelled (host) merge-verify intervals, x 168 / window hours',
-        '~100 h',
+        'verify_hours_per_landing', 'merge-verify hours per landing', 0.75, Comparison.LT,
+        'host-hours of completed (merge_verify duration_ms) plus cancelled (merge_verify_cancelled '
+        'elapsed_ms) merge verifies stamped in the window, all hosts summed (not a union) / landings '
+        '(merge_finalized done ∪ train_merged members)',
+        '0.83–1.24 h (weekly, 10-22..11-12)',
     ),
     D12Row(
         'deep_chain_p90_secs', 'deep-chain verify p90 (s)', 10800.0, Comparison.LE,
