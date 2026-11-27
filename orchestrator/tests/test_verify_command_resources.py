@@ -11,10 +11,12 @@ section 7 boundary rows run ``verify.py::_run_cmd`` under real
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import dataclasses
 import importlib.util
 import json
+import logging
 import re
 import shutil
 import socket
@@ -41,6 +43,7 @@ from shared.cgroup_stats import (
     read_cgroup,
 )
 from shared.proc_group import unified_cgroup_path
+from shared.testing_virtual_clock import virtual_clock_test
 from shared.verify_scope_tag import parse_verify_scope_unit, scope_tag_for
 
 from orchestrator.config import FusedMemoryConfig, ModuleConfig, OrchestratorConfig
@@ -52,6 +55,7 @@ from orchestrator.verify_command_resources import (
     CommandResources,
     allocate_command_capture,
     resources_from_reading,
+    watch_relocations,
 )
 
 UNREACHED_COMMAND_TIMEOUT_SECS = 120
@@ -567,6 +571,107 @@ class TestAllocateCommandCapture:
         assert 'No space left on device' in record.capture_reason
 
 
+class _FakeChild:
+    def __init__(self) -> None:
+        self.pid = 4242
+        self.returncode: int | None = None
+
+
+class _ScriptedFinder:
+    """Answers each sample from *answers* in turn, noting the loop time it was asked at."""
+
+    def __init__(self, child: _FakeChild, answers: list[frozenset[str] | Exception]) -> None:
+        self._child = child
+        self._answers = answers
+        self.asked_at: list[float] = []
+
+    async def __call__(self, child, *, launched_in):
+        assert child is self._child
+        assert launched_in == LAUNCHED
+        self.asked_at.append(asyncio.get_running_loop().time())
+        answer = self._answers[len(self.asked_at) - 1]
+        if len(self.asked_at) == len(self._answers):
+            self._child.returncode = 0
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+
+async def _watch(tmp_path: Path, answers: list[frozenset[str] | Exception]):
+    child = _FakeChild()
+    finder = _ScriptedFinder(child, answers)
+    capture = _launched_capture(_exit_capture_dir(tmp_path))
+    started = asyncio.get_running_loop().time()
+    await watch_relocations(child, launched_in=LAUNCHED, capture=capture, find_scopes=finder)
+    return [at - started for at in finder.asked_at], capture.record(**IDENTITY)
+
+
+class TestWatchRelocations:
+    @virtual_clock_test
+    async def test_samples_after_waits_of_one_two_four_seconds_until_the_child_exits(
+        self, tmp_path
+    ):
+        asked_at, record = await _watch(
+            tmp_path, [frozenset({'run-u1.scope'}), frozenset(), frozenset({'run-u2.scope'})]
+        )
+
+        assert asked_at == [1.0, 3.0, 7.0]
+        assert record.capture is Capture.RELOCATED
+        assert record.relocated_scopes == frozenset({'run-u1.scope', 'run-u2.scope'})
+
+    @virtual_clock_test
+    async def test_a_child_that_never_relocates_reads_exit(self, tmp_path):
+        asked_at, record = await _watch(tmp_path, [frozenset(), frozenset()])
+
+        assert asked_at == [1.0, 3.0]
+        assert record.capture is Capture.EXIT, record.capture_reason
+
+    @virtual_clock_test
+    async def test_an_exited_child_is_never_sampled(self, tmp_path):
+        child = _FakeChild()
+        child.returncode = 0
+        finder = _ScriptedFinder(child, [frozenset({'run-u1.scope'})])
+        capture = _launched_capture(_exit_capture_dir(tmp_path))
+
+        await watch_relocations(child, launched_in=LAUNCHED, capture=capture, find_scopes=finder)
+
+        assert finder.asked_at == []
+        assert capture.record(**IDENTITY).capture is Capture.EXIT
+
+    @virtual_clock_test
+    async def test_a_failure_ends_the_watch_and_withholds_the_exit_claim(
+        self, tmp_path, caplog
+    ):
+        child = _FakeChild()
+        finder = _ScriptedFinder(child, [frozenset(), OSError(24, 'Too many open files'), frozenset()])
+        capture = _launched_capture(_exit_capture_dir(tmp_path))
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.verify_command_resources'):
+            await watch_relocations(
+                child, launched_in=LAUNCHED, capture=capture, find_scopes=finder
+            )
+        record = capture.record(**IDENTITY)
+
+        assert len(finder.asked_at) == 2
+        assert record.capture is Capture.UNAVAILABLE
+        assert 'relocation watch failed' in record.capture_reason
+        assert 'Too many open files' in record.capture_reason
+        assert any(
+            r.levelno == logging.WARNING and 'relocation watch' in r.getMessage()
+            for r in caplog.records
+        )
+
+    @virtual_clock_test
+    async def test_scopes_seen_before_a_failure_still_read_relocated(self, tmp_path):
+        asked_at, record = await _watch(
+            tmp_path, [frozenset({'run-u1.scope'}), RuntimeError('to_thread refused'), frozenset()]
+        )
+
+        assert asked_at == [1.0, 3.0]
+        assert record.capture is Capture.RELOCATED
+        assert record.relocated_scopes == frozenset({'run-u1.scope'})
+
+
 CAPTURED_FILES = frozenset(
     {CPU_STAT, MEMORY_PEAK, SWAP_PEAK, MEMORY_EVENTS, *(r.file_name for r in PressureResource)}
 )
@@ -856,6 +961,7 @@ class TestRunCmdCapturesInItsRealScope:
 
     @pytest.mark.asyncio
     @pytest.mark.timeout(60)
+    @pytest.mark.timing(reason='the watcher must sample while the inner scope lives')
     async def test_a_relocating_command_that_exits_reads_relocated(
         self, tmp_path, inner_unit, real_project_slice: RealProjectSlice
     ):

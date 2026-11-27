@@ -14,13 +14,14 @@ What each capture state means:
 - ``relocated``: some of the command's work ran in other scopes, named in
   ``relocated_scopes``. The counters, read at exit or before the kill, cover
   the launch scope only.
-- ``unavailable``: nothing was measured, and ``capture_reason`` says why.
+- ``unavailable``: no counters are recorded, and ``capture_reason`` says why.
 
 Relocation is seen only while the other scopes are live: by the kill path's
 discovery, and by ``watch_relocations``, which samples on a doubling schedule
 while the command runs. A command that relocates late and briefly, between two
 samples, can still read as ``exit``. No kernel counter records a migration out
-of a cgroup.
+of a cgroup. An exit reading taken after the watch failed reads ``unavailable``:
+without the watch it cannot claim to cover the whole command.
 """
 
 from __future__ import annotations
@@ -34,10 +35,11 @@ import shlex
 import shutil
 import socket
 import tempfile
-from collections.abc import Iterable, Iterator, Mapping
+from collections.abc import Awaitable, Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
+from typing import Protocol
 
 from shared.cgroup_stats import (
     CGROUP_ROOT,
@@ -323,12 +325,16 @@ class CommandCapture:
         self._scope_unit: str | None = None
         self._relocated: set[str] = set()
         self._before_kill: CgroupReading | _Gap | None = None
+        self._watch_failure: str | None = None
 
     def launched(self, scope_unit: str) -> None:
         self._scope_unit = scope_unit
 
     def note_relocated(self, scopes: Iterable[str]) -> None:
         self._relocated.update(scopes)
+
+    def note_watch_failed(self, reason: str) -> None:
+        self._watch_failure = reason
 
     def wrap(self, cmd: str) -> str:
         """*cmd* in a subshell, with its scope's counters copied to the directory after it.
@@ -418,9 +424,15 @@ class CommandCapture:
         if isinstance(self._before_kill, CgroupReading):
             return _measured(self._before_kill, Capture.BEFORE_KILL, relocated)
         at_exit = self._read_exit_capture(self.directory)
-        if isinstance(at_exit, CgroupReading):
-            return _measured(at_exit, Capture.EXIT, relocated)
-        return _unavailable((self._before_kill or at_exit).reason, relocated)
+        if not isinstance(at_exit, CgroupReading):
+            return _unavailable((self._before_kill or at_exit).reason, relocated)
+        if self._watch_failure is not None and not relocated:
+            return _unavailable(
+                f'{_READ_AT[Capture.EXIT]}, but the relocation watch failed '
+                f'({self._watch_failure}), so work in other scopes may be missing',
+                relocated,
+            )
+        return _measured(at_exit, Capture.EXIT, relocated)
 
     def _recorded_scope_path(self, directory: Path) -> str | _Gap:
         """The unified cgroup path the scope script recorded, if it is the launched scope."""
@@ -477,19 +489,34 @@ def allocate_command_capture(*, cgroup_root: Path = CGROUP_ROOT) -> Iterator[Com
                 logger.warning('could not remove verify capture directory %s: %s', directory, exc)
 
 
+class _ScopeFinder(Protocol):
+    def __call__(
+        self, child: SpawnedChild, *, launched_in: str | None
+    ) -> Awaitable[frozenset[str]]: ...
+
+
 async def watch_relocations(
-    child: SpawnedChild, *, launched_in: str, capture: CommandCapture
+    child: SpawnedChild,
+    *,
+    launched_in: str,
+    capture: CommandCapture,
+    find_scopes: _ScopeFinder = relocated_scopes,
 ) -> None:
     """Note the scopes *child*'s session moved into, after waits of 1, 2, 4 ... seconds.
 
-    Runs until cancelled or *child* exits. A failure is logged at DEBUG and ends
-    the watch, so it never reaches the command's runner.
+    Runs until cancelled or *child* exits. A failure ends the watch and is noted
+    on *capture*, never reaching the command's runner.
     """
     delay = 1.0
     try:
         while child.returncode is None:
             await asyncio.sleep(delay)
-            capture.note_relocated(await relocated_scopes(child, launched_in=launched_in))
+            capture.note_relocated(await find_scopes(child, launched_in=launched_in))
             delay *= 2
-    except Exception:
-        logger.debug('relocation watch of pid %d stopped', child.pid, exc_info=True)
+    except Exception as exc:
+        logger.warning(
+            'relocation watch of verify command pid %d failed; its record cannot claim '
+            'to cover the whole command',
+            child.pid, exc_info=True,
+        )
+        capture.note_watch_failed(f'{type(exc).__name__}: {exc}')
