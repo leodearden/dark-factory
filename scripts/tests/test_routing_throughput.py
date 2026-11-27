@@ -693,13 +693,10 @@ def _sections(out: str) -> list[list[str]]:
 
 
 @pytest.fixture
-def violated_root(tmp_path, make_seeding_runs_db) -> Path:
-    """The planted cut, plus one treated implementer dispatch at the control effort."""
-    root = tmp_path / 'df-violated'
-    conn = build_cohort_root(root, make_seeding_runs_db, planted_cohort(
-        SALT, SINCE, n_per_arm=40, treated_cost_factor=PLANTED_CUT,
-    ))
-    (treated, *_), _ = arm_task_ids(SALT, 2, 1, 40)
+def violated_root(compliance_root) -> Path:
+    """The compliance cohort, plus one treated implementer dispatch at the control effort."""
+    root, conn = compliance_root
+    (treated, *_), _ = arm_task_ids(SALT, 2, 1, COMPLIANCE_N_PER_ARM)
     _dispatch(conn, treated, _hours(150), role='implementer', effort=CONTROL_EFFORT,
               rule_id=TREATED_RULE_ID)
     return root
@@ -725,12 +722,13 @@ def test_throughput_on_the_planted_cut_prints_three_ruled_tables(planted_root, c
     assert any('effort_deviations' in line for line in compliance)
 
 
-def test_throughput_ends_with_a_json_line_agreeing_with_the_report(planted_root, capsys):
-    root = planted_root(PLANTED_CUT)
-    options = _cli_options(root)
+def test_throughput_json_line_agrees_with_the_report_since_at_the_first_prefixed_dispatch(
+    known_root, capsys,
+):
+    options = _cli_options(known_root)
     report = throughput_report(options, resolve_since(options))
 
-    assert readout.main(_cli(root)) == 0
+    assert readout.main(_cli(known_root)) == 0
 
     summary = _summary(capsys.readouterr().out)
     assert set(summary) == SUMMARY_KEYS
@@ -738,7 +736,7 @@ def test_throughput_ends_with_a_json_line_agreeing_with_the_report(planted_root,
     assert report.interval is not None
     assert summary == {
         'salt': SALT,
-        'since': SINCE.isoformat(),
+        'since': _hours(1).isoformat(),
         'cohort_days': COHORT_DAYS,
         'read_at': READ_AT.isoformat(),
         'n_treated': treated.n,
@@ -755,16 +753,10 @@ def test_throughput_ends_with_a_json_line_agreeing_with_the_report(planted_root,
     }
 
 
-def test_throughput_since_defaults_to_the_first_prefixed_dispatch(planted_root, capsys):
-    assert readout.main(_cli(planted_root(PLANTED_CUT))) == 0
+def test_throughput_since_given_explicitly_is_reported_as_given(known_root, capsys):
+    explicit = _hours(1.5)
 
-    assert _summary(capsys.readouterr().out)['since'] == SINCE.isoformat()
-
-
-def test_throughput_since_given_explicitly_is_reported_as_given(planted_root, capsys):
-    explicit = SINCE + timedelta(days=1)
-
-    assert readout.main(_cli(planted_root(PLANTED_CUT), '--since', explicit.isoformat())) == 0
+    assert readout.main(_cli(known_root, '--since', explicit.isoformat())) == 0
 
     assert _summary(capsys.readouterr().out)['since'] == explicit.isoformat()
 

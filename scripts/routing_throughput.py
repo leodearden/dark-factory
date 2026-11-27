@@ -31,6 +31,9 @@ interval at the options' level. Its A/A null permutes the observed arm labels
 at the observed sizes and reports the p95 and p99 of max(R, 1/R). One
 ``random.Random(seed)`` draws the bootstrap first, then the null.
 
+:func:`render_text` prints the report as three ruled tables (R, the secondary
+measures, compliance), and :func:`summary_record` is its one-line JSON summary.
+
 Reads runs.db read-only; never imports the readout or the look.
 """
 from __future__ import annotations
@@ -74,8 +77,10 @@ __all__ = [
     'ThroughputUnavailable',
     'RoleCompliance',
     'Unavailable',
+    'render_text',
     'resolve_since',
     'side_of',
+    'summary_record',
     'throughput_report',
 ]
 
@@ -747,3 +752,186 @@ def throughput_report(options: ThroughputOptions, since: datetime) -> Throughput
         secondary=MappingProxyType({arm: _arm_secondary(records, arm) for arm in Arm}),
         compliance=_compliance(checks, options.roles),
     )
+
+
+def _instant(at: datetime) -> str:
+    return at.astimezone(UTC).isoformat()
+
+
+def _figure(value: float | None, digits: int = 3) -> str:
+    return '-' if value is None else f'{value:.{digits}f}'
+
+
+def _level(level: float) -> str:
+    return f'{level * 100:g}%'
+
+
+def _table(header: Sequence[str], rows: Iterable[Sequence[str]]) -> list[str]:
+    """*header* and *rows* as aligned columns: the first left-justified, the rest right."""
+    grid = [list(header), *(list(row) for row in rows)]
+    widths = [max(len(row[column]) for row in grid) for column in range(len(header))]
+    return [
+        '  '.join(
+            cell.ljust(width) if column == 0 else cell.rjust(width)
+            for column, (cell, width) in enumerate(zip(row, widths, strict=True))
+        ).rstrip()
+        for row in grid
+    ]
+
+
+def _rule_line(report: ThroughputReport, table: str, excluded: str, defined: Sequence[str]) -> str:
+    options = report.options
+    treated, control = report.totals[Arm.TREATED], report.totals[Arm.CONTROL]
+    return 'rule: ' + '; '.join([
+        f'{table} table',
+        f'window [{_instant(report.since)}, {_instant(report.cohort_end)}) of each task\'s first '
+        f'routing_decision in roles {", ".join(options.roles)}',
+        f'read_at {_instant(options.read_at)}: nothing at or after it counts',
+        f'population = the {treated.n + control.n} cohort tasks ({treated.n} treated, '
+        f'{control.n} control)',
+        f'roots read {", ".join(str(root) for root in options.roots)}',
+        f'arm = split_bucket({options.salt!r}, task_id, {options.buckets}): treated is bucket '
+        f'{options.treated_bucket}, control every other bucket, by intent to treat',
+        f'excluded {excluded}',
+        *defined,
+    ])
+
+
+_OUTSIDE_COHORT = (
+    'tasks first dispatched in those roles before the window or from its end, and tasks never '
+    'dispatched in them'
+)
+
+
+def _ratio_section(report: ThroughputReport) -> list[str]:
+    options = report.options
+    rule = _rule_line(report, 'R', _OUTSIDE_COHORT, [
+        'landed = the earliest recorded landing before read_at (merge_finalized done, a '
+        'coalesced train member or an attributed solo passer)',
+        'cost = invocations.cost_usd of every role started before read_at',
+        'R = (landed_t / cost_t) / (landed_c / cost_c)',
+        f'interval = {options.resamples} bootstrap redraws of tasks within each arm (seed '
+        f'{options.seed}), type-7 percentile interval at {_level(options.interval_level)}',
+        f'null = {options.resamples} permutations of the observed arm labels, arm sizes kept, '
+        'drawn after the bootstrap from the same seed',
+        'null p95/p99 = percentiles of max(R, 1/R)',
+    ])
+    rows = [
+        (arm.value, str(totals.n), str(totals.landed), _figure(totals.cost_usd),
+         _figure(totals.landed / totals.cost_usd if totals.cost_usd else None, 4))
+        for arm, totals in ((arm, report.totals[arm]) for arm in Arm)
+    ]
+    if report.interval is None:
+        interval = f'{_level(options.interval_level)} interval {report.interval_side.value}'
+    else:
+        low, high = report.interval
+        interval = (
+            f'{_level(options.interval_level)} interval [{_figure(low)}, {_figure(high)}] '
+            f'{report.interval_side.value}'
+        )
+    if report.null is None:
+        null = 'A/A null undefined: fewer than 2 relabellings define R'
+    else:
+        p95, p99 = report.null
+        null = f'A/A null of max(R, 1/R): null p95 {_figure(p95)}, p99 {_figure(p99)}'
+    return [
+        rule,
+        *_table(('arm', 'n', 'landed', 'cost_usd', 'landed_per_dollar'), rows),
+        f'R {_figure(report.ratio)}; {interval}',
+        null,
+    ]
+
+
+_SECONDARY_COLUMNS = (
+    'verify_attempts_per_landing',
+    'review_cycles_per_landing',
+    'failures_after_merge_per_landing',
+    'blocked_or_escalated_share',
+)
+
+
+def _secondary_section(report: ThroughputReport) -> list[str]:
+    rule = _rule_line(report, 'secondary', f'{_OUTSIDE_COHORT}, and every row at or after read_at', [
+        'verify attempts = task_results.verify_attempts plus the task\'s own verify_failed '
+        'merge_attempt rows',
+        'review cycles = task_results.review_cycles',
+        'failures after merge = integration_skew merge_attempts implicating a commit the merge '
+        'brought (git rev-list sha^1..sha), plus main commits saying "This reverts commit <sha>", '
+        f'inside [landed_at, min(landed_at + {AFTER_MERGE_WINDOW.days}d, read_at))',
+        '*_per_landing = arm total / arm landed tasks',
+        f'blocked_or_escalated_share = arm tasks with any outcome in '
+        f'{", ".join(sorted(BLOCKED_OUTCOMES))} / arm n',
+        'cost per task by role = the role\'s arm cost / arm n',
+    ])
+    rows = []
+    costs = []
+    for arm in Arm:
+        secondary = report.secondary[arm]
+        rows.append((
+            arm.value, str(secondary.n),
+            *(_figure(getattr(secondary, column)) for column in _SECONDARY_COLUMNS),
+        ))
+        by_role = ', '.join(
+            f'{role} {_figure(cost)}' for role, cost in secondary.cost_per_task_by_role.items()
+        )
+        costs.append(f'cost per task by role, {arm.value}: {by_role or "none"}')
+    return [rule, *_table(('arm', 'n', *_SECONDARY_COLUMNS), rows), *costs]
+
+
+def _compliance_section(report: ThroughputReport) -> list[str]:
+    options = report.options
+    rule = _rule_line(report, 'compliance', (
+        'dispatches before the window\'s start or at or after read_at, of other roles, or of '
+        'tasks outside the cohort'
+    ), [
+        f'expected effort = {options.treated_effort} treated, {options.control_effort} control',
+        'effort_deviations = dispatches not at their arm\'s expected effort',
+        f'treated_without_rule = treated dispatches whose rule_id lacks the prefix '
+        f'{options.rule_prefix!r}',
+        'COMPLIANCE FAILURE = a treated dispatch at the control effort',
+    ])
+    rows = [
+        (role, str(counts.dispatches), str(counts.effort_deviations),
+         str(counts.treated_without_rule))
+        for role, counts in report.compliance.roles.items()
+    ]
+    failures = [
+        f'COMPLIANCE FAILURE: {failure.project} task {failure.task_id} {failure.role} dispatched '
+        f'at {_instant(failure.at)} at effort {failure.effort}, treated arm expects '
+        f'{options.treated_effort}'
+        for failure in report.compliance.failures
+    ]
+    return [
+        rule,
+        *_table(('role', 'dispatches', 'effort_deviations', 'treated_without_rule'), rows),
+        *failures,
+    ]
+
+
+def render_text(report: ThroughputReport) -> str:
+    """The R, secondary and compliance tables, each opened by its ``rule:`` line."""
+    sections = (_ratio_section(report), _secondary_section(report), _compliance_section(report))
+    return '\n\n'.join('\n'.join(section) for section in sections) + '\n'
+
+
+def summary_record(report: ThroughputReport) -> dict[str, object]:
+    """The report's one-line summary: ISO instants, and None for an undefined ratio or interval bound."""
+    treated, control = report.totals[Arm.TREATED], report.totals[Arm.CONTROL]
+    low, high = report.interval if report.interval is not None else (None, None)
+    return {
+        'salt': report.options.salt,
+        'since': _instant(report.since),
+        'cohort_days': report.options.cohort_days,
+        'read_at': _instant(report.options.read_at),
+        'n_treated': treated.n,
+        'landed_treated': treated.landed,
+        'cost_treated': treated.cost_usd,
+        'n_control': control.n,
+        'landed_control': control.landed,
+        'cost_control': control.cost_usd,
+        'ratio': report.ratio,
+        'interval_level': report.options.interval_level,
+        'interval_low': low,
+        'interval_high': high,
+        'compliance_failures': len(report.compliance.failures),
+    }
