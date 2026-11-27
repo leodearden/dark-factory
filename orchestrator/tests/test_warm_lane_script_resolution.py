@@ -1,4 +1,4 @@
-"""Warm-lane script resolution: project override first, dark-factory second.
+"""Warm-lane script resolution: by default project override first, dark-factory second.
 
 Task 3072 (PRD ``plans/warm-lane-infra-repatriation-prd.md`` leaf α, Phase 1).
 Task 7864 adds the per-script exception: a name listed in
@@ -11,8 +11,9 @@ This module pins how :class:`~orchestrator.git_ops.GitOps` *chooses* between
 those copies and a project's own ``<project_root>/scripts/<name>`` override,
 and pins that the choice is observable:
 
-* **B7** — a project override always wins, and the resolved path + origin is
-  logged at INFO on every invocation.
+* **B7** — by default (nothing listed in ``git.warm_lane_df_preferred_scripts``)
+  a project override wins, and the resolved path + origin is logged at INFO
+  on every invocation.
 * **B8** — "no implementation at either location" is a WARNING naming both
   tried paths, never a DEBUG line naming one.
 
@@ -127,6 +128,12 @@ def project_root(tmp_path: Path) -> Path:
     (root / '.worktrees').mkdir(parents=True)
     (root / '.worktrees' / '.pool-root').touch()
     return root
+
+
+@pytest.fixture
+def call_log(tmp_path: Path) -> Path:
+    """Shared ordered log every origin stub in a test appends to."""
+    return tmp_path / 'which-copy-ran.log'
 
 
 def _records(caplog: pytest.LogCaptureFixture, level: int) -> list[str]:
@@ -334,9 +341,27 @@ def _origins(log: Path) -> list[str]:
     return [line.split()[0] for line in log.read_text().splitlines() if line.strip()]
 
 
+def _assert_info_names(
+    caplog: pytest.LogCaptureFixture, script_path: Path, origin: str,
+) -> None:
+    """Assert an INFO record names ``script_path`` with its ``(origin)`` marker.
+
+    The origin is matched in its parenthesised form ``(project)`` /
+    ``(dark-factory)``.  A bare substring check would be vacuous: the resolved
+    path is interpolated into the same record and ``tmp_path`` embeds the test
+    name, so ``'project' in message`` is true for reasons that have nothing to
+    do with the origin the resolver reported.
+    """
+    infos = _records(caplog, logging.INFO)
+    assert [m for m in infos if str(script_path) in m and f'({origin})' in m], (
+        f'Expected an INFO naming {script_path} with origin marker ({origin}); '
+        f'captured INFOs: {infos!r}'
+    )
+
+
 @pytest.mark.asyncio
 class TestResolvedPathIsLoggedAtInfo:
-    """B7 — the project override wins, and the choice is visible at INFO.
+    """B7 — by default the project override wins, and the choice is visible at INFO.
 
     Two halves, both required by the task's USER-OBSERVABLE SIGNAL:
 
@@ -349,17 +374,8 @@ class TestResolvedPathIsLoggedAtInfo:
       memoised, rate-limited or first-call-only —
       :meth:`test_info_line_is_emitted_on_every_invocation` pins that.
 
-    The origin is asserted in its parenthesised form ``(project)`` /
-    ``(dark-factory)``.  A bare substring check would be vacuous: the resolved
-    path is interpolated into the same record and ``tmp_path`` embeds the test
-    name, so ``'project' in message`` is true for reasons that have nothing to
-    do with the origin the resolver reported.
+    The origin is read off the INFO line by :func:`_assert_info_names`.
     """
-
-    @pytest.fixture
-    def call_log(self, tmp_path: Path) -> Path:
-        """Shared ordered log both stubs append to."""
-        return tmp_path / 'which-copy-ran.log'
 
     @pytest.mark.parametrize('wrapper', WRAPPER_PARAMS)
     async def test_project_override_runs_and_is_logged(
@@ -386,16 +402,7 @@ class TestResolvedPathIsLoggedAtInfo:
             f"dark-factory's copy when both exist (PRD D3: dark-factory's copy "
             f'is the floor, not the ceiling); call log: {_origins(call_log)!r}'
         )
-        infos = _records(caplog, logging.INFO)
-        matching = [
-            m for m in infos if str(project_script) in m and '(project)' in m
-        ]
-        assert matching, (
-            f'{wrapper.method} must log the resolved path and origin at INFO.\n'
-            f'  expected path: {project_script}\n'
-            f'  expected origin marker: (project)\n'
-            f'  captured INFOs: {infos!r}'
-        )
+        _assert_info_names(caplog, project_script, 'project')
 
     @pytest.mark.parametrize('wrapper', WRAPPER_PARAMS)
     async def test_shipped_copy_runs_when_project_lacks_one(
@@ -420,16 +427,7 @@ class TestResolvedPathIsLoggedAtInfo:
             f'{wrapper.method} must fall back to the shipped copy when the '
             f'project carries no override; call log: {_origins(call_log)!r}'
         )
-        infos = _records(caplog, logging.INFO)
-        matching = [
-            m for m in infos if str(df_script) in m and '(dark-factory)' in m
-        ]
-        assert matching, (
-            f'{wrapper.method} must log the resolved path and origin at INFO.\n'
-            f'  expected path: {df_script}\n'
-            f'  expected origin marker: (dark-factory)\n'
-            f'  captured INFOs: {infos!r}'
-        )
+        _assert_info_names(caplog, df_script, 'dark-factory')
 
     async def test_info_line_is_emitted_on_every_invocation(
         self,
@@ -500,11 +498,6 @@ class TestGcReclaimPassesProjectSeedScript:
     default instead would make dark-factory guess at a project-owned path,
     violating PRD invariant C-1.
     """
-
-    @pytest.fixture
-    def call_log(self, tmp_path: Path) -> Path:
-        """Ordered log of the gc stub's argv."""
-        return tmp_path / 'gc-argv.log'
 
     @pytest.mark.parametrize('origin', ['project', 'dark-factory'])
     async def test_seed_script_is_passed_for_both_origins(
@@ -823,15 +816,9 @@ class TestDarkFactoryPreferredScripts:
     A listed script resolves dark-factory's copy first and the project's second,
     so a project can run dark-factory's copy reversibly — one yaml line plus a
     config reload — without deleting its own (PRD D3 as amended).  Which copy
-    ran is read off the shared call log, and the origin off the INFO line in
-    its parenthesised form, for the reason
-    :class:`TestResolvedPathIsLoggedAtInfo` documents.
+    ran is read off the shared call log, and the origin off the INFO line by
+    :func:`_assert_info_names`.
     """
-
-    @pytest.fixture
-    def call_log(self, tmp_path: Path) -> Path:
-        """Shared ordered log both stubs append to."""
-        return tmp_path / 'which-copy-ran.log'
 
     @staticmethod
     def _write_both_copies(
@@ -845,16 +832,6 @@ class TestDarkFactoryPreferredScripts:
                 df_dir / script, 'dark-factory', call_log,
             ),
         }
-
-    @staticmethod
-    def _assert_info_names(
-        caplog: pytest.LogCaptureFixture, script_path: Path, origin: str,
-    ) -> None:
-        infos = _records(caplog, logging.INFO)
-        assert [m for m in infos if str(script_path) in m and f'({origin})' in m], (
-            f'Expected an INFO naming {script_path} with origin marker ({origin}); '
-            f'captured INFOs: {infos!r}'
-        )
 
     @pytest.mark.parametrize('wrapper', WRAPPER_PARAMS)
     async def test_gc_preference_flips_gc_alone(
@@ -881,7 +858,7 @@ class TestDarkFactoryPreferredScripts:
             f'With only warm-lane-gc.sh preferred, {wrapper.method} must run the '
             f'{expected} copy; call log: {_origins(call_log)!r}'
         )
-        self._assert_info_names(caplog, copies[expected], expected)
+        _assert_info_names(caplog, copies[expected], expected)
 
     @pytest.mark.parametrize('wrapper', WRAPPER_PARAMS)
     async def test_each_wrapper_script_can_be_flipped(
@@ -907,7 +884,7 @@ class TestDarkFactoryPreferredScripts:
             f'{wrapper.method} must run dark-factory\'s copy when '
             f'{wrapper.script} is preferred; call log: {_origins(call_log)!r}'
         )
-        self._assert_info_names(caplog, copies['dark-factory'], 'dark-factory')
+        _assert_info_names(caplog, copies['dark-factory'], 'dark-factory')
 
     async def test_warning_names_the_preferred_location_first(
         self,
@@ -963,7 +940,7 @@ class TestDarkFactoryPreferredScripts:
             'A preference must never turn a resolvable script into a missing '
             f'one; call log: {_origins(call_log)!r}'
         )
-        self._assert_info_names(caplog, project_script, 'project')
+        _assert_info_names(caplog, project_script, 'project')
 
     @pytest.mark.usefixtures('code_default_config')
     async def test_reload_flips_and_reverts_a_live_git_ops(
