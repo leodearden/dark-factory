@@ -196,7 +196,7 @@ class TestRequireZaiCodingEndpointFor:
 
     @pytest.mark.parametrize('names', [
         [],
-        ['claude-opus-high', 'minimax-m3-endpoint', 'codex-gpt5.6-terra'],
+        ['claude-opus-high', 'minimax-m3.1-flash-endpoint', 'codex-gpt6.1-terra'],
     ], ids=['empty', 'non-zai'])
     def test_no_zai_config_sends_no_probe_and_returns_none(
         self, names: list[str], monkeypatch: pytest.MonkeyPatch,

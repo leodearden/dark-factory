@@ -10,7 +10,6 @@ import asyncio
 import json
 import os
 import shutil
-import time
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import timedelta
@@ -601,6 +600,9 @@ def test_probe_result_caps_the_first_line():
     assert result.first_line == result.failed_dependency
 
 
+_OUTLIVING_CHILD = '(sleep 30; touch outlived) & echo $! > child.pid'
+
+
 def _probe_command(tmp_path: Path, probe: str, timeout: int = 30) -> LaneCommand:
     (tmp_path / LANE_COMMAND.cwd).mkdir(exist_ok=True)
     return LANE_COMMAND.model_copy(update={'outage_probe': probe, 'outage_probe_timeout_secs': timeout})
@@ -626,6 +628,17 @@ async def test_run_probe_runs_with_the_lane_role_and_at_normal_priority(tmp_path
     assert (result.result, result.returncode) == (ProbeKind.UP, 0)
 
 
+@pytest.mark.asyncio
+async def test_run_probe_runs_without_the_account_pool(tmp_path, monkeypatch):
+    monkeypatch.setenv('CLAUDE_OAUTH_TOKEN_B', 'pool-b-probe')
+    monkeypatch.setenv('OPENAI_API_KEY', 'openai-probe')
+    probe = 'test -z "${CLAUDE_OAUTH_TOKEN_B+set}" && test "$OPENAI_API_KEY" = openai-probe'
+
+    result = await run_probe(_probe_command(tmp_path, probe), tmp_path)
+
+    assert (result.result, result.returncode) == (ProbeKind.UP, 0)
+
+
 async def _wait_until_gone(child: int) -> bool:
     for _ in range(100):
         if not pid_running(child):
@@ -636,29 +649,23 @@ async def _wait_until_gone(child: int) -> bool:
 
 @pytest.mark.asyncio
 async def test_a_timed_out_probe_is_broken_and_its_whole_process_group_is_gone(tmp_path):
-    probe = 'sleep 30 & echo $! > child.pid; sleep 30'
-    started = time.monotonic()
+    probe = f'{_OUTLIVING_CHILD}; sleep 30'
 
     result = await run_probe(_probe_command(tmp_path, probe, timeout=1), tmp_path)
 
-    elapsed = time.monotonic() - started
     child = int((tmp_path / LANE_COMMAND.cwd / 'child.pid').read_text())
     assert (result.result, result.returncode) == (ProbeKind.BROKEN, None)
-    assert elapsed < 10
+    assert not (tmp_path / LANE_COMMAND.cwd / 'outlived').exists(), 'the probe waited out its background child instead of killing it'
     assert await _wait_until_gone(child), f'background child {child} of the timed-out probe is still alive'
 
 
 @pytest.mark.asyncio
 async def test_a_timed_out_probe_whose_shell_has_exited_still_loses_the_child_holding_its_output(tmp_path):
-    probe = 'sleep 30 & echo $! > child.pid'
-    started = time.monotonic()
+    result = await run_probe(_probe_command(tmp_path, _OUTLIVING_CHILD, timeout=1), tmp_path)
 
-    result = await run_probe(_probe_command(tmp_path, probe, timeout=1), tmp_path)
-
-    elapsed = time.monotonic() - started
     child = int((tmp_path / LANE_COMMAND.cwd / 'child.pid').read_text())
     assert (result.result, result.returncode) == (ProbeKind.BROKEN, None)
-    assert elapsed < 10
+    assert not (tmp_path / LANE_COMMAND.cwd / 'outlived').exists(), 'the probe waited out its background child instead of killing it'
     assert await _wait_until_gone(child), f'background child {child} of the timed-out probe is still alive'
 
 

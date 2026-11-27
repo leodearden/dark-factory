@@ -13,9 +13,9 @@ from test_daemon_connect_consolidation import assert_connection_thread_is_daemon
 
 from fused_memory.middleware.curation_deferral import CurationRetryPolicy, DeferReason
 from fused_memory.middleware.ticket_store import (
-    AWAITING_CURATION,
     CurationBacklog,
     OrphanedPendingRecovery,
+    TicketStatus,
     TicketStore,
     _new_ticket_id,
 )
@@ -910,7 +910,8 @@ class TestDedupHealthWindow:
         with sqlite3.connect(db_path) as conn:
             plan = ' '.join(
                 row[3] for row in conn.execute(
-                    f'EXPLAIN QUERY PLAN {DEDUP_HEALTH_SQL}', ('proj', since.isoformat()),
+                    f'EXPLAIN QUERY PLAN {DEDUP_HEALTH_SQL}',
+                    ('proj', TicketStatus.CREATED, TicketStatus.COMBINED, since.isoformat()),
                 )
             )
 
@@ -1021,7 +1022,7 @@ class TestCurationParking:
 
         row = await store.get(tid)
         assert attempts == 1
-        assert row['status'] == AWAITING_CURATION == 'awaiting_curation'
+        assert row['status'] == TicketStatus.AWAITING_CURATION == 'awaiting_curation'
         assert row['attempts'] == 1
         assert row['reason'] == 'curation-deferred: all-accounts-capped'
         assert row['defer_reason'] == 'all-accounts-capped'
@@ -1213,11 +1214,11 @@ class TestCurationParking:
 
         refused_by_default = await store.mark_resolved(tid, status='cancelled', reason='user_cancelled')
         assert refused_by_default is False
-        assert (await store.get(tid))['status'] == AWAITING_CURATION
+        assert (await store.get(tid))['status'] == TicketStatus.AWAITING_CURATION
 
         cancelled = await store.mark_resolved(
             tid, status='cancelled', reason='user_cancelled',
-            from_statuses=('pending', AWAITING_CURATION),
+            from_statuses=('pending', TicketStatus.AWAITING_CURATION),
         )
 
         row = await store.get(tid)
@@ -1245,7 +1246,7 @@ async def test_flush_keeps_parked_rows_and_makes_them_due(store):
 
     row = await store.get(parked)
     assert failed == 0
-    assert row['status'] == AWAITING_CURATION
+    assert row['status'] == TicketStatus.AWAITING_CURATION
     assert row['attempts'] == 1
     assert row['next_attempt_at'] is None
     assert row['resolved_at'] is None
@@ -1264,11 +1265,12 @@ async def test_flush_reparks_a_requeued_pending_row(store):
 
     row = await store.get(requeued)
     assert failed == 1
-    assert row['status'] == AWAITING_CURATION
+    assert row['status'] == TicketStatus.AWAITING_CURATION
     assert row['attempts'] == 1
     assert row['next_attempt_at'] is None
     assert row['resolved_at'] is None
     assert row['defer_reason'] == 'accounts-auth-failed'
+    assert row['reason'] == 'curation-deferred: accounts-auth-failed'
     fresh = await store.get(never_deferred)
     assert (fresh['status'], fresh['reason']) == ('failed', 'server_restart')
 
@@ -1290,7 +1292,8 @@ async def test_recover_for_dead_worker_reparks_requeued_and_fails_the_rest(store
     reparked = await store.get(requeued)
     assert (
         reparked['status'], reparked['attempts'], reparked['next_attempt_at'], reparked['defer_reason'],
-    ) == (AWAITING_CURATION, 1, None, 'accounts-auth-failed')
+        reparked['reason'],
+    ) == (TicketStatus.AWAITING_CURATION, 1, None, 'accounts-auth-failed', 'curation-deferred: accounts-auth-failed')
     failed = await store.get(never_deferred)
     assert (failed['status'], failed['reason']) == ('failed', 'worker_dead')
     assert await store.get(parked) == parked_before

@@ -25,9 +25,12 @@ widen the merge-time scoped-test selection to the whole owning package).
 from __future__ import annotations
 
 import pytest
+from _routing_arms import task_id_in_rule_arm
 
 from orchestrator.config import OrchestratorConfig
 from orchestrator.routing import PlanShape, RoleDefaults, RouteInputs, resolve_route
+
+pytestmark = pytest.mark.usefixtures("code_default_config")
 
 RULE_ID = 'retry-tier-up'
 
@@ -42,18 +45,9 @@ _SENTINEL_ROLE_DEFAULTS = RoleDefaults(
 )
 
 
-@pytest.fixture(autouse=True)
-def _isolated_config_env(monkeypatch, tmp_path):
-    """Every OrchestratorConfig() built here reads ONLY the package's shipped
-    defaults.yaml -- no stray project config.yaml, no ambient
-    ORCH_CONFIG_PATH. Mirrors test_routing.py's per-test convention.
-    """
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv('ORCH_CONFIG_PATH', '')
-
-
 def _inputs(
     role_name: str, *, routing_tier: int, plan_shape: PlanShape | None = None,
+    task_id: str = '1',
 ) -> RouteInputs:
     """RouteInputs with the given routing_tier and an optional plan_shape.
 
@@ -64,7 +58,7 @@ def _inputs(
     retry-tier-up in defaults.yaml."""
     return RouteInputs(
         role_name=role_name,
-        task_id='1',
+        task_id=task_id,
         task_metadata={},
         plan_shape=plan_shape,
         routing_tier=routing_tier,
@@ -184,14 +178,40 @@ class TestLargePlanRetryKeepsHeadroom:
         assert decision.source_layer == 'policy_rule'
 
     def test_tier1_large_modules_plan_keeps_large_plan_headroom(self):
-        """implementer at tier 1 WITH a >=3-module plan: large-plan-modules
-        (listed first) wins over retry-tier-up -> opus AND max_turns==120."""
+        """implementer at tier 1 WITH a >=3-module plan, for a task in
+        large-plan-modules' experiment-1 arm: large-plan-modules (listed
+        first) wins over retry-tier-up -> opus AND max_turns==120."""
         cfg = OrchestratorConfig()
+        task_id = task_id_in_rule_arm(cfg, 'large-plan-modules')
         decision = resolve_route(
-            _inputs('implementer', routing_tier=1, plan_shape=LARGE_MODULES_PLAN), cfg,
+            _inputs(
+                'implementer', routing_tier=1, plan_shape=LARGE_MODULES_PLAN, task_id=task_id,
+            ),
+            cfg,
         )
 
         assert decision.rule_id == 'large-plan-modules'
         assert decision.model == 'opus'
         assert decision.max_turns == 120
         assert decision.source_layer == 'policy_rule'
+
+
+class TestExperimentOneArmOneRetry:
+    """Experiment 1 of plans/routing-experiment-substrate-prd.md: on arm 1 a
+    3-module, under-12-step plan matches no large-plan rule, so its retry
+    takes retry-tier-up -- opus at the role's configured max_turns. On
+    retries the arms then differ in turns only."""
+
+    def test_tier1_three_module_plan_takes_retry_tier_up_without_headroom(self):
+        cfg = OrchestratorConfig()
+        task_id = task_id_in_rule_arm(cfg, 'large-plan-modules-4')
+        decision = resolve_route(
+            _inputs(
+                'implementer', routing_tier=1, plan_shape=LARGE_MODULES_PLAN, task_id=task_id,
+            ),
+            cfg,
+        )
+
+        assert decision.rule_id == RULE_ID
+        assert decision.model == 'opus'
+        assert decision.max_turns == cfg.max_turns.implementer

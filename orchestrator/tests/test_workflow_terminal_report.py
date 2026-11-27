@@ -43,6 +43,7 @@ from orchestrator.exit_contract import VERDICT_LOG_ATTRIBUTE, ExitVerdictKind
 from orchestrator.git_ops import GitOps
 from orchestrator.harness import TaskReport
 from orchestrator.scheduler import TaskAssignment
+from orchestrator.slot_lease import SlotLease
 from orchestrator.verify import VerifyResult
 from orchestrator.verify_categories import FailureCategory
 from orchestrator.workflow import WorkflowMetrics
@@ -175,7 +176,7 @@ def git_repo(tmp_path: Path) -> Path:
     """A bare-minimum git repo with an initial commit (mirrors test_workflow_e2e.py)."""
     repo = tmp_path / 'repo'
     repo.mkdir()
-    asyncio.run(_init_repo(repo))
+    _init_repo(repo)
     return repo
 
 
@@ -716,7 +717,7 @@ async def _run_stubbed_slot(
     """
     repo = tmp_path / 'repo'
     repo.mkdir()
-    await _init_git_repo(repo)
+    _init_git_repo(repo)
     config = OrchestratorConfig(project_root=repo, max_concurrent_tasks=1)
     harness = _build_harness(config)
     # `_build_harness` leaves `Scheduler` a bare MagicMock (only the
@@ -747,7 +748,7 @@ async def _run_stubbed_slot(
             modules=[],
         )
         sem = asyncio.Semaphore(1)
-        result = await harness._run_slot(assignment, sem)
+        result = await harness._run_slot(assignment, SlotLease(assignment.task_id, harness.scheduler, sem))
 
     assert result is not None
     return result

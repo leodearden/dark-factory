@@ -31,8 +31,9 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
-# Bound to the shared default by reference, as api/escalations.py's
-# _TASK_CARDS_BUDGET is: this site may tighten it, never widen it.
+# Bound to the shared default by reference, as
+# data/task_lookup.py::LOOKUP_BUDGET_SECONDS is: this site may tighten it,
+# never widen it.
 _TASK_PROSE_BUDGET = DEFAULT_WHOLE_OPERATION_BUDGET
 
 

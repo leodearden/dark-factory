@@ -8,6 +8,8 @@ every idle cycle.  ``run_full()`` records both trackers so the gate re-closes.
 
 from __future__ import annotations
 
+import time
+from collections.abc import Callable
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -25,17 +27,21 @@ _PHASE1 = VerifyResult(
 
 
 def _make_checkpoint(
-    min_interval: float = 86400.0, min_tasks: int = 20
+    min_interval: float = 86400.0,
+    min_tasks: int = 20,
+    *,
+    clock: Callable[[], float] = time.monotonic,
 ) -> ReviewCheckpoint:
     config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
     config.project_root = Path('/tmp')
+    config.review.interval = 5
     config.review.full_review_min_interval_secs = min_interval
     config.review.full_review_min_tasks = min_tasks
     # deep_reviewer resolves via resolve_route (task η) — real config.routing.*.
     stamp_stock_routing_config(config)
     mcp = MagicMock()
     mcp.mcp_config_json.return_value = {'mcpServers': {}}
-    cp = ReviewCheckpoint(config, mcp=mcp, usage_gate=None)
+    cp = ReviewCheckpoint(config, mcp=mcp, usage_gate=None, clock=clock)
     # _RecordingEventStore is a duck-typed double, not an EventStore subclass
     # (repo-wide pattern — see test_delivered_check_gate_e2e.py).
     cp.event_store = _RecordingEventStore()  # type: ignore[assignment]
@@ -86,10 +92,11 @@ class TestShouldRunFullGate:
 
 @pytest.mark.asyncio
 class TestRunFullRecordsTrackers:
-    async def test_run_full_records_time_and_merge(self, monkeypatch):
+    async def test_run_full_records_time_and_merge(self):
         """run_full() stamps both full-review trackers (separate from focused)."""
-        cp = _make_checkpoint()
-        cp._merge_count = 25
+        cp = _make_checkpoint(clock=lambda: 5000.0)
+        for _ in range(25):
+            cp.record_merge([])
 
         cp._run_review = AsyncMock(  # type: ignore[method-assign]
             return_value=ReviewReport(
@@ -98,17 +105,13 @@ class TestRunFullRecordsTrackers:
             )
         )
 
-        monkeypatch.setattr(
-            'orchestrator.review_checkpoint.time.monotonic', lambda: 5000.0
-        )
-
         await cp.run_full()
 
         # Full-review trackers recorded.
         assert cp._last_full_review_time == 5000.0
         assert cp._last_full_review_at_merge == 25
-        # Existing focused-cadence reset is preserved (not perturbed).
-        assert cp._last_review_at_merge == 25
+        # The merges the full review covered no longer trigger a focused one.
+        assert not cp.should_trigger()
 
         # The gate now re-closes: no new merges, no elapsed time → False.
         assert cp.should_run_full(now=5000.0) is False

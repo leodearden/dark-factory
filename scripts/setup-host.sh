@@ -12,9 +12,10 @@ ok()    { printf '\033[1;32m  ✓ %s\033[0m\n' "$*"; }
 warn()  { printf '\033[1;33m  ! %s\033[0m\n' "$*"; }
 fail()  { printf '\033[1;31m  ✗ %s\033[0m\n' "$*"; }
 
-# Classify what a parity checker just told us. Defined HERE, once, immediately
-# below the log shims and above every parity call site — the five sites share
-# one shell scope, and every sliced block is executed by the test harness under
+# Classify what a tagged checker just told us: the five parity checkers, the
+# network exposure check and the expected-user-timer arming. Defined HERE, once, immediately below the log shims
+# and above every call site — the sites share one shell scope, and every sliced
+# block is executed by the test harness under
 # a preamble that provides this helper (tests/scripts/setup_host_sections.py
 # slices it live out of this file, so there is no second copy to drift).
 #
@@ -33,13 +34,14 @@ fail()  { printf '\033[1;31m  ✗ %s\033[0m\n' "$*"; }
 #
 # CLASSIFICATION ONLY. Each call site keeps its own wording, severity and side
 # effects, because those legitimately differ — `absent` is `info` at the
-# orchestrator, dashboard pre-install and lms sites but `warn` at the
-# fused-memory and dashboard post-install ones; the orchestrator gate may
-# `fail` and sets _orch_install_blocked, while the lms gate is forbidden from
-# ever calling `fail` (test_setup_host_lms_parity_gate.py::test_the_lms_gate_is_warn_only).
+# orchestrator, dashboard pre-install and lms sites, `warn` at the
+# fused-memory, dashboard post-install and expected-user-timer ones and `fail`
+# at the network exposure one; the orchestrator gate may `fail` and sets
+# _orch_install_blocked, while the lms gate is forbidden from ever calling
+# `fail` (test_setup_host_lms_parity_gate.py::test_the_lms_gate_is_warn_only).
 # A helper that also emitted messages would have to collapse those distinctions
-# or take five message parameters — either way re-creating the coupling the
-# extraction removes.
+# or take a message and a severity per verdict from every site — either way
+# re-creating the coupling the extraction removes.
 #
 # The tag is matched with bash's own `[[ ]]`, never `printf | grep -q`. grep
 # exits the instant it matches and the tag is on line 1, so once the report
@@ -62,9 +64,10 @@ _parity_verdict() {
   fi
 }
 
-# Does FalkorDB answer? ONE probe, two callers — the section-2 wait loop and the
-# section-12 health check ask exactly the same question, and a copy at each site
-# is how the two drift apart.
+# Does FalkorDB answer? ONE probe, every caller — the section-2 wait loops and the
+# section-11 health check ask exactly the same question, and a copy at each site
+# is how they drift apart. The optional argument names the compose service
+# (default `falkordb`; the scratch server is `falkordb-scratch`).
 #
 # The verdict is read from the captured REPLY, not from a pipeline's exit
 # status. `... ping | grep -q PONG` answers with the PRODUCER's status, which is
@@ -86,8 +89,8 @@ _parity_verdict() {
 # `local` confines the reply to the call, so neither caller can ever read a
 # verdict the other left behind in the shared shell scope.
 falkordb_pings() {
-  local out
-  out="$(docker compose -f "$COMPOSE_FILE" exec -T falkordb redis-cli ping 2>/dev/null)" || true
+  local service="${1:-falkordb}" out
+  out="$(docker compose -f "$COMPOSE_FILE" exec -T "$service" redis-cli ping 2>/dev/null)" || true
   [[ "$out" == *PONG* ]]
 }
 
@@ -154,7 +157,10 @@ info "Starting backing stores (FalkorDB + Qdrant)"
 mkdir -p "$REPO_ROOT/fused-memory/data/falkordb"
 mkdir -p "$REPO_ROOT/fused-memory/data/qdrant"
 
-docker compose -f "$COMPOSE_FILE" up -d falkordb qdrant
+# Through the AOF gate, never a bare compose-up: on a host that already has a
+# falkordb container, a compose-up recreates it onto whatever AOF is on disk
+# (task 6330). The gate creates it on a fresh host and refuses over stale data.
+python3 "$REPO_ROOT/scripts/falkordb_aof_gate.py" --compose-file "$COMPOSE_FILE"
 
 # Wait for healthy
 for i in $(seq 1 30); do
@@ -177,15 +183,30 @@ for i in $(seq 1 30); do
   sleep 1
 done
 
-# ---------------------------------------------------------------------------
-# 3. Python subprojects — uv sync (dependency order)
-# ---------------------------------------------------------------------------
-info "Syncing Python subprojects"
+# The scratch FalkorDB that tests, the offline lane and evals write to
+# (OPERATIONS.md "The scratch FalkorDB"). Production does not depend on it, so
+# every failure here is a warning.
+if docker compose -f "$COMPOSE_FILE" up -d --no-deps falkordb-scratch; then
+  for i in $(seq 1 30); do
+    if falkordb_pings falkordb-scratch; then
+      ok "Scratch FalkorDB healthy"
+      break
+    fi
+    [ "$i" -eq 30 ] && warn "Scratch FalkorDB did not become healthy in 30s"
+    sleep 1
+  done
+else
+  warn "Scratch FalkorDB did not start; start it with: docker compose -f $COMPOSE_FILE up -d --no-deps falkordb-scratch"
+fi
 
-for proj in shared escalation fused-memory orchestrator dashboard; do
-  (cd "$REPO_ROOT/$proj" && uv sync --quiet)
-  ok "$proj"
-done
+# ---------------------------------------------------------------------------
+# 3. Python workspace — uv sync --all-packages
+# ---------------------------------------------------------------------------
+info "Syncing Python workspace (all members)"
+
+# A member-scoped sync is exact and prunes the other members from the shared .venv; see scripts/sync-orchestrator-env.sh.
+(cd "$REPO_ROOT" && uv sync --all-packages --quiet)
+ok "Python workspace synced (every member, client-feed included)"
 
 # ---------------------------------------------------------------------------
 # 4. Systemd user unit for fused-memory
@@ -752,8 +773,8 @@ else
   # Each copy is INDIVIDUALLY fault-tolerant, for the same reason the source
   # existence test above exists: under `set -euo pipefail` one failing `cp`
   # aborts this script outright, taking daemon-reload, every enable, and every
-  # LATER section of the host installer (jCodeMunch, Claude config, ...) with
-  # it. A unit is a bad reason to abandon a host setup.
+  # LATER section of the host installer (dashboard units, skill symlinks, git
+  # hooks, ...) with it. A unit is a bad reason to abandon a host setup.
   #
   # The existence test cannot cover this: the checker's `unreadable` is raised
   # on (OSError, UnicodeDecodeError), and the OSError half is exactly a file
@@ -813,111 +834,6 @@ else
     ok "orchestrator units + watchdog installed and enabled (${#_orch_installed_units[@]}/${#_orch_units[@]})"
   fi
 fi
-
-# ---------------------------------------------------------------------------
-# 6. jCodeMunch — structured code retrieval for coding agents
-# ---------------------------------------------------------------------------
-info "Installing jCodeMunch (AST-based code indexing)"
-
-# Global config (ignore patterns shared across all projects)
-CODE_INDEX_DIR="$HOME/.code-index"
-mkdir -p "$CODE_INDEX_DIR"
-
-if [ ! -f "$CODE_INDEX_DIR/config.jsonc" ]; then
-  cat > "$CODE_INDEX_DIR/config.jsonc" << 'JCEOF'
-{
-  "max_folder_files": 10000,
-  "extra_ignore_patterns": [
-    ".worktrees/",
-    ".eval-worktrees/",
-    "*-eval-worktrees/",
-    ".claude/worktrees/",
-    ".taskmaster/",
-    ".playwright-mcp/",
-    "node_modules/",
-    "target/",
-    "__pycache__/",
-    ".venv/",
-    ".mypy_cache/",
-    ".ruff_cache/",
-    ".pytest_cache/",
-    "*.png",
-    "uv.lock",
-    "Cargo.lock",
-    "pnpm-lock.yaml",
-    "package-lock.json"
-  ],
-  "staleness_days": 3
-}
-JCEOF
-  ok "Global config written to $CODE_INDEX_DIR/config.jsonc"
-else
-  ok "Global config already exists"
-fi
-
-# Project-level config
-if [ ! -f "$REPO_ROOT/.jcodemunch.jsonc" ]; then
-  cat > "$REPO_ROOT/.jcodemunch.jsonc" << 'JCEOF'
-{
-  // dark-factory: Python monorepo (fused-memory, orchestrator, escalation, shared)
-  "languages": ["python"],
-  "max_folder_files": 5000,
-  "disabled_tools": ["search_columns"],
-  "staleness_days": 3
-}
-JCEOF
-  ok "Project config written"
-else
-  ok "Project config already exists"
-fi
-
-# Install the prebuilt, version-pinned launcher the shared launch contract
-# (shared/src/shared/jcodemunch_launch.py) names, then register jcodemunch in
-# the user-level Claude config from that contract, replacing any existing entry
-# so every run converges on it: `claude mcp add-json` refuses a name that
-# already exists. `uv tool install` exits 0 even when its bin dir is not on
-# PATH, so registration is gated on the registered command resolving.
-if ! _jcodemunch_server_json="$(PYTHONPATH="$REPO_ROOT/shared/src" python3 -m shared.jcodemunch_launch)" \
-  || ! _jcodemunch_install_argv_lines="$(PYTHONPATH="$REPO_ROOT/shared/src" python3 -m shared.jcodemunch_launch install-argv)" \
-  || ! _jcodemunch_command="$(jq -r .command <<<"$_jcodemunch_server_json")"; then
-  fail "The jcodemunch launch contract did not render, so its launcher was not installed and jcodemunch was not registered in user config"
-  warn "  Fix: make 'PYTHONPATH=$REPO_ROOT/shared/src python3 -m shared.jcodemunch_launch [install-argv]' succeed, then re-run scripts/setup-host.sh"
-else
-  mapfile -t _jcodemunch_install_argv <<<"$_jcodemunch_install_argv_lines"
-  if "${_jcodemunch_install_argv[@]}"; then
-    ok "$_jcodemunch_command launcher installed at the contract's pin"
-  else
-    fail "$_jcodemunch_command launcher install failed"
-    warn "  Fix: ${_jcodemunch_install_argv[*]}"
-  fi
-  if ! command -v "$_jcodemunch_command" &>/dev/null; then
-    fail "$_jcodemunch_command is not on PATH, so jcodemunch was not registered in user config"
-    warn "  Fix: put \"\$(uv tool dir --bin)\" on PATH (uv tool update-shell), then re-run scripts/setup-host.sh"
-  elif command -v claude &>/dev/null; then
-    _jcodemunch_removed=""
-    if claude mcp remove --scope user jcodemunch >/dev/null 2>&1; then
-      _jcodemunch_removed=", and its previous registration there was removed"
-    fi
-    if claude mcp add-json --scope user jcodemunch "$_jcodemunch_server_json"; then
-      ok "jcodemunch MCP registered in user config"
-    else
-      fail "jcodemunch MCP not registered in user config$_jcodemunch_removed"
-      warn "  Fix: claude mcp add-json --scope user jcodemunch \"\$(PYTHONPATH=$REPO_ROOT/shared/src python3 -m shared.jcodemunch_launch)\""
-    fi
-  fi
-fi
-
-# Systemd watcher unit
-sed \
-  -e "s|__REPO_ROOT__|$REPO_ROOT|g" \
-  -e "s|__UV_PATH__|$UV_PATH|g" \
-  "$REPO_ROOT/scripts/jcodemunch-watcher.service.template" \
-  > "$UNIT_DIR/jcodemunch-watcher.service"
-
-systemctl --user daemon-reload
-systemctl --user enable jcodemunch-watcher
-systemctl --user restart jcodemunch-watcher
-ok "jcodemunch-watcher unit installed and started"
 
 # ---------------------------------------------------------------------------
 # 7. Dashboard systemd units
@@ -1108,6 +1024,72 @@ else
   warn "Dashboard watchdog units installed; the dashboard SERVICE unit was NOT"
   warn "  rendered — see the FAIL lines above. Whatever copy this host already"
   warn "  had is untouched and still enabled; a bare host has none."
+fi
+
+# ---------------------------------------------------------------------------
+# 7a. Client-feed publisher and defect-filer unit templates (rendered, never enabled)
+# ---------------------------------------------------------------------------
+info "Installing the client-feed publisher and defect-filer unit templates"
+
+# One instance of each per client project is enabled by hand: OPERATIONS.md §"Client feed".
+_cf_render_script="$REPO_ROOT/scripts/render_systemd_unit.py"
+if python3 "$_cf_render_script" \
+     --unit      client-feed \
+     --template  "$REPO_ROOT/scripts/client-feed.service.template" \
+     --repo-root "$REPO_ROOT" \
+     --uv-path   "$UV_PATH" \
+     --output    "$UNIT_DIR/client-feed@.service"; then
+  systemctl --user daemon-reload
+  ok "client-feed@.service installed; no instance enabled (one per client project, by hand: OPERATIONS.md §\"Client feed\")"
+else
+  fail "client-feed@.service render FAILED — see the [client_feed_unit_render] report above."
+  fail "  Any installed $UNIT_DIR/client-feed@.service was left untouched."
+fi
+if python3 "$_cf_render_script" \
+     --unit      client-feed-filer \
+     --template  "$REPO_ROOT/scripts/client-feed-filer.service.template" \
+     --repo-root "$REPO_ROOT" \
+     --uv-path   "$UV_PATH" \
+     --output    "$UNIT_DIR/client-feed-filer@.service"; then
+  systemctl --user daemon-reload
+  ok "client-feed-filer@.service installed; no instance enabled (one per client project, by hand: OPERATIONS.md §\"Client feed\")"
+else
+  fail "client-feed-filer@.service render FAILED — see the [client_feed_filer_unit_render] report above."
+  fail "  Any installed $UNIT_DIR/client-feed-filer@.service was left untouched."
+fi
+
+# ---------------------------------------------------------------------------
+# 7b. Expected user timers — the nightly ladder and the load sampler
+# ---------------------------------------------------------------------------
+info "Arming the expected user timers"
+info "  An unarmed timer's installer may run its job once, which can take minutes; the report prints when arming ends."
+
+# The registry is scripts/expected_user_timers.py. Only an unarmed timer's
+# installer runs, and a masked one is left alone. The status is believed only
+# with the [user_timers] tag (scripts/user_timers.py). Why: OPERATIONS.md §12.
+_user_timers_script="$REPO_ROOT/scripts/user_timers.py"
+if [ ! -f "$_user_timers_script" ]; then
+  fail "Expected-user-timer arming missing: $_user_timers_script"
+  fail "  Not treating that as 'every timer armed' — it is 'nothing checked'."
+else
+  _user_timers_out="$(python3 "$_user_timers_script" arm --repo-root "$REPO_ROOT" 2>&1)" \
+       && _user_timers_exit=0 || _user_timers_exit=$?
+  printf '%s\n' "$_user_timers_out"
+  _user_timers_verdict="$(_parity_verdict "$_user_timers_out" \
+       "$_user_timers_exit" '[user_timers]')"
+  case "$_user_timers_verdict" in
+  unreported)
+    fail "Expected-user-timer arming produced no [user_timers] report"
+    fail "  (status $_user_timers_exit) — it did not run, so no timer was checked."
+    ;;
+  parity)
+    ok "Expected user timers: every one is armed"
+    ;;
+  absent | finding | *)
+    warn "Expected user timers: not all armed, or an installer failed — see the [user_timers] report above."
+    warn "  Re-check: python3 $_user_timers_script check"
+    ;;
+  esac
 fi
 
 # ---------------------------------------------------------------------------
@@ -1469,11 +1451,34 @@ else
   esac
 fi
 
-# jCodeMunch watcher
-if systemctl --user is-active jcodemunch-watcher &>/dev/null; then
-  ok "jCodeMunch watcher: running"
+# Every factory port must refuse off-loopback connects and accept on 127.0.0.1,
+# unless the report notes it [no-container]: an optional compose service with no
+# container yet (contract: plans/mcp-network-exposure-prd.md §3). The status is believed only
+# with the [network_exposure] tag; the check never exits 2 under it, so `absent`
+# is a failure here.
+_net_exposure_script="$REPO_ROOT/scripts/check_network_exposure.py"
+if [ ! -f "$_net_exposure_script" ]; then
+  fail "Network exposure check missing: $_net_exposure_script"
+  fail "  Not treating that as 'nothing exposed' — it is 'nothing checked'."
 else
-  warn "jCodeMunch watcher: not running (check: journalctl --user -u jcodemunch-watcher)"
+  _net_exposure_out="$(python3 "$_net_exposure_script" 2>&1)" \
+       && _net_exposure_exit=0 || _net_exposure_exit=$?
+  printf '%s\n' "$_net_exposure_out"
+  _net_exposure_verdict="$(_parity_verdict "$_net_exposure_out" \
+       "$_net_exposure_exit" '[network_exposure]')"
+  case "$_net_exposure_verdict" in
+  unreported)
+    fail "Network exposure check produced no [network_exposure] report"
+    fail "  (status $_net_exposure_exit) — it did not run, so nothing was checked."
+    ;;
+  parity)
+    ok "Network exposure: no factory port is reachable off loopback; every running owner accepts on 127.0.0.1 (see the report above)"
+    ;;
+  absent | finding | *)
+    fail "Network exposure: a factory port is reachable off loopback, unreachable on it, or unverified —"
+    fail "  see the [network_exposure] report above."
+    ;;
+  esac
 fi
 
 echo ""

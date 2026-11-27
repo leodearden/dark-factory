@@ -193,10 +193,17 @@ today a scoring retune costs a fleet restart. The new knobs ship as a submodel g
 **D9 — Watchdog consequence is an auto-pin, bounded and owned (INV-7).** The override store
 is the only restart-durable prioritization state. The auto-pin carries `ttl_until`, is
 capped at `auto_pin_max_concurrent`, is tagged with its source so an operator's manual pin
-is never clobbered or miscounted, and is released when the task dispatches. Hitting the cap
-is itself the escalation — a systemically starved queue is an operator-grade signal, not a
-per-task one. This matters concretely: the pin queue already holds 12 entries, 4 of them
-operator pins.
+is never clobbered or miscounted, and is released when the task dispatches. A starving task
+the cap turns away files no per-task escalation; one sentinel L1 speaks for the capped cohort.
+This matters concretely: the pin queue already holds 12 entries, 4 of them operator pins.
+
+*AMENDED 2026-11-13 (task 9636).* The original text made hitting the cap itself the escalation.
+In operation that re-announced the same standing cohort of ~290 tasks, in bursts about a day
+after each restart (plans/starvation-cap-study-2026-11-12.md). Leo's ruling of 2026-11-13: the
+cap L1 signals a CHANGE in the capped cohort, a standing cohort files nothing new, and per-task
+facts stay in `starvation_detected` events. Leo's ruling of 2026-11-16 adds that it is filed only
+when the watchdog can name a wedge: some blocker's holder is not live. The rule, its thresholds
+and the liveness walk are in C4 "Cap L1".
 
 **D10 — Ordering: backfill lands before park persistence.** Making parks durable amplifies
 whatever the current parking regime does. For dark-factory the sim says the current regime
@@ -366,10 +373,92 @@ longer wipes 72h of accrued idleness and a 2.2h process era no longer bounds a 7
 4. Keep the existing level-0 INFO escalation as the human trail; it now has a consequence.
 
 **Bounds (INV-7 / INV-4).** At most `auto_pin_max_concurrent` (default 3) watchdog-owned pins
-at a time. At the cap, do not pin — escalate at L1 instead, naming the starved cohort. Every
+at a time. At the cap, do not pin: the firing joins the *waiting cohort* and waits for a pin
+slot, and the cap L1 below speaks for the cohort. Every
 auto-pin carries `ttl_until` (default 24h) and is released at both dispatch sites (where
 `_resolve_starvation_escalation` already runs), clearing **only** pins whose `source` is the
 watchdog.
+
+**Cap L1 (AMENDED 2026-11-13, task 9636; D9).** One level-1 escalation under the sentinel
+`__starvation_auto_pin_cap__` reports a CHANGE in the waiting cohort, and only when the watchdog
+can point at something a human should look at. Code: `orchestrator/src/orchestrator/starvation_cap.py`.
+
+- *Alarming.* Some blocker of some member has a non-live holder. Every blocker counts, not only
+  the first: a member needs all its modules, so a wedged holder on its second module starves it
+  as surely as one on its first. The cohort also alarms when it has members, some task holds a
+  lock, and no member has a recorded blocker, the case the watchdog cannot explain. A cohort
+  waiting while no lock is held explains nothing either way, so it changes nothing: an open
+  alarm stays open and the baseline stays. That case is the first ticks after a restart,
+  before holders re-dispatch. Resolving there would close a standing wedge at every restart,
+  and since a resolve keeps the baseline, the same wedge would never be re-filed.
+- *Liveness* (`orchestrator/src/orchestrator/blocker_liveness.py`; AMENDED 2026-11-24, task
+  10700; AMENDED 2026-11-25, task 11627). A HELD module's owner must be a slot this scheduler
+  process has dispatched and not released (`Scheduler._dispatched`); otherwise the reason is
+  `lock_without_slot`, a lock no running slot will release. A dispatched owner is live when
+  terminal, `pending` with no claimant (dispatched, not yet claimed), or gone from the active
+  read: its slot awaits its claim or is unwinding to its release. The slot's own exit path
+  bounds that unwinding, and the terminal-status watcher force-releases a slot that never unwinds
+  (`orchestrator/src/orchestrator/harness.py::Harness._force_release_wedged_slot`). Any other
+  dispatched owner is live while someone alive holds it:
+  `shared.task_claimant.is_stranded_any_status` at `claimant_liveness_ttl_secs`, the dispatch
+  gate's `has_live_claimant` (its predicate and TTL) plus the legacy `metadata.infra_hold`
+  exemption. A workflow heartbeats for its whole slot, merge phase included, so a slow holder
+  reads live. An owner no one alive holds is `blocked` when `blocked`
+  (`shared.task_claimant.is_stranded_blocked`) and `no_live_claimant` in any other non-terminal
+  status. A `pending` owner still carrying a claimant whose heartbeat went stale is a slot whose
+  requeue exit hung past the TTL. Nothing else watches a non-terminal hung slot, so it reads
+  `no_live_claimant`, non-live as a stranded `blocked` owner is. The cap L1 reads the lock view
+  and the in-flight set together, after the tick's awaits. It judges claimant heartbeats as of
+  the tick's task read (`TickContext.tasks_read_at`), not the phase's wall clock, because the
+  phases between the two can outlast `claimant_liveness_ttl_secs`: judged at the phase's clock,
+  heartbeating holders filed the false `no_live_claimant` cap L1s
+  `esc-__starvation_auto_pin_cap__-160` and `-162` (task 11627). A heartbeat that goes stale
+  during a long tick is named on the next tick. A PARKED blocker's owner is followed
+  to its own blockers, at most `PARK_FOLLOW_DEPTH` = 3 parks deep (park, park, park, holder). A
+  cycle, a deeper chain, or an owner absent from the read or terminal is non-live. A park owner
+  whose modules are all free waits only for a run slot, which is live.
+- *FILE* when no cap alarm is open, the cohort alarms, and it is news against the last
+  announcement: a new non-live holder, a new module behind a non-live holder (a live
+  holder's lock turnover is never news), or growth to
+  `size + max(GROWTH_FLOOR, ceil(GROWTH_RATIO × size))` with `GROWTH_FLOOR` = 10 and
+  `GROWTH_RATIO` = 0.5.
+- *REFRESH* the open L1 in place (same id, `dedupe_count` + 1) whenever its rendering changes.
+  The rendering carries no ages or counts, so it changes only with membership, first-blocker
+  modules or wedges.
+- *RESOLVE* every pending cap alarm, at any level, under `orchestrator-starvation-watchdog`, when
+  the cohort empties or no longer alarms.
+- *Promoted.* A cap alarm promoted past L1 and still pending (a parked L2) belongs to its human.
+  It counts as open, so no L1 is filed beside it, and it is never rewritten. It is resolved
+  with the rest once the cohort empties or no longer alarms, as the pre-9636 drain resolved
+  every pending record under the sentinel.
+- *Baseline.* FILE and REFRESH replace the last announcement. A human or watcher close keeps it,
+  so a standing cohort files nothing after a "wait" close. A resolve on a wedge clearing keeps
+  it, so a flickering heartbeat does not re-file. An empty cohort resets it, so a cohort that
+  re-forms (say after task 10578 lowers `skip_threshold`) is news.
+- *Drain.* A waiter that is a dispatch candidate this tick but no longer fires a pinning gate
+  leaves the cohort, for example after a hot-reload of `skip_threshold`, `idle_secs` or
+  `idle_only_secs`. Disabling the watchdog drains it whole. A waiter off the candidate list keeps
+  its place, as the eligibility clock's anchors do. So, outside ticks with no lock held, a cap
+  alarm is open iff the live cohort is non-empty and alarming.
+- *Restart durability* (`orchestrator/src/orchestrator/starvation_state.py`). The cohort with each
+  member's gate, the lock-refusal counts, the per-task announced set and the last announcement
+  live in `scheduler_eligibility.db` beside the eligibility anchors. A restart therefore neither
+  re-accrues refusals into a burst a day later nor re-announces a standing cohort or a task
+  already escalated.
+- *Role.* The L1 is filed, refreshed and resolved as `orchestrator-starvation-watchdog`, so none
+  of it feeds the EWA breaker numerator: watchdog alarms are observations (task 3821).
+
+*Why the growth bound.* The 2026-11-12 study saw about 9 genuinely new starving tasks a day
+against about 9 departures: 358 distinct tasks were capped in 7.5 days and 291 still wait. The
+cohort therefore random-walks. Its daily net change has a standard deviation of about 4, about 23
+over a month (about 8% of 290). +50% of a 290-task cohort is 145 tasks, more than 16 days of
+arrivals with no departure and over six monthly standard deviations: a change in the lock
+regime, never drift. The floor of 10 keeps a small cohort from re-filing on two days' arrivals.
+The bounds are code constants, not config knobs: `config.py` is itself one of the hottest
+files the cohort waits on, and nobody has asked to tune them.
+
+The cap itself stays at 3 by Leo's ruling (task 9636). The interim `skip_threshold: 150` override in
+`dark-factory-orchestrator.yaml` stays until task 10578 removes it.
 
 **Park-blocked discriminator (AMENDED 2026-08-07, post-csv-outage).** The clock above measures
 *eligibility*, which cannot separate two classes that need opposite responses:
@@ -539,6 +628,61 @@ candidate that tick, so a blocked or deferred pin head drops its whole footprint
 of re-parking it. Hand-carries (deferred owners) get no park protection (D8). The rule
 has one home, `orchestrator/src/orchestrator/scheduler.py::Scheduler._park_hold_refusal`,
 which park GC, the operator eviction guard and `reserve_now` all consult.
+
+**Amendment (task 7799, park-cycle-787-945).** Ruling (Leo, 2026-10-30): a deadlock
+between parked owners must be impossible by construction. solar_challenge sighted four:
+945<->919 (10-27, over 23 h), 787<->945 (10-29/30), 787<->{894,919} (10-30) and
+919<->955 (10-31 to 11-01, about 31 h, ended only by an orchestrator restart that wiped
+park state). Each owner held a partial park and needed a key the other had parked, and
+each one's acquire was refused by the other's park. A requeue (architect `max_turns`,
+`scope_grant_lock_conflict`) re-parks a task within a minute, so hand-breaks and
+restarts cleared a cycle only incidentally. The fix is one total order on park entries,
+`orchestrator/src/orchestrator/scheduler.py::_ParkKey`: rank first, then the dispatch
+tie-break (older numeric id, then id; non-numeric ids last, I-4). One comparator is
+enforced at two points. At INSTALL (INV-3), a new entry shadows a conflicting top with
+a larger key and is blocked by one with a smaller key, so same-tier installs resolve by
+id instead of colliding. At the GATE (INV-8,
+`orchestrator/src/orchestrator/scheduler.py::ModuleLockTable._precedence_blocking_parks`), a
+foreign top blocks a requester that owns parks only when its key precedes the
+requester's best key, the minimum over every entry it holds. A requester that owns no
+park is blocked by every park, as before. A park owner therefore passes a lower-key park
+even on a key it has not parked yet, which is exactly the edge that formed every
+sighted cycle. The gate carries the guarantee, not install: install runs only for the
+tick's top-skipped candidate, so a predecessor that is not the score-top never retries
+it (945 logged no `task_skipped` in 787<->945). Under the gate every park wait goes
+from an owner to one with a strictly smaller best key. So the wait-for graph between
+park owners is acyclic in every reachable state, including the state right after a
+requeue re-parks, and the smallest-key owner waits only on live holders. Installation
+stays rank-1-gated, so the "Below-rank-1 park INSTALLATION" row above is not widened.
+The operator eviction lever keeps its D4 live-owner refusal
+(`orchestrator/src/orchestrator/scheduler.py::Scheduler._park_hold_refusal`) unchanged:
+no pending owner can be part of a cycle, so nothing needs evicting to break one. Branch
+progress is deliberately not in the key. The key must be computable from lock-table
+state alone and stay stable from tick to tick. Branch progress is the asynchronously
+refreshed `work_product` view, and the score already credits it as continuity, which
+decides who is TRIED first. Precedence decides only whose park may block whom.
+
+**Annotation (task 6328).** The class: a candidate that is not the scored scan's top is
+refused its locks by a same-tier (or lower-tier) park whose pending owner itself waits
+on holders. It earns no skip, no park and no event, so it waits as long as the owner
+does. 6040 waited about 70 h behind 5221's park, while 5221 waited on 3096's hold of
+`harness.py`. Chosen: option (c), visibility plus a documented lever. The
+`park_refused` event names the parks, each park's priority and age, and what each owner
+waits on. The lever is to pin the waiting candidate: 6040's head pin reservation
+shadows the peer's park on the shared keys, the peer's park is restored at the
+candidate's dispatch, and no held lock is touched (OPERATIONS.md §5). The automatic
+backstop is C4's `lock_refused` gate, bounded by its auto-pin cap: at the cap the task
+joins the waiting cohort that C4's cap L1 speaks for (task 9636). Rejected for now:
+option (b), bounding how long a park may block. It is the "Park leases / expiry" row by
+another name, and it lifts C7's `backfill_max_park_age_secs` cutoff, whose named
+casualty is an owner that never dispatches. Deferred: option (a), a bounded automatic
+pin. It adds an automatic below-rank-1 reservation trigger ("refused by parks alone")
+that has never been simulated, and the "Below-rank-1 park INSTALLATION" row admits only
+a gated follow-up. Whether automatic reservations act on dispatch at all is under Leo's
+ruling at gate task 10128, which reviews the 2026-11-15..29 trial with
+`fairness.skip_threshold` at 1000000; its "change" arm names "reserve only for a task
+that has been overtaken". `park_refused` counts are the frequency evidence a later (a)
+would need. See `orchestrator/src/orchestrator/park_refusal.py`.
 
 ## 8. Pre-conditions and substrate verification (G3)
 

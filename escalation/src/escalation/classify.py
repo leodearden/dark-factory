@@ -1,13 +1,18 @@
 """Escalation classification helpers.
 
-Single site (INV-5) for three related but distinct classification concerns.
+Single site (INV-5) for five related but distinct classification concerns.
 The first two are described in plans/escalation-lifecycle-dashboard-prd.md
-Contract Seam 1; the third in plans/info-l0-disposition-router-prd.md D8:
+Contract Seam 1; the third in plans/info-l0-disposition-router-prd.md D8; the
+fourth in that PRD's D2; the fifth has no design doc, and its docstring is its
+contract:
 
 - ``classify_resolver_tier`` — maps a ``resolved_by`` attribution string to a
   coarse resolver *tier* (human / cascade / auto-watcher / steward /
   reaper-sweep / unknown / other-auto). Used both for analytics grouping and
   to derive the per-path benign default (see ``default_resolution_class_for_resolver``).
+- ``resolver_tier`` — maps a closed record to its tier in ``RESOLVER_TIERS``,
+  splitting the human tier by the record's ``ruled_by_human`` flag into
+  human-ruled and attended-seat (plans/instruments-honesty-prd.md decision 10).
 - ``effective_benign`` — the stamp-first-with-proxy-fallback predicate that
   turns a resolved/dismissed ``Escalation`` record into a
   ``(class, provenance)`` pair, so aggregators can report the stamped-vs-
@@ -15,6 +20,11 @@ Contract Seam 1; the third in plans/info-l0-disposition-router-prd.md D8:
 - ``info_l0_mechanical_class`` — which mechanical info-L0 class a record
   belongs to, if any: a registered filer role (``INFO_L0_MECHANICAL_ROLES``)
   or the discriminated done-step-commit orphan (``is_done_step_commit_orphan``).
+- ``is_harness_filed`` — whether a record was filed by the harness (the bare
+  ``HARNESS_ROLE`` or a sentinel-prefixed role) rather than by an agent.
+- ``closed_by_non_sweep_resolver`` — whether a record was closed by something
+  that carries a finding (an agent, a human, a cascade) rather than by an
+  automated sweep.
 
 All helpers are pure functions with no I/O — callers (queue.py, server.py,
 and future dashboard aggregators) import them rather than re-deriving the
@@ -24,14 +34,20 @@ same resolver membership or benign/actionable logic independently.
 from __future__ import annotations
 
 from collections.abc import Set as AbstractSet
+from enum import StrEnum
 
-from escalation.models import Escalation
+from escalation.authority import COORDINATOR_IDENTITY
+from escalation.models import HARNESS_SENTINEL_ROLE_PREFIXES, Escalation
 
 # Resolver→tier classification table (plans/escalation-lifecycle-dashboard-prd.md
 # Contract Seam 1). Exact-membership frozensets for the tiers whose
 # resolved_by values are fixed literals; 'cascade' and 'steward' are matched
 # by prefix/suffix instead since they're parameterised by escalation id / task id.
-_HUMAN_RESOLVERS: frozenset[str] = frozenset({'interactive', 'escalation-watcher'})
+# The coordinator is a human sitting, so its closes count in the human tier
+# (plans/decision-stream-prd.md §3 decision 3).
+_HUMAN_RESOLVERS: frozenset[str] = frozenset({
+    'interactive', 'escalation-watcher', COORDINATOR_IDENTITY,
+})
 _AUTO_WATCHER_RESOLVERS: frozenset[str] = frozenset(
     {'escalation-watcher-auto', 'orchestrator-escalation-watcher-auto'}
 )
@@ -47,7 +63,19 @@ _STEWARD_PREFIX = 'claude-task-'
 _STEWARD_SUFFIX = '-steward'
 
 
-def classify_resolver_tier(resolved_by: str | None) -> str:
+class SeatTier(StrEnum):
+    """The tier of the seat a ``resolved_by`` names, in display order."""
+
+    HUMAN = 'human'
+    CASCADE = 'cascade'
+    AUTO_WATCHER = 'auto-watcher'
+    STEWARD = 'steward'
+    REAPER_SWEEP = 'reaper-sweep'
+    UNKNOWN = 'unknown'
+    OTHER_AUTO = 'other-auto'
+
+
+def classify_resolver_tier(resolved_by: str | None) -> SeatTier:
     """Classify a ``resolved_by`` attribution string into a resolver tier.
 
     Order matters: exact human/auto-watcher/reaper-sweep membership checks
@@ -57,18 +85,46 @@ def classify_resolver_tier(resolved_by: str | None) -> str:
     is surfaced as its own chart segment).
     """
     if resolved_by is None:
-        return 'unknown'
+        return SeatTier.UNKNOWN
     if resolved_by in _HUMAN_RESOLVERS:
-        return 'human'
+        return SeatTier.HUMAN
     if resolved_by.startswith(_CASCADE_PREFIX):
-        return 'cascade'
+        return SeatTier.CASCADE
     if resolved_by in _AUTO_WATCHER_RESOLVERS:
-        return 'auto-watcher'
+        return SeatTier.AUTO_WATCHER
     if resolved_by.startswith(_STEWARD_PREFIX) and resolved_by.endswith(_STEWARD_SUFFIX):
-        return 'steward'
+        return SeatTier.STEWARD
     if resolved_by in _REAPER_SWEEP_RESOLVERS:
-        return 'reaper-sweep'
-    return 'other-auto'
+        return SeatTier.REAPER_SWEEP
+    return SeatTier.OTHER_AUTO
+
+
+# resolver_tier splits the human seat tier by the record's ruled_by_human flag.
+HUMAN_RULED = 'human-ruled'
+ATTENDED_SEAT = 'attended-seat'
+
+# The record-tier vocabulary resolver_tier returns, in display order: the human
+# split, then every other seat tier. The dashboard's frontend tier whitelists
+# mirror this tuple.
+RESOLVER_TIERS: tuple[str, ...] = (
+    HUMAN_RULED,
+    ATTENDED_SEAT,
+    *(tier.value for tier in SeatTier if tier is not SeatTier.HUMAN),
+)
+
+
+def resolver_tier(record: Escalation) -> str:
+    """The resolver tier of *record*: a human ruling first, then the seat that closed it.
+
+    A cascade member that inherited ``ruled_by_human=True`` is human-ruled, not
+    cascade: a ruling on a cluster is a ruling on each member.
+    """
+    if record.ruled_by_human is True:
+        return HUMAN_RULED
+    seat = classify_resolver_tier(record.resolved_by)
+    if seat is SeatTier.HUMAN:
+        return ATTENDED_SEAT
+    return seat.value
 
 
 def effective_benign(record: Escalation) -> tuple[str | None, str]:
@@ -103,6 +159,23 @@ def effective_benign(record: Escalation) -> tuple[str | None, str]:
     )
 
 
+def closed_by_non_sweep_resolver(record: Escalation) -> bool:
+    """Is *record* terminal, and closed by a resolver outside the reaper-sweep tier?
+
+    An agent, a human, a cascade or another non-sweep actor decided it. Both
+    terminal states count, because ``resolve_issue``'s ``close_only`` and
+    ``abandon`` actions dismiss rather than resolve.
+
+    A steward's hand-off dismissal (``resolved_by='steward'``, filed with an
+    L1) also passes, though it hands the record to a human rather than
+    resolving it: the stamp is shared with the back-fill of an unattributed
+    agent close, so the predicate cannot tell the two apart.
+    """
+    if record.status not in ('resolved', 'dismissed'):
+        return False
+    return classify_resolver_tier(record.resolved_by) is not SeatTier.REAPER_SWEEP
+
+
 def default_resolution_class_for_resolver(resolved_by: str | None) -> str | None:
     """Return the per-path benign default for *resolved_by*, or None.
 
@@ -115,7 +188,7 @@ def default_resolution_class_for_resolver(resolved_by: str | None) -> str | None
     unstamped so ``effective_benign``'s read-time proxy applies unless the
     caller passes an explicit ``resolution_class``.
     """
-    return 'benign' if classify_resolver_tier(resolved_by) == 'reaper-sweep' else None
+    return 'benign' if classify_resolver_tier(resolved_by) is SeatTier.REAPER_SWEEP else None
 
 
 # The orchestrator filer roles whose info-severity L0s are mechanical notices,
@@ -131,6 +204,16 @@ INFO_L0_MECHANICAL_ROLES: frozenset[str] = frozenset({
 })
 
 DONE_STEP_COMMIT_ORPHAN_CLASS = 'done-step-commit-orphan'
+
+# The bare role in-process harness code files under (workflow, merge worker,
+# exit contract); sentinel-prefixed roles are the rest of the harness namespace.
+HARNESS_ROLE = 'orchestrator'
+
+
+def is_harness_filed(record: Escalation) -> bool:
+    """Was *record* filed by the harness rather than by an agent?"""
+    role = record.agent_role or ''
+    return role == HARNESS_ROLE or role.startswith(HARNESS_SENTINEL_ROLE_PREFIXES)
 
 
 def is_done_step_commit_orphan(esc: Escalation) -> bool:
@@ -148,7 +231,7 @@ def is_done_step_commit_orphan(esc: Escalation) -> bool:
     changes, unlike a fragile summary-substring match.
     """
     return (
-        esc.agent_role == 'orchestrator'
+        esc.agent_role == HARNESS_ROLE
         and esc.category == 'infra_issue'
         and esc.suggested_action == 'verify_wip_reconciliation'
     )

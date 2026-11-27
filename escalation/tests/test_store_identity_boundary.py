@@ -27,26 +27,13 @@ from escalation.server import create_server
 from escalation.store_identity import StoreIdentity
 
 TASK = '5534'
-READS = ('get_pending_escalations', 'get_escalation', 'get_task_escalation_history')
-WRITES = ('escalate_info', 'escalate_blocker')
-GUARDED = READS + WRITES
-_FILING = {
-    'task_id': TASK,
-    'agent_role': 'implementer',
-    'category': 'design_concern',
-    'summary': 's',
-}
+READS = stores.GUARDED_READS
+WRITES = stores.GUARDED_WRITES
+GUARDED = READS + WRITES + stores.GUARDED_RESOLVES
 
 
 def arguments(name: str, escalation_id: str) -> dict[str, Any]:
-    table: dict[str, dict[str, Any]] = {
-        'get_pending_escalations': {'task_id': TASK},
-        'get_escalation': {'escalation_id': escalation_id},
-        'get_task_escalation_history': {'task_id': TASK},
-        'escalate_info': _FILING,
-        'escalate_blocker': _FILING,
-    }
-    return dict(table[name])
+    return stores.guarded_arguments(name, task_id=TASK, escalation_id=escalation_id)
 
 
 def pending_ids(queue: EscalationQueue) -> list[str]:
@@ -244,7 +231,7 @@ async def test_b6_history_answers_what_pending_cannot(
     reify_server: FastMCP, queue: EscalationQueue,
 ) -> None:
     gate = _file(queue, TASK, level=2, agent_role='deterministic')
-    queue.resolve(gate.id, 'Human reviewed the gate')
+    queue.resolve(gate.id, 'Human reviewed the gate', resolution_class='actionable')
     assert len(list(queue.queue_dir.glob(f'archive/*/{gate.id}.json'))) == 1
 
     async with Client(reify_server) as client:

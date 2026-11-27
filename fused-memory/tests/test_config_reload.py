@@ -20,7 +20,9 @@ from unittest.mock import AsyncMock
 
 import pytest
 import yaml
+from _config_overlay_files import calibration, write_overlay
 
+from fused_memory.config.overlay import OVERLAY_ENV_VAR
 from fused_memory.config.reload import (
     RELOADABLE_FIELDS,
     _iter_leaves,
@@ -33,6 +35,7 @@ from fused_memory.config.schema import (
     FusedMemoryConfig,
 )
 from fused_memory.server.entity_mint_authz import resolve_entity_mint_authorization
+from fused_memory.server.mem0_update_authz import resolve_mem0_update_authorization
 from fused_memory.server.near_duplicate_guard import (
     resolve_near_dup_guard_enabled,
     resolve_near_dup_threshold,
@@ -452,8 +455,17 @@ class TestReloadConfigTool:
         assert svc.config.reconciliation.stale_run_recovery_seconds == flagship_before
 
 
+
+def _refusal(svc: Any) -> str:
+    error = resolve_mem0_update_authorization(
+        svc, agent_id='rando', content_amend=True, metadata_patch=False,
+    ).error
+    assert isinstance(error, str)
+    return error
+
+
 class TestMem0UpdateLeavesAreGreenTier:
-    """All five mem0_update.* leaves must hot-apply (task 3088).
+    """Every mem0_update.* leaf must hot-apply (task 3088).
 
     Modelled on TestWriteTriageLeavesAreGreenTier below — the direct precedent
     for registering TOP-LEVEL (non-reconciliation.*) leaves. The existing
@@ -470,6 +482,7 @@ class TestMem0UpdateLeavesAreGreenTier:
         'mem0_update.enabled',
         'mem0_update.content_amend_allowed_agent_prefixes',
         'mem0_update.metadata_patch_allowed_agent_prefixes',
+        'mem0_update.agent_prefix_sanctioned_use',
         'mem0_update.storm_threshold',
         'mem0_update.storm_window_seconds',
     )
@@ -488,6 +501,10 @@ class TestMem0UpdateLeavesAreGreenTier:
             (
                 'mem0_update.metadata_patch_allowed_agent_prefixes',
                 ['recon-stage-', 'curator-', 'auditor-'],
+            ),
+            (
+                'mem0_update.agent_prefix_sanctioned_use',
+                {'auditor-': 'an audit sitting'},
             ),
             ('mem0_update.storm_threshold', 5),
             ('mem0_update.storm_window_seconds', 600.0),
@@ -508,13 +525,42 @@ class TestMem0UpdateLeavesAreGreenTier:
         assert d.applied_candidates[path] == {'old': old, 'new': new_value}
         assert path not in d.restart_required
 
+    @pytest.mark.asyncio
+    async def test_sanctioned_use_yaml_edit_is_rendered_live_via_reload_config(
+        self, tmp_path, monkeypatch,
+    ):
+        config_yaml = tmp_path / 'config.yaml'
+        config_yaml.write_text(yaml.safe_dump({'mem0_update': {
+            'agent_prefix_sanctioned_use': {
+                'recon-stage-': 'RECON-ROLE', 'curator-': 'OLD-CURATOR-ROLE',
+            },
+        }}))
+        monkeypatch.setenv('CONFIG_PATH', str(config_yaml))
+
+        svc = AsyncMock()
+        svc.config = FusedMemoryConfig()
+        assert "'curator-': OLD-CURATOR-ROLE" in _refusal(svc), (
+            'the seeded YAML must be rendered before the reload, or the test '
+            'cannot tell a reload from a schema default'
+        )
+        _edit_yaml(config_yaml, 'mem0_update.agent_prefix_sanctioned_use', {
+            'recon-stage-': 'RECON-ROLE', 'curator-': 'RELOADED-CURATOR-ROLE',
+        })
+
+        server = create_mcp_server(svc)
+        result = await server._tool_manager.call_tool('reload_config', {})
+
+        assert result['reloaded'] is True, result
+        assert 'mem0_update.agent_prefix_sanctioned_use' in result['applied'], result
+        assert 'mem0_update.agent_prefix_sanctioned_use' not in result['restart_required']
+        error = _refusal(svc)
+        assert "'curator-': RELOADED-CURATOR-ROLE" in error, error
+
     def test_kill_switch_flip_is_observed_live_without_a_restart(self):
         """A reload must be visible to the resolver through the SHARED config
         object — the precondition config/reload.py's reload-safety rule states
         before a leaf may be registered at all."""
         from types import SimpleNamespace
-
-        from fused_memory.server.mem0_update_authz import resolve_mem0_update_authorization
 
         live = FusedMemoryConfig()
         svc = SimpleNamespace(config=live)
@@ -544,8 +590,6 @@ class TestMem0UpdateLeavesAreGreenTier:
         widening to it would be a vacuous no-op diff and the content-amend
         denial below would fail."""
         from types import SimpleNamespace
-
-        from fused_memory.server.mem0_update_authz import resolve_mem0_update_authorization
 
         live = FusedMemoryConfig()
         svc = SimpleNamespace(config=live)
@@ -678,6 +722,7 @@ class TestWriteTriageJudgeLeavesAreGreenTier:
             ('judge_reasoning_effort', 'low'),
             ('judge_field_chars', 1_200),
             ('judge_api_url', 'http://localhost:8080/v1'),
+            ('judge_api_key', 'sk-judge-test'),
         ],
     )
     def test_a_changed_judge_leaf_lands_in_applied_candidates(self, field, new_value):
@@ -705,6 +750,7 @@ class TestWriteTriageJudgeLeavesAreGreenTier:
             ('judge_reasoning_effort', 'resolve_judge_reasoning_effort', 'low'),
             ('judge_field_chars', 'resolve_judge_field_chars', 1_200),
             ('judge_api_url', 'resolve_judge_api_url', 'http://localhost:8080/v1'),
+            ('judge_api_key', 'resolve_judge_api_key', 'sk-judge-test'),
         ],
     )
     def test_an_applied_reload_is_observed_by_the_live_resolver(
@@ -861,7 +907,7 @@ class TestWriteTriagePerCategoryLeafIsGreenTierAndAtomic:
 
     def test_iter_leaves_yields_the_map_as_exactly_one_whole_leaf(self):
         """Not one leaf per category — the map reloads all-or-nothing."""
-        from fused_memory.config.reload import _iter_leaves  # noqa: PLC0415
+        from fused_memory.config.reload import _iter_leaves
 
         config = FusedMemoryConfig()
         object.__setattr__(config.write_triage, 't_high_by_category', dict(self.SYNTHETIC))
@@ -900,7 +946,7 @@ class TestWriteTriagePerCategoryLeafIsGreenTierAndAtomic:
         calibrated it stopped deriving a cutoff for it — a stale number
         outliving its own evidence.
         """
-        from fused_memory.config.reload import apply_reload  # noqa: PLC0415
+        from fused_memory.config.reload import apply_reload
 
         live = FusedMemoryConfig()
         fresh = FusedMemoryConfig()
@@ -1091,11 +1137,19 @@ class TestConsolidationAutoLeavesAreGreenTier:
             'preferences_and_norms': 1.0,
             'observations_and_summaries': 0.4,
         },
+        'max_adjudications_per_cycle': 2,
+        'adjudicator_model': 'gpt-6-luna',
+        'adjudicator_reasoning_effort': 'medium',
+        'adjudicator_timeout_seconds': 30.0,
+        'adjudicator_field_chars': 2000,
+        'adjudicator_member_max': 6,
+        'outcome_retention_days': 30,
+        'memo_days': 7,
     }
 
     def test_the_schema_actually_declares_the_leaves(self):
         """Guards the derivation itself: an empty set would pass vacuously."""
-        assert len(self.LEAVES) == 14, self.LEAVES
+        assert len(self.LEAVES) == 22, self.LEAVES
 
     def test_every_leaf_is_allowlisted(self):
         expected = {f'consolidation_auto.{name}' for name in self.LEAVES}
@@ -1258,3 +1312,137 @@ def test_transcript_archive_reload_reaches_the_live_resolver(leaf, new, expected
     assert path not in report['restart_required']
     assert live.reconciliation is reconciliation
     assert recon_archive_root(reconciliation) == expected_root
+
+
+_EMBEDDER_SPACE_LEAVES = (
+    'write_triage.t_high',
+    'write_triage_project_calibrations',
+    'config_overlay',
+)
+
+
+class TestOverlayReloadNeverHalfApplies:
+    """Embedder-space values reload only together with the embedder section.
+
+    A band or calibration is a cosine measured in ONE embedder's space, so
+    hot-applying a rewritten band while the embedder change waits for a
+    restart would gate writes with cutoffs from a space the live process is
+    not in. The overlay provenance waits too, so it never names a merged key
+    the live process has not applied. Configs are built from temp base and
+    overlay YAML files.
+    """
+
+    @pytest.fixture
+    def files(self, tmp_path, monkeypatch):
+        base = tmp_path / 'config.yaml'
+        overlay = tmp_path / 'overlay.yaml'
+        base.write_text(yaml.safe_dump({
+            'embedder': {'model': 'text-embedding-3-small', 'dimensions': 1536},
+            'write_triage': {'t_high': 0.9, 'candidate_k': 20},
+        }))
+        monkeypatch.setenv('CONFIG_PATH', str(base))
+        return types.SimpleNamespace(base=base, overlay=overlay)
+
+    @pytest.fixture
+    def live_with_overlay_v1(self, files, monkeypatch):
+        write_overlay(files.overlay, {
+            'write_triage': {'t_high': 0.85},
+            'write_triage_project_calibrations': {'A': calibration('reports/a1.json', observations=0.8)},
+        }, mtime=1_700_000_000)
+        monkeypatch.setenv(OVERLAY_ENV_VAR, str(files.overlay))
+        return FusedMemoryConfig()
+
+    def test_a_bands_only_overlay_rewrite_applies_with_its_provenance(
+        self, files, live_with_overlay_v1,
+    ):
+        live = live_with_overlay_v1
+        write_overlay(files.overlay, {
+            'write_triage': {'t_high': 0.8},
+            'write_triage_project_calibrations': {'A': calibration('reports/a2.json', observations=0.7)},
+        }, mtime=1_700_000_100)
+        fresh = FusedMemoryConfig()
+
+        report = apply_reload(live, fresh)
+
+        assert report['reloaded'] is True, report['error']
+        for path in _EMBEDDER_SPACE_LEAVES:
+            assert path in report['applied']
+        assert live.write_triage.t_high == 0.8
+        assert live.write_triage_project_calibrations == fresh.write_triage_project_calibrations
+        assert live.config_overlay == fresh.config_overlay
+
+    def test_an_embedder_identity_change_holds_every_embedder_space_leaf(
+        self, files, live_with_overlay_v1,
+    ):
+        live = live_with_overlay_v1
+        before = live.model_copy(deep=True)
+        write_overlay(files.overlay, {
+            'embedder': {'model': 'granite-embedding', 'dimensions': 768},
+            'write_triage': {'t_high': 0.8},
+            'write_triage_project_calibrations': {'A': calibration('reports/a2.json', observations=0.7)},
+        }, mtime=1_700_000_100)
+        _edit_yaml(files.base, 'write_triage.candidate_k', 30)
+        fresh = FusedMemoryConfig()
+
+        report = apply_reload(live, fresh)
+
+        for path in ('embedder.model', 'embedder.dimensions', *_EMBEDDER_SPACE_LEAVES):
+            assert path in report['restart_required']
+            assert path not in report['applied']
+        assert live.write_triage.t_high == before.write_triage.t_high
+        assert live.write_triage_project_calibrations == before.write_triage_project_calibrations
+        assert live.config_overlay == before.config_overlay
+        assert 'write_triage.candidate_k' in report['applied']
+        assert live.write_triage.candidate_k == 30
+
+    def test_an_endpoint_only_change_holds_the_provenance_that_names_it(
+        self, files, live_with_overlay_v1,
+    ):
+        live = live_with_overlay_v1
+        before = live.model_copy(deep=True)
+        write_overlay(files.overlay, {
+            'embedder': {'providers': {'openai': {'api_url': 'http://embedder.local/v1'}}},
+            'write_triage': {'t_high': 0.8},
+            'write_triage_project_calibrations': {'A': calibration('reports/a2.json', observations=0.7)},
+        }, mtime=1_700_000_100)
+        fresh = FusedMemoryConfig()
+        assert fresh.config_overlay is not None
+        assert 'embedder.providers.openai.api_url' in fresh.config_overlay.merged_keys
+
+        report = apply_reload(live, fresh)
+
+        assert 'embedder.providers' in report['restart_required']
+        for path in _EMBEDDER_SPACE_LEAVES:
+            assert path in report['restart_required']
+        assert live.config_overlay == before.config_overlay
+        assert live.write_triage.t_high == before.write_triage.t_high
+
+    def test_the_rule_holds_for_the_tracked_base_alone(self, files):
+        live = FusedMemoryConfig()
+        _edit_yaml(files.base, 'embedder.dimensions', 768)
+        _edit_yaml(files.base, 'write_triage.t_high', 0.8)
+        fresh = FusedMemoryConfig()
+
+        report = apply_reload(live, fresh)
+
+        assert 'embedder.dimensions' in report['restart_required']
+        assert 'write_triage.t_high' in report['restart_required']
+        assert 'write_triage.t_high' not in report['applied']
+        assert live.write_triage.t_high == 0.9
+
+    @pytest.mark.asyncio
+    async def test_a_refused_overlay_fails_the_reload_closed(
+        self, files, live_with_overlay_v1, monkeypatch,
+    ):
+        svc = AsyncMock()
+        svc.config = live_with_overlay_v1
+        before = svc.config.model_copy(deep=True)
+        monkeypatch.setenv(OVERLAY_ENV_VAR, str(files.overlay.with_name('gone.yaml')))
+
+        server = create_mcp_server(svc)
+        result = await server._tool_manager.call_tool('reload_config', {})
+
+        assert result['reloaded'] is False
+        assert 'file_missing' in result['error']
+        assert result['applied'] == {}
+        assert svc.config == before

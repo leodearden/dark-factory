@@ -77,11 +77,11 @@ class TestEvalMetricsTerminalKindField:
         scoring as ``'none'``.
         """
         from orchestrator.artifacts import TaskArtifacts
-        from orchestrator.evals.metrics import _DECLINE_READERS, DECLINE_KINDS
+        from orchestrator.evals.metrics import DECLINE_KINDS, DECLINE_READERS
 
-        assert tuple(_DECLINE_READERS) == DECLINE_KINDS
+        assert tuple(DECLINE_READERS) == DECLINE_KINDS
         for kind in DECLINE_KINDS:
-            reader = _DECLINE_READERS[kind]
+            reader = DECLINE_READERS[kind]
             assert callable(getattr(TaskArtifacts, reader, None)), (
                 f'{kind!r} names TaskArtifacts.{reader}, which does not exist'
             )
@@ -452,7 +452,7 @@ class TestReadDeclineArtifacts:
         from orchestrator.evals.metrics import read_decline_artifacts
 
         eval_artifacts.write_false_premise(*_WRITERS['false_premise'][1])
-        (eval_artifacts.root / 'already_done.json').write_text('{not json')
+        eval_artifacts.artifact_path('already_done.json').write_text('{not json')
 
         with caplog.at_level(logging.WARNING):
             out = read_decline_artifacts(eval_artifacts)
@@ -484,7 +484,7 @@ class TestReadDeclineArtifacts:
         from orchestrator.evals.metrics import read_decline_artifacts
 
         eval_artifacts.write_false_premise(*_WRITERS['false_premise'][1])
-        (eval_artifacts.root / 'already_done.json').write_text(written)
+        eval_artifacts.artifact_path('already_done.json').write_text(written)
 
         with caplog.at_level(logging.WARNING):
             out = read_decline_artifacts(eval_artifacts)

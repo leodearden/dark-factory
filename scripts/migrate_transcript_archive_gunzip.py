@@ -93,7 +93,7 @@ import zlib
 from pathlib import Path
 
 import _checkout as _checkout
-from shared.project_layout import default_project_root
+from shared.project_layout import agent_transcripts_dir, default_project_root
 
 logger = logging.getLogger('migrate_transcript_archive_gunzip')
 
@@ -102,11 +102,6 @@ _LOG_PREFIX = 'migrate_transcript_archive_gunzip:'
 
 # Copy chunk size: bounds peak RSS independently of transcript size.
 _CHUNK_BYTES = 1 << 20
-
-# Mirrors gc_agent_transcripts' constant for the same archive tree — the
-# archive root is a durable, git-ignored data dir under project_root, NOT the
-# per-task worktree.
-ARCHIVE_ROOT_RELATIVE = 'data/orchestrator/agent-transcripts'
 
 GZ_SUFFIX = '.gz'
 
@@ -150,13 +145,13 @@ _UNREADABLE_SOURCE_ERRORS = (OSError, EOFError, zlib.error, UnicodeDecodeError)
 
 
 def default_archive_root() -> Path:
-    """Return the default archive root (``main checkout / ARCHIVE_ROOT_RELATIVE``).
+    """Return the default archive root: ``agent_transcripts_dir`` of the main checkout.
 
     The single resolution site for the CLI ``--root`` default, mirroring
     :func:`gc_agent_transcripts.default_archive_root`. ``--root`` overrides it;
     there is no env knob (the archive root is a fixed data-dir convention).
     """
-    return default_project_root() / ARCHIVE_ROOT_RELATIVE
+    return agent_transcripts_dir(default_project_root())
 
 
 def plain_sibling(gz_path: Path) -> Path:

@@ -18,12 +18,13 @@ import dataclasses
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _steward_helpers import _make_escalation, _make_result, _sole_invocation_end_data
 from escalation.queue import EscalationQueue
 from shared.cli_invoke import AgentResult
 from shared.testing import make_gate_mock
-from test_steward import _make_escalation, _make_result, _sole_invocation_end_data
 
-from orchestrator.workflow_types import StewardResolved
+from orchestrator.agents.steward_digest import EarlierAttempts
+from orchestrator.workflow_types import PublishedStewardOutcome, StewardResolved
 
 _SLEEP_PATCH = 'shared.cli_invoke.asyncio.sleep'
 
@@ -35,7 +36,12 @@ def queue(tmp_path):
 
 @pytest.fixture
 def steward(make_steward, queue):
-    return make_steward(escalation_queue=queue)
+    return make_steward(
+        escalation_queue=queue,
+        # This module characterises the resume arm's session bookkeeping; the
+        # default arm is covered in test_steward_session_mode.py.
+        config_overrides={'steward_session_mode': 'resume'},
+    )
 
 
 async def _captured_builder(steward, escalation):
@@ -116,6 +122,8 @@ class TestBuilderRendersTheLiveRecord:
                 e.to_dict() for e in queue.get_by_task(steward.task_id, status='pending')
             ],
             worktree=steward.worktree,
+            handled=(),
+            earlier_attempts=EarlierAttempts(),
         )
         assert prompt == steward.briefing.build_steward_initial_prompt.return_value
 
@@ -225,7 +233,10 @@ class TestDeclinedRunIsNoVerdictOnTheEscalation:
         assert esc.id not in steward._empty_output_counts
         assert steward._session_id == 'sess-live'
         assert steward.metrics.escalations_handled == 1
-        assert isinstance(outcomes.get_nowait(), StewardResolved)
+        published = outcomes.get_nowait()
+        assert isinstance(published, PublishedStewardOutcome)
+        assert published.escalation_id == esc.id
+        assert isinstance(published.outcome, StewardResolved)
         assert _sole_invocation_end_data(steward.event_store.emit)['retry_aborted'] is True
 
     async def test_an_unretried_run_records_retry_aborted_false(self, steward, queue):

@@ -20,6 +20,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from orchestrator.index_lock_liveness import GitProcess, GitProcessScan
+
 
 def test_merge_gates_exports_moved_public_symbols() -> None:
     from orchestrator.merge_lane.gates import (
@@ -86,7 +88,7 @@ def test_merge_gates_logger_name_is_merge_lane() -> None:
 class TestFinalizeRecordsQueueVerifiedTip:
     """Which landings ``_finalize_advanced_merge`` records as queue-verified."""
 
-    async def test_finalize_advanced_merge_records_queue_verified_tip(self) -> None:
+    async def test_finalize_advanced_merge_records_queue_verified_tip(self, tmp_path) -> None:
         """A clean landing records the advanced SHA as a queue-verified main tip.
 
         This is the PRODUCER for premise P2 of ``_disjoint_skip_blockers``: a
@@ -101,6 +103,7 @@ class TestFinalizeRecordsQueueVerifiedTip:
         )
 
         git_ops = MagicMock()
+        git_ops.project_root = tmp_path
         git_ops.push_main = AsyncMock(return_value='pushed')
         git_ops.cleanup_merge_worktree = AsyncMock()
         req = MagicMock()
@@ -111,7 +114,7 @@ class TestFinalizeRecordsQueueVerifiedTip:
         req.module_configs = []
 
         landed = 'deadbeefcafe0001'
-        assert not main_tip_is_queue_verified(landed), (
+        assert not main_tip_is_queue_verified(tmp_path, landed), (
             'precondition: the tip must not already be registered'
         )
 
@@ -139,12 +142,15 @@ class TestFinalizeRecordsQueueVerifiedTip:
             )
 
         assert outcome.status == 'done', f'expected done, got {outcome!r}'
-        assert main_tip_is_queue_verified(landed), (
+        assert main_tip_is_queue_verified(tmp_path, landed), (
             'a clean landing must record its advanced SHA as queue-verified, '
             'otherwise every subsequent rebase-under-drift re-verifies forever'
         )
+        assert not main_tip_is_queue_verified(tmp_path / 'elsewhere', landed), (
+            'the landing vouches only for the repository its GitOps lands into'
+        )
 
-    async def test_finalize_advanced_merge_blocked_does_not_record_tip(self) -> None:
+    async def test_finalize_advanced_merge_blocked_does_not_record_tip(self, tmp_path) -> None:
         """A landing BLOCKED by a post-advance gate records nothing.
 
         Main has already advanced at that point, but the gate chain says the
@@ -157,6 +163,7 @@ class TestFinalizeRecordsQueueVerifiedTip:
         )
 
         git_ops = MagicMock()
+        git_ops.project_root = tmp_path
         git_ops.push_main = AsyncMock(return_value='pushed')
         git_ops.cleanup_merge_worktree = AsyncMock()
         req = MagicMock()
@@ -193,7 +200,7 @@ class TestFinalizeRecordsQueueVerifiedTip:
             )
 
         assert outcome.status != 'done', f'expected a blocked outcome, got {outcome!r}'
-        assert not main_tip_is_queue_verified(landed), (
+        assert not main_tip_is_queue_verified(tmp_path, landed), (
             'a tip whose post-advance gates failed must NOT be recorded as '
             'queue-verified'
         )
@@ -1246,8 +1253,9 @@ class TestMapAdvanceFailureParkLockContended:
         )
 
     async def test_crashed_leftover_shape_still_gets_the_advice(self) -> None:
-        """A lock already older than a full grace when FIRST observed is the
-        one shape for which `rm -f` is defensible."""
+        """A lock already older than a full grace when FIRST observed, with a
+        complete holder scan that found no git process, is the one shape for
+        which `rm -f` is defensible."""
         outcome, halt = await self._map({
             'lock_path': '/p/.git/index.lock',
             'age_seconds': 3900.0,
@@ -1255,6 +1263,7 @@ class TestMapAdvanceFailureParkLockContended:
             'initial_age_seconds': 3600.0,
             'grace_seconds': 300.0,
             'dirty_files': [],
+            'holder_scan': GitProcessScan((), confirmed=True),
         })
 
         halt.assert_not_called()
@@ -1269,6 +1278,78 @@ class TestMapAdvanceFailureParkLockContended:
         assert 'no git process' in outcome.reason.lower(), (
             'destructive advice must tell the operator to confirm no git '
             f'process is running in project_root first; got {outcome.reason!r}'
+        )
+
+    async def test_live_holder_is_named_and_gets_no_destructive_advice(self) -> None:
+        """THE REIFY SHAPE (task 5229): an hour-old lock held by a live commit.
+
+        The lock was 3290s old at the first probe because a healthy
+        `git commit --only` was 55 minutes into its pre-commit hook.  Age
+        alone called it a crashed leftover and advised `rm -f`; the holder
+        scan names the commit instead, and destructive advice is withheld.
+        """
+        outcome, halt = await self._map({
+            'lock_path': '/r/.git/index.lock',
+            'age_seconds': 3290.0,
+            'waited_seconds': 0.0,
+            'initial_age_seconds': 3290.0,
+            'grace_seconds': 300.0,
+            'dirty_files': [],
+            'holder_scan': GitProcessScan(
+                (GitProcess(728900, 'git commit --only plans/x.md'),), confirmed=True,
+            ),
+        })
+
+        halt.assert_not_called()
+        assert outcome.status == 'blocked'
+        assert '728900' in outcome.reason
+        assert 'git commit --only plans/x.md' in outcome.reason
+        assert '/r/.git/index.lock' in outcome.reason
+        assert 'rm -f' not in outcome.reason, (
+            f'a lock a live git process holds must never be offered removal; got {outcome.reason!r}'
+        )
+
+    @pytest.mark.parametrize('holder_scan', [
+        GitProcessScan((), confirmed=False),
+        {'processes': (), 'confirmed': True},
+    ], ids=['unconfirmed-scan', 'not-a-scan'])
+    async def test_an_old_lock_without_proof_of_no_holder_gets_no_destructive_advice(
+        self, holder_scan,
+    ) -> None:
+        """Unknown is never "none": an unconfirmed scan, or a value that is
+        not a GitProcessScan at all, is no evidence the holder is dead."""
+        outcome, halt = await self._map({
+            'lock_path': '/p/.git/index.lock',
+            'age_seconds': 3600.0,
+            'waited_seconds': 0.0,
+            'initial_age_seconds': 3600.0,
+            'grace_seconds': 300.0,
+            'dirty_files': [],
+            'holder_scan': holder_scan,
+        })
+
+        halt.assert_not_called()
+        assert outcome.status == 'blocked'
+        assert 'rm -f' not in outcome.reason, (
+            f'an unproven holder must not get destructive advice; got {outcome.reason!r}'
+        )
+
+    async def test_an_old_lock_with_no_holder_scan_gets_no_destructive_advice(self) -> None:
+        """A side channel from before the holder scan existed carries every
+        age fact but no `holder_scan`: age alone is never sufficient."""
+        outcome, halt = await self._map({
+            'lock_path': '/p/.git/index.lock',
+            'age_seconds': 3900.0,
+            'waited_seconds': 300.0,
+            'initial_age_seconds': 3600.0,
+            'grace_seconds': 300.0,
+            'dirty_files': [],
+        })
+
+        halt.assert_not_called()
+        assert outcome.status == 'blocked'
+        assert 'rm -f' not in outcome.reason, (
+            f'age without a holder scan must not get destructive advice; got {outcome.reason!r}'
         )
 
     async def test_zero_grace_young_lock_gets_no_destructive_advice(self) -> None:
@@ -1294,6 +1375,7 @@ class TestMapAdvanceFailureParkLockContended:
                 'initial_age_seconds': initial_age,
                 'grace_seconds': 0.0,
                 'dirty_files': [],
+                'holder_scan': GitProcessScan((), confirmed=True),
             })
 
             halt.assert_not_called()
@@ -1324,6 +1406,7 @@ class TestMapAdvanceFailureParkLockContended:
             'initial_age_seconds': 3600.0,
             'grace_seconds': 0.0,
             'dirty_files': [],
+            'holder_scan': GitProcessScan((), confirmed=True),
         })
 
         halt.assert_not_called()
@@ -1349,6 +1432,7 @@ class TestMapAdvanceFailureParkLockContended:
             'initial_age_seconds': 400.0,   # > 300s floor, < 900s grace
             'grace_seconds': 900.0,
             'dirty_files': [],
+            'holder_scan': GitProcessScan((), confirmed=True),
         })
 
         assert 'rm -f' not in outcome.reason, (
@@ -1356,7 +1440,7 @@ class TestMapAdvanceFailureParkLockContended:
             f'to be normal; got {outcome.reason!r}'
         )
 
-    async def test_floor_matches_the_documented_pre_commit_budget(self) -> None:
+    async def test_floor_matches_the_default_grace(self) -> None:
         """The floor is a literal (orchestrator.config is TYPE_CHECKING-only
         in merge_gates), so pin it against the config default it mirrors —
         otherwise the two drift silently.
@@ -1370,8 +1454,7 @@ class TestMapAdvanceFailureParkLockContended:
             _STALE_LOCK_FLOOR_S
         ), (
             '_STALE_LOCK_FLOOR_S must track '
-            'GitConfig.merge_park_lock_grace_seconds\'s default (this repo\'s '
-            'documented pre-commit budget)'
+            'GitConfig.merge_park_lock_grace_seconds\'s default'
         )
 
     async def test_missing_staleness_keys_default_to_no_advice(self) -> None:
@@ -1387,6 +1470,7 @@ class TestMapAdvanceFailureParkLockContended:
             'age_seconds': 3900.0,
             'waited_seconds': 300.0,
             'dirty_files': [],
+            'holder_scan': GitProcessScan((), confirmed=True),
         })
 
         halt.assert_not_called()
@@ -1394,53 +1478,6 @@ class TestMapAdvanceFailureParkLockContended:
         assert 'rm -f' not in outcome.reason, (
             'a side channel with no staleness evidence must not produce '
             f'destructive advice; got {outcome.reason!r}'
-        )
-
-    async def test_reason_is_not_miscategorised_as_a_ff_failure(self) -> None:
-        """The reason must not trip workflow.py's merge-failure category
-        heuristic into calling an index-lock stand-off a fast-forward failure.
-
-        `workflow.py`'s blocked path infers the review category with a bare
-        substring test:
-
-            elif 'ff' in reason.lower() or 'advanced' in reason.lower():
-                category = 'merge_ff_failed'
-
-        The original wording ("advance_main stood off: ...") contains 'ff'
-        inside "off", so every park_lock_contended block was filed as
-        `merge_ff_failed` — a category that flows into
-        `_write_merge_failure_review`, the `merge_blocked` event's
-        `data.category`, and the signature-aware L1 dedup key, durably
-        polluting the very observability this task adds.
-
-        Asserted by REPLAYING the heuristic verbatim rather than by pinning
-        prose, so any future reword is checked against the real consumer.
-        (A cleaner fix — an explicit reason-prefix short-circuit in
-        workflow.py, as DROPPED_PLAN_TARGETS/TRANSIENT_INFRA/MAIN_HEALTH_RED
-        already have — needs workflow.py, which is outside this task's lock
-        set; filed as follow-up.)
-        """
-        # Benign fixture strings: the substring test also sees the lock path
-        # and any at-risk filenames, which are runtime values this code
-        # cannot constrain — the CONSTANT prose is what is pinned here.
-        outcome, _halt = await self._map({
-            'lock_path': '/p/.git/index.lock',
-            'age_seconds': 3900.0,
-            'waited_seconds': 300.0,
-            'initial_age_seconds': 3600.0,
-            'grace_seconds': 300.0,
-            'dirty_files': ['docs/notes.md'],
-        })
-
-        lowered = outcome.reason.lower()
-        assert 'verification failed' not in lowered
-        assert 'ff' not in lowered, (
-            "the reason must not contain the token 'ff' — workflow.py would "
-            f'file it as merge_ff_failed; got {outcome.reason!r}'
-        )
-        assert 'advanced' not in lowered, (
-            "the reason must not contain 'advanced' — workflow.py would file "
-            f'it as merge_ff_failed; got {outcome.reason!r}'
         )
 
     async def test_toctou_dirty_files_are_named_in_the_reason(self) -> None:

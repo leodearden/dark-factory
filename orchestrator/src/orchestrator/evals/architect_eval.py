@@ -19,6 +19,7 @@ from shared.cli_invoke import AgentResult, AllAccountsCappedException, invoke_wi
 
 from orchestrator.agents.invoke import invoke_agent
 from orchestrator.agents.roles import ARCHITECT
+from orchestrator.agents.token_pricing import TokenUsage
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import OrchestratorConfig
 from orchestrator.workflow import _inject_plan_tools_mcp, _meta_root_for_worktree
@@ -43,7 +44,9 @@ from .measurement import (
     exception_reason,
 )
 from .metrics import (
+    EndpointKind,
     EvalMetrics,
+    RoleUnderTest,
     compose_cost_source,
     is_proxied_endpoint,
     read_decline_artifacts,
@@ -80,8 +83,15 @@ def architect_eval_mcp_scope(worktree: Path) -> dict[str, Any]:
     The PAIR is the invariant (task 4757). A plan-tools config without the
     strict flag still ambient-merges the worktree's tracked ``.mcp.json``, i.e.
     the live escalation (:8102) and fused-memory (:8002) servers.
+
+    The meta root is also the task root, matching ``open_eval_artifacts``:
+    parallel trials of one task id must not share ``.task-meta/task-<id>``.
     """
-    return {'mcp_config': _inject_plan_tools_mcp(None, worktree), 'strict_mcp_config': True}
+    meta_root = _meta_root_for_worktree(worktree)
+    return {
+        'mcp_config': _inject_plan_tools_mcp(None, worktree, ARCHITECT, task_root=meta_root),
+        'strict_mcp_config': True,
+    }
 
 
 def open_eval_artifacts(worktree: Path) -> TaskArtifacts:
@@ -128,6 +138,16 @@ class ArchitectUsage:
     turns: int = 0
     duration_ms: int = 0
 
+    @property
+    def tokens(self) -> TokenUsage:
+        """The four token counts, as the pricing formula takes them."""
+        return TokenUsage(
+            input_tokens=self.input_tokens,
+            output_tokens=self.output_tokens,
+            cache_read_tokens=self.cache_read_tokens,
+            cache_create_tokens=self.cache_create_tokens,
+        )
+
     @classmethod
     def of(cls, result: AgentResult) -> ArchitectUsage:
         """The last attempt's usage; a provider that did not report one counts 0."""
@@ -150,10 +170,11 @@ class ArchitectAttempt:
     outcome: str
     plan: dict
     declines: Mapping[str, dict | None]
+    endpoint_kind: EndpointKind
     usage: ArchitectUsage = dataclasses.field(default_factory=ArchitectUsage)
     cost_usd: float = 0.0
     cost_source: str = 'cli'
-    is_local_model: bool = False
+    cli_cost_untrusted: bool = False
     unmeasured: Unmeasured | None = None
 
 
@@ -203,10 +224,10 @@ async def invoke_architect(
         declines = _read_declines(ended.artifacts, call.label)
     finally:
         await deps.cleanup_worktree(project_root, worktree)
-    is_local_model = is_proxied_endpoint(config.env_overrides)
+    cli_cost_untrusted = is_proxied_endpoint(config.env_overrides)
     cost_usd, cost_source = _architect_cost(
         ended.usage, model=config.model, prices=ended.prices,
-        spent_usd=ended.spent_usd, is_local_model=is_local_model,
+        spent_usd=ended.spent_usd, cli_cost_untrusted=cli_cost_untrusted,
     )
     return ArchitectAttempt(
         address=address,
@@ -217,7 +238,8 @@ async def invoke_architect(
         usage=ended.usage,
         cost_usd=cost_usd,
         cost_source=cost_source,
-        is_local_model=is_local_model,
+        cli_cost_untrusted=cli_cost_untrusted,
+        endpoint_kind=config.endpoint_kind,
         unmeasured=ended.unmeasured,
     )
 
@@ -286,12 +308,12 @@ class _ArchitectCall:
                 f'Architect eval {self.label}',
                 invoke_fn=timed_attempt,
                 backend=self.config.backend,
-                **_architect_invocation(self.task, self.config, prompt, self.worktree),
+                **architect_invocation(self.task, self.config, prompt, self.worktree),
             )
         return result, artifacts
 
 
-def _architect_invocation(
+def architect_invocation(
     task: dict, config: EvalConfig, prompt: str, worktree: Path,
 ) -> dict[str, Any]:
     """This candidate's architect invocation, scoped to plan-tools alone."""
@@ -418,14 +440,15 @@ def _architect_cost(
     model: str,
     prices: dict[str, Any] | None,
     spent_usd: float,
-    is_local_model: bool,
+    cli_cost_untrusted: bool,
 ) -> tuple[float, str]:
     """The architect component's ``(cost_usd, cost_source)`` per Invariant P5."""
-    if not (usage.input_tokens or usage.output_tokens or spent_usd):
+    tokens = usage.tokens
+    if tokens == TokenUsage() and not spent_usd:
         return 0.0, 'cli'
     return resolve_cost_usd(
-        usage.input_tokens, usage.output_tokens, model=model, prices=prices,
-        cli_cost_usd=spent_usd, is_local_model=is_local_model,
+        tokens, model=model, prices=prices,
+        cli_cost_usd=spent_usd, cli_cost_untrusted=cli_cost_untrusted,
     )
 
 
@@ -557,7 +580,7 @@ def assemble_metrics(
     ]
     return EvalMetrics(
         plan_quality=_plan_quality(plan, scoring, share),
-        role_under_test='architect',
+        role_under_test=RoleUnderTest.ARCHITECT,
         terminal_kind=resolve_terminal_kind(plan, attempt.declines),
         replay_frame=REPLAY_FRAME_ID,
         tests_pass=None,
@@ -568,7 +591,8 @@ def assemble_metrics(
         ),
         input_tokens=usage.input_tokens,
         output_tokens=usage.output_tokens,
-        is_local_model=attempt.is_local_model,
+        cli_cost_untrusted=attempt.cli_cost_untrusted,
+        endpoint_kind=attempt.endpoint_kind,
         cache_read_tokens=usage.cache_read_tokens,
         cache_create_tokens=usage.cache_create_tokens,
         turns_used=usage.turns,

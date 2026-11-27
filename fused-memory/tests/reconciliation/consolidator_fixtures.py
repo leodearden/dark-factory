@@ -40,7 +40,7 @@ rather than something callers reach past.
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 from _fm_helpers import complete_paged_read
 
@@ -93,6 +93,9 @@ def make_consolidator(
     memory_mock.graphiti.enumerate_all_valid_edges = AsyncMock(
         return_value=({}, complete_paged_read()),
     )
+    # EXPLICIT for the same reason: a sync read that a bare AsyncMock would
+    # answer with a coroutine. None = no Graphiti write executing.
+    memory_mock.earliest_unfinished_graphiti_write_start = MagicMock(return_value=None)
 
     port_kwargs = {} if recon_report_port is None else {'recon_report_port': recon_report_port}
     stage = MemoryConsolidator(

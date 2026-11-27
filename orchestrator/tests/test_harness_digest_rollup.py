@@ -8,8 +8,8 @@ the '## Per-(model×role) rollup' section produced by
 one runs.db file (harness.py:1373-1398), so the rollup query needs no
 separate DB handle.
 
-Reuses the ``_make_harness_with_mocks`` / ``_cost_store_factory`` fixture
-pattern from test_harness_park_stop.py's ``TestHarnessMaybeWriteDigest``
+Reuses the ``_make_harness_with_mocks`` / ``_cost_store_factory`` pattern
+from test_harness_park_stop.py's ``TestHarnessMaybeWriteDigest``
 (step-19/20), and the raw-SQLite seeding helpers from test_digest.py's
 model×role rollup tests (step-1).
 """
@@ -23,7 +23,6 @@ from pathlib import Path
 import pytest
 from test_digest import _insert_invocation, _insert_task_result
 from test_harness_park_stop import (
-    _cost_store_factory,  # noqa: F401 -- reused cross-module fixture
     _make_harness_with_mocks,
 )
 

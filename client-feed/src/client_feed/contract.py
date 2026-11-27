@@ -25,7 +25,7 @@ from pydantic import (
     model_validator,
 )
 
-FEED_VERSION: Final = '1.0'
+FEED_VERSION: Final = '1.1'
 
 
 def feed_major(version: str) -> int:
@@ -112,6 +112,7 @@ class Source(StrEnum):
     CRITERIA = 'criteria'
     ENGAGEMENT = 'engagement'
     INBOX = 'inbox'
+    FILER = 'filer'
 
 
 class SchedulerState(StrEnum):
@@ -186,6 +187,12 @@ class QuarantineReason(StrEnum):
     NOT_RESTATABLE = 'not_restatable'
     RESTATER_DECLINED = 'restater_declined'
     RESTATER_FAILED = 'restater_failed'
+
+
+class RulingKind(StrEnum):
+    NOT_A_DEFECT = 'not_a_defect'
+    NOT_COVERED = 'not_covered'
+    CHANGE_REQUEST = 'change_request'
 
 
 class _Record(BaseModel):
@@ -498,28 +505,54 @@ class CriteriaResults(_Envelope):
 class Criterion(_Record):
     """One acceptance criterion as acceptance/criteria.yaml declares it."""
 
-    id: NonEmptyStr
+    id: CriterionId
     prd: RepoPath
     capability: NonEmptyStr
     statement: NonEmptyStr
     kind: CriterionKind
 
 
+def _require_unique_ids(criteria: tuple[Criterion, ...]) -> tuple[Criterion, ...]:
+    duplicates = _duplicates(criterion.id for criterion in criteria)
+    if duplicates:
+        raise ValueError(
+            f'criterion ids must be unique: {", ".join(duplicates)} declared more than once'
+        )
+    return criteria
+
+
+UniqueCriteria = Annotated[tuple[Criterion, ...], AfterValidator(_require_unique_ids)]
+
+
 class CriteriaDeclared(_Envelope):
     """Every acceptance criterion the project declares; each declaration replaces the last."""
 
     type: Literal['criteria_declared'] = 'criteria_declared'
-    criteria: tuple[Criterion, ...]
+    criteria: UniqueCriteria
 
-    @model_validator(mode='after')
-    def _ids_are_unique(self) -> Self:
-        duplicates = _duplicates(criterion.id for criterion in self.criteria)
-        if duplicates:
-            raise ValueError(
-                f'criteria_declared ids must be unique: {", ".join(duplicates)} declared more'
-                f' than once'
-            )
-        return self
+
+class FiledDefect(_Record):
+    """A client defect report filed as a task, and whether a human gate holds its fix."""
+
+    block: PositiveInt
+    report: PositiveInt
+    task_id: TaskId
+    gated: StrictBool
+
+
+class DefectFiled(_Envelope):
+    """The factory acknowledging a client defect report: the task that carries it, and whether it is gated."""
+
+    type: Literal['defect_filed'] = 'defect_filed'
+    ref: NonEmptyStr
+    block: PositiveInt
+    report: PositiveInt
+    task_id: TaskId
+    gated: StrictBool
+
+    @property
+    def natural_key(self) -> str:
+        return self.ref
 
 
 FeedEvent = Annotated[
@@ -536,7 +569,8 @@ FeedEvent = Annotated[
     | FileRevealed
     | RevealRefused
     | CriteriaResults
-    | CriteriaDeclared,
+    | CriteriaDeclared
+    | DefectFiled,
     Field(discriminator='type'),
 ]
 FEED_EVENT_ADAPTER: Final = TypeAdapter(FeedEvent)
@@ -591,6 +625,7 @@ class FeedState(_Record):
     revealed: tuple[RevealedFile, ...]
     criteria: dict[RunKind, CriteriaResults]
     criteria_declared: dict[str, Criterion]
+    defects_filed: dict[str, FiledDefect]
     recent: tuple[FeedEvent, ...]
 
     @model_validator(mode='after')
@@ -663,7 +698,18 @@ class DefectReported(_Record):
     outcome: DefectOutcome
 
 
-InboxLine = Annotated[RevealRequested | DefectReported, Field(discriminator='type')]
+class DefectRuled(_Record):
+    """inbox.jsonl: the portal relaying Leo's ruling on a reported defect as its kind alone; the note to the client stays on the portal."""
+
+    seq: Seq
+    at: UtcTimestamp
+    type: Literal['defect_ruled'] = 'defect_ruled'
+    block: PositiveInt
+    report: PositiveInt
+    kind: RulingKind
+
+
+InboxLine = Annotated[RevealRequested | DefectReported | DefectRuled, Field(discriminator='type')]
 _INBOX_LINE_ADAPTER: Final = TypeAdapter(InboxLine)
 
 
@@ -693,10 +739,11 @@ def _json_object(text: str, *, line_no: int | None) -> dict[str, Any]:
     return value
 
 
-def _first_error(exc: ValidationError) -> str:
+def first_error(exc: ValidationError, *, whole: str) -> str:
+    """A validation failure's first error at its location, `whole` standing for the location of the value itself."""
     errors = exc.errors()
     first = errors[0]
-    location = '.'.join(str(part) for part in first['loc']) or '<record>'
+    location = '.'.join(str(part) for part in first['loc']) or whole
     more = f' (and {len(errors) - 1} more)' if len(errors) > 1 else ''
     return f'{location}: {first["msg"]}{more}'
 
@@ -707,7 +754,7 @@ def _validated(
     try:
         return validate(value)
     except ValidationError as exc:
-        raise ContractViolation(line_no=line_no, detail=_first_error(exc)) from exc
+        raise ContractViolation(line_no=line_no, detail=first_error(exc, whole='<record>')) from exc
 
 
 def _require_supported_major(header: EventHeader, *, line_no: int) -> None:

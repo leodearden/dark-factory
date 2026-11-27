@@ -2,22 +2,21 @@
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import os
-from collections.abc import Awaitable
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple
 from uuid import uuid4
 
-from shared.cli_invoke import read_transcript_records
 from shared.config_dir import TaskConfigDir
-from shared.jcodemunch_launch import jcodemunch_server_config
+from shared.escalation_project_scope import escalation_project_headers
 from shared.safe_io import load_json_or_warn
 from shared.transcript_archive import archive_task_transcripts
 
 from fused_memory.config.schema import ReconciliationConfig
+from fused_memory.models.invocation_ledger import InvocationLedger, LedgerRole
 from fused_memory.models.reconciliation import (
     ReconciliationEvent,
     StageAgentOutcome,
@@ -38,11 +37,11 @@ from fused_memory.reconciliation.cli_stage_runner import (
     recon_transcript_archive_key,
     run_stage_via_cli,
 )
-from fused_memory.reconciliation.sqlite_failures import await_best_effort
 from fused_memory.utils.validation import require_project_id, require_run_id
 
 if TYPE_CHECKING:
     from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
+    from shared.cost_store import CostStore
 
     from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
     from fused_memory.models.scope import ProjectScope
@@ -84,6 +83,7 @@ class BaseStage:
         known_projects: dict[str, str] | None = None,
         recon_report_port: int = 8003,
         recon_report_state=None,
+        cost_store: CostStore | None = None,
     ):
         self.stage_id = stage_id
         self.memory = memory_service
@@ -92,12 +92,14 @@ class BaseStage:
         self.config = config
         self.scope = scope
         # Cross-project routing: dict[project_id, project_root] of every
-        # project the harness knows about (including this one).  Stage 2
-        # surfaces this to the LLM so it can re-route a finding to the
-        # correct project_root when the scope demands.  Empty until the
-        # harness sets it per cycle.
+        # project the harness knows about (including this one).  Stages 2 and
+        # 3 surface this to the LLM through
+        # reconciliation/known_projects_section.py::render_known_projects_section
+        # so it can re-route a finding to the correct project_root when the
+        # scope demands.  Empty until the harness sets it per cycle.
         self.known_projects: dict[str, str] = known_projects or {}
         self._usage_gate = usage_gate
+        self._cost_store = cost_store
         self._escalation_url: str | None = None
         self._escalation_queue: EscalationQueue | None = None
         # PRD γ: recon_report channel threading
@@ -150,19 +152,8 @@ class BaseStage:
         prior_reports: list[StageReport],
         run_id: str,
         model: str | None = None,
-        resume_session_id: str | None = None,
     ) -> StageReport:
-        """Execute this stage via Claude CLI with MCP tools.
-
-        ``resume_session_id`` (task 2717 σ) is set only by the startup
-        adopt-and-resume pass, to ``--resume`` an in-flight session that a
-        restart interrupted mid-stage. When set AND its transcript is still on
-        disk in this run's per-run config dir (record_run_session's snapshot is
-        best-effort — see its docstring warning), the stage subprocess resumes
-        that session and is handed a purpose-written recovery prompt; otherwise
-        --resume is dropped and the stage runs fresh. Defaults to None — every
-        non-resume caller keeps today's fresh-launch behaviour.
-        """
+        """Execute this stage via Claude CLI with MCP tools."""
         require_project_id(self.project_id)
         require_run_id(run_id)
 
@@ -217,7 +208,7 @@ class BaseStage:
                     stage=self.stage_id.value,
                     project_id=self.project_id,
                 )
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 # start_report is on the critical path — a transient error
                 # (e.g. duplicate run_id from a crashed prior run, TTL-reaper race)
                 # must not abort the whole reconciliation cycle.  Short-circuit:
@@ -276,65 +267,20 @@ class BaseStage:
             else self.get_report_schema()
         )
 
-        # Session-capture substrate (task 2744): mint a CLI session and a per-run
-        # isolated config dir, persist the (session_id, stage) snapshot on the run
-        # row BEFORE launching the stage subprocess (mint-before-spawn, mirroring
-        # the orchestrator), then clear the snapshot once the subprocess exits so
-        # the row carries a session_id only while a stage is actually in flight.
-        # The config dir is derived deterministically from (data_dir, run_id) so
-        # all three stages of a run share it and the harness GCs the same path;
-        # attempt auto-increments per launch as durable history for task σ (resume).
-        # Both snapshot writes are best-effort (task 5561).
+        # A CLI session id and the per-run config dir are minted before the spawn
+        # and forwarded to the runner. The dir is derived from (data_dir, run_id),
+        # so every stage of a run shares it and the harness GCs the same path.
+        # Nothing is written to the run row.
         session_id = str(uuid4())
         config_dir = TaskConfigDir(
             task_id=run_id,
             base_dir=recon_config_base_dir(self.journal.data_dir),
         )
-        await self._write_session_snapshot_best_effort(
-            'record_run_session',
-            run_id,
-            self.journal.record_run_session(
-                run_id, session_id=session_id, stage_cursor=self.stage_id.value
-            ),
-        )
 
-        # Task σ resume seam: when the startup adopt-and-resume pass supplies the
-        # in-flight session id, --resume it IFF its transcript is still on disk in
-        # this run's per-run config dir (config_dir is keyed on run_id, so it is
-        # the SAME dir across the interrupt). record_run_session's snapshot is
-        # best-effort — it can go stale after an internal cap retry — so validate
-        # the transcript before trusting it to --resume. On a valid transcript,
-        # deliver a purpose-written recovery prompt (resume_delivers_prompt=True)
-        # that ALSO embeds the full stage payload, so a resume failure falls back
-        # to a fully-contexted fresh invocation via invoke_with_cap_retry's
-        # original_prompt. On a missing/empty transcript, drop --resume and run
-        # the stage fresh.
-        effective_payload = payload
-        effective_resume_session_id: str | None = None
-        resume_delivers_prompt = False
-        if resume_session_id:
-            transcript = read_transcript_records(config_dir.path, resume_session_id)
-            if transcript:
-                effective_resume_session_id = resume_session_id
-                resume_delivers_prompt = True
-                effective_payload = self._build_recovery_prompt(run_id, payload)
-            else:
-                logger.warning(
-                    'Stage %s run_id=%s: resume_session_id=%s has no transcript in '
-                    '%s — dropping --resume, running the stage fresh',
-                    self.stage_id.value, run_id, resume_session_id, config_dir.path,
-                )
-
-        # Clear the session snapshot on a normal stage exit (and on non-cancel
-        # errors) but PRESERVE it on asyncio.CancelledError: a restart cancelling
-        # the in-flight stage must leave (session_id, stage_cursor) on the run row
-        # so the startup adopt-and-resume pass (task σ) can --resume this run.
-        # A non-cancel exception still clears (the run is failing, not resuming).
-        cancelled = False
         try:
             stage_result = await run_stage_via_cli(
                 system_prompt=self.get_system_prompt(),
-                payload=effective_payload,
+                payload=payload,
                 disallowed_tools=disallowed,
                 config=self.config,
                 mcp_config=mcp_config,
@@ -344,18 +290,12 @@ class BaseStage:
                 output_schema=effective_output_schema,
                 session_id=session_id,
                 config_dir=config_dir,
-                resume_session_id=effective_resume_session_id,
-                resume_delivers_prompt=resume_delivers_prompt,
+                ledger=InvocationLedger.or_none(
+                    self._cost_store, LedgerRole.for_stage(self.stage_id), run_id, self.project_id,
+                ),
             )
-        except asyncio.CancelledError:
-            cancelled = True
-            raise
         finally:
             self._archive_stage_transcripts(config_dir, run_id)
-            if not cancelled:
-                await self._write_session_snapshot_best_effort(
-                    'clear_run_session', run_id, self.journal.clear_run_session(run_id),
-                )
 
         completed = datetime.now(UTC)
 
@@ -499,7 +439,7 @@ class BaseStage:
             if _corrections:
                 try:
                     _active_rrs.apply_citation_verification(run_id, _corrections)
-                except Exception as exc:  # noqa: BLE001
+                except Exception as exc:
                     # Degrade to "report is correct, durable record is stale" —
                     # never to a failed stage. Loud, not silent (the repo's
                     # loud-over-silent-degradation norm): name the run, stage and
@@ -522,6 +462,8 @@ class BaseStage:
             stats=_stats,
             llm_calls=stage_result.llm_calls,
             tokens_used=stage_result.tokens_used,
+            cache_read_tokens=stage_result.cache_read_tokens,
+            cache_create_tokens=stage_result.cache_create_tokens,
             agent_outcome=stage_result.outcome,
         )
 
@@ -549,32 +491,29 @@ class BaseStage:
 
         return stage_report
 
-    async def _write_session_snapshot_best_effort(
-        self, op: str, run_id: str, write: Awaitable[None],
-    ) -> None:
-        """Await one session-snapshot journal write, logging rather than raising on failure.
-
-        The snapshot is advisory: the task-σ resume gate
-        (``harness.py::ReconciliationHarness._resume_guard_reason`` and the
-        transcript check in ``run``) validates the transcript on disk instead
-        of trusting it. Cancellation propagates.
-        """
-        await await_best_effort(
-            write,
-            what=f'Stage {self.stage_id.value} session-snapshot write {op}',
-            run_id=run_id, logger=logger, level=logging.WARNING,
-        )
-
     def _archive_stage_transcripts(self, config_dir: TaskConfigDir, run_id: str) -> None:
         """Producer half of recon transcript archival (task 3972).
 
-        COPIES, so the σ ``--resume`` seam can still read the source. Runs on
-        every exit, cancellation included, because interrupted runs skip the
-        teardown half (``cli_stage_runner.py::gc_run_config_dir``) and
-        fused-memory has no boot-time orphan sweeper. ``session_id=None``
-        archives the whole per-run dir, so a resumed session's file and
-        subagent transcripts are covered; ``_archive_one``'s mtime-equality
-        skip makes repeats nearly free. Synchronous and total by contract.
+        Copies every transcript in the run's config dir into the archive as
+        each stage exits, cancellation included, so the archive already holds
+        them all by the time the harness writes the run row terminal.
+
+        The case only this copy covers: a kill that runs no ``finally``
+        (SIGKILL, watchdog SIGABRT, OOM) after the row went terminal and before
+        the teardown ``cli_stage_runner.py::gc_run_config_dir`` ran.
+        ``harness.py::ReconciliationHarness.run_full_cycle`` and
+        ``::_run_remediation_pass`` write the row terminal (``complete_run``,
+        ``_record_*_run``) before their finally-GC, and every recovery pass selects only 'running' rows
+        (``journal.py::ReconciliationJournal.get_stale_runs`` /
+        ``get_running_runs``). Nothing revisits such a dir, so this copy is the
+        only archival its transcripts get. A boot-time orphan sweep over recon
+        config dirs (task 4906) would retire this hook.
+
+        COPIES: deleting the source is the teardown's job, and
+        ``gc_run_config_dir`` archives before it deletes. ``session_id=None``
+        archives the whole per-run dir, so subagent transcripts are covered;
+        ``_archive_one``'s mtime-equality skip makes repeats nearly free.
+        Synchronous and total by contract.
         """
         archive_root = recon_archive_root(self.config)
         if archive_root is None:
@@ -586,66 +525,18 @@ class BaseStage:
             archive_root=archive_root,
         )
 
-    def _build_recovery_prompt(self, run_id: str, stage_payload: str) -> str:
-        """Build the continuation prompt delivered to a ``--resume``d stage (task σ).
-
-        Unlike the generic CRASH_RECOVERY placeholder ('continue where you left
-        off'), this is purpose-written for reconciliation: it frames the interrupt
-        as a fused-memory restart, notes the MCP reset, and — critically — points
-        the agent at the write journal (``causation_id={run_id}``) so it can see
-        which writes it already applied this run before repeating them. The full
-        original stage payload is appended verbatim so the same string doubles as
-        the fresh-fallback prompt (invoke_with_cap_retry keeps ``prompt`` as
-        ``original_prompt`` when a resume fails and it restarts fresh).
-        """
-        return (
-            '## Reconciliation run RESUMED after a restart\n\n'
-            f'This reconciliation stage (run_id={run_id}, stage={self.stage_id.value}) '
-            'was INTERRUPTED by a fused-memory restart mid-run and has now been '
-            'resumed via --resume. Your MCP tool connections were reset by the '
-            'restart, so re-establish any state you need before continuing.\n\n'
-            '**Some of the writes you made before the interrupt may ALREADY have '
-            'been applied.** Every fused-memory write in this run was recorded in '
-            f'the write_journal under causation_id={run_id}. Before repeating any '
-            'write, check what you already recorded this run (the write_journal '
-            f'entries with causation_id={run_id}, and the current memory/task '
-            'state they produced) so you do not duplicate work already committed. '
-            'Then continue exactly where you left off and finish the stage.\n\n'
-            '--- Original stage task (unchanged; also used verbatim if this stage '
-            'has to restart fresh) ---\n\n'
-            f'{stage_payload}'
-        )
-
     def _build_mcp_config(self) -> dict:
         """Assemble MCP server config for Claude CLI.
 
-        Always includes the fused-memory server (HTTP or stdio), the
-        jcodemunch stdio server, and the in-process recon-report HTTP server
-        on ``self._recon_report_port``.  The escalation HTTP server is added
-        only if an escalation URL is configured.
+        Always includes recon's core servers (:func:`recon_core_mcp_servers`)
+        and the in-process recon-report HTTP server on
+        ``self._recon_report_port``.  The escalation HTTP server is added
+        only if an escalation URL is configured; its entry carries the stage's
+        project as the ``X-Escalation-Project`` header, which scopes the
+        reconciliation escalation server's uuid-prefix guard.
         """
-        fm_config = _find_fused_memory_server()
-
-        if fm_config.get('type') == 'http':
-            # HTTP: just a URL, no env needed (server has its own env)
-            fm_entry: dict = {
-                'type': 'http',
-                'url': fm_config['url'],
-            }
-        else:
-            # Stdio: command + args + env
-            fm_env = dict(fm_config.get('env', {}))
-            if 'OPENAI_API_KEY' not in fm_env:
-                fm_env['OPENAI_API_KEY'] = os.environ.get('OPENAI_API_KEY', '')
-            fm_entry = {
-                'command': fm_config['command'],
-                'args': fm_config['args'],
-                'env': fm_env,
-            }
-
         servers: dict = {
-            'fused-memory': fm_entry,
-            'jcodemunch': jcodemunch_server_config(),
+            **recon_core_mcp_servers(),
             # PRD γ: recon_report MCP server — in-process only, not in any
             # disallow list because mcp__recon-report__* tools only mutate
             # in-process state (not Graphiti / Mem0 / Taskmaster).
@@ -661,9 +552,28 @@ class BaseStage:
             servers['escalation'] = {
                 'type': 'http',
                 'url': self._escalation_url,
+                'headers': escalation_project_headers(self.project_id),
             }
 
         return {'mcpServers': servers}
+
+
+def recon_core_mcp_servers(candidates: list[Path] | None = None) -> dict[str, Mapping[str, object]]:
+    """Recon's core MCP servers: fused-memory (HTTP, or stdio).
+
+    A stdio fused-memory entry carries ``OPENAI_API_KEY`` from the process env
+    unless its own env sets it; an HTTP entry needs no env, since the server
+    has its own. *candidates* is passed to :func:`_find_fused_memory_server`.
+    """
+    fm_config = _find_fused_memory_server(candidates)
+    if fm_config.get('type') == 'http':
+        fm_entry: dict = {'type': 'http', 'url': fm_config['url']}
+    else:
+        fm_env = dict(fm_config.get('env', {}))
+        if 'OPENAI_API_KEY' not in fm_env:
+            fm_env['OPENAI_API_KEY'] = os.environ.get('OPENAI_API_KEY', '')
+        fm_entry = {'command': fm_config['command'], 'args': fm_config['args'], 'env': fm_env}
+    return {'fused-memory': fm_entry}
 
 
 def _find_fused_memory_server(candidates: list[Path] | None = None) -> dict:

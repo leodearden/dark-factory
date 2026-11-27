@@ -1,12 +1,14 @@
 /* Main app — routes tabs, manages filter state, hosts tweaks */
 const { useState: uS, useEffect: uE } = React;
-const { Rail, StatStrip, Toolbar, DatumReading } = window.DF_SHELL;
+const { Rail, StatStrip, Toolbar, DatumReading, RenderFailureBoundary } = window.DF_SHELL;
 const { OverviewTab } = window.DF_OVERVIEW;
 const { OrchTab, PerfTab, MemoryTab, ReconTab, MergeTab, CostsTab, BurnTab, EscalationsTab, EscalationAnalyticsTab } = window.DF_TABS;
 const { TasksTab } = window.DF_TASKS;
 const { CuratorTab } = window.DF_CURATOR;
 const { SchedulerTab } = window.DF_SCHEDULER;
+const { QualityTab } = window.DF_QUALITY;
 const { staleNoticesForTab, loadingNoticeForTab } = window.DF_ENDPOINT_STALENESS;
+const { TAB_ENDPOINTS: TAB_POLL_PATHS } = window.DF_POLL_SCOPE;
 const { scopePollingToTab } = window.DF_DATA_LOADER;
 const { reconRunCounts, reconAttentionCount } = window.DF_RECON_STATUS;
 const { censusOver, runningOfInFlight, inFlightCount: inFlightCountReading } = window.DF_TASK_SNAPSHOT;
@@ -14,6 +16,8 @@ const { inQueueOver } = window.DF_MERGE_QUEUE;
 const { writeQueue } = window.DF_MEMORY_READINGS;
 const { todaySpend, spendText } = window.DF_SPEND_READINGS;
 const { DEFAULT_WINDOW: CHIP_DEFAULT_WINDOW, TAB_WINDOWS: CHIP_TAB_WINDOWS, windowForTab, windowEcho, highlightedWindow, pendingWindow } = window.DF_WINDOW_CHIP;
+const { tabRenderFailureNotice, chromeRenderFailureNotice, pageRenderFailureNotice } = window.DF_RENDER_FAILURE;
+const { createAssetSkewWatcher, pageAssetBuild, assetSkewGuardStorage, assetSkewNotice } = window.DF_ASSET_SKEW;
 const DD = window.DF_DATA;
 
 // Tweaks helpers are attached directly to window
@@ -62,6 +66,28 @@ function noticeBannerStyle(edgeColor) {
   };
 }
 
+// Each chrome region fails alone, so a broken topbar reading cannot take the
+// navigation down with it.
+function ChromeBoundary({ region, testId, className, children }) {
+  return (
+    <RenderFailureBoundary describe={thrown => chromeRenderFailureNotice(region, thrown)}
+                           testId={testId}
+                           className={className}
+                           style={noticeBannerStyle('var(--bad)')}>
+      {children}
+    </RenderFailureBoundary>
+  );
+}
+
+// One per page: from each poll set's receipts it decides whether this page,
+// the server and the disk are one build, and reloads a stale page itself.
+const assetSkewWatcher = createAssetSkewWatcher({
+  pageBuild: pageAssetBuild(document),
+  storage: assetSkewGuardStorage(),
+  now: () => Date.now(),
+  reload: () => window.location.reload(),
+});
+
 function App() {
   const [tab, setTab] = uS('overview');
   // Cross-tab handoff for the memory-eval escalation links. The SPA has no
@@ -89,10 +115,15 @@ function App() {
     document.documentElement.style.setProperty('--pad', tw.density === 'compact' ? '8px' : tw.density === 'roomy' ? '16px' : '12px');
   }, [tw.density]);
 
-  // Re-render when the data loader refreshes window.DF_DATA.
+  // Re-render when the data loader refreshes window.DF_DATA. The skew watcher
+  // observes here, in the handler and never in render, because it may reload.
   const [, setDataTick] = uS(0);
+  const [assetSkew, setAssetSkew] = uS(null);
   uE(() => {
-    const onRefresh = () => setDataTick(n => n + 1);
+    const onRefresh = () => {
+      setAssetSkew(assetSkewWatcher.observe(DD.__receipt));
+      setDataTick(n => n + 1);
+    };
     window.addEventListener('df-data-refresh', onRefresh);
     return () => window.removeEventListener('df-data-refresh', onRefresh);
   }, []);
@@ -136,6 +167,7 @@ function App() {
     { id: 'burn',     label: 'Burndown' },
     { id: 'esc',      label: 'Escalations' },
     { id: 'esc-analytics', label: 'Analytics' },
+    { id: 'quality',  label: 'Quality' },
   ];
   const tabLabel = tabs.find(t => t.id === tab)?.label || 'Overview';
 
@@ -159,9 +191,7 @@ function App() {
     tasks: <DatumReading datum={tasksCensus} format={inFlightCountReading} />,
     // Runs an operator should go and look at: failures, plus any row whose
     // status recon_status.js does not recognise, so vocabulary drift is
-    // visible from the rail and not only from the tab. 'interrupted' is
-    // excluded — this fleet is restarted routinely, so those rows would sit
-    // the badge permanently nonzero on a healthy system. In-flight runs get
+    // visible from the rail and not only from the tab. In-flight runs get
     // their own tile on the tab rather than inflating this number.
     recon: reconAttentionCount(reconRunCounts(DD.RECON_STATE.runs)),
     merge: <DatumReading datum={inQueueOver(DD, null)} />,
@@ -170,9 +200,9 @@ function App() {
 
   // Per-endpoint staleness for the ACTIVE tab (task 4884, #4791).
   //
-  // ONE render site, not thirteen: the tab -> endpoint mapping lives in
-  // endpoint_staleness.js::TAB_ENDPOINTS, so adding a tab is a one-line edit
-  // there, and endpoint_staleness.test.mjs fails loudly if a mapped endpoint
+  // ONE render site, not one per tab: the tab -> endpoint mapping lives in
+  // poll_scope.js::TAB_ENDPOINTS, so adding a tab is a one-line edit
+  // there, and poll_scope.test.mjs fails loudly if a mapped endpoint
   // stops existing or a tab id goes unmapped. The per-tab toolbar config map
   // further down this function is the sibling per-tab map; keep the two
   // tab-id lists in step. (Spelled out rather than naming that binding,
@@ -187,8 +217,10 @@ function App() {
   // TAB_ENDPOINTS plus CHROME_ENDPOINTS now also decide what is POLLED, so a
   // tab opened for the first time may show its pre-fetch seed until its
   // endpoints answer: the one loading notice names every path with no receipt yet.
-  const staleNotices = staleNoticesForTab({ tab, stale: DD.__stale || {}, now: Date.now() });
-  const loadingNotice = loadingNoticeForTab({ tab, receipt: DD.__receipt || {}, stale: DD.__stale || {} });
+  const staleNotices = staleNoticesForTab({ paths: TAB_POLL_PATHS[tab], stale: DD.__stale || {}, now: Date.now() });
+  const loadingNotice = loadingNoticeForTab({ paths: TAB_POLL_PATHS[tab], receipt: DD.__receipt || {}, stale: DD.__stale || {} });
+  const skewNotice = assetSkewNotice(assetSkew);
+  const reloadReachesServerBuild = assetSkew?.reloadReachesServerBuild === true;
 
   function renderTab() {
     switch (tab) {
@@ -205,6 +237,7 @@ function App() {
       case 'burn':     return <BurnTab projectFilter={projects} displayWindow={win} />;
       case 'esc':      return <EscalationsTab projectFilter={projects} focus={escFocus} onFocusConsumed={() => setEscFocus(null)} />;
       case 'esc-analytics': return <EscalationAnalyticsTab projectFilter={projects} />;
+      case 'quality':  return <QualityTab />;
       default: return null;
     }
   }
@@ -225,6 +258,7 @@ function App() {
     burn:      { showAgents: false, search: false },
     esc:       { showAgents: false, search: false },
     'esc-analytics': { showAgents: false, search: false },
+    quality:   { showProjects: false, showAgents: false, search: false },
   }[tab] || {};
   const chip = CHIP_TAB_WINDOWS[tab];
   const chipEcho = chip ? windowEcho(DD.__receipt, chip.endpoint) : null;
@@ -232,46 +266,66 @@ function App() {
 
   return (
     <div className="app" data-density={tw.density}>
-      <Rail active={tab} onSelect={setTab} counts={railCounts} />
+      <ChromeBoundary region="navigation rail" testId="rail-render-failure-banner" className="rail">
+        <Rail active={tab} onSelect={setTab} counts={railCounts} />
+      </ChromeBoundary>
       <div className="topbar">
         <div className="crumbs">
           <span style={{ color: 'var(--fg-3)' }}>dark-factory</span>
           <span style={{ color: 'var(--fg-3)' }}>/</span>
           <span className="here">{tabLabel}</span>
         </div>
-        <StatStrip live={!tw.pauseLive} lastUpdate={<LiveClock live={!tw.pauseLive} />} summary={summary} />
+        <ChromeBoundary region="status strip" testId="status-strip-render-failure-banner">
+          <StatStrip live={!tw.pauseLive} lastUpdate={<LiveClock live={!tw.pauseLive} />} summary={summary} />
+        </ChromeBoundary>
       </div>
       <div className="main">
-        <Toolbar
-          showWindow={!!chip}
-          windows={chip?.windows}
-          window={chip ? highlightedWindow(chipEcho, chip.windows) : null}
-          onWindow={setWin}
-          showProjects={toolbarConfig.showProjects !== false}
-          projects={projects} onProjects={setProjects}
-          agents={agents} onAgents={setAgents}
-          showAgents={toolbarConfig.showAgents}
-          search={toolbarConfig.search ? search : undefined}
-          onSearch={toolbarConfig.search ? setSearch : undefined}
-          searchPlaceholder={toolbarConfig.searchPlaceholder}
-          extra={
-            <>
-              {pending && (
-                <span title="chosen, not yet served" style={{ color: 'var(--fg-3)', fontSize: 11 }}>
-                  {pending} pending
-                </span>
-              )}
-              <button onClick={() => setTw('pauseLive', !tw.pauseLive)}
-                className="multi" style={{ cursor: 'pointer' }}>
-                {tw.pauseLive ? '▶ resume' : '❚❚ pause live'}
-              </button>
-            </>
-          }
-        />
+        <ChromeBoundary region="toolbar" testId="toolbar-render-failure-banner">
+          <Toolbar
+            showWindow={!!chip}
+            windows={chip?.windows}
+            window={chip ? highlightedWindow(chipEcho, chip.windows) : null}
+            onWindow={setWin}
+            showProjects={toolbarConfig.showProjects !== false}
+            projects={projects} onProjects={setProjects}
+            agents={agents} onAgents={setAgents}
+            showAgents={toolbarConfig.showAgents}
+            search={toolbarConfig.search ? search : undefined}
+            onSearch={toolbarConfig.search ? setSearch : undefined}
+            searchPlaceholder={toolbarConfig.searchPlaceholder}
+            extra={
+              <>
+                {pending && (
+                  <span title="chosen, not yet served" style={{ color: 'var(--fg-3)', fontSize: 11 }}>
+                    {pending} pending
+                  </span>
+                )}
+                <button onClick={() => setTw('pauseLive', !tw.pauseLive)}
+                  className="multi" style={{ cursor: 'pointer' }}>
+                  {tw.pauseLive ? '▶ resume' : '❚❚ pause live'}
+                </button>
+              </>
+            }
+          />
+        </ChromeBoundary>
         <div className="body" key={tab}>
           {/* ADDITIVE, never a replacement: renderTab() below stays
               unconditional so the last-good payload refreshOne deliberately
-              preserved stays on screen — marked as old, not blanked. */}
+              preserved stays on screen — marked as old, not blanked. Only the
+              boundary replaces it, when the tab's own render throws. */}
+          {skewNotice && (
+            <div className="col-span-12"
+                 data-testid="asset-skew-banner"
+                 style={noticeBannerStyle('var(--accent)')}>
+              {skewNotice.text}
+              {skewNotice.offersReload && (
+                <button onClick={() => window.location.reload()}
+                  className="multi" style={{ cursor: 'pointer', marginLeft: 8 }}>
+                  reload
+                </button>
+              )}
+            </div>
+          )}
           {staleNotices.map(notice => (
             <div key={notice.path} className="col-span-12"
                  data-testid="endpoint-stale-banner"
@@ -286,7 +340,11 @@ function App() {
               {loadingNotice.text}
             </div>
           )}
-          {renderTab()}
+          {/* The keyed .body remounts this boundary per tab, so switching tabs retries. */}
+          <RenderFailureBoundary describe={thrown => tabRenderFailureNotice(tabLabel, thrown, reloadReachesServerBuild)}
+                                 testId="tab-render-failure-banner"
+                                 className="col-span-12"
+                                 style={noticeBannerStyle('var(--bad)')}>{renderTab()}</RenderFailureBoundary>
         </div>
       </div>
 
@@ -323,4 +381,12 @@ function App() {
 // Apply density / tweak side-effects via class
 const obs = new MutationObserver(() => {});
 const root = document.getElementById('root');
-ReactDOM.createRoot(root).render(<App />);
+// The last resort: App's own body (the summary and rail-count derivations) runs
+// above every region boundary, so the operator reads its error, not an empty #root.
+ReactDOM.createRoot(root).render(
+  <RenderFailureBoundary describe={pageRenderFailureNotice}
+                         testId="page-render-failure-banner"
+                         style={{ ...noticeBannerStyle('var(--bad)'), margin: 24 }}>
+    <App />
+  </RenderFailureBoundary>
+);

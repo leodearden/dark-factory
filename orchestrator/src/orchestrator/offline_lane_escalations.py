@@ -1,8 +1,8 @@
 """The offline lane's escalation records, filed against one sentinel task id per command.
 
-Four kinds share a command's sentinel: the unlanded red, the stuck filing, and the two
+Five kinds share a command's sentinel: the unlanded red, the stuck filing, the two
 probe records (an outage, a broken probe; PRD ``plans/offline-lane-red-path-prd.md`` D7,
-section 5.10).  The lane tells its records apart only by the ids it stores.
+section 5.10), and the tick failure.  The lane tells its records apart only by the ids it stores.
 """
 
 from __future__ import annotations
@@ -22,6 +22,7 @@ UNLANDED_RED_CATEGORY = 'dependency_discovered'
 STUCK_FILING_CATEGORY = 'infra_issue'
 OUTAGE_CATEGORY = 'infra_issue'
 PROBE_BROKEN_CATEGORY = 'infra_issue'
+TICK_FAILURE_CATEGORY = 'infra_issue'
 PENDING_ESCALATION = 'pending'
 
 _SUMMARY_LIMIT = 200
@@ -52,6 +53,13 @@ class StuckFiling:
     nodes: tuple[str, ...]
     due_since: datetime
     reason: str
+
+
+@dataclass(frozen=True)
+class TickFailure:
+    command: str
+    failing_since: datetime
+    error: str
 
 
 def _bulleted(items: tuple[str, ...]) -> str:
@@ -90,6 +98,22 @@ def _stuck_detail(stuck: StuckFiling) -> str:
         f'{stuck.due_since.isoformat()} and every retry has failed.\n\n'
         f'Reason: {stuck.reason}\n\n'
         f'Tests waiting for a task:\n{_bulleted(stuck.nodes)}'
+    )
+
+
+def _tick_failure_summary(failure: TickFailure) -> str:
+    return f'Offline lane [{failure.command}] tick keeps failing: {failure.error}'[:_SUMMARY_LIMIT]
+
+
+def _tick_failure_detail(failure: TickFailure) -> str:
+    return (
+        f"Offline-lane command {failure.command!r}'s tick has raised on every poll since "
+        f'{failure.failing_since.isoformat()}. While it does, its due-filing retries, probe loop, '
+        "recheck and stuck-filing record are not being kept; the other commands' ticks go on.\n\n"
+        f'Last error: {failure.error}\n\n'
+        "The first failure's traceback is in the orchestrator.offline_lane_episodes log. "
+        "The lane closes this record itself at the command's first clean tick in the same "
+        "orchestrator process, or once the command has no record left in the lane's store."
     )
 
 
@@ -200,6 +224,33 @@ def resolve_stuck_filing(queue: EscalationQueue, escalation_id: str) -> None:
         escalation_id,
         'No filing of this command has stayed due; the lane closed its own record.',
         resolved_by=LANE_ESCALATION_ROLE,
+        resolution_class='benign',
+    )
+
+
+def file_tick_failure(queue: EscalationQueue, failure: TickFailure) -> str:
+    return _file(
+        queue, failure.command, TICK_FAILURE_CATEGORY,
+        _tick_failure_summary(failure), _tick_failure_detail(failure),
+    )
+
+
+def amend_tick_failure(queue: EscalationQueue, escalation_id: str, failure: TickFailure) -> None:
+    queue.amend(
+        escalation_id,
+        summary=_tick_failure_summary(failure),
+        detail=_tick_failure_detail(failure),
+        agent_role=LANE_ESCALATION_ROLE,
+    )
+
+
+def resolve_tick_failure(queue: EscalationQueue, escalation_id: str) -> None:
+    queue.resolve(
+        escalation_id,
+        "This command's tick no longer fails: it ran clean again, or the command has no record "
+        "left in the lane's store to tick. The lane closed its own record.",
+        resolved_by=LANE_ESCALATION_ROLE,
+        resolution_class='benign',
     )
 
 
@@ -236,12 +287,16 @@ def release_lane_record(queue: EscalationQueue, escalation_id: str, resolution: 
     amended to say the record closed.  Idempotent: a repeat resolves and amends nothing new.
     """
     if escalation_state(queue, escalation_id) == PENDING_ESCALATION:
-        queue.resolve(escalation_id, resolution, resolved_by=LANE_ESCALATION_ROLE)
+        queue.resolve(
+            escalation_id, resolution, resolved_by=LANE_ESCALATION_ROLE, resolution_class='benign',
+        )
     for holder in queue.get_pending():
         if holder.level != _HOLDER_LEVEL or escalation_id not in holder.members:
             continue
         if list(dict.fromkeys(holder.members)) == [escalation_id]:
-            queue.resolve(holder.id, resolution, resolved_by=LANE_ESCALATION_ROLE)
+            queue.resolve(
+                holder.id, resolution, resolved_by=LANE_ESCALATION_ROLE, resolution_class='benign',
+            )
         else:
             queue.amend(
                 holder.id,

@@ -257,6 +257,7 @@ class TestLevelForbidden:
         # (c) Contrast: a header-less client stays default-open on the same level.
         result_c = await _resolve_over_http(
             base_url, escalation_id=esc_open.id, resolution='ok', action='close_only',
+            resolution_class='actionable',
         )
         assert 'code' not in result_c and 'error' not in result_c, (
             f'Expected a clean success (no code/error), got: {result_c}'
@@ -399,6 +400,7 @@ class TestHumanUnrestrictedFullAuthority:
             base_url,
             escalation_id=esc_resume.id, resolution='fixed', action='resume',
             resolved_by='escalation-watcher',
+            resolution_class='actionable',
         )
         assert 'code' not in result_a and 'error' not in result_a, (
             f'Expected a clean success, got: {result_a}'
@@ -441,6 +443,7 @@ class TestHumanUnrestrictedFullAuthority:
             base_url,
             escalation_id=esc_close.id, resolution='no longer relevant',
             action='close_only', resolved_by='escalation-watcher',
+            resolution_class='benign',
         )
         assert 'code' not in result_c and 'error' not in result_c, (
             f'Expected a clean success, got: {result_c}'
@@ -482,6 +485,7 @@ class TestCascadeIntactHeaderless:
             base_url,
             escalation_id=l2.id, resolution='cluster resolved',
             action='close_only', resolved_by='escalation-watcher',
+            resolution_class='actionable',
         )
         assert 'code' not in result and 'error' not in result, (
             f'Expected a clean success, got: {result}'
@@ -698,6 +702,7 @@ class TestIdentityDerivedCeiling:
         result = await _resolve_over_http(
             base_url, identity='some-other-agent',
             escalation_id=esc.id, resolution='ok', action='close_only',
+            resolution_class='actionable',
         )
         assert 'code' not in result and 'error' not in result, (
             f'Expected a clean success (unmapped identity, no levels header), got: {result}'
@@ -884,6 +889,7 @@ class TestL2AutoCloseCarveout:
                 'is-ancestor of the current clean tip.'
             ),
             resolved_by='spoofed-by-agent',
+            resolution_class='benign',
         )
         assert 'code' not in result_a and 'error' not in result_a, (
             f'Expected a clean success (allowlisted class + evidence), got: {result_a}'
@@ -913,6 +919,7 @@ class TestL2AutoCloseCarveout:
             escalation_id=esc_b.id, action='close_only',
             resolution='live probe: curator paused=false — transient infra self-cleared',
             resolved_by='spoofed-by-agent',
+            resolution_class='benign',
         )
         assert 'code' not in result_b and 'error' not in result_b, (
             f'Expected a clean success (allowlisted class + evidence), got: {result_b}'
@@ -955,6 +962,7 @@ class TestL2AutoCloseCarveout:
             escalation_id=esc.id, action='close_only',
             resolution='Subject task status=done per get_task; escalation moot.',
             resolved_by='spoofed-by-agent',
+            resolution_class='benign',
         )
         assert 'code' not in result and 'error' not in result, (
             f'Expected a clean success (stale_task_scoped class + evidence), got: {result}'
@@ -1175,6 +1183,7 @@ class TestL2AutoCloseCarveout:
             escalation_id=esc.id, action='close_only',
             resolution='live probe: curator paused=false — transient infra self-cleared',
             resolved_by='escalation-watcher',
+            resolution_class='benign',
         )
         assert 'code' not in result and 'error' not in result, (
             f'Expected a clean success (header-less keeps full L2 authority), got: {result}'

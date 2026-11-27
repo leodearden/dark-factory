@@ -1,10 +1,11 @@
 """The link-heal config surface (plans/write-triage-link-healing-prd.md H1/H2, tasks 6181, 6184).
 
-The ``link_heal.*`` knobs: the executor's caps and storm escapes (H1) and the
+The ``link_heal.*`` knobs: the executor's caps and storm escapes (H1), the
 link adjudicator's model, sharding, text cap, share ceilings and failure streak
-(H2). All are green-tier because their only consumers are scripts
-(``scripts/link_heal.py``, ``scripts/eval_link_adjudicator.py``) that load
-config at each run start; and
+(H2), and the scheduled sweep's projects, write switch, action set, window and
+calibration gate (task 7159). All are green-tier because their only consumers
+are scripts (``scripts/link_heal.py``, ``scripts/eval_link_adjudicator.py``)
+that load config at each run start; and
 the ``link-heal-`` prefix on the metadata arm of ``mem0_update``, which the
 executor's ``update_memory`` writes need and which must not widen the
 content-amend arm.
@@ -16,6 +17,7 @@ import types
 from pathlib import Path
 
 import pytest
+import yaml
 from pydantic import ValidationError
 
 from fused_memory.config.reload import RELOADABLE_FIELDS, diff_config
@@ -49,6 +51,16 @@ class TestLinkHealConfigDefaults:
         assert cfg.corrects_share_ceiling == 0.60
         assert cfg.shard_failure_streak == 3
 
+    def test_sweep_and_calibration_defaults(self):
+        cfg = LinkHealConfig()
+        assert cfg.projects == []
+        assert cfg.writes is False
+        assert cfg.sweep_actions == ['detach', 'relabel']
+        assert cfg.sweep_window_hours == 24
+        assert cfg.max_adjudications_per_run == 200
+        assert cfg.calibration_kappa_margin == 0.10
+        assert cfg.calibration_min_project_items == 60
+
     @pytest.mark.parametrize(
         ('field', 'value'),
         [
@@ -63,6 +75,11 @@ class TestLinkHealConfigDefaults:
             ('corrects_share_ceiling', -0.01),
             ('corrects_share_ceiling', 1.01),
             ('adjudicator_model', ''),
+            ('sweep_window_hours', 0),
+            ('max_adjudications_per_run', 0),
+            ('calibration_kappa_margin', -0.01),
+            ('calibration_kappa_margin', 1.01),
+            ('calibration_min_project_items', 0),
         ],
     )
     def test_out_of_range_values_are_rejected(self, field, value):
@@ -94,10 +111,17 @@ class TestLinkHealLeavesAreGreenTier:
         'misfile_share_ceiling': 0.5,
         'corrects_share_ceiling': 0.9,
         'shard_failure_streak': 5,
+        'projects': ['dark_factory'],
+        'writes': True,
+        'sweep_actions': ['detach'],
+        'sweep_window_hours': 48,
+        'max_adjudications_per_run': 50,
+        'calibration_kappa_margin': 0.05,
+        'calibration_min_project_items': 30,
     }
 
-    def test_the_schema_declares_nine_leaves(self):
-        assert len(LEAVES) == 9, LEAVES
+    def test_the_schema_declares_sixteen_leaves(self):
+        assert len(LEAVES) == 16, LEAVES
 
     def test_every_leaf_is_allowlisted(self):
         missing = {f'link_heal.{name}' for name in LEAVES} - RELOADABLE_FIELDS
@@ -122,45 +146,69 @@ class TestLinkHealLeavesAreGreenTier:
         assert path not in d.restart_required
 
 
-class TestTrackedConfigAdmitsTheLinkHealPrefixOnTheMetadataArmOnly:
-    @pytest.fixture
-    def tracked_config(self, monkeypatch) -> FusedMemoryConfig:
-        assert TRACKED_CONFIG_YAML.is_file(), TRACKED_CONFIG_YAML
-        monkeypatch.setenv('CONFIG_PATH', str(TRACKED_CONFIG_YAML))
-        return FusedMemoryConfig()
+@pytest.fixture
+def tracked_config(monkeypatch) -> FusedMemoryConfig:
+    assert TRACKED_CONFIG_YAML.is_file(), TRACKED_CONFIG_YAML
+    monkeypatch.setenv('CONFIG_PATH', str(TRACKED_CONFIG_YAML))
+    return FusedMemoryConfig()
 
-    def test_metadata_arm_lists_recon_curator_and_link_heal(self, tracked_config):
-        prefixes = tracked_config.mem0_update.metadata_patch_allowed_agent_prefixes
+
+class TestTrackedConfigShipsTheSweepWithWritesOff:
+    def test_the_sweep_ships_with_writes_off(self, tracked_config):
+        assert tracked_config.link_heal.writes is False
+
+    def test_the_sweep_ships_with_the_default_adjudication_cap(self, tracked_config):
+        assert tracked_config.link_heal.max_adjudications_per_run == 200
+
+    def test_the_sweep_covers_the_projects_with_triage_children_in_the_soak(self, tracked_config):
+        projects = tracked_config.link_heal.projects
+        assert len(projects) == len(set(projects))
+        assert set(projects) == {
+            'dark_factory', 'reify', 'solar_challenge', 'solar_challenge_platform',
+            'scoping_intake',
+        }
+
+
+@pytest.fixture(params=['tracked-yaml', 'no-yaml'])
+def effective_config(request) -> FusedMemoryConfig:
+    if request.param == 'tracked-yaml':
+        return request.getfixturevalue('tracked_config')
+    return FusedMemoryConfig()
+
+
+class TestEffectiveConfigAdmitsTheLinkHealPrefixOnTheMetadataArmOnly:
+    def test_metadata_arm_lists_recon_curator_and_link_heal(self, effective_config):
+        prefixes = effective_config.mem0_update.metadata_patch_allowed_agent_prefixes
         for prefix in ('recon-stage-', 'curator-', 'link-heal-'):
             assert prefix in prefixes
 
-    def test_metadata_arm_keeps_every_schema_default_prefix(self, tracked_config):
-        """The YAML list replaces the schema default, so a prefix added there must be mirrored."""
-        listed = set(tracked_config.mem0_update.metadata_patch_allowed_agent_prefixes)
-        default = set(Mem0UpdateConfig().metadata_patch_allowed_agent_prefixes)
-        assert default <= listed, f'missing from config.yaml: {sorted(default - listed)}'
+    def test_content_amend_arm_stays_at_the_schema_default(self, effective_config):
+        prefixes = effective_config.mem0_update.content_amend_allowed_agent_prefixes
+        assert prefixes == Mem0UpdateConfig().content_amend_allowed_agent_prefixes
+        assert 'link-heal-' not in prefixes
 
-    def test_content_amend_arm_stays_at_the_schema_default(self, tracked_config):
-        assert (
-            tracked_config.mem0_update.content_amend_allowed_agent_prefixes
-            == Mem0UpdateConfig().content_amend_allowed_agent_prefixes
-        )
-
-    def test_a_link_heal_agent_may_patch_metadata(self, tracked_config):
+    def test_a_link_heal_agent_may_patch_metadata(self, effective_config):
         decision = resolve_mem0_update_authorization(
-            types.SimpleNamespace(config=tracked_config),
+            types.SimpleNamespace(config=effective_config),
             agent_id='link-heal-0123abcd',
             content_amend=False,
             metadata_patch=True,
         )
         assert decision.allowed, decision
 
-    def test_a_link_heal_agent_may_not_amend_content(self, tracked_config):
+    def test_a_link_heal_agent_may_not_amend_content(self, effective_config):
         decision = resolve_mem0_update_authorization(
-            types.SimpleNamespace(config=tracked_config),
+            types.SimpleNamespace(config=effective_config),
             agent_id='link-heal-0123abcd',
             content_amend=True,
             metadata_patch=False,
         )
         assert not decision.allowed
         assert decision.error_type == 'Mem0UpdateNotAuthorized'
+
+
+class TestTheLinkHealPrefixHasOneHome:
+    def test_the_tracked_config_does_not_restate_the_metadata_arm(self):
+        """An active YAML list replaces the schema default wholesale and must then be hand-mirrored."""
+        raw = yaml.safe_load(TRACKED_CONFIG_YAML.read_text())
+        assert 'metadata_patch_allowed_agent_prefixes' not in (raw.get('mem0_update') or {})

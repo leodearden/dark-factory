@@ -93,7 +93,6 @@ hand-built ``PlanShape``.
 
 from __future__ import annotations
 
-import asyncio
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
@@ -158,7 +157,7 @@ def git_repo(tmp_path: Path) -> Path:
     """A bare-minimum git repo with an initial commit."""
     repo = tmp_path / 'repo'
     repo.mkdir()
-    asyncio.run(_init_repo(repo))
+    _init_repo(repo)
     return repo
 
 
@@ -910,6 +909,7 @@ class TestRetryTierBumpAcrossDispatches:
             'role': 'implementer', 'model': 'sonnet', 'effort': 'high',
             'budget_usd': 10.0, 'max_turns': 80, 'source_layer': 'config',
             'rule_id': None, 'rejected': [], 'routing_tier': 0, 'decided_at': None,
+            'plan_steps': 5, 'plan_modules': 1,
         }
         return {
             'files': ['lib'],

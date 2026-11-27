@@ -7,7 +7,7 @@ run over a frozen population of writes. For every write the arm attached, the
 pair (write, the record its judge named) is looked up in a blind verdict
 corpus, and the arm is scored on what the raters said about that pair.
 
-It is not ``eval_write_triage_judge.py::score_attachments``. That function
+It is not ``eval_write_triage_scoring.py::score_attachments``. That function
 asks whether the attach target is the fixture's canonical record, a
 fixture-strict hit rate that feeds the judge-accuracy report. This module asks
 whether raters agree the write belongs under the record the judge chose. They
@@ -15,11 +15,9 @@ are different quantities, so each has its own definition (INV-9).
 
 Verdict corpus
 --------------
-One row per (rater, pair): ``{entry_id, target_id, verdict, rater, batch}``,
-plus any extra keys (``reason``). ``verdict`` is one of :data:`VERDICT_WORDS`,
-the rater brief's vocabulary. A pair may carry several raters' votes. It
-resolves to a :class:`Resolution` by majority on each of two binaries,
-belongs-vs-misfile first and then CORRECTS-vs-not, with UNCLEAR abstaining.
+Rows resolve to one :class:`Resolution` per pair by
+``fused_memory/maintenance/verdict_majority.py::resolve_verdicts``, which
+states the row contract and the majority rule.
 
 Cases and metrics
 -----------------
@@ -69,8 +67,9 @@ from itertools import chain
 from numbers import Real
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, TypeAlias
+from typing import TYPE_CHECKING, Any
 
+from fused_memory.maintenance.verdict_majority import Pair, Resolution, resolve_verdicts
 from fused_memory.server.write_triage import (
     OUTCOME_CONTESTED,
     OUTCOME_JUDGE,
@@ -78,91 +77,21 @@ from fused_memory.server.write_triage import (
     OUTCOME_STORED,
     TRIAGE_OUTCOMES,
 )
+from fused_memory.utils.script_loader import load_script
 
-VERDICT_WORDS: tuple[str, ...] = (
-    'SAME', 'EXTENDS', 'SUBSUMED', 'CORRECTS', 'RELATED', 'UNRELATED', 'UNCLEAR',
-)
-_CORRECTS = 'CORRECTS'
-_MISFILE_WORDS = frozenset({'RELATED', 'UNRELATED'})
-_ABSTAIN = 'UNCLEAR'
-_REQUIRED_VOTE_KEYS = ('entry_id', 'target_id', 'verdict', 'rater', 'batch')
+_SCRIPTS = Path(__file__).resolve().parent
+
+if TYPE_CHECKING:
+    import write_triage_stats as _stats
+else:
+    _stats = load_script(_SCRIPTS / 'write_triage_stats.py', 'write_triage_stats')
+
 _REQUIRED_CASE_KEYS = ('arm', 'memory_id', 'band', 'outcome')
 _ATTACH_OUTCOMES = TRIAGE_OUTCOMES - {OUTCOME_STORED}
 _BANDS = frozenset({OUTCOME_RESTATED, OUTCOME_JUDGE, OUTCOME_STORED})
 """Every band ``write_triage.py::decide_band`` routes a write to."""
 _WRITE_FLAGS = ('recon_marker', 'declares_attach_keys')
 """Case-row flags that take a write out of production's judge path (PRD §12 D19)."""
-_WILSON_Z = 1.96
-
-Pair: TypeAlias = tuple[str, str]
-"""``(entry_id, target_id)``: a write and the record it was attached to."""
-
-
-class Resolution(StrEnum):
-    """What the raters, taken together, say about one pair.
-
-    AGREEING (SAME/EXTENDS/SUBSUMED) and CORRECTS mean the write belongs under
-    the target; MISFILE (RELATED/UNRELATED) means it does not. UNCLEAR means
-    every rater abstained. TIED means the raters split evenly on a binary, so
-    the corpus still owes this pair another rating.
-    """
-
-    AGREEING = 'agreeing'
-    CORRECTS = 'corrects'
-    MISFILE = 'misfile'
-    UNCLEAR = 'unclear'
-    TIED = 'tied'
-
-    @property
-    def belongs(self) -> bool:
-        return self in (Resolution.AGREEING, Resolution.CORRECTS)
-
-
-def resolve_verdicts(rows: Iterable[Mapping[str, Any]]) -> dict[Pair, Resolution]:
-    """Resolve every rated pair in the corpus; refuse a malformed or double vote."""
-    votes: defaultdict[Pair, dict[str, str]] = defaultdict(dict)
-    for index, row in enumerate(rows):
-        pair, rater, word = _vote(index, row)
-        if rater in votes[pair]:
-            raise ValueError(
-                f'verdict row {index}: rater {rater!r} already voted on pair {pair}'
-            )
-        votes[pair][rater] = word
-    return {pair: _majority(by_rater.values()) for pair, by_rater in votes.items()}
-
-
-def _vote(index: int, row: Mapping[str, Any]) -> tuple[Pair, str, str]:
-    pair = (row.get('entry_id'), row.get('target_id'))
-    missing = [key for key in _REQUIRED_VOTE_KEYS if key not in row]
-    if missing:
-        raise ValueError(f'verdict row {index} on pair {pair} lacks {", ".join(missing)}')
-    if row['verdict'] not in VERDICT_WORDS:
-        raise ValueError(
-            f'verdict row {index} on pair {pair}: {row["verdict"]!r} is not one of {VERDICT_WORDS}'
-        )
-    return (row['entry_id'], row['target_id']), row['rater'], row['verdict']
-
-
-def _majority(words: Iterable[str]) -> Resolution:
-    decided = [word for word in words if word != _ABSTAIN]
-    if not decided:
-        return Resolution.UNCLEAR
-    misfile = _binary(sum(word in _MISFILE_WORDS for word in decided), len(decided))
-    if misfile is None:
-        return Resolution.TIED
-    if misfile:
-        return Resolution.MISFILE
-    corrects = _binary(sum(word == _CORRECTS for word in decided), len(decided))
-    if corrects is None:
-        return Resolution.TIED
-    return Resolution.CORRECTS if corrects else Resolution.AGREEING
-
-
-def _binary(yes: int, votes: int) -> bool | None:
-    """Strict majority of *votes*: True for yes, False for no, None for a tie."""
-    if 2 * yes == votes:
-        return None
-    return 2 * yes > votes
 
 
 @dataclass(frozen=True, order=True)
@@ -869,18 +798,18 @@ def _quality(scored: Sequence[ScoredCase]) -> dict[str, Any]:
         'attaches': len(attached),
         'unclear_attaches': sum(s.resolution is Resolution.UNCLEAR for s in attached),
         'misfiles': misfiles,
-        'misfile_rate_of_attaches': _rate(misfiles, decided),
-        'misfile_rate_wilson95': _wilson95(misfiles, decided),
+        'misfile_rate_of_attaches': _stats.rate(misfiles, decided),
+        'misfile_rate_wilson95': _stats.wilson95(misfiles, decided),
         'duplicates_placed': contradictions + agreeing,
         'contradictions_attached': contradictions,
         'contradictions_contested': contradictions_contested,
-        'contradiction_recall': _rate(contradictions_contested, contradictions),
+        'contradiction_recall': _stats.rate(contradictions_contested, contradictions),
         'agreeing_attaches': agreeing,
         'agreeing_contested': agreeing_contested,
-        'false_contested_rate': _rate(agreeing_contested, agreeing),
+        'false_contested_rate': _stats.rate(agreeing_contested, agreeing),
         'true_links': true_links,
         'true_links_answered_distinct': answered_distinct,
-        'true_links_answered_distinct_rate': _rate(answered_distinct, true_links),
+        'true_links_answered_distinct_rate': _stats.rate(answered_distinct, true_links),
         'contested_decision_errors': sum(s.contested_decision_error for s in scored),
         'parse_failures': sum(s.case.parse_failure for s in scored),
         'unrated_pairs': 0,
@@ -934,7 +863,7 @@ def _paired_bootstrap95(delta_by_write: Mapping[str, float]) -> list[float] | No
     sums = sorted(
         sum(draws.choices(deltas, k=len(deltas))) for _ in range(BOOTSTRAP_RESAMPLES)
     )
-    return [round(_nearest_rank(sums, 2.5), 4), round(_nearest_rank(sums, 97.5), 4)]
+    return _stats.nearest_rank95(sums)
 
 
 def _harm_figures(
@@ -961,8 +890,8 @@ def _attach_figures(attaches: Sequence[ComparedWrite]) -> dict[str, Any]:
     return {
         'placeable_attaches': decided,
         'wrong_sibling_misfiles': misfiles,
-        'wrong_sibling_rate_placeable': _rate(misfiles, decided),
-        'wrong_sibling_rate_wilson95': _wilson95(misfiles, decided),
+        'wrong_sibling_rate_placeable': _stats.rate(misfiles, decided),
+        'wrong_sibling_rate_wilson95': _stats.wilson95(misfiles, decided),
         'no_known_home_attaches': sum(
             write.scored.decided for write in attaches if not write.placeable
         ),
@@ -970,21 +899,6 @@ def _attach_figures(attaches: Sequence[ComparedWrite]) -> dict[str, Any]:
             write.scored.resolution is Resolution.UNCLEAR for write in attaches
         ),
     }
-
-
-def _rate(hits: int, total: int) -> float | None:
-    """*hits*/*total*, or None when nothing was measured; never 0.0 for an empty denominator."""
-    return round(hits / total, 4) if total else None
-
-
-def _wilson95(hits: int, total: int) -> list[float] | None:
-    if not total:
-        return None
-    share = hits / total
-    spread = _WILSON_Z * _WILSON_Z / total
-    centre = (share + spread / 2) / (1 + spread)
-    half = _WILSON_Z * math.sqrt(share * (1 - share) / total + spread / (4 * total)) / (1 + spread)
-    return [round(max(0.0, centre - half), 4), round(min(1.0, centre + half), 4)]
 
 
 def _runtime(calls: Sequence[JudgedCase]) -> dict[str, Any]:
@@ -995,18 +909,12 @@ def _runtime(calls: Sequence[JudgedCase]) -> dict[str, Any]:
     return {
         'judge_calls': len(calls),
         'untimed_calls': len(calls) - len(seconds),
-        'p50_judge_seconds': round(_nearest_rank(seconds, 50), 3) if timed else None,
-        'p95_judge_seconds': round(_nearest_rank(seconds, 95), 3) if timed else None,
+        'p50_judge_seconds': round(_stats.nearest_rank(seconds, 50), 3) if timed else None,
+        'p95_judge_seconds': round(_stats.nearest_rank(seconds, 95), 3) if timed else None,
         'judge_models': sorted({call.judge_model for call in calls if call.judge_model}),
         'unpriced_calls': len(calls) - len(costs),
         'cost_per_write_usd': round(sum(costs) / len(costs), 6) if priced else None,
     }
-
-
-def _nearest_rank(sorted_values: Sequence[float], percent: float) -> float:
-    """The smallest observed value with at least *percent*% of values at or below it."""
-    rank = math.ceil(percent * len(sorted_values) / 100)
-    return sorted_values[rank - 1]
 
 
 def _call_cost(call: JudgedCase) -> float | None:
@@ -1054,17 +962,17 @@ def _paired_error(
         'n_common': len(common),
         'only_arm': len(only_arm),
         'only_reference': len(only_reference),
-        'mcnemar_p': _mcnemar_exact(len(only_arm), len(only_reference)),
+        'mcnemar_p': mcnemar_exact(len(only_arm), len(only_reference)),
         'parent_sign_test': {
             'groups_favouring_arm': favouring_arm,
             'groups_favouring_reference': favouring_reference,
-            'p': _mcnemar_exact(favouring_arm, favouring_reference),
+            'p': mcnemar_exact(favouring_arm, favouring_reference),
         },
     }
 
 
-def _mcnemar_exact(only_first: int, only_second: int) -> float:
-    """Two-sided exact McNemar (sign) test p on the discordant counts."""
+def mcnemar_exact(only_first: int, only_second: int) -> float:
+    """Two-sided exact McNemar (sign) test p on the discordant counts, rounded to 4 places."""
     discordant = only_first + only_second
     if discordant == 0:
         return 1.0

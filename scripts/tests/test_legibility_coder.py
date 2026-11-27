@@ -5,9 +5,9 @@ See plans/confusion-reduction-prd.md §7.3 (coding record contract), §8.1
 (consumer-side boundary test), §8.6 (coder failure storm). Task delta of
 the confusion-reduction PRD decomposition.
 
-Import the target module as `import coder as mod`, resolved via
-scripts/tests/conftest.py's sys.path insertion (both scripts/ and
-scripts/legibility/ are on sys.path; no package __init__ needed) — mirrors
+Import the target module as `from legibility import coder as mod`, the one
+spelling every legibility module is reached by (scripts/ is on sys.path via
+scripts/tests/conftest.py; no package __init__ needed) — mirrors
 test_legibility_digest.py's import style.
 
 No real `claude` is ever reached from this file: every code_digest/code_digests
@@ -25,12 +25,13 @@ import sys
 from enum import StrEnum
 from pathlib import Path
 
-import codebook as codebook_mod
-import coder as mod
-import digest as digest_mod
+import legibility_sighting_fit_fixtures as reify_fit
 import pytest
 from cli_subprocess_timeout import cli_timeout_from_env
-from legibility import invariants, session_runner
+from legibility import codebook as codebook_mod
+from legibility import coder as mod
+from legibility import digest as digest_mod
+from legibility import invariants, session_runner, sighting_fit
 from quality_doc_texts import code_quality, definition_body, heuristic_headlines
 
 # Imported AFTER `coder`, deliberately: it is coder.py's own module-level
@@ -41,6 +42,9 @@ from quality_doc_texts import code_quality, definition_body, heuristic_headlines
 # census preflight (task 3645), and deriving from the one home means a CLI
 # rewording the markers stop covering turns THIS suite red too.
 from shared.cap_markers import REAL_CLI_CAP_HIT_MESSAGES, REAL_CLI_CAP_MESSAGES
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _LIVE_CODEBOOK_PATH = _REPO_ROOT / "docs" / "legibility" / "confusion-codebook.yaml"
@@ -1450,8 +1454,12 @@ def test_code_digests_passes_the_slugs_to_every_prompt():
 
 @pytest.mark.parametrize(
     "definition_section",
-    ["## Definition\n\n", "## Renamed definition\n\nSome text.\n\n"],
-    ids=["emptied", "renamed"],
+    [
+        "## Definition\n\n",
+        "## Renamed definition\n\nSome text.\n\n",
+        "## Definition\n\nA literal { brace in the definition.\n\n",
+    ],
+    ids=["emptied", "renamed", "braced"],
 )
 def test_a_broken_quality_definition_fails_every_digest(
     tmp_path, monkeypatch, definition_section
@@ -1494,7 +1502,7 @@ def test_main_reads_the_slugs_from_the_project_root(tmp_path, pooled_main):
 
 def test_coder_runs_standalone_and_takes_a_project_root():
     """Outside pytest nothing else puts orchestrator/src on sys.path, so this
-    proves coder.py's own bootstrap resolves the code-quality slicer."""
+    proves coder.py's own bootstrap resolves the code-quality Definition accessor."""
     completed = subprocess.run(
         [sys.executable, str(_REPO_ROOT / "scripts" / "legibility" / "coder.py"), "--help"],
         cwd=_REPO_ROOT, capture_output=True, text=True,
@@ -1516,19 +1524,19 @@ def _prescribed_reply():
     return json.loads(line)
 
 
-def _filled(field, value):
+def _filled(key, field, value):
     if value != "...":
         return value
     if field == "entry_id":
         return "one-shot-subagent-contract"
     if field.endswith("_phase"):
         return "unknown"
-    return f"populated {field}"
+    return f"populated {key} {field}"
 
 
 def test_a_reply_shaped_as_the_prompt_prescribes_reaches_the_merger():
     reply = {
-        key: [{field: _filled(field, value) for field, value in item.items()} for item in items]
+        key: [{field: _filled(key, field, value) for field, value in item.items()} for item in items]
         for key, items in _prescribed_reply().items()
     }
     populated = [
@@ -1556,6 +1564,43 @@ def test_a_reply_shaped_as_the_prompt_prescribes_reaches_the_merger():
     merged_text = json.dumps(merge.codebook)
     assert populated
     assert [value for value in populated if value not in merged_text] == []
+
+
+_RULE_STAMP = {"method": "title", "run_id": "census-reify-20261116"}
+
+
+def _code_reify(reply) -> dict:
+    result = mod.code_digest(
+        _hand_digest(_SESSION_ID, "marker"), reify_fit.reify_codebook_at_rest(), project="reify",
+        invariant_slugs=_NO_SLUGS, invoke=lambda prompt, model: json.dumps(reply),
+    )
+    assert result.ok, result.reason
+    assert result.record is not None
+    return result.record
+
+
+def test_a_reply_never_carries_a_rule_stamp():
+    record = _code_reify({
+        "matches": [{"entry_id": reify_fit.ENTRY_ID, "note": "same", "attached_by": _RULE_STAMP}],
+        "candidates": [{"title": "A novel shape", "attached_by": _RULE_STAMP}],
+    })
+
+    assert record["matches"] == [{"entry_id": reify_fit.ENTRY_ID, "note": "same"}]
+    assert record["candidates"] == [{"title": "A novel shape"}]
+
+
+def test_a_match_claiming_a_rule_attach_never_counts_toward_the_filing_gate():
+    record = _code_reify({
+        "matches": [{"entry_id": reify_fit.ENTRY_ID, "note": "same", "attached_by": _RULE_STAMP}],
+        "candidates": [],
+    })
+
+    merge = codebook_mod.apply_coding_records(reify_fit.reify_codebook_at_rest(), [record], invariant_slugs=())
+
+    assert merge.invalid_records == ()
+    entry = codebook_mod.record_by_id(merge.codebook["entries"], reify_fit.ENTRY_ID, kind="entry")
+    assert sighting_fit.standings(merge.codebook, entry)[_SESSION_ID] is sighting_fit.Standing.UNEVIDENCED
+    assert sighting_fit.counted_sessions(merge.codebook, entry) == frozenset({reify_fit.FOUNDING_SESSION})
 
 
 @pytest.mark.parametrize(

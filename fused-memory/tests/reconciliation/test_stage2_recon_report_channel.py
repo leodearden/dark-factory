@@ -184,27 +184,27 @@ class TestFlagContentFingerprint:
 
     def test_content_key_returns_content_fingerprint(self):
         """(a) An item with a `content` key returns
-        flag_dedup._content_fingerprint(content)."""
-        from fused_memory.reconciliation.flag_dedup import _content_fingerprint
+        flag_identity.content_fingerprint(content)."""
+        from fused_memory.reconciliation.flag_identity import content_fingerprint
         from fused_memory.reconciliation.stages.task_knowledge_sync import (
             _flag_content_fingerprint,
         )
 
         text = 'live workflow recurrence counter needed for task 452'
 
-        assert _flag_content_fingerprint({'content': text}) == _content_fingerprint(text)
+        assert _flag_content_fingerprint({'content': text}) == content_fingerprint(text)
 
     def test_description_only_key_returns_fingerprint_of_description(self):
         """(b) An item with only a `description` key (no `content`) returns
         the fingerprint of that description."""
-        from fused_memory.reconciliation.flag_dedup import _content_fingerprint
+        from fused_memory.reconciliation.flag_identity import content_fingerprint
         from fused_memory.reconciliation.stages.task_knowledge_sync import (
             _flag_content_fingerprint,
         )
 
         text = 'systemic pattern: repeated live workflow recurrence for task 452'
 
-        assert _flag_content_fingerprint({'description': text}) == _content_fingerprint(text)
+        assert _flag_content_fingerprint({'description': text}) == content_fingerprint(text)
 
     @pytest.mark.parametrize(
         'item',
@@ -267,15 +267,15 @@ class TestFlagContentFingerprint:
     def test_non_string_content_is_coerced_not_raised(self):
         """Defensive: a truthy non-string value under `content` (e.g. an int
         accidentally placed there) must not raise AttributeError out of
-        _normalize_content_description's `.split()` call — it is coerced to
+        normalize_description's `.split()` call — it is coerced to
         `str` first, mirroring compute_content_fingerprint_signature's
         `str(ftype)` coercion pattern."""
-        from fused_memory.reconciliation.flag_dedup import _content_fingerprint
+        from fused_memory.reconciliation.flag_identity import content_fingerprint
         from fused_memory.reconciliation.stages.task_knowledge_sync import (
             _flag_content_fingerprint,
         )
 
-        assert _flag_content_fingerprint({'content': 452}) == _content_fingerprint('452')
+        assert _flag_content_fingerprint({'content': 452}) == content_fingerprint('452')
 
 
 # ---------------------------------------------------------------------------

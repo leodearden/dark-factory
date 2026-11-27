@@ -74,7 +74,7 @@ import logging
 from datetime import UTC, datetime
 from typing import Any
 
-from fused_memory.models.reconciliation import RunStatus, StageReport
+from fused_memory.models.reconciliation import StageReport
 
 # Imported, not re-declared. The one shape GATE for a memory id is
 # ``utils.validation.is_full_uuid`` (task 3132, INV-5), which
@@ -549,16 +549,6 @@ def _run_still_live_hint(
             'rewritten wholesale from a writer\'s own loaded copy at each stage '
             'end, so a journal-side repair would be silently clobbered.'
         )
-        if status_value == RunStatus.interrupted.value:
-            parts.append(
-                "An 'interrupted' run is RESUMABLE, not finished: the startup "
-                'adopt-and-resume pass re-claims exactly these runs '
-                "(get_interrupted_runs() is SELECT * FROM runs WHERE status = "
-                "'interrupted'), and the resumed cycle sets status = running IN "
-                "MEMORY ONLY — the row stays 'interrupted' on disk — while "
-                'rewriting stage_reports at each stage boundary. Retry once the '
-                'run reaches a terminal status.'
-            )
     if in_process:
         parts.append(
             f'run {target_run_id} holds at least one IN-PROGRESS stage entry in '

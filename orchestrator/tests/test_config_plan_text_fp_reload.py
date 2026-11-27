@@ -10,6 +10,8 @@ suite instead of a scoped subset.
 
 from __future__ import annotations
 
+import pytest
+
 from orchestrator.config import (
     RELOADABLE_FIELDS,
     OrchestratorConfig,
@@ -18,9 +20,8 @@ from orchestrator.config import (
 )
 
 
-def test_defaults_on(monkeypatch, tmp_path):
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+@pytest.mark.usefixtures("code_default_config")
+def test_defaults_on():
     assert OrchestratorConfig().plan_text_fp_gate_enabled is True
 
 
@@ -33,9 +34,8 @@ def test_skip_neighbours_stay_restart_only():
     assert 'max_revalidation_age_hours' not in RELOADABLE_FIELDS
 
 
-def test_edit_lands_in_applied_candidates_not_restart_required(monkeypatch, tmp_path):
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+@pytest.mark.usefixtures("code_default_config")
+def test_edit_lands_in_applied_candidates_not_restart_required():
     diff = diff_config(
         OrchestratorConfig(plan_text_fp_gate_enabled=True),
         OrchestratorConfig(plan_text_fp_gate_enabled=False),
@@ -44,9 +44,8 @@ def test_edit_lands_in_applied_candidates_not_restart_required(monkeypatch, tmp_
     assert 'plan_text_fp_gate_enabled' not in diff.restart_required
 
 
-def test_apply_reload_applies_in_place(monkeypatch, tmp_path):
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+@pytest.mark.usefixtures("code_default_config")
+def test_apply_reload_applies_in_place():
     live = OrchestratorConfig(plan_text_fp_gate_enabled=True)
     report = apply_reload(live, OrchestratorConfig(plan_text_fp_gate_enabled=False))
     assert report['reloaded'] is True

@@ -31,30 +31,22 @@ import dataclasses
 import os
 import signal
 import subprocess
-import sys
 import time
 import warnings
 from collections.abc import Callable, Mapping
 from pathlib import Path
 
 import pytest
-
-REPO_ROOT = Path(__file__).resolve().parents[2]
-# APPEND, never insert(0, ...): the repo root must stay LAST on sys.path or the
-# subproject directories (orchestrator/, shared/, ...) resolve as namespace
-# packages shadowing their own src/<pkg>/ — the failure the root conftest.py
-# docstring exists to prevent.
-if str(REPO_ROOT) not in sys.path:
-    sys.path.append(str(REPO_ROOT))
-
-from nested_pytest_session import (  # noqa: E402
+from nested_pytest_session import (
     NESTED_SESSION_TIMEOUT_SECS,
-    binding_conftest,
+    arming_conftest,
     run_nested_pytest,
 )
+from shared.testing_own_time import OwnTimeClock, wait_on_own_time
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
-import df_pytest_isolation  # noqa: E402
-from df_pytest_isolation import (  # noqa: E402
+import df_pytest_isolation
+from df_pytest_isolation import (
     DRAIN_SCRIPT_CMDLINE_MARKER,
     LEAK_SELF_TERMINATION_CEILING_SECS,
     LEAK_TOKEN_ENV,
@@ -69,9 +61,12 @@ from df_pytest_isolation import (  # noqa: E402
     read_leaked_pid,
     run_in_new_session,
     run_in_new_session_until,
+    run_in_new_session_while_progressing,
     wait_pid_gone,
     wait_proof_grace_secs,
 )
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 # NOT `from df_pytest_isolation import _df_no_leaked_drain_processes`. Importing
 # a FIXTURE into a test module binds it as a module-scoped fixture that SHADOWS
@@ -471,6 +466,178 @@ class TestRunInNewSessionUntil:
             assert wait_pid_gone(leaked_pid), (
                 f'pid {leaked_pid} is STILL ALIVE after the condition raised: an '
                 'exception escaping the poll loop left the process group running.'
+            )
+        finally:
+            _reap(leaked_pid)
+
+
+def _line_count(path: Path) -> Callable[[], int]:
+    """A progress probe: how many lines *path* holds, 0 while it is absent."""
+    def progress() -> int:
+        try:
+            return len(path.read_text().splitlines())
+        except OSError:
+            return 0
+    return progress
+
+
+# Enough reads of a still stall clock that the polls between them outlast a
+# 0.01s stall bound many times over on the wall clock.
+_STILL_CLOCK_READS_BEFORE_RELEASE = 10
+
+
+class TestRunInNewSessionWhileProgressing:
+    """The must-not-hang bound counts only time in which the child made no progress."""
+
+    def test_progress_re_arms_the_stall_bound(self, tmp_path: Path) -> None:
+        ticks = tmp_path / 'ticks'
+        env = dict(os.environ)
+        env['TICKS'] = str(ticks)
+        readings: list[float] = []
+
+        def recorded_own_time(pid: int) -> Callable[[], float]:
+            clock = OwnTimeClock(pid)
+
+            def read() -> float:
+                readings.append(clock())
+                return readings[-1]
+
+            return read
+
+        result = run_in_new_session_while_progressing(
+            ['bash', '-c', 'for i in 1 2 3 4 5 6 7 8; do echo x >> "$TICKS"; sleep 0.5; done; echo DONE'],
+            progress=_line_count(ticks), stall_timeout=3, env=env,
+            stall_clock=recorded_own_time,
+        )
+
+        assert isinstance(result, subprocess.CompletedProcess)
+        assert result.returncode == 0
+        assert result.stdout == 'DONE\n'
+        assert max(readings) >= 3, (
+            f'the child ran {max(readings):.1f}s of its own time, inside its own 3s '
+            'stall bound, so it never needed the bound re-armed and proves nothing '
+            'about progress.'
+        )
+
+    def test_a_stalled_child_is_stopped_with_its_whole_group(self, tmp_path: Path) -> None:
+        pidfile = tmp_path / 'leaked.pid'
+        leaker = _leaker_script(tmp_path)
+        leaked_pid = None
+        try:
+            with pytest.raises(subprocess.TimeoutExpired) as exc_info:
+                run_in_new_session_while_progressing(
+                    ['bash', str(leaker)], progress=_pid_recorded(pidfile),
+                    stall_timeout=2, env=_leaker_env(pidfile), stall_clock=OwnTimeClock,
+                )
+            leaked_pid = read_leaked_pid(pidfile)
+
+            assert exc_info.value.timeout == 2
+            stdout = exc_info.value.stdout
+            text = stdout.decode(errors='replace') if isinstance(stdout, bytes) else stdout
+            assert 'MAIN_UP' in (text or ''), (
+                f'partial stdout was lost on the stall path; got {text!r}'
+            )
+            assert wait_pid_gone(leaked_pid), (
+                f'pid {leaked_pid} is STILL ALIVE after the stall bound fired: the '
+                'stall path did not stop the whole process group.'
+            )
+        finally:
+            _reap(leaked_pid)
+
+    def test_a_raising_progress_probe_never_leaks_the_group(self, tmp_path: Path) -> None:
+        pidfile = tmp_path / 'leaked.pid'
+        leaker = _leaker_script(tmp_path)
+        pid_recorded = _pid_recorded(pidfile)
+
+        def progress() -> bool:
+            if pid_recorded():
+                raise RuntimeError('progress blew up')
+            return False
+
+        leaked_pid = None
+        try:
+            with pytest.raises(RuntimeError, match='progress blew up'):
+                run_in_new_session_while_progressing(
+                    ['bash', str(leaker)], progress=progress,
+                    stall_timeout=60, env=_leaker_env(pidfile), stall_clock=OwnTimeClock,
+                )
+            leaked_pid = read_leaked_pid(pidfile)
+
+            assert wait_pid_gone(leaked_pid), (
+                f'pid {leaked_pid} is STILL ALIVE after the progress probe raised: '
+                'an exception escaping the poll loop left the process group running.'
+            )
+        finally:
+            _reap(leaked_pid)
+
+    def test_a_normal_exit_is_a_completed_process(self) -> None:
+        result = run_in_new_session_while_progressing(
+            ['bash', '-c', 'echo hi; echo boom >&2; exit 3'],
+            progress=lambda: 0, stall_timeout=30, stall_clock=OwnTimeClock,
+        )
+
+        assert isinstance(result, subprocess.CompletedProcess)
+        assert result.returncode == 3
+        assert result.stdout == 'hi\n'
+        assert result.stderr == 'boom\n'
+
+    def test_the_stall_is_read_on_the_clock_made_for_the_spawned_child(
+        self, tmp_path: Path,
+    ) -> None:
+        """The injected clock never moves, and releases the child only on its
+        _STILL_CLOCK_READS_BEFORE_RELEASE-th read. The polls before that already
+        outlast the stall bound on the wall clock, so the child exits on its own
+        only if the bound is read on the injected clock alone. The child prints
+        its pid, which must be the one pid the clock was made for."""
+        go = tmp_path / 'go'
+        env = dict(os.environ)
+        env['GO'] = str(go)
+        clocked_pids: list[int] = []
+
+        def stall_clock(pid: int) -> Callable[[], float]:
+            clocked_pids.append(pid)
+            reads = 0
+
+            def still_clock() -> float:
+                nonlocal reads
+                reads += 1
+                if reads == _STILL_CLOCK_READS_BEFORE_RELEASE:
+                    go.touch()
+                return 0.0
+
+            return still_clock
+
+        result = run_in_new_session_while_progressing(
+            ['bash', '-c', 'echo $$; until [ -e "$GO" ]; do sleep 0.05; done; echo DONE'],
+            progress=lambda: 0, stall_timeout=0.01, env=env, stall_clock=stall_clock,
+        )
+
+        assert isinstance(result, subprocess.CompletedProcess)
+        assert len(clocked_pids) == 1, clocked_pids
+        assert result.returncode == 0
+        assert result.stdout == f'{clocked_pids[0]}\nDONE\n'
+
+    def test_a_raising_stall_clock_never_leaks_the_group(self, tmp_path: Path) -> None:
+        pidfile = tmp_path / 'leaked.pid'
+        leaker = _leaker_script(tmp_path)
+
+        def stall_clock(pid: int) -> Callable[[], float]:
+            wait_on_own_time(pid, _pid_recorded(pidfile), budget=10)
+            raise RuntimeError('stall clock blew up')
+
+        leaked_pid = None
+        try:
+            with pytest.raises(RuntimeError, match='stall clock blew up'):
+                run_in_new_session_while_progressing(
+                    ['bash', str(leaker)], progress=_pid_recorded(pidfile),
+                    stall_timeout=60, env=_leaker_env(pidfile), stall_clock=stall_clock,
+                )
+            leaked_pid = read_leaked_pid(pidfile)
+
+            assert wait_pid_gone(leaked_pid), (
+                f'pid {leaked_pid} is STILL ALIVE after the stall clock raised: '
+                'making the clock outside the guarded region left the process '
+                'group running.'
             )
         finally:
             _reap(leaked_pid)
@@ -981,21 +1148,21 @@ class TestGuardIsLiveInThisRun:
         assert marker.autouse is True, 'the guard must be autouse — nothing requests it'
 
     def test_the_guard_fixture_is_registered_in_this_run(self, request) -> None:
-        """The conftest binding is real WIRING, not a dormant definition.
+        """The conftest's arm call is real WIRING, not a dormant definition.
 
-        pytest only collects fixtures bound into a conftest's namespace, which
-        is why df_pytest_isolation's fixtures are imported there under
-        ``# noqa: F401 — the binding IS the wiring``. Deleting that import
-        breaks nothing visible except this assertion.
+        pytest only collects fixtures a plugin or conftest registers, which is
+        why each test-root conftest calls ``arm_leaked_drain_process_guard(config)`` from its
+        ``pytest_configure``. Deleting that call breaks nothing visible except
+        this assertion.
         """
         try:
             request.getfixturevalue(_GUARD_NAME)
         except pytest.FixtureLookupError:
             pytest.fail(
-                f'{_GUARD_NAME} is not registered for this rootdir. Wire the '
-                'test-root conftest to import it from df_pytest_isolation '
-                '(`# noqa: F401 — the binding IS the wiring`); without that, '
-                'this whole suite runs with no leaked-drain-process guard.',
+                f'{_GUARD_NAME} is not registered for this rootdir. Call '
+                'arm_leaked_drain_process_guard(config) from the test-root '
+                'conftest\'s pytest_configure; without that, this whole suite runs '
+                'with no leaked-drain-process guard.',
                 pytrace=False,
             )
 
@@ -1129,7 +1296,7 @@ def _nested_run(
     leaking test spawns.
     """
     return run_nested_pytest(root, {
-        'conftest.py': binding_conftest(_GUARD_NAME),
+        'conftest.py': arming_conftest(_GUARD_NAME),
         _LEAKER_NAME: _NESTED_LEAKER,
         'test_forgetful.py': _nested_test_source(leaks=leaks, entrypoint=entrypoint),
         **(extra_files or {}),
@@ -1248,3 +1415,77 @@ class TestTheGuardFailsTheRunEndToEnd:
             f'stdout={result.stdout!r} stderr={result.stderr!r}'
         )
         assert 'LEAKED' not in result.stdout
+
+
+def _arming_conftest() -> str:
+    """Source for a nested conftest, one directory below the root, that arms the guard.
+
+    It reaches the guard through :func:`df_pytest_isolation.arm_leaked_drain_process_guard`
+    from ``pytest_configure``, the way the subproject conftests do, and binds no
+    fixture by import.
+    """
+    return (
+        'import sys\n'
+        'from pathlib import Path\n'
+        '\n'
+        'sys.path.insert(0, str(Path(__file__).resolve().parents[1]))\n'
+        '\n'
+        'from df_pytest_isolation import arm_leaked_drain_process_guard\n'
+        '\n'
+        '\n'
+        'def pytest_configure(config):\n'
+        '    arm_leaked_drain_process_guard(config)\n'
+    )
+
+
+def _armed_suite(suite: str, *, leaks: bool) -> dict[str, str]:
+    """One test root, *suite*, armed by :func:`_arming_conftest`.
+
+    *suite* must not start with ``test``: pytest loads such a directory's
+    conftest with the initial conftests, and this tree exists to have it
+    discovered mid-collection instead.  It also names the test module, since
+    two suites' modules may not share a basename.
+    """
+    return {
+        f'{suite}/conftest.py': _arming_conftest(),
+        f'{suite}/{_LEAKER_NAME}': _NESTED_LEAKER,
+        f'{suite}/test_forgetful_{suite}.py': _nested_test_source(leaks=leaks),
+    }
+
+
+class TestArmLeakedDrainProcessGuard:
+    """The subproject conftests' wiring arms the guard with no conftest binding.
+
+    A suite named on the command line loads its conftest before configure, as a
+    subproject's own ``pytest tests/`` does. A tree collected whole from the
+    nested root discovers it mid-collection instead, where ``pytest_plugins``
+    is refused.
+    """
+
+    @pytest.mark.parametrize(
+        'targets', [('suite_a',), ()], ids=['loaded-at-startup', 'found-mid-collection'],
+    )
+    def test_a_leak_under_an_armed_suite_fails_the_run(
+        self, tmp_path: Path, targets: tuple[str, ...],
+    ) -> None:
+        root = tmp_path / 'armed'
+        pidfile = root / 'suite_a' / _LEAKED_PIDFILE_NAME
+        try:
+            result = run_nested_pytest(
+                root, _armed_suite('suite_a', leaks=True), targets=targets,
+            )
+            _assert_the_leak_failed_the_run(result, pidfile)
+        finally:
+            _reap_leaker(_read_pid_file(pidfile))
+
+    def test_two_suites_arming_in_one_session_run_clean(self, tmp_path: Path) -> None:
+        """Arming twice is a no-op, not pytest's duplicate-plugin error."""
+        result = run_nested_pytest(tmp_path / 'two-roots', {
+            **_armed_suite('suite_a', leaks=False),
+            **_armed_suite('suite_b', leaks=False),
+        })
+
+        assert result.returncode == 0, (
+            f'stdout={result.stdout!r} stderr={result.stderr!r}'
+        )
+        assert '2 passed' in result.stdout, result.stdout

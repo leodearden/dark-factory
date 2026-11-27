@@ -92,6 +92,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
+from fused_memory.canonical_marker import is_canonical
 from fused_memory.models.enums import SourceStore
 
 if TYPE_CHECKING:
@@ -117,11 +118,10 @@ _MAX_ANCHOR_TOPICS = 3
 _ANCHOR_SCROLL_LIMIT = 25
 
 #: The two ``KIND_REGISTRY`` members that attach to a parent (task 3195).
-#: DELIBERATELY restated rather than imported from ``server/grouped_read.py``:
-#: that module imports ``_MEM0_CONTENT_KEYS`` from ``services/memory_service.py``,
-#: which imports this module, so a ``services -> server`` import here would close
-#: an import cycle.  ``test_child_kinds_matches_the_grouped_read_registry`` pins
-#: the two copies equal so the duplication cannot drift silently (INV-5).
+#: Restated rather than imported from ``server/grouped_read.py`` until task 6720
+#: moves the child rule into ``memory_metadata.py`` and deletes this copy.
+#: ``test_child_kinds_matches_the_grouped_read_registry`` pins the two copies
+#: equal so the duplication cannot drift silently (INV-5).
 _CHILD_KINDS = frozenset({'amendment', 'sighting'})
 
 #: Sorts ahead of every real ISO-8601 timestamp, so a payload with a missing or
@@ -232,11 +232,9 @@ def select_canonical_payload(
 
     1. drop payloads outside *allowed_categories* (when it is not ``None``),
        planned payloads (unless *include_planned*), and child-shaped payloads;
-    2. keep only STRICTLY canonical survivors — ``meta.get('canonical') is True``,
-       an IDENTITY check, never truthiness.  ``1 == True`` in Python, so
-       truthiness would admit an int as canonical; the identity check mirrors
-       the write-side uniqueness predicate at ``memory_service.py:940`` so the
-       read path and the write path agree on what "canonical" means;
+    2. keep only STRICTLY canonical survivors, read through
+       ``fused_memory/canonical_marker.py::is_canonical`` — an identity check,
+       never truthiness, which is why an int ``1`` is not canonical;
     3. apply the deterministic tie-break.
 
     Filtering BEFORE selecting is what makes *allowed_categories* a narrowing:
@@ -291,7 +289,7 @@ def select_canonical_payload(
             continue
         if _is_child_shaped(meta):
             continue
-        if meta.get('canonical') is not True:
+        if not is_canonical(meta):
             continue
         survivors.append(payload)
 

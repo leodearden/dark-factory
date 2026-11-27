@@ -515,9 +515,31 @@ R5).
   would put two axes of variability in one field (heuristic 3) and touch every Datum call
   site.
 - **Rendering.** `shell.jsx::DatumReading` and `Pip` gain an optional `rule` prop. Their
-  `title` is the non-fresh `reason` when there is one, otherwise the rule. Figures inside a
-  view render through one small component that takes the parent Datum, so `≥`, staleness and
-  em-dash-for-unknown apply uniformly (one-datum decision 7).
+  `title` is the non-fresh `reason` when there is one, otherwise the rule.
+- **A block's provenance is read once, by its head.** `PRD_VIEW` and `PRD_CONTENTION` are each
+  one served Datum, and each is read once per block, not once per figure. `prd_lanes.jsx`
+  renders one shell `Pip` at the head of the lanes page (`ProjectPrdLanes`) and one at the head
+  of the contention line (`PrdContentionLine`), each taking its block's Datum and its served
+  rule. That `Pip` alone carries `≥` for a lower-bound Datum, the age, and the non-fresh
+  `reason` (one-datum decision 7). Every figure inside a block titled with its own single
+  rule is a plain `ViewFigure` span, not a `Pip`. Its `title` is its served rule, preceded by
+  the row detail where the row has one (`prd_lanes_view.js::figureTitle`), whatever the
+  Datum's state. These are the lane headers; the row's PRD title, state line, `done/total`,
+  signal, ready and next-action cells; the expanded row's activity line; the dark-matter
+  summary and hidden-high line; the footer's closed, signal-coverage and `multi_link` counts;
+  and the contention entries, held-share and never-started figures. A few figures take their
+  rule from a container's `title`, not from their own: the segment legend (`rules.segments`)
+  and the expanded row's blocker, ready-high and deferred chips (`rules.detail`). The
+  contention meta line is the one figure carrying two rules: a plain span, not a
+  `ViewFigure`, titled with `rules.lock_depth` and `rules.snapshot_at` together. Two kinds
+  of figure are titled with something other than a rule: the bar's segments carry their label
+  and count, and the footer's input pips (`prd_lanes.jsx::PrdInputPip`) carry each input's
+  own state and reason (§4.11). Neither is the Datum's reading. No inner figure carries the
+  *Datum's* provenance: its `≥`, age and `reason` appear only on the head `Pip`. A served
+  value may itself be a bound or an age. The ready cell's `≥` comes from the served
+  `oldest_is_lower_bound`, and the contention meta line's "scheduler state changed …" renders
+  the served `snapshot_at`. These are values, not the Datum's provenance. A Datum that is
+  `unknown` renders its `reason` in place of its block, so no figure inside it renders.
 - **Test.** A test asserts every `FigureId` has a non-empty rule and every figure in a shaped
   payload names one.
 
@@ -620,8 +642,9 @@ sidecar_path(prd_key: str) -> str          # 'plans/x-prd.md' -> 'plans/x-prd.ca
 - **Stamper.** `manifest_stamping.py::_stamp_capability_manifests_impl` uses `sidecar_path`
   and preserves `signal_leaves` across a stamp.
 - **Drift audit.** `scripts/audit_manifest_descriptor_drift.py` reports a signal label whose
-  bound task is missing or whose PRD field disagrees with the sidecar's `prd`. It reports only,
-  like the rest of that audit.
+  bound task is missing, or whose own PRD field, read by `prd_attribution.coalesce_prd` and
+  `normalise_prd_key` (§5.4) exactly as §4.7's cross-check reads it, does not name the
+  sidecar's `prd`. It reports only, like the rest of that audit.
 
 ### 5.3 Lineage datum (γ1, `data/task_lineage.py`)
 
@@ -747,7 +770,7 @@ a fixture runs.db, fixture sidecars or a fixture corpus. No test patches a priva
 | 17 | Parked [γ2] | all-deferred PRD with valid caller-kind records; one with an unrecorded deferral; one all-`planning`; a `held_by_session` record with a live holder (a real spawned process) and one with a dead holder; a pending member with an unfired milestone and one with a fired milestone | first parked; second stuck with "1 deferred with no recorded reason" and `record_deferral`; all-planning not parked ("planning births not yet committed"); live holder held, dead holder not; unfired milestone held, fired not |
 | 18 | Stuck line and age [γ2] | ready members with backfilled and real anchors | `oldest_pending_days` from the oldest; `oldest_is_lower_bound` true for a backfilled anchor; `dispatch` names it |
 | 19 | Contention [γ2] | scheduler state fixture with `lock_depth`, holders (one `pending` holder), a wanted key with no holder, a file `snapshot_at`; runs.db with/without `task_started` | top keys counted once per task; holder status from the status map; served `snapshot_at` is the file's, not the cache fill time; `never_started` from `task_started` only; scheduler offline → `PRD_CONTENTION` unknown, `PRD_VIEW` unaffected; the Scheduler tab's payload is unchanged (it now reads the same access datum) |
-| 20 | Render [δ] | boundary payload fixture family `prd_view` | five sections in display order, Tail collapsed with count and names; each row's bar has six titled segments and a legend; hover titles equal the served rules; an `unknown` view renders its reason and the list mode still works; `prd_grouping.js` is gone and `classic_script_scope` agrees |
+| 20 | Render [δ] | boundary payload fixture family `prd_view` | five sections in display order, Tail collapsed with count and names; each row's bar has six titled segments and a legend; each rule-titled figure's hover title ends with its served rule, after the row detail where there is one (§4.10); an `unknown` view renders its reason and the list mode still works; `prd_grouping.js` is gone and `classic_script_scope` agrees |
 | 21 | Mode default [δ] | no persisted preference / persisted `list` | by-PRD / list |
 
 ## 7. Pre-conditions (G3): substrate verified on `99ad2d7ddb`

@@ -14,21 +14,18 @@ consult those docs yourself rather than re-deriving what they cover.
 Package dirs follow a `<pkg>/src/<pkg>/` double-nesting convention:
 `orchestrator/src/orchestrator/`, `fused-memory/src/fused_memory/`,
 `escalation/src/escalation/`, `shared/src/shared/`. `skills/` is the
-**in-repo** skill source (distinct from `~/.claude/skills`). Other
-top-level dirs: `dashboard/` — web UI for task/escalation state;
-`scripts/` — operator and CI helper scripts; `hooks/` — git hooks
-(pre-commit, pre-merge-commit); `plans/` — design docs and PRDs for
-in-flight/past work; `docs/` — reference docs (see `docs/legibility/` for
-the confusion codebook).
+**in-repo** skill source (distinct from `~/.claude/skills`).
 
 Every project targeted by Dark Factory — this repo included — must expose
 its top-level orchestrator config at
 `<project_root>/dark-factory-orchestrator.yaml`. That is the canonical,
 required filename: it's what the dashboard's escalation-URL discovery
-(`_discover_escalation_urls`) keys on. Legacy spellings (`orchestrator.yaml`,
-`orchestrator-config.yaml`, `orchestrator/config.yaml`) are honored only as
-a discovery fallback for not-yet-migrated projects, not a supported choice
-for new ones.
+(`_discover_escalation_urls`) keys on. Discovery reads no other name (task
+7138 retired the legacy spellings `orchestrator.yaml`,
+`orchestrator-config.yaml` and `orchestrator/config.yaml`). A project still
+using one keeps its dashboard row and its tasks still show, but until renamed
+its escalation-backed views (escalations, merge queue and halt status, task
+runtime state) go dark and its burndown run-slot capacity reads as unknown.
 
 This repo uses `ruff check` only; `ruff format` is deliberately NOT adopted
 and most files are not format-clean. Do not file or perform
@@ -76,7 +73,7 @@ the contract §11 human-gate task.
 cd fused-memory/docker && docker-compose up -d
 
 # Python environment
-cd fused-memory && uv sync
+uv sync --all-packages    # from the repo root
 
 # Required env vars (inherit from shell):
 # OPENAI_API_KEY  (for embeddings; ANTHROPIC_API_KEY is NOT needed — agents use OAuth)
@@ -84,17 +81,28 @@ cd fused-memory && uv sync
 
 Full fresh-machine walkthrough: `SETUP.md`.
 
+Production FalkorDB (`docker-falkordb-1`, `:6379`) takes no experiments,
+clones or index work, and ad-hoc access to it is `redis-cli` reads only. The
+rule, and the stopword IN-list crash it guards against, are in `OPERATIONS.md`
+§"FalkorDB settings and the recreate gate" → "Experiments never touch
+production FalkorDB".
+
 ### Locating installed code
 
 The uv workspace has ONE root `.venv` per tree — `<project_root>/.venv` (CPython
-3.13.9, uv 0.11.6 in the main checkout). None of the seven workspace members
+3.13.9, uv 0.11.6 in the main checkout). No workspace member
 carries its own. A task worktree gets an INDEPENDENT root `.venv`, not a share
 of main's, once it has been cold-verified — `verify_cold_preprovision_command`
 (`uv sync --all-packages && npm ci …`) runs *inside* the worktree, and such a
 venv can even be a different interpreter (measured: several `.worktrees/*/.venv` are CPython
-3.14.0 against main's 3.13.9). Before that it has no `.venv` at all. Meanwhile
-an agent Bash session typically inherits `VIRTUAL_ENV` and a bare `python` from
-the MAIN checkout's `.venv` even when cwd is a worktree.
+3.14.0 against main's 3.13.9). Before that it has no `.venv` at all. A
+dispatched agent's shell has no venv: every agent spawn path drops
+`VIRTUAL_ENV`, uv's project vars and the venv's `bin` from `PATH`
+(`shared/src/shared/python_env.py::without_python_env_selection`, which Claude
+spawns reach via `shared/src/shared/secret_env.py::agent_subprocess_env`).
+There a bare `python` is the system interpreter (3.12 on this host), so name
+the checkout's own `.venv/bin/python` instead in the recipes below. An interactive session keeps its launching
+shell's env, often main's `VIRTUAL_ENV` even in a worktree.
 
 So the venv path is **not derivable from your cwd**. Ask the interpreter; never
 guess a path.
@@ -117,19 +125,16 @@ but raising it is the wrong fix: the scoped query above is ~300x faster.
 
 Third-party packages resolve under `<venv>/lib/python3.X/site-packages/`.
 First-party workspace members do NOT: they are installed **editable**, so they
-resolve into a checkout's `src/` tree instead. WHICH checkout is the question
-that matters — from a worktree shell that inherited main's `VIRTUAL_ENV`,
-`import <member>` hands you MAIN's source, not the code you just edited in your
-worktree. That inheritance is real for **your own Bash session and only there**
-— the orchestrator hands an agent subprocess a plain copy of its own environment
-(`orchestrator/src/orchestrator/agents/invoke.py`), `VIRTUAL_ENV` included. It is
-NOT how verify runs: every verify command is spawned through
-`orchestrator/src/orchestrator/verify.py::_target_subprocess_env`, which strips
-`VIRTUAL_ENV` and drops the venv's `bin` from `PATH` so the target resolves its
-OWN `.venv`. So a hand-run import in your shell can disagree with verify — when
-it does, verify is the one reading your worktree. That asymmetry is the mechanism
-behind the `OPERATIONS.md` Troubleshooting row for an agent reporting an
-`AttributeError` in its own shell for code it just wrote.
+resolve into a checkout's `src/` tree instead. WHICH checkout matters — main's
+interpreter hands you MAIN's source, not your worktree's edits: from an
+interactive shell that inherited main's `VIRTUAL_ENV`, or from a dispatched
+agent naming main's `.venv/bin/python` because its worktree has no `.venv` yet.
+Verify applies the same scrub through
+`orchestrator/src/orchestrator/verify.py::_target_subprocess_env`, so a
+hand-run import can disagree with verify — when it does, verify is the one
+reading your worktree. That asymmetry is the mechanism behind the
+`OPERATIONS.md` Troubleshooting row for an agent reporting an `AttributeError`
+in its own shell for code it just wrote.
 
 <!-- import-provenance-check:begin
      Also EXECUTED verbatim by
@@ -152,6 +157,35 @@ printing every copy. `Glob` passes `--no-ignore` and fails the same way;
 `Grep` honours `.gitignore`. Ask git's index instead:
 `git ls-files -- '*<name>'`, adding `--others --exclude-standard` for untracked
 files. Inside a task worktree both walks are fine.
+
+### Locating a session transcript
+
+A session id is enough to find its transcript, so **never `find /` for one**:
+two census-verifier sessions on 2026-08-16 scanned the whole filesystem for a
+session id and outran the Bash tool's 2-minute default `timeout`, though both
+transcripts were in the archive. Dispatched agents' sessions are archived at
+the MAIN checkout (`data/` is untracked, so no worktree has one) as
+`data/orchestrator/agent-transcripts/<task_id>/<encoded-cwd>/<session-id>.jsonl`,
+subagents under `<session-id>/subagents/`; the first component can be a run key
+such as `recon-<run_id>`. The files are plain `.jsonl` since task 3618, so the
+`.jsonl.gz` in `plans/agent-transcript-archival-prd.md` is historical. A
+session is archived when its invocation ends; until then it is in its
+worktree's `.task/claude-config-<task_id>/projects/`. Interactive sessions are
+never archived and stay at `~/.claude/projects/<encoded-cwd>/<session-id>.jsonl`.
+The layout's one home is `shared/src/shared/transcript_archive.py::durable_archive_path`.
+
+<!-- session-transcript-lookup:begin
+     EXECUTED by tests/scripts/test_session_transcript_lookup_convention.py from a
+     linked worktree, against an archive the real writer built. Turn it into a
+     hand-written glob or `find` and that guard goes red. -->
+- **Session transcript**: `python3 scripts/locate_session_transcript.py <session-id>`
+<!-- session-transcript-lookup:end -->
+
+It prints every match, one path per line; on a miss it exits 1, naming each
+root it searched. It takes full ids only. Another project's sessions are in
+that project's own archive (`--project-root <root>`). It searches only the
+archive and `~/.claude/projects`, so it misses a session still in flight in a
+worktree's `.task/` config or one run under another `CLAUDE_CONFIG_DIR`.
 
 ### Anchoring ad-hoc paths
 
@@ -225,10 +259,20 @@ measured 2026-09-27 (CLI 2.1.283), `Grep` answered "Path does not exist:
 orchestrator/src/orchestrator. Note: your current working directory is
 .../orchestrator/src".
 
+Leave a directory before you delete it. In an interactive session, a shell
+that `cd`'d into a scratch worktree or a `mktemp -d` dir and then removed it is
+stranded: the next call is refused unrun ("Working directory ... no longer
+exists, so this command was not run"), even one that opens with an absolute
+`cd`. Neither `cd ..` from a subdirectory of the removed tree nor the anchor
+above gets you out of a scratch worktree: both leave the shell inside it. Do the
+entered work in a subshell, `( cd "$D" && ... )`, or pass the directory
+instead (`git -C`, `uv run --directory`). The full rule's single home is
+`orchestrator/src/orchestrator/agents/bash_cwd_guidance.py::DELETED_CWD_GUIDANCE`.
+
 ## Memory Usage
 
 ### When to read memory
-- **Session start** — search for project context, recent decisions, active conventions
+- **Session start** — build the briefing in `/memory` → "Context Briefing" (`.claude/commands/memory.md`): the conventions of the area you will work in, and the context of your task.
 - **Encountering unfamiliar entities** — `get_entity` to understand relationships
 - **Before architectural decisions** — search for prior decisions and rationale
 - **Tasks with memory_hints** — only if you can actually see them. `metadata.memory_hints`
@@ -248,27 +292,14 @@ orchestrator/src/orchestrator. Note: your current working directory is
 
 ### Write operations
 
-| Operation | Cost | When to use |
-|-----------|------|-------------|
-| `add_memory` | 0-3 LLM calls | Discrete, distilled facts — **prefer this** |
-| `add_episode` | 5-15 LLM calls | Raw content needing extraction — use sparingly |
+Prefer `add_memory` (0-3 LLM calls) over `add_episode` (5-15); category
+routing is in the fused-memory server instructions.
 
 ```
 add_memory(content="Task 3127 moved retries into the caller because they hid latency",
            category="decisions_and_rationale", project_id="dark_factory",
            agent_id="claude-interactive", entities=[{'kind': 'task', 'id': 3127}])
 ```
-
-### Category routing
-
-| Category | Primary Store | Use for |
-|----------|--------------|---------|
-| `entities_and_relations` | Graphiti | Facts about things and connections |
-| `temporal_facts` | Graphiti | State that changes over time |
-| `decisions_and_rationale` | Graphiti | Choices made and why |
-| `preferences_and_norms` | Mem0 | Conventions, style rules |
-| `procedural_knowledge` | Mem0 | Workflows, how-to steps |
-| `observations_and_summaries` | Mem0 | High-level takeaways, session recaps |
 
 ## Write-Tagging Convention
 
@@ -332,6 +363,25 @@ type and the Python type its values arrive as, and refuses loudly rather than
 reporting an empty schema. It states no column names of its own, deliberately:
 the store is the only copy of them that cannot be stale.
 
+The reconciliation TICKET store, which holds the `tkt_…` ids `submit_task`
+returns, is a second store with the same two traps. WHERE it is: one
+fused-memory server serves every project on this host, so ONE ticket store
+serves them all, in that server's reconciliation data dir:
+`/home/leo/src/dark-factory/data/reconciliation/tickets.db`. `data/` is
+untracked, so no worktree has one, and `fused-memory/data/tickets.db` is a
+0-byte decoy. The location's one home is
+`fused-memory/src/fused_memory/server/main.py::resolve_data_dir`
+(`reconciliation.data_dir` in `fused-memory/config/config.yaml`, overridable by
+`RECONCILIATION_DATA_DIR`). WHAT SHAPE it is: its key is not a task store's
+`id`, and the same tool answers with `--db`.
+
+<!-- tickets-db-schema-lookup:begin
+     EXECUTED by tests/scripts/test_tasks_db_schema_convention.py, with the
+     store swapped for a fixture. Degrade it into a hand-written sqlite query
+     and that guard goes red. -->
+- **Ticket store shape**: `python scripts/tasks_db_schema.py --db /home/leo/src/dark-factory/data/reconciliation/tickets.db`
+<!-- tickets-db-schema-lookup:end -->
+
 ## Model Routing
 
 The orchestrator resolves `(model, effort, budget_usd, max_turns)` for
@@ -350,8 +400,8 @@ the task-author pin is in `docs/task-authoring.md`.
 ## Session Lifecycle
 
 ### Starting a session
-1. Search memory for project context: `search(query="project overview and current status", project_id="dark_factory")`
-2. Check task tree: `get_tasks(project_root="/home/leo/src/dark-factory")`
+1. Build the context briefing in `/memory` → "Context Briefing" (`.claude/commands/memory.md`). Its query phrasing has one home, `shared/src/shared/briefing_queries.py`; this file does not restate it. There is no project-overview search: for orientation read the documents that section's "Two queries are absent on purpose" paragraph names.
+2. Read task state narrowly, as item 3 of that section says. Never call `get_tasks` without `statuses` and `fields`.
 3. If working on a specific task, read it with `get_task` — and if it carries
    `memory_hints`, execute the hint queries. This works in an **interactive** session;
    an orchestrator-dispatched task agent holds no `get_task` and cannot do it (see
@@ -374,13 +424,7 @@ Use `/memory` for detailed guidance on writing effective memories.
 `mcp__escalation__reload_config` hot-applies an
 `dark-factory-orchestrator.yaml` edit to a **running** orchestrator
 without a restart (it always re-reads that process's own
-`ORCH_CONFIG_PATH`, never another project's). Green tier (hot-reloadable)
-covers per-role models/budgets/max_turns/effort/timeouts/backends,
-`routing.*`, steward grace, scheduler + watcher tuning, `review.*`,
-`unblock_auto.*`, `verify_env`, and `git.offline_lane_*` leaves; red tier
-(restart-only) covers `max_concurrent_tasks`, pool sizes, escalation
-host/port, `sandbox.backend`, `project_root`, merge-lane `git.*`
-structural fields, and `usage_cap.*`. **Reloaded ≠ everything took
+`ORCH_CONFIG_PATH`, never another project's). **Reloaded ≠ everything took
 effect** — always read the returned `applied` / `restart_required`
 dispositions, not just the top-level `reloaded` flag. Full tier lists and
 workflow: **`OPERATIONS.md` §"Config reload vs restart"** and
@@ -391,35 +435,17 @@ workflow: **`OPERATIONS.md` §"Config reload vs restart"** and
 Three deliberately orthogonal restart mechanisms act on the fleet:
 watchdog **liveness** probes (revive a wedged unit immediately, no clock),
 the watchdog **staleness** backstop and the merge-landed **coordinator**
-(both invoke `scripts/restart-all-orchestrators.sh` and read one 8h
-fleet-deploy clock). Don't conflate them when debugging a
+(both invoke `scripts/restart-all-orchestrators.sh` and read one 72h
+fleet-deploy clock; the long window is deliberate, amortizing the throughput
+cost of deploys, and deliberate deploy tasks are allowed for high-value
+changes). Don't conflate them when debugging a
 restart, and run `scripts/orchestrator-watchdog.py --report` (strictly
 read-only) before manually restarting anything. Full model, `--report`
 column reference, and the soak signal to watch:
 **`OPERATIONS.md` §"Fleet redeploy & watchdog"**.
 
-Two things that section used to claim, and that measurement disproved on
-2026-08-24/25: only the **staleness** tier passes `--drain` (historical: the
-coordinator passed no arguments then; since task **5371** both tiers pass it),
-and the two tiers **can** both redeploy inside one 8h window — the clock is stamped only
-when a sweep completes, so a long sweep leaves it reading the previous deploy
-throughout. Tasks **4754** and **4755** have since closed this: a sweep now
-holds an in-flight lease that the backstop, the coordinator and (for its
-`current_unit` only) the liveness probe all honor. Two residuals remain — a
-sweep overrunning `orchestrator_restart_lease_max_age_secs` loses the lease
-and degrades to the old collision, and the fused-memory tier has no lease at
-all — so read `--report`'s `FLEET-LEASE:` line rather than assuming.
-
-`--drain` (task 5371, per unit since task 7297) is a two-stage drain: Stage A
-halts a unit's merge admission when the sweep reaches it; Stage B restarts it
-once none of its merge verifies is in flight, bounded by each verify's own
-timeout, a per-unit `ORCH_DRAIN_VERIFY_MAX_WAIT_SECS`, and a sweep-wide
-ceiling `ORCH_DRAIN_SWEEP_VERIFY_MAX_WAIT_SECS` counted from sweep start; past
-the ceiling every unit still gets its request and is restarted at its first
-acknowledged poll. How the ceiling fits under the lease is derived at
-`scripts/restart-all-orchestrators.sh::DRAIN_SWEEP_VERIFY_MAX_WAIT_SECS`.
-Pre-5371 units and refused requests keep the old 600s merge-idle gate. The
-first sweep after a deploy of that code still meets old-code units. Detail:
+Restart sweeps hold a lease, with known residuals: read `--report`'s
+`FLEET-LEASE:` line rather than assuming. `--drain` mechanics:
 `OPERATIONS.md` §"Reading a drain".
 
 ## Working in the main checkout
@@ -431,9 +457,15 @@ directly, not just interactive agents.
 - For a direct-to-main commit under contention, use `git commit --only <path>`
   (not a bare `git commit`) so you don't sweep up unrelated staged/dirty state
   from a concurrent process.
-- `pre-commit` runs pyright **only for packages with staged `.py` changes**
-  (`hooks/project-checks`, task 2551): a docs-only commit prints
-  `pyright skipped (no Python changes)` and is quick. When a commit does stage
+- `pre-commit` runs the merge gate's module checks **only for modules with
+  staged `.py` changes**, plus `root:type` for a staged repo-root `.py`
+  (`hooks/project-checks` via
+  `scripts/hook_module_checks.py`, task 8531). A commit mapping to none prints
+  `merge-gate checks skipped (...)` and is quick. A docs-only commit runs the
+  `scripts/merge_screen.yaml` screen instead (about 10 s warm) when it stages
+  anything under `plans/`, `docs/` or `review/`, or a `*.yaml`/`*.json`/`*.md`
+  outside a workspace package, root-level docs such as this file included;
+  other docs-only commits skip the merge-gate checks. When a commit does stage
   Python, pass `timeout: 300000` (or higher) to `Bash`, or run detached via
   `setsid` and poll, rather than letting the default timeout kill it mid-hook.
 - `git commit --only` holds `.git/index.lock` for that **entire** hook run,
@@ -467,17 +499,32 @@ directly, not just interactive agents.
   by an unrelated process, and a `stash pop` on a clean tree can apply another
   task's WIP into yours. Park WIP as commits on a branch instead.
 
+## Killing processes on this host
+
+- **Never** kill by a bare program or script name. `pkill -f PATTERN` and
+  `kill $(pgrep -f PATTERN)` match the full command line of **every** process
+  on this shared host: every project's merge verifies, the offline lane, and
+  production systemd timers. On 2026-11-02 a read-only `/team` investigation
+  subagent stopped its own `/tmp/s2/c.sh` loops by killing whatever
+  `pgrep -f 'c\.sh'` returned. `c\.sh` matches any "gc.sh", so that one
+  command SIGTERMed the offline lane's
+  `orchestrator/tests/warm-lane/test_warm_lane_gc.sh` run and reify's
+  production `reify-warm-lane-gc.service` (task 8231).
+- Stop what you launched by the pid, process group or session id you captured
+  at launch: `setsid` plus a recorded session id, or the task id `Bash`'s
+  `run_in_background` returns. Failing that, anchor the pattern on your own
+  absolute path and preview it with `pgrep -af` before killing. A `pkill -f`
+  whose pattern appears in your own command line also kills the shell running
+  it ("Exit code 144").
+- The full rule's single home is
+  `orchestrator/src/orchestrator/agents/pkill_guidance.py::PKILL_SELF_MATCH_GUIDANCE`.
+
 ## Reference
 
-- **User docs**: `README.md` (entry point) · `SETUP.md` (install/onboard)
-  · `OPERATIONS.md` (runbook: skills map, merging, resolve_issue, config
-  reload, model routing, fleet redeploy, troubleshooting)
-  · `ARCHITECTURE.md` (process topology, task lifecycle, agent roles,
-  escalation ladder, merge lane) · `docs/task-authoring.md` (task metadata
-  reference) · `CONTRIBUTING.md` (conventions, quality gates, git workflow)
 - **Design docs**: `DESIGN.md` (fused-memory architecture),
   `fused-memory/src/fused_memory/reconciliation/prompts/` (reconciliation
   stage/judge prompt sources), `RECONCILIATION_PLAN.md`
 - **Memory skill**: `/memory` — detailed reference for memory operations, categories, search patterns
 - **Config**: `fused-memory/config/config.yaml`, `.mcp.json`
 - **Design invariants**: `docs/legibility/design-invariants.md` — checkable invariants gating `/prd` decompose (G7) and `/review` phase 2
+- **Verify-result cache**: `OPERATIONS.md` §11a "Verify-result cache" — per-role modes, unit outcomes, audit and kill switch, R-cache-1/2 pointers

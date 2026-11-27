@@ -1,14 +1,14 @@
 """Harness.run() with its dispatch loop PARKED (task 5344, INV-10).
 
-Under saturation the loop sits in ``await sem.acquire()`` (a slot is busy and
-``acquire_next`` keeps handing out work) rather than in a rest branch.  These
+Under saturation the loop waits for a live slot to end without picking a task,
+so no picked task holds its module locks while it waits (task 8480).  These
 tests drive the real ``run()`` in that shape and assert what must still happen
 there: a finishing slot's report is collected, an owed service restart
 force-fires, and the fleet merge heartbeat keeps advancing.
 
-``max_concurrent_tasks=1`` is what parks the loop: once slot ``'1'`` holds the
-semaphore, the next assignment blocks in ``sem.acquire()`` until that slot
-ends.  Startup collaborators are stubbed the way
+``max_concurrent_tasks=1`` with no main-health-fix reserve is what parks the
+loop: once slot ``'1'`` holds the only run slot, the loop makes no further
+``acquire_next`` call until that slot ends.  Startup collaborators are stubbed the way
 ``test_harness_scheduler_seam.py::TestFinishStartupCalledBeforeFirstAcquireNext``
 does; the slot body is stubbed at its one seam, ``_run_slot``.
 """
@@ -17,35 +17,50 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from collections import defaultdict
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _cancel_immune import ignore_cancels_until
 from _orch_helpers import wait_responsive
 
 from orchestrator.config import OrchestratorConfig, ReviewConfig
 from orchestrator.harness import Harness, HarnessReport, TaskReport
+from orchestrator.run_slots import DispatchScope
 from orchestrator.scheduler import TaskAssignment
 from orchestrator.service_restart import StaleServiceRestartCoordinator
+from orchestrator.slot_lease import SlotLease
 from orchestrator.workflow import WorkflowOutcome
 
 _TICK = 0.01
 _FORCE_FIRE_AFTER_SECS = 900.0
 _UNIT = 'orchestrator-parked-test.service'
+_SHUTDOWN_DRAIN_SECS = 0.2
+_HANG_GUARD_SECS = 60.0
 
 
 class _Slots:
     """Stand-in slot runner: each slot ends when the test opens its gate.
 
-    Mirrors ``Harness._run_slot``'s contract: it releases the semaphore on
-    exit and turns a cancel into a synthetic CANCELLED report.
+    Mirrors ``Harness._run_slot``'s contract: it releases its lease on exit
+    and turns a cancel into a synthetic CANCELLED report.  A slot whose id is
+    in ``immune`` ignores every cancel and every gate, ``open_all``'s
+    included, until ``immune_release`` is set.  A slot whose id is in
+    ``absorbs_one_cancel`` ignores its gate and its first cancel, noting
+    ``'slot <id> absorbed a cancel'`` in ``events``, and ends on the next.
     """
 
     def __init__(self) -> None:
         self.gates: defaultdict[str, asyncio.Event] = defaultdict(asyncio.Event)
+        self.started: set[str] = set()
         self.finished: set[str] = set()
+        self.immune: set[str] = set()
+        self.immune_release = asyncio.Event()
+        self.absorbs_one_cancel: set[str] = set()
+        self.events: list[str] = []
         self._all_open = False
 
     def open_all(self) -> None:
@@ -53,39 +68,81 @@ class _Slots:
         for gate in self.gates.values():
             gate.set()
 
-    async def run(self, assignment: TaskAssignment, sem: asyncio.Semaphore) -> TaskReport:
+    async def run(self, assignment: TaskAssignment, lease: SlotLease) -> TaskReport:
         tid = assignment.task_id
+        self.started.add(tid)
         if self._all_open:
             self.gates[tid].set()
         try:
+            if tid in self.immune:
+                await ignore_cancels_until(self.immune_release)
+                return TaskReport(task_id=tid, title=tid, outcome=WorkflowOutcome.CANCELLED)
+            if tid in self.absorbs_one_cancel:
+                await _absorb_one_cancel(lambda: self.events.append(f'slot {tid} absorbed a cancel'))
             await self.gates[tid].wait()
             return TaskReport(task_id=tid, title=tid, outcome=WorkflowOutcome.DONE)
         except asyncio.CancelledError:
+            self.events.append(f'slot {tid} unwound')
             return TaskReport(task_id=tid, title=tid, outcome=WorkflowOutcome.CANCELLED)
         finally:
             self.finished.add(tid)
-            sem.release()
+            lease.release(requeued=False)
+
+
+class _HangGuard:
+    """Frees a cancel-immune task if shutdown would otherwise wait on it forever.
+
+    Armed at the cancel, so its budget bounds the shutdown alone.  A timer
+    handle, not a Task, so run()'s straggler sweep cannot cancel it.
+    """
+
+    def __init__(self, release: asyncio.Event) -> None:
+        self._release = release
+        self._handle: asyncio.TimerHandle | None = None
+        self.fired = False
+
+    def arm(self) -> None:
+        self._handle = asyncio.get_running_loop().call_later(_HANG_GUARD_SECS, self._fire)
+
+    def _fire(self) -> None:
+        self.fired = True
+        self._release.set()
+
+    def cancel(self) -> None:
+        if self._handle is not None:
+            self._handle.cancel()
+
+
+async def _absorb_one_cancel(on_absorbed: Callable[[], None]) -> None:
+    try:
+        await asyncio.Event().wait()
+    except asyncio.CancelledError:
+        on_absorbed()
+    await asyncio.Event().wait()
 
 
 class _Dispatch:
     """``acquire_next`` stand-in handing out ``task_ids`` in order, then None.
 
+    Its tasks are not main-health fixes, so a restricted tick hands out none.
     Call number N blocks until ``held_ticks[N]`` is set, like a long tick.
     """
 
     def __init__(self, task_ids: list[str]) -> None:
         self._pending = list(task_ids)
         self.calls = 0
+        self.scopes: list[DispatchScope] = []
         self.stop_when: Callable[[], bool] = lambda: False
         self.held_ticks: dict[int, asyncio.Event] = {}
 
-    async def acquire_next(self) -> TaskAssignment | None:
+    async def acquire_next(self, scope: DispatchScope = DispatchScope.ANY) -> TaskAssignment | None:
         self.calls += 1
+        self.scopes.append(scope)
         if self.calls in self.held_ticks:
             await self.held_ticks[self.calls].wait()
         if self.stop_when():
             raise _Stop
-        if not self._pending:
+        if scope is not DispatchScope.ANY or not self._pending:
             return None
         tid = self._pending.pop(0)
         return TaskAssignment(task_id=tid, task={'title': tid}, modules=[])
@@ -115,10 +172,14 @@ async def _until(predicate: Callable[[], bool], label: str) -> None:
     await wait_responsive(poll(), label=label)
 
 
-def _harness(tmp_path: Path, dispatch: _Dispatch, slots: _Slots) -> Harness:
+def _harness(
+    tmp_path: Path, dispatch: _Dispatch, slots: _Slots, *,
+    max_concurrent_tasks: int = 1, main_health_fix_reserved_slots: int = 0,
+) -> Harness:
     config = OrchestratorConfig(
         project_root=tmp_path,
-        max_concurrent_tasks=1,
+        max_concurrent_tasks=max_concurrent_tasks,
+        main_health_fix_reserved_slots=main_health_fix_reserved_slots,
         idle_poll_secs=_TICK,
         merge_heartbeat_interval_secs=_TICK,
         stale_service_restart_interval_secs=_TICK,
@@ -189,6 +250,18 @@ def _heartbeat_ts(fleet_dir: Path) -> float | None:
     return json.loads(path.read_text())['ts_epoch']
 
 
+def _shrink_shutdown_drains(h: Harness, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(h, '_SHUTDOWN_WORKFLOW_DRAIN_SECS', _SHUTDOWN_DRAIN_SECS)
+    monkeypatch.setattr(h, '_SHUTDOWN_STRAGGLER_DRAIN_SECS', _SHUTDOWN_DRAIN_SECS)
+
+
+def _harness_errors_naming(caplog: pytest.LogCaptureFixture, name: str) -> list[str]:
+    return [
+        r.getMessage() for r in caplog.records
+        if r.name == 'orchestrator.harness' and r.levelno == logging.ERROR and name in r.getMessage()
+    ]
+
+
 @pytest.fixture
 def fleet_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     fleet = tmp_path / 'fleet'
@@ -236,7 +309,7 @@ class TestParkedLoop:
         h.review_checkpoint = review
 
         async def drive() -> None:
-            for tid, calls in (('1', 2), ('2', 3), ('3', 4)):
+            for tid, calls in (('1', 1), ('2', 2), ('3', 3)):
                 await _until(lambda n=calls: dispatch.calls >= n, f'dispatch call {calls}')
                 slots.gates[tid].set()
 
@@ -252,7 +325,7 @@ class TestParkedLoop:
         dispatch, slots = _Dispatch(['1']), _Slots()
         tick = asyncio.Event()
         dispatch.held_ticks[2] = tick
-        h = _harness(tmp_path, dispatch, slots)
+        h = _harness(tmp_path, dispatch, slots, main_health_fix_reserved_slots=1)
 
         async def drive() -> None:
             try:
@@ -265,6 +338,9 @@ class TestParkedLoop:
         report = await _run_driven(h, slots, drive)
 
         assert [r.task_id for r in report.task_reports] == ['1']
+        assert dispatch.scopes[:2] == [DispatchScope.ANY, DispatchScope.MAIN_HEALTH_FIX], (
+            'tick 2 is the reserve tick, run while slot 1 holds the only general slot'
+        )
 
     async def test_owed_restart_force_fires_while_parked(
         self, tmp_path: Path, fleet_dir: Path,
@@ -275,14 +351,14 @@ class TestParkedLoop:
         coord = _fused_memory_restart(h, clock, fired)
 
         async def drive() -> None:
-            await _until(lambda: dispatch.calls >= 2, 'loop parked on slot 1')
+            await _until(lambda: dispatch.calls >= 1, 'loop parked on slot 1')
             await _arm(coord)
             reads_when_armed = clock.reads
             await _until(lambda: clock.reads >= reads_when_armed + 3, 'restart polled while parked')
             assert not fired.is_set(), 'a polite restart must wait while a slot is live'
             clock.now += _FORCE_FIRE_AFTER_SECS
             await _until(fired.is_set, 'owed restart force-fired while parked')
-            assert dispatch.calls == 2, 'the loop must still be parked when it fires'
+            assert dispatch.calls == 1, 'the loop must still be parked when it fires'
 
         await _run_driven(h, slots, drive)
 
@@ -293,11 +369,11 @@ class TestParkedLoop:
         h = _harness(tmp_path, dispatch, slots)
 
         async def drive() -> None:
-            await _until(lambda: dispatch.calls >= 2, 'loop parked on slot 1')
+            await _until(lambda: dispatch.calls >= 1, 'loop parked on slot 1')
             await _until(lambda: _heartbeat_ts(fleet_dir) is not None, 'first heartbeat')
             first = _heartbeat_ts(fleet_dir) or 0.0
             await _until(lambda: (_heartbeat_ts(fleet_dir) or 0.0) > first, 'heartbeat advanced')
-            assert dispatch.calls == 2, 'the loop must still be parked'
+            assert dispatch.calls == 1, 'the loop must still be parked'
 
         await _run_driven(h, slots, drive)
 
@@ -310,12 +386,114 @@ class TestParkedLoop:
         assert main is not None
 
         async def sigterm_while_parked() -> None:
-            await _until(lambda: dispatch.calls >= 2, 'loop parked on slot 1')
+            await _until(lambda: dispatch.calls >= 1, 'loop parked on slot 1')
             main.cancel()
 
         with pytest.raises(asyncio.CancelledError):
             await _run_driven(h, slots, sigterm_while_parked)
 
+        outcomes = {r.task_id: r.outcome for r in h.report.task_reports}
+        assert outcomes == {'1': WorkflowOutcome.CANCELLED}
+
+    async def test_cancel_immune_bystander_does_not_hang_the_straggler_sweep(
+        self, tmp_path: Path, fleet_dir: Path,
+        monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        caplog.set_level(logging.ERROR, logger='orchestrator.harness')
+        dispatch, slots = _Dispatch(['1', '2']), _Slots()
+        h = _harness(tmp_path, dispatch, slots)
+        _shrink_shutdown_drains(h, monkeypatch)
+        release = asyncio.Event()
+        guard = _HangGuard(release)
+        main = asyncio.current_task()
+        assert main is not None
+        bystanders: list[asyncio.Task] = []
+
+        async def sigterm_beside_an_immune_bystander() -> None:
+            await _until(lambda: dispatch.calls >= 1, 'loop parked on slot 1')
+            bystanders.append(asyncio.create_task(ignore_cancels_until(release), name='immune-bystander'))
+            await asyncio.sleep(0)
+            guard.arm()
+            main.cancel()
+
+        try:
+            with pytest.raises(asyncio.CancelledError):
+                await _run_driven(h, slots, sigterm_beside_an_immune_bystander)
+
+            assert not guard.fired, 'shutdown waited on the cancel-immune bystander until the hang guard freed it'
+            [bystander] = bystanders
+            assert not bystander.done(), 'shutdown must not wait for a task that ignores its cancel'
+            assert _harness_errors_naming(caplog, 'immune-bystander')
+            outcomes = {r.task_id: r.outcome for r in h.report.task_reports}
+            assert outcomes == {'1': WorkflowOutcome.CANCELLED}
+        finally:
+            guard.cancel()
+            release.set()
+            if bystanders:
+                await asyncio.wait(bystanders)
+
+    async def test_cancel_immune_slot_is_detached_and_its_sibling_still_collected(
+        self, tmp_path: Path, fleet_dir: Path,
+        monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        caplog.set_level(logging.ERROR, logger='orchestrator.harness')
+        dispatch, slots = _Dispatch(['1', '2', '3']), _Slots()
+        slots.immune = {'1'}
+        h = _harness(tmp_path, dispatch, slots, max_concurrent_tasks=2)
+        _shrink_shutdown_drains(h, monkeypatch)
+        guard = _HangGuard(slots.immune_release)
+        main = asyncio.current_task()
+        assert main is not None
+        immune_slots: list[asyncio.Task] = []
+
+        async def sigterm_with_both_slots_running() -> None:
+            await _until(lambda: {'1', '2'} <= slots.started, 'slots 1 and 2 running')
+            immune_slots.append(next(t for t in asyncio.all_tasks() if t.get_name() == 'workflow-1'))
+            guard.arm()
+            main.cancel()
+
+        try:
+            with pytest.raises(asyncio.CancelledError):
+                await _run_driven(h, slots, sigterm_with_both_slots_running)
+
+            assert not guard.fired, 'shutdown waited on the cancel-immune slot until the hang guard freed it'
+            [immune_slot] = immune_slots
+            assert not immune_slot.done(), 'shutdown must not wait for a slot that ignores its cancel'
+            assert immune_slot not in h._live_tasks
+            detach_errors = [m for m in _harness_errors_naming(caplog, 'workflow-1') if 'detached' in m]
+            assert len(detach_errors) == 1, 'the workflow drain must log the slot it detached'
+            outcomes = {r.task_id: r.outcome for r in h.report.task_reports}
+            assert outcomes == {'2': WorkflowOutcome.CANCELLED}
+        finally:
+            guard.cancel()
+            slots.immune_release.set()
+            if immune_slots:
+                await asyncio.wait(immune_slots)
+
+    async def test_slot_surviving_one_cancel_unwinds_in_the_workflow_drain(
+        self, tmp_path: Path, fleet_dir: Path,
+        monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        caplog.set_level(logging.ERROR, logger='orchestrator.harness')
+        dispatch, slots = _Dispatch(['1', '2']), _Slots()
+        slots.absorbs_one_cancel = {'1'}
+        h = _harness(tmp_path, dispatch, slots)
+        _shrink_shutdown_drains(h, monkeypatch)
+        monkeypatch.setattr(
+            h.mcp, 'stop', AsyncMock(side_effect=lambda: slots.events.append('mcp.stop')),
+        )
+        main = asyncio.current_task()
+        assert main is not None
+
+        async def sigterm_while_parked() -> None:
+            await _until(lambda: dispatch.calls >= 1, 'loop parked on slot 1')
+            main.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await _run_driven(h, slots, sigterm_while_parked)
+
+        assert slots.events == ['slot 1 absorbed a cancel', 'slot 1 unwound', 'mcp.stop']
+        assert _harness_errors_naming(caplog, 'workflow-1') == []
         outcomes = {r.task_id: r.outcome for r in h.report.task_reports}
         assert outcomes == {'1': WorkflowOutcome.CANCELLED}
 

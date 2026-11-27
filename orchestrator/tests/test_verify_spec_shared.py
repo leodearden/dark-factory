@@ -8,12 +8,13 @@ that host's config. These tests pin each rule at its one home.
 """
 
 import dataclasses
+import inspect
 import json
 from pathlib import Path
 
 import pytest
 
-from orchestrator.config import ModuleConfig, OrchestratorConfig
+from orchestrator.config import GitConfig, ModuleConfig, OrchestratorConfig
 from orchestrator.verify_spec_shared import (
     VerifyCommand,
     apply_spec_to_host_config,
@@ -55,6 +56,25 @@ class TestVerifyCommand:
         assert VerifyCommand.from_module_config(mc) == VerifyCommand(
             prefix='m', test_command='t', lint_command='l', type_check_command='y',
         )
+
+    def test_a_never_cache_flag_rides_the_command_to_the_rebuilt_module(self):
+        vc = VerifyCommand.from_module_config(ModuleConfig(prefix='m', test_command='t', verify_cache='never'))
+
+        assert vc == VerifyCommand(prefix='m', test_command='t', verify_cache='never')
+        assert VerifyCommand.from_dict(vc.to_dict()).verify_cache == 'never'
+        assert module_config_from_command(vc).verify_cache == 'never'
+
+    def test_a_command_document_from_before_the_flag_decodes_to_default(self):
+        legacy = {'prefix': 'm', 'test_command': 't', 'lint_command': None, 'type_check_command': None}
+
+        assert VerifyCommand.from_dict(legacy).verify_cache == 'default'
+
+    def test_an_unknown_flag_is_rejected_naming_prefix_field_and_value(self):
+        with pytest.raises(ValueError, match=r"'m'.*verify_cache.*'sometimes'"):
+            VerifyCommand.from_dict({
+                'prefix': 'm', 'test_command': None, 'lint_command': None,
+                'type_check_command': None, 'verify_cache': 'sometimes',
+            })
 
 
 class TestGlobalVerifyCommandFor:
@@ -110,9 +130,16 @@ class TestApplySpecToHostConfig:
             'global_verify_command': None,
             'module_configs': [],
             'field_overrides': {},
+            'git_field_overrides': {},
             'verify_cold_preprovision_command': '',
         }
         return apply_spec_to_host_config(config, **{**arguments, **overrides})
+
+    def test_every_spec_keyword_is_required(self):
+        """Each consumer states what its spec ships; a default would silently keep the host's own."""
+        parameters = inspect.signature(apply_spec_to_host_config).parameters.values()
+
+        assert [p.name for p in parameters if p.default is not inspect.Parameter.empty] == []
 
     def test_spec_env_wins_and_host_only_keys_survive(self, tmp_path: Path):
         config = _host_config(tmp_path)
@@ -219,6 +246,54 @@ class TestApplySpecToHostConfig:
         assert config.module_configs_or_empty is original_registry
         assert original_registry == {'host/only': ModuleConfig(prefix='host/only')}
         assert config.verify_cold_preprovision_command == 'host-prep'
+
+    def _host_with_git(self, tmp_path: Path) -> OrchestratorConfig:
+        return _host_config(
+            tmp_path,
+            git=GitConfig(main_branch='trunk', merge_config_only_full_gate_globs=['host.yaml']),
+        )
+
+    def test_git_field_overrides_replace_only_the_named_git_field(self, tmp_path: Path):
+        applied = self._apply(
+            self._host_with_git(tmp_path),
+            git_field_overrides={'merge_config_only_full_gate_globs': ['spec.yaml']},
+        )
+
+        assert applied.git.merge_config_only_full_gate_globs == ['spec.yaml']
+        assert applied.git.main_branch == 'trunk'
+
+    def test_no_git_field_overrides_keeps_the_hosts_git(self, tmp_path: Path):
+        applied = self._apply(self._host_with_git(tmp_path))
+
+        assert applied.git.merge_config_only_full_gate_globs == ['host.yaml']
+
+    def test_unknown_git_field_override_is_rejected_naming_it(self, tmp_path: Path):
+        with pytest.raises(TypeError, match='merge_config_only_full_gate_globz'):
+            self._apply(
+                self._host_with_git(tmp_path),
+                git_field_overrides={'merge_config_only_full_gate_globz': []},
+            )
+
+    @pytest.mark.parametrize('value', ['x.yaml', ('x.yaml',), [1]])
+    def test_mistyped_git_field_override_is_rejected_naming_it(
+        self, tmp_path: Path, value: object,
+    ):
+        with pytest.raises(TypeError, match=r'GitConfig\.merge_config_only_full_gate_globs'):
+            self._apply(
+                self._host_with_git(tmp_path),
+                git_field_overrides={'merge_config_only_full_gate_globs': value},
+            )
+
+    def test_caller_git_is_not_mutated(self, tmp_path: Path):
+        config = self._host_with_git(tmp_path)
+        original_git = config.git
+        original_globs = config.git.merge_config_only_full_gate_globs
+
+        self._apply(config, git_field_overrides={'merge_config_only_full_gate_globs': ['spec.yaml']})
+
+        assert config.git is original_git
+        assert config.git.merge_config_only_full_gate_globs is original_globs
+        assert original_globs == ['host.yaml']
 
 
 class TestCanonicalJson:

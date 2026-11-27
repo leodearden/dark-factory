@@ -46,6 +46,11 @@ indent-style = "space"
 docstring-code-format = true
 
 [tool.pytest.ini_options]
+markers = [
+    "defect(ref): this test reproduces the declared defect <ref>; the binding is read statically by shared/src/shared/defect_enumerator.py (plans/defect-tests-prd.md decision 8). Not deselected by default.",
+    "criterion(id): this test evidences acceptance criterion <id> (plans/client-feed-prd.md §7.7). Not deselected by default.",
+    "timing(reason): a deadline, grace period or timeout is the behaviour under test, named by reason=; the timing-dependence lint (fused-memory/scripts/_timing_dependence.py) accepts a real sleep, an elapsed-vs-literal assert or a literal wait deadline only under it. Not deselected by default.",
+]
 asyncio_mode = "auto"
 # Default per-test timeout. This entry CLOSES A TOTAL-ABSENCE GAP rather than
 # updating a stale value: until task 5442 this config declared neither key, so
@@ -73,6 +78,6 @@ dev = [
     "pytest-asyncio>=0.21.0",
     "pytest-timeout>=2.4.0",
     # verify's injected -n; see tests/scripts/test_merge_gate_parallelism_config.py::RULED_SERIAL_MEMBERS
-    "pytest-xdist>=3.5.0",
+    "pytest-xdist>=3.6.0",
     "ruff>=0.7.1",
 ]

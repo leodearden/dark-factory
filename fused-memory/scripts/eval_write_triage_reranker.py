@@ -776,14 +776,10 @@ def _library_versions() -> dict[str, str | None]:
 
 @contextlib.asynccontextmanager
 async def _live_memory_service(config: Any) -> AsyncIterator[Any]:
-    from fused_memory.services.memory_service import MemoryService  # noqa: PLC0415
+    from fused_memory.maintenance._utils import maintenance_service
 
-    memory = MemoryService(config)
-    await memory.initialize()
-    try:
+    async with maintenance_service(config=config) as (_, memory):
         yield memory
-    finally:
-        await memory.close()
 
 
 def run_cli(
@@ -792,8 +788,8 @@ def run_cli(
     memory_service_factory: Callable[[Any], AbstractAsyncContextManager[Any]] | None = None,
     arms: Sequence[_arms.ArmSpec] | None = None,
 ) -> int:
-    from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
-    from fused_memory.server.write_triage import resolve_candidate_k  # noqa: PLC0415
+    from fused_memory.config.schema import FusedMemoryConfig
+    from fused_memory.server.write_triage import resolve_candidate_k
 
     report_path = guard_report_path(args.report_path, limit=args.limit)
     if args.config:

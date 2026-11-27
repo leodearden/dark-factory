@@ -21,12 +21,14 @@ import orchestrator.evals.results as results_module
 from orchestrator.evals import runner
 from orchestrator.evals.architect_eval import ArchitectEvalDeps
 from orchestrator.evals.configs import EvalConfig
+from orchestrator.evals.metrics import EvalMetrics, RoleUnderTest
 from orchestrator.evals.results import (
     CellName,
     EvalResult,
     MissingResultsDirError,
     ResultLoadError,
     ResultStore,
+    load_result,
     normalize_legacy_metrics,
 )
 from orchestrator.workflow import WorkflowOutcome
@@ -42,7 +44,7 @@ def _result(
 ) -> EvalResult:
     fields = {
         'outcome': 'done',
-        'metrics': {'tests_passed': True, 'cost_usd': 1.5},
+        'metrics': {'tests_passed': True, 'cost_usd': 1.5, 'role_under_test': 'implementer'},
         'worktree_path': '/fake/wt',
         'wall_clock_ms': 1200,
         'trial': 1,
@@ -157,6 +159,27 @@ class TestExistence:
         assert store.paths_matching('t', 'cfg') == []
 
 
+class TestTaskCells:
+    def test_every_config_of_the_task_is_listed_in_path_order(
+        self, store: ResultStore
+    ):
+        b = store.save(_result(task_id='df_task_1', config_name='cfg-b'))
+        a = store.save(_result(task_id='df_task_1', config_name='cfg-a'))
+        store.save(_result(task_id='df_task_12', config_name='cfg-a'))
+        store.save(_result(task_id='u', config_name='cfg-a'))
+        assert store.paths_for_task('df_task_1') == sorted([a, b])
+
+    def test_names_outside_the_grammar_are_not_cells(self, store: ResultStore):
+        cell = store.save(_result(task_id='df_task_1', config_name='cfg'))
+        payload = json.dumps(_result(task_id='df_task_1', config_name='cfg').to_dict())
+        (store.directory / 'df_task_1__cfg.json').write_text(payload)
+        (store.directory / 'df_task_1__cfg__r__x.json').write_text(payload)
+        assert store.paths_for_task('df_task_1') == [cell]
+
+    def test_a_missing_directory_lists_no_task_cells(self, store: ResultStore):
+        assert store.paths_for_task('t') == []
+
+
 class TestCellPaths:
     def test_only_top_level_json_files_are_cells(self, store: ResultStore):
         cell = store.save(_result())
@@ -200,6 +223,35 @@ class TestLoudLoad:
         assert excinfo.value.path == bad
         assert str(bad) in str(excinfo.value)
         assert excinfo.value.detail.startswith(error_type)
+
+
+class TestLoadResult:
+    def test_a_saved_cell_reads_back_equal_metrics_included(self, store: ResultStore):
+        saved = _result(
+            metrics={'tests_pass': True, 'review_blocking_issues': 2, 'role_under_test': 'implementer'},
+        )
+        assert load_result(store.save(saved)) == saved
+
+    def test_a_missing_cell_is_named(self, store: ResultStore):
+        missing = store.directory / 'absent.json'
+        with pytest.raises(ResultLoadError) as excinfo:
+            load_result(missing)
+        assert excinfo.value.path == missing
+        assert str(missing) in str(excinfo.value)
+
+    @pytest.mark.parametrize(
+        'text', ['[1, 2, 3]', '{"task_id": "x", "conf'], ids=['a-list', 'truncated'],
+    )
+    def test_an_unreadable_cell_is_named_never_a_bare_error(
+        self, store: ResultStore, text: str
+    ):
+        store.directory.mkdir(parents=True)
+        bad = store.directory / 'bad.json'
+        bad.write_text(text)
+        with pytest.raises(ResultLoadError) as excinfo:
+            load_result(bad)
+        assert excinfo.value.path == bad
+        assert str(bad) in str(excinfo.value)
 
 
 class TestRewrite:
@@ -287,7 +339,7 @@ class TestSchemaDriftTolerance:
 
 
 def test_normalize_legacy_metrics_returns_an_equal_new_dict():
-    metrics = {'cost_usd': 2.0, 'nested': {'a': 1}}
+    metrics = {'cost_usd': 2.0, 'nested': {'a': 1}, 'role_under_test': 'implementer'}
     normalized = normalize_legacy_metrics(metrics)
     assert normalized == metrics
     assert normalized is not metrics
@@ -324,7 +376,7 @@ class TestLegacyInvocationErrorRule:
         ]
 
     def test_a_two_marker_string_is_one_record_driven_by_the_first(self):
-        from orchestrator.evals.report import format_invocation_errors
+        from orchestrator.evals.measurement import format_invocation_errors
 
         marker = 'architect:timeout: no answer within 60m; judge:raised: RuntimeError: x'
         normalized = normalize_legacy_metrics({'invocation_error': marker})
@@ -333,7 +385,7 @@ class TestLegacyInvocationErrorRule:
         assert format_invocation_errors(normalized['invocation_errors']) == marker
 
     def test_a_clipped_reason_keeps_its_trailing_space(self):
-        from orchestrator.evals.report import format_invocation_errors
+        from orchestrator.evals.measurement import format_invocation_errors
 
         marker = 'architect:cap_exhausted: all accounts capped after 1 '
         normalized = normalize_legacy_metrics({'invocation_error': marker})
@@ -364,6 +416,7 @@ class TestLegacyInvocationErrorRule:
 
     def test_a_new_shape_cell_passes_through_unchanged(self):
         metrics = {
+            'role_under_test': 'architect',
             'cap_tainted': True,
             'invocation_errors': [
                 {'stage': 'architect', 'cause': 'cap_hit', 'reason': 'r'},
@@ -376,6 +429,70 @@ class TestLegacyInvocationErrorRule:
         before = dict(metrics)
         normalize_legacy_metrics(metrics)
         assert metrics == before
+
+
+class TestLegacyRoleRule:
+    """ε: a cell persisted before task 6738 with no role was a run_eval implementer cell."""
+
+    @pytest.mark.parametrize(
+        'metrics', [{}, {'role_under_test': None}], ids=['absent', 'null'],
+    )
+    def test_a_roleless_cell_is_an_implementer_cell(self, metrics: dict):
+        normalized = normalize_legacy_metrics(metrics)
+        assert normalized['role_under_test'] is RoleUnderTest.IMPLEMENTER
+
+    @pytest.mark.parametrize(
+        ('stored', 'role'),
+        [('architect', RoleUnderTest.ARCHITECT), ('judge', RoleUnderTest.JUDGE)],
+    )
+    def test_a_stored_role_is_parsed_to_its_member(self, stored: str, role: RoleUnderTest):
+        assert normalize_legacy_metrics({'role_under_test': stored})['role_under_test'] is role
+
+    def test_the_input_is_not_mutated(self):
+        metrics = {'cost_usd': 1.0}
+        normalize_legacy_metrics(metrics)
+        assert metrics == {'cost_usd': 1.0}
+
+    def test_an_unknown_role_fails_the_load_naming_the_cell(self, store: ResultStore):
+        bad = store.save(_result(metrics={'role_under_test': 'reviewer'}))
+        with pytest.raises(ResultLoadError) as excinfo:
+            store.load_all()
+        assert excinfo.value.path == bad
+
+
+class TestLegacyCliCostUntrustedRule:
+    """A cell persisted before task 9970 stored the cost-trust flag as 'is_local_model'."""
+
+    def test_the_old_key_is_renamed(self):
+        normalized = normalize_legacy_metrics({'is_local_model': True})
+        assert normalized == {
+            'cli_cost_untrusted': True,
+            'role_under_test': RoleUnderTest.IMPLEMENTER,
+        }
+
+    def test_a_cell_with_both_keys_keeps_the_new_value(self):
+        normalized = normalize_legacy_metrics(
+            {'is_local_model': True, 'cli_cost_untrusted': False},
+        )
+        assert normalized['cli_cost_untrusted'] is False
+        assert 'is_local_model' not in normalized
+
+    def test_a_cell_with_neither_key_gains_neither(self):
+        normalized = normalize_legacy_metrics({'cost_usd': 1.0})
+        assert 'cli_cost_untrusted' not in normalized
+        assert 'is_local_model' not in normalized
+
+    def test_the_input_is_not_mutated(self):
+        metrics = {'is_local_model': True}
+        normalize_legacy_metrics(metrics)
+        assert metrics == {'is_local_model': True}
+
+    def test_a_stored_legacy_cell_loads_untrusted_with_no_endpoint_kind(self, store: ResultStore):
+        store.save(_result(metrics={'is_local_model': True}))
+        [loaded] = store.load_all()
+        metrics = EvalMetrics.from_dict(loaded.metrics)
+        assert metrics.cli_cost_untrusted is True
+        assert metrics.endpoint_kind is None
 
 
 def test_the_packaged_store_lives_beside_the_results_module():
@@ -399,6 +516,15 @@ async def _fake_create_wt(*_a, **_k):
     return Path('/fake/wt'), 'run-b1'
 
 
+async def _fake_collect(
+    _wf, _wt, _task, *, role, replay_frame=None, sandbox_backend=None, endpoint_kind=None,
+):
+    return EvalMetrics(
+        composite_score=0.9, tests_pass=True, role_under_test=role, replay_frame=replay_frame,
+        sandbox_backend=sandbox_backend, endpoint_kind=endpoint_kind,
+    )
+
+
 @pytest.mark.asyncio
 async def test_b1_an_executor_cell_reads_back_through_the_store(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -406,11 +532,9 @@ async def test_b1_an_executor_cell_reads_back_through_the_store(
     store = ResultStore(tmp_path / 'results')
     workflow = MagicMock()
     workflow.run = AsyncMock(return_value=SimpleNamespace(outcome=WorkflowOutcome.DONE))
-    metrics = MagicMock()
-    metrics.to_dict.return_value = {'composite_score': 0.9, 'tests_pass': True}
     monkeypatch.setattr(runner, 'create_eval_worktree', _fake_create_wt)
     monkeypatch.setattr(runner, 'build_workflow', lambda **_kw: workflow)
-    monkeypatch.setattr(runner, 'collect_metrics', AsyncMock(return_value=metrics))
+    monkeypatch.setattr(runner, 'collect_metrics', AsyncMock(side_effect=_fake_collect))
     monkeypatch.setattr(runner, 'load_task', lambda _p: _executor_task(tmp_path))
 
     result = await runner.run_eval(

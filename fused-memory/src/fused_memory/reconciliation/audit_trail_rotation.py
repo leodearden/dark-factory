@@ -26,6 +26,7 @@ from typing import Any, Literal, Protocol, get_args
 from shared.task_metadata import is_known_metadata_key
 from shared.task_statuses import TERMINAL
 
+from fused_memory.models.memory import Mem0WriteState
 from fused_memory.reconciliation.context_assembler import HINT_QUERIES_EXECUTED
 
 logger = logging.getLogger(__name__)
@@ -648,6 +649,7 @@ def _unrotatable_report(task: Mapping[str, Any], refusal: Refusal) -> dict[str, 
 class AuditTrailArchive(Protocol):
     """Where rotated-out text goes; ``read`` must return exactly what ``write`` stored.
 
+    ``write``'s ``metadata`` carries ``task_id``, the task whose history it archives.
     ``discard`` removes an archive that no committed rewrite points at.
     """
 
@@ -801,8 +803,12 @@ class _MemoryServiceArchive:
             agent_id=ARCHIVE_AGENT_ID,
             metadata=dict(metadata),
             _source=ARCHIVE_SOURCE,
+            defer_transient_mem0_failure=False,
+            declared_referents=[{'kind': 'task', 'id': metadata['task_id']}],
         )
-        return response.memory_ids[0] if response.memory_ids else None
+        if response.mem0_write_state is Mem0WriteState.LANDED:
+            return response.memory_ids[0]
+        return None
 
     async def read(self, *, project_id: str, memory_id: str) -> str | None:
         record = await self.memory_service.get_memory_by_id(project_id, memory_id)
@@ -821,8 +827,9 @@ class _MemoryServiceArchive:
 def memory_service_archive(memory_service: Any) -> AuditTrailArchive:
     """The archive port over a duck-typed MemoryService.
 
-    add_memory reports a mem0 failure as empty ``memory_ids``, so ``write``
-    returns None for it.  ``get_memory_by_id`` takes ``project_id`` FIRST and
+    ``write`` opts out of Mem0 retry deferral, so a transient failure is
+    reported now (``write`` returns None) rather than landing later as an
+    orphan nothing points at.  ``get_memory_by_id`` takes ``project_id`` FIRST and
     positionally; its TimeoutError propagates rather than reading as a miss.
     ``discard`` is a mem0 ``delete_memory`` of the archive record.
     """

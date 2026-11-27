@@ -1,0 +1,24 @@
+{
+  "task_id": "10991",
+  "reason": "net-additive guard: _reuse_warm_lane restores the branch's entry tip and raises BranchResetError when the resume attach dropped commits; BranchResetError names the guarded step",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/git_ops.py",
+      "baseline": 1544,
+      "current": 1551
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/git_ops.py::BranchResetError::__init__",
+      "baseline": 2,
+      "current": 4
+    },
+    {
+      "measure": "total:cognitive",
+      "key": "<cluster>",
+      "baseline": 5232,
+      "current": 5239
+    }
+  ]
+}

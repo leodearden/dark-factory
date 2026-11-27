@@ -1,7 +1,8 @@
 """Tests for score_write_triage_reader.py — the rubric v2.1 reader-consequence scorer.
 
 Reached only through the public surface: ``score_reader``, its refusal
-``IncompleteJudgementError``, ``render_markdown`` and the ``main`` CLI. The
+``IncompleteJudgementError``, ``item_readings``, ``render_markdown`` and the
+``main`` CLI. The
 scripts are loaded by path (``scripts/`` is not a package), lazily through
 ``_mod()``.
 
@@ -36,6 +37,20 @@ def _mod() -> types.ModuleType:
 @functools.cache
 def _stats() -> types.ModuleType:
     return load_script_module(SCRIPTS / 'write_triage_stats.py', mod_name='write_triage_stats')
+
+
+@functools.cache
+def _rubric() -> types.ModuleType:
+    return load_script_module(
+        SCRIPTS / 'write_triage_reader_rubric.py', mod_name='write_triage_reader_rubric',
+    )
+
+
+@functools.cache
+def _rounds() -> types.ModuleType:
+    return load_script_module(
+        SCRIPTS / 'write_triage_rating_rounds.py', mod_name='write_triage_rating_rounds',
+    )
 
 
 _FLAT = {'home': 'YES', 'loss': 'NO', 'conflict': 'NO'}
@@ -127,18 +142,30 @@ def _corpus() -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
 
 
 _STRATA = {'r': 40, 'a': 20, 'c': 5, 's': 30}
+def _soak_brief() -> Any:
+    """The rater brief the synthetic corpus and the committed soak baseline were rated under."""
+    return _rounds().BRIEF_V2_1
+
+
+def _soak_brief_flags() -> list[str]:
+    """The CLI's explicit form of :func:`_soak_brief`, for a corpus that records no re-rate."""
+    return ['--rubric', _soak_brief().version, '--brief-sha256', _soak_brief().sha256]
+
+
+def _score_reader(*args: Any, **kwargs: Any) -> dict[str, Any]:
+    return _mod().score_reader(*args, brief=_soak_brief(), **kwargs)
 
 
 @functools.cache
 def _report() -> dict[str, Any]:
     items, verdicts = _corpus()
-    return _mod().score_reader(items, verdicts)
+    return _score_reader(items, verdicts)
 
 
 @functools.cache
 def _weighted_report() -> dict[str, Any]:
     items, verdicts = _corpus()
-    return _mod().score_reader(items, verdicts, strata=_STRATA)
+    return _score_reader(items, verdicts, strata=_STRATA)
 
 
 def _block(hits: int, n: int, *, unclear: int = 0) -> dict[str, Any]:
@@ -147,6 +174,96 @@ def _block(hits: int, n: int, *, unclear: int = 0) -> dict[str, Any]:
         'wilson95': _stats().wilson95(hits, n), 'unclear': unclear,
         'population_rate': None, 'population_interval95': None,
     }
+
+
+class TestTheBrief:
+    """The report records the brief its verdicts were rated under, which verdict rows do not say.
+
+    The CLI takes it from the corpus record's latest re-rate, or explicitly as
+    a label and sha256 for a corpus that records no re-rate.
+    """
+
+    def test_the_report_records_the_briefs_version_and_sha256(self) -> None:
+        items, verdicts = _corpus()
+        report = _mod().score_reader(items, verdicts, brief=_rounds().RaterBrief('v2.2', 'a' * 64))
+        assert (report['rubric'], report['brief_sha256']) == ('v2.2', 'a' * 64)
+        markdown = _mod().render_markdown(report)
+        assert markdown.startswith('# Write-triage reader report (rubric v2.2)')
+        assert 'a' * 64 in markdown
+
+    def test_no_brief_is_assumed(self) -> None:
+        items, verdicts = _corpus()
+        with pytest.raises(TypeError, match='brief'):
+            _mod().score_reader(items, verdicts)
+
+    @staticmethod
+    def _inputs(tmp_path: Path) -> list[str]:
+        items = _write_jsonl(tmp_path / 'items.jsonl', [_item('X', 'contested', 'P')])
+        verdicts = _write_jsonl(tmp_path / 'verdicts.jsonl', [_vote('X', 'P', conflict='YES')])
+        return ['--items', str(items), '--verdicts', str(verdicts)]
+
+    def test_the_cli_requires_a_corpus_record_or_a_label(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        with pytest.raises(SystemExit) as exited:
+            _mod().main(self._inputs(tmp_path))
+        assert exited.value.code == 2
+        err = capsys.readouterr().err
+        assert '--corpus-record' in err and '--rubric' in err
+
+    def test_a_label_needs_its_sha256(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        with pytest.raises(SystemExit) as exited:
+            _mod().main([*self._inputs(tmp_path), '--rubric', 'v2.1'])
+        assert exited.value.code == 2
+        assert '--brief-sha256' in capsys.readouterr().err
+
+    def test_a_corpus_record_with_a_sha256_is_refused_naming_the_flag(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        record = tmp_path / 'summary.json'
+        record.write_text(json.dumps({'rerates': [
+            {'version': 'v2.2', 'round': 1, 'pairs': 1, 'brief_sha256': 'c' * 64},
+        ]}))
+        with pytest.raises(SystemExit) as exited:
+            _mod().main([*self._inputs(tmp_path), '--corpus-record', str(record),
+                         '--brief-sha256', 'c' * 64])
+        assert exited.value.code == 2
+        assert '--brief-sha256' in capsys.readouterr().err
+
+    @pytest.mark.parametrize(('label', 'sha', 'named'), [
+        ('v2.1', 'xyz', "'xyz'"), ('2.1', 'a' * 64, "'2.1'"),
+    ])
+    def test_a_malformed_label_or_sha256_is_refused_naming_it(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], label: str, sha: str, named: str,
+    ) -> None:
+        with pytest.raises(SystemExit) as exited:
+            _mod().main([*self._inputs(tmp_path), '--rubric', label, '--brief-sha256', sha])
+        assert exited.value.code == 2
+        assert named in capsys.readouterr().err
+
+    def test_a_corpus_record_names_the_brief_of_its_latest_rerate(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        record = tmp_path / 'summary.json'
+        record.write_text(json.dumps({'rerates': [
+            {'version': 'v2.1', 'round': 1, 'pairs': 2, 'brief_sha256': 'b' * 64},
+            {'version': 'v2.2', 'round': 2, 'pairs': 1, 'brief_sha256': 'c' * 64},
+        ]}))
+        assert _mod().main([*self._inputs(tmp_path), '--corpus-record', str(record)]) == 0
+        printed = json.loads(capsys.readouterr().out)
+        assert (printed['rubric'], printed['brief_sha256']) == ('v2.2', 'c' * 64)
+
+    def test_a_corpus_record_without_a_rerate_is_refused_naming_it(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        record = tmp_path / 'summary.json'
+        record.write_text(json.dumps({'rerates': []}))
+        with pytest.raises(SystemExit) as exited:
+            _mod().main([*self._inputs(tmp_path), '--corpus-record', str(record)])
+        assert exited.value.code == 2
+        assert str(record) in capsys.readouterr().err
 
 
 class TestTheItemRowContract:
@@ -163,18 +280,19 @@ class TestTheItemRowContract:
         self, row: dict[str, Any], match: str,
     ) -> None:
         with pytest.raises(ValueError, match=match):
-            _mod().score_reader([row], [])
+            _score_reader([row], [])
 
     def test_a_duplicate_entry_is_refused(self) -> None:
         rows = [_item('X', 'contested', 'P1'), _item('X', 'contested', 'P2')]
         with pytest.raises(ValueError, match="row 1.*'X'"):
-            _mod().score_reader(rows, [_vote('X', 'P1', conflict='YES')])
+            _score_reader(rows, [_vote('X', 'P1', conflict='YES')])
 
 
 class TestTheReport:
     def test_states_its_rubric_rules_and_weights(self) -> None:
         report = _report()
-        assert report['rubric'] == 'v2.1'
+        assert (report['rubric'], report['brief_sha256']) == (
+            _soak_brief().version, _soak_brief().sha256)
         assert set(report['cell_rules']) == {
             'hidden_detail', 'hidden_conflict', 'digest_conflict', 'wrong_home',
             'false_conflict', 'duplicate_clutter', 'orphaned_conflict', 'attached_supersession',
@@ -286,13 +404,13 @@ class TestTheReport:
 
     def test_a_rerun_gives_the_same_report(self) -> None:
         items, verdicts = _corpus()
-        assert _mod().score_reader(items, verdicts) == _report()
+        assert _score_reader(items, verdicts) == _report()
 
 
 class TestHarmWeights:
     def test_a_custom_map_changes_the_totals(self) -> None:
         items, verdicts = _corpus()
-        report = _mod().score_reader(items, verdicts, harm_weights={'wrong_home': 10})
+        report = _score_reader(items, verdicts, harm_weights={'wrong_home': 10})
         assert report['harm_weights'] == {'wrong_home': 10}
         assert report['harm_weights_status'] == 'custom'
         assert report['harm']['per_write'] == {'triage': round(30 / 13, 4), 'status_quo': 0.0}
@@ -307,7 +425,7 @@ class TestHarmWeights:
     def test_a_bad_weight_is_refused_listing_the_cells(self, weights: dict[str, Any]) -> None:
         items, verdicts = _corpus()
         with pytest.raises(ValueError, match='wrong_home.*hidden_conflict|hidden_detail'):
-            _mod().score_reader(items, verdicts, harm_weights=weights)
+            _score_reader(items, verdicts, harm_weights=weights)
 
 
 class TestStrata:
@@ -338,7 +456,7 @@ class TestStrata:
         verdicts = [_vote('R1', 'P1', **conflict), _vote('R2', 'P2', **conflict),
                     _vote('R3', 'P3', **_FLAT), _vote('R4', 'P4', **_FLAT)]
         verdicts += [_vote(f'C{n}', f'Q{n}', **conflict) for n in range(1, 5)]
-        m3 = _mod().score_reader(items, verdicts, strata={'r': 40, 'c': 4})['metrics']['m3']
+        m3 = _score_reader(items, verdicts, strata={'r': 40, 'c': 4})['metrics']['m3']
         assert (m3['n'], m3['hits']) == (6, 2)
         assert m3['population_rate'] == round(20 / 24, 4)
         low, high = m3['population_interval95']
@@ -350,12 +468,12 @@ class TestStrata:
     def test_an_item_outside_every_stratum_is_refused(self) -> None:
         items, verdicts = _corpus()
         with pytest.raises(ValueError, match="'s'"):
-            _mod().score_reader(items, verdicts, strata={'r': 40, 'a': 20, 'c': 5})
+            _score_reader(items, verdicts, strata={'r': 40, 'a': 20, 'c': 5})
 
     def test_a_stratum_smaller_than_its_sample_is_refused(self) -> None:
         items, verdicts = _corpus()
         with pytest.raises(ValueError, match="'c'.*5"):
-            _mod().score_reader(items, verdicts, strata={**_STRATA, 'c': 4})
+            _score_reader(items, verdicts, strata={**_STRATA, 'c': 4})
 
 
 def _rated(
@@ -370,7 +488,7 @@ def _rated(
 def _by_binary(*rated: tuple[dict[str, Any], list[dict[str, Any]]]) -> dict[str, Any]:
     items = [item for item, _ in rated]
     verdicts = [vote for _, votes in rated for vote in votes]
-    return _mod().score_reader(items, verdicts)['kappa']['by_binary']
+    return _score_reader(items, verdicts)['kappa']['by_binary']
 
 
 def _agreement(n: int, kappa: float | None, floor_met: bool = False) -> dict[str, Any]:
@@ -489,6 +607,127 @@ class TestKappa:
         assert _by_binary(*rated)['home'] == _agreement(agreeing + split, kappa, floor_met)
 
 
+def _key(entry: str, target: str, basis: str = 'current') -> Any:
+    rubric = _rubric()
+    return rubric.PairKey(entry, target, rubric.Basis(basis))
+
+
+def _consumed(*keys: tuple[str, str, str]) -> list[tuple[Any, Any]]:
+    """(pair key, binary) consumed keys, each given as (entry, target, binary) on the current basis."""
+    return [(_key(entry, target), _rubric().Binary(binary)) for entry, target, binary in keys]
+
+
+def _judgements(*votes: dict[str, Any]) -> Any:
+    return _rubric().resolve_judgements(list(votes))
+
+
+def _primary_second(entry: str, target: str, primary: dict[str, Any],
+                    second: dict[str, Any]) -> list[dict[str, Any]]:
+    return [_vote(entry, target, rater='opus-primary', role='primary', **primary),
+            _vote(entry, target, rater='opus-second', role='second', **second)]
+
+
+_ABSTAINS = {'home': 'UNCLEAR', 'conflict': 'NO', 'unclear_reason': 'cut at the subject'}
+
+
+class TestKappaOverConsumed:
+    """kappa_over_consumed scores (pair key, binary) keys directly, so several pairs of one write count."""
+
+    def test_reports_the_same_block_as_score_reader(self) -> None:
+        kappa = _mod().kappa_over_consumed([], _judgements())
+        assert set(kappa) == {'floor', 'min_pairs', 'floor_binaries', 'by_binary'}
+        assert (kappa['floor'], kappa['min_pairs'], kappa['floor_binaries']) == (
+            0.70, 60, ['home', 'conflict', 'loss'])
+        assert kappa['by_binary'] == {
+            binary: _agreement(0, None)
+            for binary in ('home', 'loss', 'conflict', 'scope', 'action_changing', 'digest')
+        }
+
+    def test_two_pairs_of_one_write_each_count_on_their_own_consumed_binaries(self) -> None:
+        judgements = _judgements(
+            *_primary_second('W', 'T1', _KEPT, _KEPT),
+            *_primary_second('W', 'T2', _STRAY, _KEPT),
+        )
+        consumed = _consumed(('W', 'T1', 'home'), ('W', 'T1', 'conflict'), ('W', 'T2', 'home'))
+        by_binary = _mod().kappa_over_consumed(consumed, judgements)['by_binary']
+        home_kappa = _stats().cohen_kappa([('YES', 'YES'), ('NO', 'YES')])
+        assert by_binary['home'] == _agreement(2, home_kappa)
+        assert by_binary['conflict'] == _agreement(1, None)
+        assert by_binary['loss'] == _agreement(0, None)
+
+    def test_the_answer_pairs_name_each_counted_key_with_both_words(self) -> None:
+        judgements = _judgements(
+            *_primary_second('W', 'T1', _KEPT, _KEPT),
+            *_primary_second('W', 'T2', _STRAY, _KEPT),
+        )
+        consumed = _consumed(('W', 'T1', 'home'), ('W', 'T1', 'conflict'), ('W', 'T2', 'home'))
+        pairs = _mod().consumed_answer_pairs(consumed, judgements)
+        binary = _rubric().Binary
+        assert set(pairs) == set(binary)
+        assert pairs[binary.HOME] == [(_key('W', 'T1'), 'YES', 'YES'), (_key('W', 'T2'), 'NO', 'YES')]
+        assert pairs[binary.CONFLICT] == [(_key('W', 'T1'), 'NO', 'NO')]
+        assert pairs[binary.LOSS] == []
+
+    def test_a_key_counts_once_however_often_it_is_consumed(self) -> None:
+        judgements = _judgements(*_primary_second('W', 'T1', _KEPT, _KEPT))
+        consumed = _consumed(('W', 'T1', 'home'), ('W', 'T1', 'home'))
+        assert _mod().kappa_over_consumed(consumed, judgements)['by_binary']['home'] == _agreement(1, None)
+
+    @pytest.mark.parametrize('votes', [
+        pytest.param(_primary_second('W', 'T1', _ABSTAINS, _KEPT), id='primary-abstains'),
+        pytest.param(_primary_second('W', 'T1', _KEPT, _ABSTAINS), id='second-abstains'),
+        pytest.param([_vote('W', 'T1', rater='opus-primary', role='primary', **_KEPT)],
+                     id='no-second'),
+        pytest.param([_vote('W', 'T1', rater='opus-primary', role='primary', **_KEPT),
+                      _vote('W', 'T1', rater='opus-primary-b', role='primary', **_KEPT),
+                      _vote('W', 'T1', rater='opus-second', role='second', **_KEPT)],
+                     id='two-primaries'),
+        pytest.param([_vote('W', 'T1', rater='opus-primary', role='primary', **_KEPT),
+                      _vote('W', 'T1', rater='opus-third', role='third', **_KEPT)],
+                     id='third-instead-of-second'),
+        pytest.param([], id='no-judgement'),
+    ])
+    def test_a_key_without_one_decided_primary_and_second_answer_is_left_out(
+        self, votes: list[dict[str, Any]],
+    ) -> None:
+        judgements = _judgements(*votes)
+        consumed = _consumed(('W', 'T1', 'home'))
+        assert _mod().kappa_over_consumed(consumed, judgements)['by_binary']['home'] == _agreement(0, None)
+        assert _mod().consumed_answer_pairs(consumed, judgements)[_rubric().Binary.HOME] == []
+
+    def test_a_binary_one_rater_did_not_answer_is_left_out(self) -> None:
+        judgements = _judgements(*_primary_second('W', 'T1', _KEPT, _STRAY))
+        consumed = _consumed(('W', 'T1', 'loss'), ('W', 'T1', 'home'))
+        by_binary = _mod().kappa_over_consumed(consumed, judgements)['by_binary']
+        assert by_binary['loss'] == _agreement(0, None)
+        assert by_binary['home'] == _agreement(1, _stats().cohen_kappa([('YES', 'NO')]))
+
+    @pytest.mark.parametrize(('agreeing', 'split', 'kappa', 'floor_met'), [
+        (60, 0, 1.0, True),
+        (59, 0, 1.0, False),
+        (40, 20, 0.4, False),
+    ])
+    def test_the_floor_needs_both_agreement_and_pairs(
+        self, agreeing: int, split: int, kappa: float, floor_met: bool,
+    ) -> None:
+        votes, keys = [], []
+        for index in range(agreeing):
+            answers = (_KEPT, _STRAY)[index % 2]
+            votes += _primary_second('W', f'A{index:03d}', answers, answers)
+            keys.append(('W', f'A{index:03d}', 'home'))
+        for index in range(split):
+            votes += _primary_second('W', f'S{index:03d}', _KEPT, _STRAY)
+            keys.append(('W', f'S{index:03d}', 'home'))
+        by_binary = _mod().kappa_over_consumed(_consumed(*keys), _judgements(*votes))['by_binary']
+        assert by_binary['home'] == _agreement(agreeing + split, kappa, floor_met)
+
+    def test_a_key_off_the_current_basis_is_refused(self) -> None:
+        judgements = _judgements(_vote('W', 'T1', basis='attach_time', **_KEPT))
+        consumed = [(_key('W', 'T1', 'attach_time'), _rubric().Binary.HOME)]
+        with pytest.raises(ValueError, match='attach_time'):
+            _mod().kappa_over_consumed(consumed, judgements)
+
+
 class TestRefusal:
     def test_a_decisive_gap_refuses_naming_every_gap(self) -> None:
         items = [
@@ -498,7 +737,7 @@ class TestRefusal:
         verdicts = [_vote('X2', 'P2', home='YES'),
                     _vote('X2', 'P2', rater='sonnet', role='second', conflict='NO')]
         with pytest.raises(_mod().IncompleteJudgementError) as refusal:
-            _mod().score_reader(items, verdicts)
+            _score_reader(items, verdicts)
         assert refusal.value.gaps == (
             ('X1', 'P1', 'conflict', 'unrated'), ('X2', 'P2', 'loss', 'open'),
         )
@@ -512,25 +751,25 @@ class TestRefusal:
                     _vote('X', 'P', rater='sonnet', role='second', conflict='NO', home='YES',
                           loss='NO')]
         with pytest.raises(_mod().IncompleteJudgementError) as refusal:
-            _mod().score_reader([_item('X', 'contested', 'P')], verdicts)
+            _score_reader([_item('X', 'contested', 'P')], verdicts)
         assert refusal.value.gaps == (('X', 'P', 'conflict', 'tied'),)
 
     def test_a_non_decisive_tie_is_accepted(self) -> None:
         verdicts = [_vote('X', 'P', conflict='YES', home='YES'),
                     _vote('X', 'P', rater='sonnet', role='second', conflict='YES', home='NO')]
-        report = _mod().score_reader([_item('X', 'contested', 'P')], verdicts)
+        report = _score_reader([_item('X', 'contested', 'P')], verdicts)
         assert report['metrics']['m5']['hits'] == 1
 
     def test_a_missing_attach_time_judgement_never_refuses(self) -> None:
         item = _item('X', 'contested', 'P', parent_edited_after_attach=True)
-        report = _mod().score_reader([item], [_vote('X', 'P', conflict='YES')])
+        report = _score_reader([item], [_vote('X', 'P', conflict='YES')])
         assert report['metrics']['m6']['attach_time_unrated'] == 1
 
     def test_an_undecided_attach_time_judgement_is_counted_not_refused(self) -> None:
         item = _item('X', 'contested', 'P', parent_edited_after_attach=True)
         verdicts = [_vote('X', 'P', conflict='YES'),
                     _vote('X', 'P', basis='attach_time', home='YES')]
-        report = _mod().score_reader([item], verdicts)
+        report = _score_reader([item], verdicts)
         assert report['metrics']['m6']['attach_time_undecided'] == 1
         assert report['metrics']['m6']['attach_time_rated'] == 0
 
@@ -549,7 +788,7 @@ class TestTheCli:
             '--items', str(_write_jsonl(tmp_path / 'items.jsonl', items)),
             '--verdicts', str(_write_jsonl(tmp_path / 'v1.jsonl', verdicts[:5])),
             str(_write_jsonl(tmp_path / 'v2.jsonl', verdicts[5:])),
-            '--strata', str(strata),
+            '--strata', str(strata), *_soak_brief_flags(),
         ]
 
     def test_prints_the_report_and_writes_both_files(
@@ -583,7 +822,7 @@ class TestTheCli:
         verdicts = _write_jsonl(tmp_path / 'verdicts.jsonl', [_vote('X0', 'P0', home='YES')])
         out, markdown = tmp_path / 'report.json', tmp_path / 'report.md'
         code = _mod().main([
-            '--items', str(items), '--verdicts', str(verdicts),
+            '--items', str(items), '--verdicts', str(verdicts), *_soak_brief_flags(),
             '--out', str(out), '--markdown', str(markdown),
         ])
         assert code == 1
@@ -599,7 +838,8 @@ class TestTheCli:
         items.write_text(json.dumps(_item('X', 'contested', 'P')) + '\n{not json\n')
         verdicts = _write_jsonl(tmp_path / 'verdicts.jsonl', [_vote('X', 'P', conflict='YES')])
         with pytest.raises(ValueError, match=f'{items}:2'):
-            _mod().main(['--items', str(items), '--verdicts', str(verdicts)])
+            _mod().main(['--items', str(items), '--verdicts', str(verdicts),
+                         *_soak_brief_flags()])
 
 
 def _table_rows(markdown: str) -> dict[str, list[str]]:
@@ -713,9 +953,38 @@ class TestTheV2ScriptsImportOnlyDownward:
         ('write_triage_reader_rubric', {'write_triage_reader_rubric'}),
         ('score_write_triage_reader', {
             'score_write_triage_reader', 'write_triage_reader_rubric', 'write_triage_stats',
+            'write_triage_rating_rounds',
+        }),
+        ('write_triage_rating_rounds', {
+            'write_triage_rating_rounds', 'write_triage_reader_rubric',
+        }),
+        ('mem0_history_at', {'mem0_history_at'}),
+        ('backfill_rating_shard_kinds', {
+            'backfill_rating_shard_kinds', 'write_triage_rating_rounds', 'write_triage_reader_rubric',
         }),
         ('build_write_triage_v2_soak_baseline', {
-            'build_write_triage_v2_soak_baseline', 'write_triage_reader_rubric',
+            'build_write_triage_v2_soak_baseline', 'write_triage_rating_rounds',
+            'write_triage_reader_rubric', 'mem0_history_at',
+        }),
+        ('rebuild_write_triage_live_slates', {
+            'rebuild_write_triage_live_slates', 'mem0_history_at', 'write_triage_rating_rounds',
+            'write_triage_reader_rubric', 'freeze_write_triage_population',
+            'eval_write_triage_retrieval', 'calibrate_write_triage', 'eval_write_triage_scoring',
+        }),
+        ('build_write_triage_eval_set', {
+            'build_write_triage_eval_set', 'write_triage_rating_rounds',
+            'write_triage_reader_rubric', 'score_write_triage_reader', 'write_triage_stats',
+            'run_write_triage_population_arms', 'freeze_write_triage_population',
+            'calibrate_write_triage', 'eval_write_triage_retrieval', 'score_write_triage_pairs',
+            'write_triage_judge_wording', 'eval_write_triage_scoring',
+        }),
+        ('rate_write_triage_cross_family', {
+            'rate_write_triage_cross_family', 'build_write_triage_eval_set',
+            'write_triage_rating_rounds', 'write_triage_reader_rubric', 'score_write_triage_reader',
+            'write_triage_stats', 'run_write_triage_population_arms',
+            'freeze_write_triage_population', 'calibrate_write_triage',
+            'eval_write_triage_retrieval', 'score_write_triage_pairs',
+            'write_triage_judge_wording', 'eval_write_triage_scoring',
         }),
     ])
     def test_a_module_loads_exactly_its_downward_closure(
@@ -756,7 +1025,7 @@ def _committed_inputs() -> tuple[list[dict[str, Any]], list[dict[str, Any]], dic
 @functools.cache
 def _rescored_baseline() -> dict[str, Any]:
     items, verdicts, strata = _committed_inputs()
-    return _mod().score_reader(items, verdicts, strata=strata)
+    return _score_reader(items, verdicts, strata=strata)
 
 
 @functools.cache
@@ -793,6 +1062,7 @@ class TestTheCommittedSoakBaseline:
         extension = {stratum: counts['extension'] for stratum, counts in sample.items()}
         report = _rescored_baseline()
         assert report['rubric'] == 'v2.1'
+        assert report['brief_sha256'] == _rounds().BRIEF_V2_1_SHA256
         assert report['population']['n_items'] == 553 + sum(extension.values())
         assert report['population']['by_outcome'] == {
             'amended': 40 + extension['amended-sample'], 'contested': 473,
@@ -840,3 +1110,71 @@ class TestTheCommittedSoakBaseline:
 
     def test_counts_at_least_the_13_parents_edited_after_attach(self) -> None:
         assert _rescored_baseline()['metrics']['m6']['parent_edited'] >= 13
+
+
+class TestItemReadings:
+    """Per-item endings under the scorer's own M3 rule (task 7519)."""
+
+    @staticmethod
+    def _readings() -> dict[str, Any]:
+        items, verdicts = _corpus()
+        items = [item for item in items if item['entry_id'] != 'C5']
+        return {reading.entry_id: reading for reading in _mod().item_readings(items, verdicts)}
+
+    def test_the_hidden_endings_are_the_ones_m3_counts(self) -> None:
+        hidden = _mod().HIDDEN_ENDINGS
+        assert hidden == frozenset({'restated', 'amended', 'stored_unlinked'})
+
+    @pytest.mark.xdist_group('committed_v2_soak_baseline')
+    def test_over_the_committed_soak_they_reproduce_m3(self) -> None:
+        items, verdicts, _ = _committed_inputs()
+        conflict = [
+            reading for reading in _mod().item_readings(items, verdicts)
+            if reading.decided is not None and reading.decided.conflict
+        ]
+        m3 = _rescored_baseline()['metrics']['m3']
+        hidden = [r for r in conflict if r.m3_ending in _mod().HIDDEN_ENDINGS]
+        assert len(hidden) == m3['hits']
+        endings = Counter(reading.m3_ending for reading in conflict)
+        assert {ending: endings[ending] for ending in m3['by_ending']} == m3['by_ending']
+        assert sum(endings.values()) == sum(m3['by_ending'].values())
+
+    def test_each_conflict_write_reads_its_ending(self) -> None:
+        readings = self._readings()
+        assert readings['R3'].m3_ending == 'restated'
+        assert readings['A2'].m3_ending == 'amended'
+        assert readings['C1'].m3_ending == 'contested'
+        assert readings['R3'].stratum == 'r'
+        assert readings['R3'].outcome == 'restated'
+
+    def test_a_non_conflict_or_undecided_write_has_no_ending(self) -> None:
+        items, verdicts = _corpus()
+        readings = {r.entry_id: r for r in _mod().item_readings(items, verdicts)}
+        assert readings['R1'].decided is not None
+        assert not readings['R1'].decided.conflict
+        assert readings['R1'].m3_ending is None
+        assert readings['C5'].decided is None
+        assert readings['C5'].m3_ending is None
+
+    def test_a_stored_conflict_reads_linked_only_when_its_record_is_marked(self) -> None:
+        readings = self._readings()
+        assert readings['S1'].m3_ending == 'stored_linked'
+        assert readings['S2'].m3_ending == 'stored_unlinked'
+
+    def test_a_decisive_tie_refuses_as_score_reader_does(self) -> None:
+        verdicts = [_vote('X', 'P', conflict='YES'),
+                    _vote('X', 'P', rater='sonnet', role='second', conflict='NO', home='YES',
+                          loss='NO')]
+        with pytest.raises(_mod().IncompleteJudgementError) as refusal:
+            _mod().item_readings([_item('X', 'contested', 'P')], verdicts)
+        assert refusal.value.gaps == (('X', 'P', 'conflict', 'tied'),)
+
+    def test_readings_are_sorted_by_entry_id(self) -> None:
+        items, verdicts = _corpus()
+        ids = [reading.entry_id for reading in _mod().item_readings(items[::-1], verdicts)]
+        assert ids == sorted(item['entry_id'] for item in items)
+
+    def test_a_reading_is_frozen(self) -> None:
+        reading = next(iter(self._readings().values()))
+        with pytest.raises(AttributeError):
+            reading.outcome = 'stored'

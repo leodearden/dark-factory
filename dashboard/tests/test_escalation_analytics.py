@@ -117,27 +117,47 @@ def _aggregate(
 # step-1: load_regime_markers
 # ---------------------------------------------------------------------------
 
+COMMITTED_REGIME_MARKERS = [
+    {'date': '2026-07-15', 'label': 'Starvation threshold raised to 72h', 'tasks': [2631]},
+    {'date': '2026-07-15', 'label': 'Auto-watcher benign closes', 'tasks': [2630]},
+    {'date': '2026-07-15', 'label': 'Verify-scope flip', 'tasks': [2593]},
+]
+
 
 class TestLoadRegimeMarkers:
     """load_regime_markers(path) -> (markers, parse_failures_delta). Never raises."""
 
     def test_default_path_parses_committed_seed_file(self):
-        """The committed dashboard/regime-markers.yaml parses to exactly 3 markers."""
+        """The committed file's regime entries, unchanged; its quality artefact is not one of them."""
         markers, parse_failures_delta = load_regime_markers()
 
         assert parse_failures_delta == 0
-        assert len(markers) == 3
-        for m in markers:
-            assert set(m) == {'date', 'label', 'tasks'}
-            # Must be JSON-serializable: yaml.safe_load parses unquoted
-            # YYYY-MM-DD as a datetime.date, which is NOT JSON-serializable —
-            # the loader must normalize it to a str.
-            assert isinstance(m['date'], str)
-            assert isinstance(m['label'], str)
-            assert isinstance(m['tasks'], list)
+        assert markers == COMMITTED_REGIME_MARKERS
 
-        all_tasks = sorted(t for m in markers for t in m['tasks'])
-        assert all_tasks == [2593, 2630, 2631]
+    def test_only_regime_entries_are_escalation_regime_markers(self, tmp_path):
+        mixed = tmp_path / 'mixed.yaml'
+        mixed.write_text(
+            '- {date: 2026-07-15, label: a regime, tasks: [1]}\n'
+            '- {date: 2026-10-16, until: 2026-10-16, kind: artefact, label: an artefact}\n'
+            '- {date: 2026-11-01, kind: effort, label: an effort change}\n'
+        )
+
+        assert load_regime_markers(mixed) == ([{'date': '2026-07-15', 'label': 'a regime', 'tasks': [1]}], 0)
+
+    def test_a_rejected_entry_is_counted_in_the_delta(self, tmp_path):
+        partly_bad = tmp_path / 'partly-bad.yaml'
+        partly_bad.write_text('- {date: 2026-07-15, label: kept}\n- not a mapping\n')
+
+        assert load_regime_markers(partly_bad) == ([{'date': '2026-07-15', 'label': 'kept', 'tasks': []}], 1)
+
+    def test_the_payload_serves_the_committed_regime_markers(self, tmp_path):
+        now = golden_now()
+        esc_dir = tmp_path / 'escalations'
+        build_golden_archive(esc_dir, now)
+
+        result = _analytics([('dark_factory', esc_dir, _make_runs_db(tmp_path, []))], now=now)
+
+        assert result['regime_markers'] == COMMITTED_REGIME_MARKERS
 
     def test_malformed_yaml_returns_empty_and_one_failure(self, tmp_path):
         """Unparseable YAML syntax -> ([], 1), never raises."""
@@ -554,18 +574,18 @@ class TestAggregateProjectLifespan:
         samples = {tuple(row) for row in lifespan['samples']}
         assert samples == {
             ((now - timedelta(days=9)).date().isoformat(), 'reaper-sweep', 0, 86400.0),
-            ((now - timedelta(days=7)).date().isoformat(), 'human', 0, 86400.0),
+            ((now - timedelta(days=7)).date().isoformat(), 'attended-seat', 0, 86400.0),
             (
                 (now - timedelta(days=6) + timedelta(hours=2)).date().isoformat(),
                 'auto-watcher', 1, 7200.0,
             ),
             (
                 (now - timedelta(days=5) + timedelta(hours=3)).date().isoformat(),
-                'human', 2, 10800.0,
+                'attended-seat', 2, 10800.0,
             ),
             (
                 (now - timedelta(days=4) + timedelta(hours=1)).date().isoformat(),
-                'human', 2, 3600.0,
+                'attended-seat', 2, 3600.0,
             ),
         }
 
@@ -624,7 +644,9 @@ class TestAggregateProjectLifespan:
         lifespan = entry['lifespan']
 
         promo = lifespan['l1_to_l2_promotion']
-        assert promo == {'count': 0, 'p50_secs': None, 'p90_secs': None}
+        assert promo == {
+            'count': 0, 'p50_secs': None, 'p90_secs': None, 'fold_time_unknown': 0,
+        }
 
         open_by_id = {item['id']: item for item in lifespan['open_items']}
         assert open_by_id['esc-201-1']['breach_6h'] is False
@@ -634,6 +656,51 @@ class TestAggregateProjectLifespan:
 # ---------------------------------------------------------------------------
 # step-9: Workflow block
 # ---------------------------------------------------------------------------
+
+
+class TestResolverTierFromTheRecord:
+    """Every block tiers a record through escalation.classify.resolver_tier
+    (plans/instruments-honesty-prd.md decision 10): the human-ruling flag first."""
+
+    def _one_terminal(self, esc_dir: Path, now: datetime, **fields) -> None:
+        esc = {
+            'id': 'esc-77-1', 'task_id': '77', 'agent_role': 'implementer',
+            'severity': 'blocking', 'category': 'scope_violation', 'summary': 'tier fixture',
+            'timestamp': _iso(now - timedelta(days=3)), 'status': 'resolved', 'level': 2,
+            'resolved_at': _iso(now - timedelta(days=3) + timedelta(hours=1)),
+            'resolution_class': 'actionable',
+        }
+        esc.update(fields)
+        _write_escalation(esc_dir, esc, archived=True)
+
+    def _tiers(self, tmp_path: Path, **fields) -> tuple[set, set, set]:
+        now = golden_now()
+        esc_dir = tmp_path / 'escalations'
+        self._one_terminal(esc_dir, now, **fields)
+        entry, _ = _aggregate('dark_factory', esc_dir, tmp_path / 'runs.db', now=now)
+        samples = {row[1] for row in entry['lifespan']['samples']}
+        weekly = {tier for week in entry['workflow']['tier_weekly'].values() for tier in week}
+        flow = {row['tier'] for row in entry['workflow']['flow_daily']}
+        return samples, weekly, flow
+
+    def test_a_human_ruling_is_human_ruled_in_every_block(self, tmp_path):
+        tiers = self._tiers(tmp_path, resolved_by='interactive', ruled_by_human=True)
+        assert tiers == ({'human-ruled'},) * 3
+
+    def test_a_seat_close_without_a_ruling_is_attended_seat_in_every_block(self, tmp_path):
+        tiers = self._tiers(tmp_path, resolved_by='interactive')
+        assert tiers == ({'attended-seat'},) * 3
+
+    def test_a_cascade_close_keeps_its_tier(self, tmp_path):
+        tiers = self._tiers(tmp_path, resolved_by='l2-cascade:esc-76-1')
+        assert tiers == ({'cascade'},) * 3
+
+    def test_an_unstamped_legacy_resolve_still_infers_actionable(self, tmp_path):
+        now = golden_now()
+        esc_dir = tmp_path / 'escalations'
+        self._one_terminal(esc_dir, now, resolved_by='interactive', resolution_class=None)
+        entry, _ = _aggregate('dark_factory', esc_dir, tmp_path / 'runs.db', now=now)
+        assert {row['class'] for row in entry['workflow']['flow_daily']} == {'actionable'}
 
 
 class TestAggregateProjectWorkflow:
@@ -650,10 +717,10 @@ class TestAggregateProjectWorkflow:
         # week numbers.
         expected_tier_by_resolved = [
             (now - timedelta(days=9), 'reaper-sweep'),                        # 101-1
-            (now - timedelta(days=7), 'human'),                               # 102-1
+            (now - timedelta(days=7), 'attended-seat'),                               # 102-1
             (now - timedelta(days=6) + timedelta(hours=2), 'auto-watcher'),   # 103-1
-            (now - timedelta(days=5) + timedelta(hours=3), 'human'),          # 104-1
-            (now - timedelta(days=4) + timedelta(hours=1), 'human'),          # 105-1
+            (now - timedelta(days=5) + timedelta(hours=3), 'attended-seat'),          # 104-1
+            (now - timedelta(days=4) + timedelta(hours=1), 'attended-seat'),          # 105-1
         ]
         expected_tier_weekly: dict[str, dict[str, int]] = {}
         for dt, tier in expected_tier_by_resolved:
@@ -725,18 +792,18 @@ class TestAggregateProjectWorkflow:
         }
         assert flow_cells == {
             ((now - timedelta(days=9)).date().isoformat(), 'implementer', 0, 'reaper-sweep', 'benign'),
-            ((now - timedelta(days=7)).date().isoformat(), 'implementer', 0, 'human', 'actionable'),
+            ((now - timedelta(days=7)).date().isoformat(), 'implementer', 0, 'attended-seat', 'actionable'),
             (
                 (now - timedelta(days=6) + timedelta(hours=2)).date().isoformat(),
                 'architect', 1, 'auto-watcher', 'benign',
             ),
             (
                 (now - timedelta(days=5) + timedelta(hours=3)).date().isoformat(),
-                'architect', 2, 'human', 'actionable',
+                'architect', 2, 'attended-seat', 'actionable',
             ),
             (
                 (now - timedelta(days=4) + timedelta(hours=1)).date().isoformat(),
-                'implementer', 2, 'human', 'actionable',
+                'implementer', 2, 'attended-seat', 'actionable',
             ),
         }
         assert all(row['n'] == 1 for row in workflow['flow_daily'])
@@ -911,11 +978,11 @@ class TestSamplesDownsampling:
     # 3 tiers at a 3:2:1 ratio (60/40/20 of 120 total) so a threshold=40
     # downsample gives every tier a comfortably non-zero quota.
     _TIER_RESOLVERS = {
-        'human': 'interactive',
+        'attended-seat': 'interactive',
         'auto-watcher': 'escalation-watcher-auto',
         'reaper-sweep': 'auto-dismissed',
     }
-    _TIER_COUNTS = {'human': 60, 'auto-watcher': 40, 'reaper-sweep': 20}
+    _TIER_COUNTS = {'attended-seat': 60, 'auto-watcher': 40, 'reaper-sweep': 20}
 
     def _build_fixture(self, esc_dir: Path, now: datetime) -> int:
         """Write ``_TIER_COUNTS`` terminal records per tier; return the total count."""
@@ -1730,6 +1797,37 @@ class TestCompleteResolutionClasses:
 
         assert source['classes']['not-a-class'] == 1
         assert source['classified'] == sum(source['classes'].values()) == len(RESOLUTION_CLASSES) + 1
+
+
+_ROUTER_CLASSES = frozenset({'addressed', 'observation-consumed', 'converted', 'status-info'})
+
+
+class TestDispositionedBucket:
+    """origin.sources[].dispositioned counts what the info-L0 router closed
+    (plans/info-l0-disposition-router-prd.md D14), beside the per-class keys."""
+
+    def test_it_counts_the_four_router_classes_and_no_other(self, tmp_path):
+        now = golden_now()
+        esc_dir = tmp_path / 'escalations'
+        _one_terminal_per_class(esc_dir, now)
+        strand = _terminal('esc-7-1', now=now, status='dismissed', resolution_class='stale-strand')
+        _write_escalation(esc_dir, {**strand, 'agent_role': 'steward'}, archived=True)
+
+        entry, _ = _aggregate('dark_factory', esc_dir, tmp_path / 'runs.db', now=now)
+        sources = {s['source']: s for s in entry['origin']['sources']}
+
+        implementer = sources['implementer']
+        assert implementer['dispositioned'] == 4
+        assert implementer['dispositioned'] == sum(implementer['classes'][c] for c in _ROUTER_CLASSES)
+        assert sources['steward']['dispositioned'] == 0
+        assert set(implementer['classes']) == set(RESOLUTION_CLASSES)
+        assert {row['class'] for row in entry['workflow']['flow_daily']} <= RESOLUTION_CLASSES
+
+    def test_the_bucket_is_drawn_from_the_resolution_vocabulary(self):
+        from dashboard.data.escalation_analytics import DISPOSITIONED_CLASSES
+
+        assert DISPOSITIONED_CLASSES == _ROUTER_CLASSES
+        assert DISPOSITIONED_CLASSES <= RESOLUTION_CLASSES
 
 
 class TestOneTerminalPopulation:

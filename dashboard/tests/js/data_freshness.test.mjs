@@ -156,7 +156,7 @@ test('staleness: a recovered endpoint clears its failures AND its notice', async
   const failing = win.DF_DATA.__stale[CURATOR_PATH];
   assert.equal(failing.failures, STALE_FAILURE_THRESHOLD);
   assert.equal(
-    staleNoticesForTab({ tab: 'curator', stale: win.DF_DATA.__stale, now: t }).length, 1,
+    staleNoticesForTab({ paths: [CURATOR_PATH], stale: win.DF_DATA.__stale, now: t }).length, 1,
     'the tab must actually be reporting the endpoint stale before recovery is ' +
       'asserted, or the clearing assertions below prove nothing',
   );
@@ -176,7 +176,7 @@ test('staleness: a recovered endpoint clears its failures AND its notice', async
       'pre-outage success and the notice would return with a stale age',
   );
   assert.deepEqual(
-    staleNoticesForTab({ tab: 'curator', stale: win.DF_DATA.__stale, now: t }),
+    staleNoticesForTab({ paths: [CURATOR_PATH], stale: win.DF_DATA.__stale, now: t }),
     [],
     'the tab still renders a staleness notice for an endpoint that is serving 200s',
   );
@@ -224,6 +224,8 @@ test('receipts: a successful refresh records servedAt from the body and received
     servedAt: '2026-09-20T12:00:00+00:00',
     receivedAt: 555,
     window: null,
+    pacingHoldMs: 0,
+    assetBuild: { started: null, onDisk: null },
   });
 });
 
@@ -239,6 +241,8 @@ test('receipts: a windowed body\'s WINDOW echo is recorded verbatim beside serve
     servedAt: 'S',
     receivedAt: 555,
     window: { requested: '90d', served: '30d', days: 30 },
+    pacingHoldMs: 0,
+    assetBuild: { started: null, onDisk: null },
   });
 });
 
@@ -250,7 +254,13 @@ test('receipts: a body with no served_at records null, never undefined', async (
 
   await api.refreshOne(CURATOR_PATH, {}, api.createPollState(), deps);
 
-  assert.deepEqual(win.DF_DATA.__receipt[CURATOR_PATH], { servedAt: null, receivedAt: 42, window: null });
+  assert.deepEqual(win.DF_DATA.__receipt[CURATOR_PATH], {
+    servedAt: null,
+    receivedAt: 42,
+    window: null,
+    pacingHoldMs: 0,
+    assetBuild: { started: null, onDisk: null },
+  });
 });
 
 test('receipts: a FAILED refresh leaves the receipt alone, so the tiles keep ageing', async () => {
@@ -295,6 +305,69 @@ test('receipts: a FAILED refresh keeps the WINDOW echo describing the values sti
 
     assert.equal(JSON.stringify(win.DF_DATA.__receipt[COSTS_PATH]), before, 'a failed refresh relabelled the window');
     assert.deepEqual(win.DF_DATA.__receipt[COSTS_PATH].window, echo);
+  }
+});
+
+// The serving build: which static/redux build the server that answered was
+// started with, and which is on disk now. Copied raw, as WINDOW is; the page's
+// reader, asset_skew.js, validates at read.
+const SERVING_BUILD_HEADERS = {
+  'X-DF-Asset-Build-Started': '0123456789abcdef',
+  'X-DF-Asset-Build-On-Disk': 'not an identity',
+};
+
+function respondingWith(headers) {
+  return () => Promise.resolve({ ok: true, headers, json: async () => ({}) });
+}
+
+test('receipts: the serving build\'s two identity headers are copied raw into assetBuild', async () => {
+  const { api, window: win } = loadDataJs();
+
+  const outcome = await api.refreshOne(CURATOR_PATH, {}, api.createPollState(), {
+    fetchImpl: respondingWith(new Headers(SERVING_BUILD_HEADERS)),
+    now: () => 7,
+  });
+
+  assert.equal(outcome, api.REFRESH_OUTCOMES.applied);
+  assert.deepEqual(win.DF_DATA.__receipt[CURATOR_PATH].assetBuild, {
+    started: '0123456789abcdef',
+    onDisk: 'not an identity',
+  });
+});
+
+test('receipts: a response with no build headers records both identities as null and still applies', async () => {
+  for (const [label, headers] of [
+    ['no headers at all', undefined],
+    ['headers without the build names', new Headers({ 'Content-Type': 'application/json' })],
+    ['a headers object with no get()', {}],
+  ]) {
+    const { api, window: win } = loadDataJs();
+
+    const outcome = await api.refreshOne(CURATOR_PATH, {}, api.createPollState(), {
+      fetchImpl: respondingWith(headers),
+      now: () => 7,
+    });
+
+    assert.equal(outcome, api.REFRESH_OUTCOMES.applied, label);
+    assert.deepEqual(win.DF_DATA.__receipt[CURATOR_PATH].assetBuild, { started: null, onDisk: null }, label);
+  }
+});
+
+test('receipts: a FAILED refresh leaves the serving build of the values still on screen', async () => {
+  for (const fetchImpl of [
+    () => Promise.reject(new Error('boom')),
+    () => Promise.resolve({ ok: false, status: 503, headers: new Headers({ 'X-DF-Asset-Build-Started': 'ffffffffffffffff' }), json: async () => ({}) }),
+  ]) {
+    const { api, window: win } = loadDataJs();
+    const state = api.createPollState();
+    await api.refreshOne(CURATOR_PATH, {}, state, { fetchImpl: respondingWith(new Headers(SERVING_BUILD_HEADERS)), now: () => 100 });
+
+    await quietly(() => api.refreshOne(CURATOR_PATH, {}, state, { fetchImpl, now: () => 900 }));
+
+    assert.deepEqual(win.DF_DATA.__receipt[CURATOR_PATH].assetBuild, {
+      started: '0123456789abcdef',
+      onDisk: 'not an identity',
+    });
   }
 });
 

@@ -38,7 +38,8 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
-from _fm_helpers import _init_git_repo, load_script_module
+from _fm_git_repos import _init_git_repo
+from _fm_helpers import load_script_module
 from shared.briefing_queries import (
     CONVENTIONS_AREA,
     CONVENTIONS_GENERIC,
@@ -48,6 +49,9 @@ from shared.briefing_queries import (
     BriefingScope,
     queries_for,
 )
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 SCRIPT_PATH = (
     Path(__file__).parent.parent / 'scripts' / 'harvest_production_queries.py'
@@ -101,7 +105,7 @@ class TestTheScriptIsLoadedOnceNotReExecuted:
     """
 
     def test_the_script_is_loaded_once_not_re_executed(self):
-        import sys  # noqa: PLC0415
+        import sys
 
         first = _load_module()
         second = _load_module()
@@ -159,7 +163,7 @@ def _build_journal(
     rows: Sequence[JournalRow],
 ) -> Path:
     """Write a synthetic journal at `path`."""
-    import sqlite3  # noqa: PLC0415
+    import sqlite3
 
     con = sqlite3.connect(str(path))
     try:
@@ -180,7 +184,7 @@ def _search_rows(
     text: str, n: int, *, limit: int = 5, caller: str | None = None
 ) -> list[tuple[str, str, str]]:
     """`n` search ops, journalled with `caller_agent_id` when `caller` is set."""
-    import json  # noqa: PLC0415
+    import json
 
     params: dict[str, object] = {'query': text, 'limit': limit}
     if caller is not None:
@@ -619,7 +623,7 @@ def _briefing_rows(
 
 
 def _query_of(row: tuple[str, str, str]) -> str:
-    import json  # noqa: PLC0415
+    import json
 
     return json.loads(row[2])['query']
 
@@ -976,7 +980,7 @@ class TestFixtureRowShape:
 
     def test_an_op_with_no_usable_limit_is_bucketed_not_defaulted(self, tmp_path):
         """A missing limit is `unspecified`, not silently the scoring window."""
-        import json  # noqa: PLC0415
+        import json
 
         mod = _mod()
         rows = _search_rows(RETIRED_OVERVIEW, 10)
@@ -1092,9 +1096,9 @@ class TestReadOnlyAccess:
             con.close()
 
     def test_a_write_attempt_raises(self, tmp_path):
-        import sqlite3  # noqa: PLC0415
+        import sqlite3
 
-        import pytest  # noqa: PLC0415
+        import pytest
 
         mod = _mod()
         db = _standard_journal(tmp_path)
@@ -1106,7 +1110,7 @@ class TestReadOnlyAccess:
             con.close()
 
     def test_harvesting_does_not_modify_the_journal(self, tmp_path):
-        import hashlib  # noqa: PLC0415
+        import hashlib
 
         mod = _mod()
         db = _standard_journal(tmp_path)
@@ -1218,6 +1222,23 @@ class TestTheJournalPathIsAnchoredOnTheMainCheckout:
         assert result.journal_path == 'data/j.db'
 
 
+class TestTheDefaultJournalIsTheMainCheckouts:
+    """The default `--journal` is derived from where the checkout really lives.
+
+    It names no user's home directory, and a lane run reads the same live
+    journal as a run from the main checkout.
+    """
+
+    def test_a_lane_copy_defaults_to_the_main_checkouts_journal(self, tmp_path):
+        main, lane = _seed_checkout_with_harvest_copy(tmp_path)
+
+        args = _load_copy_in(lane).build_parser().parse_args(
+            ['--out', str(tmp_path / 'out.jsonl')]
+        )
+
+        assert Path(args.journal).resolve() == main / 'data' / 'reconciliation' / 'write_journal.db'
+
+
 class TestTheCommittedArtifactsCarryNoAbsolutePath:
     """The published artifacts must not name anyone's home directory either.
 
@@ -1229,7 +1250,7 @@ class TestTheCommittedArtifactsCarryNoAbsolutePath:
     """
 
     def test_the_committed_sidecar_records_a_repo_relative_journal_path(self):
-        import json  # noqa: PLC0415
+        import json
 
         sidecar = FIXTURES_DIR / 'production_query_sample.provenance.json'
         value = json.loads(sidecar.read_text(encoding='utf-8'))['journal_path']
@@ -1253,7 +1274,7 @@ class TestTheCommittedArtifactsCarryNoAbsolutePath:
         or moved -- the silently-empty measurement this module's header
         docstring ("READ-ONLY, LOUDLY") rejects everywhere else.
         """
-        import json  # noqa: PLC0415
+        import json
 
         report = Path(__file__).parents[2] / 'plans' / 'read-transform-selection-report.json'
         assert report.exists(), f'published selection report is missing: {report}'
@@ -1268,7 +1289,7 @@ class TestLoudDegradation:
     """An unreadable journal is a named error, never an empty sample."""
 
     def test_an_absent_journal_raises_a_named_error(self, tmp_path):
-        import pytest  # noqa: PLC0415
+        import pytest
 
         mod = _mod()
         missing = tmp_path / 'nope.db'
@@ -1279,9 +1300,9 @@ class TestLoudDegradation:
     def test_a_journal_without_write_ops_raises_rather_than_returning_empty(
         self, tmp_path
     ):
-        import sqlite3  # noqa: PLC0415
+        import sqlite3
 
-        import pytest  # noqa: PLC0415
+        import pytest
 
         mod = _mod()
         db = tmp_path / 'wrong.db'
@@ -1293,7 +1314,7 @@ class TestLoudDegradation:
             mod.harvest(db)
 
     def test_no_fixture_is_written_when_the_journal_is_unavailable(self, tmp_path):
-        import pytest  # noqa: PLC0415
+        import pytest
 
         mod = _mod()
         out = tmp_path / 'production_query_sample.jsonl'
@@ -1303,7 +1324,7 @@ class TestLoudDegradation:
 
     def test_an_empty_journal_writes_no_fixture_either(self, tmp_path):
         """Zero traffic must not silently become an empty-but-valid fixture."""
-        import pytest  # noqa: PLC0415
+        import pytest
 
         mod = _mod()
         db = _build_journal(tmp_path / 'j.db', [])
@@ -1335,7 +1356,7 @@ class TestTheRefusalNamesTheRealFailure:
     _SCAN = staticmethod(lambda sql: 'FROM write_ops' in sql)
 
     def _harvest_with_scan_error(self, tmp_path, monkeypatch, exc, *, after_rows=None):
-        import functools  # noqa: PLC0415
+        import functools
 
         mod = _mod()
         db = _standard_journal(tmp_path)
@@ -1354,9 +1375,9 @@ class TestTheRefusalNamesTheRealFailure:
     def test_a_lock_contention_error_is_not_reported_as_a_missing_table(
         self, tmp_path, monkeypatch
     ):
-        import sqlite3  # noqa: PLC0415
+        import sqlite3
 
-        import pytest  # noqa: PLC0415
+        import pytest
 
         injected = sqlite3.OperationalError('database is locked')
         mod, db = self._harvest_with_scan_error(tmp_path, monkeypatch, injected)
@@ -1373,9 +1394,9 @@ class TestTheRefusalNamesTheRealFailure:
     def test_a_disk_io_error_is_not_reported_as_a_missing_table(
         self, tmp_path, monkeypatch
     ):
-        import sqlite3  # noqa: PLC0415
+        import sqlite3
 
-        import pytest  # noqa: PLC0415
+        import pytest
 
         injected = sqlite3.OperationalError('disk I/O error')
         mod, db = self._harvest_with_scan_error(tmp_path, monkeypatch, injected)
@@ -1401,9 +1422,9 @@ class TestTheRefusalNamesTheRealFailure:
         Same three assertions as its `execute()`-time sibling, from
         mid-iteration instead.
         """
-        import sqlite3  # noqa: PLC0415
+        import sqlite3
 
-        import pytest  # noqa: PLC0415
+        import pytest
 
         injected = sqlite3.OperationalError('disk I/O error')
         mod, db = self._harvest_with_scan_error(
@@ -1424,9 +1445,9 @@ class TestTheRefusalNamesTheRealFailure:
         another.  The cause chain is `None` here because nothing raised: an
         empty probe is a READING, not a failure.
         """
-        import sqlite3  # noqa: PLC0415
+        import sqlite3
 
-        import pytest  # noqa: PLC0415
+        import pytest
 
         mod = _mod()
         db = tmp_path / 'wrong.db'
@@ -1446,7 +1467,7 @@ class TestFixtureWrite:
     """The committed fixture is JSONL plus a provenance sidecar."""
 
     def test_main_writes_jsonl_rows_and_a_sidecar(self, tmp_path):
-        import json  # noqa: PLC0415
+        import json
 
         mod = _mod()
         db = _standard_journal(tmp_path)

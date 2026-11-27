@@ -17,8 +17,8 @@ import dataclasses
 import json
 import logging
 import os
-import shutil
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
 from legibility import account_pool, session_runner
@@ -28,8 +28,19 @@ from legibility.session_runner import (
     SessionRunner,
     StageSpec,
 )
+from shared.account_reserve import WorkKind
 from shared.cap_markers import REAL_CLI_CAP_HIT_MESSAGES, REAL_CLI_NEAR_CAP_MESSAGES
+from shared.cli_invoke import resolve_claude_binary
 from shared.config_models import UsageCapConfig
+from shared.testing import make_gate_mock
+from shared.testing_reserve import (
+    PROTECTED,
+    RELEASE_AT,
+    RESERVE_ACCOUNT,
+    ReserveClock,
+    cap_all_but_reserve,
+    reserve_gate,
+)
 
 from shared import usage_gate
 
@@ -347,7 +358,7 @@ def test_a_missing_claude_binary_is_a_loud_failure_naming_the_cwd(
     empty_bin = tmp_path / 'empty-bin'
     empty_bin.mkdir()
     monkeypatch.setenv('PATH', f'{empty_bin}{os.pathsep}/usr/bin')
-    assert shutil.which('claude') is None, 'the premise: no claude is reachable'
+    assert resolve_claude_binary() is None, 'the premise: no claude is reachable'
     project = tmp_path / 'project'
     project.mkdir()
     accounts_file, env_file = pool_roster(_P)
@@ -404,3 +415,44 @@ def test_a_teardown_failure_is_logged_never_raised_and_the_rest_still_runs(
     assert warning.levelno == logging.WARNING
     assert warning.exc_info is not None
     assert 'gate shutdown blew up' in str(warning.exc_info[1])
+
+
+# ---------------------------------------------------------------------------
+# The allowance reserve (plans/allowance-reserve-by-account-prd.md C10): the
+# census is background work, so while the reserve is the only open account in
+# its protected window, a call defers as on any frozen pool, naming the reserve.
+# ---------------------------------------------------------------------------
+
+
+def test_a_reserve_refused_call_defers_naming_the_reserve_and_its_release(
+    fake_claude_cli, sentinel_login, tmp_path,
+):
+    gate = reserve_gate(
+        tmp_path, clock=ReserveClock(PROTECTED), account_names=(_P, RESERVE_ACCOUNT),
+    )
+    cap_all_but_reserve(gate)
+
+    with SessionRunner(gate, label='t') as runner:
+        invoke = runner.invoker(_CLASSIFIER_STAGE)
+        with pytest.raises(session_runner.NoHeadroom) as excinfo:
+            invoke('the prompt', 'haiku')
+
+    message = str(excinfo.value)
+    assert RESERVE_ACCOUNT in message, message
+    assert RELEASE_AT.isoformat() in message, message
+    assert 'pool accounts capped' not in message, message
+    assert fake_claude_cli.calls() == []
+
+
+def test_a_census_call_declares_background_work(fake_claude_cli, sentinel_login):
+    fake_claude_cli.plan(default={'result': _PLAIN_VERDICT})
+    gate = make_gate_mock(shutdown=AsyncMock())
+
+    with SessionRunner(gate, label='t') as runner:
+        reply = runner.invoker(_CLASSIFIER_STAGE)('the prompt', 'haiku')
+
+    assert reply == _PLAIN_VERDICT
+    [admission] = gate.before_invoke.await_args_list
+    work_class = admission.kwargs.get('work_class')
+    assert work_class is not None, admission
+    assert work_class.kind is WorkKind.BACKGROUND

@@ -38,7 +38,8 @@
 #   -h, --help              Print this message and exit (0).
 #
 # Preconditions (caller-asserted FREE is independently re-verified via the
-# lane flock — T3; the other two are checked here before any work):
+# lane flock (T3) and a /proc live-reference scan (T4); the rest are checked
+# here before any work):
 #   lane_dir must exist and be a directory.
 #   lane_dir must be under $REIFY_WARM_LANE_MOUNT, when that env var is set.
 #   lane_dir must not resolve to (or be literally named) the base dir, and
@@ -54,9 +55,11 @@
 #         base anyway, so a lane a caller re-acquires is never left cold).
 #   1   — Precondition guard refusal (nonexistent lane, ==base dir, not under
 #         $REIFY_WARM_LANE_MOUNT).
-#   2   — Usage error (unknown flag, missing positional, --reseed without --base).
-#   75  — EX_TEMPFAIL: the lane's own flock is held by a live consumer
-#         (ASSIGNED lane; inv.2 one-consumer-per-lane-at-a-time).
+#   2   — Usage error (unknown flag, missing positional, --reseed without --base),
+#         or a WIRING error: the sibling scripts/lib_live_refs.sh is missing.
+#   75  — EX_TEMPFAIL: the lane is BUSY, either (a) its flock is held (token
+#         LANE_LOCK_CONTENDED:) or (b) a live process references it (token
+#         LANE_LIVE_REF:). Both are benign skips; nothing is removed.
 #
 # Invariants (PRD §9.3):
 #   T1 — only target/ is ever removed; source tree / .git / uncommitted WIP
@@ -69,8 +72,33 @@
 #        the fly, which can itself fail under a truly exhausted filesystem
 #        (ENOSPC) before any bytes are freed. Only bites a lane thinned
 #        outside the pool's acquire/release lifecycle.
+#   T4 — a live process reference at or under lane_dir (cwd / open fd / mmap)
+#        refuses (75), checked under the held T3 flock immediately before the
+#        rm. Mechanism: lib_live_refs.sh::live_ref_present; rationale: README.md
+#        "Delta 17".
 
 set -euo pipefail
+
+# dirname by PARAMETER EXPANSION, not a fork: a PATH without dirname yields an
+# EMPTY substitution, `cd ""` succeeds as a no-op, and SCRIPT_DIR silently becomes
+# the CALLER'S CWD. See README.md "Delta 7".
+_src="${BASH_SOURCE[0]}"
+_dir='.'
+case "$_src" in
+    */*) _dir="${_src%/*}"
+         [ -n "$_dir" ] || _dir='/' ;;
+esac
+SCRIPT_DIR="$(cd "$_dir" && pwd)"
+unset _src _dir
+
+# Fail LOUDLY, before argv parsing, if the T4 scanner is missing: exit 2
+# (usage/WIRING), never a bare source's runtime 1. See README.md "Delta 8".
+if [ ! -f "$SCRIPT_DIR/lib_live_refs.sh" ]; then
+    echo "thin-warm-lane.sh: ERROR — scripts/lib_live_refs.sh not found next to thin-warm-lane.sh" >&2
+    exit 2
+fi
+# shellcheck source=scripts/lib_live_refs.sh
+source "$SCRIPT_DIR/lib_live_refs.sh"
 
 # ── log helpers (all write to stderr) ────────────────────────────────────────
 info()  { printf '\033[1;34m[info]\033[0m  %s\n' "$*" >&2; }
@@ -114,9 +142,11 @@ Usage: $(basename "$0") <lane_dir> [--reseed] [--base <base_target_dir>] [--seed
           re-seed is logged (stderr) but does not change the exit code.
     1   — Precondition guard refusal (nonexistent lane, ==base dir, not under
           \$REIFY_WARM_LANE_MOUNT).
-    2   — Usage error (unknown flag, missing positional, --reseed without --base).
-    75  — EX_TEMPFAIL: the lane's flock is held by a live consumer (ASSIGNED
-          lane; inv.2 one-consumer-per-lane).
+    2   — Usage error (unknown flag, missing positional, --reseed without --base),
+          or a WIRING error: the sibling scripts/lib_live_refs.sh is missing.
+    75  — EX_TEMPFAIL: the lane is BUSY, either (a) its flock is held (token
+          LANE_LOCK_CONTENDED:) or (b) a live process references it (token
+          LANE_LIVE_REF:). Both are benign skips; nothing is removed.
 EOF
 }
 
@@ -178,25 +208,8 @@ if [ -n "$RESEED" ] && [ -z "$BASE_TARGET_DIR" ]; then
     exit 2
 fi
 
-# Default --seed-script: sibling scripts/seed-warm-lane.sh, resolved via
-# BASH_SOURCE so this script works when invoked via a relative/symlinked path.
-#
-# dirname by PARAMETER EXPANSION, not a fork: a PATH without dirname yields an
-# EMPTY substitution, `cd ""` succeeds as a no-op, and _script_dir silently
-# becomes the CALLER'S CWD — making "resolved via BASH_SOURCE" above untrue, and
-# here that mis-resolution is EXECUTED, not merely sourced. See README.md
-# "Delta 7".
-if [ -z "$SEED_SCRIPT" ]; then
-    _src="${BASH_SOURCE[0]}"
-    _dir='.'
-    case "$_src" in
-        */*) _dir="${_src%/*}"
-             [ -n "$_dir" ] || _dir='/' ;;
-    esac
-    _script_dir="$(cd "$_dir" && pwd)"
-    unset _src _dir
-    SEED_SCRIPT="$_script_dir/seed-warm-lane.sh"
-fi
+# Default --seed-script: the sibling seed-warm-lane.sh beside THIS script.
+[ -n "$SEED_SCRIPT" ] || SEED_SCRIPT="$SCRIPT_DIR/seed-warm-lane.sh"
 
 # ── lane_dir existence guard ───────────────────────────────────────────────────
 if [ ! -d "$LANE_DIR" ]; then
@@ -262,11 +275,23 @@ LANE_LOCK="${LANE_DIR}.lock"
 exec 9>"$LANE_LOCK"
 if ! flock -n 9; then
     exec 9>&-
-    err "Lane lock held by a live consumer (flock -n failed): $LANE_LOCK"
+    err "LANE_LOCK_CONTENDED: Lane lock held by a live consumer (flock -n failed): $LANE_LOCK"
     err "Refusing to thin an ASSIGNED lane (inv.2: one consumer per lane at a time)."
     exit 75
 fi
 # FD 9 stays open (lock held) for the rest of the run; bash releases it on exit.
+
+# ── T4: live-process-reference gate ───────────────────────────────────────────
+# The flock is a reseed mutex, not a liveness oracle: it is never held across
+# the implement phase. So ask /proc, under the held flock and immediately
+# before the rm (never an up-front snapshot), which also covers --reseed. SKIP,
+# never wait: a wait here would hold FD 9 and stall the acquire reseed.
+if live_ref_present "$LANE_DIR"; then
+    exec 9>&-
+    err "LANE_LIVE_REF: Live process reference at or under the lane (cwd / open fd / mmap): $_rp_lane_dir"
+    err "Refusing to thin a lane with a live consumer; preserving target/ (retry next cycle)."
+    exit 75
+fi
 
 # ── FREE-FIRST reclaim (T1/T2): only target/ is ever removed ──────────────────
 # Mirrors warm-lane-gc.sh's disk-pressure fast-path (L521-539): rm-stderr

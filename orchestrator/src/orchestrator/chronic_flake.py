@@ -24,8 +24,8 @@ threshold/window. :func:`maybe_file_chronic_flake_tasks` unions both.
 This module never talks to the fused-memory MCP directly —
 :class:`ChronicFlakeTaskClient` is the pluggable seam, and
 :class:`SchedulerChronicFlakeTaskClient` is the concrete adapter over a
-duck-typed scheduler exposing ``dispatch_tool`` and ``submit_task``
-(self-contained here to avoid a workflow<->harness import cycle).
+:class:`SchedulerTaskStore` (self-contained here to avoid a
+workflow<->harness import cycle).
 
 Non-blocking guarantee: :func:`maybe_file_chronic_flake_tasks` is internally
 catch-all-defensive, so a ledger/MCP/search error can never fail the
@@ -42,14 +42,20 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Protocol, TypeGuard
+from typing import TYPE_CHECKING, Protocol, TypeGuard
 
-from shared.mcp_envelope import parse_tool_result
+from shared.mcp_envelope import EnvelopeParseError, parse_tool_result, tool_error_text
 from shared.safe_io import load_json_or_warn
+from shared.status_paging import (
+    StatusPage,
+    StatusPagingError,
+    read_status_page,
+    status_page_arguments,
+    walk_status_pages,
+)
+from shared.task_read import TASK_NOT_FOUND_ERROR_TYPE
 from shared.task_statuses import TERMINAL
 from shared.task_submit import SubmitFailed, SubmitOutcome
-
-from orchestrator.mcp_lifecycle import tool_error_text
 
 if TYPE_CHECKING:
     from orchestrator.config import OrchestratorConfig
@@ -352,7 +358,7 @@ class ChronicFlakeTaskClient(Protocol):
     """Pluggable task-filing seam so this module never talks to the
     fused-memory MCP directly.
     :class:`SchedulerChronicFlakeTaskClient` (step-15/step-16) is the
-    concrete adapter over a duck-typed scheduler.
+    concrete adapter over a :class:`SchedulerTaskStore`.
 
     That adapter now serves a SECOND consumer:
     ``orchestrator/src/orchestrator/flake_ledger.py::FlakeLedgerTaskClient``,
@@ -583,9 +589,8 @@ def _unwrap_dispatch_envelope(result: object) -> dict:
 
     Tolerates a bare payload dict, ``{'structuredContent': {...}}`` /
     ``{'result': {...}}`` nested, or a ``content`` list of text blocks
-    carrying JSON, so the parsers here — :func:`_extract_results_list`,
-    :func:`_extract_task`, and
-    :func:`_extract_statuses_map` for bare shapes — share one seam. Returns
+    carrying JSON, so the parsers here — :func:`_extract_results_list` and
+    :func:`_extract_task` — share one seam. Returns
     ``{}`` for a non-dict *result* or when no known shape unwraps.
 
     UNWRAPS ITERATIVELY, and that is the whole correctness of it.  The
@@ -596,10 +601,11 @@ def _unwrap_dispatch_envelope(result: object) -> dict:
     — so a single step lands on the INNER RESULT, whose keys are
     ``content``/``structuredContent``/``isError`` and never the payload's own.
     A one-step unwrapper therefore returns a dict in which every payload key is
-    absent, which each parser above reads as a well-formed envelope that simply
-    does not carry its key: ``_extract_statuses_map`` returned an error on
-    EVERY successful production call.  Corroborated by
-    ``orchestrator/src/orchestrator/scheduler.py::SchedulerFacade.get_statuses``, which
+    absent, which each parser over this seam reads as a well-formed envelope
+    that simply does not carry its key: :func:`_extract_task` would report no
+    task, and :func:`_extract_results_list` no results, for EVERY successful
+    production call, as the adapter's ``get_statuses`` reader once did.  Corroborated by
+    ``shared/src/shared/status_paging.py::read_status_page``, which
     parses the very same ``dispatch_tool`` result with
     ``shared.mcp_envelope.parse_tool_result(result, 'statuses', dict)`` — a
     parser that requires exactly ``result['result']['content'][i]['text']``.
@@ -609,8 +615,9 @@ def _unwrap_dispatch_envelope(result: object) -> dict:
     are returned untouched.  ``shared.mcp_envelope.parse_tool_result`` cannot
     stand in for this generic unwrap, because it accepts ONLY the strict
     ``result.content[].text`` spelling and rejects every bare shape; where one
-    tool's reader must match the scheduler's, as :func:`_extract_statuses_map`
-    does, it is used for JSON-RPC bodies and this unwrap only for bare ones.
+    tool's reader must match the scheduler's, as ``get_statuses``' must,
+    :func:`_ledger_status_page` reads the response through the shared page reader
+    and this unwrap only describes a failed read.
     """
     if not isinstance(result, dict):
         return {}
@@ -668,72 +675,54 @@ def _is_jsonrpc_response(result: object) -> bool:
     return isinstance(result, dict) and 'jsonrpc' in result
 
 
-def _extract_statuses_map(result: object) -> tuple[dict[str, str], Exception | None]:
-    """Extract a ``get_statuses`` response's ``statuses`` mapping from a
-    ``dispatch_tool`` result, as a ``(statuses, error)`` pair.
+def _ledger_status_page(result: object) -> StatusPage[str]:
+    """Read one ``dispatch_tool`` result for ``get_statuses`` as a page of the flake ledger's walk.
 
-    A JSON-RPC response is parsed by ``shared.mcp_envelope.parse_tool_result(result,
-    'statuses', dict)``, the exact call ``scheduler.py::Scheduler.get_statuses`` makes,
-    so the two readers of this tool cannot disagree; its error becomes the reported
-    error's ``__cause__``.  Only an already-unwrapped bare shape, which test fakes alone
-    produce, goes through :func:`_unwrap_dispatch_envelope`.
+    Every response, a non-JSON-RPC one included, is read by
+    ``shared/src/shared/status_paging.py::read_status_page``, the reader
+    ``scheduler.py::Scheduler.get_statuses`` uses, and the pages are assembled by the
+    same ``::walk_status_pages``.  An unreadable reply raises a ``ValueError``
+    describing it, with the reader's error as its ``__cause__``;
+    :func:`_unwrap_dispatch_envelope` only describes it.
 
-    The PAIR is what keeps two things that both look like an empty mapping apart.  A
+    Telling a failed read apart from an empty mapping is what matters here.  A
     PRESENT ``statuses`` dict, even an empty one, is a CORROBORATED ABSENCE: the tool
     answered and silently omits ids it does not know, so emptiness is real evidence
     that the task is gone.  An envelope carrying no ``statuses`` key, or a non-dict
-    one, is not an answer at all.  Returning ``{}`` for BOTH is what made them
+    one, is not an answer at all.  Reading both as ``{}`` is what made them
     indistinguishable one seam away, in
     ``orchestrator/src/orchestrator/flake_ledger.py::_ensure_owner_task``, which reads a
     missing id as a deleted task and files a replacement de-flake task for it.
 
-    Construct-don't-raise, matching ``scheduler.py::SchedulerFacade.get_statuses``'
-    ``({}, exception)`` convention: an unreadable response yields ``({}, error)``
-    describing it, never a raise.
-
     Keys and values are coerced to ``str``: the tool returns JSON, but a caller may
     hand ints and the consumer (``flake_ledger``) looks the id up as a ``str``.
+    ``delivered`` stays the server's own count, which the walk checks.
     """
-    if _is_jsonrpc_response(result):
-        statuses, parse_error = parse_tool_result(result, 'statuses', dict)
-        if parse_error is not None:
-            return {}, _response_error(
-                f'get_statuses response unreadable ({parse_error})',
-                _unwrap_dispatch_envelope(result),
-                cause=parse_error,
-            )
-        assert statuses is not None
-    else:
-        envelope = _unwrap_dispatch_envelope(result)
-        if 'statuses' not in envelope:
-            return {}, _response_error('get_statuses response carries no "statuses" key', envelope)
-        statuses = envelope['statuses']
-        if not isinstance(statuses, dict):
-            return {}, _response_error(
-                f'get_statuses response "statuses" is {type(statuses).__name__}, not a dict',
-                envelope,
-            )
-    return {str(key): str(value) for key, value in statuses.items()}, None
-
-
-# The `error_type` fused-memory's `get_task` tool answers with when its query ran and
-# found no row (backends/task_backend_errors.py::TaskNotFoundError, structured by
-# server/tool_errors.py::mcp_tool_errors).  The one error that is an ANSWER, not a
-# failure — and a type, so the discrimination never rests on message wording.
-_TASK_NOT_FOUND_ERROR_TYPE = 'TaskNotFoundError'
+    try:
+        page = read_status_page(result)
+    except EnvelopeParseError as e:
+        raise _response_error(
+            f'get_statuses response unreadable ({e})',
+            _unwrap_dispatch_envelope(result),
+            cause=e,
+        ) from e
+    return StatusPage(
+        {str(key): str(value) for key, value in page.statuses.items()},
+        page.delivered,
+        page.pagination,
+    )
 
 
 def _extract_task(result: object) -> tuple[dict | None, Exception | None]:
     """Extract a ``get_task`` response's task from a ``dispatch_tool`` envelope (see
     :func:`_unwrap_dispatch_envelope`), as a ``(task, error)`` pair.
 
-    Beside :func:`_extract_statuses_map` and over the same seam, for the same reason:
-    one envelope policy for every parser.  Three readings, which
+    Three readings, which
     ``orchestrator/src/orchestrator/flake_ledger.py::resolve_debt`` must tell apart:
 
     - ``(task, None)`` — a dict carrying ``status``, after descending one ``data``
       layer (the wrapper ``scheduler.py::Scheduler.get_task`` also unwraps);
-    - ``(None, None)`` — :data:`_TASK_NOT_FOUND_ERROR_TYPE`, a CORROBORATED ABSENCE;
+    - ``(None, None)`` — :data:`TASK_NOT_FOUND_ERROR_TYPE`, a CORROBORATED ABSENCE;
     - ``(None, exc)`` — any other ``error``, or an answer with no task in it.
 
     Construct-don't-raise.  ``metadata`` is deliberately left as the tool sent it: the
@@ -741,7 +730,7 @@ def _extract_task(result: object) -> tuple[dict | None, Exception | None]:
     dict, a JSON string or ``None``.
     """
     envelope = _unwrap_dispatch_envelope(result)
-    if envelope.get('error_type') == _TASK_NOT_FOUND_ERROR_TYPE:
+    if envelope.get('error_type') == TASK_NOT_FOUND_ERROR_TYPE:
         return None, None
     if 'error' in envelope:
         return None, _response_error('get_task answered with an error', envelope)
@@ -761,8 +750,8 @@ def _extract_metadata_matches(result: object) -> tuple[list[dict], bool, Excepti
     """One ``find_tasks_by_metadata`` page from a ``dispatch_tool`` result, as ``(rows,
     has_more, error)``.
 
-    Two branches, as in :func:`_extract_statuses_map`: a JSON-RPC body is parsed whole by
-    ``shared.mcp_envelope.parse_tool_result``, a bare shape by
+    Two branches: a JSON-RPC body is parsed whole by
+    ``shared.mcp_envelope.parse_tool_result``, an already-unwrapped bare shape by
     :func:`_unwrap_dispatch_envelope`.  Rows are returned as the tool sent them, so an
     int ``task_id`` stays an int.  Construct-don't-raise.
     """
@@ -792,17 +781,28 @@ _SUBMIT_TASK_TIMEOUT_SECS = 30
 _METADATA_LOOKUP_PAGE = 100
 
 
+class SchedulerTaskStore(Protocol):
+    """The scheduler surface :class:`SchedulerChronicFlakeTaskClient` reads and files through."""
+
+    async def dispatch_tool(
+        self, name: str, arguments: dict, *, timeout: float = ...,
+    ) -> dict: ...
+
+    async def submit_task(
+        self, arguments: dict, *, timeout: float = ...,
+    ) -> SubmitOutcome: ...
+
+
 class SchedulerChronicFlakeTaskClient:
-    """Concrete :class:`ChronicFlakeTaskClient` adapter over a duck-typed
-    scheduler exposing ``dispatch_tool`` (the ``SchedulerFacade`` surface) and
-    ``orchestrator/src/orchestrator/scheduler.py::Scheduler.submit_task``.
+    """Concrete :class:`ChronicFlakeTaskClient` adapter over a
+    :class:`SchedulerTaskStore`.
 
     Self-contained here (not in ``harness.py``) so this module never talks
     to the fused-memory MCP directly and avoids a workflow<->harness import
     cycle.
     """
 
-    def __init__(self, scheduler: Any, project_root: str | Path) -> None:
+    def __init__(self, scheduler: SchedulerTaskStore, project_root: str | Path) -> None:
         self._scheduler = scheduler
         self._project_root = str(project_root)
 
@@ -863,22 +863,35 @@ class SchedulerChronicFlakeTaskClient:
         TEXT, and an int on the wire would match nothing.
 
         The dispatch stays here so the seam remains ``dispatch_tool`` alone, but
-        the response is read by ``scheduler.py::Scheduler.get_statuses``' own
-        parser (see :func:`_extract_statuses_map`); ``orchestrator/tests/
-        test_chronic_flake.py::TestGetStatusesHasOneParser`` pins the two to
-        one answer over the real composition.
+        pages are read by ``shared/src/shared/status_paging.py::read_status_page``
+        (see :func:`_ledger_status_page`) and assembled by ``::walk_status_pages``:
+        the same reader and walk ``scheduler.py::Scheduler.get_statuses`` runs.
+        ``orchestrator/tests/test_chronic_flake.py::TestGetStatusesHasOneParser``
+        pins the two to one answer over the real composition, paged answers
+        included.
         """
+        arguments = {'project_root': self._project_root, 'ids': [str(i) for i in ids]}
+
+        async def _page(offset: int) -> StatusPage[str]:
+            try:
+                result = await self._scheduler.dispatch_tool(
+                    'get_statuses', status_page_arguments(arguments, offset),
+                )
+            except Exception:
+                logger.warning(
+                    'chronic_flake: get_statuses dispatch failed for ids=%s at offset %d',
+                    list(ids), offset, exc_info=True,
+                )
+                raise
+            return _ledger_status_page(result)
+
         try:
-            result = await self._scheduler.dispatch_tool(
-                'get_statuses',
-                {'project_root': self._project_root, 'ids': [str(i) for i in ids]},
-            )
-        except Exception as exc:
-            logger.warning(
-                'chronic_flake: get_statuses dispatch failed for ids=%s', list(ids), exc_info=True,
-            )
+            return await walk_status_pages(_page, self._project_root), None
+        except StatusPagingError as exc:
+            logger.warning('chronic_flake: get_statuses for ids=%s refused: %s', list(ids), exc)
             return {}, exc
-        return _extract_statuses_map(result)
+        except Exception as exc:
+            return {}, exc
 
     async def get_task(self, task_id: str) -> tuple[dict | None, Exception | None]:
         """One task, read live via ``dispatch_tool('get_task', ...)``, as the ``(task,
@@ -890,9 +903,11 @@ class SchedulerChronicFlakeTaskClient:
         so the ledger's warning carries the real cause.  The id is coerced to ``str``
         for the same reason ``get_statuses`` coerces its ids.
 
-        Not delegated to ``scheduler.py::Scheduler.get_task``: that returns ``None`` for
-        a failed read AND for a missing task, the very conflation this pair exists to
-        remove.
+        ``scheduler.py::Scheduler.read_task`` types the same reply as TaskFound /
+        TaskAbsent / TaskReadFailed, and :func:`_extract_task` still disagrees with it
+        on an ``isError`` envelope, a row without ``status`` and an ``error_type``-only
+        reply.  Projecting this pair from ``read_task`` and deleting
+        :func:`_extract_task` is ticket tkt_0RWS67MFHYSKHF60BWRYE8F1VR.
         """
         try:
             result = await self._scheduler.dispatch_tool(
@@ -906,21 +921,23 @@ class SchedulerChronicFlakeTaskClient:
         return _extract_task(result)
 
     async def find_tasks_by_metadata(
-        self, key: str, value: str, statuses: Sequence[str],
+        self, key: str, value: str | None, statuses: Sequence[str], *, include_value: bool = False,
     ) -> tuple[list[dict], Exception | None]:
         """Every task in one of *statuses* whose top-level metadata *key* holds *value*,
         read page by page via ``dispatch_tool('find_tasks_by_metadata', ...)``.
 
+        A ``None`` *value* is a presence lookup, and *include_value* adds each row's
+        ``matched_value``; neither alters the wire of a call that omits them.
         An empty list is an answer (no such task), so a failure is reported in band as
         ``([], error)``: never a partial list, and never a raise, like its siblings.
         """
-        arguments = {
-            'project_root': self._project_root,
-            'key': key,
-            'value': value,
-            'statuses': list(statuses),
-            'limit': _METADATA_LOOKUP_PAGE,
-        }
+        arguments: dict = {'project_root': self._project_root, 'key': key}
+        if value is not None:
+            arguments['value'] = value
+        arguments['statuses'] = list(statuses)
+        arguments['limit'] = _METADATA_LOOKUP_PAGE
+        if include_value:
+            arguments['include_value'] = True
         rows: list[dict] = []
         has_more = True
         while has_more:
@@ -941,7 +958,7 @@ class SchedulerChronicFlakeTaskClient:
         except Exception as exc:
             logger.warning(
                 'chronic_flake: find_tasks_by_metadata dispatch failed for %s=%s',
-                arguments['key'], arguments['value'], exc_info=True,
+                arguments['key'], arguments.get('value'), exc_info=True,
             )
             return [], False, exc
         return _extract_metadata_matches(result)

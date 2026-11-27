@@ -50,7 +50,7 @@ ALL_TOOL_KINDS = list(ToolKind)
 
 
 def _classify(tool: ToolKind, output: str, rc: int, timed_out: bool) -> FailureCategory:
-    from orchestrator.verify_classify import classify_failure  # noqa: PLC0415
+    from orchestrator.verify_classify import classify_failure
 
     return classify_failure(tool, rc, output, timed_out)
 
@@ -2851,7 +2851,7 @@ def _summarize(*args, **kwargs):
     going through this harness.  Widening every old call site instead would
     have been fourteen edits that assert nothing.
     """
-    from orchestrator.verify import _summarize_checks  # noqa: PLC0415
+    from orchestrator.verify import _summarize_checks
 
     return _summarize_checks(*args, **kwargs)[:4]
 

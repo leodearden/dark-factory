@@ -29,10 +29,13 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.memory_metadata import ParentHasChildrenError
 from fused_memory.server.tools import create_mcp_server
-from fused_memory.services.memory_service import DescendantScan
+from fused_memory.services.memory_service import DescendantScan, MemoryService
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 # Doomed duplicate and its surviving replacement — both canonical 36-char UUIDs.
 DOOMED = '2531b4d8-1111-4aaa-8bbb-000000000001'
@@ -60,7 +63,9 @@ def _task(task_id, status, metadata):
     return {'id': task_id, 'status': status, 'title': f'task {task_id}', 'metadata': metadata}
 
 
-def _make_service(resolvable=(SURVIVOR,), descendants=(), truncated=False, children=()):
+def _make_service(
+    resolvable=(SURVIVOR,), descendants=(), truncated=False, children=(), missing=(),
+):
     """MemoryService whose awaited children are EXPLICIT AsyncMocks.
 
     Required by tests/test_check_bare_magicmock_config.py and
@@ -78,6 +83,9 @@ def _make_service(resolvable=(SURVIVOR,), descendants=(), truncated=False, child
     gate ``delete_memory`` runs internally, exposed so the tool can ask
     "would this be refused?" BEFORE the citation gate mutates anything.
     *children* makes it raise, modelling a target that still has them.
+
+    ``memory_exists`` is the target-existence probe the tool asks before any
+    citation pass; *missing* names the ids it answers False for.
     """
     svc = AsyncMock()
     svc.delete_memory = AsyncMock(
@@ -100,6 +108,11 @@ def _make_service(resolvable=(SURVIVOR,), descendants=(), truncated=False, child
         return_value=DescendantScan(ids=list(descendants), truncated=truncated),
     )
     svc.refuse_if_children = AsyncMock(side_effect=_refuse_if_children)
+
+    async def _exists(memory_id, *, store, project_id):
+        return memory_id not in missing
+
+    svc.memory_exists = AsyncMock(side_effect=_exists)
     return svc
 
 
@@ -652,7 +665,9 @@ class TestAllowDanglingCitationsEscape:
 
         assert result['error_type'] == 'CitationRepointRequired', value
         mock_service.delete_memory.assert_not_awaited()
-        assert result['ignored_override'] == {'allow_dangling_citations': value}
+        assert result['ignored_override'] == {
+            'allow_dangling_citations': value, 'is_remedy': True,
+        }
         assert 'literal boolean True' in result['hint']
 
     @pytest.mark.asyncio
@@ -1457,10 +1472,11 @@ class TestCascadeCitationRepointPass:
 
         async def _blink(project_root):
             calls['n'] += 1
-            # One scan per record per pass and no sweeps on the override
-            # arm: calls 1-3 are the pre-flight, 4 and 5 are GRANDCHILD's
-            # and CHILD's repoint-pass scans, so 6 is the target's.
-            if calls['n'] >= 6:
+            # One batched pre-flight read, then one scan per record on the
+            # repoint pass and no sweeps on the override arm: call 1 is the
+            # pre-flight, 2 and 3 are GRANDCHILD's and CHILD's repoint-pass
+            # scans, so 4 is the target's.
+            if calls['n'] >= 4:
                 raise RuntimeError('task db blinked')
             return snapshot
 
@@ -1558,11 +1574,12 @@ class TestCascadeCitationRepointPass:
 
         assert result['status'] == 'deleted'
         assert mock_service.get_memory_by_id.await_count == 1
-        # The citation scan is NOT memoized and must not become so: it is the
-        # fail-closed guarantee, and a task can begin citing a doomed id at
-        # any moment. Three pre-flight scans, three on the repoint pass, plus
-        # each sweep's own read.
-        assert interceptor.get_tasks.await_count >= 6
+        # The repoint pass's citation scan is NOT memoized and must not become
+        # so: it is the fail-closed guarantee, and a task can begin citing a
+        # doomed id at any moment. One batched pre-flight read, then one live
+        # scan per record on the repoint pass (3) plus the sweep's own read for
+        # each of the two cited records (2).
+        assert interceptor.get_tasks.await_count == 6
 
     @pytest.mark.asyncio
     async def test_uncited_cascade_pays_for_no_writes(self, mock_service):
@@ -1761,12 +1778,12 @@ class TestCascadePreflightFailsClosedAndCostsNothingWhenInactive:
 
     @pytest.mark.asyncio
     async def test_descendant_scan_failure_blocks_the_cascade(self):
-        """(c) The per-id fail-closed arm reaches the aggregate.
+        """(c) The fail-closed arm reaches the aggregate.
 
-        The first scan (the descendant, deepest-first) cannot be read, so
-        that id's CitationScanFailed rides the blocked list and the whole
-        cascade is refused — an unreadable citation state for ONE record in
-        the set is enough.
+        The pre-flight reads the task tree ONCE for the whole set, so one
+        failed read leaves EVERY id's citation state unknown: each rides the
+        blocked list as CitationScanFailed and the whole cascade is refused.
+        A second read would have succeeded, and is never made.
         """
         service = _make_service(descendants=[CHILD])
         interceptor = _make_interceptor([])
@@ -1778,8 +1795,10 @@ class TestCascadePreflightFailsClosedAndCostsNothingWhenInactive:
         result = await _call_delete(mcp_server, cascade=True)
 
         assert result['error_type'] == 'CascadeCitationGateRejected'
-        assert [b['memory_id'] for b in result['blocked']] == [CHILD]
-        assert result['blocked'][0]['error_type'] == 'CitationScanFailed'
+        assert [b['memory_id'] for b in result['blocked']] == [CHILD, DOOMED]
+        assert {b['error_type'] for b in result['blocked']} == {'CitationScanFailed'}
+        assert {b['scan_error_type'] for b in result['blocked']} == {'RuntimeError'}
+        assert interceptor.get_tasks.await_count == 1
         service.delete_memory.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -1963,3 +1982,427 @@ class TestChildRefusalPrecedesAnyRepoint:
 
         assert result['status'] == 'deleted'
         service.refuse_if_children.assert_not_awaited()
+
+
+class TestIgnoredOverrideNoteAdvertisesOnlyARealRemedy:
+    """A non-boolean override is always NAMED, but "resend it" only where it helps.
+
+    The note telling a caller to resend allow_dangling_citations as JSON true
+    is advice, and advice into a wall is worse than none. On a
+    CitationReplacement* refusal taking the override would strand live citers
+    the caller has a survivor for; CitationScanFailed cannot be unlocked by it
+    at all. Only a refusal for which the override is the documented remedy may
+    advertise the resend.
+    """
+
+    @pytest.fixture
+    def mock_service(self):
+        return _make_service()
+
+    @pytest.fixture
+    def interceptor(self):
+        return _make_interceptor([
+            _task('1701', 'pending', {'mem0_canonical_entry': DOOMED}),
+        ])
+
+    @pytest.fixture
+    def mcp_server(self, mock_service, interceptor):
+        return create_mcp_server(
+            mock_service, task_interceptor=interceptor, known_projects=KNOWN_PROJECTS,
+        )
+
+    @staticmethod
+    def _assert_named_but_no_resend(result, value):
+        assert result['ignored_override'] == {
+            'allow_dangling_citations': value, 'is_remedy': False,
+        }
+        assert 'is not the way past THIS refusal' in result['hint']
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('value', ['yes', 1, 'true'])
+    async def test_a_malformed_replacement_is_not_told_to_resend(
+        self, mcp_server, mock_service, value,
+    ):
+        result = await _call_delete(
+            mcp_server,
+            agent_id='claude-interactive',
+            replacement_memory_id=SURVIVOR[:8],
+            metadata={'allow_dangling_citations': value},
+        )
+
+        assert result['error_type'] == 'CitationReplacementInvalid'
+        self._assert_named_but_no_resend(result, value)
+        assert 'copy it from the search result' in result['hint']
+        mock_service.delete_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('value', ['yes', 1, 'true'])
+    async def test_an_unresolvable_replacement_is_not_told_to_resend(
+        self, mcp_server, mock_service, value,
+    ):
+        result = await _call_delete(
+            mcp_server,
+            agent_id='claude-interactive',
+            replacement_memory_id=HALLUCINATED,
+            metadata={'allow_dangling_citations': value},
+        )
+
+        assert result['error_type'] == 'CitationReplacementNotFound'
+        self._assert_named_but_no_resend(result, value)
+        assert "Re-read the surviving entry's id" in result['hint']
+        mock_service.delete_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('value', ['yes', 1, 'true'])
+    async def test_a_scan_failure_is_not_told_to_resend(self, mock_service, value):
+        interceptor = _make_interceptor([])
+        interceptor.get_tasks = AsyncMock(side_effect=RuntimeError('task db unreachable'))
+        mcp_server = create_mcp_server(
+            mock_service, task_interceptor=interceptor, known_projects=KNOWN_PROJECTS,
+        )
+
+        result = await _call_delete(
+            mcp_server,
+            agent_id='claude-interactive',
+            metadata={'allow_dangling_citations': value},
+        )
+
+        assert result['error_type'] == 'CitationScanFailed'
+        self._assert_named_but_no_resend(result, value)
+        mock_service.delete_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('value', ['yes', 1, 'true'])
+    async def test_a_cascade_blocked_only_by_missing_repoints_is_told_to_resend(
+        self, value,
+    ):
+        """Positive control: every blocked[] entry is CitationRepointRequired,
+        for which the override is the documented remedy."""
+        service = _make_service(descendants=[CHILD])
+        interceptor = _make_interceptor([
+            _task('1711', 'pending', {'mem0_canonical_entry': CHILD}),
+            _task('1712', 'pending', {'mem0_canonical_entry': DOOMED}),
+        ])
+        mcp_server = create_mcp_server(
+            service, task_interceptor=interceptor, known_projects=KNOWN_PROJECTS,
+        )
+
+        result = await _call_delete(
+            mcp_server,
+            cascade=True,
+            metadata={'allow_dangling_citations': value},
+        )
+
+        assert result['error_type'] == 'CascadeCitationGateRejected'
+        assert {b['error_type'] for b in result['blocked']} == {'CitationRepointRequired'}
+        assert result['escape_offered'] is True
+        assert result['ignored_override'] == {
+            'allow_dangling_citations': value, 'is_remedy': True,
+        }
+        assert 'Resend it as JSON true' in result['hint']
+        service.delete_memory.assert_not_awaited()
+
+
+class TestCascadeHintOffersTheEscapeOnlyWhereItIsTheRemedy:
+    """The cascade refusal's hint names allow_dangling_citations only when
+    every blocked[] record is one the override is meant to clear.
+
+    A replacement-class refusal was reached BY naming a survivor, so the escape
+    there would strand citers the caller can repoint; the replacement-outside-set
+    refusal is decided before the override is even consulted.
+    """
+
+    @staticmethod
+    def _server(service, interceptor):
+        return create_mcp_server(
+            service, task_interceptor=interceptor, known_projects=KNOWN_PROJECTS,
+        )
+
+    @staticmethod
+    def _assert_shared_cascade_guidance(hint):
+        assert 'nothing was deleted' in hint
+        assert 'blocked[]' in hint
+
+    @classmethod
+    def _assert_no_escape_offered(cls, result):
+        assert result['escape_offered'] is False
+        assert 'a wrong one is wrong for every record' in result['hint']
+        cls._assert_shared_cascade_guidance(result['hint'])
+
+    @pytest.mark.asyncio
+    async def test_a_replacement_inside_the_set_is_not_offered_the_escape(self):
+        service = _make_service(descendants=[CHILD])
+        interceptor = _make_interceptor([
+            _task('1801', 'pending', {'mem0_canonical_entry': DOOMED}),
+        ])
+
+        result = await _call_delete(
+            self._server(service, interceptor), cascade=True, replacement_memory_id=CHILD,
+        )
+
+        assert result['error_type'] == 'CascadeCitationGateRejected'
+        assert result['blocked'][0]['error_type'] == 'CitationReplacementInvalid'
+        self._assert_no_escape_offered(result)
+        service.delete_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_an_unresolvable_replacement_is_not_offered_the_escape(self):
+        service = _make_service(descendants=[CHILD])
+        interceptor = _make_interceptor([
+            _task('1811', 'pending', {'mem0_canonical_entry': CHILD}),
+            _task('1812', 'pending', {'mem0_canonical_entry': DOOMED}),
+        ])
+
+        result = await _call_delete(
+            self._server(service, interceptor),
+            cascade=True,
+            replacement_memory_id=HALLUCINATED,
+        )
+
+        assert result['error_type'] == 'CascadeCitationGateRejected'
+        assert [b['error_type'] for b in result['blocked']] == [
+            'CitationReplacementNotFound', 'CitationReplacementNotFound',
+        ]
+        self._assert_no_escape_offered(result)
+        service.delete_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_missing_repoints_are_offered_the_escape(self):
+        service = _make_service(descendants=[CHILD])
+        interceptor = _make_interceptor([
+            _task('1821', 'pending', {'mem0_canonical_entry': CHILD}),
+            _task('1822', 'pending', {'mem0_canonical_entry': DOOMED}),
+        ])
+
+        result = await _call_delete(self._server(service, interceptor), cascade=True)
+
+        assert result['error_type'] == 'CascadeCitationGateRejected'
+        assert [b['error_type'] for b in result['blocked']] == [
+            'CitationRepointRequired', 'CitationRepointRequired',
+        ]
+        assert result['escape_offered'] is True
+        assert 'allow_dangling_citations' in result['hint']
+        self._assert_shared_cascade_guidance(result['hint'])
+        service.delete_memory.assert_not_awaited()
+
+
+class TestCascadePreflightReadsTheTaskTreeOnce:
+    """The non-mutating pre-flight answers for the whole set from ONE read.
+
+    Each record's question is the same gate's, so the rules keep one home; only
+    the task-tree READ is shared. The mutating pass still reads live per
+    record, because that re-read is the fail-closed guarantee.
+    """
+
+    @staticmethod
+    def _server(service, interceptor):
+        return create_mcp_server(
+            service, task_interceptor=interceptor, known_projects=KNOWN_PROJECTS,
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_refused_preflight_reads_the_task_tree_once(self):
+        service = _make_service(descendants=[GRANDCHILD, CHILD])
+        interceptor = _make_interceptor([
+            _task('1901', 'pending', {'mem0_canonical_entry': GRANDCHILD}),
+            _task('1902', 'pending', {'mem0_canonical_entry': CHILD}),
+            _task('1903', 'pending', {'mem0_canonical_entry': DOOMED}),
+        ])
+
+        result = await _call_delete(self._server(service, interceptor), cascade=True)
+
+        assert result['error_type'] == 'CascadeCitationGateRejected'
+        assert [b['memory_id'] for b in result['blocked']] == [GRANDCHILD, CHILD, DOOMED]
+        assert interceptor.get_tasks.await_count == 1
+        service.delete_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_the_mutating_pass_still_reads_live_per_record(self):
+        service = _make_service(descendants=[GRANDCHILD, CHILD])
+        interceptor = _make_interceptor([
+            _task('1911', 'pending', {'unrelated': 'nothing'}),
+        ])
+
+        result = await _call_delete(self._server(service, interceptor), cascade=True)
+
+        assert result['status'] == 'deleted'
+        # One pre-flight read, then one LIVE read per record on the pass.
+        assert interceptor.get_tasks.await_count == 4
+        service.delete_memory.assert_awaited_once()
+
+
+class TestMissingTargetIsRefusedBeforeAnyCitationPass:
+    """A delete whose target does not exist must not have mutated anything.
+
+    The service returns ``MemoryNotFound`` for a missing target, but only
+    after the tool layer's citation passes have run. A cascade aimed at a
+    missing parent whose orphaned children survive used to repoint and
+    tombstone the citers of those LIVE children, then delete nothing; the
+    override arm logged dangles for deletes that never ran.
+    """
+
+    @pytest.fixture
+    def interceptor(self):
+        return _make_interceptor([
+            _task('1801', 'pending', {'mem0_canonical_entry': CHILD}),
+            _task('1802', 'pending', {'mem0_canonical_entry': DOOMED}),
+        ])
+
+    def _server(self, service, interceptor):
+        return create_mcp_server(
+            service, task_interceptor=interceptor, known_projects=KNOWN_PROJECTS,
+        )
+
+    @pytest.mark.asyncio
+    async def test_cascade_on_a_missing_parent_rewrites_no_task(self, interceptor):
+        service = _make_service(descendants=[CHILD], missing=[DOOMED])
+        mcp_server = self._server(service, interceptor)
+
+        result = await _call_delete(
+            mcp_server, cascade=True, replacement_memory_id=SURVIVOR,
+        )
+
+        assert result['error_type'] == 'MemoryNotFound'
+        assert result['id'] == DOOMED
+        assert 'cascade_citation_repoint' not in result
+        interceptor.update_task.assert_not_awaited()
+        service.list_descendant_ids.assert_not_awaited()
+        service.delete_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_single_record_replacement_on_a_missing_target_rewrites_no_task(
+        self, interceptor,
+    ):
+        service = _make_service(missing=[DOOMED])
+        mcp_server = self._server(service, interceptor)
+
+        result = await _call_delete(mcp_server, replacement_memory_id=SURVIVOR)
+
+        assert result['error_type'] == 'MemoryNotFound'
+        interceptor.update_task.assert_not_awaited()
+        service.refuse_if_children.assert_not_awaited()
+        service.delete_memory.assert_not_awaited()
+
+    @pytest.mark.parametrize('cascade', [False, True])
+    @pytest.mark.asyncio
+    async def test_override_on_a_missing_target_claims_no_dangle(
+        self, interceptor, caplog, cascade,
+    ):
+        service = _make_service(descendants=[CHILD], missing=[DOOMED])
+        mcp_server = self._server(service, interceptor)
+
+        with caplog.at_level('WARNING'):
+            result = await _call_delete(
+                mcp_server, cascade=cascade,
+                metadata={'allow_dangling_citations': True},
+            )
+
+        assert result['error_type'] == 'MemoryNotFound'
+        assert 'dangled_citations' not in result
+        assert not [r for r in caplog.records if 'dangling' in r.getMessage()]
+        service.delete_memory.assert_not_awaited()
+
+    @pytest.mark.parametrize('override', [None, 'yes'])
+    @pytest.mark.asyncio
+    async def test_a_plain_delete_of_a_missing_cited_target_is_not_offered_an_escape(
+        self, interceptor, override,
+    ):
+        """A citation refusal would advertise replacement_memory_id and
+        allow_dangling_citations; either retry meets ``MemoryNotFound``, so
+        that is the refusal given first."""
+        service = _make_service(missing=[DOOMED])
+        mcp_server = self._server(service, interceptor)
+        extra = {} if override is None else {'metadata': {'allow_dangling_citations': override}}
+
+        result = await _call_delete(mcp_server, **extra)
+
+        assert result['error_type'] == 'MemoryNotFound'
+        assert result['id'] == DOOMED
+        assert 'citing_tasks' not in result
+        if override is not None:
+            assert result['ignored_override'] == {
+                'allow_dangling_citations': override, 'is_remedy': False,
+            }
+        interceptor.update_task.assert_not_awaited()
+        service.delete_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_an_uncited_plain_delete_pays_for_no_existence_probe(self):
+        """The probe is charged on the refusal path only; the service settles
+        existence itself for a delete the gate lets through."""
+        service = _make_service()
+        interceptor = _make_interceptor([
+            _task('1803', 'pending', {'unrelated': 'nothing'}),
+        ])
+
+        result = await _call_delete(self._server(service, interceptor))
+
+        assert result['status'] == 'deleted'
+        service.memory_exists.assert_not_awaited()
+        service.delete_memory.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_an_existing_target_still_repoints_and_deletes(self, interceptor):
+        """Positive control: the probe answering True leaves the path as it was."""
+        service = _make_service()
+        mcp_server = self._server(service, interceptor)
+
+        result = await _call_delete(mcp_server, replacement_memory_id=SURVIVOR)
+
+        assert result['status'] == 'deleted'
+        service.memory_exists.assert_awaited_once()
+        interceptor.update_task.assert_awaited_once()
+        service.delete_memory.assert_awaited_once()
+
+
+class TestMissingParentCascadeOverARealService:
+    """The reviewer's probe, end to end: the real MCP tool over a real
+    MemoryService, DOOMED absent from Qdrant, CHILD an orphan still carrying
+    DOOMED as its ``parent_id`` and cited by a live task."""
+
+    @pytest.fixture
+    def service(self, mock_config):
+        svc = MemoryService(mock_config)
+        svc.graphiti = MagicMock()
+        svc.mem0 = MagicMock()
+
+        async def _point(memory_id, scope):
+            if memory_id == DOOMED:
+                return None
+            return {'id': CHILD, 'memory': 'live child', 'metadata': {'parent_id': DOOMED}}
+
+        async def _count(scope, filters):
+            return 1 if filters.get('parent_id') == DOOMED else 0
+
+        svc.mem0.get_point_by_id = AsyncMock(side_effect=_point)
+        svc.mem0.count_by_metadata = AsyncMock(side_effect=_count)
+        svc.mem0.scroll_by_metadata = AsyncMock(
+            return_value=[{'id': CHILD, 'memory': 'live child', 'metadata': {'parent_id': DOOMED}}],
+        )
+        svc.mem0.delete = AsyncMock(return_value={'message': 'deleted'})
+        return svc
+
+    @pytest.mark.asyncio
+    async def test_no_citer_of_a_surviving_child_is_rewritten(self, service, caplog):
+        interceptor = _make_interceptor([
+            _task('1', 'pending', {'mem0_canonical_entry': CHILD}),
+        ])
+        mcp_server = create_mcp_server(
+            service, task_interceptor=interceptor, known_projects=KNOWN_PROJECTS,
+        )
+
+        with caplog.at_level('WARNING'):
+            result = await _call_delete(
+                mcp_server, cascade=True, replacement_memory_id=SURVIVOR,
+            )
+
+        assert result['error_type'] == 'MemoryNotFound'
+        assert 'cascade_citation_repoint' not in result
+        interceptor.update_task.assert_not_awaited()
+        service.mem0.delete.assert_not_awaited()
+        assert not [r for r in caplog.records if 'dangling' in r.getMessage()]
+        # Control: the miss was actually read from the store, not assumed.
+        assert any(
+            DOOMED in c.args or DOOMED in c.kwargs.values()
+            for c in service.mem0.get_point_by_id.await_args_list
+        )

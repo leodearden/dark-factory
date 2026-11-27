@@ -8,10 +8,9 @@ from __future__ import annotations
 
 import ast
 import asyncio
-import contextlib
 import functools
+import logging
 import os
-import signal
 import subprocess
 import sys
 from pathlib import Path
@@ -19,52 +18,23 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from _predicate_specimens import POLLUTED_PREDICATE_OUTPUT
+from _script_survivor import (
+    SURVIVOR_SCRIPT,
+    await_recorded_pid,
+    kill_survivor,
+    needs_group_pidfd_signals,
+)
+from df_pytest_isolation import wait_pid_gone
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
-from shared.proc_group import SigkillDispatch
+from shared.process_identity import ProcessIdentity, capture
 
 # The one orchestrator symbol imported at module scope (the rest are imported
 # inside each test, as this file has always done): a `parametrize` decorator is
 # evaluated at collection time, so the disposition matrix below cannot name its
 # enum members any other way.
-from orchestrator.deterministic_runner import ProcessTeardown
-
-# ---------------------------------------------------------------------------
-# Task 3286 — the real task-2902 specimen shape.
-#
-# `_default_run_script` merges stderr into stdout and returns `[-2000:]`, so a
-# chatty predicate script's server-log noise reached `done_provenance.note`
-# verbatim — and from there fused-memory's `_format_outcome_echo` wrote it into
-# a Mem0 completion summary.  The live note on task 2902 is exactly 1999 chars:
-# it starts MID-TOKEN (the 2000-char tail cut), carries FalkorDB identity-scan
-# WARNINGs naming the unrelated project `my_solar_challenge` plus `httpx` HTTP
-# request lines, and ends with the script's own pretty-printed dry-run JSON
-# verdict — the ONE part actually worth keeping.
-#
-# Shape-faithful, not byte-identical: reproduced from the plan's analysis (the
-# live task is a preserved forensic specimen and is never re-read or mutated
-# by this suite).  An abridged copy lives in
-# scripts/tests/test_scan_provenance_note_log_leaks.py — the two suites cannot
-# share imports across orchestrator/tests/ and scripts/tests/.
-# ---------------------------------------------------------------------------
-
-POLLUTED_PREDICATE_OUTPUT = """\
-_tariff_pence_per_kwh' in group 'my_solar_challenge' (exact-name identity gate should prevent this — investigate)
-2026-07-30 16:39:00,523 fused_memory.backends.graphiti_client WARNING identity scan found 3 candidate nodes for 'import_tariff_pence_per_kwh' in group 'my_solar_challenge'
-2026-07-30 16:39:00,584 fused_memory.backends.graphiti_client WARNING identity scan found 2 candidate nodes for 'export_tariff_pence_per_kwh' in group 'my_solar_challenge'
-2026-07-30 16:39:00,625 httpx INFO HTTP Request: GET http://localhost:6333 "HTTP/1.1 200 OK"
-2026-07-30 16:39:00,701 httpx INFO HTTP Request: POST http://localhost:6333/collections/mem0/points/scroll "HTTP/1.1 200 OK"
-2026-07-30 16:39:00,742 fused_memory.backends.graphiti_client WARNING identity scan found 4 candidate nodes for 'battery_state_of_charge' in group 'my_solar_challenge'
-{
-  "dry_run": true,
-  "before": {
-    "total_source": 0,
-    "total_with_kind": 0
-  },
-  "orphan_count": 0,
-  "orphan_ids": [],
-  "verdict": "clean"
-}"""
+from orchestrator.before_done_script import REAP_GRACE_SECS, ProcessTeardown
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -201,8 +171,16 @@ def _seed_resolved_gate(queue: EscalationQueue, task_id: str) -> Escalation:
         category='milestone_gate', summary='Ship feature gate', level=2,
     )
     queue.submit(esc)
-    queue.resolve(esc.id, 'human resolved the gate', resolved_by='human')
+    queue.resolve(esc.id, 'human resolved the gate', resolved_by='human', resolution_class='actionable')
     return esc
+
+
+def _runnable_script(directory: Path, name: str = 'restart-deploy.sh') -> Path:
+    directory.mkdir(parents=True, exist_ok=True)
+    script = directory / name
+    script.write_text('#!/bin/sh\nexit 0\n')
+    script.chmod(0o755)
+    return script
 
 
 def _deploy_task(
@@ -373,49 +351,6 @@ _FRESH_UNIT_STATE: dict = {
     'ActiveEnterTimestampMonotonic': 2_000_000,
 }
 
-# The already-exited-script timeout shape (task 4252): the script exits while a
-# child it spawned keeps the merged stdout pipe open, so `_terminate_process
-# _tree`'s pid-recycling guard dispatches NO signal and that child is still
-# alive when the test's assertions run — which is exactly what those tests
-# assert.  Every such test must therefore reap it itself, or leak a live
-# `sleep 30` past pytest exit (measured by the reviewer on the first of them).
-_SURVIVOR_SCRIPT = (
-    '#!/bin/sh\n'
-    'sleep 30 &\n'
-    'echo $! > "$1"\n'
-    'echo started\n'
-    'exit 7\n'
-)
-
-
-def _read_survivor_pid(pidfile: Path) -> int:
-    """The pid ``_SURVIVOR_SCRIPT`` recorded for the child that outlived it.
-
-    Written milliseconds into the run, long before the 1s timeout fires, so it
-    is reliably on disk by the time a caller reads it.
-    """
-    return int(pidfile.read_text().strip())
-
-
-def _is_alive(pid: int) -> bool:
-    """Whether *pid* still exists — the signal-0 existence probe."""
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    return True
-
-
-def _kill_survivor(pidfile: Path) -> None:
-    """SIGKILL the process ``_SURVIVOR_SCRIPT`` left behind, if still there.
-
-    Tolerates every way the pid can already be gone (no file, empty file, the
-    process reaped in the meantime) so it is safe in a ``finally``.
-    """
-    with contextlib.suppress(OSError, ValueError):
-        os.kill(_read_survivor_pid(pidfile), signal.SIGKILL)
-
-
 def _seed_escalation(
     queue: EscalationQueue, task_id: str, agent_role: str, *,
     resolved: bool = False, category: str = 'infra_issue', level: int = 2,
@@ -437,7 +372,7 @@ def _seed_escalation(
     )
     queue.submit(esc)
     if resolved:
-        queue.resolve(esc.id, 'resolved for test setup')
+        queue.resolve(esc.id, 'resolved for test setup', resolution_class='actionable')
     return esc
 
 
@@ -1143,7 +1078,7 @@ class TestPureGateResumeHardening:
             category='milestone_gate', summary='Ship feature gate', level=2,
         )
         queue.submit(existing)
-        queue.resolve(existing.id, 'human approved the gate', resolved_by='human')
+        queue.resolve(existing.id, 'human approved the gate', resolved_by='human', resolution_class='actionable')
         # Sanity: resolved record is archived (not pending) but archive-visible.
         assert queue.get_by_task('99', status='pending') == []
         assert len(queue.get_by_task('99', agent_role='orchestrator-deterministic')) == 1
@@ -2017,7 +1952,7 @@ class TestHumanCuratorGateAdjudicationGuard:
         # ── 2. the human does the work, stamps, and resolves the re-ask ─────
         stamp = '2026-07-31T11:15:00+00:00'
         task['metadata']['human_curator_adjudicated_at'] = stamp
-        queue.resolve(re_ask.id, 'reviewed all 13 entries', resolved_by='human')
+        queue.resolve(re_ask.id, 'reviewed all 13 entries', resolved_by='human', resolution_class='actionable')
 
         # ── 3. re-dispatch: closes, citing the GATE record ──────────────────
         assert await runner.run(_make_assignment(task)) == WorkflowOutcome.DONE
@@ -2456,6 +2391,31 @@ class TestBeforeDoneCrossUnitDeploy:
 # the deploy script's exit code alone.
 # ---------------------------------------------------------------------------
 
+_TARGETLESS_RAN_AT = '2026-06-23T10:00:00+00:00'
+
+
+def _targetless_crash_before_done_write(queue: EscalationQueue) -> dict:
+    return _deploy_task(
+        task_id='2632', target_unit=None, before_done_ran_at=_TARGETLESS_RAN_AT,
+        before_done_verified_at='2026-06-23T10:01:00+00:00', before_done_verified_pid=0,
+    )
+
+
+def _targetless_human_resolution(queue: EscalationQueue) -> dict:
+    _seed_escalation(queue, '2632', 'orchestrator-deterministic', resolved=True)
+    return _deploy_task(
+        task_id='2632', target_unit=None, before_done_ran_at=_TARGETLESS_RAN_AT,
+        phase='escalated',
+    )
+
+
+def _targetless_gate_resolved(queue: EscalationQueue) -> dict:
+    task = _gate_task(task_id='2632', gate_escalated_at='2026-06-23T12:00:00+00:00')
+    task['metadata']['before_done'] = _deploy_task(target_unit=None)['metadata']['before_done']
+    task['metadata']['before_done_ran_at'] = _TARGETLESS_RAN_AT
+    return task
+
+
 @pytest.mark.asyncio
 class TestBeforeDoneTargetUnitlessDeploy:
     """DeterministicRunner — before_done cross-unit deploy with a falsy
@@ -2515,7 +2475,7 @@ class TestBeforeDoneTargetUnitlessDeploy:
         scheduler.set_task_status.assert_awaited_once()
         call = scheduler.set_task_status.call_args
         assert call.args[1] == 'done'
-        assert call.kwargs['done_provenance']['kind'] == 'deterministic-deploy'
+        assert call.kwargs['done_provenance']['kind'] == 'deterministic-deploy-unverified'
 
         verified_calls = [
             c for c in scheduler.update_task.call_args_list
@@ -2524,6 +2484,102 @@ class TestBeforeDoneTargetUnitlessDeploy:
         assert verified_calls, (
             'update_task must stamp before_done_verified_at (crash-safe verified stamp)'
         )
+
+    async def test_targetless_rc0_provenance_is_distinguishable_from_verified_empty_baseline(
+        self, tmp_path: Path,
+    ):
+        """Both record pid 0; only the kind says whether a unit was checked (task 5281)."""
+        from shared.task_metadata import DoneProvenance
+
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        queue = EscalationQueue(tmp_path)
+
+        async def _done_provenance(task: dict, unit_inspector: AsyncMock) -> dict:
+            scheduler = _mock_scheduler(task)
+            runner = DeterministicRunner(
+                scheduler=scheduler,
+                escalation_queue=queue,
+                unit_inspector=unit_inspector,
+                script_runner=AsyncMock(return_value=(0, 'ok')),
+            )
+            await runner.run(_make_assignment(task))
+            scheduler.set_task_status.assert_awaited_once()
+            return scheduler.set_task_status.call_args.kwargs['done_provenance']
+
+        targetless = await _done_provenance(
+            _deploy_task(task_id='2632', target_unit=None), AsyncMock(),
+        )
+        baseline_state = {
+            'MainPID': 0,
+            'ActiveState': 'inactive',
+            'ActiveEnterTimestamp': '',
+            'ActiveEnterTimestampMonotonic': 0,
+        }
+        fresh_state = {
+            'MainPID': 0,
+            'ActiveState': 'active',
+            'ActiveEnterTimestamp': 'Mon 2026-06-23 10:01:00 UTC',
+            'ActiveEnterTimestampMonotonic': 5_000_000,
+        }
+        verified = await _done_provenance(
+            _deploy_task(task_id='967', target_unit='legibility-trickle@dark-factory.timer'),
+            AsyncMock(side_effect=[baseline_state, fresh_state]),
+        )
+
+        assert targetless['kind'] == 'deterministic-deploy-unverified'
+        assert verified['kind'] == 'deterministic-deploy'
+        assert targetless != verified
+        assert 'unit' not in targetless
+        assert 'active_enter_timestamp' not in targetless
+        DoneProvenance.parse_for_write(targetless)
+
+    @pytest.mark.parametrize(
+        ('build_task', 'note'),
+        [
+            pytest.param(
+                _targetless_crash_before_done_write,
+                'resumed after deploy (crash before done write)',
+                id='crash-before-done-write',
+            ),
+            pytest.param(
+                _targetless_human_resolution,
+                'resumed after human resolution',
+                id='human-resolution',
+            ),
+            pytest.param(
+                _targetless_gate_resolved,
+                'resumed after gate resolution',
+                id='act-then-ask-gate-resolved',
+            ),
+        ],
+    )
+    async def test_targetless_resume_paths_record_unverified_kind(
+        self, tmp_path: Path, build_task, note,
+    ):
+        """A targetless deploy's kind must not depend on which path closed it (task 5281)."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        queue = EscalationQueue(tmp_path)
+        task = build_task(queue)
+        scheduler = _mock_scheduler(task)
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=AsyncMock(),
+            script_runner=AsyncMock(return_value=(0, 'ok')),
+        )
+
+        outcome = await runner.run(_make_assignment(task))
+
+        assert outcome == WorkflowOutcome.DONE
+        done_calls = [c for c in scheduler.set_task_status.call_args_list if c.args[1] == 'done']
+        assert len(done_calls) == 1
+        provenance = done_calls[0].kwargs['done_provenance']
+        assert provenance['kind'] == 'deterministic-deploy-unverified'
+        assert provenance['note'] == note
+        assert 'pid' not in provenance
 
     async def test_targetless_deploy_rc_nonzero_escalates_and_blocks(self, tmp_path: Path):
         """rc != 0 with a falsy target_unit must escalate + block — NOT
@@ -2983,15 +3039,16 @@ class TestDefaultRunnerInnerTimeoutDeployHonesty:
     ``communicate()`` times out with the script's REAL exit code already in
     hand.  That is the very shape Layer A (task 2087/2090) exists for, and
     reporting "no exit code was produced" there would swap a fabricated rc
-    for an affirmative falsehood (reviewer amendment).  It is also the shape
-    in which the teardown dispatches NO signal, so it pins the escalation
-    against claiming a kill and against losing the surviving process.
+    for an affirmative falsehood (reviewer amendment).  The teardown still
+    SIGKILLs that reaped script's whole group, through the leader pidfd
+    run_script holds from spawn (task 10370), so it pins the escalation to
+    report both the code and the kill, and the surviving child dead.
 
     The matrix test then drives every {exit code} x {teardown disposition}
     cell through the seam, pinning that the kill claim keys on the MEASURED
     disposition rather than on the exit code — which is not a sound proxy in
-    either direction, and whose exit-during-teardown cell no end-to-end test
-    can reach.
+    either direction, and whose code-without-signal cell no end-to-end test
+    can reach deterministically on a Linux 6.9+ kernel.
 
     A green-on-arrival companion closes the class: only the TIMEOUT wording
     moved, and a genuine non-zero exit code is still reported verbatim.
@@ -3189,6 +3246,7 @@ class TestDefaultRunnerInnerTimeoutDeployHonesty:
         ]
         assert done_calls == [], 'set_task_status must NOT be called with done on timeout'
 
+    @needs_group_pidfd_signals
     async def test_targetless_deploy_script_that_exited_reports_its_real_exit_code(
         self, tmp_path: Path,
     ):
@@ -3205,12 +3263,17 @@ class TestDefaultRunnerInnerTimeoutDeployHonesty:
         this task removed with an affirmative falsehood about a script that
         ran to completion.
 
-        And because the script was already reaped when the teardown ran, the
-        pid-recycling guard dispatched NO signal: the child holding the pipe
-        open is STILL RUNNING while this escalation is read.  So this test
-        also pins the escalation against claiming a kill — the most
-        operationally costly direction of the defect, since it tells an
-        operator a surviving process is gone when it is not.
+        The script was already reaped when the teardown ran, yet its whole
+        group is SIGKILLed through the leader pidfd run_script holds from
+        spawn (task 10370).  So the child holding the pipe open dies, and the
+        escalation must report that kill rather than send the operator to
+        find a survivor.
+
+        It pins that escalation text end to end, without holding the loop
+        clock until the script is measured reaped.
+        ``test_before_done_script.py::TestBeforeDoneSubprocessTimeoutHardening::test_timeout_of_a_reaped_script_kills_the_child_holding_its_pipe``
+        does hold it, and is the deterministic guard for the reaped-leader
+        shape itself.
         """
         import asyncio
 
@@ -3219,7 +3282,7 @@ class TestDefaultRunnerInnerTimeoutDeployHonesty:
 
         script = tmp_path / 'exits-but-child-lives.sh'
         pidfile = tmp_path / 'survivor.pid'
-        script.write_text(_SURVIVOR_SCRIPT)
+        script.write_text(SURVIVOR_SCRIPT)
         script.chmod(0o755)
 
         task = _deploy_task(
@@ -3242,8 +3305,12 @@ class TestDefaultRunnerInnerTimeoutDeployHonesty:
             script_runner=None,
         )
 
+        survivor: ProcessIdentity | None = None
         try:
-            outcome = await asyncio.wait_for(runner.run(assignment), timeout=20)
+            run = asyncio.ensure_future(asyncio.wait_for(runner.run(assignment), timeout=20))
+            survivor_pid = await await_recorded_pid(pidfile, run)
+            survivor = capture(survivor_pid)
+            outcome = await run
 
             assert outcome == WorkflowOutcome.BLOCKED
 
@@ -3280,37 +3347,27 @@ class TestDefaultRunnerInnerTimeoutDeployHonesty:
                 f'fired, so nothing was captured either way: {esc.detail!r}'
             )
 
-            survivor_pid = _read_survivor_pid(pidfile)
-            assert _is_alive(survivor_pid), (
+            assert survivor is not None, (
+                f'the precondition is child pid {survivor_pid} alive when it was recorded'
+            )
+            assert await asyncio.to_thread(wait_pid_gone, survivor_pid, timeout=REAP_GRACE_SECS), (
                 f'THE MEASUREMENT the assertions below are about: survivor pid '
-                f'{survivor_pid} is still RUNNING, because the teardown dispatched '
-                f'no signal to it at all'
+                f'{survivor_pid}, holding the pipe of a reaped script, must die '
+                f'with the group'
             )
-            assert 'SIGKILLed' not in esc.detail, (
-                f'HONESTY PIN (task 4252 reviewer finding): in this shape '
-                f"_terminate_process_tree's pid-recycling guard dispatched NO "
-                f'signal, so claiming a kill tells the operator that surviving '
-                f'process (pid {survivor_pid}, alive as this runs) is gone when it '
-                f'is not — the most operationally costly direction of the defect: '
-                f'{esc.detail!r}'
+            assert 'SIGKILLed' in esc.detail, (
+                f'the whole group WAS SIGKILLed through the held leader pidfd, so '
+                f'the detail must say so: {esc.detail!r}'
             )
-            assert 'nothing was signalled at all' in esc.detail, (
-                f'the detail must state that the process group was deliberately NOT '
-                f'signalled: {esc.detail!r}'
+            assert 'survivor was killed with the group' in esc.detail, (
+                f'...and that the child holding the pipe died with it: {esc.detail!r}'
             )
-            assert 'recycled pid' in esc.detail, (
-                f'...and WHY: the script had already been reaped, so signalling its '
-                f'pid could hit an unrelated group (task 845): {esc.detail!r}'
+            assert 'nothing was signalled at all' not in esc.detail, (
+                f'HONESTY PIN: a signal WAS dispatched: {esc.detail!r}'
             )
-            assert 'located and killed out-of-band' in esc.detail, (
-                f'nothing else will clean the survivor up, so the detail must tell '
-                f'the operator to find and kill it before resolving: {esc.detail!r}'
-            )
-            assert str(script) in esc.detail, (
-                f'...and must name the script path as the thing to search BY — the '
-                f'raw pid is deliberately not offered, since the runner refused to '
-                f'signal it precisely because it may now belong to an unrelated '
-                f'group: {esc.detail!r}'
+            assert 'located and killed out-of-band' not in esc.detail, (
+                f'the survivor is dead, so sending the operator to find and kill '
+                f'it would be a false lead: {esc.detail!r}'
             )
 
             done_calls = [
@@ -3323,7 +3380,7 @@ class TestDefaultRunnerInnerTimeoutDeployHonesty:
             )
             unit_inspector.assert_not_awaited()
         finally:
-            _kill_survivor(pidfile)
+            kill_survivor(survivor)
 
     @pytest.mark.parametrize('exit_code', [None, 7], ids=['no_exit_code', 'exited_rc7'])
     @pytest.mark.parametrize(
@@ -3342,11 +3399,12 @@ class TestDefaultRunnerInnerTimeoutDeployHonesty:
         out-of-band IFF it did not.
 
         ``exit_code`` is not a sound proxy for either, in either direction —
-        the common exited-script shape short-circuits the killpg entirely,
-        while a script that exits in the window between the timeout firing and
-        the killpg gets both a code AND a real group kill.  That second cell is
-        a race no end-to-end test can drive, which is why the matrix is driven
-        through the seam.
+        the common exited-script shape gets both a code AND a real group kill
+        end to end, through the leader pidfd held from spawn (task 10370),
+        while a script reaped before that pidfd was taken, or one on a kernel
+        before Linux 6.9, gets a code with no signal.  That second cell is a
+        race or a kernel no end-to-end test here can drive, which is why the
+        matrix is driven through the seam.
 
         Raising ``ScriptTimeout`` from an INJECTED ``script_runner`` is a
         deliberate test seam for reaching a specific measured shape.  It is not
@@ -3354,7 +3412,8 @@ class TestDefaultRunnerInnerTimeoutDeployHonesty:
         ``(rc, tail)`` pair, and only the default runner raises this (see the
         ``ScriptTimeout`` docstring).
         """
-        from orchestrator.deterministic_runner import DeterministicRunner, ScriptTimeout
+        from orchestrator.before_done_script import ScriptTimeout
+        from orchestrator.deterministic_runner import DeterministicRunner
         from orchestrator.workflow import WorkflowOutcome
 
         task = _deploy_task(task_id='4252e', target_unit=None)
@@ -3362,13 +3421,12 @@ class TestDefaultRunnerInnerTimeoutDeployHonesty:
         queue = EscalationQueue(tmp_path)
         scheduler = _mock_scheduler(task)
 
+        timeout = ScriptTimeout(1, exit_code=exit_code, teardown=teardown)
         runner = DeterministicRunner(
             scheduler=scheduler,
             escalation_queue=queue,
             unit_inspector=AsyncMock(),
-            script_runner=AsyncMock(
-                side_effect=ScriptTimeout(1, exit_code=exit_code, teardown=teardown),
-            ),
+            script_runner=AsyncMock(side_effect=timeout),
         )
 
         outcome = await runner.run(assignment)
@@ -3396,6 +3454,12 @@ class TestDefaultRunnerInnerTimeoutDeployHonesty:
             f'{teardown.name} left processes the script spawned alive, so the '
             f'detail must send the operator to find and kill them — and must '
             f'NOT say so when the group really was killed: {esc.detail!r}'
+        )
+        assert timeout.budget_line('Deploy script') in esc.detail, esc.detail
+        signal_death = exit_code is None and teardown is ProcessTeardown.NOT_SIGNALLED
+        assert ('died of a SIGNAL' in esc.detail) == signal_death, (
+            f'an already-reaped script with no exit code died of a signal, and '
+            f'only that cell may say so: {esc.detail!r}'
         )
 
     async def test_targetless_deploy_injected_runner_nonzero_rc_still_reports_rc(
@@ -4429,521 +4493,6 @@ class TestWritebackBackoffsSeam:
 
 
 # ---------------------------------------------------------------------------
-# Default seam: _default_run_script env merge
-# ---------------------------------------------------------------------------
-
-@pytest.mark.asyncio
-class TestDefaultRunScriptEnv:
-    """_default_run_script merges a partial env dict over os.environ."""
-
-    async def test_partial_env_inherits_path(self, tmp_path: Path):
-        """Passing a partial env dict must NOT drop os.environ — PATH must survive.
-
-        Regression guard for the latent footgun where ``create_subprocess_exec``
-        received the raw ``before_done['env']`` dict, which completely replaced the
-        process environment (no PATH/HOME/XDG_RUNTIME_DIR → most binaries fail to
-        resolve).  The fix merges over ``os.environ`` so the deploy script still runs
-        in a sane environment while callers can still override individual variables.
-        """
-        import os
-        from unittest.mock import AsyncMock as _AsyncMock
-        from unittest.mock import patch
-
-        from escalation.queue import EscalationQueue
-
-        from orchestrator.deterministic_runner import DeterministicRunner
-
-        queue = EscalationQueue(tmp_path)
-        runner = DeterministicRunner(scheduler=MagicMock(), escalation_queue=queue)
-
-        before_done = {
-            'script': '/usr/bin/true',
-            'args': [],
-            'env': {'MY_DEPLOY_VAR': 'hello'},
-            'cwd': str(tmp_path),
-            'timeout_secs': 5,
-            'target_unit': 'orchestrator-reify.service',
-        }
-
-        mock_proc = _AsyncMock()
-        mock_proc.communicate = _AsyncMock(return_value=(b'', b''))
-        mock_proc.returncode = 0
-
-        with patch('asyncio.create_subprocess_exec', return_value=mock_proc) as mock_exec:
-            await runner._default_run_script(before_done)
-
-        call_kwargs = mock_exec.call_args.kwargs
-        passed_env = call_kwargs['env']
-
-        assert passed_env is not None, (
-            'env must not be None when before_done.env is non-empty'
-        )
-        assert 'PATH' in passed_env, (
-            f'child must inherit PATH from os.environ when a partial env dict is '
-            f'passed; got env keys: {sorted(passed_env)}'
-        )
-        assert passed_env['PATH'] == os.environ['PATH'], (
-            'inherited PATH must match os.environ[PATH]'
-        )
-        assert passed_env['MY_DEPLOY_VAR'] == 'hello', (
-            'custom override from before_done.env must be present in merged env'
-        )
-
-
-# ---------------------------------------------------------------------------
-# Task 2090 — Layer A: whole-process-group kill on subprocess timeout
-# ---------------------------------------------------------------------------
-
-def _fake_pgid() -> int:
-    """A stand-in pgid that ``shared.proc_group.unsafe_pgid_reason`` will never refuse.
-
-    ``_terminate_process_tree`` delegates to
-    ``shared/src/shared/proc_group.py::sigkill_process_group``, which
-    sanity-checks the pgid against this process's own identifiers (task 3884
-    amendment), so a hard-coded literal can collide with
-    ``os.getpid()``/``os.getppid()``/``os.getpgrp()`` and make the helper
-    refuse-and-fall-back instead of dispatching the killpg these tests assert
-    on. That is ~1-in-1.4M with this box's ``pid_max=4194304``, but ~1-in-10k
-    on the older 32768 default — a real flake, and a baffling one to debug.
-    Deriving a provably-distinct value removes the class outright.
-    """
-    live = {os.getpid(), os.getppid(), os.getpgrp()}
-    candidate = 12345
-    while candidate in live:
-        candidate += 1
-    return candidate
-
-
-@pytest.mark.asyncio
-class TestBeforeDoneSubprocessTimeoutHardening:
-    """DeterministicRunner — Layer A: kill the WHOLE process tree on timeout.
-
-    Guards against the inherited-pipe hang behind task 2087's stranding:
-    restart-fused-memory.sh --drain spawns grandchildren (systemctl restart,
-    curl, journalctl, sleep, the restarted daemon) that inherit the write end
-    of the merged stdout pipe.  Killing only the direct child (pre-2090
-    behavior) leaves the tree alive and the pipe open forever.
-
-    Task 4065 / 4252 amendment: the timeout branch RAISES ``ScriptTimeout``
-    instead of returning ``(1, '<script timed out after Ns>')`` — see that
-    class's docstring for why — and that exception carries only MEASURED
-    data: the overrun budget it blew, the script's own exit code when the
-    teardown found it already exited, and WHICH SIGNAL that teardown actually
-    dispatched (``ProcessTeardown``).  No fabricated exit code, no stand-in
-    output, and no inferred kill.  The Layer-A teardown below is unchanged and
-    must still happen BEFORE the raise, so the grandchild-is-dead assertion
-    stays exactly as it was.
-
-    The teardown disposition is asserted in BOTH directions here, because the
-    two shapes are what the escalation text has to tell apart: a script still
-    running at teardown entry gets a real whole-group SIGKILL (and the
-    grandchild-is-dead assertion corroborates it), while a script that already
-    exited gets NO signal at all — its pid may have been recycled — so the
-    child it spawned is still running when the escalation is filed.  Each of
-    the four ``_terminate_process_tree`` branch tests below therefore also
-    pins the value it RETURNS, since those are the tests that independently
-    prove which branch ran.
-    """
-
-    async def test_timeout_kills_whole_process_group(self, tmp_path: Path):
-        """On timeout, a backgrounded grandchild must be killed too, not just
-        the direct child — and the timeout must surface as ``ScriptTimeout``.
-
-        The raise carries only MEASURED structured data (task 4252): the
-        overrun budget, and an ``exit_code`` that is ``None`` here because
-        this script's own process was still running when the kill fired.
-        (The exited-script case, where a surviving child holds the pipe open
-        and a real exit code IS in hand, is pinned by
-        ``TestDefaultRunnerInnerTimeoutDeployHonesty``.)
-        """
-        import asyncio
-        import os
-        import time
-
-        from orchestrator.deterministic_runner import (
-            DeterministicRunner,
-            ProcessTeardown,
-            ScriptTimeout,
-        )
-
-        script = tmp_path / 'hang.sh'
-        pidfile = tmp_path / 'grandchild.pid'
-        script.write_text(
-            '#!/bin/sh\n'
-            'sleep 60 &\n'
-            'echo $! > "$1"\n'
-            'sleep 60\n'
-        )
-        script.chmod(0o755)
-
-        queue = EscalationQueue(tmp_path)
-        runner = DeterministicRunner(scheduler=MagicMock(), escalation_queue=queue)
-
-        before_done = {
-            'script': str(script),
-            'args': [str(pidfile)],
-            'cwd': str(tmp_path),
-            'timeout_secs': 1,
-            'target_unit': 'orchestrator-reify.service',
-        }
-
-        # Hang tripwire: if the fix regresses into a real hang, fail loudly
-        # instead of stalling the suite.
-        with pytest.raises(ScriptTimeout) as excinfo:
-            await asyncio.wait_for(
-                runner._default_run_script(before_done), timeout=10,
-            )
-
-        exc = excinfo.value
-        assert exc.timeout_secs == 1, (
-            f'ScriptTimeout must carry the budget it overran, got {exc.timeout_secs!r}'
-        )
-        assert exc.exit_code is None, (
-            f'the direct child was still running when the timeout fired, so '
-            f'it produced no exit code — the teardown signal that killed it '
-            f'(a negative returncode) is not one, and must normalize to None: '
-            f'{exc.exit_code!r}'
-        )
-        assert exc.teardown is ProcessTeardown.GROUP_KILLED, (
-            f'the script was alive at teardown entry, so the whole-group '
-            f'SIGKILL really was dispatched — and the grandchild-is-dead '
-            f'assertion below is the INDEPENDENT corroboration that this '
-            f'disposition is honest, so the two agree by construction rather '
-            f'than by assumption (task 4252): {exc.teardown!r}'
-        )
-        assert not hasattr(exc, 'rc'), (
-            f'a SIGKILLed script produced NO exit code, so the exception must '
-            f'not carry a fabricated one for a caller to re-report to a human '
-            f'(task 4252), got rc={getattr(exc, "rc", None)!r}'
-        )
-        assert not hasattr(exc, 'tail'), (
-            f'no output was captured either — communicate() was cancelled by '
-            f'the timeout — so the old marker string was a placeholder, not '
-            f'script output (task 4252), got tail='
-            f'{getattr(exc, "tail", None)!r}'
-        )
-        assert 'no exit code' in str(exc), (
-            f'the message must still say what did NOT happen, so a log line '
-            f'carrying only str(exc) is readable: {str(exc)!r}'
-        )
-        assert '1s' in str(exc), (
-            f'the message must still name the budget it overran: {str(exc)!r}'
-        )
-
-        grandchild_pid = int(pidfile.read_text().strip())
-        deadline = time.monotonic() + 3.0
-        alive = True
-        while time.monotonic() < deadline:
-            try:
-                os.kill(grandchild_pid, 0)
-            except ProcessLookupError:
-                alive = False
-                break
-            await asyncio.sleep(0.05)
-        assert not alive, (
-            f'grandchild pid {grandchild_pid} must be dead after timeout — the '
-            f'WHOLE process group must be killed, not just the direct child'
-        )
-
-    async def test_timeout_of_already_exited_script_does_not_signal_the_group(
-        self, tmp_path: Path,
-    ):
-        """The other half of Layer A, measured: when the SCRIPT has already
-        exited, the teardown dispatches NO signal and the child it spawned
-        SURVIVES — so "exited" and "group killed" are independent facts.
-
-        Mechanism: ``communicate()`` waits for the merged stdout/stderr pipe to
-        CLOSE, and the child holding its write end keeps it open past the
-        script's own exit, while asyncio's child watcher populates
-        ``Process.returncode`` independently.  So ``returncode`` is ALREADY set
-        at teardown entry, and ``_terminate_process_tree``'s pid-recycling
-        short-circuit (task 845/3884) fires: refusing to signal a possibly
-        recycled pid beats reaping an orphan.
-
-        All three facts are asserted together because the escalation text is
-        built from them, and the defect this pins is text that infers a kill
-        from a timeout rather than reporting what was measured (task 4252
-        reviewer finding).
-        """
-        import asyncio
-
-        from orchestrator.deterministic_runner import (
-            DeterministicRunner,
-            ProcessTeardown,
-            ScriptTimeout,
-        )
-
-        script = tmp_path / 'exits-but-child-lives.sh'
-        pidfile = tmp_path / 'survivor.pid'
-        script.write_text(_SURVIVOR_SCRIPT)
-        script.chmod(0o755)
-
-        queue = EscalationQueue(tmp_path)
-        runner = DeterministicRunner(scheduler=MagicMock(), escalation_queue=queue)
-
-        before_done = {
-            'script': str(script),
-            'args': [str(pidfile)],
-            'cwd': str(tmp_path),
-            'timeout_secs': 1,
-            'target_unit': 'orchestrator-reify.service',
-        }
-
-        try:
-            # Hang tripwire, as in the sibling test above.
-            with pytest.raises(ScriptTimeout) as excinfo:
-                await asyncio.wait_for(
-                    runner._default_run_script(before_done), timeout=10,
-                )
-
-            exc = excinfo.value
-            assert exc.exit_code == 7, (
-                f'the script really did run to completion, and its exit code is '
-                f'in hand at the raise site: {exc.exit_code!r}'
-            )
-            assert exc.teardown is ProcessTeardown.NOT_SIGNALLED, (
-                f'the direct child was already reaped at teardown entry, so the '
-                f'pid-recycling guard dispatched NOTHING — not a group kill, not '
-                f'even a direct kill: {exc.teardown!r}'
-            )
-            survivor_pid = _read_survivor_pid(pidfile)
-            assert _is_alive(survivor_pid), (
-                f'survivor pid {survivor_pid} must still be RUNNING — nothing '
-                f'signalled it, and this is the fact the escalation text has to '
-                f'report: the process holding the deploy output pipe open is '
-                f'still there for an operator to find and kill'
-            )
-        finally:
-            _kill_survivor(pidfile)
-
-    async def test_terminate_process_tree_swallows_process_lookup_error(
-        self, tmp_path: Path,
-    ):
-        """``_terminate_process_tree`` must swallow ProcessLookupError from
-        BOTH the killpg path and the proc.kill() fallback — an already-exited
-        process must never propagate out of the timeout-cleanup helper.
-
-        Task 3884: the killpg now targets the pgid FROZEN at spawn (passed in
-        by the caller) rather than one re-derived via ``os.getpgid(proc.pid)``
-        at kill time, so the dispatch is actually reached here — the swallow
-        being asserted is the killpg's own ProcessLookupError, then the
-        proc.kill() fallback's.
-        """
-        import signal
-        from unittest.mock import patch
-
-        from orchestrator.deterministic_runner import DeterministicRunner, ProcessTeardown
-
-        queue = EscalationQueue(tmp_path)
-        runner = DeterministicRunner(
-            scheduler=MagicMock(),
-            escalation_queue=queue,
-            reap_grace_secs=0.05,
-        )
-
-        pgid = _fake_pgid()
-        mock_proc = MagicMock()
-        # pid must equal the pgid: unsafe_pgid_reason refuses a mismatch as a
-        # corrupted capture, which would short-circuit before the killpg.
-        mock_proc.pid = pgid
-        # A bare MagicMock's `.returncode` is a truthy Mock (i.e. `is not None`),
-        # which the task-3884 reaped-proc short-circuit would read as "already
-        # reaped" and skip the signal entirely.  This proc is still running.
-        mock_proc.returncode = None
-        mock_proc.kill = MagicMock(side_effect=ProcessLookupError('already exited'))
-        mock_proc.wait = AsyncMock(return_value=None)
-
-        with patch(
-            'os.killpg', side_effect=ProcessLookupError('no such process'),
-        ) as mock_killpg:
-            result = await runner._terminate_process_tree(mock_proc, pgid)
-
-        mock_killpg.assert_called_once_with(pgid, signal.SIGKILL)
-        mock_proc.kill.assert_called_once()
-        assert result is ProcessTeardown.DIRECT_KILLED, (
-            f'the killpg raised, so only the DIRECT child was signalled and '
-            f'anything it spawned survives — the caller writes operator-facing '
-            f'text about what was killed, so it must be able to learn that '
-            f'(task 4252 reviewer finding): {result!r}'
-        )
-
-    async def test_terminate_process_tree_bounds_reap_when_proc_never_exits(
-        self, tmp_path: Path,
-    ):
-        """The reap following the kill signal must be bounded by
-        ``reap_grace_secs`` — a process that never exits after being signaled
-        (e.g. stuck in an uninterruptible D-state) must not hang
-        ``_terminate_process_tree`` forever.
-
-        The existing ProcessLookupError-swallow test's ``mock_proc.wait``
-        resolves immediately, so it never exercises the
-        ``except TimeoutError: logger.warning(...)`` branch around
-        ``asyncio.wait_for(proc.wait(), timeout=self._reap_grace_secs)`` —
-        this test exercises that bound directly.
-        """
-        import asyncio
-        from unittest.mock import patch
-
-        from orchestrator.deterministic_runner import DeterministicRunner, ProcessTeardown
-
-        queue = EscalationQueue(tmp_path)
-        runner = DeterministicRunner(
-            scheduler=MagicMock(),
-            escalation_queue=queue,
-            reap_grace_secs=0.05,
-        )
-
-        pgid = _fake_pgid()
-        mock_proc = MagicMock()
-        # pid must equal the pgid — see the sibling test.
-        mock_proc.pid = pgid
-        # Still running (see the sibling test): a bare MagicMock's `.returncode`
-        # is truthy, which the task-3884 reaped-proc short-circuit would treat
-        # as already-reaped and skip the killpg this test asserts on.
-        mock_proc.returncode = None
-        # proc.wait() never resolves — simulates an unkillable/D-state process
-        # that ignores SIGKILL.
-        never_resolves = asyncio.Event()
-        mock_proc.wait = AsyncMock(side_effect=never_resolves.wait)
-
-        with patch('os.killpg') as mock_killpg:
-            # Hang tripwire: if reap_grace_secs stops bounding the wait, fail
-            # loudly instead of stalling the suite.
-            result = await asyncio.wait_for(
-                runner._terminate_process_tree(mock_proc, pgid), timeout=5,
-            )
-
-        mock_killpg.assert_called_once()
-        assert result is ProcessTeardown.GROUP_KILLED, (
-            f'the abandoned reap must NOT downgrade the disposition: a whole-group '
-            f'signal WAS dispatched, and what the reap proves (or fails to prove) '
-            f'is whether anything actually DIED — a separate fact the caller is '
-            f'told not to conclude from this value: {result!r}'
-        )
-
-    async def test_no_killpg_after_proc_reaped(self, tmp_path: Path):
-        """A reaped proc must receive NO killpg — its pid may already be recycled.
-
-        Task 3884 / task 845: freezing the pgid at spawn removes the
-        ``os.getpgid`` lookup, but the frozen NUMBER is itself stale once the
-        leader has been reaped — the kernel may have recycled that pid onto an
-        unrelated group (in the original incidents, the user's ``systemd --user``
-        group, which killed the whole login session).  So the helper must
-        dispatch no signal at all once ``proc.returncode is not None``, mirroring
-        ``shared.proc_group.terminate_process_group``'s step 1.
-        """
-        from unittest.mock import patch
-
-        from orchestrator.deterministic_runner import DeterministicRunner, ProcessTeardown
-
-        runner = DeterministicRunner(
-            scheduler=MagicMock(),
-            escalation_queue=EscalationQueue(tmp_path),
-            reap_grace_secs=0.05,
-        )
-        mock_proc = MagicMock()
-        mock_proc.pid = 12345
-        mock_proc.returncode = 0          # already reaped by asyncio's child watcher
-        mock_proc.kill = MagicMock()
-        mock_proc.wait = AsyncMock(return_value=0)
-        killpg_calls: list[tuple[int, int]] = []
-        getpgid_calls: list[int] = []
-        with (
-            patch('os.killpg', side_effect=lambda pgid, sig: killpg_calls.append((pgid, sig))),
-            patch('os.getpgid', side_effect=lambda pid: getpgid_calls.append(pid) or 999),
-        ):
-            result = await runner._terminate_process_tree(mock_proc, 12345)
-        assert killpg_calls == [], f'must not killpg a reaped proc (task 845); got {killpg_calls}'
-        assert getpgid_calls == [], f'must never re-derive the pgid at kill time; got {getpgid_calls}'
-        mock_proc.kill.assert_not_called()
-        assert result is ProcessTeardown.NOT_SIGNALLED, (
-            f'the caller builds operator-facing text claiming a kill, so it must '
-            f'be able to learn that NOTHING was signalled (task 4252 reviewer '
-            f'finding) — the three assertions above are the independent proof '
-            f'that this disposition is the TRUE one: {result!r}'
-        )
-
-    @pytest.mark.parametrize('scenario', ['own_process_group', 'pid_mismatch'])
-    async def test_refuses_to_killpg_an_unsafe_pgid(
-        self, tmp_path: Path, scenario: str,
-    ):
-        """An unsafe pgid must be refused and degraded to a direct kill().
-
-        The residual defence behind the frozen capture and the reaped-proc
-        short-circuit: this helper delegates the signal choice to
-        ``shared/src/shared/proc_group.py::sigkill_process_group``, whose
-        ``unsafe_pgid_reason`` check is what refuses here.
-
-        ``own_process_group`` is the consequential case, not a synthetic one —
-        it is precisely the task-845 outcome. A pgid that resolves to our OWN
-        group means the killpg would SIGKILL this test session, the
-        orchestrator, and everything else sharing it. ``pid_mismatch`` covers a
-        corrupted capture, where the frozen int no longer describes ``proc``.
-
-        Degrading to ``proc.kill()`` rather than doing nothing matches
-        ``df_pytest_isolation``'s handling of the same refusal: the timed-out
-        child still dies, and only the (unreachable) grandchildren are forgone.
-        """
-        from unittest.mock import patch
-
-        from orchestrator.deterministic_runner import DeterministicRunner, ProcessTeardown
-
-        runner = DeterministicRunner(
-            scheduler=MagicMock(),
-            escalation_queue=EscalationQueue(tmp_path),
-            reap_grace_secs=0.05,
-        )
-        mock_proc = MagicMock()
-        mock_proc.returncode = None          # still running: not the reaped path
-        mock_proc.kill = MagicMock()
-        mock_proc.wait = AsyncMock(return_value=None)
-
-        if scenario == 'own_process_group':
-            pgid = os.getpgrp()
-            mock_proc.pid = pgid
-        else:
-            pgid = _fake_pgid()
-            mock_proc.pid = pgid + 1         # capture no longer describes proc
-
-        killpg_calls: list[tuple[int, int]] = []
-        with patch('os.killpg', side_effect=lambda p, s: killpg_calls.append((p, s))):
-            result = await runner._terminate_process_tree(mock_proc, pgid)
-
-        assert killpg_calls == [], (
-            f'{scenario}: refused pgid must never be signalled -- killpg on our '
-            f'own group is the task-845 login-session kill; got {killpg_calls}'
-        )
-        mock_proc.kill.assert_called_once()
-        assert result is ProcessTeardown.DIRECT_KILLED, (
-            f'{scenario}: only the direct child was signalled, so anything it '
-            f'spawned SURVIVES — the caller must be able to learn that instead '
-            f'of telling an operator the whole group is gone (task 4252 reviewer '
-            f'finding): {result!r}'
-        )
-
-
-class TestProcessTeardownFromDispatch:
-    """ProcessTeardown.from_dispatch renders shared.proc_group's SigkillDispatch."""
-
-    @pytest.mark.parametrize(
-        ('dispatch', 'expected'),
-        [
-            (SigkillDispatch.GROUP_KILLED, ProcessTeardown.GROUP_KILLED),
-            (SigkillDispatch.DIRECT_KILLED, ProcessTeardown.DIRECT_KILLED),
-            (SigkillDispatch.NOT_SIGNALLED, ProcessTeardown.NOT_SIGNALLED),
-        ],
-    )
-    def test_maps_each_dispatch_to_its_namesake(self, dispatch, expected):
-        assert ProcessTeardown.from_dispatch(dispatch) is expected
-
-    def test_the_mapping_is_a_bijection(self):
-        assert len(SigkillDispatch) == len(ProcessTeardown)
-        assert {ProcessTeardown.from_dispatch(d) for d in SigkillDispatch} == set(
-            ProcessTeardown
-        )
-
-
-# ---------------------------------------------------------------------------
 # Task 2091 — bound _default_inspect_unit's systemctl communicate() call
 # ---------------------------------------------------------------------------
 
@@ -5859,7 +5408,7 @@ class TestFileInfraIssueEscalatedAdvanceFailureConverges:
 
         # A human resolves the (only) escalation — but the phase is still
         # stuck at 'ran', not 'escalated'.
-        queue.resolve(first_pending[0].id, 'human restarted the unit manually')
+        queue.resolve(first_pending[0].id, 'human restarted the unit manually', resolution_class='actionable')
 
         # --- Run 2 (resume): connection recovers. The phase==ESCALATED
         # resolution proof is NOT satisfied (still 'ran'), so this is
@@ -5883,7 +5432,7 @@ class TestFileInfraIssueEscalatedAdvanceFailureConverges:
         )
 
         # A human resolves the second escalation.
-        queue.resolve(second_pending[0].id, 'human confirmed the unit is healthy')
+        queue.resolve(second_pending[0].id, 'human confirmed the unit is healthy', resolution_class='actionable')
 
         # --- Run 3 (resume): phase==ESCALATED + own_escalation_resolved now
         # both hold — converges to done, no further escalation.
@@ -6044,9 +5593,9 @@ class TestFileMilestoneGateSkipsRedundantEscalatedAdvance:
         assert illegal_escs == []
 
     async def test_pure_gate_path_unchanged(self, tmp_path: Path) -> None:
-        """Parity fence (GREEN before AND after the step-2 fix): the pure-gate
-        (before_done=None) branch is byte-unchanged by this task's guard,
-        which is confined to the before_done-is-not-None deploy path."""
+        """Parity fence (GREEN before AND after the step-2 fix): the task-4048
+        deploy guard leaves the pure-gate (before_done=None) arm untouched; the
+        guard is confined to the before_done-is-not-None deploy path."""
         from orchestrator.deterministic_runner import DeterministicRunner
         from orchestrator.workflow import WorkflowOutcome
 
@@ -6063,7 +5612,9 @@ class TestFileMilestoneGateSkipsRedundantEscalatedAdvance:
         assert scheduler.update_task.call_count == 1
         call = scheduler.update_task.call_args
         assert call.args[0] == '4048'
-        assert set(call.args[1].keys()) == {'gate_escalated_at'}
+        assert set(call.args[1].keys()) == {
+            'gate_escalated_at', 'gate_escalated_preconditions',
+        }
         assert call.args[1]['gate_escalated_at']
         assert call.kwargs.get('metadata_mode') == 'merge'
 
@@ -6530,7 +6081,7 @@ class TestBeforeDoneResumeAfterResolution:
             level=2,
         )
         queue.submit(esc)
-        queue.resolve(esc.id, 'human verified the unit manually')
+        queue.resolve(esc.id, 'human verified the unit manually', resolution_class='actionable')
 
     async def test_resume_script_runner_not_called(self, tmp_path: Path):
         """before_done_ran_at set + resolved escalation → script_runner NOT called (I1 no re-run)."""
@@ -6694,6 +6245,51 @@ class TestBeforeDoneCrashWindow:
 
 
 @pytest.mark.asyncio
+class TestRunActsOnTheStoreRow:
+    """run() re-reads the task at entry and acts on the store's row, not the dispatched one (task 11430)."""
+
+    @pytest.mark.parametrize('status', ['done', 'cancelled'])
+    async def test_a_row_the_store_holds_terminal_returns_done_with_no_side_effect(
+        self, tmp_path: Path, status: str,
+    ):
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        dispatched = {**_gate_task(), 'status': 'pending'}
+        scheduler = _mock_scheduler({**dispatched, 'status': status})
+        queue = EscalationQueue(tmp_path)
+
+        outcome = await DeterministicRunner(scheduler=scheduler, escalation_queue=queue).run(
+            _make_assignment(dispatched),
+        )
+
+        assert outcome == WorkflowOutcome.DONE
+        assert queue.get_by_task('99') == []
+        scheduler.set_task_status.assert_not_awaited()
+        scheduler.update_task.assert_not_awaited()
+
+    async def test_an_unreadable_store_row_falls_back_to_the_dispatched_row(self, tmp_path: Path):
+        from shared.task_metadata import GATE_ESCALATED_PRECONDITIONS_KEY
+
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        dispatched = _gate_task(deps=[10])
+        scheduler = _mock_scheduler(dispatched)
+        scheduler.get_task = AsyncMock(return_value=None)
+        queue = EscalationQueue(tmp_path)
+
+        outcome = await DeterministicRunner(scheduler=scheduler, escalation_queue=queue).run(
+            _make_assignment(dispatched),
+        )
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        assert [e.category for e in queue.get_by_task('99', status='pending')] == ['milestone_gate']
+        stamps = [call.args[1] for call in scheduler.update_task.await_args_list]
+        assert [stamp[GATE_ESCALATED_PRECONDITIONS_KEY]['dependencies'] for stamp in stamps] == [['10']]
+
+
+@pytest.mark.asyncio
 class TestCrashWindowScheduledDoubleDispatch:
     """Task 2983 fix (a): a double-dispatched, already-completed scheduled
     self-deploy must NOT trip the crash-window false positive.
@@ -6713,7 +6309,18 @@ class TestCrashWindowScheduledDoubleDispatch:
     (_is_scheduled_self_deploy_complete), treat it as deploy-complete — return
     DONE with NO escalation and NO status write.  A fresh read that is NOT
     scheduled-complete still re-escalates exactly as today.
+
+    Since run() acts on the store row read at entry (task 11430), fix (a) is
+    the fallback for when that entry read fails: the fix-(a) tests below make
+    the entry read return None and the crash-window re-read return the
+    completed row.
     """
+
+    @staticmethod
+    def _entry_read_fails_then(current_task: dict) -> AsyncMock:
+        """get_task that fails at run() entry, then returns *current_task*."""
+        reads = iter([None])
+        return AsyncMock(side_effect=lambda _task_id: next(reads, current_task))
 
     def _stale_snapshot(self, task_id: str = '2912') -> dict:
         """The stale eligibility snapshot: before_done_ran_at only (no
@@ -6725,11 +6332,12 @@ class TestCrashWindowScheduledDoubleDispatch:
             before_done_ran_at='2026-07-23T10:00:00+00:00',
         )
 
-    async def test_double_dispatch_via_done_provenance_returns_done_no_side_effects(
+    async def test_entry_read_failure_then_done_provenance_returns_done_no_side_effects(
         self, tmp_path: Path,
     ):
-        """Fresh get_task shows status='done' + done_provenance.kind=
-        'deterministic-deploy-scheduled' → DONE, no escalation, no status write."""
+        """Entry read fails; the crash-window re-read shows status='done' +
+        done_provenance.kind='deterministic-deploy-scheduled' → DONE, no
+        escalation, no status write."""
         from orchestrator.deterministic_runner import DeterministicRunner
         from orchestrator.workflow import WorkflowOutcome
 
@@ -6749,7 +6357,7 @@ class TestCrashWindowScheduledDoubleDispatch:
                 },
             },
         }
-        scheduler.get_task = AsyncMock(return_value=current_task)
+        scheduler.get_task = self._entry_read_fails_then(current_task)
 
         runner = DeterministicRunner(
             scheduler=scheduler,
@@ -6765,11 +6373,13 @@ class TestCrashWindowScheduledDoubleDispatch:
         )
         scheduler.set_task_status.assert_not_awaited()
 
-    async def test_double_dispatch_via_scheduled_stamp_returns_done_no_side_effects(
+    async def test_double_dispatch_via_scheduled_stamp_takes_the_b_self_resume(
         self, tmp_path: Path,
     ):
-        """Fresh get_task carries before_done_scheduled_at → DONE, no escalation,
-        no status write (recognized via the stamp even without done_provenance)."""
+        """The store row carries before_done_scheduled_at while the done write has
+        not landed. run() reads that row at entry (task 11430), so the b-self
+        resume drives it to done: DONE, no escalation, one scheduled-deploy done write."""
+        from orchestrator.deploy_state import SCHEDULED_DEPLOY_PROVENANCE_KIND
         from orchestrator.deterministic_runner import DeterministicRunner
         from orchestrator.workflow import WorkflowOutcome
 
@@ -6800,7 +6410,9 @@ class TestCrashWindowScheduledDoubleDispatch:
 
         assert outcome == WorkflowOutcome.DONE
         assert queue.get_by_task('2912') == []
-        scheduler.set_task_status.assert_not_awaited()
+        status_writes = scheduler.set_task_status.await_args_list
+        assert [call.args[1] for call in status_writes] == ['done']
+        assert status_writes[0].kwargs['done_provenance']['kind'] == SCHEDULED_DEPLOY_PROVENANCE_KIND
 
     async def test_genuine_crash_window_still_reescalates_and_blocks(
         self, tmp_path: Path,
@@ -6838,12 +6450,14 @@ class TestCrashWindowScheduledDoubleDispatch:
         ]
         assert blocked_calls, 'genuine crash-window must leave the task blocked'
 
-    async def test_stale_redispatch_always_escalates_true_refiles_gate_not_done(
+    async def test_entry_read_failure_always_escalates_true_refiles_gate_not_done(
         self, tmp_path: Path,
     ):
         """Amendment (reviewer_comprehensive): a STALE re-dispatch of an
         always_escalates=True scheduled self-deploy must NOT be short-circuited
-        to DONE by the fresh-read backstop.
+        to DONE by the fresh-read backstop.  The entry read fails, so run()
+        acts on the stale dispatched row and only the crash-window re-read
+        sees the scheduled stamp.
 
         The before_done_scheduled_at stamp is written on BOTH the
         always_escalates=False path (which sets the task 'done') AND the
@@ -6876,7 +6490,7 @@ class TestCrashWindowScheduledDoubleDispatch:
             },
         )
         current_task['metadata']['always_escalates'] = True
-        scheduler.get_task = AsyncMock(return_value=current_task)
+        scheduler.get_task = self._entry_read_fails_then(current_task)
 
         runner = DeterministicRunner(
             scheduler=scheduler,
@@ -8504,7 +8118,7 @@ class TestDefaultScheduleDetachedRestart:
         runner = DeterministicRunner(scheduler=MagicMock(), escalation_queue=queue)
 
         before_done = {
-            'script': '/usr/local/bin/restart-deploy.sh',
+            'script': str(_runnable_script(tmp_path / 'bin')),
             'args': [],
             'target_unit': 'orchestrator-reify.service',
         }
@@ -8534,7 +8148,7 @@ class TestDefaultScheduleDetachedRestart:
         runner = DeterministicRunner(scheduler=MagicMock(), escalation_queue=queue)
 
         before_done = {
-            'script': '/usr/local/bin/restart-deploy.sh',
+            'script': str(_runnable_script(tmp_path / 'bin')),
             'args': [],
             'target_unit': 'orchestrator-reify.service',
         }
@@ -8567,8 +8181,9 @@ class TestDefaultScheduleDetachedRestart:
         queue = EscalationQueue(tmp_path)
         runner = DeterministicRunner(scheduler=MagicMock(), escalation_queue=queue)
 
+        script = _runnable_script(tmp_path / 'bin')
         before_done = {
-            'script': '/usr/local/bin/restart-deploy.sh',
+            'script': str(script),
             'args': [],
             'target_unit': 'orchestrator-reify.service',
         }
@@ -8586,7 +8201,7 @@ class TestDefaultScheduleDetachedRestart:
             str(a) for call in mock_exec.call_args_list for a in call.args
         )
         assert '--collect' in all_argv, f'--collect must appear in argv: {all_argv!r}'
-        assert '/usr/local/bin/restart-deploy.sh' in all_argv, (
+        assert str(script) in all_argv, (
             f'payload script must appear in argv: {all_argv!r}'
         )
 
@@ -8609,7 +8224,7 @@ class TestDefaultScheduleDetachedRestart:
         runner = DeterministicRunner(scheduler=MagicMock(), escalation_queue=queue)
 
         before_done = {
-            'script': '/usr/local/bin/restart-deploy.sh',
+            'script': str(_runnable_script(tmp_path / 'bin')),
             'args': [],
             'target_unit': 'orchestrator-reify.service',
         }
@@ -8842,7 +8457,7 @@ class TestDefaultScheduleDetachedRestart:
         runner = DeterministicRunner(scheduler=MagicMock(), escalation_queue=queue)
 
         before_done = {
-            'script': '/usr/local/bin/restart-deploy.sh',
+            'script': str(_runnable_script(tmp_path / 'bin')),
             'args': [],
             'target_unit': 'orchestrator-reify.service',
         }
@@ -8872,7 +8487,7 @@ class TestDefaultScheduleDetachedRestart:
         runner = DeterministicRunner(scheduler=MagicMock(), escalation_queue=queue)
 
         before_done = {
-            'script': '/usr/local/bin/restart-deploy.sh',
+            'script': str(_runnable_script(tmp_path / 'bin')),
             'args': [],
             'target_unit': 'orchestrator-reify.service',
         }
@@ -8904,7 +8519,7 @@ class TestDefaultScheduleDetachedRestart:
         runner = DeterministicRunner(scheduler=MagicMock(), escalation_queue=queue)
 
         before_done = {
-            'script': '/usr/local/bin/restart-deploy.sh',
+            'script': str(_runnable_script(tmp_path / 'bin')),
             'args': [],
             'target_unit': 'orchestrator-reify.service',
         }
@@ -8943,7 +8558,7 @@ class TestDefaultScheduleDetachedRestart:
         runner = DeterministicRunner(scheduler=MagicMock(), escalation_queue=queue)
 
         before_done = {
-            'script': '/usr/local/bin/restart-deploy.sh',
+            'script': str(_runnable_script(tmp_path / 'bin')),
             'args': [],
             'target_unit': 'orchestrator-reify.service',
         }
@@ -9101,12 +8716,18 @@ class TestDetachedRestartWorkingDirectory:
         from orchestrator.deterministic_runner import DeterministicRunner
 
         queue = EscalationQueue(tmp_path)
-        runner = DeterministicRunner(scheduler=MagicMock(), escalation_queue=queue)
+        project_root = (tmp_path / 'project').resolve()
+        _runnable_script(project_root / 'scripts', 'restart-all-orchestrators.sh')
+        working_dir = (tmp_path / 'working-dir').resolve()
+        working_dir.mkdir()
+        scheduler = MagicMock()
+        scheduler.config.project_root = project_root
+        runner = DeterministicRunner(scheduler=scheduler, escalation_queue=queue)
 
         before_done = {
             'script': 'scripts/restart-all-orchestrators.sh',
             'args': [],
-            'cwd': '/home/leo/src/dark-factory',
+            'cwd': str(working_dir),
             'target_unit': 'orchestrator-dark-factory.service',
         }
         mock_proc = self._make_mock_proc()
@@ -9121,7 +8742,7 @@ class TestDetachedRestartWorkingDirectory:
 
         argv = mock_exec.call_args_list[0].args
         all_argv = ' '.join(str(a) for a in argv)
-        assert '--working-directory=/home/leo/src/dark-factory' in all_argv, (
+        assert f'--working-directory={working_dir}' in all_argv, (
             f'--working-directory must be set from before_done["cwd"]: {all_argv!r}'
         )
         assert argv[-3] == '/bin/sh' and argv[-2] == '-c', (
@@ -9141,6 +8762,7 @@ class TestDetachedRestartWorkingDirectory:
 
         queue = EscalationQueue(tmp_path)
         project_root = (tmp_path / 'project').resolve()
+        _runnable_script(project_root / 'scripts', 'restart-all-orchestrators.sh')
         scheduler = MagicMock()
         scheduler.config.project_root = project_root
         runner = DeterministicRunner(scheduler=scheduler, escalation_queue=queue)
@@ -9183,10 +8805,13 @@ class TestDetachedRestartWorkingDirectory:
         queue = EscalationQueue(tmp_path)
         runner = DeterministicRunner(scheduler=MagicMock(), escalation_queue=queue)
 
+        script = _runnable_script((tmp_path / 'bin').resolve())
+        cwd = (tmp_path / 'working-dir').resolve()
+        cwd.mkdir()
         before_done = {
-            'script': '/usr/local/bin/restart-deploy.sh',
+            'script': str(script),
             'args': [],
-            'cwd': '/home/leo/src/dark-factory',
+            'cwd': str(cwd),
             'target_unit': 'orchestrator-reify.service',
         }
         mock_proc = self._make_mock_proc()
@@ -9201,10 +8826,10 @@ class TestDetachedRestartWorkingDirectory:
 
         argv = mock_exec.call_args_list[0].args
         wrapped = argv[-1]
-        assert wrapped.startswith('/usr/local/bin/restart-deploy.sh'), (
+        assert wrapped.startswith(str(script)), (
             f'an absolute script must be embedded unchanged, leading the payload: {wrapped!r}'
         )
-        assert '/home/leo/src/dark-factory/usr/local/bin/restart-deploy.sh' not in wrapped, (
+        assert f'{cwd}{script}' not in wrapped, (
             f'absolute script must not be double-joined under cwd: {wrapped!r}'
         )
 
@@ -9240,7 +8865,7 @@ class TestDetachedRestartDelegatesToRestartPlan:
         runner = DeterministicRunner(scheduler=MagicMock(), escalation_queue=queue)
 
         before_done = {
-            'script': '/usr/local/bin/restart-deploy.sh',
+            'script': str(_runnable_script(tmp_path / 'bin')),
             'args': ['--flag'],
             'cwd': '/home/leo/src/dark-factory',
             'target_unit': 'orchestrator-reify.service',
@@ -9292,7 +8917,7 @@ class TestDetachedRestartDelegatesToRestartPlan:
         runner = DeterministicRunner(scheduler=MagicMock(), escalation_queue=queue)
 
         before_done = {
-            'script': '/usr/local/bin/restart-deploy.sh',
+            'script': str(_runnable_script(tmp_path / 'bin')),
             'args': [],
             'target_unit': 'orchestrator-reify.service',
         }
@@ -9325,7 +8950,7 @@ class TestDetachedRestartDelegatesToRestartPlan:
         runner = DeterministicRunner(scheduler=MagicMock(), escalation_queue=queue)
 
         before_done = {
-            'script': '/usr/local/bin/restart-deploy.sh',
+            'script': str(_runnable_script(tmp_path / 'bin')),
             'args': [],
             'target_unit': 'orchestrator-reify.service',
         }
@@ -9355,7 +8980,7 @@ class TestDetachedRestartDelegatesToRestartPlan:
         runner = DeterministicRunner(scheduler=MagicMock(), escalation_queue=queue)
 
         before_done = {
-            'script': '/usr/local/bin/restart-deploy.sh',
+            'script': str(_runnable_script(tmp_path / 'bin')),
             'args': [],
             'target_unit': 'orchestrator-reify.service',
         }
@@ -9389,8 +9014,9 @@ class TestDetachedRestartDelegatesToRestartPlan:
         queue = EscalationQueue(tmp_path)
         runner = DeterministicRunner(scheduler=MagicMock(), escalation_queue=queue)
 
+        script = _runnable_script(tmp_path / 'bin')
         before_done = {
-            'script': '/usr/local/bin/restart-deploy.sh',
+            'script': str(script),
             'args': [],
             'cwd': '/home/leo/src/dark-factory',
             'target_unit': 'orchestrator-reify.service',
@@ -9422,7 +9048,7 @@ class TestDetachedRestartDelegatesToRestartPlan:
             f'expected a /bin/sh -c wrapper payload, got {argv!r}'
         )
         wrapped = argv[-1]
-        assert '/usr/local/bin/restart-deploy.sh' in wrapped
+        assert str(script) in wrapped
         assert '-ne 0' in wrapped, f'escalation must be gated behind a non-zero exit check: {wrapped!r}'
         assert 'escalation' in wrapped and 'submit' in wrapped
 
@@ -10052,251 +9678,6 @@ class TestSharedDoneProvenance:
 
 
 # ---------------------------------------------------------------------------
-# Task 3286: `_summarize_predicate_output` — the ALLOWLIST sanitizer standing
-# between a predicate script's raw stdout tail and `done_provenance.note`.
-#
-# The note is not a private field: fused-memory's `_format_outcome_echo` reads
-# it and appends it to a Mem0 completion-summary write, so anything that lands
-# here is ingested into the knowledge graph.  Task 2902 is the specimen that
-# proved raw forwarding corrupts it.
-# ---------------------------------------------------------------------------
-
-class TestSummarizePredicateOutput:
-    """The sanitizer keeps the structured verdict and drops the log noise."""
-
-    def test_specimen_starts_with_deterministic_verdict_prefix(self):
-        """The verdict prefix is unconditional — a note is never empty."""
-        from orchestrator.deterministic_runner import _summarize_predicate_output
-
-        result = _summarize_predicate_output(POLLUTED_PREDICATE_OUTPUT, rc=0)
-
-        assert result.startswith('predicate check passed (rc=0)'), result
-
-    @pytest.mark.parametrize(
-        'marker',
-        [
-            'fused_memory.backends.graphiti_client',
-            'httpx',
-            'my_solar_challenge',
-            'HTTP/1.1 200 OK',
-            'WARNING',
-        ],
-    )
-    def test_specimen_server_log_markers_are_dropped(self, marker: str):
-        """No server-log noise survives into the note (the task-2902 leak)."""
-        from orchestrator.deterministic_runner import _summarize_predicate_output
-
-        result = _summarize_predicate_output(POLLUTED_PREDICATE_OUTPUT, rc=0)
-
-        assert marker not in result, (
-            f'{marker!r} leaked into the provenance note: {result!r}'
-        )
-
-    def test_specimen_trailing_json_verdict_survives_compacted(self):
-        """The script's OWN structured verdict is the part worth keeping."""
-        from orchestrator.deterministic_runner import _summarize_predicate_output
-
-        result = _summarize_predicate_output(POLLUTED_PREDICATE_OUTPUT, rc=0)
-
-        # Compact json.dumps separators — no space after ':' or ','.
-        assert '"orphan_count":0' in result, result
-        assert '"verdict":"clean"' in result, result
-
-    def test_specimen_result_is_single_line(self):
-        """A note flowing into a Mem0 summary must not carry newlines."""
-        from orchestrator.deterministic_runner import _summarize_predicate_output
-
-        result = _summarize_predicate_output(POLLUTED_PREDICATE_OUTPUT, rc=0)
-
-        assert '\n' not in result, result
-
-    def test_specimen_mid_token_first_line_is_dropped(self):
-        """The 2000-char tail cut starts mid-word — that fragment is noise."""
-        from orchestrator.deterministic_runner import _summarize_predicate_output
-
-        result = _summarize_predicate_output(POLLUTED_PREDICATE_OUTPUT, rc=0)
-
-        assert '_tariff_pence_per_kwh' not in result, result
-
-    # -- Tier 2: one clean final line survives -----------------------------
-    #
-    # Each shape below is a REAL in-repo predicate script's output, and each
-    # is load-bearing for a pre-existing green test.  A sanitizer that dropped
-    # them would be throwing away the verdict it exists to preserve.
-
-    @pytest.mark.parametrize(
-        ('out', 'expected'),
-        [
-            # test_deterministic_runner.py's own predicate-mode fixtures.
-            ('check ok: 0 flakes', 'check ok: 0 flakes'),
-            # scripts/check_merge_flakiness.sh — drives the REAL-subprocess
-            # test at test_milestone_integration_gate.py's exemplar-pass case.
-            (
-                'check_merge_flakiness: value=1 threshold=5 window_days=7 '
-                '-- invariant holds',
-                'invariant holds',
-            ),
-            # scripts/check_esc_analytics_perf.sh.
-            (
-                'measured_median_ms=12 attempts=5 threshold_ms=2000 '
-                'url=http://127.0.0.1:8080/api/escalations/analytics',
-                'measured_median_ms=12 attempts=5',
-            ),
-        ],
-    )
-    def test_clean_final_line_is_preserved(self, out: str, expected: str):
-        """A single clean verdict line is the payload — kept verbatim."""
-        from orchestrator.deterministic_runner import _summarize_predicate_output
-
-        result = _summarize_predicate_output(out, rc=0)
-
-        assert result.startswith('predicate check passed (rc=0)'), result
-        assert expected in result, result
-
-    def test_trailing_blank_lines_do_not_defeat_extraction(self):
-        """A script ending with a newline still yields its verdict line."""
-        from orchestrator.deterministic_runner import _summarize_predicate_output
-
-        result = _summarize_predicate_output('check ok: 0 flakes\n\n', rc=0)
-
-        assert 'check ok: 0 flakes' in result, result
-
-    # -- Log-shaped lines are rejected -------------------------------------
-
-    def test_pure_log_output_yields_bare_verdict(self):
-        """Nothing but logger lines -> no payload at all, not a log line."""
-        from orchestrator.deterministic_runner import _summarize_predicate_output
-
-        out = (
-            '2026-07-30 16:39:00,523 fused_memory.backends.graphiti_client '
-            'WARNING identity scan found 3 candidate nodes\n'
-            '2026-07-30 16:39:00,625 httpx INFO HTTP Request: GET '
-            'http://localhost:6333 "HTTP/1.1 200 OK"'
-        )
-
-        result = _summarize_predicate_output(out, rc=0)
-
-        assert result == 'predicate check passed (rc=0)', result
-
-    @pytest.mark.parametrize(
-        'out',
-        [
-            '2026-07-30 16:39:00,523 fused_memory.x INFO done',
-            # No timestamp — the standalone level token alone is enough.
-            'INFO: all checks passed',
-        ],
-    )
-    def test_level_token_final_line_is_rejected(self, out: str):
-        """Deliberately conservative: a level token forfeits the payload.
-
-        Losing a payload is the safe failure direction — the verdict prefix
-        always survives and the raw text is logged (step-6).
-        """
-        from orchestrator.deterministic_runner import _summarize_predicate_output
-
-        result = _summarize_predicate_output(out, rc=0)
-
-        assert result == 'predicate check passed (rc=0)', result
-
-    def test_formatter_less_log_line_survives_as_documented_limitation(self):
-        """Tier 2 is a DENYLIST, and this pins the gap it leaves open.
-
-        A ``%(name)s %(message)s`` formatter emits no timestamp and no level
-        token, so ``_LOG_LINE_RE`` does not reject it and the line is kept as
-        the payload.  Tier 2 cannot be tightened into a grammar-based
-        allowlist without also dropping ``check ok: 0 flakes`` and
-        ``-- invariant holds`` (see the parametrized cases above), which are
-        structurally identical prose.
-
-        The exposure is bounded rather than closed — ONE line, capped — and
-        this test exists so the boundary is asserted rather than assumed.  If
-        a future change narrows tier 2, this expectation should flip
-        deliberately, not silently.
-        """
-        from orchestrator.deterministic_runner import _summarize_predicate_output
-
-        out = 'httpx HTTP Request: GET http://localhost:6333 secret=abc'
-
-        result = _summarize_predicate_output(out, rc=0)
-
-        assert result == f'predicate check passed (rc=0): {out}', result
-        # Still bounded: a single line, never the multi-KB 2902 blob.
-        assert '\n' not in result, result
-
-    # -- The verdict word is derived from rc, never hardcoded ---------------
-
-    def test_nonzero_rc_verdict_does_not_claim_passed(self):
-        """The prefix cannot contradict the code it renders.
-
-        Only the ``rc == 0`` branch calls this today, but a hardcoded
-        ``passed`` would let a future caller stamp
-        ``predicate check passed (rc=2)`` into a provenance note that flows
-        into a Mem0 completion summary.
-        """
-        from orchestrator.deterministic_runner import _summarize_predicate_output
-
-        result = _summarize_predicate_output('check failed: 3 flakes', rc=2)
-
-        assert result.startswith('predicate check failed (rc=2)'), result
-        assert 'passed' not in result, result
-        assert 'check failed: 3 flakes' in result, result
-
-    # -- Size bound: elide wholesale, never slice mid-structure -------------
-
-    def test_oversized_payload_is_elided_not_sliced(self):
-        """Task 2054's lesson: a mid-structure cut is worse than no payload.
-
-        A raw ``note[:N]`` slice there garbled ``8679,8680`` into
-        ``8679,868``.  A sliced JSON object is worse still — unparseable, yet
-        still structured-looking to a reader.
-        """
-        import json as _json
-
-        from orchestrator.deterministic_runner import (
-            _PREDICATE_NOTE_MAX_PAYLOAD_CHARS,
-            _summarize_predicate_output,
-        )
-
-        obj = {'ids': list(range(2000))}
-        compact = _json.dumps(obj, separators=(',', ':'))
-        assert len(compact) > _PREDICATE_NOTE_MAX_PAYLOAD_CHARS, 'fixture too small'
-
-        result = _summarize_predicate_output(_json.dumps(obj, indent=2), rc=0)
-
-        # Bounded: the cap plus the verdict prefix and the marker's own text.
-        assert len(result) <= _PREDICATE_NOTE_MAX_PAYLOAD_CHARS + 200, len(result)
-        # The marker names the dropped size and where the full text lives.
-        assert str(len(compact)) in result, result
-        assert 'elided' in result, result
-        # Critically: NOT a prefix-slice of the compact dump.
-        assert compact[:100] not in result, result
-
-    def test_payload_at_the_cap_is_kept(self):
-        """The bound elides only what exceeds it — it is not a blanket drop."""
-        from orchestrator.deterministic_runner import (
-            _PREDICATE_NOTE_MAX_PAYLOAD_CHARS,
-            _summarize_predicate_output,
-        )
-
-        out = 'ok ' + 'x' * (_PREDICATE_NOTE_MAX_PAYLOAD_CHARS - 10)
-        result = _summarize_predicate_output(out, rc=0)
-
-        assert out in result, result
-        assert 'elided' not in result, result
-
-    # -- Degenerate inputs -------------------------------------------------
-
-    @pytest.mark.parametrize('out', ['', None, 42, b'check ok', ['check ok']])
-    def test_degenerate_output_yields_bare_verdict(self, out: object):
-        """A falsy/non-str seam return never raises and never leaks a repr."""
-        from orchestrator.deterministic_runner import _summarize_predicate_output
-
-        result = _summarize_predicate_output(out, rc=0)
-
-        assert result == 'predicate check passed (rc=0)', result
-
-
-# ---------------------------------------------------------------------------
 # Task 2336 (γ-predicate): predicate deterministic mode — a read-only
 # exit-code verdict check (before_done.kind == 'predicate'), NOT a systemd
 # deploy.  Boundary tests B7 (pass), B8 (fail), B9 (timeout/infra), B10
@@ -10396,10 +9777,8 @@ class TestPredicateModePassPath:
         `_format_outcome_echo` and appended to a Mem0 completion summary, so
         raw subprocess output landing here is ingested into memory.
         """
-        from orchestrator.deterministic_runner import (
-            DeterministicRunner,
-            _summarize_predicate_output,
-        )
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.predicate_output import summarize_predicate_output
 
         task = _predicate_task(task_id='700')
         assignment = _make_assignment(task)
@@ -10419,7 +9798,7 @@ class TestPredicateModePassPath:
 
         note = scheduler.set_task_status.call_args.kwargs['done_provenance']['note']
 
-        assert note == _summarize_predicate_output(POLLUTED_PREDICATE_OUTPUT, rc=0)
+        assert note == summarize_predicate_output(POLLUTED_PREDICATE_OUTPUT, rc=0)
         for marker in (
             'fused_memory.backends.graphiti_client',
             'httpx',
@@ -12260,3 +11639,297 @@ class TestOperationalLlmGateMarker:
         assert 'operational_llm_needs_lane' not in esc.detail, (
             f'decision+llm gate (no marker) detail must carry no token: {esc.detail!r}'
         )
+
+
+# ---------------------------------------------------------------------------
+# Task 8598: before_done.env reaches the self-target detached restart. The
+# DEFAULT restart scheduler builds a RestartPlan whose /bin/sh -c payload
+# prefixes the script with one KEY=value assignment per entry, because
+# systemd-run passes on none of this process's environment.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestSelfTargetRestartCarriesBeforeDoneEnv:
+    """run() on a self-target deploy, through the default restart scheduler."""
+
+    async def _run_self_target(self, tmp_path: Path, env: dict):
+        from unittest.mock import patch
+
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        task = _deploy_task(
+            task_id='8598', target_unit='orchestrator-reify.service', env=env,
+            script=str(_runnable_script(tmp_path / 'bin')),
+        )
+        scheduler = _mock_scheduler(task)
+        queue = EscalationQueue(tmp_path)
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=AsyncMock(return_value=_BASELINE_UNIT_STATE),
+            script_runner=script_runner,
+            own_unit_resolver=lambda: 'orchestrator-reify.service',
+        )
+        mock_proc = AsyncMock()
+        mock_proc.communicate = AsyncMock(return_value=(b'', b''))
+        mock_proc.returncode = 0
+
+        with patch('asyncio.create_subprocess_exec', return_value=mock_proc) as mock_exec:
+            outcome = await runner.run(_make_assignment(task))
+
+        systemd_run_calls = [
+            call for call in mock_exec.call_args_list
+            if call.args and call.args[0] == 'systemd-run'
+        ]
+        return outcome, systemd_run_calls, script_runner, scheduler, queue
+
+    async def test_before_done_env_reaches_the_payload_command(self, tmp_path: Path):
+        from orchestrator.workflow import WorkflowOutcome
+
+        outcome, systemd_run_calls, script_runner, _scheduler, _queue = (
+            await self._run_self_target(
+                tmp_path, {'DEPLOY_FLAG': 'canary', 'PYTHONPATH': '/payload-only'},
+            )
+        )
+
+        assert outcome == WorkflowOutcome.DONE
+        assert len(systemd_run_calls) == 1
+        argv = systemd_run_calls[0].args
+        assert argv[-1].startswith('DEPLOY_FLAG=canary PYTHONPATH=/payload-only /'), (
+            f'before_done.env must prefix the deploy script: {argv[-1]!r}'
+        )
+        assert not any(
+            token.startswith(('--setenv=DEPLOY_FLAG', '--setenv=PYTHONPATH=/payload-only'))
+            for token in argv
+        ), f'before_done.env must not become a unit-wide --setenv: {argv!r}'
+        script_runner.assert_not_awaited()
+
+    async def test_non_portable_env_key_is_refused_loudly(self, tmp_path: Path):
+        from orchestrator.workflow import WorkflowOutcome
+
+        outcome, systemd_run_calls, _script_runner, scheduler, queue = (
+            await self._run_self_target(tmp_path, {'FOO-BAR': 'x'})
+        )
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        assert systemd_run_calls == []
+        pending = queue.get_by_task('8598', status='pending')
+        assert len(pending) == 1
+        assert pending[0].category == 'infra_issue'
+        assert 'FOO-BAR' in pending[0].detail
+        assert all(
+            'done' not in call.args for call in scheduler.set_task_status.call_args_list
+        ), 'a refused env must never be reported as a scheduled DONE'
+
+
+@pytest.mark.asyncio
+class TestCrossUnitDeployCarriesBeforeDoneEnv:
+    """run()'s cross-unit deploy: the RestartPlan it builds records
+    before_done.env, and a real deploy script sees it."""
+
+    async def test_plan_carries_before_done_env(self, tmp_path: Path):
+        from unittest.mock import patch
+
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.proc_supervision import (
+            RestartDisposition,
+            RestartOutcome,
+            RestartPlan,
+        )
+
+        task = _deploy_task(
+            task_id='8598c',
+            target_unit='orchestrator-reify.service',
+            env={'DEPLOY_FLAG': 'canary'},
+        )
+        runner = DeterministicRunner(
+            scheduler=_mock_scheduler(task),
+            escalation_queue=EscalationQueue(tmp_path),
+            unit_inspector=AsyncMock(side_effect=[_BASELINE_UNIT_STATE, _FRESH_UNIT_STATE]),
+            script_runner=AsyncMock(return_value=(0, 'ok')),
+            own_unit_resolver=lambda: 'orchestrator.service',
+        )
+        captured_plans: list = []
+        canned = RestartOutcome(disposition=RestartDisposition.DEPLOYED_AND_VERIFIED)
+
+        async def _fake_execute(self, *, runner=None, inspector=None):
+            captured_plans.append(self)
+            return canned
+
+        with patch.object(RestartPlan, 'execute', _fake_execute):
+            await runner.run(_make_assignment(task))
+
+        assert len(captured_plans) == 1
+        assert captured_plans[0].env == {'DEPLOY_FLAG': 'canary'}, (
+            'the plan must describe the env its deploy runs with'
+        )
+
+    async def test_real_deploy_script_sees_before_done_env(self, tmp_path: Path):
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        script = tmp_path / 'env-deploy.sh'
+        script.write_text('#!/bin/sh\nprintf %s "$DEPLOY_FLAG" > "$1"\n')
+        script.chmod(0o755)
+        seen = tmp_path / 'seen'
+        task = _deploy_task(
+            task_id='8598d',
+            target_unit='orchestrator-reify.service',
+            script=str(script),
+            args=[str(seen)],
+            cwd=str(tmp_path),
+            env={'DEPLOY_FLAG': 'canary'},
+        )
+        runner = DeterministicRunner(
+            scheduler=_mock_scheduler(task),
+            escalation_queue=EscalationQueue(tmp_path),
+            unit_inspector=AsyncMock(side_effect=[_BASELINE_UNIT_STATE, _FRESH_UNIT_STATE]),
+            script_runner=None,
+            own_unit_resolver=lambda: 'orchestrator.service',
+        )
+
+        outcome = await asyncio.wait_for(runner.run(_make_assignment(task)), timeout=20)
+
+        assert outcome == WorkflowOutcome.DONE
+        assert seen.read_text() == 'canary'
+
+    async def test_invalid_env_key_is_refused_loudly(self, tmp_path: Path):
+        """RestartPlan refuses an env key holding '='. On this path the refusal
+        must file a born-at-L2 infra_issue that names the plan refusal, not a
+        deploy script failure: the script never ran."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _deploy_task(
+            task_id='8598e',
+            target_unit='orchestrator-reify.service',
+            env={'A=B': 'v'},
+        )
+        queue = EscalationQueue(tmp_path)
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+        runner = DeterministicRunner(
+            scheduler=_mock_scheduler(task),
+            escalation_queue=queue,
+            unit_inspector=AsyncMock(side_effect=[_BASELINE_UNIT_STATE, _FRESH_UNIT_STATE]),
+            script_runner=script_runner,
+            own_unit_resolver=lambda: 'orchestrator.service',
+        )
+
+        outcome = await runner.run(_make_assignment(task))
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        script_runner.assert_not_awaited()
+        pending = queue.get_by_task('8598e', status='pending')
+        assert len(pending) == 1
+        assert pending[0].category == 'infra_issue'
+        assert pending[0].summary == (
+            'Deploy plan refused before_done: orchestrator-reify.service'
+        )
+        assert 'A=B' in pending[0].detail
+        assert 'environment variable name' in pending[0].detail
+
+
+class TestFileIllegalDeployTransition:
+    """The DS-2 sink is a module-level function, so the scheduled-deploy settler
+    files the same born-at-L2 record as the runner does."""
+
+    def test_files_one_born_at_l2_record_naming_both_phases(self, tmp_path):
+        from orchestrator.deploy_state import DeployPhase
+        from orchestrator.deterministic_runner import (
+            DETERMINISTIC_AGENT_ROLE,
+            file_illegal_deploy_transition,
+        )
+
+        queue = EscalationQueue(tmp_path)
+        file_illegal_deploy_transition(
+            queue, '7238', DeployPhase.SCHEDULED, DeployPhase.DONE, actor='ScheduledDeploySettler',
+        )
+
+        [record] = queue.get_by_task('7238')
+        assert record.agent_role == DETERMINISTIC_AGENT_ROLE
+        assert record.level == 2
+        assert record.severity == 'critical'
+        assert record.category == 'illegal_deploy_transition'
+        assert 'scheduled' in record.summary
+        assert 'done' in record.summary
+        assert record.detail.startswith('ScheduledDeploySettler attempted')
+        assert 'DeterministicRunner' not in record.detail
+
+
+class TestFileDeterministicEscalation:
+    """The runner's born-at-L2 filing is a module-level function, so the
+    scheduled-deploy settler files the same record the runner does."""
+
+    @staticmethod
+    def _file(queue, **kwargs):
+        from orchestrator.deterministic_runner import file_deterministic_escalation
+
+        return file_deterministic_escalation(
+            queue, '7238', actor='ScheduledDeploySettler',
+            summary=kwargs.pop('summary', 'restart failed'),
+            detail=kwargs.pop('detail', 'the transient read failed'), **kwargs,
+        )
+
+    @staticmethod
+    def _own_role_record(queue) -> str:
+        from orchestrator.deterministic_runner import DETERMINISTIC_AGENT_ROLE
+
+        esc = Escalation(
+            id=queue.make_id('7238'),
+            task_id='7238',
+            agent_role=DETERMINISTIC_AGENT_ROLE,
+            severity='critical',
+            category='infra_issue',
+            summary='an earlier filing',
+            level=2,
+        )
+        queue.submit(esc)
+        return esc.id
+
+    def test_files_one_born_at_l2_record_and_returns_its_id(self, tmp_path):
+        from orchestrator.deterministic_runner import DETERMINISTIC_AGENT_ROLE
+
+        queue = EscalationQueue(tmp_path)
+        esc_id = self._file(queue, summary='x' * 300, detail='the transient read failed')
+
+        [record] = queue.get_by_task('7238')
+        assert esc_id == record.id
+        assert record.agent_role == DETERMINISTIC_AGENT_ROLE
+        assert record.level == 2
+        assert record.severity == 'critical'
+        assert record.category == 'infra_issue'
+        assert record.summary == 'x' * 200
+        assert record.detail == 'the transient read failed'
+
+    def test_a_pending_own_role_escalation_skips_the_filing(self, tmp_path):
+        queue = EscalationQueue(tmp_path)
+        self._own_role_record(queue)
+
+        assert self._file(queue) is None
+        assert len(queue.get_by_task('7238')) == 1
+
+    def test_a_resolved_own_role_escalation_does_not_skip_the_filing(self, tmp_path):
+        queue = EscalationQueue(tmp_path)
+        queue.resolve(self._own_role_record(queue), 'fixed', resolution_class='actionable')
+
+        esc_id = self._file(queue)
+
+        assert esc_id is not None
+        assert len(queue.get_by_task('7238')) == 2
+
+    def test_the_category_is_honoured(self, tmp_path):
+        queue = EscalationQueue(tmp_path)
+        self._file(queue, category='milestone_check_failed')
+
+        [record] = queue.get_by_task('7238')
+        assert record.category == 'milestone_check_failed'
+
+    def test_the_filing_is_logged_under_its_actor(self, tmp_path, caplog):
+        queue = EscalationQueue(tmp_path)
+        with caplog.at_level(logging.INFO, logger='orchestrator.deterministic_runner'):
+            self._file(queue)
+
+        messages = [r.getMessage() for r in caplog.records]
+        assert any(m.startswith('ScheduledDeploySettler: filed L2 infra_issue') for m in messages), messages
+        assert not any('DeterministicRunner' in m for m in messages), messages

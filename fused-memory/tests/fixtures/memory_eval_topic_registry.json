@@ -625,9 +625,9 @@
     },
     {
       "canonical": {
-        "content_hash": "fb93b6b1f41d10cd",
-        "content_prefix": "CANONICAL SOP (reify) — LANDING DOCS / PRD ARTIFACTS. Round-2 consolidation, 2026-07-27 (curator gate esc-5541-1). Supersedes canonical 166f5106 and closes out ",
-        "last_known_id": "0e954870-bba1-44a7-81e9-5be94d5f6255"
+        "content_hash": "01be43fcafa49e3a",
+        "content_prefix": "CANONICAL SOP (reify) — landing PRD artifacts (PRD .md, capability-manifest .md, YAML sidecar). RE-ISSUED 2026-07-27 under human curator gate esc-5541-1 (reify ",
+        "last_known_id": "9b01e961-e086-428a-ad7e-68323b22f21a"
       },
       "claim_queries": [
         {
@@ -682,55 +682,55 @@
       },
       "supersedes_pairs": [
         {
-          "successor_hash": "fb93b6b1f41d10cd",
+          "successor_hash": "01be43fcafa49e3a",
           "superseded_hash": "ae718e614edf0ded"
         },
         {
-          "successor_hash": "fb93b6b1f41d10cd",
+          "successor_hash": "01be43fcafa49e3a",
           "superseded_hash": "9768ba72b7338f5f"
         },
         {
-          "successor_hash": "fb93b6b1f41d10cd",
+          "successor_hash": "01be43fcafa49e3a",
           "superseded_hash": "17799174a8b670cb"
         },
         {
-          "successor_hash": "fb93b6b1f41d10cd",
+          "successor_hash": "01be43fcafa49e3a",
           "superseded_hash": "a054210ee9c8f574"
         },
         {
-          "successor_hash": "fb93b6b1f41d10cd",
+          "successor_hash": "01be43fcafa49e3a",
           "superseded_hash": "e8c51fb7fc8bbb3b"
         },
         {
-          "successor_hash": "fb93b6b1f41d10cd",
+          "successor_hash": "01be43fcafa49e3a",
           "superseded_hash": "5c6f4ded4036fac7"
         },
         {
-          "successor_hash": "fb93b6b1f41d10cd",
+          "successor_hash": "01be43fcafa49e3a",
           "superseded_hash": "06265d32e047651f"
         },
         {
-          "successor_hash": "fb93b6b1f41d10cd",
+          "successor_hash": "01be43fcafa49e3a",
           "superseded_hash": "966f3eaf6f793c0a"
         },
         {
-          "successor_hash": "fb93b6b1f41d10cd",
+          "successor_hash": "01be43fcafa49e3a",
           "superseded_hash": "bdf4fa056f6331f4"
         },
         {
-          "successor_hash": "fb93b6b1f41d10cd",
+          "successor_hash": "01be43fcafa49e3a",
           "superseded_hash": "35c7e00b9277e9c0"
         },
         {
-          "successor_hash": "fb93b6b1f41d10cd",
+          "successor_hash": "01be43fcafa49e3a",
           "superseded_hash": "3054a829765a0562"
         },
         {
-          "successor_hash": "fb93b6b1f41d10cd",
+          "successor_hash": "01be43fcafa49e3a",
           "superseded_hash": "51669448d58a7b9a"
         },
         {
-          "successor_hash": "fb93b6b1f41d10cd",
+          "successor_hash": "01be43fcafa49e3a",
           "superseded_hash": "30790ef196d6c3df"
         }
       ],
@@ -949,9 +949,9 @@
     },
     {
       "canonical": {
-        "content_hash": "7ded508506c1bd65",
-        "content_prefix": "reify HARNESS-LAYOUT GATE — the decision rule. CANONICAL (consolidation round-2, 2026-07-27, curator gate esc-5534-1; supersedes 1a265e20 and folds in ad415479 ",
-        "last_known_id": "168c3a6b-55dd-4f53-88e4-3a829ea210fc"
+        "content_hash": "5a1174ffc2c74305",
+        "content_prefix": "reify HARNESS-LAYOUT GATE — the decision rule. CANONICAL INDEX (shrunk from its ~9.5k-char absorbing form 2026-09-08). Fires on a new top-level `crates/<c>/test",
+        "last_known_id": "bbc063a7-ea8f-4262-b9dd-eef3002a99a8"
       },
       "claim_queries": [
         {
@@ -998,23 +998,23 @@
       },
       "supersedes_pairs": [
         {
-          "successor_hash": "7ded508506c1bd65",
+          "successor_hash": "5a1174ffc2c74305",
           "superseded_hash": "400bccbae8191294"
         },
         {
-          "successor_hash": "7ded508506c1bd65",
+          "successor_hash": "5a1174ffc2c74305",
           "superseded_hash": "9d3b8eb0ae17cb4f"
         },
         {
-          "successor_hash": "7ded508506c1bd65",
+          "successor_hash": "5a1174ffc2c74305",
           "superseded_hash": "aebb8e9f87504821"
         },
         {
-          "successor_hash": "7ded508506c1bd65",
+          "successor_hash": "5a1174ffc2c74305",
           "superseded_hash": "ba09646ea3c31de2"
         },
         {
-          "successor_hash": "7ded508506c1bd65",
+          "successor_hash": "5a1174ffc2c74305",
           "superseded_hash": "a077f897f4db5661"
         }
       ],
@@ -1292,9 +1292,9 @@
     },
     {
       "canonical": {
-        "content_hash": "0c2d92cc2b8d19da",
-        "content_prefix": "NEVER match processes by a pattern your own command line contains — `pkill -f` / `pgrep -f` SELF-MATCH. CANONICAL (merges 86187cbc + 052bf682 + 90a10d71 + the p",
-        "last_known_id": "d4b39613-bd62-4ad6-98e1-105cfcca254b"
+        "content_hash": "4f0df03924396c06",
+        "content_prefix": "INDEX — `pkill -f` / `pgrep -f` SELF-MATCH in reify agent sessions. The Claude Code Bash tool runs your command inside a `bash -c '… eval …'` wrapper whose own ",
+        "last_known_id": "5f83c557-361d-48a8-b053-cda0a0ff3fcd"
       },
       "claim_queries": [
         {
@@ -1339,15 +1339,15 @@
       },
       "supersedes_pairs": [
         {
-          "successor_hash": "0c2d92cc2b8d19da",
+          "successor_hash": "4f0df03924396c06",
           "superseded_hash": "838647fa957b4bad"
         },
         {
-          "successor_hash": "0c2d92cc2b8d19da",
+          "successor_hash": "4f0df03924396c06",
           "superseded_hash": "d2666d3d7a8d8de7"
         },
         {
-          "successor_hash": "0c2d92cc2b8d19da",
+          "successor_hash": "4f0df03924396c06",
           "superseded_hash": "053504cc8bce5036"
         }
       ],
@@ -1393,8 +1393,8 @@
     },
     {
       "canonical": {
-        "content_hash": "0788efd4a9fca4a1",
-        "content_prefix": "Orchestrator/fused-memory pytest-xdist gotcha (canonical, merges bbe45a4f's 6 prior entries + 6d203bd5)",
+        "content_hash": "69f202cdddc3a363",
+        "content_prefix": "Orchestrator/fused-memory pytest-xdist gotcha (canonical, merges bbe45a4f's 6 prior entries + 6d203bd5 + 0ebfcaa7): orchestrator/pyproject.toml and fused-memory",
         "last_known_id": "8bb3eb15-1133-4e7b-ac1f-5bac10329b51"
       },
       "claim_queries": [
@@ -1826,8 +1826,8 @@
     },
     {
       "canonical": {
-        "content_hash": "0cb14865572918d0",
-        "content_prefix": "ADDING A TOOL TO THE reify-debug MCP — CANONICAL (consolidates 9 entries, 2026-05-05..2026-06-09, under curator gate esc-5563-1). Verified against the tree 2026",
+        "content_hash": "2b14e3dddfef687f",
+        "content_prefix": "ADDING A TOOL TO THE reify-debug MCP — CANONICAL (consolidates 9 entries, 2026-05-05..2026-06-09, under curator gate esc-5563-1; addendum folded 2026-08-30, see",
         "last_known_id": "e0a41fcd-0745-426b-bf71-45466e6d34e0"
       },
       "claim_queries": [
@@ -1879,39 +1879,39 @@
       },
       "supersedes_pairs": [
         {
-          "successor_hash": "0cb14865572918d0",
+          "successor_hash": "2b14e3dddfef687f",
           "superseded_hash": "387b6b012d88d2f5"
         },
         {
-          "successor_hash": "0cb14865572918d0",
+          "successor_hash": "2b14e3dddfef687f",
           "superseded_hash": "d15018c0a0f991f8"
         },
         {
-          "successor_hash": "0cb14865572918d0",
+          "successor_hash": "2b14e3dddfef687f",
           "superseded_hash": "4bc889996ef68818"
         },
         {
-          "successor_hash": "0cb14865572918d0",
+          "successor_hash": "2b14e3dddfef687f",
           "superseded_hash": "971967c05b31b363"
         },
         {
-          "successor_hash": "0cb14865572918d0",
+          "successor_hash": "2b14e3dddfef687f",
           "superseded_hash": "9f94cf70e21a2ea9"
         },
         {
-          "successor_hash": "0cb14865572918d0",
+          "successor_hash": "2b14e3dddfef687f",
           "superseded_hash": "731353c98fc7194e"
         },
         {
-          "successor_hash": "0cb14865572918d0",
+          "successor_hash": "2b14e3dddfef687f",
           "superseded_hash": "38dbdfd4dd38562b"
         },
         {
-          "successor_hash": "0cb14865572918d0",
+          "successor_hash": "2b14e3dddfef687f",
           "superseded_hash": "4c6f05544c724489"
         },
         {
-          "successor_hash": "0cb14865572918d0",
+          "successor_hash": "2b14e3dddfef687f",
           "superseded_hash": "4e4ff9195a0e6ad9"
         }
       ],
@@ -1965,8 +1965,8 @@
     },
     {
       "canonical": {
-        "content_hash": "6c6d4a4ad7a0bbce",
-        "content_prefix": "reify: the `tracing` callsite-Interest cache-poisoning gotcha, and the TWO legitimate remedies. CANONICAL (merges 2200d20e + 524933e4 + 2eda458f; verified again",
+        "content_hash": "e23078d49bc1e5fc",
+        "content_prefix": "reify: the `tracing` callsite-Interest cache-poisoning gotcha, and the TWO legitimate remedies. CANONICAL (merges 2200d20e + 524933e4 + 2eda458f, curator gate e",
         "last_known_id": "70fd0700-9007-4ac0-9559-8616900715bc"
       },
       "claim_queries": [

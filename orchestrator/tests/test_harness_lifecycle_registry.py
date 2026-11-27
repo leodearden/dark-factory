@@ -22,16 +22,21 @@ do not yet exist.
 from __future__ import annotations
 
 import asyncio
+import logging
 import threading
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from _escalation_server_capture import create_server_kwargs
+from _startup_harness import journal_merge_request, merge_lane_harness_factory
 from escalation.queue import EscalationQueue
 from shared.project_layout import escalation_queue_dir
+from shared.task_submit import SubmitOutcome, SubmittedTask
 
+from orchestrator import flake_debt_drain
 from orchestrator.background_service import BackgroundService, ManagedService
 from orchestrator.config import OrchestratorConfig
 from orchestrator.event_store import EventStore, EventType
@@ -41,6 +46,8 @@ from orchestrator.flake_ledger import (
     FlakeCallSite,
     enqueue_debt,
     ledger_db_path,
+    open_debt,
+    read_debt,
     read_due_items,
     record_failed_due_attempt,
 )
@@ -50,10 +57,12 @@ from orchestrator.verify_admission_gate import AdmissionPlan, AdmissionPolicy, g
 # Canonical start-order registration list — task 2241 plan.json "HARNESS
 # MIGRATION": the loop-stall monitor first, so it watches every other
 # service's whole life and stops last (task 7366); then escalation-server and
-# merge-worker (the recovery block depends on both being live); the remaining bespoke adapter (offline-lane)
-# and the seven BackgroundService sweeps follow, then the always-on services
+# merge-worker (the recovery block needs the escalation server live and the
+# merge worker constructed, not running; task 8268); the remaining bespoke adapter (offline-lane)
+# and the eight BackgroundService sweeps follow, then the always-on services
 # that keep their cadence whatever the dispatch loop does (task 5344; the
-# verify-admission watch, task 5628; the flake-debt drain, task 6934).
+# verify-admission watch, task 5628; the flake-debt drain, task 6934; the
+# flake-debt resolution sweep, task 8409).
 _CANONICAL_ORDER = [
     'loop-stall-monitor',
     'escalation-server',
@@ -66,11 +75,13 @@ _CANONICAL_ORDER = [
     'main-tip-sweep',
     'no-landings-breaker',
     'deterministic-recon-sweep',
+    'scheduled-deploy-settle',
     'warm-lane-gc',
     'stale-service-restart',
     'merge-heartbeat',
     'verify-admission-watch',
     'flake-debt-drain',
+    'flake-debt-resolution',
 ]
 
 
@@ -109,6 +120,36 @@ class TestLifecycleRegistrationOrder:
         names = [s.name for s in harness._lifecycle.services]
         assert 'warm-lane-gc' not in names
         assert names == [n for n in _CANONICAL_ORDER if n != 'warm-lane-gc']
+
+    def test_scheduled_deploy_settle_follows_the_recon_sweep_gate(self, tmp_path: Path) -> None:
+        config = OrchestratorConfig(project_root=tmp_path)
+        config.deterministic_recon_sweep_enabled = False
+        harness = Harness(config)
+
+        harness._build_lifecycle_registry()
+
+        assert harness._lifecycle is not None
+        gated = {'deterministic-recon-sweep', 'scheduled-deploy-settle'}
+        names = [s.name for s in harness._lifecycle.services]
+        assert names == [n for n in _CANONICAL_ORDER if n not in gated]
+
+    @pytest.mark.asyncio
+    async def test_a_scheduled_deploy_settle_pass_without_a_queue_warns(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        harness = Harness(OrchestratorConfig(project_root=tmp_path))
+        harness._build_lifecycle_registry()
+        assert harness._lifecycle is not None
+        [settle] = [s for s in harness._lifecycle.services if s.name == 'scheduled-deploy-settle']
+        assert isinstance(settle, BackgroundService)
+
+        with caplog.at_level('WARNING', logger='orchestrator.harness'):
+            await settle.pass_fn()
+
+        assert any(
+            'scheduled-deploy settle' in r.getMessage() and 'no escalation queue' in r.getMessage()
+            for r in caplog.records if r.levelname == 'WARNING'
+        )
 
     @pytest.mark.asyncio
     async def test_the_first_service_is_a_live_loop_stall_monitor(
@@ -228,7 +269,8 @@ class TestLifecycleRegistryRunWiring:
         _dismiss_stale_escalations (task 2241 design decision: the
         startup-ritual collapse is safe because escalation-server +
         merge-worker are registered first-in-order and the seven sweeps are
-        sleep-first)."""
+        sleep-first). The recovery block needs the merge worker constructed,
+        not running: its loop launches after finish_startup() (task 8268)."""
         h, _mock_mcp = _make_run_wired_harness(tmp_path)
         h._build_lifecycle_registry()
         assert h._lifecycle is not None
@@ -388,3 +430,219 @@ class TestFlakeDebtDrainPass:
         [record] = fresh.get_by_task(STALE_DUE_ESCALATION_SENTINEL, status='pending')
         assert record.level == 1
         assert record.category == 'infra_issue'
+
+
+# ---------------------------------------------------------------------------
+# task 8409: the flake-debt resolution sweep closes a done owner's cycle and
+# records one event per pass
+# ---------------------------------------------------------------------------
+
+_FLAKY_TEST = 'tests/test_flaky.py::test_x'
+
+
+class _FilingClient:
+    """A ``flake_ledger.FlakeLedgerTaskClient`` that files one pending de-flake task."""
+
+    async def submit_task(self, arguments: dict) -> SubmitOutcome:
+        return SubmittedTask('deflake-1', 'pending')
+
+    async def get_statuses(self, ids: list[str]) -> tuple[dict[str, str], Exception | None]:
+        return {'deflake-1': 'pending'}, None
+
+    async def get_task(self, task_id: str) -> tuple[dict | None, Exception | None]:
+        return {'id': 'deflake-1', 'status': 'pending', 'metadata': {}}, None
+
+    async def commit_planning(self, task_ids: list[str]) -> None:
+        return None
+
+
+class TestFlakeDebtResolutionPass:
+    """The registered ``flake-debt-resolution`` pass reads owners through the harness's
+    scheduler and writes its report to the harness's event store, when one is wired."""
+
+    @staticmethod
+    async def _seeded_harness(tmp_path: Path) -> Harness:
+        config = OrchestratorConfig(project_root=tmp_path)
+        h = Harness(config)
+        await open_debt(
+            ledger_db_path(tmp_path), config.fused_memory.project_id, _FLAKY_TEST,
+            task_client=_FilingClient(),
+        )
+        row = read_debt(ledger_db_path(tmp_path), _FLAKY_TEST)
+        assert row is not None and row.owner_task_id == 'deflake-1'
+        return h
+
+    @staticmethod
+    async def _run_registered_pass(h: Harness) -> None:
+        h._build_lifecycle_registry()
+        assert h._lifecycle is not None
+        [service] = [
+            s for s in h._lifecycle.services
+            if isinstance(s, BackgroundService) and s.name == 'flake-debt-resolution'
+        ]
+        assert service.interval_secs == flake_debt_drain.RESOLUTION_INTERVAL_SECS
+        done = {'id': 'deflake-1', 'status': 'done', 'metadata': {}}
+        with patch.object(h.scheduler, 'dispatch_tool', AsyncMock(return_value=done)):
+            await service.pass_fn()
+
+    @staticmethod
+    def _resolved(tmp_path: Path) -> bool:
+        row = read_debt(ledger_db_path(tmp_path), _FLAKY_TEST)
+        assert row is not None
+        return row.resolved_at is not None
+
+    @pytest.mark.asyncio
+    async def test_pass_closes_a_done_owners_cycle_and_emits_one_event(
+        self, tmp_path: Path,
+    ) -> None:
+        h = await self._seeded_harness(tmp_path)
+        h.event_store = EventStore(tmp_path / 'events.db', run_id='t')
+
+        await self._run_registered_pass(h)
+
+        assert self._resolved(tmp_path)
+        [event] = h.event_store.fetch_events_by_type(EventType.flake_debt_resolution_pass)
+        assert event['data'] == {
+            'examined': 1, 'resolved': 1, 'owner_unreadable': 0, 'stop': None,
+        }
+
+    @pytest.mark.asyncio
+    async def test_a_pass_over_an_empty_ledger_still_emits_its_event(
+        self, tmp_path: Path,
+    ) -> None:
+        """An hour with no event must mean the service is not running, never that it
+        found nothing to examine."""
+        h = Harness(OrchestratorConfig(project_root=tmp_path))
+        h.event_store = EventStore(tmp_path / 'events.db', run_id='t')
+
+        await self._run_registered_pass(h)
+
+        [event] = h.event_store.fetch_events_by_type(EventType.flake_debt_resolution_pass)
+        assert event['data'] == {
+            'examined': 0, 'resolved': 0, 'owner_unreadable': 0, 'stop': None,
+        }
+
+    @pytest.mark.asyncio
+    async def test_pass_without_an_event_store_still_resolves(self, tmp_path: Path) -> None:
+        h = await self._seeded_harness(tmp_path)
+        h.event_store = None
+
+        await self._run_registered_pass(h)
+
+        assert self._resolved(tmp_path)
+
+
+# ---------------------------------------------------------------------------
+# task 8268 (plans/startup-hardening-prd.md §3.4): the merge worker is
+# constructed at 1b; its loop is launched only after finish_startup()
+# ---------------------------------------------------------------------------
+
+class _ProcessKillingFault(BaseException):
+    """Escapes the startup-step runner, which catches only ``Exception``."""
+
+
+@pytest.fixture
+def make_merge_lane_harness(tmp_path: Path) -> Callable[[], Harness]:
+    return merge_lane_harness_factory(tmp_path)
+
+
+def _drain_queued(h: Harness) -> list:
+    queued = []
+    while not h._merge_queue.empty():
+        queued.append(h._merge_queue.get_nowait())
+    return queued
+
+
+def _messages(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [r.getMessage() for r in caplog.records]
+
+
+def _index_of(messages: list[str], fragment: str) -> int:
+    return next(i for i, m in enumerate(messages) if fragment in m)
+
+
+def _merge_worker_loops() -> list[asyncio.Task]:
+    return [t for t in asyncio.all_tasks() if t.get_name() == 'merge-worker']
+
+
+@pytest.mark.asyncio
+class TestMergeWorkerLaunchedAfterStartup:
+    async def test_a_crash_in_2c_resolves_no_journaled_merge(
+        self, make_merge_lane_harness,
+    ) -> None:
+        h = make_merge_lane_harness()
+        request_id = await journal_merge_request(h, '41')
+        h._recover_crashed_tasks = AsyncMock(side_effect=_ProcessKillingFault('injected 2c'))
+
+        with pytest.raises(_ProcessKillingFault):
+            await h.run(prd_path=None)
+
+        assert h.event_store is not None
+        assert h.event_store.fetch_events_by_type(EventType.merge_finalized) == []
+        [queued] = _drain_queued(h)
+        assert queued.request_id == request_id
+        assert not queued.result.done()
+
+        h2 = make_merge_lane_harness()
+        await h2.run(prd_path=None, dry_run=True)
+
+        assert [r.request_id for r in _drain_queued(h2)] == [request_id]
+
+    async def test_a_healthy_start_launches_the_loop_after_the_task_tree_is_populated(
+        self, make_merge_lane_harness, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        h = make_merge_lane_harness()
+        loops_during_2c: list[asyncio.Task] = []
+        loops_at_first_acquire: list[asyncio.Task] = []
+
+        async def recover_crashed_tasks() -> None:
+            loops_during_2c.extend(_merge_worker_loops())
+
+        h._recover_crashed_tasks = recover_crashed_tasks
+
+        async def first_acquire(*_args: object) -> None:
+            loops_at_first_acquire.extend(_merge_worker_loops())
+            raise RuntimeError('__stop_sentinel__')
+
+        h.scheduler.acquire_next = AsyncMock(side_effect=first_acquire)
+
+        with caplog.at_level(logging.INFO, logger='orchestrator.harness'), \
+             pytest.raises(RuntimeError, match='__stop_sentinel__'):
+            await h.run(prd_path=None)
+
+        assert loops_during_2c == []
+        assert len(loops_at_first_acquire) == 1
+        messages = _messages(caplog)
+        assert _index_of(messages, 'Task tree populated') < _index_of(
+            messages, 'Speculative merge worker started',
+        )
+
+    async def test_a_dry_run_start_never_runs_the_loop(
+        self, make_merge_lane_harness, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        h = make_merge_lane_harness()
+
+        with caplog.at_level(logging.INFO, logger='orchestrator.harness'):
+            await h.run(prd_path=None, dry_run=True)
+
+        assert _merge_worker_loops() == []
+        assert not any('Speculative merge worker started' in m for m in _messages(caplog))
+        h.scheduler.finish_startup.assert_called_once()
+
+    async def test_stopping_a_constructed_but_unlaunched_merge_worker_resolves_nothing(
+        self, make_merge_lane_harness,
+    ) -> None:
+        h = make_merge_lane_harness()
+        h._build_lifecycle_registry()
+        assert h._lifecycle is not None
+        [service] = [s for s in h._lifecycle.services if s.name == 'merge-worker']
+        await service.start()
+        assert h._merge_worker is not None
+        assert _merge_worker_loops() == []
+
+        with patch.object(h._merge_worker, 'stop', AsyncMock()) as stop, \
+             patch.object(h._drain_participant, 'on_shutdown', MagicMock()) as on_shutdown:
+            await service.stop()
+
+        stop.assert_not_called()
+        on_shutdown.assert_not_called()

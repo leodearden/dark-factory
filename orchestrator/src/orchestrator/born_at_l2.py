@@ -1,0 +1,127 @@
+"""File an orchestrator-detected condition as one deduped born-at-L2 escalation.
+
+A born-at-L2 escalation goes straight to a human: it is filed at level 2 with
+severity ``urgent`` under a role in the harness sentinel namespace
+(``harness-`` or ``orchestrator-``, which BornAtL2Alarm enforces), so the
+agent-role downgrade gate exempts it. One pending L2 per root cause is the
+dedup policy, and a filing failure never reaches the caller.
+"""
+
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass
+from typing import TYPE_CHECKING
+
+from escalation.categories import EscalationCategory, require_registered_category
+from escalation.models import HARNESS_SENTINEL_ROLE_PREFIXES, Escalation
+
+from orchestrator.event_store import EventType
+
+if TYPE_CHECKING:
+    from escalation.queue import EscalationQueue
+
+    from orchestrator.event_store import EventStore
+
+logger = logging.getLogger(__name__)
+
+_SUMMARY_LIMIT = 200
+
+
+@dataclass(frozen=True)
+class BornAtL2Alarm:
+    """What stays the same each time one kind of alarm is filed."""
+
+    root_cause: str
+    task_id: str
+    role: str
+    category: EscalationCategory
+    suggested_action: str
+    created_reason: str
+
+    def __post_init__(self) -> None:
+        require_registered_category(self.category)
+        if not self.role.startswith(HARNESS_SENTINEL_ROLE_PREFIXES):
+            raise ValueError(
+                f'BornAtL2Alarm {self.root_cause!r} has role={self.role!r}; it needs a role '
+                f'starting with one of {HARNESS_SENTINEL_ROLE_PREFIXES}. The record is written '
+                'at level 2 straight through EscalationQueue.submit, skipping the agent-role '
+                'downgrade gate, and escalation/submit.py refuses the same combination.'
+            )
+
+
+def file_deduped_born_at_l2(
+    queue: EscalationQueue | None,
+    alarm: BornAtL2Alarm,
+    *,
+    summary: str,
+    detail: str,
+    event_store: EventStore | None,
+    filing_claimant_run_id: str | None,
+) -> Escalation | None:
+    """File *alarm* unless an L2 with its root cause is already pending.
+
+    Returns the filed escalation, or ``None`` when there is no queue, one was
+    already pending, or filing failed. A failure is logged, never raised.
+    """
+    if queue is None:
+        return None
+    try:
+        if queue.find_pending_l2_by_root_cause(alarm.root_cause) is not None:
+            return None
+        escalation = _escalation(queue, alarm, summary, detail, filing_claimant_run_id)
+        queue.submit(escalation)
+    except Exception:
+        logger.warning('%s: failed to file the born-at-L2', alarm.root_cause, exc_info=True)
+        return None
+    _emit_created(event_store, alarm, escalation)
+    logger.warning(
+        '%s: born-at-L2 %s filed: %s', alarm.root_cause, escalation.id, escalation.summary,
+    )
+    return escalation
+
+
+def _escalation(
+    queue: EscalationQueue,
+    alarm: BornAtL2Alarm,
+    summary: str,
+    detail: str,
+    filing_claimant_run_id: str | None,
+) -> Escalation:
+    return Escalation(
+        id=queue.make_id(alarm.task_id),
+        task_id=alarm.task_id,
+        agent_role=alarm.role,
+        severity='urgent',
+        category=alarm.category,
+        level=2,
+        root_cause=alarm.root_cause,
+        summary=summary[:_SUMMARY_LIMIT],
+        detail=detail,
+        suggested_action=alarm.suggested_action,
+        filing_claimant_run_id=filing_claimant_run_id,
+    )
+
+
+def _emit_created(
+    event_store: EventStore | None, alarm: BornAtL2Alarm, escalation: Escalation,
+) -> None:
+    if event_store is None:
+        return
+    try:
+        event_store.emit(
+            EventType.escalation_created,
+            task_id=alarm.task_id,
+            data={
+                'escalation_id': escalation.id,
+                'category': escalation.category,
+                'severity': escalation.severity,
+                'level': escalation.level,
+                'reason': alarm.created_reason,
+            },
+        )
+    except Exception:
+        logger.warning(
+            '%s: born-at-L2 %s filed but its escalation_created emit failed',
+            alarm.root_cause, escalation.id, exc_info=True,
+        )

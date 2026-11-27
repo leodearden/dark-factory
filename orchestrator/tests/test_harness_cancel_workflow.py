@@ -18,6 +18,7 @@ from _orch_helpers import _init_harness_state_for_test, wire_scheduler_liveness_
 from orchestrator.config import OrchestratorConfig
 from orchestrator.harness import Harness, TaskReport
 from orchestrator.scheduler import TaskAssignment
+from orchestrator.slot_lease import SlotLease
 from orchestrator.workflow import WorkflowOutcome
 from orchestrator.workflow_types import WorkflowState
 
@@ -148,6 +149,8 @@ def harness_for_run_slot() -> Harness:
     h._merge_queue = None  # type: ignore[assignment]
     h._merge_worker = None
     h._merge_inflight_registry = None  # type: ignore[assignment]
+    h._task_verify_dispatcher = MagicMock()
+    h._verify_cache = MagicMock()
     h.cost_store = None
     # _collect_slot_report uses these
     h._live_tasks = set()
@@ -203,7 +206,7 @@ async def test_run_slot_returns_cancelled_report_when_hard_cancelled(
         mock_wf.run = _wedge
         mock_wf_cls.return_value = mock_wf
 
-        wrapper_task = asyncio.create_task(h._run_slot(assignment, sem))
+        wrapper_task = asyncio.create_task(h._run_slot(assignment, SlotLease(assignment.task_id, h.scheduler, sem)))
 
         # Poll until _run_slot registers itself in _workflow_slot_tasks.
         for _ in range(50):
@@ -283,7 +286,7 @@ async def test_run_slot_clears_stale_grace_stamp_at_dispatch(
         mock_wf.run = _wedge
         mock_wf_cls.return_value = mock_wf
 
-        wrapper_task = asyncio.create_task(h._run_slot(assignment, sem))
+        wrapper_task = asyncio.create_task(h._run_slot(assignment, SlotLease(assignment.task_id, h.scheduler, sem)))
 
         # Poll until the slot registers.  The stamp pop happens at dispatch,
         # just before the slot-task registration, so once the slot is present
@@ -343,7 +346,7 @@ async def _drive_cancelled_slot(
             # A cancel landing BEFORE `workflow` is bound.  The except handler
             # must not touch an unbound local.
             mock_wf_cls.side_effect = asyncio.CancelledError()
-            wrapper_task = asyncio.create_task(h._run_slot(assignment, sem))
+            wrapper_task = asyncio.create_task(h._run_slot(assignment, SlotLease(assignment.task_id, h.scheduler, sem)))
             done, _ = await asyncio.wait({wrapper_task}, timeout=5.0)
             assert wrapper_task in done
             return _narrow(wrapper_task.result())
@@ -356,7 +359,7 @@ async def _drive_cancelled_slot(
         mock_wf.state = state
         mock_wf_cls.return_value = mock_wf
 
-        wrapper_task = asyncio.create_task(h._run_slot(assignment, sem))
+        wrapper_task = asyncio.create_task(h._run_slot(assignment, SlotLease(assignment.task_id, h.scheduler, sem)))
         if capture_task is not None:
             capture_task.append(wrapper_task)
         for _ in range(50):

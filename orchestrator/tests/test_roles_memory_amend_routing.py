@@ -54,6 +54,8 @@ section, and with the docs half untested nothing would catch the drift.
 
 from __future__ import annotations
 
+from _roles_helpers import tool_is_granted
+
 from orchestrator.agents.roles import (
     _MEMORY_INSTRUCTIONS,
     ARCHITECT,
@@ -74,22 +76,6 @@ _IN_PLACE_UPDATE_TOOL = 'mcp__fused-memory__update_memory'
 # `test_plan_authoring_roles_carry_the_rule` below is the derived counterpart
 # that a future PLAN-AUTHORING role cannot escape.
 _MEMORY_INSTRUCTION_ROLES = (ARCHITECT, IMPLEMENTER, DEBUGGER, DEEP_REVIEWER, SIMPLE_TASK)
-
-
-def _tool_is_granted(tool: str, granted: set[str]) -> bool:
-    """True if `tool` is granted directly, or covered by a `mcp__<family>__*` wildcard.
-
-    Mirrors `test_roles_ancestry_check.py::_tool_is_granted` rather than
-    importing it, so neither module's private helper becomes a cross-suite
-    dependency. Wildcard awareness is load-bearing in both directions here:
-    it keeps the plan-authoring selection correct if a role ever switches to
-    a family wildcard, and it keeps the "nobody holds update_memory" guard
-    honest if someone grants `mcp__fused-memory__*`.
-    """
-    if tool in granted:
-        return True
-    family_prefix, sep, _name = tool.rpartition('__')
-    return sep == '__' and f'{family_prefix}__*' in granted
 
 
 def test_memory_instructions_splice_the_amend_routing_rule() -> None:
@@ -133,7 +119,7 @@ def test_plan_authoring_roles_carry_the_rule() -> None:
     """
     authors = [
         role for role in ROLES.values()
-        if _tool_is_granted(_PLAN_STEP_AUTHORING_TOOL, set(role.allowed_tools))
+        if tool_is_granted(_PLAN_STEP_AUTHORING_TOOL, set(role.allowed_tools))
     ]
     # Anti-vacuity: if `add_plan_step` is ever renamed, the selection above
     # goes empty and the offender check below passes while guarding nothing.
@@ -175,7 +161,7 @@ def test_no_role_is_granted_the_in_place_update_tool() -> None:
     """
     offenders = [
         role.name for role in ROLES.values()
-        if _tool_is_granted(_IN_PLACE_UPDATE_TOOL, set(role.allowed_tools))
+        if tool_is_granted(_IN_PLACE_UPDATE_TOOL, set(role.allowed_tools))
     ]
     assert offenders == [], (
         f'Role(s) granted {_IN_PLACE_UPDATE_TOOL}: {offenders}. No dispatched '

@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
-"""The whole-repo quality metrics snapshot: plans/quality-metrics-snapshot-prd.md §Contract, schema 2 (schema 1 is still read).
+"""The whole-repo quality metrics snapshot: plans/quality-metrics-snapshot-prd.md §Contract, schema 3 (schemas 1 and 2 are still read).
 
 A report, never a gate: it emits measures and the quality doc's two heuristic-14
-marks, and no verdict, ranking, average or threshold of its own.
+marks, and no verdict, ranking, average or threshold of its own. The params
+fields are plans/quality-dashboard-prd.md §Contract (Snapshot identity).
 
     --run-id RUN_ID --out PATH [--root DIR] [--diff PREVIOUS.json]   measure HEAD, write PATH
     --current SNAPSHOT.json --diff PREVIOUS.json                      diff two snapshots
     --summary SNAPSHOT.json                                           per-member table
+    --summary SNAPSHOT.json --json                                    the same table as one JSON object
+    --params                                                          the params a measurement here records
 
 Exit 0 when done; exit 2 on an instrument failure, with the cause named on
 stderr. The PRD holds the rationale for every choice made here.
@@ -17,6 +20,7 @@ import argparse
 import ast
 import dataclasses
 import json
+import platform
 import sys
 import time
 from collections import Counter
@@ -29,7 +33,7 @@ import source_measures
 
 from shared import safe_io
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 INSTRUMENT = 'quality-metrics-snapshot'
 
 #: heuristic 14's two marks (docs/code-quality.md, heuristic 14) -- the doc's figures, not this script's thresholds.
@@ -531,12 +535,27 @@ def _require_unmoved_head(root: Path, as_of: str) -> None:
         )
 
 
+def measurement_params() -> dict[str, Any]:
+    """What a measurement by this interpreter and this instrument records as its params."""
+    complexipy_version = source_measures.require_complexipy()
+    return {
+        'complexipy_version': complexipy_version,
+        'python_version': platform.python_version(),
+        'instrument': {
+            'quality_metrics_snapshot': source_measures.blob_sha(Path(__file__).resolve()),
+            'source_measures': source_measures.blob_sha(Path(source_measures.__file__).resolve()),
+        },
+        'h14_soft_ceiling_lines': H14_SOFT_CEILING_LINES,
+        'h14_alarm_lines': H14_ALARM_LINES,
+    }
+
+
 def take_snapshot(root: Path, *, run_id: str, since: str) -> dict[str, Any]:
     """Measure *root*'s HEAD as a SCHEMA_VERSION snapshot; refuse a dirty domain or a moved HEAD."""
     started = time.monotonic()
-    version = source_measures.require_complexipy()
+    params = measurement_params()
     as_of = source_measures.head_commit(root)
-    domain = source_measures.workspace_domain(root)
+    domain = source_measures.measurement_domain(root)
     _require_clean_domain(root, as_of)
     measured = measure_domain(root, domain)
     _require_unmoved_head(root, as_of)
@@ -549,16 +568,43 @@ def take_snapshot(root: Path, *, run_id: str, since: str) -> dict[str, Any]:
         'since': since,
         'evidence': _evidence(domain, measured),
         'cost': {'wall_clock_s': round(time.monotonic() - started, 1)},
-        'params': {
-            'complexipy_version': version,
-            'h14_soft_ceiling_lines': H14_SOFT_CEILING_LINES,
-            'h14_alarm_lines': H14_ALARM_LINES,
-        },
+        'params': params,
         'files': {path: dict(record) for path, record in measured.files.items()},
         'functions': dict(measured.functions),
         'import_graph': dict(measured.import_graph),
     }
     return validate_snapshot(snapshot, origin='this measurement')
+
+
+@dataclasses.dataclass(frozen=True)
+class MeasurementIdentity:
+    """plans/quality-dashboard-prd.md decision 17: the params held as canonical JSON, so the value is hashable and fixed."""
+
+    as_of_sha: str
+    params_json: str
+
+    @classmethod
+    def of(cls, as_of_sha: str, params: Mapping[str, Any]) -> MeasurementIdentity:
+        return cls(as_of_sha, json.dumps(params, sort_keys=True))
+
+    def __str__(self) -> str:
+        return f'{self.as_of_sha} {self.params_json}'
+
+
+def identity_known(snapshot: Mapping[str, Any]) -> bool:
+    """Whether a validated snapshot's schema records every params key, so that it has an identity."""
+    return not _unknown_params(snapshot)
+
+
+def measurement_identity(snapshot: Mapping[str, Any]) -> MeasurementIdentity:
+    """A validated snapshot's identity; refused when it is not *identity_known*, since unknown equals nothing."""
+    unknown = _unknown_params(snapshot)
+    if unknown:
+        raise source_measures.MetricsError(
+            f'a schema-{snapshot["schema_version"]} snapshot records no {", ".join(unknown)}: '
+            'its measurement identity is unknown, and unknown equals no identity'
+        )
+    return MeasurementIdentity.of(snapshot['as_of_sha'], snapshot['params'])
 
 
 # ---------------------------------------------------------------------------
@@ -736,15 +782,28 @@ _SCHEMA_1_IMPORT_GRAPH = _Object({
     'cycles': _CYCLES,
 })
 
+_SCHEMA_1_PARAMS = _Object({
+    'complexipy_version': _STRING,
+    'h14_soft_ceiling_lines': _INTEGER,
+    'h14_alarm_lines': _INTEGER,
+})
+
+_PARAMS = _Object({
+    **_SCHEMA_1_PARAMS.fields,
+    'python_version': _STRING,
+    'instrument': _Object({'quality_metrics_snapshot': _STRING, 'source_measures': _STRING}),
+})
+
 _INSTRUMENT = _Leaf(lambda value: value == INSTRUMENT, json.dumps(INSTRUMENT))
 
 
 @dataclasses.dataclass(frozen=True)
 class _Schema:
-    """What a schema version's file record and import graph hold."""
+    """What a schema version's file record, import graph and params hold."""
 
     record: _ByKind
     import_graph: _Object
+    params: _Object
 
 
 def _snapshot_shape(version: int, schema: _Schema) -> _Object:
@@ -767,11 +826,7 @@ def _snapshot_shape(version: int, schema: _Schema) -> _Object:
                 ordered=True,
             ),
             'cost': _Object({'wall_clock_s': _NUMBER}),
-            'params': _Object({
-                'complexipy_version': _STRING,
-                'h14_soft_ceiling_lines': _INTEGER,
-                'h14_alarm_lines': _INTEGER,
-            }),
+            'params': schema.params,
             'files': _MapOf(schema.record),
             'functions': _MapOf(_INTEGER),
             'import_graph': schema.import_graph,
@@ -780,16 +835,26 @@ def _snapshot_shape(version: int, schema: _Schema) -> _Object:
     )
 
 
-#: Schema 1 is read so a committed pre-6612 snapshot still diffs and summarises (the PRD's §Contract).
+_SCHEMA_2_RECORD = _record_shape({**_SCHEMA_1_SRC, 'cycle_closing_imports': _INTEGER})
+
+#: Schemas 1 and 2 are read so a committed pre-6612 or pre-8463 snapshot still diffs and summarises (the PRD's §Contract).
 _SCHEMAS: Mapping[int, _Schema] = {
-    1: _Schema(_record_shape(_SCHEMA_1_SRC), _SCHEMA_1_IMPORT_GRAPH),
-    SCHEMA_VERSION: _Schema(
-        _record_shape({**_SCHEMA_1_SRC, 'cycle_closing_imports': _INTEGER}), _IMPORT_GRAPH
-    ),
+    1: _Schema(_record_shape(_SCHEMA_1_SRC), _SCHEMA_1_IMPORT_GRAPH, _SCHEMA_1_PARAMS),
+    2: _Schema(_SCHEMA_2_RECORD, _IMPORT_GRAPH, _SCHEMA_1_PARAMS),
+    SCHEMA_VERSION: _Schema(_SCHEMA_2_RECORD, _IMPORT_GRAPH, _PARAMS),
 }
 _SNAPSHOTS: Mapping[int, _Object] = {
     version: _snapshot_shape(version, schema) for version, schema in _SCHEMAS.items()
 }
+
+#: Every params key a read schema records, so a key neither side records still reads unknown.
+_PARAMS_KEYS = tuple(sorted({key for schema in _SCHEMAS.values() for key in schema.params.fields}))
+
+
+def _unknown_params(snapshot: Mapping[str, Any]) -> list[str]:
+    """The params keys *snapshot*'s schema does not record: unknown, which equals nothing, not even unknown."""
+    recorded = _SCHEMAS[snapshot['schema_version']].params.fields
+    return [key for key in _PARAMS_KEYS if key not in recorded]
 
 
 def _require_evidence_agrees(snapshot: Mapping[str, Any], origin: str) -> None:
@@ -827,9 +892,10 @@ def _require_evidence_agrees(snapshot: Mapping[str, Any], origin: str) -> None:
 
 @dataclasses.dataclass(frozen=True)
 class _GraphKind:
-    """One kind of import-graph entry, named by *label*."""
+    """One kind of import-graph entry, named by *label* in prose and by *slug* in --summary --json."""
 
     label: str
+    slug: str
     needs: tuple[str, ...]  # the import_graph lists it derives from; its entries are the first's
     key: Callable[[Any], tuple[Any, ...]]  # what --diff compares: never a line number
     render: Callable[[Any], str]  # a key, as --diff names it
@@ -854,20 +920,22 @@ def _deferred_rendered(key: tuple[str, tuple[str, ...]]) -> str:
 
 
 def _cycle_kind(label: str, name: str) -> _GraphKind:
-    return _GraphKind(label, (name,), lambda cycle: tuple(cycle), lambda key: ', '.join(key))
+    return _GraphKind(label, name, (name,), lambda cycle: tuple(cycle), lambda key: ', '.join(key))
 
 
 _GRAPH_KINDS: tuple[_GraphKind, ...] = (
-    _GraphKind('edge', ('edges',), lambda edge: tuple(edge), lambda key: f'{key[0]} -> {key[1]}'),
+    _GraphKind('edge', 'edges', ('edges',), lambda edge: tuple(edge), lambda key: f'{key[0]} -> {key[1]}'),
     _GraphKind(
         'reach-back',
+        'reach_backs',
         ('reach_back',),
         lambda entry: (entry['from'], entry['to'], tuple(entry['names'])),
         lambda key: f'{key[0]} -> {key[1]} ({", ".join(key[2])})',
     ),
-    _GraphKind('deferred import', ('deferred',), _deferred_key, _deferred_rendered),
+    _GraphKind('deferred import', 'deferred_imports', ('deferred',), _deferred_key, _deferred_rendered),
     _GraphKind(
         'cycle-closing deferred import',
+        'cycle_closing_imports',
         ('deferred', 'hidden_cycles'),
         _deferred_key,
         _deferred_rendered,
@@ -962,6 +1030,11 @@ _PAIR_MOVED = (
 )
 _PAIR_ADDED = '; total up: complexity added'
 _CROSSING_LABEL = 'measure per heuristic 14, not a target'
+_PARAMS_DIFFER = 'params differ: '
+_NOT_ATTRIBUTABLE = (
+    'not attributable to code: a delta below may come from the params change, not from the code'
+)
+_UNKNOWN = 'unknown'
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1035,6 +1108,32 @@ def _record_pairs(
     pairs += [(path, None, now[path]) for path in pairing.added if path in now]
     pairs += [(path, before[path], None) for path in pairing.removed if path in before]
     return sorted(pairs, key=lambda pair: pair[0])
+
+
+def _param_rendered(snapshot: Mapping[str, Any], key: str) -> str:
+    """*key*'s value as JSON, or bare unknown when *snapshot*'s schema does not record it."""
+    if key in _unknown_params(snapshot):
+        return _UNKNOWN
+    return json.dumps(snapshot['params'][key], sort_keys=True)
+
+
+def _params_entries(current: Mapping[str, Any], previous: Mapping[str, Any]) -> list[str]:
+    """Every params key unknown on either side or differing, sorted: unknown never equals unknown."""
+    renderings = (
+        (key, _param_rendered(previous, key), _param_rendered(current, key)) for key in _PARAMS_KEYS
+    )
+    return [
+        f'{key} {before} -> {after}'
+        for key, before, after in renderings
+        if _UNKNOWN in (before, after) or before != after
+    ]
+
+
+def _params_lines(current: Mapping[str, Any], previous: Mapping[str, Any]) -> list[str]:
+    entries = _params_entries(current, previous)
+    if not entries:
+        return []
+    return [_PARAMS_DIFFER + '; '.join(entries), f'  {_NOT_ATTRIBUTABLE}']
 
 
 def _header(label: str, snapshot: Mapping[str, Any]) -> str:
@@ -1157,10 +1256,15 @@ def _diff_section(header: str, entries: Sequence[str]) -> list[str]:
 
 
 def diff_lines(current: Mapping[str, Any], previous: Mapping[str, Any]) -> list[str]:
-    """What moved from *previous* to *current*: measures and their changes, never a verdict."""
+    """What moved from *previous* to *current*: measures and their changes, never a verdict.
+
+    When a params key differs or is unknown on either side, a params-differ line
+    and its not-attributable label come first.
+    """
     pairing = _pairing(current, previous)
     pairs = _record_pairs(pairing, current, previous)
     return [
+        *_params_lines(current, previous),
         _header('current', current),
         _header('previous', previous),
         *_diff_section('unreadable (measures unknown, never zero):', _unreadable_entries(current, previous)),
@@ -1181,63 +1285,98 @@ def diff_lines(current: Mapping[str, Any], previous: Mapping[str, Any]) -> list[
 # --summary: per-member counts and totals, members in name order.
 
 _Records = Sequence[Mapping[str, Any]]
+#: A cell's typed value: a count or total, or the (max, total) cognitive pair.
+_CellValue = int | tuple[int, int]
 
 
-def _sum_over(kind: str | None, value: Callable[[Mapping[str, Any]], int]) -> Callable[[_Records], str]:
+def _sum_over(kind: str | None, value: Callable[[Mapping[str, Any]], int]) -> Callable[[_Records], int]:
     """An aggregator summing *value* over the records of *kind* (every record when None)."""
 
-    def aggregate(records: _Records) -> str:
-        return str(sum(value(record) for record in records if kind in (None, record['kind'])))
+    def aggregate(records: _Records) -> int:
+        return sum(value(record) for record in records if kind in (None, record['kind']))
 
     return aggregate
 
 
-def _cognitive_pair(records: _Records) -> str:
+def _cognitive_pair(records: _Records) -> tuple[int, int]:
     src = [record for record in records if record['kind'] == _SRC]
     highest = max((record['cognitive_max'] for record in src), default=0)
-    return f'{highest} / {sum(record["cognitive_total"] for record in src)}'
+    return highest, sum(record['cognitive_total'] for record in src)
 
 
-#: Every column after member and pseudo, as (header, aggregator over file records).
-_SUMMARY_COLUMNS: tuple[tuple[str, Callable[[_Records], str]], ...] = (
-    ('src files', _sum_over(_SRC, lambda record: 1)),
-    ('src lines', _sum_over(_SRC, lambda record: record['lines'])),
-    ('src prose lines', _sum_over(_SRC, lambda record: record['prose_lines'])),
-    ('src cognitive max / total', _cognitive_pair),
-    ('tests files', _sum_over(_TESTS, lambda record: 1)),
-    ('tests lines', _sum_over(_TESTS, lambda record: record['lines'])),
-    ('tests cognitive total', _sum_over(_TESTS, lambda record: record['cognitive_total'])),
+def _cell_text(value: _CellValue) -> str:
+    """A cell as the markdown table prints it."""
+    if isinstance(value, tuple):
+        highest, total = value
+        return f'{highest} / {total}'
+    return str(value)
+
+
+_SummaryColumn = tuple[str, str, Callable[[_Records], _CellValue]]
+
+#: Each heuristic-14 column's slug and the line mark it counts files at.
+_H14_COLUMN_MARKS: Mapping[str, int] = {
+    'files_at_soft_ceiling': H14_SOFT_CEILING_LINES,
+    'files_at_alarm': H14_ALARM_LINES,
+}
+
+
+def _h14_column(slug: str, mark: int) -> _SummaryColumn:
+    return slug, f'files >= {mark} lines', _sum_over(None, lambda record: record['lines'] >= mark)
+
+
+#: Every column after member and pseudo, as (slug, header, aggregator over file records).
+_SUMMARY_COLUMNS: tuple[_SummaryColumn, ...] = (
+    ('src_files', 'src files', _sum_over(_SRC, lambda record: 1)),
+    ('src_lines', 'src lines', _sum_over(_SRC, lambda record: record['lines'])),
+    ('src_prose_lines', 'src prose lines', _sum_over(_SRC, lambda record: record['prose_lines'])),
+    ('src_cognitive_max_total', 'src cognitive max / total', _cognitive_pair),
+    ('tests_files', 'tests files', _sum_over(_TESTS, lambda record: 1)),
+    ('tests_lines', 'tests lines', _sum_over(_TESTS, lambda record: record['lines'])),
+    ('tests_cognitive_total', 'tests cognitive total', _sum_over(_TESTS, lambda record: record['cognitive_total'])),
+    *(_h14_column(slug, mark) for slug, mark in _H14_COLUMN_MARKS.items()),
+    ('function_local_imports', 'function-local imports', _sum_over(_SRC, lambda record: record['function_local_imports'])),
+    ('reexport_names', 're-export names', _sum_over(_SRC, lambda record: len(record['reexport_names']))),
+    ('reach_back_imports', 'reach-back imports', _sum_over(_SRC, lambda record: record['reach_back_imports'])),
     (
-        f'files >= {H14_SOFT_CEILING_LINES} lines',
-        _sum_over(None, lambda record: record['lines'] >= H14_SOFT_CEILING_LINES),
-    ),
-    (
-        f'files >= {H14_ALARM_LINES} lines',
-        _sum_over(None, lambda record: record['lines'] >= H14_ALARM_LINES),
-    ),
-    ('function-local imports', _sum_over(_SRC, lambda record: record['function_local_imports'])),
-    ('re-export names', _sum_over(_SRC, lambda record: len(record['reexport_names']))),
-    ('reach-back imports', _sum_over(_SRC, lambda record: record['reach_back_imports'])),
-    (
+        'private_patch_targets',
         'private patch targets',
         _sum_over(_TESTS, lambda record: len(record['private_patch_targets'])),
     ),
-    ('private reads', _sum_over(_TESTS, lambda record: record['private_reads'])),
+    ('private_reads', 'private reads', _sum_over(_TESTS, lambda record: record['private_reads'])),
 )
+
+
+def _row_values(records: _Records) -> list[_CellValue]:
+    return [aggregate(records) for _slug, _header, aggregate in _SUMMARY_COLUMNS]
+
+
+def _member_rows(snapshot: Mapping[str, Any]) -> list[tuple[str, bool, list[_CellValue]]]:
+    """(member, pseudo, cell values) per member, in name order."""
+    by_member: dict[str, list[Mapping[str, Any]]] = {}
+    for record in snapshot['files'].values():
+        by_member.setdefault(record['member'], []).append(record)
+    pseudo = {member['name']: member['pseudo'] for member in snapshot['evidence']['members']}
+    return [(name, pseudo[name], _row_values(by_member.get(name, []))) for name in sorted(pseudo)]
 
 
 def _markdown_row(cells: Sequence[str]) -> str:
     return '| ' + ' | '.join(cells) + ' |'
 
 
-def _graph_line(snapshot: Mapping[str, Any]) -> str:
-    """The import graph's count of each kind; a kind its schema does not record is unknown, never zero."""
+def _graph_counts(snapshot: Mapping[str, Any]) -> dict[str, int | None]:
+    """The import graph's count of each kind by slug; a kind its schema does not record is None, never zero."""
     graph = snapshot['import_graph']
-    counts = [
-        f'{len(kind.entries(graph))} {kind.label}s' for kind in _GRAPH_KINDS if _records(snapshot, kind)
-    ]
-    unknown = [f'{kind.label}s' for kind in _GRAPH_KINDS if not _records(snapshot, kind)]
-    line = f'import graph: {", ".join(counts)}'
+    return {
+        kind.slug: len(kind.entries(graph)) if _records(snapshot, kind) else None for kind in _GRAPH_KINDS
+    }
+
+
+def _graph_line(snapshot: Mapping[str, Any]) -> str:
+    counts = _graph_counts(snapshot)
+    known = [f'{counts[kind.slug]} {kind.label}s' for kind in _GRAPH_KINDS if counts[kind.slug] is not None]
+    unknown = [f'{kind.label}s' for kind in _GRAPH_KINDS if counts[kind.slug] is None]
+    line = f'import graph: {", ".join(known)}'
     if unknown:
         line += f'; {", ".join(unknown)} unknown (schema {snapshot["schema_version"]})'
     return line
@@ -1259,17 +1398,12 @@ def _summary_header(snapshot: Mapping[str, Any]) -> list[str]:
 
 def summary_table(snapshot: Mapping[str, Any]) -> str:
     """Header lines, then one markdown row per member in name order and a (domain) row."""
-    records = list(snapshot['files'].values())
-    by_member: dict[str, list[Mapping[str, Any]]] = {}
-    for record in records:
-        by_member.setdefault(record['member'], []).append(record)
-    pseudo = {member['name']: member['pseudo'] for member in snapshot['evidence']['members']}
     rows = [
-        [name, json.dumps(pseudo[name]), *(cell(by_member.get(name, [])) for _h, cell in _SUMMARY_COLUMNS)]
-        for name in sorted(pseudo)
+        [name, json.dumps(pseudo), *map(_cell_text, values)]
+        for name, pseudo, values in _member_rows(snapshot)
     ]
-    rows.append(['(domain)', '', *(cell(records) for _h, cell in _SUMMARY_COLUMNS)])
-    headers = ['member', 'pseudo', *(header for header, _cell in _SUMMARY_COLUMNS)]
+    rows.append(['(domain)', '', *map(_cell_text, _row_values(list(snapshot['files'].values())))])
+    headers = ['member', 'pseudo', *(header for _slug, header, _aggregate in _SUMMARY_COLUMNS)]
     return '\n'.join([
         *_summary_header(snapshot),
         '',
@@ -1277,6 +1411,35 @@ def summary_table(snapshot: Mapping[str, Any]) -> str:
         '|' + '---|' * len(headers),
         *(_markdown_row(row) for row in rows),
     ])
+
+
+def _json_cells(values: Sequence[_CellValue]) -> list[dict[str, Any]]:
+    return [{'value': value, 'text': _cell_text(value)} for value in values]
+
+
+def summary_json(snapshot: Mapping[str, Any]) -> dict[str, Any]:
+    """summary_table's figures as one JSON object: each cell its typed value and its markdown text."""
+    evidence = snapshot['evidence']
+    return {
+        'run_id': snapshot['run_id'],
+        'as_of_sha': snapshot['as_of_sha'],
+        'since': snapshot['since'],
+        'schema_version': snapshot['schema_version'],
+        'params': snapshot['params'],
+        'unknown_params': _unknown_params(snapshot),
+        'complete': evidence['complete'],
+        'measured_files': evidence['measured_files'],
+        'domain_files': evidence['domain_files'],
+        'unreadable': evidence['unreadable'],
+        'columns': [{'slug': slug, 'header': header} for slug, header, _aggregate in _SUMMARY_COLUMNS],
+        'members': [
+            {'member': name, 'pseudo': pseudo, 'cells': _json_cells(values)}
+            for name, pseudo, values in _member_rows(snapshot)
+        ],
+        'domain': {'cells': _json_cells(_row_values(list(snapshot['files'].values())))},
+        'h14_marks': dict(_H14_COLUMN_MARKS),
+        'import_graph': _graph_counts(snapshot),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1306,12 +1469,27 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--diff', help='The previous snapshot to diff against.')
     parser.add_argument('--current', help='Diff this snapshot instead of measuring.')
     parser.add_argument('--summary', help='Print this snapshot as a per-member table.')
+    parser.add_argument(
+        '--json',
+        action='store_true',
+        help='With --summary: print the table as one JSON object, each cell its typed value and its text.',
+    )
+    parser.add_argument(
+        '--params',
+        action='store_true',
+        help='Print the params a measurement here would record, as one JSON line; measure nothing.',
+    )
     return parser
 
 
 def _require_one_mode(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
     measuring = (args.run_id, args.out, args.root) != (None, None, None)
-    if args.summary is not None:
+    if args.json and args.summary is None:
+        parser.error('--json is only for --summary')
+    if args.params:
+        if measuring or (args.diff, args.current, args.summary) != (None, None, None):
+            parser.error('--params takes no other argument')
+    elif args.summary is not None:
         if measuring or args.diff is not None or args.current is not None:
             parser.error('--summary takes no other argument')
     elif args.current is not None:
@@ -1320,7 +1498,7 @@ def _require_one_mode(parser: argparse.ArgumentParser, args: argparse.Namespace)
     elif args.run_id is None or args.out is None:
         parser.error(
             'measuring needs both --run-id and --out; '
-            'otherwise give --current with --diff, or --summary'
+            'otherwise give --current with --diff, --summary, or --params'
         )
 
 
@@ -1365,8 +1543,12 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     _require_one_mode(parser, args)
     try:
+        if args.params:
+            print(json.dumps(measurement_params()))
+            return 0
         if args.summary is not None:
-            print(summary_table(load_snapshot(Path(args.summary))))
+            summarised = load_snapshot(Path(args.summary))
+            print(json.dumps(summary_json(summarised), sort_keys=True) if args.json else summary_table(summarised))
             return 0
         if args.current is not None:
             return _compare(args)

@@ -2,8 +2,10 @@
 
 The chip DECISION is tested as a pure function in
 ``dashboard/tests/js/invariant_chip.test.mjs``. That the Tasks tab actually
-reads ``DF_DATA.INVARIANTS`` and polls its endpoint is derived, not grepped, by
-``test_app_poll_scope.py``'s tasks floor. This module covers what neither can
+reads ``DF_DATA.INVARIANTS`` and polls its endpoint is measured on a rendered
+page, not grepped, by the tasks floor of
+``dashboard/tests/js/render_app_shell.test.mjs``'s read-set tests. This module
+covers what neither can
 see: that the module is reachable from the browser, tagged in ``index.html``
 exactly once with its siblings' cache-buster, and evaluated before the JSX that
 calls its global. Like ``test_tab_tasks_offline_banner.py`` it asserts only
@@ -13,7 +15,7 @@ structural facts about served HTML, never JSX source text (esc-3857-9).
 from __future__ import annotations
 
 from _cache_buster_helpers import redux_cache_buster_versions
-from _dashboard_helpers import ScriptTagCollector, assert_script_loads_before
+from _jsx_source_helpers import ScriptTagCollector, assert_script_loads_before
 
 _CHIP_SRC = '/static/redux/invariant_chip.js'
 

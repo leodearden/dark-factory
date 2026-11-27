@@ -1,7 +1,8 @@
 """Tests for scripts/clear_leaked_claimants.py (task 4625).
 
 Every expectation is hand-derived from the tier table in
-docs/prds/claimant-invariant-enforcement.md D3, never computed by calling the
+docs/prds/claimant-invariant-enforcement.md D3 and the ledger of
+docs/prds/claimant-invariant-detection.md D-5, never computed by calling the
 shared predicates, and every store is a synthetic temp tasks.db.
 """
 from __future__ import annotations
@@ -20,6 +21,7 @@ from pathlib import Path
 import pytest
 from _task_db_scan import UNREADABLE_STORE_ERRORS
 from clear_leaked_claimants import (
+    REPAIRABLE_TIERS,
     REREAD_FAILED_DETAIL,
     STILL_VIOLATING_DETAIL,
     UNVERIFIED_DETAIL,
@@ -27,6 +29,7 @@ from clear_leaked_claimants import (
     Bucket,
     Census,
     ExitCode,
+    RefusalReason,
     Tier,
     apply_repairs,
     emit_report,
@@ -38,6 +41,7 @@ from clear_leaked_claimants import (
     take_census,
 )
 from cli_subprocess_timeout import cli_timeout_from_env
+from shared.project_layout import scheduler_state_json
 
 NOW = datetime(2026, 10, 11, 12, tzinfo=UTC)
 STALE = NOW - timedelta(hours=2)
@@ -56,11 +60,21 @@ def _claimed(task_id, status, claimant, heartbeat, **extra):
     }
 
 
+def _ledger(claimant: str) -> dict:
+    return {'claimant_exception': {
+        'claimant_run_id': claimant, 'target_status': 'done', 'agent_id': 'claude-interactive',
+        'tag': 'master', 'stamped_at': _iso(STALE),
+    }}
+
+
 POSITIVE_CONTROL = _claimed(4028, 'done', 'run-a/4028-x/pid=1', NOW - timedelta(days=50))
 FREEFORM_CANCELLED = _claimed(5225, 'cancelled', 'agent-esc-5053-2-docs-fix', None)
 FRESH_DONE = _claimed(101, 'done', 'run-c/101-x/pid=3', FRESH)
 STALE_PENDING = _claimed(103, 'pending', 'run-e/103-x/pid=5', STALE)
 STALE_MERGE_DEFERRED = _claimed(109, 'merge-deferred', 'run-k/109-x/pid=11', STALE)
+LEDGERED_DONE = _claimed(
+    111, 'done', 'run-l/111-x/pid=12', STALE, metadata=_ledger('run-l/111-x/pid=12'),
+)
 
 TIER_TABLE_ROWS = [
     POSITIVE_CONTROL,
@@ -75,6 +89,7 @@ TIER_TABLE_ROWS = [
     _claimed(108, 'deferred', 'run-j/108-x/pid=10', STALE, metadata={'infra_hold': True}),
     STALE_MERGE_DEFERRED,
     _claimed(110, 'pending', '  ', STALE),
+    LEDGERED_DONE,
 ]
 
 
@@ -129,6 +144,7 @@ class TestCensus:
             (101, Tier.TERMINAL),
             (103, Tier.HYGIENE),
             (109, Tier.HYGIENE),
+            (111, Tier.LEDGERED),
         }
 
     def test_violation_carries_the_row_verbatim_and_the_measurement_time(self, seed_root):
@@ -151,16 +167,17 @@ class TestCensus:
     def test_totals_by_tier_and_by_tier_and_status(self, seed_root):
         totals = take_census(seed_root(TIER_TABLE_ROWS), NOW).totals()
 
-        assert totals.by_tier == {Tier.TERMINAL: 3, Tier.HYGIENE: 2}
+        assert totals.by_tier == {Tier.TERMINAL: 3, Tier.HYGIENE: 2, Tier.LEDGERED: 1}
         assert totals.by_tier_status == {
             Tier.TERMINAL: {'done': 2, 'cancelled': 1},
             Tier.HYGIENE: {'pending': 1, 'merge-deferred': 1},
+            Tier.LEDGERED: {'done': 1},
         }
 
     def test_zero_tiers_are_reported_not_omitted(self, seed_root):
         totals = take_census(seed_root([POSITIVE_CONTROL]), NOW).totals()
 
-        assert totals.by_tier == {Tier.TERMINAL: 1, Tier.HYGIENE: 0}
+        assert totals.by_tier == {Tier.TERMINAL: 1, Tier.HYGIENE: 0, Tier.LEDGERED: 0}
 
     def test_an_empty_stub_store_is_unreadable_not_a_clean_zero(self, tmp_path):
         root = tmp_path / 'stub'
@@ -232,7 +249,7 @@ class TestDryRunCli:
         census = project['census']
         assert {'measured_at', 'rows_in_store', 'totals', 'violations'} <= census.keys()
         assert census['rows_in_store'] == len(CLI_ROWS)
-        assert census['totals']['by_tier'] == {'terminal': 2, 'hygiene': 1}
+        assert census['totals']['by_tier'] == {'terminal': 2, 'hygiene': 1, 'ledgered': 0}
         assert all(set(v) == VIOLATION_JSON_KEYS for v in census['violations'])
         by_id = {v['task_id']: v for v in census['violations']}
         assert by_id[4028]['tier'] == 'terminal'
@@ -307,6 +324,7 @@ TERMINAL_ONLY = frozenset({Tier.TERMINAL})
 BOTH_TIERS = frozenset({Tier.TERMINAL, Tier.HYGIENE})
 TERMINAL_IDS = {4028, 5225, 101}
 HYGIENE_IDS = {103, 109}
+LEDGERED_IDS = {111}
 
 
 def _apply(census, client, tiers=TERMINAL_ONLY, clock=lambda: NOW):
@@ -358,7 +376,7 @@ class TestApplyRepairs:
 
         verification = _verification(report)
         assert verification.totals().by_tier[Tier.TERMINAL] == 0
-        assert {v.task_id for v in verification.violations} == HYGIENE_IDS
+        assert {v.task_id for v in verification.violations} == HYGIENE_IDS | LEDGERED_IDS
 
     def test_freeform_claimant_with_no_heartbeat_is_repaired_not_skipped(self, seed_root):
         root = seed_root([FREEFORM_CANCELLED])
@@ -649,7 +667,7 @@ class TestUnreadableStoreMidBatch:
 
 
 def _write_scheduler_state(root: str, text: str) -> None:
-    state = Path(root) / 'data' / 'orchestrator' / 'scheduler_state.json'
+    state = scheduler_state_json(root)
     state.parent.mkdir(parents=True, exist_ok=True)
     state.write_text(text)
 
@@ -669,11 +687,29 @@ class TestHolderPreflight:
         report = _apply(census, server)
 
         assert report.refused is True
+        assert report.refusal is RefusalReason.HOLDERS_IN_SELECTION
+        assert report.holder_set_error is None
         assert report.holder_intersection == (4028,)
         assert server.calls == []
         assert _store_rows(root) == before
         assert report.outcomes == ()
         assert report.verification_census is None
+
+    @pytest.mark.parametrize('named', ['4028', '7777'])
+    def test_a_selected_row_sharing_a_key_with_another_holder_refuses(self, seed_root, named):
+        root = seed_root(TIER_TABLE_ROWS)
+        _write_scheduler_state(root, json.dumps({
+            'current_holders': {'docs/shared.md': named},
+            'held_by_task': {'4028': ['docs/shared.md'], '7777': ['docs/shared.md']},
+            'parks': {},
+        }))
+        server = _FakeClaimantServer()
+
+        report = _apply(take_census(root, NOW), server)
+
+        assert report.refused is True
+        assert report.holder_intersection == (4028,)
+        assert server.calls == []
 
     def test_holders_outside_the_selected_rows_do_not_refuse(self, seed_root):
         root = seed_root(TIER_TABLE_ROWS)
@@ -693,6 +729,8 @@ class TestHolderPreflight:
         report = _apply(take_census(root, NOW), server)
 
         assert report.refused is False
+        assert report.refusal is None
+        assert report.holder_set_error is None
         assert server.written_ids() == TERMINAL_IDS
 
     def test_holders_are_read_at_apply_time_not_census_time(self, seed_root):
@@ -707,16 +745,61 @@ class TestHolderPreflight:
         assert report.holder_intersection == (5225,)
         assert server.calls == []
 
-    @pytest.mark.parametrize('snapshot', ['[]', '{"current_holders": ["4028"]}'])
-    def test_a_malformed_snapshot_is_treated_as_no_holders(self, seed_root, snapshot):
+    @pytest.mark.parametrize(
+        'snapshot', ['', '{not json', '[]', '{"current_holders": ["4028"]}'],
+        ids=['empty', 'invalid-json', 'non-object', 'malformed-shape'],
+    )
+    def test_an_unreadable_snapshot_refuses_the_whole_project(self, seed_root, snapshot):
         root = seed_root(TIER_TABLE_ROWS)
         _write_scheduler_state(root, snapshot)
+        census = take_census(root, NOW)
+        before = _store_rows(root)
+        server = _FakeClaimantServer()
+
+        report = _apply(census, server)
+
+        assert report.refused is True
+        assert report.refusal is RefusalReason.HOLDER_SET_UNREADABLE
+        assert report.holder_intersection == ()
+        assert report.holder_set_error is not None
+        assert 'scheduler_state.json' in report.holder_set_error
+        assert server.calls == []
+        assert _store_rows(root) == before
+        assert report.outcomes == ()
+        assert report.verification_census is None
+
+    def test_a_snapshot_path_that_cannot_be_read_refuses(self, seed_root):
+        root = seed_root(TIER_TABLE_ROWS)
+        scheduler_state_json(root).mkdir(parents=True)
+        server = _FakeClaimantServer()
+
+        report = _apply(take_census(root, NOW), server)
+
+        assert report.refusal is RefusalReason.HOLDER_SET_UNREADABLE
+        assert server.calls == []
+        assert report.holder_set_error is not None
+        assert 'IsADirectoryError' in report.holder_set_error
+
+    def test_an_unreadable_snapshot_with_nothing_selected_does_not_refuse(self, seed_root):
+        root = seed_root([STALE_PENDING])
+        _write_scheduler_state(root, '{not json')
         server = _FakeClaimantServer()
 
         report = _apply(take_census(root, NOW), server)
 
         assert report.refused is False
-        assert server.written_ids() == TERMINAL_IDS
+        assert report.refusal is None
+        assert server.calls == []
+
+    def test_an_unreadable_snapshot_refuses_a_hygiene_only_selection(self, seed_root):
+        root = seed_root([STALE_PENDING])
+        _write_scheduler_state(root, '{not json')
+        server = _FakeClaimantServer()
+
+        report = _apply(take_census(root, NOW), server, tiers=REPAIRABLE_TIERS)
+
+        assert report.refusal is RefusalReason.HOLDER_SET_UNREADABLE
+        assert server.calls == []
 
 
 def _sweep(roots, client, *, apply=True, tiers=TERMINAL_ONLY, clock=lambda: NOW):
@@ -742,6 +825,8 @@ class TestApplyOutput:
         assert 4028 in {v['task_id'] for v in project['census']['violations']}
         applied = project['apply']
         assert applied['refused'] is False
+        assert applied['refusal_reason'] is None
+        assert applied['holder_set_error'] is None
         assert applied['holder_intersection'] == []
         assert applied['counts'] == {
             'repaired': 3, 'skipped_changed_under_us': 0, 'arrived_during_window': 0, 'failed': 0,
@@ -781,6 +866,134 @@ class TestApplyOutput:
         fields = {token.split('=', 1)[0] for token in skipped_line.split()}
         assert {'delta.status', 'delta.claimant_run_id'} <= fields
 
+    def test_json_names_an_unreadable_holder_set_as_the_refusal_reason(self, seed_root):
+        root = seed_root(TIER_TABLE_ROWS)
+        _write_scheduler_state(root, '{not json')
+
+        payload = json.loads(render_json(_sweep([root], _FakeClaimantServer())))
+
+        applied = payload['projects'][0]['apply']
+        assert applied['refused'] is True
+        assert applied['refusal_reason'] == 'holder_set_unreadable'
+        assert applied['holder_intersection'] == []
+        assert 'scheduler_state.json' in applied['holder_set_error']
+        assert applied['counts']['repaired'] == 0
+
+    def test_json_names_held_rows_as_the_refusal_reason(self, seed_root):
+        root = seed_root(TIER_TABLE_ROWS)
+        _write_scheduler_state(root, _holders(orchestrator_src='4028'))
+
+        payload = json.loads(render_json(_sweep([root], _FakeClaimantServer())))
+
+        applied = payload['projects'][0]['apply']
+        assert applied['refusal_reason'] == 'holders_in_selection'
+        assert applied['holder_set_error'] is None
+
+    def test_text_says_the_holder_set_could_not_be_read(self, seed_root):
+        root = seed_root(TIER_TABLE_ROWS)
+        _write_scheduler_state(root, '{not json')
+
+        text = render_text(_sweep([root], _FakeClaimantServer()))
+
+        (refused_line,) = [
+            line for line in text.splitlines() if 'refused' in line and 'could not be read' in line
+        ]
+        assert 'scheduler_state.json' in refused_line
+
+
+def _tiers_by_id(census: Census) -> dict[int, Tier]:
+    return {v.task_id: v.tier for v in census.violations}
+
+
+class TestLedgeredRows:
+    def test_a_ledger_covered_done_row_is_reported_but_not_written(self, seed_root):
+        root = seed_root(TIER_TABLE_ROWS)
+        census = take_census(root, NOW)
+        server = _FakeClaimantServer()
+
+        report = _apply(census, server, tiers=BOTH_TIERS)
+
+        assert _tiers_by_id(census)[111] is Tier.LEDGERED
+        assert 111 not in server.written_ids()
+        assert 111 not in {outcome.violation.task_id for outcome in report.outcomes}
+        assert _claimants(root)[111] == _seeded_claimant(LEDGERED_DONE)
+        assert _tiers_by_id(_verification(report))[111] is Tier.LEDGERED
+
+    def test_a_ledger_naming_another_claimant_does_not_cover_the_row(self, seed_root):
+        restamped = _claimed(
+            112, 'done', 'run-m/112-x/pid=13', STALE, metadata=_ledger('run-old/112-w/pid=1'),
+        )
+        root = seed_root([restamped])
+        census = take_census(root, NOW)
+
+        report = _apply(census, _FakeClaimantServer())
+
+        assert _tiers_by_id(census) == {112: Tier.TERMINAL}
+        assert _buckets(report) == {112: Bucket.REPAIRED}
+        assert _claimants(root)[112] == (None, None)
+
+    def test_a_row_ledgered_after_the_census_is_skipped(self, seed_root):
+        root = seed_root(TIER_TABLE_ROWS)
+        census = take_census(root, NOW)
+        _mutate_store(
+            root,
+            'UPDATE tasks SET metadata = ? WHERE id = 4028',
+            (json.dumps(_ledger(POSITIVE_CONTROL['claimant_run_id'])),),
+        )
+        server = _FakeClaimantServer()
+
+        report = _apply(census, server)
+
+        assert 4028 not in server.written_ids()
+        assert _skip_delta(report, 4028) == {'tier': ('terminal', 'ledgered')}
+        assert _claimants(root)[4028] == _seeded_claimant(POSITIVE_CONTROL)
+
+    def test_a_row_unledgered_after_the_census_arrives_during_the_window(self, seed_root):
+        root = seed_root(TIER_TABLE_ROWS)
+        census = take_census(root, NOW)
+        _mutate_store(root, 'UPDATE tasks SET metadata = NULL WHERE id = 111')
+        server = _FakeClaimantServer()
+
+        report = _apply(census, server, clock=_ticking_clock())
+
+        assert _tiers_by_id(census)[111] is Tier.LEDGERED
+        assert 111 not in server.written_ids()
+        assert _outcome_for(report, 111).bucket is Bucket.ARRIVED_DURING_WINDOW
+        assert _tiers_by_id(_verification(report))[111] is Tier.TERMINAL
+        assert _claimants(root)[111] == _seeded_claimant(LEDGERED_DONE)
+
+    def test_a_dry_run_reports_ledgered_rows_separately(self, seed_root):
+        result = _sweep([seed_root(TIER_TABLE_ROWS)], None, apply=False)
+
+        payload = json.loads(render_json(result))
+        census = payload['projects'][0]['census']
+        (ledgered,) = [v for v in census['violations'] if v['task_id'] == 111]
+        assert ledgered['tier'] == 'ledgered'
+        assert census['totals']['by_tier']['ledgered'] == 1
+        assert payload['repair_tiers'] == ['terminal']
+        text = render_text(result)
+        assert 'tier=ledgered' in _violation_line(text, 111).split()
+        assert 'ledgered=1' in text.split()
+
+    def test_apply_repairs_refuses_to_select_the_ledgered_tier(self, seed_root):
+        root = seed_root(TIER_TABLE_ROWS)
+        census = take_census(root, NOW)
+        before = _store_rows(root)
+        server = _FakeClaimantServer()
+
+        with pytest.raises(ValueError, match='ledgered'):
+            _apply(census, server, tiers=frozenset({Tier.TERMINAL, Tier.LEDGERED}))
+
+        assert server.calls == []
+        assert _store_rows(root) == before
+
+    def test_sweep_refuses_to_select_the_ledgered_tier_before_reading(self, tmp_path):
+        with pytest.raises(ValueError, match='ledgered'):
+            _sweep(
+                [str(tmp_path / 'missing')], None, apply=False,
+                tiers=frozenset({Tier.TERMINAL, Tier.LEDGERED}),
+            )
+
 
 class TestExitCode:
     def test_a_clean_apply_is_ok(self, seed_root):
@@ -818,6 +1031,40 @@ class TestExitCode:
 
         assert exit_code(result) is ExitCode.REPAIR_FAILED
         assert exit_conditions(result) == (ExitCode.REPAIR_FAILED, ExitCode.HOLDER_REFUSED)
+
+    def test_an_unreadable_holder_set_is_its_own_exit_code(self, seed_root):
+        root = seed_root(TIER_TABLE_ROWS)
+        _write_scheduler_state(root, '{not json')
+
+        result = _sweep([root], _FakeClaimantServer())
+
+        assert exit_code(result) is ExitCode.HOLDER_SET_UNREADABLE
+        assert int(ExitCode.HOLDER_SET_UNREADABLE) == 6
+
+    def test_exit_precedence_is_failure_then_unreadable_then_held(self, seed_root):
+        unreadable = seed_root(TIER_TABLE_ROWS, name='unreadable')
+        refused = seed_root(TIER_TABLE_ROWS, name='refused')
+        failing = seed_root(TIER_TABLE_ROWS, name='failing')
+        _write_scheduler_state(unreadable, '{not json')
+        _write_scheduler_state(refused, _holders(orchestrator_src='4028'))
+
+        result = _sweep([unreadable, refused, failing], _mixed_traffic_server(failing))
+
+        assert exit_conditions(result) == (
+            ExitCode.REPAIR_FAILED, ExitCode.HOLDER_SET_UNREADABLE, ExitCode.HOLDER_REFUSED,
+        )
+
+    def test_stderr_names_an_unreadable_holder_set(self, seed_root, capsys):
+        root = seed_root(TIER_TABLE_ROWS)
+        _write_scheduler_state(root, '{not json')
+        result = _sweep([root], _FakeClaimantServer())
+        capsys.readouterr()
+
+        emit_report(result, as_json=False)
+
+        errors = [line for line in capsys.readouterr().err.splitlines() if line.startswith('error:')]
+        (error,) = errors
+        assert 'scheduler_state.json' in error
 
     def test_stderr_names_every_condition_not_only_the_winning_one(self, seed_root, capsys):
         refused = seed_root(TIER_TABLE_ROWS, name='refused')

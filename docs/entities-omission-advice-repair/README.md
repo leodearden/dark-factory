@@ -1,4 +1,4 @@
-# Entities-omission advice: corpus repair (tasks 6060 and 6067)
+# Entities-omission advice: corpus repair (tasks 6060, 6067 and 7117)
 
 ## What was repaired, and why
 
@@ -104,3 +104,33 @@ The census searches re-run in phase 2 also found records written after the
 census that still teach omission. `census.json` is the single list of targets,
 so they are out of phase 2's scope. They were filed as follow-up ticket
 `tkt_0RVYG32127ZF9JAN9XCV4ZKFB4`.
+
+## Phase 3
+
+Task 7117 handled the records that were written after `census.json` was
+captured and that still taught omission. Task-authoring §11 bars a dispatched
+agent from amending memories in place, so this phase ran as a
+`/curate-fused-memories` sitting on 2026-11-19, under the identity
+`curator-7117-phase3-entities-advice-repair` and run id
+`curate-7117-phase3-2026-11-19`. Leo ruled on esc-7117-4 that it should run
+that way.
+
+- `phase3-census.json` is phase 3's own read-only capture. Its target list is
+  separate from `census.json`'s. It re-ran the four census searches in all five
+  projects. It adds a literal sweep: a read-only scroll of every Mem0 record in
+  each project, with the text matched against the patterns it records.
+  `scan_memory_content` could not do this, because it re-checked every hit with
+  the tool-call-leak detector (task 4857 fixed this). The sweep found nine targets that the top-20
+  searches missed. There are 18 targets in all (13 dark_factory, 5 reify) and
+  13 reviewed non-targets. The census was committed before any record was
+  changed.
+- `phase3-apply.json` is in the phase-2 shape. It holds the authority probe
+  (`MemoryNotFound`) and, for each amendment, its pre-read (equal to the census
+  pre-image), the sent text, the raw reply and the readback. It also holds the
+  re-run searches and a re-run of the sweep. In that re-run, no record that was
+  not reviewed carries omission advice without a correction.
+
+The correction block uses the phase-2 wording, with one change: the
+"word: NNNN" residual is now described as fixed by task 6826, in merge commit
+`b5cc350565` on 2026-11-18. Phase 2 had listed it as still open. In each body,
+only the omission clause was replaced, with a pointer to the correction.

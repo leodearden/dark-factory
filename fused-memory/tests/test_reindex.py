@@ -1,11 +1,13 @@
 """Tests for reindex maintenance: GraphitiBackend stale-embedding queries and ReindexManager."""
 from __future__ import annotations
 
+import asyncio
 import logging
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from _fm_helpers import assert_ro_query_only, extract_cypher, extract_params
+from _graph_access_fake import FakeGraphAccess, wait_forever, with_backend_budgets
 
 from fused_memory.backends.falkor_indices import vector_drop_statement
 from fused_memory.backends.graphiti_client import (
@@ -1410,19 +1412,17 @@ class TestNodeCount:
     @pytest.mark.asyncio
     async def test_returns_count(self, mock_config, make_backend, make_graph_mock):
         """Returns the integer count from result_set[0][0]."""
-        backend = make_backend(mock_config)
         graph = make_graph_mock([[42]])
-        with patch.object(backend, '_graph_for', return_value=graph):
-            result = await backend.node_count('my_graph')
+        backend = make_backend(mock_config, graph_access=FakeGraphAccess({'my_graph': graph}))
+        result = await backend.node_count('my_graph')
         assert result == 42
 
     @pytest.mark.asyncio
     async def test_returns_zero_when_empty(self, mock_config, make_backend, make_graph_mock):
         """Returns 0 when result_set is empty."""
-        backend = make_backend(mock_config)
         graph = make_graph_mock([])
-        with patch.object(backend, '_graph_for', return_value=graph):
-            result = await backend.node_count('empty_graph')
+        backend = make_backend(mock_config, graph_access=FakeGraphAccess({'empty_graph': graph}))
+        result = await backend.node_count('empty_graph')
         assert result == 0
 
     @pytest.mark.asyncio
@@ -1443,56 +1443,54 @@ class TestNodeCount:
     @pytest.mark.asyncio
     async def test_uses_ro_query_not_query(self, mock_config, make_backend, make_graph_mock):
         """node_count uses ro_query (read-only path) and never calls graph.query."""
-        backend = make_backend(mock_config)
         graph = make_graph_mock([[7]])
-        with patch.object(backend, '_graph_for', return_value=graph):
-            await backend.node_count('test_graph')
+        backend = make_backend(mock_config, graph_access=FakeGraphAccess({'test_graph': graph}))
+        await backend.node_count('test_graph')
         graph.ro_query.assert_awaited_once()
         graph.query.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_delegates_to_graph_for(self, mock_config, make_backend, make_graph_mock):
-        """node_count delegates graph resolution to _graph_for, not _require_driver._get_graph."""
-        backend = make_backend(mock_config)
-        graph = make_graph_mock([[42]])
-        with patch.object(backend, '_graph_for', return_value=graph) as mock_graph_for:
-            result = await backend.node_count('my_graph')
-        mock_graph_for.assert_called_once_with('my_graph')
+    async def test_resolves_its_graph_through_graph_access(
+        self, mock_config, make_backend, make_graph_mock,
+    ):
+        """The count comes from the injected provider's graph for exactly the name given."""
+        backend = make_backend(mock_config, graph_access=FakeGraphAccess({
+            'my_graph': make_graph_mock([[42]]),
+            'other_graph': make_graph_mock([[9]]),
+        }))
+        result = await backend.node_count('my_graph')
         assert result == 42
-
-
-class TestRequireFalkorClient:
-    """GraphitiBackend._require_falkor_client() returns the FalkorDB client or raises."""
-
-    def test_returns_driver_client(self, mock_config, make_backend):
-        """Returns the .client attribute of the underlying FalkorDriver."""
-        backend = make_backend(mock_config)
-        sentinel = object()
-        backend._driver.client = sentinel
-        result = backend._require_falkor_client()
-        assert result is sentinel
-
-    def test_raises_when_not_initialized(self, mock_config):
-        """Raises RuntimeError when backend is not initialized (_driver is None)."""
-        backend = GraphitiBackend(mock_config)
-        with pytest.raises(RuntimeError, match='not initialized'):
-            backend._require_falkor_client()
 
 
 class TestListGraphs:
     """GraphitiBackend.list_graphs() returns non-system FalkorDB graph names."""
 
     @pytest.mark.asyncio
-    async def test_returns_filtered(self, mock_config, make_backend):
-        """Filters out 'default_db' and names ending in '_db'; delegates to _require_falkor_client."""
-        backend = make_backend(mock_config)
-        with patch.object(backend, '_require_falkor_client') as mock_client_accessor:
-            mock_client_accessor.return_value.list_graphs = AsyncMock(
-                return_value=['proj_a', 'default_db', 'proj_b', 'internal_db']
-            )
-            result = await backend.list_graphs()
-        assert result == ['proj_a', 'proj_b']
-        mock_client_accessor.assert_called_once_with()
+    async def test_filters_system_graphs_from_the_providers_listing(self, mock_config, make_backend):
+        """Filters out 'default_db' and names ending in '_db' from the provider's listing."""
+        backend = make_backend(mock_config, graph_access=FakeGraphAccess({
+            'proj_a': MagicMock(),
+            'default_db': MagicMock(),
+            'proj_b': MagicMock(),
+            'internal_db': MagicMock(),
+        }))
+
+        assert await backend.list_graphs() == ['proj_a', 'proj_b']
+
+    @pytest.mark.asyncio
+    async def test_a_hanging_listing_fails_on_the_read_budget(
+        self, mock_config, make_backend, make_graph_driver,
+    ):
+        driver = make_graph_driver({})
+        driver.client.list_graphs = AsyncMock(side_effect=wait_forever)
+        backend = make_backend(
+            with_backend_budgets(mock_config, read_s=0.05, write_s=0.08), driver=driver,
+        )
+
+        with pytest.raises(TimeoutError) as raised:
+            await asyncio.wait_for(backend.list_graphs(), 5.0)
+
+        assert str(raised.value) == 'Graphiti list_graphs timed out after 0.05s'
 
     @pytest.mark.asyncio
     async def test_raises_when_not_initialized(self, mock_config):

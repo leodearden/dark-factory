@@ -1,23 +1,38 @@
 """One publisher pass: every source read as its own unit, the events built in a fixed order, a heartbeat last."""
 
+import json
 import logging
 import os
 import shutil
 import threading
 from collections import Counter
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
-from _archive_files import junit_xml, passed, red, write_junit, write_plan, write_summary
-from _git_repo import Repo, make_repo, path_with_git_killed_on
+import yaml
+from _archive_files import (
+    junit_xml,
+    passed,
+    red,
+    task_dir,
+    write_junit,
+    write_plan,
+    write_summary,
+)
+from _git_repo import Repo, make_repo, path_with_git_answering, path_with_git_killed_on
 from _in_dir import write_engagement
-from _stores import RunsDb, TasksDb
+from _stores import EscalationQueueDir, RunsDb, TasksDb
 from shared.project_layout import runs_db, tasks_db
 
 from client_feed.contract import (
     BranchSnapshot,
+    CriteriaDeclared,
+    CriteriaResults,
+    CriterionOutcome,
+    CriterionResult,
     Degradation,
     FactoryState,
     FeedLine,
@@ -25,6 +40,7 @@ from client_feed.contract import (
     MergeLanded,
     PrdUpserted,
     ReviewCounts,
+    RunKind,
     SchedulerState,
     Source,
     TaskPhase,
@@ -36,6 +52,13 @@ from client_feed.contract import (
     VerifyTestResults,
     WaitingOn,
     parse_state,
+)
+from client_feed.criteria import (
+    CRITERIA_RELPATH,
+    STAGING_FILENAME,
+    CriteriaRun,
+    collection_map_path,
+    write_staging,
 )
 from client_feed.feed_io import CURSOR_FILENAME, Cursor, OutDir, read_feed_lines
 from client_feed.fold import fold
@@ -84,11 +107,12 @@ def prd_markdown(title: str) -> str:
 
 @dataclass(frozen=True)
 class Project:
-    """A fixture root as the publisher meets it: main, task branches, the two stores, a verify archive."""
+    """A fixture root as the publisher meets it: main, task branches, the two stores, the escalation queue, a verify archive."""
 
     repo: Repo
     tasks: TasksDb
     runs: RunsDb
+    queue: EscalationQueueDir
     policy: Policy
     merge: str
     last_stream_id: int
@@ -163,13 +187,17 @@ def project(tmp_path: Path) -> Project:
     landed = runs.emit(
         'merge_finalized', at=at(20), task_id=7, phase='merge', data={'state': 'done', 'merge_sha': merge}
     )
-    runs.emit('escalation_created', at=at(25), task_id=9, data={'escalation_id': 'esc-9-1', 'level': 2})
     runs.emit('scheduler_paused', at=at(30))
+    queue = EscalationQueueDir.create(repo.root)
+    queue.write('esc-9-1', task_id='9', level=2)
     out_dir = tmp_path / 'out'
     out_dir.mkdir()
     policy = policy_over(repo.root, out_dir, tmp_path / 'in')
     write_engagement(policy.in_dir, project_id=PROJECT)
-    return Project(repo=repo, tasks=tasks, runs=runs, policy=policy, merge=merge, last_stream_id=landed)
+    return Project(
+        repo=repo, tasks=tasks, runs=runs, queue=queue, policy=policy, merge=merge,
+        last_stream_id=landed,
+    )
 
 
 def feed(project: Project) -> tuple[FeedLine, ...]:
@@ -359,16 +387,23 @@ def test_an_unreadable_runs_db_is_named_events_and_every_other_source_still_publ
     assert_valid(project)
 
 
-def test_a_restored_runs_db_publishes_the_held_stream_and_rewaits_the_escalated_task(
+def upserted_task(lines: tuple[FeedLine, ...], task_id: int) -> TaskUpserted:
+    (task,) = (line for line in lines if isinstance(line, TaskUpserted) and line.task_id == task_id)
+    return task
+
+
+def test_an_unreadable_runs_db_holds_the_stream_but_not_who_the_escalated_task_waits_on(
     project: Project,
 ) -> None:
     good = runs_db(project.root).read_bytes()
     runs_db(project.root).write_bytes(NOT_A_DATABASE)
     out = project.open()
-    run_pass(project.policy, out, now=NOW)
+
+    blind = run_pass(project.policy, out, now=NOW)
+
     held = feed(project)
-    (task_9,) = (line for line in held if isinstance(line, TaskUpserted) and line.task_id == 9)
-    assert task_9.waiting_on is WaitingOn.FACTORY
+    assert [degradation.source for degradation in blind.degraded] == [Source.EVENTS]
+    assert upserted_task(held, 9).waiting_on is WaitingOn.LEO
     assert_valid(project)
     runs_db(project.root).write_bytes(good)
 
@@ -377,26 +412,73 @@ def test_a_restored_runs_db_publishes_the_held_stream_and_rewaits_the_escalated_
     recovered = feed(project)[len(held) :]
     assert report.degraded == ()
     assert {'task_phase', 'verify_run', 'merge_landed'} <= types_of(recovered)
-    upserts = [line for line in recovered if isinstance(line, TaskUpserted)]
-    assert [(task.task_id, task.waiting_on) for task in upserts] == [(9, WaitingOn.LEO)]
     assert stored_cursor(project).events_id == project.last_stream_id
     assert_valid(project)
 
 
-def test_a_rescan_while_runs_db_is_unreadable_holds_the_escalated_tasks_waiting_on(
+def test_a_missing_escalation_queue_is_named_events_and_its_return_rewaits_the_escalated_task(
     project: Project,
+) -> None:
+    shutil.rmtree(project.queue.path)
+    out = project.open()
+
+    blind = run_pass(project.policy, out, now=NOW)
+
+    first = feed(project)
+    (degradation,) = blind.degraded
+    assert degradation.source is Source.EVENTS
+    assert 'data/escalations' in degradation.reason
+    assert upserted_task(first, 9).waiting_on is WaitingOn.FACTORY
+    assert_valid(project)
+    EscalationQueueDir.create(project.root).write('esc-9-1', task_id='9', level=2)
+
+    report = run_pass(project.policy, out, now=NOW, rescan_tasks=False)
+
+    upserts = [line for line in feed(project)[len(first) :] if isinstance(line, TaskUpserted)]
+    assert report.degraded == ()
+    assert [(task.task_id, task.waiting_on) for task in upserts] == [(9, WaitingOn.LEO)]
+    assert_valid(project)
+
+
+def _queue_replaced_by_a_file(queue: Path) -> None:
+    shutil.rmtree(queue)
+    queue.write_text('not a directory')
+
+
+@pytest.mark.parametrize(
+    'break_queue', [shutil.rmtree, _queue_replaced_by_a_file], ids=['removed', 'replaced-by-a-file']
+)
+def test_a_rescan_while_the_escalation_queue_is_unreadable_holds_the_escalated_tasks_waiting_on(
+    project: Project, break_queue: Callable[[Path], object]
 ) -> None:
     out = project.open()
     run_pass(project.policy, out, now=NOW)
     assert out.state.tasks[9].waiting_on is WaitingOn.LEO
     first = feed(project)
-    runs_db(project.root).write_bytes(NOT_A_DATABASE)
+    break_queue(project.queue.path)
 
     report = run_pass(project.policy, out, now=NOW, rescan_tasks=True)
 
     assert [degradation.source for degradation in report.degraded] == [Source.EVENTS]
     assert 'task_upserted' not in types_of(feed(project)[len(first) :])
     assert out.state.tasks[9].waiting_on is WaitingOn.LEO
+    assert_valid(project)
+
+
+def test_a_malformed_escalation_record_is_counted_and_the_escalated_task_still_waits_on_leo(
+    project: Project,
+) -> None:
+    project.queue.write_raw('esc-9-2.json', '{not json')
+
+    report = run_pass(project.policy, project.open(), now=NOW)
+
+    assert report.degraded == (
+        Degradation(
+            source=Source.EVENTS,
+            reason='skipped 1 records in data/escalations: malformed_record=1',
+        ),
+    )
+    assert upserted_task(feed(project), 9).waiting_on is WaitingOn.LEO
     assert_valid(project)
 
 
@@ -548,6 +630,18 @@ def test_an_unusable_git_directory_is_named_git_and_the_heartbeat_has_no_head(
     assert_valid(project)
 
 
+def test_git_output_that_does_not_parse_is_named_git_and_the_pass_still_commits(
+    project: Project, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv('PATH', path_with_git_answering(tmp_path / 'bin', 'ls-tree', b'garbage\0'))
+
+    report = run_pass(project.policy, project.open(), now=NOW)
+
+    assert {degradation.source for degradation in report.degraded} == {Source.GIT}
+    assert 'task_upserted' in types_of(feed(project))
+    assert_valid(project)
+
+
 @dataclass(frozen=True)
 class Landing:
     merge: str
@@ -694,4 +788,245 @@ def test_publish_rereads_every_task_on_its_first_pass_and_then_every_rescan_cade
     passes_before = sum(isinstance(line, Heartbeat) for line in lines[:late_at])
     assert passes_before == TASKS_RESCAN_PASSES
     assert stored_cursor(project).tasks_updated_at == UPDATED_9
+    assert_valid(project)
+
+
+# acceptance criteria
+
+CRITERION_IDS = ('C-1', 'C-2', 'C-3')
+STAGED = CriteriaRun(
+    commit='f' * 40,
+    run_at=at(40),
+    results=(CriterionResult(id='C-1', outcome=CriterionOutcome.FAILED, tests=('tests.e2e::t',)),),
+)
+
+
+def _declare_criteria(project: Project, text: str | None = None) -> None:
+    """acceptance/criteria.yaml declaring C-1..C-3, committed on main."""
+    declared = {
+        'format': 1,
+        'criteria': [
+            {
+                'id': criterion_id,
+                'prd': X_PRD,
+                'capability': 'Widget',
+                'statement': f'The widget meets {criterion_id}.',
+                'kind': 'success',
+            }
+            for criterion_id in CRITERION_IDS
+        ],
+    }
+    project.repo.write(CRITERIA_RELPATH, yaml.safe_dump(declared) if text is None else text)
+    project.repo.commit('Declare the acceptance criteria', when=at(19))
+
+
+def _bind(junit: Path) -> None:
+    """A defect-tests collection map beside `junit` binding test_a to C-1 and test_b to C-2."""
+    collection_map = {
+        'tests/test_a.py::test_a': {'defects': [], 'criterion': 'C-1'},
+        'tests/test_a.py::test_b': {'defects': [], 'criterion': 'C-2'},
+    }
+    collection_map_path(junit).write_text(json.dumps(collection_map))
+
+
+def _map_beside_the_archived_junit(project: Project) -> None:
+    (junit,) = task_dir(project.root).glob('*.junit-*.xml.gz')
+    _bind(junit)
+
+
+def _task_9_verify_run_with_a_map(project: Project) -> None:
+    """Task 9's verify window [at(40), at(50)]: test_a red and test_b green, with a map beside its junit."""
+    write_plan(project.root, at(41), task_id=9)
+    write_summary(project.root, at(45), commands=RED_TEST, task_id=9)
+    junit = write_junit(
+        project.root,
+        at(45),
+        junit_xml(red('test_a', 'failure', 'AssertionError'), passed('test_b')),
+        task_id=9,
+    )
+    _bind(junit)
+    project.runs.emit('phase_enter', at=at(40), task_id=9, phase='verify')
+    project.runs.emit('phase_exit', at=at(50), task_id=9, phase='verify')
+
+
+TASK_9_RESULTS = (
+    CriterionResult(id='C-1', outcome=CriterionOutcome.FAILED, tests=('tests.test_a::test_a',)),
+    CriterionResult(id='C-2', outcome=CriterionOutcome.PASSED, tests=('tests.test_a::test_b',)),
+    CriterionResult(id='C-3', outcome=CriterionOutcome.NOT_RUN, tests=()),
+)
+
+
+def _criteria_events(project: Project) -> list[CriteriaDeclared | CriteriaResults]:
+    return [
+        line for line in feed(project) if isinstance(line, CriteriaDeclared | CriteriaResults)
+    ]
+
+
+def _results_of(project: Project, kind: RunKind) -> list[CriteriaResults]:
+    return [
+        line
+        for line in feed(project)
+        if isinstance(line, CriteriaResults) and line.run_kind is kind
+    ]
+
+
+def test_b20_a_pass_publishes_the_declared_criteria_and_the_verify_runs_outcomes(
+    project: Project,
+) -> None:
+    _declare_criteria(project)
+    _map_beside_the_archived_junit(project)
+
+    run_pass(project.policy, project.open(), now=NOW)
+
+    lines = feed(project)
+    assert [line.type for line in lines[-4:]] == [
+        'prd_upserted',
+        'criteria_declared',
+        'criteria_results',
+        'heartbeat',
+    ]
+    declared, results = lines[-3], lines[-2]
+    assert isinstance(declared, CriteriaDeclared)
+    assert [criterion.id for criterion in declared.criteria] == list(CRITERION_IDS)
+    assert isinstance(results, CriteriaResults)
+    assert (results.run_kind, results.at, results.run_at) == (RunKind.VERIFY, at(10), at(10))
+    assert results.results == (
+        CriterionResult(id='C-1', outcome=CriterionOutcome.PASSED, tests=('tests.test_a::test_a',)),
+        CriterionResult(id='C-2', outcome=CriterionOutcome.FAILED, tests=('tests.test_a::test_b',)),
+        CriterionResult(id='C-3', outcome=CriterionOutcome.NOT_RUN, tests=()),
+    )
+    assert_valid(project)
+
+
+def test_a_second_pass_appends_no_criteria_event_again(project: Project) -> None:
+    _declare_criteria(project)
+    _map_beside_the_archived_junit(project)
+    out = project.open()
+    run_pass(project.policy, out, now=NOW)
+    first = len(feed(project))
+
+    run_pass(project.policy, out, now=NOW)
+
+    assert [line.type for line in feed(project)[first:]] == ['heartbeat']
+
+
+def test_the_criteria_join_reads_every_case_whatever_the_case_cap(project: Project) -> None:
+    _declare_criteria(project)
+    _map_beside_the_archived_junit(project)
+    capped = project.policy.model_copy(update={'max_cases_per_run': 1})
+
+    run_pass(capped, project.open(), now=NOW)
+
+    (test_results,) = [line for line in feed(project) if isinstance(line, VerifyTestResults)]
+    assert [case.id for case in test_results.cases] == ['tests.test_a::test_b']
+    (verify,) = _results_of(project, RunKind.VERIFY)
+    assert verify.results[0].outcome is CriterionOutcome.PASSED
+
+
+def test_a_run_whose_junit_has_no_map_records_no_criteria_results(project: Project) -> None:
+    _declare_criteria(project)
+
+    run_pass(project.policy, project.open(), now=NOW)
+
+    assert [event.type for event in _criteria_events(project)] == ['criteria_declared']
+
+
+def test_a_staging_file_is_published_once_as_the_staging_results(project: Project) -> None:
+    _declare_criteria(project)
+    write_staging(project.out_dir, STAGED)
+    out = project.open()
+
+    run_pass(project.policy, out, now=NOW)
+    run_pass(project.policy, out, now=NOW)
+
+    (staging,) = _results_of(project, RunKind.STAGING)
+    assert (staging.commit, staging.run_at, staging.results) == (
+        STAGED.commit,
+        STAGED.run_at,
+        STAGED.results,
+    )
+    assert_valid(project)
+
+
+def test_an_invalid_criteria_file_is_named_criteria_and_every_other_source_still_publishes(
+    project: Project,
+) -> None:
+    _declare_criteria(project, text='format: 2\ncriteria: []\n')
+    _map_beside_the_archived_junit(project)
+
+    report = run_pass(project.policy, project.open(), now=NOW)
+
+    assert [degradation.source for degradation in report.degraded] == [Source.CRITERIA]
+    assert CRITERIA_RELPATH in report.degraded[0].reason
+    assert last_heartbeat(project).degraded == report.degraded
+    assert _criteria_events(project) == []
+    assert [line.type for line in feed(project)] == FIRST_PASS_TYPES
+
+
+def test_a_malformed_staging_file_is_named_criteria_and_the_verify_criteria_still_publish(
+    project: Project,
+) -> None:
+    _declare_criteria(project)
+    _map_beside_the_archived_junit(project)
+    (project.out_dir / STAGING_FILENAME).write_text('not json')
+
+    report = run_pass(project.policy, project.open(), now=NOW)
+
+    assert [degradation.source for degradation in report.degraded] == [Source.CRITERIA]
+    assert STAGING_FILENAME in report.degraded[0].reason
+    assert [event.type for event in _criteria_events(project)] == [
+        'criteria_declared',
+        'criteria_results',
+    ]
+    assert _results_of(project, RunKind.STAGING) == []
+
+
+def test_of_two_tested_runs_in_one_pass_only_the_newest_is_joined(project: Project) -> None:
+    _declare_criteria(project)
+    _map_beside_the_archived_junit(project)
+    _task_9_verify_run_with_a_map(project)
+
+    run_pass(project.policy, project.open(), now=NOW)
+
+    (verify,) = _results_of(project, RunKind.VERIFY)
+    assert (verify.run_at, verify.results) == (at(50), TASK_9_RESULTS)
+    assert_valid(project)
+
+
+def test_a_malformed_archived_map_is_named_criteria_and_the_declaration_still_publishes(
+    project: Project,
+) -> None:
+    _declare_criteria(project)
+    (junit,) = task_dir(project.root).glob('*.junit-*.xml.gz')
+    collection_map_path(junit).write_text('[]')
+
+    report = run_pass(project.policy, project.open(), now=NOW)
+
+    assert [degradation.source for degradation in report.degraded] == [Source.CRITERIA]
+    assert 'invalid_map' in report.degraded[0].reason
+    assert [event.type for event in _criteria_events(project)] == ['criteria_declared']
+    assert_valid(project)
+
+
+def test_a_new_verify_run_joins_the_states_declaration_while_the_criteria_file_is_invalid(
+    project: Project,
+) -> None:
+    _declare_criteria(project)
+    _map_beside_the_archived_junit(project)
+    out = project.open()
+    run_pass(project.policy, out, now=NOW)
+    first = len(feed(project))
+    project.repo.write(CRITERIA_RELPATH, 'format: 2\ncriteria: []\n')
+    project.repo.commit('Break the acceptance criteria', when=at(39))
+    _task_9_verify_run_with_a_map(project)
+
+    report = run_pass(project.policy, out, now=NOW)
+
+    assert [degradation.source for degradation in report.degraded] == [Source.CRITERIA]
+    assert CRITERIA_RELPATH in report.degraded[0].reason
+    (verify,) = [
+        line for line in feed(project)[first:] if isinstance(line, CriteriaDeclared | CriteriaResults)
+    ]
+    assert isinstance(verify, CriteriaResults)
+    assert (verify.run_kind, verify.run_at, verify.results) == (RunKind.VERIFY, at(50), TASK_9_RESULTS)
     assert_valid(project)

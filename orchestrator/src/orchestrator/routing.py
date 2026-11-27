@@ -12,8 +12,10 @@ Task epsilon adds ``resolve_route`` -- the single layered authority for
 ``orchestrator.workflow.TaskWorkflow._invoke``. See ``resolve_route``'s own
 docstring for the layer precedence.
 
-Kept import-light at module top (stdlib only) so ``config.py`` can
-``from orchestrator.routing import DEFAULT_ALLOWED_MODELS`` with no circular
+Kept import-light at module top (stdlib, plus the stdlib-only
+``orchestrator.implementer_brief_variant`` and ``shared.routing_split``) so
+``config.py`` can ``from orchestrator.routing import DEFAULT_ALLOWED_MODELS``
+with no circular
 import; heavier imports (e.g. ``shared.cli_invoke.invoke_claude_agent``) are
 deferred to inside the functions that need them. ``OrchestratorConfig`` is
 imported under ``TYPE_CHECKING`` only (never at runtime) for the same
@@ -28,6 +30,10 @@ import logging
 import os
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
+
+from shared.routing_split import split_bucket
+
+from orchestrator.implementer_brief_variant import invocation_bounds
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Mapping
@@ -402,7 +408,8 @@ def _rule_matches(rule: RoutingRule, inputs: RouteInputs) -> bool:
     task_metadata``), ``plan_min_steps``/``plan_min_modules``/
     ``module_prefix`` (plan-shape conditions -- a ``None`` plan_shape fails
     ANY of these three), ``min_routing_tier``, ``min_dispatch_count``,
-    ``simple_saturated``. When both ``module_prefix`` and
+    ``simple_saturated``, ``split`` (the task id's ``split_bucket`` arm
+    equals ``split.bucket``; an empty task id is in no arm). When both ``module_prefix`` and
     ``plan_min_modules`` are present, ``plan_min_modules`` counts only the
     prefix-matched modules (not the total) -- this is what reproduces the
     pre-epsilon Rust heuristic (``_select_model_for_role``) exactly.
@@ -432,6 +439,12 @@ def _rule_matches(rule: RoutingRule, inputs: RouteInputs) -> bool:
     if (
         match.simple_saturated is not None
         and _task_simple_saturated(inputs.task_metadata) != match.simple_saturated
+    ):
+        return False
+    split = match.split
+    if split is not None and (
+        not inputs.task_id
+        or split_bucket(split.salt, inputs.task_id, split.buckets) != split.bucket
     ):
         return False
 
@@ -536,6 +549,10 @@ def resolve_route(inputs: RouteInputs, config: OrchestratorConfig) -> RoutingDec
     4. ``role_default`` -- ``inputs.role_defaults`` (invariant 1: Total,
        always available and unconditional -- this is the only layer never
        subject to fail-safe validation -- so this function never raises).
+
+    Then a final, non-layer transform: under ``config.implementer_brief_variant``
+    one-step the implementer's budget_usd/max_turns are divided per
+    ``orchestrator/src/orchestrator/implementer_brief_variant.py``.
 
     Each of effort/budget_usd/max_turns is resolved independently
     field-by-field from the highest layer that specifies it;
@@ -661,6 +678,10 @@ def resolve_route(inputs: RouteInputs, config: OrchestratorConfig) -> RoutingDec
             source_layer = 'metadata_override'
         else:
             rejected.append(f'metadata_override:{reason}')
+
+    budget_usd, max_turns = invocation_bounds(
+        config.implementer_brief_variant, inputs.role_name, budget_usd, max_turns,
+    )
 
     return RoutingDecision(
         model=model,

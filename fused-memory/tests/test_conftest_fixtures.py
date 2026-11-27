@@ -24,6 +24,7 @@ from _fm_helpers import (
     make_rebuild_detail,
 )
 from _graphiti_fake import FakeGraphitiClient
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.backends.graphiti_client import (
     INCOMPLETE_SHORT_READ,
@@ -31,6 +32,8 @@ from fused_memory.backends.graphiti_client import (
     PagedRead,
 )
 from fused_memory.models.scope import KNOWN_PROJECT_ROOTS_ENV
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 CONFTEST_PATH = Path(__file__).parent / 'conftest.py'
 
@@ -681,7 +684,7 @@ class TestTheLeaseDirIsolationHasOneDefinition:
         assert definitions == [self.HOME], (
             f'{definitions} define the fixture themselves; import the one '
             f'definition instead — `from _fm_helpers import '
-            f'lease_dir_fixture  # noqa: F401`'
+            f'lease_dir_fixture as lease_dir_fixture`'
         )
 
     def test_an_importing_module_really_gets_the_isolation(self, lease_dir):
@@ -702,4 +705,16 @@ class TestTheLeaseDirIsolationHasOneDefinition:
 
         assert not any(
             value is lease_dir_fixture for value in vars(conftest).values()
+        )
+
+
+class TestTheMockDerivedStrayDirGuardIsWired:
+    """The shared guard from ``df_pytest_isolation`` is live in this suite (task 5145)."""
+
+    def test_it_is_registered_for_every_test(self, request):
+        assert '_df_no_mock_derived_stray_dirs' in request.fixturenames, (
+            'call arm_test_root_isolation(config) from '
+            'fused-memory/tests/conftest.py\'s pytest_configure, which arms '
+            '_df_no_mock_derived_stray_dirs. Without it a fused-memory run can materialise an AsyncMock/ '
+            'tree silently, which is the task-4592 incident.'
         )

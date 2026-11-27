@@ -11,8 +11,14 @@ import subprocess
 from pathlib import Path
 
 import pytest
-import shared.reify_checkout as reify_checkout
+import shared.locking as shared_locking
+from _census_helpers import census_lines
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
+from fused_memory.middleware.gitignored_deliverable_guard import (
+    GitignoredDeliverableFinding,
+    gitignored_deliverable_reject,
+)
 from fused_memory.middleware.lock_charter_guard import (
     EXTENSIONLESS_FILENAMES,
     FILE_EXTENSIONS,
@@ -22,81 +28,27 @@ from fused_memory.middleware.lock_charter_guard import (
     lock_charter_error,
 )
 
-# ---------------------------------------------------------------------------
-# _resolve_reify_checkout — marker-bound adapter over `shared.reify_checkout`,
-# the single source of layout-independent reify-checkout discovery AND of the
-# skip wording that goes with it (established by task 3843 here, promoted to
-# shared/ by task 3978 so orchestrator's scripts/verify.sh gate resolves
-# through the same walk).
-#
-# Feeds BOTH cross-repo call sites below: _REIFY_GUARD_SCRIPT (Tier-2 drift
-# guard, just below) and _REIFY_REPO_ROOT (corpus->allowlist guard, further
-# down — see the pointer comment at its old site).
-# ---------------------------------------------------------------------------
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
-_REIFY_GUARD_RELPATH = Path('scripts') / 'lock-charter-guard.sh'
+_SOURCE = 'lock_charter_guard.extract_files'
 
-
-def _resolve_reify_checkout(start: Path | None = None) -> reify_checkout.ReifyCheckout:
-    """Locate the reify checkout carrying THIS module's guard script.
-
-    Marker-bound adapter over the shared single source.  Every semantic —
-    discovery order, REIFY_ROOT precedence, the measured worktree-vs-bare-
-    checkout evidence table (and why "change parents[5] to parents[3]" is a
-    REGRESSION rather than a fix), and why an override absent on disk is
-    honored VERBATIM — lives in `shared.reify_checkout.resolve_reify_checkout`.
-    Do not restate or re-derive them here, and do not reintroduce a local copy
-    of the ancestor walk.
-
-    Returns the shared `ReifyCheckout` — root AND provenance — rather than a
-    bare path, so `reify_skip_reason` below is formatted from the very
-    resolution that produced the root and cannot blame REIFY_ROOT for a path
-    that was actually discovered.
-
-    *start* defaults to THIS file, and that default belongs here rather than in
-    the shared helper: the walk has to begin at the CALL SITE, and shared's own
-    ``__file__`` would start it in ``shared/src/shared/``.
-
-    The module-level constants below (_REIFY_REPO_ROOT, _REIFY_GUARD_SCRIPT,
-    _REIFY_SKIP_REASON) are evaluated at IMPORT time, so REIFY_ROOT must be
-    exported BEFORE pytest starts to steer them — a mid-session
-    `monkeypatch.setenv` only affects direct `_resolve_reify_checkout()` calls
-    (which is exactly what the TestReifyCheckoutAdapter cases below do; they
-    never touch the constants).
-    """
-    # Called through the module attribute on purpose: the delegation pin in
-    # TestReifyCheckoutAdapter patches `reify_checkout.resolve_reify_checkout`,
-    # which a `from ... import resolve_reify_checkout` binding would put out of
-    # its reach.
-    return reify_checkout.resolve_reify_checkout(
-        _REIFY_GUARD_RELPATH, start=start or Path(__file__)
-    )
-
-
-_LCG_LOGGER = 'fused_memory.middleware.lock_charter_guard'
 
 # ---------------------------------------------------------------------------
-# Drift guard — two tiers:
+# Drift guards — what this suite pins, and what it deliberately does not:
 #
-# Tier 1 (test_extension_drift_guard): same-file consistency check.
-#   Asserts sorted(FILE_EXTENSIONS) == _CANONICAL_EXTENSIONS, where both are
-#   defined in this file.  Catching that FILE_EXTENSIONS and _CANONICAL_EXTENSIONS
-#   stay in sync with each other.  Update BOTH lists together when the allowlist
-#   changes.  This does NOT catch cross-language α/γ drift on its own.
+# Tier 1 (test_extension_drift_guard, test_extensionless_drift_guard): each
+#   vector against a canonical literal in this file.  Update BOTH together when
+#   the allowlist changes.  This does NOT catch α/γ drift on its own.
 #
-# Tier 2 (test_extension_drift_guard_vs_reify_script): cross-source guard.
-#   Invokes the real reify/scripts/lock-charter-guard.sh --list-extensions and
-#   compares its output to sorted(FILE_EXTENSIONS).  Skipped, with the reason
-#   built by `shared.reify_checkout.reify_skip_reason` (via the
-#   `_resolve_reify_checkout` adapter above), when the checkout is
-#   undiscoverable — e.g. a standalone fused-memory checkout; override with
-#   REIFY_ROOT — or when REIFY_ROOT names a path that has no guard script, in
-#   which case the skip NAMES that path.  Run this in any environment that has
-#   both repos checked out side-by-side.
+# α == γ (test_gamma_vectors_match_shared_locking): this copy against
+#   shared.locking's.  Both copies are committed in this repo, so the
+#   comparison depends only on the commit under verify.
 #
-# Out of suite: `scripts/check_lock_charter_drift.py` (task 3226) runs the same
-#   cross-repo comparison explicitly, without the full suite — three exit codes,
-#   no skip state, so an absent or unrunnable sibling reports as loudly as drift.
+# Cross-repo (reify's scripts/lock-charter-guard.sh and tracked corpus): NOT
+#   in this suite.  A sibling checkout's working state must not sit on the
+#   merge gate (task 11623), so `scripts/check_lock_charter_drift.py` compares
+#   them nightly via lock-charter-drift-check.timer and files one heal task per
+#   drift.  OPERATIONS.md section 9a.
 # ---------------------------------------------------------------------------
 
 # The canonical α/γ vector — update this list AND FILE_EXTENSIONS together.
@@ -114,197 +66,31 @@ _CANONICAL_EXTENSIONS = [
     'lock', 'log',
     'manifest', 'md', 'mjs', 'mts',
     'npmrc', 'png', 'py', 'python-version',
-    'ri', 'rs', 'scss', 'service', 'sh', 'step', 'stl', 'svg',
+    'ri', 'rs', 'scss', 'service', 'sh', 'stderr', 'step', 'stl', 'svg',
     'template', 'timer', 'tombstones', 'toml', 'ts', 'tsv', 'tsx', 'txt', 'typed',
     'yaml', 'yml',
 ]
-
-# Resolved once at import time via _resolve_reify_checkout (defined above),
-# which delegates to shared.reify_checkout — see THAT module's docstring for
-# the measured evidence table and why a fixed parents[N] index cannot work in
-# both a bare checkout and a dark-factory worktree.
-# _REIFY_REPO_ROOT also feeds the corpus->allowlist guard further down (moved
-# up here from its old site — see the pointer comment left there — so both
-# reify call sites share one resolution).
-_REIFY_CHECKOUT = _resolve_reify_checkout()
-_REIFY_REPO_ROOT: Path | None = _REIFY_CHECKOUT.root
-_REIFY_GUARD_SCRIPT: Path | None = (
-    _REIFY_REPO_ROOT / _REIFY_GUARD_RELPATH if _REIFY_REPO_ROOT is not None else None
-)
-# The skip wording comes from the shared builder too, not from a hand-rolled
-# string per gate.  It separates the two arms the old inline reason conflated:
-# a discovery MISS (nobody has reify checked out — benign) from a REIFY_ROOT
-# naming a path that is not there (an operator typo, which must NAME the bad
-# path instead of telling the operator to set the env var they already set).
-_REIFY_SKIP_REASON: str | None = reify_checkout.reify_skip_reason(
-    _REIFY_GUARD_RELPATH, _REIFY_REPO_ROOT, named_by_env=_REIFY_CHECKOUT.named_by_env
-)
-
-
-def _reify_guard_vector(flag: str) -> list[str]:
-    """Return the sorted vector emitted by the reify guard script's *flag*.
-
-    LOUD on failure, by design, and the distinction is deliberate: the callers
-    are guarded by a ``skipif`` on the script's ABSENCE — a standalone checkout
-    legitimately has no reify sibling — but a script that EXISTS and then fails
-    is real signal and is raised, never skipped.
-
-    Measured 2026-08-09 on the live script: an unrecognised flag prints usage to
-    stderr and exits 2.  So the previous skip-on-any-non-zero would have retired
-    both Tier-2 guards the moment reify renamed or dropped an emitter, leaving
-    them green forever while enforcing nothing — the precise silent degradation
-    that the "three-way α/γ/bash agreement is ENFORCED rather than merely
-    asserted in prose" claim in both module docstrings rules out.
-    """
-    assert _REIFY_GUARD_SCRIPT is not None, (
-        'every caller is skipif-guarded on _REIFY_GUARD_SCRIPT being a real '
-        'file, so reaching here with None means a caller lost its guard — fail '
-        'loudly rather than stringify None into a bogus `bash None` invocation'
-    )
-    result = subprocess.run(
-        ['bash', str(_REIFY_GUARD_SCRIPT), flag],
-        capture_output=True,
-        text=True,
-    )
-    assert result.returncode == 0, (
-        f'reify {_REIFY_GUARD_SCRIPT.name} {flag} exited {result.returncode}, '
-        f'expected 0 — the emitter this cross-source drift guard depends on is '
-        f'gone, renamed, or broken.  Check `bash {_REIFY_GUARD_SCRIPT} --help`.  '
-        f'This is a HARD failure and not a skip on purpose: silently retiring a '
-        f'cross-source guard would let the three copies of the predicate diverge '
-        f'with every test in the tree still green.\n'
-        f'  stdout: {result.stdout[:400]!r}\n'
-        f'  stderr: {result.stderr[:400]!r}'
-    )
-    return sorted(line.strip() for line in result.stdout.splitlines() if line.strip())
-
 
 def test_extension_drift_guard():
     """Tier-1 (same-file): sorted(FILE_EXTENSIONS) must match _CANONICAL_EXTENSIONS.
 
     This is a same-file consistency check — FILE_EXTENSIONS and _CANONICAL_EXTENSIONS
-    must be updated together.  For cross-source α/γ drift detection see
-    test_extension_drift_guard_vs_reify_script.
+    must be updated together.  For α/γ drift see
+    test_gamma_vectors_match_shared_locking.
     """
     assert sorted(FILE_EXTENSIONS) == _CANONICAL_EXTENSIONS
 
 
-@pytest.mark.skipif(_REIFY_SKIP_REASON is not None, reason=_REIFY_SKIP_REASON or '')
-def test_extension_drift_guard_vs_reify_script():
-    """Tier-2 (cross-source): sorted(FILE_EXTENSIONS) must match reify --list-extensions.
+def test_gamma_vectors_match_shared_locking():
+    """α == γ: both of this module's vectors must equal shared.locking's.
 
-    Invokes the real scripts/lock-charter-guard.sh --list-extensions and
-    compares its output to sorted(FILE_EXTENSIONS), catching any α/γ divergence
-    that the same-file Tier-1 guard would miss.
-
-    A present-but-failing script is a hard failure, not a skip — see
-    _reify_guard_vector.
+    Each Tier-1 guard compares one copy only with a literal in its own test
+    file, so an edit to one Python copy plus its own literal would pass both.
+    Until task 11623 the cross-repo guards gave this transitively (each copy
+    equal to reify's emitter); this pins it directly, without leaving the repo.
     """
-    script_exts = _reify_guard_vector('--list-extensions')
-    assert script_exts == sorted(FILE_EXTENSIONS), (
-        f'α/γ drift detected!\n'
-        f'  reify --list-extensions : {script_exts!r}\n'
-        f'  γ FILE_EXTENSIONS       : {sorted(FILE_EXTENSIONS)!r}\n'
-        f'Update FILE_EXTENSIONS (and _CANONICAL_EXTENSIONS) to match reify.'
-    )
-
-
-# ---------------------------------------------------------------------------
-# _resolve_reify_checkout — this call site's binding to the shared resolver.
-#
-# Task 3843's title prescribes changing _REIFY_GUARD_SCRIPT's parents[5] to
-# parents[3]. That prescription is a REGRESSION, not a fix: '.worktrees/<id>'
-# contributes exactly two path segments, so parents[5] is correct in a
-# worktree checkout and parents[3] is correct in a bare checkout — no single
-# fixed index is correct in both layouts. The ancestor walk that replaced both
-# parents[N] call sites now lives in shared.reify_checkout (task 3978) — see
-# ITS docstring for the measured evidence table.
-#
-# The resolver's SEMANTICS are owned by shared/tests/test_reify_checkout.py:
-# the layout matrix (bare vs worktree vs extra nesting), nearest-ancestor
-# precedence, marker-less-dir shadowing, and the whole REIFY_ROOT override
-# contract are pinned there, once. Duplicating that matrix here would mean
-# three near-identical suites to edit for one semantic change — the very
-# duplication this promotion existed to remove. What stays here is only what
-# is specific to THIS call site: that it delegates, that it binds its own
-# marker, that its constants track the resolver, and one end-to-end smoke case
-# against a real planted tree.
-# ---------------------------------------------------------------------------
-
-
-class TestReifyCheckoutAdapter:
-    """`_resolve_reify_checkout` — this module's binding to the shared resolver."""
-
-    def test_resolver_delegates_to_the_shared_single_source(self, tmp_path, monkeypatch):
-        """The ancestor walk must live in ONE place — shared.reify_checkout.
-
-        Deliberately white-box, and deliberately the only genuinely-RED
-        assertion available for what is otherwise a behaviour-preserving
-        refactor: a black-box equivalence assertion cannot express it, since a
-        faithful local duplicate of the walk would satisfy every one of them
-        while defeating the single-sourcing.  What this pin buys is that a
-        SECOND copy of the walk cannot quietly reappear in this file.
-        """
-        sentinel = tmp_path / 'sentinel-reify'
-        start = tmp_path / 'dark-factory' / 'fused-memory' / 'tests' / 'test_x.py'
-        seen = {}
-
-        def _stub(marker, start=None):
-            seen['marker'] = Path(marker)
-            seen['start'] = start
-            return reify_checkout.ReifyCheckout(sentinel, False)
-
-        monkeypatch.setattr(reify_checkout, 'resolve_reify_checkout', _stub)
-
-        assert _resolve_reify_checkout(start).root == sentinel, (
-            'this module must DELEGATE to '
-            'shared.reify_checkout.resolve_reify_checkout rather than keep a '
-            'private copy of the ancestor walk'
-        )
-        assert seen['marker'] == _REIFY_GUARD_RELPATH, (
-            'the shared resolver must be bound to THIS call site marker '
-            f'(expected {_REIFY_GUARD_RELPATH}, got {seen.get("marker")})'
-        )
-        assert seen['start'] == start
-
-    def test_discovers_a_planted_checkout_end_to_end(self, tmp_path, monkeypatch):
-        """One real-tree smoke case, so the marker binding is not stub-only.
-
-        The delegation pin above proves the adapter passes
-        _REIFY_GUARD_RELPATH; this proves that marker actually finds a checkout
-        carrying it.  Planted in the worktree layout because that is where
-        orchestrator verify runs — the layout that a fixed parents[3] would
-        break.  The rest of the layout matrix belongs to
-        shared/tests/test_reify_checkout.py.
-        """
-        monkeypatch.delenv(reify_checkout.REIFY_ROOT_ENV, raising=False)
-        guard_script = tmp_path / 'reify' / _REIFY_GUARD_RELPATH
-        guard_script.parent.mkdir(parents=True)
-        guard_script.write_text('#!/bin/sh\necho stub\n')
-        tests_dir = tmp_path / 'dark-factory' / '.worktrees' / '3843' / 'fused-memory' / 'tests'
-        tests_dir.mkdir(parents=True)
-
-        checkout = _resolve_reify_checkout(tests_dir / 'test_x.py')
-
-        assert checkout.root == (tmp_path / 'reify').resolve()
-        assert checkout.named_by_env is False
-
-    def test_module_constants_track_the_resolver(self):
-        """Single-source-of-truth pin against the call sites re-diverging.
-
-        Covers the skip reason too: it must be the SHARED builder's output for
-        this module's own resolution, not a hand-rolled string that can drift
-        from the wording orchestrator's gate uses.
-        """
-        checkout = _resolve_reify_checkout()
-
-        assert checkout.root == _REIFY_REPO_ROOT
-        if _REIFY_REPO_ROOT is not None:
-            assert _REIFY_GUARD_SCRIPT == _REIFY_REPO_ROOT / _REIFY_GUARD_RELPATH
-        shared_reason = reify_checkout.reify_skip_reason(
-            _REIFY_GUARD_RELPATH, checkout.root, named_by_env=checkout.named_by_env
-        )
-        assert shared_reason == _REIFY_SKIP_REASON
+    assert FILE_EXTENSIONS == shared_locking.FILE_EXTENSIONS
+    assert EXTENSIONLESS_FILENAMES == shared_locking.EXTENSIONLESS_FILENAMES
 
 
 # ---------------------------------------------------------------------------
@@ -412,6 +198,8 @@ _ACCEPT_PATHS = [
     'docs/reify-language-spec.tombstones',  # reify
     # reify #9058 (α-first): the first tracked reify `.tsv`, landed by reify #8662.
     'tests/infra/affected-crates-direct-sets.tsv',  # reify
+    # reify #10618 (α-first): trybuild expected output for reify #10554's must_not_compile cases.
+    'crates/reify-eval-core/tests/must_not_compile/await_inside_section.stderr',  # reify
 ]
 
 
@@ -507,7 +295,9 @@ def test_leading_dot_directories_stay_directories(path):
 # identical to the 2026-07-31 measurement): every tracked path whose final
 # segment contains no '.'.  dark-factory contributes Dockerfile LICENSE
 # pre-commit pre-merge-commit project-checks; reify adds cargo
-# cargo-audit-orphans reference-transaction.  Union = the 8 below.
+# cargo-audit-orphans reference-transaction, and sccache
+# (scripts/canon-bin/guard/sccache, reify task 10232, measured on reify main
+# 2026-11-23).  Union = the 9 below.
 #
 # GITLINK EXCLUSION (load-bearing, not a measurement artefact): entries with
 # mode 160000 are submodule mount points — `graphiti` and `mem0` in
@@ -527,11 +317,13 @@ _CANONICAL_EXTENSIONLESS = [
     'pre-merge-commit',
     'project-checks',
     'reference-transaction',
+    'sccache',
 ]
 
 # One REAL tracked path per canonical extension-less name — dark-factory unless
 # the comment says reify (same convention as _ACCEPT_PATHS above).  Verified
-# tracked with `git ls-files --error-unmatch` on 2026-08-09.  Enforced complete
+# tracked with `git ls-files --error-unmatch` on 2026-08-09 (the sccache entry
+# on 2026-11-23).  Enforced complete
 # by test_extensionless_accept_corpus_covers_every_canonical_name.
 _EXTENSIONLESS_ACCEPT_PATHS = [
     'LICENSE',
@@ -544,6 +336,8 @@ _EXTENSIONLESS_ACCEPT_PATHS = [
     # reify
     'scripts/agent-bin/cargo',
     # reify
+    'scripts/canon-bin/guard/sccache',
+    # reify
     'scripts/cargo-audit-orphans',
 ]
 
@@ -551,45 +345,10 @@ _EXTENSIONLESS_ACCEPT_PATHS = [
 def test_extensionless_drift_guard():
     """Tier-1 (same-file): sorted(EXTENSIONLESS_FILENAMES) == _CANONICAL_EXTENSIONLESS.
 
-    Same shape and same reason as test_extension_drift_guard above; the Tier-2
-    cross-source counterpart is test_extensionless_drift_guard_vs_reify_script.
+    Same shape and same reason as test_extension_drift_guard above; its α/γ
+    counterpart is test_gamma_vectors_match_shared_locking.
     """
     assert sorted(EXTENSIONLESS_FILENAMES) == _CANONICAL_EXTENSIONLESS
-
-
-@pytest.mark.skipif(_REIFY_SKIP_REASON is not None, reason=_REIFY_SKIP_REASON or '')
-def test_extensionless_drift_guard_vs_reify_script():
-    """Tier-2 (cross-source): EXTENSIONLESS_FILENAMES must match --list-extensionless.
-
-    The extension-less sibling of test_extension_drift_guard_vs_reify_script,
-    and the reason the extension-half guard cannot stand in for it: that one
-    compares ``--list-extensions``, a vector of EXTENSION strings, so it is
-    structurally blind to this frozenset.  Without this test the three copies
-    could silently disagree on the 8 names while every other guard stayed green.
-
-    #3248 was PLANNED on the premise that this vector was a dark_factory-only
-    lead and that reify's bash ``_is_file_path`` still conservative-rejected all
-    8 names, with a reify follow-up to be filed.  That premise was refuted by
-    measurement on 2026-08-09: reify #5890 had already landed the identical
-    vector and added ``--list-extensionless`` specifically so the other side
-    could pin against it.  ``classify hooks/project-checks`` returns ACCEPT.  So
-    no follow-up is owed, and the seam is CONVERGED — this test is what keeps it
-    that way.
-
-    A present-but-failing script is a hard failure, not a skip — see
-    _reify_guard_vector.  That matters more here than for the extension half:
-    ``--list-extensionless`` is the NEWER emitter (reify #5890), so it is the
-    likelier of the two to be renamed or dropped upstream.
-    """
-    script_names = _reify_guard_vector('--list-extensionless')
-    assert script_names == sorted(EXTENSIONLESS_FILENAMES), (
-        f'α/γ/bash drift detected on the extension-less vector!\n'
-        f'  reify --list-extensionless : {script_names!r}\n'
-        f'  γ EXTENSIONLESS_FILENAMES  : {sorted(EXTENSIONLESS_FILENAMES)!r}\n'
-        f'Update EXTENSIONLESS_FILENAMES here, in shared/src/shared/locking.py, '
-        f"and reify's own scripts/lock-charter-guard.sh _EXTLESS, plus "
-        f'_CANONICAL_EXTENSIONLESS in both test copies — all five places.'
-    )
 
 
 def test_extensionless_filenames_is_frozenset():
@@ -719,45 +478,9 @@ def test_accept_corpus_covers_every_canonical_extension():
 
 # Repo root, resolved from this test file's location.  __file__ lives at
 # <repo>/fused-memory/tests/, so parents[2] is the dark-factory checkout root
-# — works in a worktree too, unlike the reify sibling hop (see
-# shared.reify_checkout's docstring for why).
+# — in a worktree too.  These sweeps read THIS checkout only; reify's tracked
+# corpus is swept off the gate by scripts/check_lock_charter_drift.py.
 _DF_REPO_ROOT = Path(__file__).parents[2]
-# _REIFY_REPO_ROOT used to be defined here as `Path(__file__).parents[5] / 'reify'`
-# (a bare-checkout regression — task 3843). It now lives beside
-# _REIFY_GUARD_SCRIPT, above, resolved once via _resolve_reify_checkout() so both
-# reify call sites share one layout-independent resolution.  The reachability
-# precondition that guards the sweeps below, `_skip_unless_checkout`, likewise
-# keeps only its local binding here: both its arms' wording lives in
-# `shared.reify_checkout.checkout_skip_reason` (task 4259).
-
-
-def _skip_unless_checkout(repo: str, repo_root: Path | None) -> Path:
-    """Skip unless *repo_root* names a real checkout directory; else return it.
-
-    Marker-bound adapter over `shared.reify_checkout.checkout_skip_reason`,
-    which owns BOTH arms' wording — why a discovery MISS is not an operator's
-    REIFY_ROOT typo, why the set-but-absent arm names the path verbatim, and why
-    it does not borrow the stronger marker-based reason.  Do not restate or
-    re-derive them here, and do not reintroduce a local copy of either arm; the
-    same helper in shared/tests/test_locking.py delegates to the identical
-    builder, which is the point (task 4259, consolidating what task 3843
-    established here).
-
-    What is LOCAL is only the binding: this call site's guard-script marker, and
-    turning the reason into a ``pytest.skip`` — the shared module is pytest-free.
-
-    Called through the module attribute on purpose, for the same reason
-    `_resolve_reify_checkout` notes above: the delegation pin in
-    TestSkipUnlessCheckout patches `reify_checkout.checkout_skip_reason`, which
-    a ``from ... import`` binding would put out of its reach.
-    """
-    reason = reify_checkout.checkout_skip_reason(
-        repo, repo_root, marker=_REIFY_GUARD_RELPATH
-    )
-    if reason is not None:
-        pytest.skip(reason)
-    assert repo_root is not None  # narrows for the return
-    return repo_root
 
 
 def _tracked_entries(repo_root: Path) -> tuple[list[str], list[str]] | None:
@@ -804,12 +527,7 @@ def _tracked_file_paths(repo_root: Path) -> list[str] | None:
     return None if entries is None else entries[0]
 
 
-@pytest.mark.parametrize(
-    ('repo', 'repo_root'),
-    [('dark-factory', _DF_REPO_ROOT), ('reify', _REIFY_REPO_ROOT)],
-    ids=['dark-factory', 'reify'],
-)
-def test_every_tracked_extension_is_allowlisted(repo: str, repo_root: Path | None):
+def test_every_tracked_extension_is_allowlisted():
     """No REAL tracked file may classify as a directory because of a missing ext.
 
     Direction: **corpus → allowlist**.  This is the failure mode that produced
@@ -824,21 +542,15 @@ def test_every_tracked_extension_is_allowlisted(repo: str, repo_root: Path | Non
     incident.  This test makes the allowlist self-auditing against the actual
     tracked corpus instead.
 
-    BOTH repos are swept, and that is load-bearing rather than thoroughness for
-    its own sake — do not "simplify" this to the local repo.  The allowlist is a
-    single α/γ-shared vector governing declarations for both projects, and the
-    two corpora barely overlap: measured 2026-07-28, 19 extensions are tracked in
-    both, 12 only in dark-factory (diff, example, example-systemd-config,
-    gitattributes, gitmodules, jsonl, jsx, log, python-version, svg, template,
-    typed) and 17 only in reify (c, conf, cpp, gcode, gitkeep, golden, grammar,
-    h, icns, ico, jq, manifest, npmrc, png, ri, ts, tsx).  ``manifest`` is in that
-    reify-only group — zero ``.manifest`` files are tracked in dark-factory — so a
-    dark-factory-only sweep would NOT have caught the very incident that motivated
-    this task.  Verified by mutation: removing ``manifest`` from FILE_EXTENSIONS
-    fails the reify parametrization (naming
-    ``tests/infra/harness-layout-baseline.manifest``) and passes the dark-factory
-    one.  Each repo is skipped independently when that checkout is absent,
-    mirroring the Tier-2 skipif above.
+    Only THIS checkout is swept here, and that is not the whole property.  The
+    allowlist is a single α/γ-shared vector governing declarations for both
+    projects, and the two corpora barely overlap: measured 2026-07-28, 19
+    extensions are tracked in both, 12 only in dark-factory and 17 only in
+    reify.  ``manifest`` is in the reify-only group, so this sweep alone would
+    NOT have caught the very incident that motivated it.  Reify's corpus is
+    swept by ``scripts/check_lock_charter_drift.py::check_corpus``, nightly and
+    off the merge gate, because a reify commit must never red a dark-factory
+    merge (task 11623; OPERATIONS.md section 9a).
 
     Measured precondition when added: dark-factory 2124 tracked paths and reify
     3778, with ZERO non-allowlisted extensions in either — so this carries no
@@ -866,11 +578,10 @@ def test_every_tracked_extension_is_allowlisted(repo: str, repo_root: Path | Non
     design — the escape hatch is ``files=[]``, i.e. declaring NO charter at all,
     which is exactly the silent under-locking #3248 fixes.
     """
-    repo_root = _skip_unless_checkout(repo, repo_root)
-    paths = _tracked_file_paths(repo_root)
+    paths = _tracked_file_paths(_DF_REPO_ROOT)
     if paths is None:
-        pytest.skip(f'{repo_root} is not a git checkout (git ls-files failed)')
-    assert paths, f'git ls-files returned no tracked paths for {repo_root}'
+        pytest.skip(f'{_DF_REPO_ROOT} is not a git checkout (git ls-files failed)')
+    assert paths, f'git ls-files returned no tracked paths for {_DF_REPO_ROOT}'
 
     # ext -> first tracked path exhibiting it, for an actionable failure message.
     unknown: dict[str, str] = {}
@@ -882,7 +593,7 @@ def test_every_tracked_extension_is_allowlisted(repo: str, repo_root: Path | Non
             unknown.setdefault(seg.rsplit('.', 1)[1], path)
 
     assert not unknown, (
-        f'{len(unknown)} extension(s) on real tracked {repo} files are absent '
+        f'{len(unknown)} extension(s) on real tracked dark-factory files are absent '
         f'from FILE_EXTENSIONS, so those files classify as DIRECTORIES and any '
         f'task declaring one in metadata.files is rejected with a '
         f'LockCharterViolation:\n'
@@ -893,11 +604,7 @@ def test_every_tracked_extension_is_allowlisted(repo: str, repo_root: Path | Non
     )
 
 
-@pytest.mark.parametrize(
-    ('repo', 'repo_root'),
-    [('dark-factory', _DF_REPO_ROOT), ('reify', _REIFY_REPO_ROOT)],
-)
-def test_no_canonical_extensionless_name_is_also_a_directory(repo: str, repo_root: Path):
+def test_no_canonical_extensionless_name_is_also_a_directory():
     """No member may appear as a NON-FINAL component of any tracked path.
 
     This is what bounds the risk of matching on a bare basename.  A member
@@ -908,19 +615,19 @@ def test_no_canonical_extensionless_name_is_also_a_directory(repo: str, repo_roo
     than leaving it as a one-time observation.
 
     SCOPE, stated plainly so the guard is not over-read: it bounds the risk for
-    these TWO checkouts only, while the predicate governs lock charters for
-    every project the orchestrator targets.  Several members are generic
+    THIS checkout only (reify's tree is swept off the gate by
+    ``scripts/check_lock_charter_drift.py::check_extensionless``), while the
+    predicate governs lock charters for every project the orchestrator targets.  Several members are generic
     basenames (`cargo`, `Dockerfile`, `LICENSE`, `pre-commit`), so a third
     project with a real `tools/cargo/` DIRECTORY would have it classified as a
     file and retained as a subtree-wide prefix lock, unswept by this test.  That
     is why admitting a generic basename is a cross-project commitment — see the
     CROSS-PROJECT SCOPE note on the EXTENSIONLESS_FILENAMES vector.
     """
-    repo_root = _skip_unless_checkout(repo, repo_root)
-    paths = _tracked_file_paths(repo_root)
+    paths = _tracked_file_paths(_DF_REPO_ROOT)
     if paths is None:
-        pytest.skip(f'{repo_root} is not a git checkout (git ls-files failed)')
-    assert paths, f'git ls-files returned no tracked paths for {repo_root}'
+        pytest.skip(f'{_DF_REPO_ROOT} is not a git checkout (git ls-files failed)')
+    assert paths, f'git ls-files returned no tracked paths for {_DF_REPO_ROOT}'
 
     collisions: dict[str, str] = {}
     for path in paths:
@@ -930,25 +637,23 @@ def test_no_canonical_extensionless_name_is_also_a_directory(repo: str, repo_roo
 
     assert not collisions, (
         f'{len(collisions)} EXTENSIONLESS_FILENAMES member(s) are also '
-        f'DIRECTORY names in {repo}, so declaring that directory would now '
+        f'DIRECTORY names in dark-factory, so declaring that directory would now '
         f'be accepted as a file-level lock charter:\n'
         + '\n'.join(f'  {name} — e.g. {path}' for name, path in sorted(collisions.items()))
         + '\nRemove the name from the allowlist, or rename the directory.'
     )
 
 
-@pytest.mark.parametrize(
-    ('repo', 'repo_root'),
-    [('dark-factory', _DF_REPO_ROOT), ('reify', _REIFY_REPO_ROOT)],
-)
-def test_every_tracked_extensionless_file_is_allowlisted(repo: str, repo_root: Path):
-    """Corpus->allowlist self-audit: the 9th extensionless file must go RED.
+def test_every_tracked_extensionless_file_is_allowlisted():
+    """Corpus->allowlist self-audit: a newly tracked extensionless file must go RED.
 
     The extension-less sibling of test_every_tracked_extension_is_allowlisted,
     and the same direction — **corpus → allowlist**.  Turns "add 8 names" into a
     self-auditing invariant: when someone adds a new extension-less tracked file
-    to either repo, this test names it here rather than letting it surface later
+    to this repo, this test names it here rather than letting it surface later
     as a LockCharterViolation at submit time — or, worse, as a silent under-lock.
+    Reify's extension-less corpus is swept off the gate, by
+    ``scripts/check_lock_charter_drift.py::check_extensionless``.
 
     This sweep IS duplicated between the α and γ suites, unlike the
     extension-corpus vectors which are pinned twice for drift detection.  The
@@ -961,25 +666,23 @@ def test_every_tracked_extensionless_file_is_allowlisted(repo: str, repo_root: P
     admitted; that exclusion is asserted below.  The gitlink set is DERIVED from
     git's own mode column rather than hardcoded, which matters in both
     directions: hardcoding ``('graphiti', 'mem0')`` made the assertion vacuously
-    true for the reify parametrization (reify vendors no submodules), and would
-    have gone red for no real defect if dark-factory ever de-vendored them.
-    A repo with no submodules now skips the sub-assertion explicitly instead of
-    passing it silently — so read this guard as non-vacuous exactly where
-    gitlinks actually exist, which today is the dark-factory parametrization.
+    true for a repo that vendors no submodules, and would have gone red for no
+    real defect if dark-factory ever de-vendored them.  A corpus with no
+    submodules skips the sub-assertion explicitly instead of passing it
+    silently.
     """
-    repo_root = _skip_unless_checkout(repo, repo_root)
-    entries = _tracked_entries(repo_root)
+    entries = _tracked_entries(_DF_REPO_ROOT)
     if entries is None:
-        pytest.skip(f'{repo_root} is not a git checkout (git ls-files failed)')
+        pytest.skip(f'{_DF_REPO_ROOT} is not a git checkout (git ls-files failed)')
     paths, gitlinks = entries
-    assert paths, f'git ls-files returned no tracked paths for {repo_root}'
+    assert paths, f'git ls-files returned no tracked paths for {_DF_REPO_ROOT}'
 
     # The gitlink filter must be doing real work, not passing vacuously.
     if gitlinks:
         overlap = sorted(set(gitlinks) & set(paths))
         assert not overlap, (
             f'{overlap!r} appear as BOTH mode-160000 gitlinks and ordinary '
-            f'tracked paths in {repo}; _tracked_entries must partition the '
+            f'tracked paths in dark-factory; _tracked_entries must partition the '
             f'corpus, and admitting a submodule mount point would let a task '
             f'declare an entire vendored submodule as its lock charter'
         )
@@ -1001,7 +704,7 @@ def test_every_tracked_extensionless_file_is_allowlisted(repo: str, repo_root: P
             unknown.setdefault(seg, path)
 
     assert not unknown, (
-        f'{len(unknown)} extension-less tracked {repo} file(s) classify as '
+        f'{len(unknown)} extension-less tracked dark-factory file(s) classify as '
         f'DIRECTORIES, so any task declaring one in metadata.files is either '
         f'rejected with a LockCharterViolation or — silently — stripped to an '
         f'empty charter and given a task-<id> synthetic lock that conflicts '
@@ -1011,7 +714,7 @@ def test_every_tracked_extensionless_file_is_allowlisted(repo: str, repo_root: P
         'shared/src/shared/locking.py AND '
         'fused-memory/src/fused_memory/middleware/lock_charter_guard.py, '
         'and to reify scripts/lock-charter-guard.sh _EXTLESS (all three must '
-        'agree — omitting reify reds test_extensionless_drift_guard_vs_reify_script), '
+        'agree; the nightly scripts/check_lock_charter_drift.py reports reify), '
         'plus _CANONICAL_EXTENSIONLESS and _EXTENSIONLESS_ACCEPT_PATHS in '
         'both test copies.'
     )
@@ -1094,17 +797,17 @@ class TestExtractFiles:
 
     def test_unparseable_json_warns_and_returns_empty(self, caplog):
         """RED (task 2166 step-9): the str/json branch currently discards silently."""
-        with caplog.at_level(logging.WARNING, logger=_LCG_LOGGER):
+        with caplog.at_level(logging.WARNING):
             result = extract_files('not valid json {{{')
         assert result == []
-        warns = [
-            r for r in caplog.records
-            if r.name == _LCG_LOGGER and r.levelno >= logging.WARNING
-        ]
-        assert any('task_metadata.schema_warning' in r.message for r in warns), (
-            f'expected a task_metadata.schema_warning WARNING; got '
-            f'{[r.message for r in warns]!r}'
-        )
+        assert len(census_lines(caplog, _SOURCE)) == 1
+
+    @pytest.mark.parametrize('metadata', [42, ['a/b.rs']], ids=repr)
+    def test_non_str_unreadable_metadata_warns_and_returns_empty(self, metadata, caplog):
+        with caplog.at_level(logging.WARNING):
+            result = extract_files(metadata)
+        assert result == []
+        assert len(census_lines(caplog, _SOURCE)) == 1
 
     def test_json_non_dict_returns_empty(self):
         # JSON string that parses to a list, not a dict
@@ -1172,104 +875,54 @@ class TestLockCharterError:
         assert 'error' in result
         assert result['error_type'] == 'LockCharterViolation'
 
+    @pytest.mark.parametrize(
+        'path',
+        ['tasks.db', '.taskmaster/tasks/tasks.db', 'data/x.sqlite', '.env'],
+    )
+    def test_unrecognised_extension_rejection_names_deterministic_routing(self, path):
+        assert directory_locks([path]) == [path]
 
-class TestSkipUnlessCheckout:
-    """`_skip_unless_checkout` — this suite's binding to the shared skip builder.
+        result = lock_charter_error([path])
 
-    Its FIRST direct coverage here (task 4259).  Until now it was exercised only
-    indirectly through the three parametrized sweeps below, which never observe
-    the ``None`` arm on a host where reify IS discoverable — the gap
-    shared/tests/test_locking.py's own TestSkipUnlessCheckout docstring already
-    called out in prose.  These cases call the helper directly, so both arms are
-    pinned host-independently.
-    """
+        assert result['unrecognised_extension_paths'] == [path]
+        assert "task_kind='deterministic'" in result['error']
+        assert "task_kind='deterministic'" in result['hint']
+        assert path in result['hint']
+        assert 'FILE_EXTENSIONS' in result['hint']
 
-    def test_delegates_the_skip_decision_to_the_shared_builder(self, tmp_path, monkeypatch):
-        """The genuinely-RED pin: the DECISION must come from the shared builder.
+    def test_unrecognised_extension_hint_carries_the_gitignored_guard_routing(self):
+        gitignored_hint = gitignored_deliverable_reject(
+            GitignoredDeliverableFinding(ignored_paths=('tasks.db',))
+        )['hint']
 
-        The recomputed-equality cases below cannot tell delegation from a
-        hand-rolled string that happens to agree — which is exactly the state
-        both copies of this helper were in.  This one can: it patches the shared
-        builder to answer for a root that is a perfectly good directory, which a
-        local implementation would ADMIT.
+        assert gitignored_hint in lock_charter_error(['tasks.db'])['hint']
 
-        RED before the rewire: the helper decides both arms itself, so a real
-        directory is returned unchanged and no skip is raised.
-        """
-        seen = {}
+    @pytest.mark.parametrize(
+        'path',
+        ['crates/', 'orchestrator/', 'src', 'crates/reify-eval/src', 'hooks/some-new-hook', 'tasks.db/'],
+    )
+    def test_genuine_directory_rejection_omits_deterministic_routing(self, path):
+        assert directory_locks([path]) == [path]
 
-        def _stub(repo, root, *, marker):
-            seen.update(repo=repo, root=root, marker=marker)
-            return 'stub reason from the shared builder'
+        result = lock_charter_error([path])
 
-        monkeypatch.setattr(reify_checkout, 'checkout_skip_reason', _stub)
+        assert result['unrecognised_extension_paths'] == []
+        assert 'deterministic' not in result['error']
+        assert 'deterministic' not in result['hint']
 
-        with pytest.raises(pytest.skip.Exception) as excinfo:
-            _skip_unless_checkout('reify', tmp_path)
+    @pytest.mark.parametrize('path', ['README.MD', 'config/app.YAML'])
+    def test_case_variant_of_an_allowlisted_extension_gets_only_the_lowercase_advice(self, path):
+        assert directory_locks([path]) == [path]
 
-        assert str(excinfo.value) == 'stub reason from the shared builder', (
-            'this module must DELEGATE the skip decision to '
-            'shared.reify_checkout.checkout_skip_reason rather than keep a '
-            'private copy of the two arms'
-        )
-        assert seen['repo'] == 'reify'
-        assert seen['root'] == tmp_path
-        assert seen['marker'] == _REIFY_GUARD_RELPATH, (
-            "the shared builder must be bound to THIS call site's marker "
-            f'(expected {_REIFY_GUARD_RELPATH}, got {seen.get("marker")!r})'
-        )
+        result = lock_charter_error([path])
 
-    def test_discovery_miss_skips_with_the_shared_wording(self):
-        """A None root is the discovery-miss arm — nobody has a reify sibling.
+        assert result['unrecognised_extension_paths'] == []
+        assert 'deterministic' not in result['error'] + result['hint']
+        assert 'lowercase' in result['hint']
 
-        Two ways: the INDEPENDENT invariants first (the reason names the
-        override var and the marker), then the recomputed-call equality.  Green
-        either side of the rewire by construction — `checkout_skip_reason`
-        delegates its None arm to `reify_skip_reason`, which this helper already
-        called — and that is the point rather than a gap: a coincidental match
-        is indistinguishable from delegation from the outside.  What it adds is
-        that this suite and shared's cannot drift apart afterwards.
-        """
-        with pytest.raises(pytest.skip.Exception) as excinfo:
-            _skip_unless_checkout('reify', None)
+    def test_mixed_rejection_lists_only_the_unrecognised_extension_paths(self):
+        result = lock_charter_error(['crates/', 'tasks.db'])
 
-        reason = str(excinfo.value)
-        assert isinstance(reason, str) and reason, (
-            f'a falsy reason would turn this skip into a phantom pass: {reason!r}'
-        )
-        assert 'REIFY_ROOT' in reason, f'the skip must name the override: {reason!r}'
-        assert 'scripts/lock-charter-guard.sh' in reason, (
-            f'the skip must name the marker: {reason!r}'
-        )
-        assert reason == reify_checkout.checkout_skip_reason(
-            'reify', None, marker=_REIFY_GUARD_RELPATH
-        ), 'the discovery-miss wording must come from the shared builder'
-
-    def test_set_but_absent_root_skips_with_the_shared_wording(self, tmp_path):
-        """A REIFY_ROOT-shaped path that is not on disk must be NAMED.
-
-        Same two-way shape as above, against the set-but-absent arm — the
-        f-string that was hand-rolled identically here and in
-        shared/tests/test_locking.py before task 4259.
-        """
-        missing = tmp_path / 'no-such-reify-checkout'
-
-        with pytest.raises(pytest.skip.Exception) as excinfo:
-            _skip_unless_checkout('reify', missing)
-
-        reason = str(excinfo.value)
-        assert str(missing) in reason, (
-            f'the skip reason must name the bad path so a REIFY_ROOT typo is '
-            f'self-evident: {reason!r}'
-        )
-        assert reason == reify_checkout.checkout_skip_reason(
-            'reify', missing, marker=_REIFY_GUARD_RELPATH
-        ), 'the set-but-absent wording must come from the shared builder'
-
-    def test_present_directory_is_returned_unchanged(self, tmp_path):
-        """A real directory must be RETURNED, not skipped.
-
-        Otherwise the helper could skip everything vacuously and the three
-        sweeps it guards would never run against a real checkout.
-        """
-        assert _skip_unless_checkout('reify', tmp_path) == tmp_path
+        assert result['directory_paths'] == ['crates/', 'tasks.db']
+        assert result['unrecognised_extension_paths'] == ['tasks.db']
+        assert "task_kind='deterministic'" in result['hint']

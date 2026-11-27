@@ -21,6 +21,7 @@ every test below fails at import.
 
 from __future__ import annotations
 
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -28,9 +29,10 @@ from _orch_helpers import pydantic_spec, stamp_stock_routing_config
 from _recording_event_store import _RecordingEventStore
 
 from orchestrator.config import OrchestratorConfig
-from orchestrator.event_store import EventType
-from orchestrator.routing import RoleDefaults, RoutingDecision
+from orchestrator.event_store import EventStore, EventType
+from orchestrator.routing import PlanShape, RoleDefaults, RoutingDecision
 from orchestrator.routing_dispatch import resolve_and_record_route
+from orchestrator.workflow_types import WorkflowState
 
 _HELPER = 'orchestrator.routing_dispatch'
 
@@ -144,6 +146,43 @@ class TestEmitsRoutingDecisionEvent:
 
 
 @pytest.mark.asyncio
+class TestRecordsPlanShape:
+    """The event and the in-memory mirror carry the plan shape the caller
+    passed: step and module counts, null when there is none."""
+
+    async def _record(self, plan_shape: PlanShape | None) -> tuple[dict, dict]:
+        rec = _RecordingEventStore()
+        task: dict = {}
+        with patch(f'{_HELPER}.resolve_route', return_value=_fake_decision()):
+            await resolve_and_record_route(
+                role_name='steward',
+                role_defaults=_STEWARD_DEFAULTS,
+                config=_mk_cfg(),
+                task_id='2537',
+                task_metadata={},
+                plan_shape=plan_shape,
+                event_store=rec,
+                in_memory_task=task,
+            )
+        (entry,) = _routing_entries(rec)
+        return entry['data'], task['metadata']['routing']['latest']
+
+    async def test_plan_shape_is_recorded(self) -> None:
+        data, latest = await self._record(PlanShape(step_count=5, module_paths=('a', 'b', 'c')))
+
+        assert (data['plan_steps'], data['plan_modules']) == (5, 3)
+        assert (latest['plan_steps'], latest['plan_modules']) == (5, 3)
+
+    async def test_no_plan_shape_records_nulls(self) -> None:
+        data, latest = await self._record(None)
+
+        for record in (data, latest):
+            assert 'plan_steps' in record and 'plan_modules' in record
+            assert record['plan_steps'] is None
+            assert record['plan_modules'] is None
+
+
+@pytest.mark.asyncio
 class TestAppliedBudgetAnnotation:
     """`applied_budget_usd` surfaces a caller-enforced per-invocation cap that
     differs in kind from the resolver's advisory ``budget_usd`` (today: the
@@ -192,6 +231,44 @@ class TestAppliedBudgetAnnotation:
         # Byte-equivalent event at every non-steward site: no annotation keys.
         assert 'applied_budget_usd' not in data
         assert 'budget_usd_advisory' not in data
+
+
+@pytest.mark.asyncio
+class TestEmitsPhase:
+    """A per-task caller's workflow phase lands on the persisted
+    routing_decision row's phase column, matching the site's own
+    invocation_end row; project-level/batch callers pass none and the column
+    stays NULL (task 5350)."""
+
+    async def _emit(
+        self, store: EventStore, phase: WorkflowState | None = None,
+    ) -> None:
+        with patch(f'{_HELPER}.resolve_route', return_value=_fake_decision()):
+            await resolve_and_record_route(
+                role_name='steward',
+                role_defaults=_STEWARD_DEFAULTS,
+                config=_mk_cfg(),
+                task_id='5350',
+                task_metadata={},
+                event_store=store,
+                phase=phase,
+            )
+
+    async def test_phase_is_stamped_on_the_event_row(self, tmp_path: Path) -> None:
+        store = EventStore(tmp_path / 'runs.db', 'run-test')
+        await self._emit(store, phase=WorkflowState.BLOCKED)
+
+        rows = store.fetch_events_by_type(EventType.routing_decision)
+        assert len(rows) == 1, rows
+        assert rows[0]['phase'] == 'blocked'
+
+    async def test_no_phase_leaves_column_null(self, tmp_path: Path) -> None:
+        store = EventStore(tmp_path / 'runs.db', 'run-test')
+        await self._emit(store)
+
+        rows = store.fetch_events_by_type(EventType.routing_decision)
+        assert len(rows) == 1, rows
+        assert rows[0]['phase'] is None
 
 
 @pytest.mark.asyncio

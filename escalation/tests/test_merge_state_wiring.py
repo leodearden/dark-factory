@@ -21,12 +21,14 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import types
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
+from _landing_verdicts import stub_landing_producer
 from _merge_tool_calls import call_merge_cancel, call_merge_request, call_merge_status
 from shared.merge_state import (
     CANCEL_STATES,
@@ -231,16 +233,17 @@ class TestMergeStatusCleanMissEmitsNoRecord:
 @pytest.mark.asyncio
 @pytest.mark.skipif(not _ORCHESTRATOR_AVAILABLE, reason='orchestrator package not installed')
 class TestMergeStatusTier35EmitsDone:
-    async def test_found_on_main_returns_done_member(self, tmp_path: Path) -> None:
+    async def test_found_on_main_returns_done_member(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
         tip, main_sha, citation = 'a' * 40, 'm' * 40, 'c' * 40
+        stub_landing_producer(monkeypatch, 'landed', evidence_sha=citation)
         stub_git = types.SimpleNamespace(
             resolve_branch_sha=AsyncMock(
                 side_effect=lambda b: tip if b == 'task/123' else main_sha
             ),
             is_ancestor=AsyncMock(return_value=True),
             find_merge_marker=AsyncMock(return_value=None),
-            find_task_citation_commit=AsyncMock(return_value=citation),
-            commit_effect_present_in_main=AsyncMock(return_value=True),
         )
         harness = types.SimpleNamespace(
             _merge_worker=None, _terminal_retention=None, git_ops=stub_git
@@ -380,6 +383,33 @@ class TestMergeCancelEmitsCancelStates:
         assert result['cancelled'] is False
         _assert_is_member(result['state'], CANCEL_STATES, 'merge_cancel excepted future')
         assert result['state'] == MergeState.blocked
+
+
+# ---------------------------------------------------------------------------
+# merge_cancel's tool description — the state list a calling model reads
+# ---------------------------------------------------------------------------
+
+_QUOTED_TOKEN_RE = re.compile(r"'([a-z_]+)'")
+_STATE_FIELD_RE = re.compile(r'^\s*state\s+\(str\)', re.MULTILINE)
+_REASON_FIELD_RE = re.compile(r'^\s*reason\s+\(str\|None\)', re.MULTILINE)
+
+
+@pytest.mark.asyncio
+class TestMergeCancelDescriptionRendersCancelStates:
+    """The model calling merge_cancel cannot import shared.merge_state, so the
+    tool description must carry every CANCEL_STATES value.
+    """
+
+    async def test_state_field_lists_every_cancel_state(self, tmp_path: Path) -> None:
+        tool = await _server(tmp_path).get_tool('merge_cancel')
+        assert tool is not None
+        description = tool.description or ''
+        state_label = _STATE_FIELD_RE.search(description)
+        reason_label = _REASON_FIELD_RE.search(description)
+        assert state_label and reason_label, f'field labels not found in: {description!r}'
+
+        state_field = description[state_label.end():reason_label.start()]
+        assert set(_QUOTED_TOKEN_RE.findall(state_field)) == {str(s) for s in CANCEL_STATES}
 
 
 # ---------------------------------------------------------------------------

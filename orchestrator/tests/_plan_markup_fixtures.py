@@ -1,9 +1,10 @@
 """The plan DOCUMENT substrate the two plan-tools markup suites share.
 
 ``test_plan_tools_markup_repair`` and ``test_plan_tools_markup_self_name`` both
-drive plan-tools' lazy read-repair, so both need the same three things and
-neither may own a second copy: a ``TaskArtifacts`` over a temp worktree, a
-clean plan document to poison, and the same reading of what landed on disk.
+drive plan-tools' lazy read-repair, so both need the same two things and
+neither may own a second copy: a clean plan document to poison, and the same
+reading of what landed on disk. The ``TaskArtifacts`` over a temp worktree they
+drive it through is ``_orch_suite_fixtures.py::plan_artifacts``.
 
 The refusal memo belongs here for a sharper reason than tidiness. It is
 process-local by design and therefore shared by every test in a pytest RUN,
@@ -21,8 +22,7 @@ import json
 
 import pytest
 
-from orchestrator.artifacts import TaskArtifacts
-from orchestrator.mcp import plan_tools
+from orchestrator.mcp import plan_markup_repair
 
 #: The clean ``design_decisions[0].decision`` every specimen is built around.
 DECISION_PROSE = (
@@ -32,21 +32,13 @@ DECISION_PROSE = (
 
 
 # ---------------------------------------------------------------------------
-# The fixtures.
+# The autouse fixture.
 # ---------------------------------------------------------------------------
-
-
-@pytest.fixture()
-def plan_artifacts(tmp_path):
-    """TaskArtifacts over a temp worktree — mirrors ``test_plan_tools_server``."""
-    a = TaskArtifacts(tmp_path)
-    a.init('test-1', 'Test task', 'A test')
-    return a
 
 
 @pytest.fixture(autouse=True)
 def isolate_the_refusal_memo():
-    """Clear ``_REPORTED_REFUSALS`` around every test in an importing module.
+    """Forget every reported refusal around each test in an importing module.
 
     The memo is process-local by design (one plan-tools subprocess per agent
     invocation, so "once per process" is "once per session"), which under pytest
@@ -54,9 +46,9 @@ def isolate_the_refusal_memo():
     suite order-independent instead of making a later test depend on whether an
     earlier one happened to report the same locator.
     """
-    plan_tools._REPORTED_REFUSALS.clear()
+    plan_markup_repair.forget_reported_refusals()
     yield
-    plan_tools._REPORTED_REFUSALS.clear()
+    plan_markup_repair.forget_reported_refusals()
 
 
 def corrupt_plan(**overrides) -> dict:
@@ -122,4 +114,4 @@ def corrupt_plan(**overrides) -> dict:
 
 
 def on_disk(artifacts) -> dict:
-    return json.loads((artifacts.root / 'plan.json').read_text())
+    return json.loads(artifacts.artifact_path('plan.json').read_text())

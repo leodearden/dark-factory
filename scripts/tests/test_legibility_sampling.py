@@ -23,6 +23,8 @@ from legibility.detectors import AgentClass, SignalClass
 from legibility_carrier_fixtures import (
     PROSE_QUOTING_THE_SCHEMA,
     briefing_text,
+    census_synthesis_prompt,
+    census_verifier_prompt,
     coder_judgment,
     json_fenced,
 )
@@ -485,6 +487,39 @@ class TestPeekSessionId:
         assert mod.peek_session_id(path) == 'sess-c'
 
 
+class TestDropCoded:
+    """drop_coded keeps, in order, the sessions whose transcript identity
+    (peek_session_id's key) is not in the coded set."""
+
+    @staticmethod
+    def _sessions(tmp_path: Path, *session_ids: str) -> list[inventory.SessionRecord]:
+        return [
+            _session_on_disk(tmp_path, session_id, [_with_session(_clean_record(0), session_id)])
+            for session_id in session_ids
+        ]
+
+    def test_drops_the_coded_session_and_keeps_input_order(self, tmp_path):
+        a, b, c = self._sessions(tmp_path, 'sess-a', 'sess-b', 'sess-c')
+        assert mod.drop_coded([a, b, c], frozenset({'sess-b'})) == [a, c]
+
+    def test_keys_on_the_first_record_carrying_a_session_id(self, tmp_path):
+        late = _session_on_disk(tmp_path, 'late', [
+            _queue_operation_record(), _with_session(_clean_record(0), 'sess-b'),
+        ])
+        assert mod.drop_coded([late], frozenset({'sess-b'})) == []
+
+    def test_keeps_a_session_with_no_readable_id(self, tmp_path):
+        missing = inventory.SessionRecord(
+            path=tmp_path / 'missing.jsonl', encoded_dir=tmp_path.name, cwd=MAIN_CWD,
+            date=dt_date(2026, 7, 13), size_bytes=0,
+        )
+        assert mod.drop_coded([missing], frozenset({'sess-b'})) == [missing]
+
+    def test_an_empty_coded_set_keeps_every_session(self, tmp_path):
+        sessions = self._sessions(tmp_path, 'sess-a', 'sess-b', 'sess-c')
+        assert mod.drop_coded(sessions, frozenset()) == sessions
+
+
 class TestScoreSession:
     """score_session is the one scan + classify + first-turn-text step every
     consumer of enumerated sessions shares."""
@@ -592,6 +627,12 @@ class TestReingestedContentIsNotScored:
         pytest.param([_assistant_texts(coder_judgment(_LITERAL_LINE))], id='coder_judgment'),
         pytest.param([_assistant_texts(json_fenced(coder_judgment(_LITERAL_LINE)))], id='json_fenced_coder_judgment'),
         pytest.param([_trickle_coder_prompt_turn()], id='trickle_coder_prompt'),
+        pytest.param(
+            [_user_turn(census_verifier_prompt(*_SIGNAL_LITERALS))], id='census_verifier_prompt',
+        ),
+        pytest.param(
+            [_user_turn(census_synthesis_prompt(_LITERAL_LINE))], id='census_synthesis_prompt',
+        ),
         pytest.param([_user_turn(briefing_text(_LITERAL_LINE))], id='briefing'),
         pytest.param(
             [_origin_stamped(_user_turn(_LITERAL_LINE), 'task-notification')],
@@ -698,15 +739,25 @@ class TestSamplerReingestedContentParity:
         assert {name: digested[name] for name in _TEXT_CLASSES} == dict.fromkeys(_TEXT_CLASSES, 0)
 
 
+def _trickle_coder_instrument_prompt() -> str:
+    return coder.build_prompt(digest_text='- (turn 1) ok', codebook_index='', invariant_slugs=())
+
+
 class TestLegibilityInstrumentStratum:
-    def test_an_instrument_session_with_signal_is_sampled_in_its_own_stratum(self, tmp_path):
+    @pytest.mark.parametrize(
+        'build_prompt',
+        [_trickle_coder_instrument_prompt, census_verifier_prompt, census_synthesis_prompt],
+        ids=['trickle_coder', 'census_verifier', 'census_synthesis'],
+    )
+    def test_an_instrument_session_with_signal_is_sampled_in_its_own_stratum(
+        self, tmp_path, build_prompt,
+    ):
         encoded = tmp_path / '-home-leo-src-dark-factory'
         encoded.mkdir()
-        coder_prompt = coder.build_prompt(
-            digest_text='- (turn 1) ok', codebook_index='', invariant_slugs=(),
-        )
         sessions = [
-            _session_on_disk(encoded, 'coder-run', [_user_turn(coder_prompt), _tool_error_record()]),
+            _session_on_disk(
+                encoded, 'instrument-run', [_user_turn(build_prompt()), _tool_error_record()],
+            ),
             _session_on_disk(encoded, 'interactive-run', [_clean_record(0), _not_found_record()]),
         ]
         config = _sampling_config()
@@ -1606,7 +1657,7 @@ class TestDigestByteCostFn:
         assert mod.digest_byte_cost_fn(max_bytes=15360)(record) == expected
         assert expected > 0
 
-    def test_max_bytes_defaults_to_the_module_constant(self):
+    def test_max_bytes_defaults_to_the_digest_cap(self):
         calls = []
 
         def fake_build(path, **kwargs):
@@ -1614,24 +1665,7 @@ class TestDigestByteCostFn:
             return 'z'
 
         mod.digest_byte_cost_fn(build=fake_build)(self._record())
-        assert calls == [mod.DEFAULT_DIGEST_MAX_BYTES]
-
-    def test_module_constant_matches_the_renderers_own_default(self):
-        """The whole point of this change is that the COST basis and the
-        RENDER basis are provably the same number. ``digest.py`` is outside
-        task 3268's locked scope, so its ``max_bytes=15360`` literal stays a
-        third independent definition of the §7.2 cap — this pins it equal to
-        ours so a drift fails here instead of silently mis-charging the
-        budget (reviewer_comprehensive, task 3268 amendment pass).
-        """
-        import inspect
-
-        from legibility import digest as digest_mod
-
-        renderer_default = (
-            inspect.signature(digest_mod.build_digest).parameters['max_bytes'].default
-        )
-        assert renderer_default == mod.DEFAULT_DIGEST_MAX_BYTES
+        assert calls == [digest.DEFAULT_MAX_BYTES]
 
 
 class TestRenderManifest:
@@ -1726,7 +1760,7 @@ class TestMainCLI:
         ``main`` is the diagnostic an operator reads to decide whether the
         budget is the reason a session was skipped, so its ``bytes used``
         line has to be the same quantity ``nightly`` charges: the real
-        rendered digest bytes at ``DEFAULT_DIGEST_MAX_BYTES``.
+        rendered digest bytes at ``digest.DEFAULT_MAX_BYTES``.
         """
         from legibility import digest as digest_mod
 
@@ -1774,7 +1808,7 @@ class TestMainCLI:
                 digest_mod.build_digest(
                     Path(entry['session']),
                     agent_class_override=entry['stratum'],
-                    max_bytes=mod.DEFAULT_DIGEST_MAX_BYTES,
+                    max_bytes=digest_mod.DEFAULT_MAX_BYTES,
                 ).encode('utf-8')
             )
             for entry in selected
@@ -1784,7 +1818,7 @@ class TestMainCLI:
         # The two WRONG bases really are distinguishable on this fixture, so
         # the assertion above cannot pass by coincidence:
         #   - raw transcript size (the original defect): 768 bytes measured
-        #   - the flat DEFAULT_DIGEST_MAX_BYTES estimate (the step-4
+        #   - the flat digest.DEFAULT_MAX_BYTES estimate (the step-4
         #     fallback, and what main reported before this wiring): 30_720
         # against 744 real digest bytes. The flat-estimate margin is 41x;
         # the raw-size margin on a 2-line fixture is only ~24 bytes (the
@@ -1794,7 +1828,7 @@ class TestMainCLI:
         # saturate the 15KB cap and collapse the flat-estimate margin.
         raw_total = sum(entry['size'] for entry in selected)
         assert reported != raw_total
-        assert reported != len(selected) * mod.DEFAULT_DIGEST_MAX_BYTES
+        assert reported != len(selected) * digest_mod.DEFAULT_MAX_BYTES
 
     def test_main_threads_resolved_archive_roots_into_enumerate(self, tmp_path, monkeypatch):
         # Wiring proof (no operator flip): main() resolves the config's

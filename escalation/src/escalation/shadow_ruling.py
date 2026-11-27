@@ -44,8 +44,14 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import MappingProxyType
 
-from escalation.authority import L2_AUTO_CLOSE_DENY_CATEGORIES, L2_AUTO_CLOSE_DENY_ROLES
-from escalation.classify import classify_resolver_tier
+from escalation.authority import (
+    L2_AUTO_CLOSE_DENY_CATEGORIES,
+    L2_AUTO_CLOSE_DENY_ROLES,
+    POLICY_TABLE,
+    REVERSIBILITY_WAIVED_ACTIONS,
+    REVERSIBLE_POLICY_ACTIONS,
+)
+from escalation.classify import HUMAN_RULED, resolver_tier
 from escalation.models import Escalation
 from escalation.queue import iter_all_escalation_paths, read_escalation_for_scan
 
@@ -57,31 +63,28 @@ logger = logging.getLogger(__name__)
 #: for a stamp.
 SHADOW_RULING_MARKER = 'x_shadow_ruling:'
 
-#: The first-tranche candidate classes, SHADOWED AND NOT ADOPTED. Each names a
-#: recurring L2 shape the standing-policy skeleton proposes could be ruled by
-#: the adjudicating session. Enumerated with their prose gloss in
-#: ``docs/escalation-standing-policy.md``; that document and this frozenset are
-#: held equal by ``tests/scripts/test_shadow_ruling_doc_contract.py``.
-FIRST_TRANCHE_CLASSES: frozenset[str] = frozenset({
-    'risk_identified_branch_behind_main',
-    'risk_identified_recovery_veto_streak',
-    'design_concern_semantic_collision',
-    'infra_issue_transient_self_cleared',
-})
+#: The candidate classes a shadow stamp may name: exactly the slugs of
+#: ``escalation/src/escalation/authority.py::POLICY_TABLE``, the only
+#: enumeration of policy classes (``plans/decision-stream-prd.md`` §5.1).
+#: ``docs/escalation-standing-policy.md`` glosses each one and is held equal to
+#: this set by ``tests/scripts/test_shadow_ruling_doc_contract.py``.
+FIRST_TRANCHE_CLASSES: frozenset[str] = frozenset(row.policy_class for row in POLICY_TABLE)
 
-#: The reversible actions the ratified skeleton permits. A SUPERSET of the C1
-#: ``resolution_action`` vocabulary: ``close_only`` and ``resume`` are C1 values
-#: a resolved record records, while ``add_dependency``, ``update_task_amendment``
-#: and ``file_task`` are task-side operations that leave ``resolution_action``
-#: unset — which is why the weekly count needs a third ``not_comparable``
-#: outcome rather than folding them into agreement or divergence.
-REVERSIBLE_ACTIONS: frozenset[str] = frozenset({
-    'close_only',
-    'resume',
-    'add_dependency',
-    'update_task_amendment',
-    'file_task',
-})
+#: The actions a stamp may propose, DERIVED from
+#: ``escalation/src/escalation/authority.py``'s ``REVERSIBLE_POLICY_ACTIONS`` and
+#: ``REVERSIBILITY_WAIVED_ACTIONS``, so the codec and ``PolicyRow.reversible``
+#: read one list. A SUPERSET of the C1 ``resolution_action`` vocabulary:
+#: ``close_only`` and ``resume`` are C1 values a resolved record records, while
+#: ``add_dependency``, ``update_task_amendment`` and ``file_task`` are task-side
+#: operations that leave ``resolution_action`` unset — which is why the weekly
+#: count needs a third ``not_comparable`` outcome rather than folding them into
+#: agreement or divergence.
+#:
+#: ``done_flip`` is the waived member, scored as the ``close_only`` it ends in
+#: (:data:`_TRAILING_RESOLUTION_ACTION`).
+REVERSIBLE_ACTIONS: frozenset[str] = frozenset(
+    action.value for action in REVERSIBLE_POLICY_ACTIONS | REVERSIBILITY_WAIVED_ACTIONS
+)
 
 #: The seven classes of decision that stay with the human FOREVER, whatever any
 #: shadow measurement shows. Only the first two have a record-level signal; see
@@ -107,10 +110,10 @@ DETECTABLE_GATES: frozenset[str] = frozenset({'milestone_gate', 'deterministic_r
 #: QUESTIONS, and ``design_concern`` is the single cell where the two answers
 #: diverge:
 #:
-#: * authority.py asks *may the AUTO-WATCHER IDENTITY auto-close this at L2?* —
-#:   a table its own docstring scopes to the identified callers in
-#:   ``ROLE_LEVEL_ALLOWLIST``, whose sole member is the auto-watcher. Nothing
-#:   here changes that answer: the auto-watcher still may not auto-close a
+#: * authority.py asks *may an identified AUTOMATED caller auto-close this at
+#:   L2?* — the auto-watcher through its close_only carve-out, the executor
+#:   through its deny list, which includes every one of these categories.
+#:   Nothing here changes that answer: neither may auto-close a
 #:   ``design_concern``.
 #: * this detector asks *does the ratified skeleton keep this record with the
 #:   human FOREVER, whatever the measurement shows?* The skeleton's gate list is
@@ -150,6 +153,7 @@ GATED_ROLES: frozenset[str] = L2_AUTO_CLOSE_DENY_ROLES
 _MILESTONE_CATEGORIES: frozenset[str] = frozenset({
     'milestone_gate',
     'milestone_check_failed',
+    'milestone_check_stalled',
 })
 
 #: The reversible actions that are ALSO C1 ``resolution_action`` values, so an
@@ -166,6 +170,12 @@ _MILESTONE_CATEGORIES: frozenset[str] = frozenset({
 #: convention ``escalation/src/escalation/authority.py`` already uses for the
 #: watcher identity string and ``action_effects.py`` for its target statuses.
 COMPARABLE_ACTIONS: frozenset[str] = frozenset({'close_only', 'resume'})
+
+#: The C1 ``resolution_action`` a proposal is scored against when it is not
+#: itself a C1 value but ends in one. A ``done_flip`` marks the task done and
+#: then closes the record ``close_only`` (``plans/decision-stream-prd.md`` §3
+#: decision 7), so a human ``close_only`` is agreement with it.
+_TRAILING_RESOLUTION_ACTION: Mapping[str, str] = MappingProxyType({'done_flip': 'close_only'})
 
 #: Each wire key of the JSON payload against the :class:`ShadowRuling` attribute
 #: it carries — the ONE place that vocabulary is written. The encoder renders
@@ -414,8 +424,9 @@ class ClassAgreement:
     into either side, so the denominator the adoption threshold is read off is
     one a reader can see, and missing data never reads as disagreement.
 
-    ``non_human_resolver`` counts the in-window stamps whose record was resolved
-    by no human at all — a cascade, a reaper sweep, the steward — so the
+    ``not_human_ruled`` counts the in-window stamps whose record carries no
+    human ruling — an attended-seat close, a cascade, a reaper sweep, the
+    steward (``escalation/src/escalation/classify.py::resolver_tier``) — so the
     proposal was never held against an adjudication. It is PER CLASS because
     ``AgreementReport.resolver_tiers`` says only what took the sample: a reader
     of ``cascade=3`` could not tell which shadowed class paid for it, and a
@@ -428,7 +439,7 @@ class ClassAgreement:
     agreed: int
     diverged: int
     not_comparable: int
-    non_human_resolver: int
+    not_human_ruled: int
 
     @property
     def comparable(self) -> int:
@@ -439,7 +450,7 @@ class ClassAgreement:
     def total(self) -> int:
         """Every in-window record counted for this class, rate-bearing or not."""
         return (
-            self.agreed + self.diverged + self.not_comparable + self.non_human_resolver
+            self.agreed + self.diverged + self.not_comparable + self.not_human_ruled
         )
 
     @property
@@ -479,8 +490,9 @@ class AgreementReport:
     ``resolver_tiers`` is NOT the tier breakdown of every in-window stamp its
     bare name suggests: it is tallied after the gated and self-resolved
     exclusions, so it covers only the subset that reached the resolver check.
-    It is also aggregate — which class a non-human resolution took a sample from
-    is on :attr:`ClassAgreement.non_human_resolver`, which owns that reading.
+    It is also aggregate — which class a record with no human ruling took a
+    sample from is on :attr:`ClassAgreement.not_human_ruled`, which owns that
+    reading.
     """
 
     since: datetime
@@ -568,12 +580,12 @@ def agreement_report(
     ``except OSError`` the no-silent-fail-soft invariant forbids.
 
     THE ORDER OF CHECKS IS PART OF THE CONTRACT: unstamped -> unresolved ->
-    out-of-window -> unreadable -> gated -> self_resolved -> non-human resolver
+    out-of-window -> unreadable -> gated -> self_resolved -> not human-ruled
     -> not_comparable -> agreed/diverged. Everything up to ``not_comparable`` is
     "this record must not contribute to a rate at all"; putting any of them
     later would let an in-window matching close fall through to ``agreed``
-    first. The non-human-resolver step tallies per class as well as per tier;
-    :attr:`ClassAgreement.non_human_resolver` owns why.
+    first. The not-human-ruled step tallies per class as well as per tier;
+    :attr:`ClassAgreement.not_human_ruled` owns why.
 
     TWO OF THOSE POSITIONS FOLLOW FROM THE FIELD SEMANTICS :class:`AgreementReport`
     states, and this docstring does not restate them. Pendingness is decided
@@ -590,7 +602,9 @@ def agreement_report(
     ``escalation-watcher``, so a watcher that stamps a proposal and then closes
     the record itself under that standing rule would otherwise be read back as
     a human agreeing with itself, inflating the very ``design_concern`` class
-    this measurement exists to judge, toward its own adoption threshold.
+    this measurement exists to judge, toward its own adoption threshold. An
+    attended-seat close that asserts no ruling is not a ruling at all, and is
+    counted as not human-ruled before agreement is scored.
 
     The limit of that check, stated honestly: attribution is server-enforced
     only for a header-bearing identity —
@@ -604,7 +618,7 @@ def agreement_report(
     agreed: Counter[str] = Counter()
     diverged: Counter[str] = Counter()
     not_comparable: Counter[str] = Counter()
-    non_human: Counter[str] = Counter()
+    not_human_ruled: Counter[str] = Counter()
     tiers: Counter[str] = Counter()
     gated_stamps = 0
     self_resolved = 0
@@ -643,10 +657,10 @@ def agreement_report(
             self_resolved += 1
             continue
 
-        tier = classify_resolver_tier(record.resolved_by)
+        tier = resolver_tier(record)
         tiers[tier] += 1
-        if tier != 'human':
-            non_human[ruling.ruling_class] += 1
+        if tier != HUMAN_RULED:
+            not_human_ruled[ruling.ruling_class] += 1
             continue
 
         # COMPARABILITY IS A PROPERTY OF BOTH SIDES, and the observed side can
@@ -657,15 +671,17 @@ def agreement_report(
         # proposal that becomes a silent ``diverged`` for every such record —
         # depressing the single number adoption is read off, in the direction
         # that looks like disagreement rather than like missing data.
-        if (ruling.proposed_action not in COMPARABLE_ACTIONS
-                or record.resolution_action is None):
+        compared = _TRAILING_RESOLUTION_ACTION.get(
+            ruling.proposed_action, ruling.proposed_action,
+        )
+        if compared not in COMPARABLE_ACTIONS or record.resolution_action is None:
             not_comparable[ruling.ruling_class] += 1
-        elif record.resolution_action == ruling.proposed_action:
+        elif record.resolution_action == compared:
             agreed[ruling.ruling_class] += 1
         else:
             diverged[ruling.ruling_class] += 1
 
-    counted = sorted(set(agreed) | set(diverged) | set(not_comparable) | set(non_human))
+    counted = sorted(set(agreed) | set(diverged) | set(not_comparable) | set(not_human_ruled))
     return AgreementReport(
         since=since,
         until=until,
@@ -675,7 +691,7 @@ def agreement_report(
                 agreed=agreed[slug],
                 diverged=diverged[slug],
                 not_comparable=not_comparable[slug],
-                non_human_resolver=non_human[slug],
+                not_human_ruled=not_human_ruled[slug],
             )
             for slug in counted
         ),
@@ -692,7 +708,7 @@ def agreement_report(
 _DEFAULT_WINDOW = timedelta(days=7)
 
 _ROW = (
-    '{cls:<40} {agreed:>7} {diverged:>9} {not_comparable:>15} {non_human:>10} '
+    '{cls:<40} {agreed:>7} {diverged:>9} {not_comparable:>15} {not_human_ruled:>15} '
     '{comparable:>11} {rate:>8}'
 )
 
@@ -708,7 +724,7 @@ def _as_json(report: AgreementReport) -> str:
                     'agreed': c.agreed,
                     'diverged': c.diverged,
                     'not_comparable': c.not_comparable,
-                    'non_human_resolver': c.non_human_resolver,
+                    'not_human_ruled': c.not_human_ruled,
                     'comparable': c.comparable,
                     'total': c.total,
                     'agreement_rate': c.agreement_rate,
@@ -749,14 +765,14 @@ def _as_table(report: AgreementReport) -> str:
     if report.classes:
         lines.append(_ROW.format(
             cls='class', agreed='agreed', diverged='diverged',
-            not_comparable='not_comp', non_human='non_human',
+            not_comparable='not_comp', not_human_ruled='not_human_ruled',
             comparable='comparable', rate='rate',
         ))
         for c in report.classes:
             rate = 'n/a' if c.agreement_rate is None else f'{c.agreement_rate * 100:.1f}%'
             lines.append(_ROW.format(
                 cls=c.ruling_class, agreed=c.agreed, diverged=c.diverged,
-                not_comparable=c.not_comparable, non_human=c.non_human_resolver,
+                not_comparable=c.not_comparable, not_human_ruled=c.not_human_ruled,
                 comparable=c.comparable, rate=rate,
             ))
     else:

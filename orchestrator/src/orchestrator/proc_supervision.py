@@ -61,16 +61,20 @@ import importlib
 import importlib.util
 import logging
 import os
+import re
 import shlex
 import sys
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from pathlib import Path
+from types import MappingProxyType
 from typing import TYPE_CHECKING
 
 from orchestrator.systemd_inspect import _empty_baseline_fresh, inspect_systemd_unit
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+
     from escalation.models import Escalation
     from escalation.queue import EscalationQueue
 
@@ -98,6 +102,18 @@ silently drift apart (task 3404).
 # speculative): ``escalation.__main__`` -> ``escalation.submit`` ->
 # ``escalation.queue`` -> ``shared.timestamps`` -> ``shared/__init__.py``.
 _SUBMIT_CHILD_PACKAGES: tuple[str, ...] = ('escalation', 'shared')
+
+# The portable environment variable name (POSIX shell ``name``) every
+# ``RestartPlan.env`` key must match. The detached path relies on it: it
+# renders each entry as an unquoted ``KEY=`` shell assignment.
+_PORTABLE_ENV_NAME = re.compile(r'[A-Za-z_][A-Za-z0-9_]*')
+
+
+def _systemd_execstart_literal(text: str) -> str:
+    """systemd expands ``${NAME}`` and ``$$`` inside an ExecStart argv element,
+    even within shell single quotes. Doubling every ``$`` makes systemd hand
+    /bin/sh the original text."""
+    return text.replace('$', '$$')
 
 
 def _submit_child_pythonpath() -> str:
@@ -155,7 +171,7 @@ def _submit_child_pythonpath() -> str:
             # name or it is indistinguishable from a healthy one.
             logger.warning(
                 'proc_supervision: cannot resolve the import root of package %r '
-                '(%s) — the deferred systemd-run child will NOT carry it on '
+                '(%s) — the RP-4 submit child will NOT carry it on '
                 'PYTHONPATH, so the RP-4 on-failure `python -m escalation '
                 'submit` may be unable to import and file no L2 at fire time',
                 pkg, reason,
@@ -167,23 +183,24 @@ def _submit_child_pythonpath() -> str:
     return os.pathsep.join(roots)
 
 
-def _submit_child_setenv_args() -> list[str]:
-    """The ``--setenv=PYTHONPATH=...`` systemd-run args for the submit child.
+def _submit_child_shell_command(spec: EscalationSpec, python_exe: str) -> str:
+    """The ``/bin/sh`` command line that runs the RP-4 submit child, already
+    escaped as an ExecStart literal (:func:`_systemd_execstart_literal`).
 
-    Returns a single-element list, or an empty list when there is nothing to
-    supply (in which case the child keeps the empty PYTHONPATH systemd-run
-    would have given it anyway — no behaviour is lost by omitting the token).
+    PYTHONPATH rides as a shell assignment prefix, so it is scoped to this one
+    command and never reaches the deploy payload sharing the unit (task 5509).
     """
+    command = ' '.join(shlex.quote(p) for p in spec.to_submit_argv(python_exe))
     pythonpath = _submit_child_pythonpath()
     if not pythonpath:
         logger.warning(
-            'proc_supervision: no PYTHONPATH roots resolved — the detached '
-            'systemd-run argv carries NO --setenv=PYTHONPATH guarantee, so the '
-            'RP-4 submit child runs with the empty PYTHONPATH systemd-run '
-            'gives it (per-package causes logged above)',
+            'proc_supervision: no PYTHONPATH roots resolved — the RP-4 submit '
+            'command carries NO PYTHONPATH prefix, so the child runs with the '
+            'empty PYTHONPATH systemd-run gives it (per-package causes logged '
+            'above)',
         )
-        return []
-    return [f'--setenv=PYTHONPATH={pythonpath}']
+        return _systemd_execstart_literal(command)
+    return _systemd_execstart_literal(f'PYTHONPATH={shlex.quote(pythonpath)} {command}')
 
 
 def _warn_if_submit_module_unimportable(transient_unit: str | None) -> None:
@@ -272,9 +289,9 @@ class EscalationSpec:
            PATH, which a systemd-run child inherits from the user manager
            rather than from the orchestrator unit.
         2. **Workspace src roots** — supplied explicitly by the
-           ``--setenv=PYTHONPATH=`` token on the detached argv (see
-           :func:`_submit_child_pythonpath`), because ``systemd-run --user``
-           propagates none of the caller's environment.
+           ``PYTHONPATH=`` assignment prefix the RP-4 wrapper puts on this
+           command (see :func:`_submit_child_shell_command`), because
+           ``systemd-run --user`` propagates none of the caller's environment.
         """
         return [
             python_exe, '-m', 'escalation', 'submit',
@@ -429,6 +446,11 @@ class RestartPlan:
     stat-checked here (would race / force hermetic tests to create real
     files) — a missing script surfaces at runtime as exit-127, escalated by
     the RP-4 on-failure wrapper.
+
+    ``env`` holds the extra environment variables the restart script
+    receives, and every ``execute()`` path delivers them to the script alone.
+    It is stored as a read-only copy, so the ``__post_init__`` checks hold for
+    the plan's whole life.
     """
 
     script: Path
@@ -440,6 +462,7 @@ class RestartPlan:
     verify: FreshPidVerify | None
     transient_unit: str | None = None
     on_active_secs: int = 60
+    env: Mapping[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not self.cwd.is_absolute():
@@ -449,6 +472,23 @@ class RestartPlan:
             )
         if not self.script.is_absolute():
             object.__setattr__(self, 'script', self.cwd / self.script)
+        object.__setattr__(self, 'env', MappingProxyType(dict(self.env)))
+        self._check_env()
+
+    def _check_env(self) -> None:
+        """Refuse an ``env`` key that is not a portable variable name, so every
+        spawn path accepts exactly the same keys."""
+        for key in self.env:
+            if not _PORTABLE_ENV_NAME.fullmatch(key):
+                raise ValueError(
+                    f'RestartPlan.env keys must be portable environment variable '
+                    f'names matching {_PORTABLE_ENV_NAME.pattern}; got {key!r}'
+                )
+
+    def _child_environ(self) -> dict[str, str] | None:
+        """``env`` overlaid on ``os.environ``, or None (full inherit) when empty: the
+        rule of ``orchestrator/src/orchestrator/before_done_script.py::run_script``."""
+        return {**os.environ, **self.env} if self.env else None
 
     async def execute(self, *, runner=None, inspector=None) -> RestartOutcome:
         """Run this restart plan, honoring RP-1..5.
@@ -654,6 +694,7 @@ class RestartPlan:
         proc = await runner(
             str(self.script), *self.args,
             cwd=str(self.cwd),
+            env=self._child_environ(),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
         )
@@ -811,34 +852,41 @@ class RestartPlan:
         wrapper) — still a valid ``/bin/sh -c`` invocation, just with no
         on-failure reporting.
 
-        ``--setenv=PYTHONPATH=<roots>`` is the same shape of guard as
-        ``--working-directory``, one environment dimension over: cwd was
-        silently DEFAULTED to $HOME, PYTHONPATH is silently DROPPED. MEASURED
-        against the live user manager:
+        The submit child's PYTHONPATH is supplied as a shell assignment prefix
+        on the on-failure command (:func:`_submit_child_shell_command`, value
+        from :func:`_submit_child_pythonpath`), because ``systemd-run --user``
+        propagates NO environment from its caller — MEASURED: a caller
+        exporting ``PYTHONPATH=/tmp/sentinel-df`` produced a transient unit
+        whose ``$PYTHONPATH`` was ``[]``. It is NOT a systemd-run ``--setenv``:
+        that would set it for the whole transient unit, the deploy payload
+        included (task 5509; pinned in
+        ``orchestrator/tests/test_proc_supervision_submit_child_env.py``). See
+        :meth:`EscalationSpec.to_submit_argv` for the OTHER leg of the child's
+        importability (interpreter identity, which PYTHONPATH cannot cover).
 
-        - ``systemd-run --user`` propagates NO environment from its caller — a
-          caller exporting ``PYTHONPATH=/tmp/sentinel-df`` produced a transient
-          unit whose ``$PYTHONPATH`` was ``[]``. (Its PATH is the systemd user
-          manager's, not the orchestrator unit's ``Environment=PATH=``.)
-        - ``--setenv`` DOES reach the DEFERRED ``--on-active`` unit at fire
-          time, not just an immediate one: an ``--on-active=5
-          --setenv=PYTHONPATH=/tmp/x`` unit printed
-          ``ONACTIVE PYTHONPATH=[/tmp/x]`` when it fired.
-
-        So the token is emitted GATED on ``on_failure_escalation`` — it exists
-        solely so the RP-4 ``python -m escalation submit`` child can import,
-        and a plan with no escalation spec has no submit token in its payload,
-        keeping that argv byte-identical. See :func:`_submit_child_pythonpath`
-        for how the value is built, and :meth:`EscalationSpec.to_submit_argv`
-        for the OTHER leg of the child's importability (interpreter identity,
-        which PYTHONPATH cannot cover).
+        The plan's own ``env`` is scoped to the payload command, NOT the unit:
+        each entry is a ``KEY=<quoted value>`` shell assignment prefixing the
+        script, so the RP-4 submit child sees none of it and keeps only the
+        user manager's environment plus its own PYTHONPATH. ``_check_env``'s
+        name rule is what makes the unquoted ``KEY=`` a valid assignment.
+        Values are also escaped for systemd's ExecStart ``$`` expansion
+        (:func:`_systemd_execstart_literal`), so they reach the script
+        byte-for-byte.
         """
         on_active_secs = max(int(self.on_active_secs), 5)
-        payload = ' '.join(shlex.quote(p) for p in [str(self.script), *self.args])
+        env_assignments = [
+            f'{key}={_systemd_execstart_literal(shlex.quote(value))}'
+            for key, value in self.env.items()
+        ]
+        payload = ' '.join([
+            *env_assignments,
+            *(shlex.quote(p) for p in [str(self.script), *self.args]),
+        ])
         if self.on_failure_escalation is not None:
             _warn_if_submit_module_unimportable(self.transient_unit)
-            on_failure_argv = self.on_failure_escalation.to_submit_argv(sys.executable)
-            on_failure = ' '.join(shlex.quote(p) for p in on_failure_argv)
+            on_failure = _submit_child_shell_command(
+                self.on_failure_escalation, sys.executable,
+            )
             # This is the SINGLE source of truth for the RP-4 wrapper. Both
             # detached-restart entry points delegate here and build no wrapper
             # of their own: `deterministic_runner._default_schedule_detached_
@@ -892,10 +940,8 @@ class RestartPlan:
                 f'fi; '
                 f'exit "$__rc"'
             )
-            setenv_args = _submit_child_setenv_args()
         else:
             wrapped = payload
-            setenv_args = []
 
         argv = [
             'systemd-run', '--user',
@@ -903,7 +949,6 @@ class RestartPlan:
             f'--unit={self.transient_unit}',
             '--collect',
             f'--working-directory={self.cwd}',
-            *setenv_args,
             '/bin/sh', '-c', wrapped,
         ]
         proc = await runner(
@@ -974,6 +1019,7 @@ class RestartPlan:
         await runner(
             str(self.script), *self.args,
             cwd=str(self.cwd),
+            env=self._child_environ(),
             start_new_session=True,
         )
         return RestartOutcome(disposition=RestartDisposition.SCHEDULED)

@@ -51,17 +51,18 @@ wording is what distinguishes them, not the severity.
 
 Design mirrors :class:`fused_memory.middleware.curator_escalator.CuratorEscalator`:
 
-* Defensive import of the optional ``escalation`` workspace package.  When
-  the package is missing (minimal envs, tests without escalation infra),
-  ``report_rejection`` becomes a logged no-op — the guard's own outcome is
-  unaffected (on the FILES-certain path the error dict is still returned;
-  on the advisory path the submission still proceeds and still carries the
-  stamp), so escalation is purely additive.
 * Per-project ``EscalationQueue`` cache keyed by ``project_root``.
 * Escalations land in ``{project_root}/data/escalations`` — the *filing*
   project's queue (the place the agent was operating against), regardless
   of outcome.  This matches the existing esc-2240-series scope_violation
   pattern referenced in task 1088.
+
+Unlike that class, it still imports the ``escalation`` workspace package
+behind a leftover ``HAS_ESCALATION`` guard.  Escalation is a declared
+dependency of fused-memory, so the guard's no-op arm is dead; task 11688
+removes it.  Filing is purely additive: the guard's own outcome never depends
+on the filing (on the FILES-certain path the error dict is still returned; on the
+advisory path the submission still proceeds and still carries the stamp).
 
 Burst control: :meth:`report_budget_misconfig` applies a per-project dedup
 window (``_BUDGET_MISCONFIG_DEDUP_WINDOW_SECS``) so a sustained per-call
@@ -89,9 +90,8 @@ from shared.project_layout import escalation_queue_dir
 if TYPE_CHECKING:
     from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
 
-# Mirror the defensive-import pattern from curator_escalator.py:50-55 so
-# the escalator silently no-ops when the escalation package is unavailable
-# (minimal CI / unit-test envs, deployments that haven't installed it yet).
+# Leftover defensive import: escalation is a declared dependency of
+# fused-memory, so the ImportError arm is dead.  Task 11688 removes this guard.
 try:
     from escalation.dedupe import (  # type: ignore[import-untyped]
         DedupeConfig,
@@ -531,8 +531,10 @@ class ScopeViolationEscalator:
             # "queued for curation" / "resolved asynchronously" would be the
             # same class of unverified claim in a new direction.  The stamp
             # sentence is conditional on a task actually being CREATED:
-            # _execute_combine merges only curator_* keys onto the target, so
-            # a combine target never receives this candidate's
+            # _execute_combine never copies a candidate's
+            # possible_scope_mismatch onto the target (its writes are the
+            # curator_* markers, declared_scope and followup_items), so a
+            # combine target never receives this candidate's
             # possible_scope_mismatch.
             detail_lines.append(
                 'A task creation request cited paths that look like they belong '

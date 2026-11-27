@@ -51,7 +51,7 @@ class TestSchema:
 
 class TestSetGet:
     def test_set_boost_then_get_overrides_returns_row(self, tmp_path: Path) -> None:
-        from orchestrator.overrides import OverrideRow, OverrideStore
+        from orchestrator.overrides import OverrideRow, OverrideSource, OverrideStore
 
         store = OverrideStore(tmp_path / 'scheduler_overrides.db')
         store.set_override('proj', 'task-A', boost_tier='high')
@@ -64,6 +64,7 @@ class TestSetGet:
                 pin_order=None,
                 reserve_now=False,
                 ttl_until=None,
+                source=OverrideSource.OPERATOR,
             )
         }
 
@@ -207,7 +208,7 @@ class TestPinning:
             try:
                 barrier.wait()  # both threads enter set_override at the same time
                 store.set_override('proj', task_id, pinned=True)
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 errors.append(exc)
 
         t1 = threading.Thread(target=pin_task, args=('A',))
@@ -492,6 +493,53 @@ class TestSweeps:
             store.clear_expired('proj', now=datetime(2026, 5, 14))
 
 
+class TestExpiredIds:
+    """``expired_ids`` names exactly the rows ``clear_expired`` would delete, and deletes none."""
+
+    NOW = datetime(2026, 5, 14, 12, 0, tzinfo=UTC)
+
+    def _store_with_ttls(self, tmp_path: Path):
+        from orchestrator.overrides import OverrideStore
+
+        store = OverrideStore(tmp_path / 'scheduler_overrides.db')
+        store.set_override('proj', 'past', boost_tier='high', ttl_until=self.NOW - timedelta(hours=1))
+        store.set_override('proj', 'past-offset', boost_tier='high',
+                           ttl_until=datetime(2026, 5, 14, 16, 0, tzinfo=timezone(timedelta(hours=5))))
+        store.set_override('proj', 'equal', boost_tier='high', ttl_until=self.NOW)
+        store.set_override('proj', 'future', boost_tier='high', ttl_until=self.NOW + timedelta(hours=1))
+        store.set_override('proj', 'no-ttl', boost_tier='high')
+        store.set_override('other', 'other-past', boost_tier='high', ttl_until=self.NOW - timedelta(hours=1))
+        return store
+
+    def test_names_exactly_what_clear_expired_then_deletes(self, tmp_path: Path) -> None:
+        store = self._store_with_ttls(tmp_path)
+
+        named = store.expired_ids('proj', self.NOW)
+
+        assert named == ['past', 'past-offset']
+        assert store.clear_expired('proj', self.NOW) == named
+
+    def test_deletes_nothing(self, tmp_path: Path) -> None:
+        store = self._store_with_ttls(tmp_path)
+        before = (store.get_overrides('proj'), store.get_overrides('other'))
+
+        store.expired_ids('proj', self.NOW)
+
+        assert (store.get_overrides('proj'), store.get_overrides('other')) == before
+
+    def test_compares_in_utc_whatever_the_callers_offset(self, tmp_path: Path) -> None:
+        store = self._store_with_ttls(tmp_path)
+        same_instant = self.NOW.astimezone(timezone(timedelta(hours=-7)))
+
+        assert store.expired_ids('proj', same_instant) == store.expired_ids('proj', self.NOW)
+
+    def test_rejects_naive_now_as_clear_expired_does(self, tmp_path: Path) -> None:
+        store = self._store_with_ttls(tmp_path)
+
+        with pytest.raises(ValueError, match='timezone'):
+            store.expired_ids('proj', datetime(2026, 5, 14))
+
+
 class TestFromConfig:
     def test_from_config_returns_store_at_canonical_db_path(self, tmp_path: Path) -> None:
         from orchestrator.config import OrchestratorConfig
@@ -531,7 +579,7 @@ class TestSeparateDB:
         SQLite file from taskmaster state.  If someone ever consolidates the
         storage, this test will fail and force a conscious decision.
         """
-        from orchestrator.overrides import OverrideRow, OverrideStore
+        from orchestrator.overrides import OverrideRow, OverrideSource, OverrideStore
 
         db_path = tmp_path / 'scheduler_overrides.db'
         store = OverrideStore(db_path)
@@ -561,4 +609,172 @@ class TestSeparateDB:
             pin_order=1,
             reserve_now=False,
             ttl_until=None,
+            source=OverrideSource.OPERATOR,
         )
+
+
+_LEGACY_OVERRIDES_SCHEMA = """\
+CREATE TABLE overrides (
+    project_root  TEXT NOT NULL,
+    task_id       TEXT NOT NULL,
+    boost_tier    TEXT,
+    pinned        INTEGER NOT NULL DEFAULT 0,
+    pin_order     INTEGER,
+    reserve_now   INTEGER NOT NULL DEFAULT 0,
+    ttl_until     TEXT,
+    created_at    TEXT NOT NULL,
+    updated_at    TEXT NOT NULL,
+    PRIMARY KEY (project_root, task_id)
+);
+"""
+
+
+def _write_legacy_overrides_db(db_path: Path) -> None:
+    """A pre-``source`` overrides DB holding one pinned row for task 'L'."""
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.executescript(_LEGACY_OVERRIDES_SCHEMA)
+        conn.execute(
+            'INSERT INTO overrides (project_root, task_id, boost_tier, pinned, '
+            'pin_order, reserve_now, ttl_until, created_at, updated_at) '
+            "VALUES ('proj', 'L', NULL, 1, 7, 0, NULL, 'then', 'then')"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+class TestOverrideSource:
+    def test_operator_pin_reads_back_operator_owned(self, tmp_path: Path) -> None:
+        from orchestrator.overrides import OverrideSource, OverrideStore
+
+        store = OverrideStore(tmp_path / 'scheduler_overrides.db')
+        store.set_override('proj', 'A', pinned=True)
+
+        assert store.get_overrides('proj')['A'].source is OverrideSource.OPERATOR
+        [(tid, row)] = store.get_pin_queue('proj')
+        assert tid == 'A'
+        assert row.source is OverrideSource.OPERATOR
+
+    def test_legacy_db_migrates_to_operator_source(self, tmp_path: Path) -> None:
+        from orchestrator.overrides import OverrideSource, OverrideStore
+
+        db_path = tmp_path / 'scheduler_overrides.db'
+        _write_legacy_overrides_db(db_path)
+
+        store = OverrideStore(db_path)
+        row = store.get_overrides('proj')['L']
+        assert row.source is OverrideSource.OPERATOR
+        assert row.pinned is True
+        assert row.pin_order == 7
+
+        OverrideStore(db_path)
+        assert OverrideStore(db_path).get_pin_queue('proj') == [('L', row)]
+
+    def test_source_vocabulary_is_closed(self) -> None:
+        from enum import StrEnum
+
+        from orchestrator.overrides import OverrideSource
+
+        assert issubclass(OverrideSource, StrEnum)
+        assert {s.value for s in OverrideSource} == {
+            'operator', 'starvation_watchdog',
+        }
+
+
+def _raw_row(db_path: Path, task_id: str) -> tuple[object, ...] | None:
+    conn = sqlite3.connect(str(db_path))
+    try:
+        return conn.execute(
+            'SELECT * FROM overrides WHERE project_root=? AND task_id=?',
+            ('proj', task_id),
+        ).fetchone()
+    finally:
+        conn.close()
+
+
+class TestWatchdogPin:
+    def test_create_appends_after_operator_pins(self, tmp_path: Path) -> None:
+        from orchestrator.overrides import OverrideSource, OverrideStore
+
+        store = OverrideStore(tmp_path / 'scheduler_overrides.db')
+        store.set_override('proj', 'O1', pinned=True)
+        store.set_override('proj', 'O2', pinned=True)
+        ttl = datetime(2026, 10, 29, 12, 0, tzinfo=UTC)
+
+        assert store.create_watchdog_pin('proj', 'T', ttl_until=ttl) == 3
+
+        queue = dict(store.get_pin_queue('proj'))
+        assert [tid for tid, _ in store.get_pin_queue('proj')] == ['O1', 'O2', 'T']
+        assert queue['O1'].pin_order == 1
+        assert queue['O2'].pin_order == 2
+        watchdog_row = queue['T']
+        assert watchdog_row.pinned is True
+        assert watchdog_row.source is OverrideSource.STARVATION_WATCHDOG
+        assert watchdog_row.ttl_until == ttl
+
+    def test_create_never_touches_an_existing_row(self, tmp_path: Path) -> None:
+        from orchestrator.overrides import OverrideStore
+
+        db_path = tmp_path / 'scheduler_overrides.db'
+        store = OverrideStore(db_path)
+        store.set_override('proj', 'T', boost_tier='high')
+        before = _raw_row(db_path, 'T')
+
+        created = store.create_watchdog_pin(
+            'proj', 'T', ttl_until=datetime(2026, 10, 29, tzinfo=UTC),
+        )
+
+        assert created is None
+        assert _raw_row(db_path, 'T') == before
+
+    def test_create_rejects_naive_ttl(self, tmp_path: Path) -> None:
+        from orchestrator.overrides import OverrideStore
+
+        store = OverrideStore(tmp_path / 'scheduler_overrides.db')
+        with pytest.raises(ValueError, match='timezone'):
+            store.create_watchdog_pin('proj', 'T', ttl_until=datetime(2026, 10, 29))
+
+    def test_release_deletes_only_watchdog_owned_rows(self, tmp_path: Path) -> None:
+        from orchestrator.overrides import OverrideStore
+
+        store = OverrideStore(tmp_path / 'scheduler_overrides.db')
+        ttl = datetime(2026, 10, 29, tzinfo=UTC)
+        store.create_watchdog_pin('proj', 'W', ttl_until=ttl)
+        store.set_override('proj', 'O', pinned=True)
+
+        assert store.release_watchdog_pin('proj', 'W') is True
+        assert 'W' not in store.get_overrides('proj')
+
+        assert store.release_watchdog_pin('proj', 'O') is False
+        assert 'O' in store.get_overrides('proj')
+
+    def test_operator_write_takes_ownership_of_a_watchdog_pin(
+        self, tmp_path: Path
+    ) -> None:
+        from orchestrator.overrides import OverrideSource, OverrideStore
+
+        store = OverrideStore(tmp_path / 'scheduler_overrides.db')
+        store.create_watchdog_pin(
+            'proj', 'W', ttl_until=datetime(2026, 10, 29, tzinfo=UTC),
+        )
+        store.set_override('proj', 'W', boost_tier='high')
+
+        assert store.get_overrides('proj')['W'].source is OverrideSource.OPERATOR
+        assert store.release_watchdog_pin('proj', 'W') is False
+        assert store.get_overrides('proj')['W'].pinned is True
+
+    def test_count_pins_counts_pinned_rows_of_one_source(self, tmp_path: Path) -> None:
+        from orchestrator.overrides import OverrideSource, OverrideStore
+
+        store = OverrideStore(tmp_path / 'scheduler_overrides.db')
+        ttl = datetime(2026, 10, 29, tzinfo=UTC)
+        store.create_watchdog_pin('proj', 'W1', ttl_until=ttl)
+        store.create_watchdog_pin('proj', 'W2', ttl_until=ttl)
+        store.set_override('proj', 'O1', pinned=True)
+        store.set_override('proj', 'B', boost_tier='low')
+        store.create_watchdog_pin('other', 'W3', ttl_until=ttl)
+
+        assert store.count_pins('proj', OverrideSource.STARVATION_WATCHDOG) == 2
+        assert store.count_pins('proj', OverrideSource.OPERATOR) == 1

@@ -165,6 +165,8 @@ submit_task(project_root=<root>, agent_id=<overlay>, priority=<severity>,
 resolve_ticket(...)   # → the task id, or the curator's drop/combine target
 ```
 
+Tickets filed here go through the curator, which (once task 8376 lands) stamps a complexity hint and, on the treated arm of `routing-exp-2`, may set `complexity="simple"` on a ticket that names files: see `docs/task-authoring.md` §4, "Curator complexity hint".
+
 Record `filed:<id>` (or the `filed:`/`accepted:` a dedup step found) on the finding, and the deciding step in the report. A store that cannot be reached for step 1 means nothing is filed and the report says so; the findings stay `open`. Weakened findings and every `structural` finding go to deliberation.
 
 Then write the two artefacts (shape: `references/report-format.md`) — `<output_dir>/bug-hotspot-survey-<date>[-<n>].md` and `<output_dir>/bug-hotspot-survey-<date>[-<n>]-full-findings.json`; a rerun never overwrites an earlier report (contract §5) — and run the conformance check:
@@ -212,10 +214,10 @@ At the end, write a survey summary to fused-memory:
 
 ```
 add_memory(
-  content="Bug-hotspot survey <run_id> (<mode>, as_of <sha>, since <sha|none>): <N> agents, <tokens>; mined <corpora>; <K> clusters reviewed of <C>; <X> confirmed / <Y> weakened / <Z> refuted / <U> unverified new findings; carried <c> still open, <f> fixed; fix signal <chosen> (raw <raw>). Report: <md path>, findings: <json path>.",
+  content="Bug-hotspot survey <run_id> (<mode>, as_of <sha>, since <sha|none>): <N> agents, <tokens>; mined <corpora>; <K> clusters reviewed of <C>; <X> confirmed / <Y> weakened / <Z> refuted / <U> unverified new findings; carried <c> still open, <f> fixed; fix signal <chosen> (raw <raw>). Report: <md path>, findings: <json path>. Next survey gated by task 3127.",
   category="observations_and_summaries",
   project_id=<overlay>, agent_id="claude-interactive",
-  entities=[]   # a task or run this summary is about, e.g. [{'kind': 'task', 'id': <the chain's human gate id>}]
+  entities=[{'kind': 'task', 'id': 3127}]  # replace 3127 with the human gate of the trigger chain Hand-off step 4 filed, here and in content; if it filed none, as under --findings-only, use [] and drop the gate sentence from content
 )
 ```
 

@@ -52,8 +52,9 @@ class CountedSet:
         return sum(self.cost(path) for path in set(revealed))
 
     def grantable(self, path: str, revealed: Collection[str]) -> bool:
-        """A revealed path stays granted; any other must fit what is left of the budget."""
-        return path in revealed or self.spent(revealed) + self.cost(path) <= self.budget_lines
+        """A grant that adds nothing to spent (a revealed path, or one outside the counted set) is granted; any other must fit what is left."""
+        added = 0 if path in revealed else self.cost(path)
+        return added == 0 or self.spent(revealed) + added <= self.budget_lines
 
     def budget(self, revealed: Collection[str]) -> RevealBudget:
         return RevealBudget(

@@ -29,7 +29,7 @@ half of the same classification is exposed to the sweep-side appliers as
 eta rewired the KEY ELEMENT, never the table.
 
 Task 3563 normalised the OTHER side of that comparison: :class:`Claimant`'s
-``run_id`` is now homogeneous across all three liveness sources — a full
+``run_id`` is now homogeneous across every liveness source — a full
 ``shared.task_claimant.compose_claimant_run_id`` identity or ``None``
 (unknown), never a bare ``session_id``. See the :class:`Claimant` docstring
 for the normative contract. This is disposition-neutral by construction: no
@@ -82,7 +82,6 @@ from __future__ import annotations
 import asyncio
 import enum
 import logging
-import os
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
@@ -90,6 +89,7 @@ from typing import TYPE_CHECKING
 from escalation.pins import classify_pins
 from pydantic import ValidationError
 from shared.deploy_state import DeployPhase, DeployState
+from shared.proc_liveness import pid_alive
 from shared.task_claimant import (
     DEFAULT_CLAIMANT_HEARTBEAT_TTL,
     compose_claimant_run_id,
@@ -114,11 +114,13 @@ if TYPE_CHECKING:
     from escalation.queue import EscalationQueue
 
     from orchestrator.git_ops import GitOps
+    from orchestrator.merge_deferred_recovery import LiveMergeRequests
     from orchestrator.scheduler import Scheduler
 
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    'BranchShaSource',
     'BranchState',
     'BranchStateKind',
     'Claimant',
@@ -154,6 +156,23 @@ class BranchStateKind(enum.StrEnum):
     GONE_NO_MARKER = 'gone_no_marker'
 
 
+class BranchShaSource(enum.StrEnum):
+    """Where a :class:`BranchState`'s ``sha`` came from."""
+
+    JOURNAL = 'journal'
+    CITATION = 'citation'
+    BRANCH_TIP = 'branch_tip'
+    MERGE_MARKER = 'merge_marker'
+
+
+#: The sources whose sha names a landing commit independent of the branch ref.
+_LANDING_SHA_SOURCES: frozenset[BranchShaSource] = frozenset({
+    BranchShaSource.JOURNAL,
+    BranchShaSource.CITATION,
+    BranchShaSource.MERGE_MARKER,
+})
+
+
 #: The branch shapes that are evidence the work is ON MAIN.  The one definition
 #: behind the blocked arm's MARK_DONE upgrade and the question of whether that
 #: upgrade would fire (:func:`report_blocked_arm_would_move`).
@@ -169,6 +188,7 @@ class ClaimantSource(enum.StrEnum):
     DB = 'db'
     PLAN_LOCK = 'plan_lock'
     IN_MEMORY = 'in_memory'
+    MERGE_REQUEST = 'merge_request'
 
 
 class RecoveryAction(enum.StrEnum):
@@ -192,18 +212,34 @@ class BranchState:
 
     ``sha`` is carried only for the ``on_main`` / ``gone_with_merge_marker``
     variants — ``exists_off_main`` and ``gone_no_marker`` have no associated
-    merged sha, so it defaults to ``None`` for those.
+    merged sha, so it defaults to ``None`` for those. ``sha_source`` records
+    which resolver arm produced ``sha``. ``landing_sha`` is that sha only when
+    it names a landing commit independent of the branch ref, because the
+    citation-disabled arm's sha is the branch's own tip and proves nothing
+    about what landed.
     """
 
     kind: BranchStateKind
     sha: str | None = None
+    sha_source: BranchShaSource | None = None
+
+    def __post_init__(self) -> None:
+        if self.sha_source is not None and self.sha is None:
+            raise ValueError(
+                f'BranchState invariant: sha_source={self.sha_source!r} '
+                f'names no sha (kind={self.kind!r})'
+            )
+
+    @property
+    def landing_sha(self) -> str | None:
+        return self.sha if self.sha_source in _LANDING_SHA_SOURCES else None
 
 
 @dataclass(frozen=True)
 class Claimant:
-    """A live claimant identity, folded from one of three liveness signals.
+    """A live claimant identity, folded from one of four liveness signals.
 
-    ``run_id`` CONTRACT (task 3563) — normative, all three sources:
+    ``run_id`` CONTRACT (task 3563) — normative, every source:
     it is either a FULL ``shared.task_claimant.compose_claimant_run_id``
     identity (``'{run_id}/{session_id}/pid={owner_pid}'``) or ``None``,
     meaning UNKNOWN.  It is never a bare ``session_id`` and never partially
@@ -219,7 +255,7 @@ class Claimant:
       through whole.  The plan.lock leg's fail-safe is deliberately NOT mirrored
       here — normalising that PRODUCER is a 3563 follow-up (ticket
       ``tkt_0RSGFS860E6VY37A7XH6S9FYCP``), and the "never partially composed"
-      rule holds for all three sources only once it lands.
+      rule holds for every source only once it lands.
     * PLAN_LOCK — composed here from the lock's ``run_id``/``session_id``/
       ``owner_pid``, which ``TaskArtifacts.lock_plan`` records in the same
       process that stamps the DB claimant, making the two byte-identical for
@@ -228,6 +264,8 @@ class Claimant:
       workflows have none to record.
     * IN_MEMORY — always ``None``; the scheduler's held-set carries no
       identity.
+    * MERGE_REQUEST — always ``None``; the in-flight registry carries no
+      claimant identity.
 
     Composing PARTIALLY would be worse than the bare session id this replaced:
     ``'/{session_id}/pid={pid}'`` carries the ``/pid=`` marker, so it PASSES
@@ -278,8 +316,12 @@ class EscalationRef:
     means "unknown"; ``orchestrator.recovery_emission.escalation_ages_secs``
     maps that to a ``None`` age rather than dropping the id.
 
-    All three added fields are DEFAULTED so every existing construction site
-    keeps working untouched.
+    ``members`` carries an L2's held member ids, so
+    ``escalation.pins.pinned_only_by_human_parked`` can see a promoted hold
+    without a second read.
+
+    Every field after ``level`` is DEFAULTED so every existing construction
+    site keeps working untouched.
     """
 
     id: str
@@ -288,6 +330,7 @@ class EscalationRef:
     severity: str = ''
     filing_claimant_run_id: str | None = None
     created_at: str | None = None
+    members: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -328,33 +371,6 @@ def _utc_now() -> datetime:
     return datetime.now(UTC)
 
 
-def _pid_alive(pid: int) -> bool:
-    """Return True if the process identified by *pid* is alive.
-
-    Duplicates ``orchestrator.harness._pid_alive`` (itself mirroring
-    fused-memory's ``orchestrator_detector.py:58-72``) rather than importing
-    it, to avoid a harness->task_ground_truth->harness circular import once
-    θ2 migrates the harness's reconcile sweeps to call derive_truth/
-    recovery_for.
-
-    - Returns False for pid <= 0 (invalid).
-    - Uses os.kill(pid, 0): success → alive; ProcessLookupError → dead;
-      PermissionError → alive (we can see it but lack permission to signal it);
-      other OSError → treat as dead.
-    """
-    if pid <= 0:
-        return False
-    try:
-        os.kill(pid, 0)
-        return True
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    except OSError:
-        return False
-
-
 def _known_str(value: object) -> str | None:
     """Return *value* VERBATIM if it is a non-blank ``str``, else ``None``.
 
@@ -369,6 +385,26 @@ def _known_str(value: object) -> str | None:
     stamp built from those same components.
     """
     return value if isinstance(value, str) and value.strip() else None
+
+
+def _parse_owner_pid(raw: object) -> int | None:
+    """Parse a plan.lock ``owner_pid`` into an int, or ``None`` when malformed.
+
+    A bool is rejected before any int() conversion: ``int(True) == 1`` would
+    turn a JSON ``true`` into pid 1 (init), a phantom live claimant.  A str is
+    accepted, so a zero-padded ``'00123'`` parses to the int the composed
+    identity must embed.
+    """
+    if isinstance(raw, bool):
+        return None
+    if isinstance(raw, int):
+        return raw
+    if isinstance(raw, str):
+        try:
+            return int(raw)
+        except ValueError:
+            return None
+    return None
 
 
 def _lock_fresh(locked_at: object, now: datetime, ttl: timedelta) -> bool:
@@ -420,6 +456,7 @@ class TaskGroundTruth:
         *,
         now_fn: Callable[[], datetime] = _utc_now,
         heartbeat_ttl: timedelta = DEFAULT_CLAIMANT_HEARTBEAT_TTL,
+        merge_requests: LiveMergeRequests | None = None,
     ) -> None:
         self.git_ops = git_ops
         self.scheduler = scheduler
@@ -427,6 +464,7 @@ class TaskGroundTruth:
         self.worktree_resolver = worktree_resolver
         self.now_fn = now_fn
         self.heartbeat_ttl = heartbeat_ttl
+        self.merge_requests = merge_requests
 
     async def derive_truth(self, tid: str) -> TruthReport:
         """Compose a fresh :class:`TruthReport` for *tid* (PRD §5.4).
@@ -484,7 +522,9 @@ class TaskGroundTruth:
         """
         row = MergeProvenance.lookup(tid)
         if row is not None:
-            return BranchState(BranchStateKind.ON_MAIN, row.advanced_sha)
+            return BranchState(
+                BranchStateKind.ON_MAIN, row.advanced_sha, BranchShaSource.JOURNAL,
+            )
 
         # Git-archaeology fallback (journal miss). EXACTLY ONCE — this is
         # the sole owner of the is_ancestor -> resolve_branch_sha ->
@@ -547,12 +587,17 @@ class TaskGroundTruth:
                 # (merge_queue.py). dark-factory's default pattern is None, so
                 # this arm is inert on this repo.
                 sha = await self.git_ops.resolve_branch_sha(branch)
-                return BranchState(BranchStateKind.ON_MAIN, sha)
+                return BranchState(
+                    BranchStateKind.ON_MAIN, sha,
+                    BranchShaSource.BRANCH_TIP if sha is not None else None,
+                )
             citation = await self.git_ops.find_task_citation_commit(
                 tid, pattern_template=citation_pattern,
             )
             if citation is not None:
-                return BranchState(BranchStateKind.ON_MAIN, citation)
+                return BranchState(
+                    BranchStateKind.ON_MAIN, citation, BranchShaSource.CITATION,
+                )
             # Trivially-ancestor branch with no attributable citation is NOT a
             # landing. The branch ref genuinely exists (that is how is_ancestor
             # was evaluable), so classify EXISTS_OFF_MAIN — the recovery table
@@ -568,15 +613,20 @@ class TaskGroundTruth:
 
         marker_sha = await self.git_ops.find_merge_marker(branch)
         if marker_sha:
-            return BranchState(BranchStateKind.GONE_WITH_MERGE_MARKER, marker_sha)
+            return BranchState(
+                BranchStateKind.GONE_WITH_MERGE_MARKER, marker_sha,
+                BranchShaSource.MERGE_MARKER,
+            )
         return BranchState(BranchStateKind.GONE_NO_MARKER)
 
     def _resolve_live_claimant(self, tid: str, task: dict, worktree_path: Path) -> Claimant | None:
-        """Resolve *tid*'s live claimant (TG-3), folding three signals in
+        """Resolve *tid*'s live claimant (TG-3), folding four signals in
         priority order:
 
         1. ``scheduler.is_actively_held(tid)`` — the in-memory public
            accessor (task 2235).
+        1a. A merge request in flight for *tid* (``merge_requests``), which
+           outlives a dead submitter's stale db claimant (task 7277).
         2. A fresh W2 db claimant: ``claimant_run_id`` present AND NOT
            ``shared.task_claimant.is_stranded_any_status`` against the
            injected ``now_fn``/``heartbeat_ttl``.
@@ -612,12 +662,15 @@ class TaskGroundTruth:
         *worktree_path* is :meth:`derive_truth`'s single
         ``worktree_resolver(tid)`` resolution (also shared with
         ``worktree_present``, review finding #2) — this method makes no I/O
-        of its own beyond the plan.lock read, which is addressed at
-        *worktree_path*'s ``.task-meta`` SIBLING, not inside it (task 4028;
-        see the comment on that leg below).
+        of its own beyond the plan.lock read, which is addressed at *tid*'s
+        own ``.task-meta/task-<tid>`` root beside *worktree_path* (see the
+        comment on that leg below).
         """
         if self.scheduler.is_actively_held(tid):
             return Claimant(run_id=None, heartbeat_at=None, source=ClaimantSource.IN_MEMORY)
+
+        if self.merge_requests is not None and tid in self.merge_requests.task_ids_in_flight():
+            return Claimant(run_id=None, heartbeat_at=None, source=ClaimantSource.MERGE_REQUEST)
 
         claimant_run_id = task.get('claimant_run_id')
         if claimant_run_id and str(claimant_run_id).strip():
@@ -629,42 +682,36 @@ class TaskGroundTruth:
                 source=ClaimantSource.DB,
             )
 
-        # Addressed at the ``.task-meta`` SIBLING — where the lock's sole
-        # writer puts it (``TaskWorkflow`` builds its ``TaskArtifacts`` with
-        # ``_meta_root_for_worktree(self.worktree)``, workflow.py) — via
-        # ``meta_root_for``, the single owner of that path shape, so neither
-        # side hand-joins ``.task-meta`` (task 4028).
+        # Addressed at the task's own root, ``.task-meta/task-<tid>`` — where
+        # the lock's sole writer puts it (plan.lock is task-scoped in
+        # ``ARTIFACT_ROOTS``, and ``TaskWorkflow._artifact_roots`` hands every
+        # dispatch that root) — via ``TaskArtifacts.for_task``, so neither side
+        # hand-joins ``.task-meta`` (tasks 4028, 3155).
         #
-        # Deliberately NO legacy fallback: nothing has written
-        # ``<worktree>/.task/plan.lock`` since the meta-root migration, so a
-        # new-then-old read (as in ``Harness._resolve_recovery_artifact``)
-        # would be dead code on arrival, and any legacy lock still on disk
-        # necessarily predates that migration and so fails ``_lock_fresh``
-        # below anyway. Pinned by
-        # ``TestPlanLockIsReadFromTheMetaRoot::test_lock_at_the_legacy_root_is_ignored``.
+        # Deliberately NO fallback to the lane root ``.task-meta/<name>`` or
+        # the legacy ``<worktree>/.task``: nothing writes a lock there any
+        # more, so a new-then-old read would be dead code on arrival (PRD
+        # ``plans/task-meta-task-keying-prd.md`` decision 7), and a lock still
+        # sitting at either address predates the move and so fails
+        # ``_lock_fresh`` below anyway. Pinned by
+        # ``test_task_ground_truth.py::TestPlanLockIsReadFromTheTaskRoot``.
         #
         # ATTRIBUTION IS BY ADDRESS, NOT BY SESSION IDENTITY: any fresh,
-        # live-pid lock at this task's resolved meta root is taken to be
-        # *tid*'s, WITHOUT checking that ``session_id`` carries the
-        # ``'{tid}-'`` prefix ``clear_stale_plan_lock`` keys on.  Deliberate,
-        # and deliberately not symmetric with that method:
+        # live-pid lock at this task's root is taken to be *tid*'s, WITHOUT
+        # checking that ``session_id`` carries the ``'{tid}-'`` prefix
+        # ``clear_stale_plan_lock`` keys on.  Deliberate, and deliberately not
+        # symmetric with that method:
         #   * The dominant stale-lock case is a crashed PRIOR incarnation of
-        #     the SAME task (a same-task lane reuse preserves the meta root
-        #     precisely because those artifacts are the task's own), and it
-        #     carries a MATCHING prefix — so a prefix gate would not catch
-        #     the case that actually happens.
-        #   * The cross-task case a gate WOULD catch — a warm lane's meta
-        #     root outliving its previous occupant, since it is a sibling of
-        #     the worktree and survives cleanup — is already cleared on every
-        #     different-task acquisition route by
-        #     ``GitOps._clear_foreign_meta_root`` (RECYCLE /
-        #     RESET_IN_PLACE_REATTACH / CREATE_ONCE_FRESH /
-        #     CREATE_ONCE_REATTACH).
+        #     the SAME task, and it carries a MATCHING prefix — so a prefix
+        #     gate would not catch the case that actually happens.
+        #   * The root is keyed by task id, so no lane lifecycle can leave
+        #     another task's lock there; a gate would guard only against a
+        #     writer bug.
         #   * A gate would fail DANGEROUS. Rejecting a lock this resolver
         #     cannot positively attribute makes a LIVE task read as
         #     unclaimed, which is the task-2588 un-claim incident class.
         #     Mis-attributing the other way only DELAYS recovery.
-        # What bounds that delay is ``_lock_fresh`` alone, not ``_pid_alive``:
+        # What bounds that delay is ``_lock_fresh`` alone, not ``pid_alive``:
         # ``owner_pid`` is the ORCHESTRATOR's pid, which outlives any single
         # task, so the liveness half is nearly always true. Freshness caps the
         # exposure at ``heartbeat_ttl`` — a window in which the harness's R3
@@ -672,12 +719,17 @@ class TaskGroundTruth:
         # recovery mid-run. Pinned (both the attribution and its freshness
         # bound) by test_task_ground_truth.py::TestPlanLockAttributionIsByAddress.
         #
-        # Derived OUTSIDE the try: this is pure path algebra with no I/O, and
-        # must not be swallowed by the degradation arm below, which exists for
-        # a corrupt lock FILE — not for a mis-derived root.
-        meta_root = TaskArtifacts.meta_root_for(worktree_path.parent, worktree_path.name)
+        # Derived OUTSIDE the corrupt-file try below: an id ``task_root_for``
+        # refuses is an unaddressable task, not a corrupt lock FILE. It has no
+        # lock to read, so it degrades to "no plan-lock claimant" on its own
+        # arm rather than aborting the sweep.
         try:
-            lock_data = TaskArtifacts(worktree_path, meta_root).read_plan_lock()
+            artifacts = TaskArtifacts.for_task(worktree_path, tid)
+        except ValueError:
+            logger.warning('No plan-lock claimant for unaddressable task id %r', tid)
+            return None
+        try:
+            lock_data = artifacts.read_plan_lock()
         except (ValueError, OSError):
             # A truncated/corrupt plan.lock is a realistic outcome of the
             # very crash this resolver recovers from — degrade to "no
@@ -707,18 +759,12 @@ class TaskGroundTruth:
         # test_vestigial_worktree_lock_is_inert_and_unlinked, which is what it
         # always actually pinned, task 4028).
         if isinstance(lock_data, dict):
-            owner_pid = lock_data.get('owner_pid')
             # Retain the PARSED pid: the composed identity below must embed the
             # same int this liveness check validated, not a re-parse of the raw
             # value (which could be e.g. the string '123', composing a
             # different byte sequence than the DB stamp's int).
-            parsed_pid: int | None = None
-            try:
-                parsed_pid = None if owner_pid is None else int(owner_pid)
-                owner_alive = parsed_pid is not None and _pid_alive(parsed_pid)
-            except (TypeError, ValueError):
-                parsed_pid = None
-                owner_alive = False
+            parsed_pid = _parse_owner_pid(lock_data.get('owner_pid'))
+            owner_alive = pid_alive(parsed_pid)
             lock_fresh = _lock_fresh(lock_data.get('locked_at'), self.now_fn(), self.heartbeat_ttl)
             if owner_alive and lock_fresh:
                 # Compose ONLY when every component is known and well-formed;
@@ -747,9 +793,11 @@ class TaskGroundTruth:
     ) -> tuple[list[EscalationRef], bool]:
         """Map *tid*'s pending escalations to refs, plus the store's readability.
 
-        ``severity``, ``filing_claimant_run_id`` and ``created_at`` travel with
-        each ref so consumers can feed ``escalation.pins.classify_pins``
-        directly, and age a hold, without re-reading the store (spec
+        ``severity``, ``filing_claimant_run_id``, ``created_at`` and
+        ``members`` travel with each ref so consumers can feed
+        ``escalation.pins.classify_pins`` and
+        ``escalation.pins.pinned_only_by_human_parked`` directly, and age a
+        hold, without re-reading the store (spec
         ``docs/task-escalation-state-spec.md`` S6/E7).  ``row.severity or ''``
         normalises a null/absent severity to the unknown-severity sentinel, so
         the classifier reaches its documented fail-safe-to-pinning branch
@@ -789,6 +837,7 @@ class TaskGroundTruth:
                 severity=row.severity or '',
                 filing_claimant_run_id=row.filing_claimant_run_id,
                 created_at=getattr(row, 'timestamp', None),
+                members=tuple(row.members or ()),
             )
             for row in rows
         ], False

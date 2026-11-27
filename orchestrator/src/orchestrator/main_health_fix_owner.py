@@ -12,10 +12,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Protocol
+from typing import Any, Protocol
 
+from shared.elision import elide_at_word
 from shared.mcp_envelope import parse_tool_result
 from shared.task_metadata import RetryLedger
 from shared.task_metadata_wire import coerce_task_metadata
@@ -29,10 +31,16 @@ logger = logging.getLogger(__name__)
 
 SIGNATURE_KEY = 'main_health_signature'
 
+
+def is_main_health_fix(task: Mapping[str, Any]) -> bool:
+    """Whether *task* is the fix owner of a confirmed main break."""
+    signature = (coerce_task_metadata(task.get('metadata')) or {}).get(SIGNATURE_KEY)
+    return isinstance(signature, str) and bool(signature.strip())
+
+
 _LOOKUP_TIMEOUT_SECS = 15.0
 
 _FIX_BRIEF_TITLE_MAX = 100
-_FIX_BRIEF_DETAIL_MAX = 800
 
 REPRODUCE_FIRST = (
     'Before changing any code, reproduce the failure on a clean checkout of main. '
@@ -64,25 +72,21 @@ class MainBreak:
         )
 
 
-def compose_fix_main_brief(
-    category: str, cause_hint: str, detail: str = '',
-) -> tuple[str, str]:
+def compose_fix_main_brief(category: str, cause_hint: str) -> tuple[str, str]:
     """Return the ``(title, description)`` of a fix-main task.
 
-    The title is ``'fix main: <cause_hint or category>'``, cut to
-    ``_FIX_BRIEF_TITLE_MAX`` characters; the description carries category,
-    cause and at most ``_FIX_BRIEF_DETAIL_MAX`` characters of *detail*.
+    The title is ``'fix main: <cause_hint or category>'``, cut at a word to
+    ``_FIX_BRIEF_TITLE_MAX`` characters with the counted elision marker; the
+    full label stays on the description's Category/Cause lines. The failure
+    detail travels in the task's ``details``, not here.
     """
     label = cause_hint.strip() if cause_hint and cause_hint.strip() else category
-    title = f'fix main: {label}'[:_FIX_BRIEF_TITLE_MAX]
-    detail_snippet = (detail or '').strip()[:_FIX_BRIEF_DETAIL_MAX]
+    title = elide_at_word(f'fix main: {label}', _FIX_BRIEF_TITLE_MAX)
     description = (
         f'Automated main-health fix task.\n'
         f'Category: {category}\n'
         f'Cause: {cause_hint}\n'
     )
-    if detail_snippet:
-        description += f'\nDetail:\n{detail_snippet}'
     return title, description
 
 
@@ -94,7 +98,7 @@ def build_main_fix_task_arguments(
     escalation_id: str | None = None,
 ) -> dict:
     """The ``submit_task`` arguments of a HIGH-lane fix-main task for *brk*."""
-    title, description = compose_fix_main_brief(brk.category, brk.cause_hint, brk.reason)
+    title, description = compose_fix_main_brief(brk.category, brk.cause_hint)
     metadata: dict = {
         'merge_lane': 'high',
         'spawn_context': spawn_context.value,
@@ -102,13 +106,16 @@ def build_main_fix_task_arguments(
     }
     if escalation_id is not None:
         metadata['main_health_escalation_id'] = escalation_id
-    return {
+    arguments: dict = {
         'title': title,
         'description': f'{description}\n\n{REPRODUCE_FIRST}',
         'priority': 'high',
         'project_root': project_root,
         'metadata': metadata,
     }
+    if detail := brk.reason.strip():
+        arguments['details'] = detail
+    return arguments
 
 
 @dataclass(frozen=True)

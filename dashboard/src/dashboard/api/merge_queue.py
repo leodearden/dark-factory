@@ -5,7 +5,8 @@ This module is the ROUTE layer. The aggregation it calls lives in
 names imported below (``build_per_project_merge_queue``,
 ``fetch_live_merge_queues``, ``resolve_active``, ``merge_task_refs``,
 ``enrich_merges_with_titles``) all come from that data module, never from
-here. Row titles come from ``dashboard.data.task_lookup.lookup_tasks``: one
+here. The runs.db readings pass through as the Datums the data module built;
+the shaper projects them for the wire. Row titles come from ``dashboard.data.task_lookup.lookup_tasks``: one
 call over every id the payload names, never a whole task tree.
 
 ``render_at`` is resolved once per request and threaded through every leg,
@@ -15,20 +16,19 @@ so a queue and the sparkline beside it cannot disagree about the present.
 from __future__ import annotations
 
 import asyncio
-from pathlib import Path
-from typing import cast
 
 import httpx
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
+from dashboard.api.clock import app_clock
 from dashboard.api.window import _parse_window, with_window
 from dashboard.config import DashboardConfig
 from dashboard.data import redux_api
-from dashboard.data.chart_utils import ChartData, trim_leading_zero_buckets
 from dashboard.data.db import DbPool
 from dashboard.data.merge_halt import get_merge_halt_status
 from dashboard.data.merge_queue import (
+    ProjectRunsDb,
     build_per_project_merge_queue,
     enrich_merges_with_titles,
     fetch_live_merge_queues,
@@ -36,33 +36,37 @@ from dashboard.data.merge_queue import (
     resolve_active,
 )
 from dashboard.data.metrics import get_merge_active_series
+from dashboard.data.task_activity import RUNS_DB
 from dashboard.data.task_lookup import lookup_tasks
-from dashboard.data.utils import resolve_now
-from dashboard.project_dbs import _project_scoped_dbs_labeled
+from dashboard.project_dbs import roots_without_file
 
 router = APIRouter()
 
 
+async def _project_runs_dbs(config: DashboardConfig, pool: DbPool) -> list[ProjectRunsDb]:
+    """Each known root's runs.db, its path derived once for the pool's connection and the landing read."""
+    stores = [(str(root), root / RUNS_DB) for root in config.all_project_roots]
+    return [ProjectRunsDb(label, await pool.get(path), path) for label, path in stores]
+
+
 @router.get('/api/v2/dashboard/merge-queue')
 async def api_merge_queue(request: Request) -> JSONResponse:
-    """MERGE_QUEUE — per-project depth/outcomes/latency/recent/in_queue/speculative."""
+    """MERGE_QUEUE — per-project depth/attempts/recent/in_queue/speculative/train_throughput/landing_rate."""
     config: DashboardConfig = request.app.state.config
     labels = config.project_labels
     pool: DbPool = request.app.state.db
     window = _parse_window(request.query_params)
-    render_at = resolve_now(None)
+    clock = app_clock(request.app)
+    render_at = clock()
 
-    project_dbs = await _project_scoped_dbs_labeled(
-        config,
-        pool,
-        Path('data/orchestrator/runs.db'),
-    )
+    project_dbs = await _project_runs_dbs(config, pool)
     http_client: httpx.AsyncClient = request.app.state.http_client
     projects_raw, halt_status, live_map = await asyncio.gather(
         build_per_project_merge_queue(
             project_dbs,
             hours=window.days * 24,
             now=render_at,
+            runs_db_absent=roots_without_file(config, RUNS_DB),
         ),
         get_merge_halt_status(http_client, config.escalation_urls),
         fetch_live_merge_queues(http_client, config.escalation_urls),
@@ -90,9 +94,6 @@ async def api_merge_queue(request: Request) -> JSONResponse:
     enriched = {
         pid: {
             **data,
-            'depth_timeseries': trim_leading_zero_buckets(
-                cast(ChartData, data['depth_timeseries'])
-            ),
             'recent': enrich_merges_with_titles(data['recent'], pid, lookup),
             'active': enrich_merges_with_titles(queues[pid].entries, pid, lookup),
             'in_queue': queues[pid].in_queue,
@@ -104,7 +105,7 @@ async def api_merge_queue(request: Request) -> JSONResponse:
     }
     # Resolved AFTER the fan-out, as api/tasks.py::api_tasks does: every
     # as_of above was stamped at or before this instant, never after it.
-    served_at = resolve_now(None)
+    served_at = clock()
     return JSONResponse(
         with_window(
             redux_api.shape_merge_queue(

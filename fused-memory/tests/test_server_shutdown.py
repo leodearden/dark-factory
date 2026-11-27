@@ -1,4 +1,39 @@
-"""Tests for the _graceful_shutdown helper in fused_memory.server.main."""
+"""Tests for the _graceful_shutdown helper in fused_memory.server.main.
+
+Tool-call durations, for sizing
+fused-memory/src/fused_memory/config/schema.py::ServerConfig.graceful_shutdown_timeout
+(task 9493). Window 2026-11-09..12. Source: Claude Code client transcripts,
+tool_use -> tool_result per mcp__fused-memory__<tool>. The server log names no
+tool and carries no request id, so it cannot be paired per tool. Counted: the
+50 sessions whose Read/Grep/Glob median was <= 1 s (1152 calls); the other
+sessions' transcripts add 20-40 s of client overhead per call. Seconds, an
+upper bound where a turn ran several tools.
+
+    tool                          n     p50     p90     max
+    get_task                    306    0.40    3.14   70.82
+    search_tasks                150    1.06   12.98   60.82
+    add_memory                   29    5.30   27.74   53.27
+    find_tasks_by_metadata      324    0.87   12.43   43.61
+    search                        3   19.47   38.64   43.43
+    get_statuses                 35    0.31    7.00   37.04
+    scan_memory_content           1   22.61   22.61   22.61
+    update_task                 170    0.28    1.27   20.58
+    commit_planning               2   12.73   18.50   19.94
+    get_dead_letters              1   18.58   18.58   18.58
+    get_tasks                     5   10.86   16.63   18.21
+    add_dependency               26    0.14   13.76   14.73
+    set_task_status              55    0.41    2.66   14.06
+    submit_task                  22    0.14    6.29   12.61
+    count_memories_by_metadata   12    0.91    1.34    1.66
+    all other tools              11    0.20    0.37    0.46
+
+The drain stays 10 s because 10 s + _FORCE_EXIT_BUDGET 75 s must stay under
+TimeoutStopSec=90 (TestShutdownBudgetArithmetic); the review-all shutdown-sequence
+work (plans/review-all-dark_factory-20261008.md) lengthens it once it frees room.
+Over 40 restarts (2026-11-09..12) a repeat SIGTERM landed at most 1.542 s after
+the first; that sizes
+fused-memory/src/fused_memory/server/main.py::_OPERATOR_STOP_REPEAT_WINDOW_SECS.
+"""
 
 import asyncio
 import contextlib
@@ -6,8 +41,11 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.server.main import _build_uvicorn_config, _graceful_shutdown, _run_shielded
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 
 def _parse_timeout_stop_sec(unit_file_path: Path) -> float:
@@ -91,30 +129,30 @@ class TestGracefulShutdownJournalClosedDespiteMemoryServiceError:
 
 
 class TestGracefulShutdownClosesCuratorCostStore:
-    """step-5: _graceful_shutdown must await curator_cost_store.close() when provided."""
+    """step-5: _graceful_shutdown must await invocations_store.close() when provided."""
 
     @pytest.mark.asyncio
-    async def test_curator_cost_store_closed_on_happy_path(self):
-        """curator_cost_store.close() must be awaited once on the happy path."""
+    async def test_invocations_store_closed_on_happy_path(self):
+        """invocations_store.close() must be awaited once on the happy path."""
         memory_service = MagicMock()
         memory_service.close = AsyncMock()
 
-        curator_cost_store = MagicMock()
-        curator_cost_store.close = AsyncMock()
+        invocations_store = MagicMock()
+        invocations_store.close = AsyncMock()
 
         await _graceful_shutdown(
             memory_service=memory_service,
             task_interceptor=None,
             harness_loop_task=None,
             recon_journal=None,
-            curator_cost_store=curator_cost_store,
+            invocations_store=invocations_store,
         )
 
-        curator_cost_store.close.assert_awaited_once()
+        invocations_store.close.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_curator_cost_store_closed_even_when_memory_service_raises(self):
-        """curator_cost_store.close() must be awaited even if memory_service.close() raises.
+    async def test_invocations_store_closed_even_when_memory_service_raises(self):
+        """invocations_store.close() must be awaited even if memory_service.close() raises.
 
         Mirrors TestGracefulShutdownJournalClosedDespiteMemoryServiceError in
         test_server_shutdown.py — each cleanup step runs under its own shield.
@@ -122,22 +160,22 @@ class TestGracefulShutdownClosesCuratorCostStore:
         memory_service = MagicMock()
         memory_service.close = AsyncMock(side_effect=RuntimeError('memory close failed'))
 
-        curator_cost_store = MagicMock()
-        curator_cost_store.close = AsyncMock()
+        invocations_store = MagicMock()
+        invocations_store.close = AsyncMock()
 
         await _graceful_shutdown(
             memory_service=memory_service,
             task_interceptor=None,
             harness_loop_task=None,
             recon_journal=None,
-            curator_cost_store=curator_cost_store,
+            invocations_store=invocations_store,
         )
 
-        curator_cost_store.close.assert_awaited_once()
+        invocations_store.close.assert_awaited_once()
 
 
 class TestGracefulShutdownQuiescesCuratorGate:
-    """curator_usage_gate.shutdown() must be awaited before curator_cost_store.close().
+    """curator_usage_gate.shutdown() must be awaited before invocations_store.close().
 
     Fixes the race where a 429-driven cap event fires just before shutdown
     and its background save_account_event task writes to an already-closed
@@ -162,7 +200,7 @@ class TestGracefulShutdownQuiescesCuratorGate:
 
     @pytest.mark.asyncio
     async def test_gate_shutdown_before_cost_store_close(self):
-        """curator_usage_gate.shutdown() must complete before curator_cost_store.close().
+        """curator_usage_gate.shutdown() must complete before invocations_store.close().
 
         Ordering is critical: gate.shutdown() cancels/drains background tasks
         that may still be writing to the CostStore's SQLite connection.
@@ -175,7 +213,7 @@ class TestGracefulShutdownQuiescesCuratorGate:
         curator_usage_gate = MagicMock(
             shutdown=AsyncMock(side_effect=lambda: call_order.append('gate_shutdown'))
         )
-        curator_cost_store = MagicMock(
+        invocations_store = MagicMock(
             close=AsyncMock(side_effect=lambda: call_order.append('store_close'))
         )
 
@@ -185,7 +223,7 @@ class TestGracefulShutdownQuiescesCuratorGate:
             harness_loop_task=None,
             recon_journal=None,
             curator_usage_gate=curator_usage_gate,
-            curator_cost_store=curator_cost_store,
+            invocations_store=invocations_store,
         )
 
         assert call_order == ['gate_shutdown', 'store_close'], (
@@ -215,6 +253,40 @@ class TestGracefulShutdownQuiescesCuratorGate:
         )
 
         curator_usage_gate.shutdown.assert_awaited_once()
+
+
+class TestGracefulShutdownClosesCostStoreAfterHarness:
+    """The recon stages, judge and verify loop write their invocations rows through
+    invocations_store until the harness loop stops (task 10414)."""
+
+    @pytest.mark.asyncio
+    async def test_cost_store_closes_after_the_harness_loop_stops(self):
+        call_order: list[str] = []
+        started = asyncio.Event()
+
+        async def _recon_loop():
+            started.set()
+            try:
+                await asyncio.sleep(9999)
+            except asyncio.CancelledError:
+                call_order.append('harness_stopped')
+                raise
+
+        harness_loop_task = asyncio.create_task(_recon_loop())
+        await started.wait()
+        invocations_store = MagicMock(
+            close=AsyncMock(side_effect=lambda: call_order.append('store_close'))
+        )
+
+        await _graceful_shutdown(
+            memory_service=MagicMock(close=AsyncMock()),
+            task_interceptor=None,
+            harness_loop_task=harness_loop_task,
+            recon_journal=None,
+            invocations_store=invocations_store,
+        )
+
+        assert call_order == ['harness_stopped', 'store_close']
 
 
 class TestGracefulShutdownClosesTaskInterceptor:
@@ -839,6 +911,15 @@ class TestShutdownBudgetArithmetic:
 
         default_timeout = ServerConfig().graceful_shutdown_timeout
         assert default_timeout + main_mod._FORCE_EXIT_BUDGET < main_mod._SYSTEMD_TIMEOUT_STOP_SECS
+
+    def test_repeat_stop_window_stays_below_the_drain(self):
+        """A window reaching the drain would ignore a deliberate second signal
+        for the whole drain, removing the force-exit escape hatch."""
+        import fused_memory.server.main as main_mod
+        from fused_memory.config.schema import ServerConfig
+
+        default_timeout = ServerConfig().graceful_shutdown_timeout
+        assert default_timeout > main_mod._OPERATOR_STOP_REPEAT_WINDOW_SECS
 
     def test_schema_mirror_constants_match_main(self):
         """ServerConfig._validate_graceful_shutdown_timeout_budget duplicates

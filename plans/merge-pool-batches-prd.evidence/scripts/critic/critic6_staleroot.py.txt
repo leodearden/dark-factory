@@ -1,0 +1,32 @@
+import sqlite3, json, subprocess, collections
+REPO='/home/leo/src/dark-factory'
+db=sqlite3.connect(f'file:{REPO}/data/orchestrator/runs.db?mode=ro', uri=True)
+def git(*a):
+    r=subprocess.run(['git','-C',REPO,*a],capture_output=True,text=True)
+    return r.returncode, r.stdout.strip()
+main=git('rev-parse','main')[1]
+c=collections.Counter(); ex=[]
+for ts,data in db.execute("select timestamp,data from events where event_type='merge_verify' and timestamp>='2026-11-06' order by id"):
+    d=json.loads(data)
+    if d.get('attempt') not in (None,0): continue
+    n=d.get('chain_items') or 1
+    if n<2 or d.get('base_relation')!='main': continue
+    tip=d['merge_sha']
+    rc,root=git('rev-parse',f'{tip}~{n}')
+    if rc: c['no-commit']+=1; continue
+    c['batches']+=1
+    any_newer=False
+    for i in range(n):           # member i: second parent of tip~i
+        rc,mt=git('rev-parse',f'{tip}~{i}^2')
+        if rc: c['member-no-2nd-parent']+=1; continue
+        c['members']+=1
+        rc,mb=git('merge-base',mt,main)
+        if rc: continue
+        # newer than root iff mb is not an ancestor of root
+        rc2,_=git('merge-base','--is-ancestor',mb,root)
+        if rc2!=0:
+            c['members carrying main commits newer than root']+=1; any_newer=True
+            rcn,cnt=git('rev-list','--count','--first-parent',f'{root}..{mb}')
+            if len(ex)<6: ex.append((ts[:16],tip[:8],n,i,cnt))
+    if any_newer: c['batches with such a member']+=1
+print(dict(c)); print(ex)

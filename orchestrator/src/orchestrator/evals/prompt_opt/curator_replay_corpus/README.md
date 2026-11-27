@@ -233,25 +233,21 @@ cd orchestrator && uv run python -m orchestrator.evals.prompt_opt build-curator-
 
 ```bash
 cd orchestrator && uv run python -m orchestrator.evals.prompt_opt build-curator-corpus \
-    --db-path /home/leo/src/dark-factory/data/reconciliation/tickets.db \
     --n 100 --seed 2496 --spot-check-size 200 \
     --out orchestrator/src/orchestrator/evals/prompt_opt/curator_replay_corpus/manifest.json
 ```
 
-`--db-path` defaults to `/home/leo/src/dark-factory/data/reconciliation/tickets.db`
-(override via the flag or the `CURATOR_TICKETS_DB` env var, for portability
-across checkouts -- tickets.db is offline, gitignored data that lives in the
-MAIN repo, not a task worktree). If `--db-path` doesn't point at a real
-file, the command fails fast with a clear error rather than letting
-`sqlite3` silently create an empty database.
+`--db-path` defaults to the main checkout's `data/reconciliation/tickets.db`
+(tickets.db is offline, gitignored data that lives in the MAIN repo
+checkout, not a task worktree; the main checkout is derived from wherever
+this code runs, even a linked worktree). Pass `--db-path` to read another
+file. If `--db-path` doesn't point at a real file, the command fails fast
+with a clear error rather than letting `sqlite3` silently create an empty
+database.
 
 The real frontier call (`propose_curator_label_frontier`) also needs a repo
-checkout to run its `invoke_agent` harness in. This defaults to
-`/home/leo/src/dark-factory` as well, overridable via the `CURATOR_REPO_ROOT`
-env var (or the function's own `cwd` parameter for programmatic callers) --
-the same portability reasoning as `CURATOR_TICKETS_DB` above, so running
-`build-curator-corpus` from a different checkout (another operator, CI)
-doesn't silently point the agent at the wrong working directory.
+checkout to run its `invoke_agent` harness in: the main checkout as well
+(or the function's own `cwd` parameter for programmatic callers).
 
 The command prints the total frontier labeling cost (summed from each
 sampled candidate's `FrontierLabel.cost_usd`, populated by

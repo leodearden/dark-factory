@@ -59,6 +59,9 @@ def _make(
     seen_redo_costs: list[float] | None = None,
     files: list[str] | None = None,
     metadata_backend: FakeMetadataBackend | None = None,
+    title: str = 'Document foo',
+    description: str = 'd',
+    details: str | None = None,
 ) -> _Fixture:
     if auto_eval_phases is None:
         auto_eval_phases = {'plan', 'execute', 'verify', 'review'}
@@ -150,17 +153,16 @@ def _make(
         update_task = AsyncMock(return_value=True)
         scheduler.update_task = update_task
 
-    assignment = TaskAssignment(
-        task_id='orig-task',
-        task={
-            'id': 'orig-task',
-            'title': 'Document foo',
-            'description': 'd',
-            'priority': 'medium',
-            'metadata': metadata,
-        },
-        modules=['mod_a'],
-    )
+    task: dict = {
+        'id': 'orig-task',
+        'title': title,
+        'description': description,
+        'priority': 'medium',
+        'metadata': metadata,
+    }
+    if details is not None:
+        task['details'] = details
+    assignment = TaskAssignment(task_id='orig-task', task=task, modules=['mod_a'])
 
     # ``submit_task`` answers with the real parser over the production
     # JSON-RPC body of ``submit_payload`` (the tool's own return value).
@@ -400,6 +402,33 @@ async def test_dispatches_redo_on_block(tmp_path: Path):
     assert data['optimistic_path'] == 'simple_task'
 
     assert 'redo-1' in f.harness._auto_eval_redo_task_ids
+
+
+async def _redo_submit_args(f: _Fixture) -> dict:
+    await f.harness._maybe_auto_eval(f.assignment, _make_report())
+    [submit_args] = [args for tool, args in f.submit_calls if tool == 'submit_task']
+    return submit_args
+
+
+@pytest.mark.asyncio
+async def test_the_redo_is_filed_with_the_original_description_and_details(tmp_path: Path):
+    description = '\n'.join(f'spec line {i}: do the thing' for i in range(400))
+    details = 'Step 1: read the spec.\nStep 2: implement it.'
+    f = _make(project_root=tmp_path / 'proj', description=description, details=details)
+
+    submit_args = await _redo_submit_args(f)
+
+    assert description in submit_args['description']
+    assert submit_args['details'] == details
+
+
+@pytest.mark.asyncio
+async def test_an_original_without_details_files_no_details(tmp_path: Path):
+    f = _make(project_root=tmp_path / 'proj')
+
+    submit_args = await _redo_submit_args(f)
+
+    assert 'details' not in submit_args
 
 
 @pytest.mark.asyncio

@@ -7,9 +7,7 @@ Served metrics
 ``KNOWN_METRICS`` is the sorted exact names of the sampler groups the
 dashboard serves, a projection of
 ``sampler/src/sampler/metrics.py::METRIC_GROUPS``, so a metric added to a
-served group is served with no edit here (the Host load card's own
-presentation list in ``static/redux/tab_overview.jsx`` still needs an entry
-before it displays the metric).  Keys not in this tuple are
+served group is served with no edit here.  Keys not in this tuple are
 filtered from query results, giving the frontend a fixed shape.  The
 response always contains every key; a known metric with nothing to serve
 returns the placeholder shape
@@ -28,9 +26,13 @@ before changing the bound.  Pinned by
 Unwindowed groups
 -----------------
 A group the sampler records unwindowed (PSI, which the kernel already
-windows) carries NULL ``window_mean`` and ``window_max`` columns.  The data
-module passes these NULLs through as Python ``None``, so callers must not
-expect numeric window values for those metrics.
+windows, and the verify-scope group) carries NULL ``window_mean`` and
+``window_max`` columns.  The data module passes these NULLs through as Python
+``None``, so callers must not expect numeric window values for those metrics.
+
+The verify-scope group is written every 30 seconds, not every tick, so its
+60-sample sparkline spans 30 minutes, and its newest row trails the 5-second
+groups' by up to 30 seconds — well inside the recency slack.
 """
 
 from __future__ import annotations
@@ -45,7 +47,7 @@ from dashboard.data.db import with_db
 
 logger = logging.getLogger(__name__)
 
-_SERVED_GROUPS = frozenset({GroupName.PSI, GroupName.PROCESS})
+_SERVED_GROUPS = frozenset({GroupName.PSI, GroupName.PROCESS, GroupName.VERIFY_SCOPES})
 
 KNOWN_METRICS: tuple[str, ...] = exact_metric_names(METRIC_GROUPS, _SERVED_GROUPS)
 

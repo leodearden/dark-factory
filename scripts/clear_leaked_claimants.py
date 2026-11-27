@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """Census and repair of task-store claimants that own nothing (task 4625).
 
-Two tiers, per docs/prds/claimant-invariant-enforcement.md D3: TERMINAL rows
-carrying any claimant, and HYGIENE rows (an allowlisted non-terminal status)
-carrying a stale one. A dry run is the default: it reports both tiers and never
-dials the MCP server. --apply clears the terminal tier, plus the hygiene tier
-with --repair-hygiene, through set_task_claimant only. The PRD's D6 and its
-task zeta give the rationale for each gate.
+Three tiers. TERMINAL is the alarm tier: a terminal row carrying a claimant
+that no metadata.claimant_exception covers (docs/prds/claimant-invariant-detection.md
+D-5/E-2). LEDGERED is a terminal row whose claimant the C4-E2 ledger covers, a
+sanctioned exception that is reported and never written (task 6777). HYGIENE is
+an allowlisted non-terminal row carrying a stale claimant, per
+docs/prds/claimant-invariant-enforcement.md D3. A dry run is the default: it
+reports every tier and never dials the MCP server. --apply clears the terminal
+tier, plus the hygiene tier with --repair-hygiene, through set_task_claimant
+only. The enforcement PRD's D6 and its task zeta give the rationale for each gate.
 
 Usage:
     python scripts/clear_leaked_claimants.py --project-root ROOT [--project-root ROOT ...]
@@ -23,7 +26,7 @@ import json
 import sqlite3
 import sys
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from enum import IntEnum, StrEnum
 from pathlib import Path
@@ -32,12 +35,12 @@ from typing import Any, Protocol
 import httpx
 from _task_db_scan import (
     UNREADABLE_STORE_ERRORS,
-    connect_ro,
     decode_metadata,
     format_kv_line,
     tasks_db_path,
 )
 from migrate_metadata_modules_to_files import FusedMemoryClient, write_failure_reason
+from shared.tasks_db_readonly import connect_ro
 
 # Bind shared/ and fused-memory/ to THIS checkout rather than whichever copy an
 # editable install put on sys.path (scripts/audit_manifest_descriptor_drift.py::_SHARED_SRC).
@@ -46,10 +49,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'fused-memory' /
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'shared' / 'src'))
 
 # A stdlib-only module under empty package __init__s, so the scripts env can import it.
-from fused_memory.mcp_tools.scheduler_state import read_scheduler_state
+from fused_memory.mcp_tools.scheduler_state import (
+    SchedulerStateUnreadable,
+    read_scheduler_state_strict,
+)
 from shared.task_claimant import (
     DEFAULT_CLAIMANT_HEARTBEAT_TTL,
     is_stale_hygiene_tier_claimant,
+    ledger_covers_claimant,
     violates_terminal_claimant_invariant,
 )
 
@@ -57,6 +64,19 @@ from shared.task_claimant import (
 class Tier(StrEnum):
     TERMINAL = 'terminal'
     HYGIENE = 'hygiene'
+    LEDGERED = 'ledgered'
+
+
+REPAIRABLE_TIERS: frozenset[Tier] = frozenset({Tier.TERMINAL, Tier.HYGIENE})
+
+
+def _require_repairable(tiers: frozenset[Tier]) -> None:
+    unrepairable = sorted(tier.value for tier in tiers - REPAIRABLE_TIERS)
+    if unrepairable:
+        repairable = sorted(tier.value for tier in REPAIRABLE_TIERS)
+        raise ValueError(
+            f'tiers {unrepairable} cannot be selected for repair; only {repairable} may be'
+        )
 
 
 def classify_tier(task: Mapping, now: datetime) -> Tier | None:
@@ -64,7 +84,7 @@ def classify_tier(task: Mapping, now: datetime) -> Tier | None:
     # terminal predicate takes no TTL, and a missing heartbeat is stranded per
     # shared/src/shared/task_claimant.py::_claimant_liveness_stranded, so it never fails closed.
     if violates_terminal_claimant_invariant(task):
-        return Tier.TERMINAL
+        return Tier.LEDGERED if ledger_covers_claimant(task) else Tier.TERMINAL
     if is_stale_hygiene_tier_claimant(task, now, DEFAULT_CLAIMANT_HEARTBEAT_TTL):
         return Tier.HYGIENE
     return None
@@ -179,6 +199,11 @@ class Bucket(StrEnum):
     FAILED = 'failed'
 
 
+class RefusalReason(StrEnum):
+    HOLDERS_IN_SELECTION = 'holders_in_selection'
+    HOLDER_SET_UNREADABLE = 'holder_set_unreadable'
+
+
 Delta = Mapping[str, tuple[Any, Any]]
 
 
@@ -194,11 +219,23 @@ class RowOutcome:
 class ApplyReport:
     project_root: str
     tiers: tuple[Tier, ...]
-    refused: bool
     holder_intersection: tuple[int, ...]
+    holder_set_error: str | None
     outcomes: tuple[RowOutcome, ...]
     verification_census: Census | None
     verification_error: str | None
+
+    @property
+    def refusal(self) -> RefusalReason | None:
+        if self.holder_set_error is not None:
+            return RefusalReason.HOLDER_SET_UNREADABLE
+        if self.holder_intersection:
+            return RefusalReason.HOLDERS_IN_SELECTION
+        return None
+
+    @property
+    def refused(self) -> bool:
+        return self.refusal is not None
 
     def counts(self) -> dict[Bucket, int]:
         counts = {bucket: 0 for bucket in Bucket}
@@ -240,7 +277,19 @@ async def _clear_claimant(client: ToolClient, project_root: str, violation: Viol
 
 
 def holder_task_ids(project_root: str) -> frozenset[str]:
-    return frozenset(read_scheduler_state(Path(project_root)).current_holders.values())
+    snapshot = read_scheduler_state_strict(Path(project_root))
+    return frozenset() if snapshot is None else snapshot.holder_task_ids()
+
+
+def _holder_preflight(root: str, selected: Sequence[Violation]) -> tuple[tuple[int, ...], str | None]:
+    """The selected rows the scheduler holds, or why its holder set could not be read."""
+    if not selected:
+        return (), None
+    try:
+        holders = holder_task_ids(root)
+    except SchedulerStateUnreadable as exc:
+        return (), _describe(exc)
+    return tuple(sorted(v.task_id for v in selected if str(v.task_id) in holders)), None
 
 
 def observed_delta(
@@ -321,22 +370,23 @@ async def apply_repairs(
     tiers: frozenset[Tier],
     clock: Callable[[], datetime],
 ) -> ApplyReport:
+    _require_repairable(tiers)
     if client is None:
         raise ValueError('apply_repairs writes through an MCP client; none was given')
     root = census.project_root
     selected = tuple(v for v in census.violations if v.tier in tiers)
-    holders = holder_task_ids(root)
-    held = tuple(sorted(v.task_id for v in selected if str(v.task_id) in holders))
-    if held:
-        return ApplyReport(
-            project_root=root,
-            tiers=_ordered(tiers),
-            refused=True,
-            holder_intersection=held,
-            outcomes=(),
-            verification_census=None,
-            verification_error=None,
-        )
+    held, holder_set_error = _holder_preflight(root, selected)
+    preflight = ApplyReport(
+        project_root=root,
+        tiers=_ordered(tiers),
+        holder_intersection=held,
+        holder_set_error=holder_set_error,
+        outcomes=(),
+        verification_census=None,
+        verification_error=None,
+    )
+    if preflight.refused:
+        return preflight
     attempts = {
         violation.key: await _attempt_repair(client, root, violation, clock())
         for violation in selected
@@ -345,11 +395,8 @@ async def apply_repairs(
         verification, verification_error = take_census(root, clock()), None
     except UNREADABLE_STORE_ERRORS as exc:
         verification, verification_error = None, _describe(exc)
-    return ApplyReport(
-        project_root=root,
-        tiers=_ordered(tiers),
-        refused=False,
-        holder_intersection=(),
+    return replace(
+        preflight,
         outcomes=bucket_outcomes(selected, attempts, verification, tiers),
         verification_census=verification,
         verification_error=verification_error,
@@ -382,6 +429,7 @@ async def sweep(
     client: ToolClient | None,
     clock: Callable[[], datetime],
 ) -> SweepResult:
+    _require_repairable(tiers)
     if apply and client is None:
         raise ValueError('an applying sweep writes through an MCP client; none was given')
     projects: list[ProjectReport] = []
@@ -438,10 +486,19 @@ def _outcome_line(outcome: RowOutcome) -> str:
     return format_kv_line(pairs, indent='    ')
 
 
+def _refusal_line(report: ApplyReport) -> str:
+    if report.refusal is RefusalReason.HOLDER_SET_UNREADABLE:
+        return (
+            '  apply: refused, nothing was written; the scheduler lock-holder set '
+            f'could not be read: {report.holder_set_error}'
+        )
+    held = ' '.join(str(task_id) for task_id in report.holder_intersection)
+    return f'  apply: refused, nothing was written; current lock holders among the selected rows: {held}'
+
+
 def _apply_lines(report: ApplyReport) -> list[str]:
     if report.refused:
-        held = ' '.join(str(task_id) for task_id in report.holder_intersection)
-        return [f'  apply: refused, nothing was written; current lock holders among the selected rows: {held}']
+        return [_refusal_line(report)]
     lines = [format_kv_line(list(report.counts().items()), indent='  buckets: ')]
     lines.extend(_outcome_line(outcome) for outcome in report.outcomes)
     if report.verification_census is not None:
@@ -497,7 +554,9 @@ def _apply_json(report: ApplyReport) -> dict[str, Any]:
     verification = report.verification_census
     return {
         'refused': report.refused,
+        'refusal_reason': report.refusal,
         'holder_intersection': list(report.holder_intersection),
+        'holder_set_error': report.holder_set_error,
         'counts': report.counts(),
         'buckets': {
             bucket: [_outcome_json(o) for o in report.outcomes if o.bucket is bucket]
@@ -534,6 +593,7 @@ class ExitCode(IntEnum):
     NOTHING_READ = 3
     SERVER_UNREACHABLE = 4
     HOLDER_REFUSED = 5
+    HOLDER_SET_UNREADABLE = 6
 
 
 _EXIT_CODE_MEANINGS = {
@@ -546,6 +606,10 @@ _EXIT_CODE_MEANINGS = {
         '--apply refused a project because a selected row is a current lock holder; '
         'that project was not written'
     ),
+    ExitCode.HOLDER_SET_UNREADABLE: (
+        '--apply refused a project because its scheduler_state.json exists but could not be read '
+        'as a snapshot, so the lock-holder pre-flight could not check; that project was not written'
+    ),
 }
 
 
@@ -554,9 +618,11 @@ def exit_conditions(result: SweepResult) -> tuple[ExitCode, ...]:
     if not result.projects:
         return (ExitCode.NOTHING_READ,)
     reports = [project.apply for project in result.projects if project.apply is not None]
+    refusals = {report.refusal for report in reports}
     conditions = {
         ExitCode.REPAIR_FAILED: any(report.counts()[Bucket.FAILED] for report in reports),
-        ExitCode.HOLDER_REFUSED: any(report.refused for report in reports),
+        ExitCode.HOLDER_SET_UNREADABLE: RefusalReason.HOLDER_SET_UNREADABLE in refusals,
+        ExitCode.HOLDER_REFUSED: RefusalReason.HOLDERS_IN_SELECTION in refusals,
     }
     return tuple(code for code, present in conditions.items() if present)
 
@@ -638,7 +704,7 @@ async def _applying_sweep(
 
 
 async def main_async(args: argparse.Namespace) -> int:
-    tiers = frozenset({Tier.TERMINAL, Tier.HYGIENE} if args.repair_hygiene else {Tier.TERMINAL})
+    tiers = REPAIRABLE_TIERS if args.repair_hygiene else frozenset({Tier.TERMINAL})
     if args.apply:
         result = await _applying_sweep(args.server_url, args.project_roots, tiers)
         if result is None:

@@ -1,11 +1,12 @@
-// data.js's on-demand seam: the ON_DEMAND_KEYS rows (terminal, taskProse);
+// data.js's on-demand seam: the ON_DEMAND_KEYS rows (terminal, taskProse,
+// quality, qualitySnapshotDiff);
 // requestOnDemand with its joining and retention; REFRESH_OUTCOMES; and what a
 // requesting caller reads back (onDemandView, onDemandDatum). Run via
 // `node --test`; dashboard/tests/test_graph_layout_js.py globs it.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { loadDataJs, drain, quietly } from './_data_loader.mjs';
+import { loadDataJs, drain, quietly, warningsFrom } from './_data_loader.mjs';
 import {
   CURATOR_PATH,
   PLAIN_SPEC,
@@ -163,7 +164,13 @@ test('on-demand: flow-control and staleness are recorded under the request\'s OW
   assert.equal(state.get(TASKS_PATH), undefined, 'the on-demand request took over the POLLED tasks entry');
   assert.ok(win.DF_DATA.__stale[TERMINAL_STATE_KEY], 'the on-demand request published no staleness of its own');
   assert.equal(win.DF_DATA.__stale[TASKS_PATH], undefined, "the on-demand request wrote the polled endpoint's __stale");
-  assert.deepEqual(win.DF_DATA.__receipt[TERMINAL_STATE_KEY], { servedAt: '2026-09-20T09:00:01+00:00', receivedAt: 77, window: null });
+  assert.deepEqual(win.DF_DATA.__receipt[TERMINAL_STATE_KEY], {
+    servedAt: '2026-09-20T09:00:01+00:00',
+    receivedAt: 77,
+    window: null,
+    pacingHoldMs: 0,
+    assetBuild: { started: null, onDisk: null },
+  });
   assert.equal(win.DF_DATA.__receipt[TASKS_PATH], undefined, "the on-demand receipt landed on the polled endpoint's path");
 });
 
@@ -745,5 +752,221 @@ test('on-demand retention: a row that declares no retain keeps every param', asy
 
   for (const project of projects) {
     assert.ok(win.DF_DATA[`TASKS_TERMINAL:${project}`], `${project} was forgotten`);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// quality — one request, three param-scoped fields (task 8461)
+//
+// /api/v2/dashboard/quality answers with FIXED body keys (QUALITY,
+// QUALITY_MARKERS, QUALITY_SNAPSHOTS), but its value depends on the query, so
+// each field lands under `<FIELD>:<query>`. The query is built once, by
+// qualityQuery, and used only as an opaque identity. The route is not polled:
+// a read costs about a second and its data moves on a 600 s sampler tick.
+// ---------------------------------------------------------------------------
+
+const QUALITY_PATH = '/api/v2/dashboard/quality';
+const QUALITY_FIELDS = ['QUALITY', 'QUALITY_MARKERS', 'QUALITY_SNAPSHOTS'];
+const QUALITY_WINDOW_ECHO = Object.freeze({ requested: '100', served: '100', landings: 100 });
+
+function qualityDatum(value) {
+  return { value, as_of: '2026-11-12T09:00:00+00:00', state: 'fresh', reason: null, freshness_bound_seconds: 1200 };
+}
+
+function qualityBody(overrides = {}) {
+  return {
+    QUALITY: qualityDatum({ axis: [], metrics: {} }),
+    QUALITY_MARKERS: qualityDatum({ markers: [] }),
+    QUALITY_SNAPSHOTS: qualityDatum({ series: [] }),
+    WINDOW: QUALITY_WINDOW_ECHO,
+    served_at: '2026-11-12T09:00:01+00:00',
+    ...overrides,
+  };
+}
+
+function qualityResponse(body = qualityBody()) {
+  return () => Promise.resolve({ ok: true, json: async () => body });
+}
+
+test('qualityQuery: fixed key order, URL-encoded, module omitted when absent', () => {
+  const { api } = loadDataJs();
+  const { qualityQuery } = api;
+
+  assert.equal(qualityQuery({ project: 'dark_factory', window: '100', module: null }), 'project=dark_factory&window=100');
+  assert.equal(qualityQuery({ project: 'dark_factory', window: '100' }), 'project=dark_factory&window=100');
+  assert.equal(
+    qualityQuery({ module: 'dashboard/src', window: '300', project: 'a b&c' }),
+    'project=a%20b%26c&window=300&module=dashboard%2Fsrc',
+  );
+  assert.equal(
+    qualityQuery({ project: 'p', window: 'all', module: 'm' }),
+    qualityQuery({ module: 'm', project: 'p', window: 'all' }),
+    'equal inputs give equal params, whatever their key order',
+  );
+});
+
+test('quality: the row builds its url from the query and keys each field under it', () => {
+  const { api } = loadDataJs();
+  const row = api.ON_DEMAND_KEYS.quality;
+  const q = api.qualityQuery({ project: 'p', window: '100' });
+
+  assert.equal(row.url(q), `${QUALITY_PATH}?${q}`);
+  assert.deepEqual([...row.fields], QUALITY_FIELDS);
+  for (const field of QUALITY_FIELDS) assert.equal(row.key(q, field), `${field}:${q}`);
+  assert.equal(row.key(q), row.key(q, 'QUALITY'), 'the bare key names the QUALITY field');
+  assert.equal(row.spec.kind, 'datum');
+  assert.ok(Number.isInteger(row.retain) && row.retain >= 1, `quality.retain must be a positive integer, got ${row.retain}`);
+});
+
+test('quality: one fetch lands all three Datums under their query-scoped keys, receipt-stamped', async () => {
+  const { api, window: win } = loadDataJs();
+  const q = api.qualityQuery({ project: 'p', window: '100' });
+  const fetchUrls = [];
+  const inner = qualityResponse();
+  const deps = { fetchImpl: url => { fetchUrls.push(url); return inner(url); }, now: () => 777 };
+
+  const outcome = await api.requestOnDemand('quality', q, { state: api.createPollState(), deps });
+
+  assert.equal(outcome, api.REFRESH_OUTCOMES.applied);
+  assert.deepEqual(fetchUrls, [api.ON_DEMAND_KEYS.quality.url(q)]);
+  for (const field of QUALITY_FIELDS) {
+    const stored = win.DF_DATA[api.ON_DEMAND_KEYS.quality.key(q, field)];
+    assert.ok(stored, `${field} did not land`);
+    assert.deepEqual(stored.value, qualityBody()[field].value, field);
+    assert.equal(stored._served_at, '2026-11-12T09:00:01+00:00', field);
+    assert.equal(stored._received_at, 777, field);
+    assert.equal(win.DF_DATA.__loaded[api.ON_DEMAND_KEYS.quality.key(q, field)], true, field);
+  }
+  assert.equal(win.DF_DATA.QUALITY, undefined, 'no field lands under its bare body key');
+});
+
+test('quality: a field that is not a Datum is refused loudly while the other two land', async () => {
+  const { api, window: win } = loadDataJs();
+  const q = api.qualityQuery({ project: 'p', window: '100' });
+  const deps = { fetchImpl: qualityResponse(qualityBody({ QUALITY_MARKERS: { markers: [] } })), now: () => 1 };
+
+  const warnings = await warningsFrom(() => api.requestOnDemand('quality', q, { state: api.createPollState(), deps }));
+
+  assert.equal(win.DF_DATA[api.ON_DEMAND_KEYS.quality.key(q, 'QUALITY_MARKERS')], undefined);
+  assert.ok(warnings.some(args => args.includes(api.ON_DEMAND_KEYS.quality.key(q, 'QUALITY_MARKERS'))), 'the refusal names the key');
+  assert.ok(win.DF_DATA[api.ON_DEMAND_KEYS.quality.key(q, 'QUALITY')]);
+  assert.ok(win.DF_DATA[api.ON_DEMAND_KEYS.quality.key(q, 'QUALITY_SNAPSHOTS')]);
+});
+
+test('quality: onDemandReceipt exposes the WINDOW echo the body carried', async () => {
+  const { api } = loadDataJs();
+  const q = api.qualityQuery({ project: 'p', window: '100' });
+  assert.equal(api.onDemandReceipt('quality', q), null, 'no receipt before the request');
+
+  await api.requestOnDemand('quality', q, { state: api.createPollState(), deps: { fetchImpl: qualityResponse(), now: () => 1 } });
+
+  assert.deepEqual(api.onDemandReceipt('quality', q).window, QUALITY_WINDOW_ECHO);
+});
+
+test('quality: onDemandDatum answers the field it is asked for, QUALITY by default', async () => {
+  const { api, window: win } = loadDataJs();
+  const q = api.qualityQuery({ project: 'p', window: '100' });
+  const outcome = await api.requestOnDemand('quality', q, { state: api.createPollState(), deps: { fetchImpl: qualityResponse(), now: () => 1 } });
+  const { key } = api.ON_DEMAND_KEYS.quality;
+
+  assert.equal(api.onDemandDatum('quality', q, outcome, 'QUALITY_MARKERS'), win.DF_DATA[key(q, 'QUALITY_MARKERS')]);
+  assert.equal(api.onDemandDatum('quality', q, outcome), win.DF_DATA[key(q, 'QUALITY')]);
+  const other = api.qualityQuery({ project: 'p', window: '300' });
+  assert.equal(api.onDemandDatum('quality', other, null, 'QUALITY_SNAPSHOTS').state, 'unknown');
+});
+
+test('quality retention: trimming forgets every field, its __loaded mark and the receipt', async () => {
+  const { api, window: win } = loadDataJs();
+  const state = api.createPollState();
+  const { retain, key } = api.ON_DEMAND_KEYS.quality;
+  const deps = { fetchImpl: qualityResponse(), now: () => 9 };
+  const queries = Array.from({ length: retain + 1 }, (_, i) => api.qualityQuery({ project: `p${i}`, window: '100' }));
+
+  for (const q of queries) await api.requestOnDemand('quality', q, { state, deps });
+
+  const [oldest, ...kept] = queries;
+  for (const field of QUALITY_FIELDS) {
+    assert.equal(win.DF_DATA[key(oldest, field)], undefined, `${field} of the oldest query is still held`);
+    assert.equal(win.DF_DATA.__loaded[key(oldest, field)], undefined, `${field}'s __loaded mark is still held`);
+    for (const q of kept) assert.ok(win.DF_DATA[key(q, field)], `${field} of ${q} was forgotten inside the cap`);
+  }
+  assert.equal(api.onDemandReceipt('quality', oldest), null, 'the oldest receipt is still held');
+  assert.equal(state.size, retain);
+  assert.equal(Object.keys(win.DF_DATA.__receipt).length, retain);
+});
+
+test('quality: the route is on demand only, never in the polled registry', () => {
+  const { api } = loadDataJs();
+  for (const win of ['24h', '7d', '30d', 'all']) {
+    const paths = Object.keys(api.endpointsFor(win)).map(api.pollKey);
+    assert.equal(paths.includes(QUALITY_PATH), false, `endpointsFor('${win}') polls ${QUALITY_PATH}`);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// qualitySnapshotDiff — one snapshot point's instrument --diff text (task 8465)
+//
+// /api/v2/dashboard/quality/snapshot-diff answers with a FIXED body key,
+// QUALITY_SNAPSHOT_DIFF, whose value depends on the query, so it lands under
+// `QUALITY_SNAPSHOT_DIFF:<query>`. PLAIN: the diff is the instrument's report
+// text, not a measurement. The query is built once, by snapshotDiffQuery.
+// ---------------------------------------------------------------------------
+
+const SNAPSHOT_DIFF_PATH = '/api/v2/dashboard/quality/snapshot-diff';
+const SERVED_DIFF = Object.freeze({
+  point_id: 'nightly-2', previous_id: 'nightly-1', state: 'ready', text: 'params differ: python_version\n', reason: null,
+});
+
+test('snapshotDiffQuery: fixed key order and URL-encoded', () => {
+  const { api } = loadDataJs();
+  const { snapshotDiffQuery } = api;
+
+  assert.equal(snapshotDiffQuery({ project: 'dark_factory', point: 'nightly-2' }), 'project=dark_factory&point=nightly-2');
+  assert.equal(
+    snapshotDiffQuery({ point: 'review-all dark/factory&2', project: 'a b' }),
+    'project=a%20b&point=review-all%20dark%2Ffactory%262',
+  );
+  assert.equal(
+    snapshotDiffQuery({ project: 'p', point: 'x' }),
+    snapshotDiffQuery({ point: 'x', project: 'p' }),
+    'equal inputs give equal params, whatever their key order',
+  );
+});
+
+test('qualitySnapshotDiff: the row builds its url from the query and keys its one plain field under it', () => {
+  const { api } = loadDataJs();
+  const row = api.ON_DEMAND_KEYS.qualitySnapshotDiff;
+  const q = api.snapshotDiffQuery({ project: 'p', point: 'nightly-2' });
+
+  assert.ok(row, 'ON_DEMAND_KEYS.qualitySnapshotDiff must be declared');
+  assert.equal(row.url(q), `${SNAPSHOT_DIFF_PATH}?${q}`);
+  assert.equal(row.key(q), `QUALITY_SNAPSHOT_DIFF:${q}`);
+  assert.deepEqual([...row.fields], ['QUALITY_SNAPSHOT_DIFF']);
+  assert.equal(row.spec.kind, 'plain');
+  assert.equal(row.retain, 8);
+});
+
+test('qualitySnapshotDiff: one fetch stores the served diff verbatim under its query-scoped key', async () => {
+  const { api, window: win } = loadDataJs();
+  const q = api.snapshotDiffQuery({ project: 'p', point: 'nightly-2' });
+  const fetchUrls = [];
+  const deps = {
+    fetchImpl: url => { fetchUrls.push(url); return Promise.resolve({ ok: true, json: async () => ({ QUALITY_SNAPSHOT_DIFF: SERVED_DIFF }) }); },
+    now: () => 5,
+  };
+
+  const outcome = await api.requestOnDemand('qualitySnapshotDiff', q, { state: api.createPollState(), deps });
+
+  assert.equal(outcome, api.REFRESH_OUTCOMES.applied);
+  assert.deepEqual(fetchUrls, [`${SNAPSHOT_DIFF_PATH}?${q}`]);
+  assert.deepEqual(win.DF_DATA[api.ON_DEMAND_KEYS.qualitySnapshotDiff.key(q)], SERVED_DIFF);
+  assert.equal(win.DF_DATA.QUALITY_SNAPSHOT_DIFF, undefined, 'nothing lands under the bare body key');
+});
+
+test('qualitySnapshotDiff: the route is on demand only, never in the polled registry', () => {
+  const { api } = loadDataJs();
+  for (const win of ['24h', '7d', '30d', 'all']) {
+    const paths = Object.keys(api.endpointsFor(win)).map(api.pollKey);
+    assert.equal(paths.includes(SNAPSHOT_DIFF_PATH), false, `endpointsFor('${win}') polls ${SNAPSHOT_DIFF_PATH}`);
   }
 });

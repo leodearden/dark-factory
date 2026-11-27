@@ -44,7 +44,7 @@ capability↔prompt coupling IS runtime behaviour (unlike the wording), so
 `test_role_holds_every_mcp_tool_its_prompt_names` pins it, generically:
 parametrized over every role in `ROLES` (not just STEWARD, since any role's
 prompt can name a tool its allowlist doesn't grant), and wildcard-aware (a
-role granting `mcp__<family>__*` -- e.g. jcodemunch, verdict-tools --
+role granting `mcp__<family>__*` -- e.g. verdict-tools --
 satisfies any prompt mention of a specific tool in that family). It asserts
 on tool GRANTS, not on wording, so any rephrasing that keeps naming a tool
 still passes, and dropping the tool from the allowlist (or naming a new
@@ -58,18 +58,11 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from _roles_helpers import tool_is_granted
 
 from orchestrator.agents.roles import ROLES
 
 _MCP_TOOL_RE = re.compile(r'mcp__[a-z0-9-]+__[a-z0-9_]+')
-
-
-def _tool_is_granted(tool: str, granted: set[str]) -> bool:
-    """True if `tool` is granted directly, or covered by a `mcp__<family>__*` wildcard."""
-    if tool in granted:
-        return True
-    family_prefix, sep, _name = tool.rpartition('__')
-    return sep == '__' and f'{family_prefix}__*' in granted
 
 
 @pytest.mark.parametrize('role_key', sorted(ROLES))
@@ -88,7 +81,7 @@ def test_role_holds_every_mcp_tool_its_prompt_names(role_key: str) -> None:
     role = ROLES[role_key]
     named = set(_MCP_TOOL_RE.findall(role.system_prompt))
     granted = set(role.allowed_tools)
-    missing = sorted(t for t in named if not _tool_is_granted(t, granted))
+    missing = sorted(t for t in named if not tool_is_granted(t, granted))
     assert not missing, (
         f"{role_key}'s system_prompt prescribes MCP tools absent from its allowed_tools "
         f'allowlist: {missing}. Each role passes allowed_tools to the SDK as an '

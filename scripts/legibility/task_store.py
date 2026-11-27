@@ -3,7 +3,8 @@ resolves through: ``find_tasks_by_metadata``, ``search_tasks``, ``get_task``
 and ``resolve_ticket`` (fused-memory/src/fused_memory/server/tools.py). Each
 reply is parsed here into a frozen value, and anything that is not a usable
 answer raises StoreUnreachable, which never means "no match"
-(plans/census-incremental-prd.md L4; docs/quality-findings-contract.md §8).
+(plans/census-incremental-prd.md L4; docs/quality-findings-contract.md §8);
+a degraded reply raises StoreUnreachable's subclass StoreDegraded.
 """
 from __future__ import annotations
 
@@ -26,15 +27,27 @@ class StoreUnreachable(Exception):
     means "no match"."""
 
 
+class StoreDegraded(StoreUnreachable):
+    """The store answered ``degraded: true``, its report that a backing service
+    (an embedder or Qdrant) is out, so the same call may answer on a later run.
+    That is not guaranteed: the corpus search behind it
+    (fused-memory/src/fused_memory/middleware/task_curator.py::TaskCurator.search_corpus)
+    reports every failure as degraded, so a failure deterministic for one
+    query answers degraded on every run."""
+
+
 class _MalformedReply(ValueError):
     pass
 
 
 class TicketStatus(enum.StrEnum):
+    PENDING = "pending"
+    AWAITING_CURATION = "awaiting_curation"
     CREATED = "created"
     COMBINED = "combined"
     REFUSED = "refused"
     FAILED = "failed"
+    CANCELLED = "cancelled"
 
 
 @dataclass(frozen=True)
@@ -68,7 +81,10 @@ class TicketOutcome:
 
     @property
     def undecided(self) -> bool:
-        """The wait expired before the curator decided; the ticket may still be decided."""
+        """The curator has not decided yet; the ticket may still be decided."""
+        if self.status in (TicketStatus.PENDING, TicketStatus.AWAITING_CURATION):
+            return True
+        # A pre-6705 fused-memory answers an expired wait failed/timeout; task 8004 retires this.
         return self.status is TicketStatus.FAILED and self.reason == "timeout"
 
 
@@ -199,6 +215,10 @@ class McpTaskStore:
             )
         except Exception as exc:
             raise StoreUnreachable(f"{tool}: the call raised {type(exc).__name__}: {exc}") from exc
+        if isinstance(reply, Mapping) and reply.get("degraded") is True:
+            raise StoreDegraded(
+                f"{tool}: degraded: {reply.get('error_type', 'error')}: {reply.get('error', 'no error text')}"
+            )
         if isinstance(reply, Mapping) and "error" in reply:
             raise StoreUnreachable(f"{tool}: {reply.get('error_type', 'error')}: {reply['error']}")
         try:

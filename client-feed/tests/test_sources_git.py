@@ -1,12 +1,21 @@
 """Read-only git plumbing confined to one root, over throwaway repositories."""
 
+import functools
 import os
+import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
-from _git_repo import Repo, make_repo
+from _git_repo import (
+    Repo,
+    make_repo,
+    path_with_git_answering,
+    path_with_git_replaced_on,
+    path_with_git_stalled_on,
+)
 
 from client_feed.contract import Branch
 from client_feed.sources.git import (
@@ -25,6 +34,7 @@ from client_feed.sources.git import (
     last_changes,
     main_head,
     merge_stats,
+    path_entry,
     repository_toplevel,
     task_branches,
     tree_changes,
@@ -133,6 +143,62 @@ def test_tree_entries_lists_files_symlinks_and_submodules(repo: Repo) -> None:
     assert set(entries) == {'src/a.py', 'bin/run', 'odd name/ünï.txt', 'src/link', 'vendor/lib'}
 
 
+CRITERIA = 'acceptance/criteria.yaml'
+
+
+def test_path_entry_is_the_file_a_commit_holds_at_the_path(repo: Repo) -> None:
+    repo.write(CRITERIA, 'format: 1\n')
+    repo.write('acceptance/other.yaml', 'x\n')
+    commit = repo.commit('one', when=T0)
+
+    assert path_entry(repo.root, commit, CRITERIA) == TreeEntry(
+        path=CRITERIA, kind=EntryKind.FILE, object_sha=repo.rev(f'{commit}:{CRITERIA}'), size=10
+    )
+
+
+def test_path_entry_is_none_when_the_commit_holds_no_such_path(repo: Repo) -> None:
+    repo.write('a.txt', 'a\n')
+    commit = repo.commit('one', when=T0)
+
+    assert path_entry(repo.root, commit, CRITERIA) is None
+
+
+def test_path_entry_is_none_when_the_path_is_a_directory(repo: Repo) -> None:
+    repo.write(f'{CRITERIA}/x', 'x\n')
+    commit = repo.commit('one', when=T0)
+
+    assert path_entry(repo.root, commit, CRITERIA) is None
+
+
+def test_path_entry_names_a_committed_symlink(repo: Repo) -> None:
+    repo.symlink(CRITERIA, '/home/someone/secret')
+    commit = repo.commit('one', when=T0)
+
+    entry = path_entry(repo.root, commit, CRITERIA)
+
+    assert entry is not None
+    assert entry.kind is EntryKind.SYMLINK
+
+
+def test_path_entry_reads_the_commit_not_the_working_tree(repo: Repo) -> None:
+    repo.write(CRITERIA, 'format: 1\n')
+    commit = repo.commit('one', when=T0)
+    repo.write(CRITERIA, 'an uncommitted edit\n')
+    repo.write('acceptance/untracked.yaml', 'x\n')
+
+    entry = path_entry(repo.root, commit, CRITERIA)
+
+    assert entry is not None
+    assert entry.object_sha == repo.rev(f'{commit}:{CRITERIA}')
+    assert path_entry(repo.root, commit, 'acceptance/untracked.yaml') is None
+
+
+@pytest.mark.parametrize('bad', ['--output=x', 'HEAD', 'a' * 39, 'A' * 40])
+def test_path_entry_refuses_a_non_hex_commit_before_git_runs(tmp_path: Path, bad: str) -> None:
+    with pytest.raises(ValueError, match='sha'):
+        path_entry(tmp_path / 'missing', bad, CRITERIA)
+
+
 def test_blob_reader_reads_committed_bytes_in_one_session(repo: Repo) -> None:
     repo.write('a.txt', b'alpha\n')
     repo.write('b.bin', b'\x00\x01\nbeta')
@@ -170,6 +236,24 @@ def test_reading_an_unknown_blob_raises_a_typed_error(repo: Repo) -> None:
 
     assert caught.value.subcommand == 'cat-file'
     assert str(repo.root) not in str(caught.value)
+
+
+def test_a_blob_read_git_never_answers_fails_as_a_timeout(
+    repo: Repo, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo.write('a.txt', 'a\n')
+    commit = repo.commit('one', when=T0)
+    blob = repo.rev(f'{commit}:a.txt')
+    monkeypatch.setenv('PATH', path_with_git_stalled_on(tmp_path / 'bin', 'cat-file', seconds=30))
+    started = time.monotonic()
+
+    with pytest.raises(GitError) as caught, blob_reader(repo.root, timeout_secs=0.5) as read:
+        read(blob)
+
+    assert caught.value.subcommand == 'cat-file'
+    assert caught.value.returncode is None
+    assert 'timed out' in caught.value.reason
+    assert time.monotonic() - started < 15
 
 
 @pytest.mark.parametrize('commit', ['--output=x', 'HEAD', 'a' * 39, 'A' * 40, f'{"a" * 40}\n'])
@@ -579,3 +663,78 @@ def test_change_readers_refuse_a_non_hex_sha_before_git_runs(tmp_path: Path, bad
     for call in calls:
         with pytest.raises(ValueError, match='sha'):
             call()
+
+
+def _answering(subcommand: str, stdout: bytes) -> Callable[[Path], str]:
+    return functools.partial(path_with_git_answering, subcommand=subcommand, stdout=stdout)
+
+
+def _read_one_blob(root: Path, sha: str) -> bytes:
+    with blob_reader(root) as read:
+        return read(sha)
+
+
+PARSE_FAILURE = 'output not understood'
+UNPARSABLE_OUTPUTS = [
+    pytest.param(
+        'ls-tree', _answering('ls-tree', b'garbage\0'), tree_entries, id='tree_entries'
+    ),
+    pytest.param(
+        'for-each-ref',
+        _answering('for-each-ref', b'refs/heads/task/7\x00not-a-time\x000 0\n'),
+        lambda root, sha: task_branches(root),
+        id='task_branches',
+    ),
+    pytest.param(
+        'diff-tree', _answering('diff-tree', b'x\ty\tpath\0'), merge_stats, id='merge_stats'
+    ),
+    pytest.param(
+        'log',
+        _answering('log', b'\x01not-a-time\0'),
+        lambda root, sha: last_changes(root, sha, since=None),
+        id='last_changes',
+    ),
+    pytest.param(
+        'diff-tree',
+        _answering('diff-tree', b':bogus\0'),
+        lambda root, sha: tree_changes(root, sha, sha),
+        id='tree_changes',
+    ),
+    pytest.param(
+        'log',
+        _answering('log', b':bogus\0'),
+        lambda root, sha: first_parent_changes(root, since=sha, head=sha),
+        id='first_parent_changes',
+    ),
+    pytest.param(
+        'cat-file',
+        functools.partial(
+            path_with_git_replaced_on,
+            subcommand='cat-file',
+            shell='read line; printf \'%s blob many\\n\' "$line"; exit 0',
+        ),
+        _read_one_blob,
+        id='blob_reader',
+    ),
+]
+
+
+@pytest.mark.parametrize(('subcommand', 'fake_git', 'reads'), UNPARSABLE_OUTPUTS)
+def test_git_output_that_does_not_parse_is_a_git_error_of_its_command(
+    repo: Repo,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    subcommand: str,
+    fake_git: Callable[[Path], str],
+    reads: Callable[[Path, str], object],
+) -> None:
+    repo.write('a.txt', 'a\n')
+    commit = repo.commit('one', when=T0)
+    monkeypatch.setenv('PATH', fake_git(tmp_path / 'bin'))
+
+    with pytest.raises(GitError) as caught:
+        reads(repo.root, commit)
+
+    assert caught.value.subcommand == subcommand
+    assert PARSE_FAILURE in caught.value.reason
+    assert str(repo.root) not in str(caught.value)

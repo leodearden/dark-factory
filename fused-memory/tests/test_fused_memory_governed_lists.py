@@ -11,9 +11,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import fm_timeout_marker_grandfathered
+import pytest
 from _fm_helpers import load_script_module
 from shared.governed_exceptions import Debt, Policy, TaskRef, governed_exceptions
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.memory_metadata import BLESSED_METADATA_KEYS
 from fused_memory.middleware import (
@@ -25,6 +26,8 @@ from fused_memory.middleware import (
 from fused_memory.middleware.cancelled_premise_blocklist import load_blocklist
 from fused_memory.middleware.recon_code_fix_premise_guard import load_premise_registry
 from fused_memory.reconciliation import flag_dedup, internal_writers, mem0_tombstone
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 _PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 
@@ -47,17 +50,17 @@ WALL_CLOCK_DEADLINE_BASELINE = governed_exceptions(
     'Per-file budgets of wall-clock-deadline (Rule C) violations grandfathered when the '
     'rule was adopted; each budget may only fall.',
     ['fused-memory/scripts/check_bare_magicmock_config.py::_WALL_CLOCK_DEADLINE_DEBT'],
-    default=Debt(TaskRef(6201)),
+    default=Debt(TaskRef(11471)),
     default_covers=1,
 )
 
-FUSED_MEMORY_TIMEOUT_MARKER_GRANDFATHERED = governed_exceptions(
-    'fused_memory_tests.fm_timeout_marker_grandfathered.INVERSION_BAND_GRANDFATHERED',
-    'An in-band timeout-marker site in fused-memory/tests that predates the timeout-marker '
-    'inversion guard, exempt from it until migrated; entries may only be removed.',
-    sorted('::'.join(site) for site in fm_timeout_marker_grandfathered.INVERSION_BAND_GRANDFATHERED),
-    default=Debt(TaskRef(6337)),
-    default_covers=20,
+TIMING_DEPENDENCE_BASELINE = governed_exceptions(
+    'fused_memory_scripts._timing_dependence_debt.TIMING_DEPENDENCE_DEBT',
+    'Per-file budgets of timing-dependence (Rule D) violations grandfathered when the '
+    'rule was adopted; each budget may only fall.',
+    ['fused-memory/scripts/_timing_dependence_debt.py::TIMING_DEPENDENCE_DEBT'],
+    default=Debt(TaskRef(9513)),
+    default_covers=1,
 )
 
 CANCELLED_PREMISE_BLOCKLIST = governed_exceptions(
@@ -168,4 +171,12 @@ def test_the_wall_clock_baseline_unit_still_has_a_baseline() -> None:
         'check_bare_magicmock_config._WALL_CLOCK_DEADLINE_DEBT has been burned down or '
         'deleted, so WALL_CLOCK_DEADLINE_BASELINE (its key and list_id) must be deleted '
         'with it.'
+    )
+
+
+def test_the_timing_dependence_baseline_unit_still_has_a_baseline() -> None:
+    debt = load_script_module(_PACKAGE_ROOT / 'scripts' / '_timing_dependence_debt.py')
+    assert debt.TIMING_DEPENDENCE_DEBT, (
+        '_timing_dependence_debt.TIMING_DEPENDENCE_DEBT has been burned down or emptied, so '
+        'TIMING_DEPENDENCE_BASELINE (its key and list_id) must be deleted with it.'
     )

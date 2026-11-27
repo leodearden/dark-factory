@@ -64,7 +64,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, NamedTuple, Protocol
 
-from _task_db_scan import UNREADABLE_STORE_ERRORS
+from _task_db_scan import UNREADABLE_STORE_ERRORS, discover_or_report_no_default_root
 from audit_wiped_metadata_files import (
     CONTRADICTED_REAL_MERGE_SHA,
     FIDELITY_FILE_LEVEL,
@@ -567,7 +567,7 @@ async def repair_one(
                 "metadata_mode": "merge",
             },
         )
-    except Exception as exc:  # noqa: BLE001 — a per-task failure, never fatal
+    except Exception as exc:  # a per-task failure, never fatal
         return RepairOutcome(
             task_id=candidate.task_id,
             tag=candidate.tag,
@@ -773,7 +773,7 @@ async def repair_project(
                     "project_root": project_root,
                 },
             )
-        except Exception as exc:  # noqa: BLE001 — transport-only, by construction; see below
+        except Exception as exc:  # transport-only, by construction; see below
             # This arm can ONLY be client-side/transport. The fused-memory
             # tool layer never raises across the wire — @mcp_tool_errors
             # (fused-memory/src/fused_memory/server/tool_errors.py:44-59)
@@ -1231,7 +1231,9 @@ async def main_async(args: argparse.Namespace) -> int:
     (:data:`EXIT_NOTHING_SCANNED`), so :data:`EXIT_WRITE_FAILED` keeps its one
     documented meaning.
     """
-    roots = discover_project_roots(project_roots=args.project_roots)
+    roots = discover_or_report_no_default_root(
+        lambda: discover_project_roots(project_roots=args.project_roots)
+    )
     if not roots:
         print(
             "no project root resolvable with a readable tasks.db (checked "

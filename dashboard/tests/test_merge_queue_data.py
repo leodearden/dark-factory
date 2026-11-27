@@ -5,7 +5,10 @@ from __future__ import annotations
 import asyncio
 import json
 import sqlite3
+import time
 from datetime import UTC, datetime, timedelta
+from itertools import pairwise
+from typing import TypeVar
 from unittest.mock import AsyncMock, patch
 
 import aiosqlite
@@ -17,6 +20,8 @@ from _dashboard_helpers import (
     mcp_notify_response,
     mcp_tool_response,
 )
+from _runs_db_fixture import runs_db_path, write_runs_db
+from shared.testing_virtual_clock import virtual_clock_test
 
 # ---------------------------------------------------------------------------
 # Schema — events table from orchestrator/src/orchestrator/event_store.py
@@ -131,20 +136,48 @@ from dashboard.data import merge_queue  # noqa: E402
 from dashboard.data.datum import Datum, DatumState, validate_datum  # noqa: E402
 from dashboard.data.merge_queue import (  # noqa: E402
     RECENT_MERGES_CAP,
+    TRAILING_WINDOW_LADDER,
+    LandingRateSeries,
+    ProjectRunsDb,
     _align_bucket,
     _bucket_minutes_for_window,
     _cutoff_iso,
     _ts_sort_key,
     enrich_merges_with_titles,
+    landing_rate,
     merge_attempts,
     merge_task_refs,
     queue_depth_timeseries,
     recent_merges,
     resolve_active,
     speculative_stats,
+    trailing_landing_rates,
 )
 from dashboard.data.stats_utils import percentile  # noqa: E402
 from dashboard.data.task_lookup import TaskRef  # noqa: E402
+
+_Read = TypeVar('_Read')
+
+
+def fresh_read(datum: Datum[_Read], now: datetime) -> _Read:
+    """*datum*'s value, once checked to be a FRESH runs.db window read measured at *now*."""
+    assert datum.state is DatumState.FRESH, datum.reason
+    assert datum.as_of == now
+    assert datum.freshness_bound_seconds == merge_queue.RUNS_DB_READ_FRESHNESS_BOUND_SECONDS
+    validate_datum(datum, now)
+    assert datum.value is not None
+    return datum.value
+
+
+def assert_unread(datum: Datum, now: datetime, *fragments: str) -> None:
+    """*datum* is a valid UNKNOWN whose non-empty reason names every one of *fragments*."""
+    assert datum.state is DatumState.UNKNOWN
+    assert (datum.value, datum.as_of) == (None, None)
+    reason = datum.reason or ''
+    assert reason.strip()
+    for fragment in fragments:
+        assert fragment in reason, (fragment, reason)
+    validate_datum(datum, now)
 
 # ---------------------------------------------------------------------------
 # TestBucketMinutesForWindow
@@ -313,10 +346,10 @@ class TestQueueDepthTimeseries:
 
         async with aiosqlite.connect(str(merge_events_db)) as db:
             db.row_factory = aiosqlite.Row
-            result = await queue_depth_timeseries(db, hours=24, now=now)
+            series = fresh_read(await queue_depth_timeseries(db, hours=24, now=now), now)
 
-        labels = result['labels']
-        values = result['values']
+        labels = series['labels']
+        values = series['values']
 
         assert len(labels) == 97
         assert len(values) == 97
@@ -346,26 +379,48 @@ class TestQueueDepthTimeseries:
 
         async with aiosqlite.connect(str(merge_events_db)) as db:
             db.row_factory = aiosqlite.Row
-            result = await queue_depth_timeseries(db, hours=24, now=now)
+            series = fresh_read(await queue_depth_timeseries(db, hours=24, now=now), now)
 
-        assert expected_label in result['labels']
-        idx = result['labels'].index(expected_label)
-        assert result['values'][idx] == 1
+        assert expected_label in series['labels']
+        idx = series['labels'].index(expected_label)
+        assert series['values'][idx] == 1
 
     @pytest.mark.asyncio
     async def test_none_db(self):
-        """None DB returns empty ChartData."""
-        result = await queue_depth_timeseries(None, hours=24)
-        assert result == {'labels': [], 'values': []}
+        """A project with no runs.db open counted nothing, so its series is unknown."""
+        now = datetime(2026, 4, 11, 12, 7, 30, tzinfo=UTC)
+        assert_unread(await queue_depth_timeseries(None, hours=24, now=now), now, 'no runs.db is open')
+
+    @pytest.mark.asyncio
+    async def test_unreadable_db_is_unknown_never_an_empty_series(self, tableless_runs_conn):
+        """with_db swallows the OperationalError; its default must still say the read failed."""
+        now = datetime(2026, 4, 11, 12, 7, 30, tzinfo=UTC)
+        assert_unread(await queue_depth_timeseries(tableless_runs_conn, hours=168, now=now), now)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'hours, minutes', [(24, 15), (168, 60), (720, 360), (87600, 1440)],
+    )
+    async def test_labels_are_spaced_at_the_windows_bucket_width(
+        self, empty_merge_events_conn, hours, minutes,
+    ):
+        """The labels are spaced exactly the ladder's width apart; the series serves no width key."""
+        now = datetime(2026, 4, 11, 12, 7, 30, tzinfo=UTC)
+        series = fresh_read(await queue_depth_timeseries(empty_merge_events_conn, hours=hours, now=now), now)
+
+        assert 'bucket_minutes' not in series
+        starts = [datetime.fromisoformat(label) for label in series['labels']]
+        gaps = {later - earlier for earlier, later in pairwise(starts)}
+        assert gaps == {timedelta(minutes=minutes)}
 
     @pytest.mark.asyncio
     async def test_empty_db(self, empty_merge_events_conn):
         """No events → 97 buckets all with count 0."""
         now = datetime(2026, 4, 11, 12, 7, 30, tzinfo=UTC)
-        result = await queue_depth_timeseries(empty_merge_events_conn, hours=24, now=now)
-        assert len(result['labels']) == 97
-        assert len(result['values']) == 97
-        assert all(v == 0 for v in result['values'])
+        series = fresh_read(await queue_depth_timeseries(empty_merge_events_conn, hours=24, now=now), now)
+        assert len(series['labels']) == 97
+        assert len(series['values']) == 97
+        assert all(v == 0 for v in series['values'])
 
     @pytest.mark.asyncio
     async def test_7d_uses_1h_buckets(self, merge_events_db):
@@ -384,10 +439,10 @@ class TestQueueDepthTimeseries:
 
         async with aiosqlite.connect(str(merge_events_db)) as db:
             db.row_factory = aiosqlite.Row
-            result = await queue_depth_timeseries(db, hours=168, now=now)
+            series = fresh_read(await queue_depth_timeseries(db, hours=168, now=now), now)
 
-        labels = result['labels']
-        values = result['values']
+        labels = series['labels']
+        values = series['values']
 
         assert len(labels) == 169
         assert len(values) == 169
@@ -420,10 +475,10 @@ class TestQueueDepthTimeseries:
 
         async with aiosqlite.connect(str(merge_events_db)) as db:
             db.row_factory = aiosqlite.Row
-            result = await queue_depth_timeseries(db, hours=720, now=now)
+            series = fresh_read(await queue_depth_timeseries(db, hours=720, now=now), now)
 
-        labels = result['labels']
-        values = result['values']
+        labels = series['labels']
+        values = series['values']
 
         assert len(labels) == 121
 
@@ -449,9 +504,9 @@ class TestQueueDepthTimeseries:
         - diff = 3650 days → 3650 + 1 = 3651 buckets
         """
         now = datetime(2026, 4, 11, 12, 7, 30, tzinfo=UTC)
-        result = await queue_depth_timeseries(empty_merge_events_conn, hours=87600, now=now)
+        series = fresh_read(await queue_depth_timeseries(empty_merge_events_conn, hours=87600, now=now), now)
 
-        labels = result['labels']
+        labels = series['labels']
         assert len(labels) == 3651, (
             f"Expected exactly 3651 daily buckets, got {len(labels)} "
             f"(regression guard against the 350 401-bucket blowup)"
@@ -495,16 +550,16 @@ class TestQueueDepthTimeseries:
 
         async with aiosqlite.connect(str(merge_events_db)) as db:
             db.row_factory = aiosqlite.Row
-            result = await queue_depth_timeseries(db, hours=24, now=now)
+            series = fresh_read(await queue_depth_timeseries(db, hours=24, now=now), now)
 
         first_label = cutoff_aligned.isoformat()
-        assert first_label in result['labels'], (
+        assert first_label in series['labels'], (
             f"Expected first bucket label {first_label!r} in labels"
         )
-        idx = result['labels'].index(first_label)
-        assert result['values'][idx] == 1, (
+        idx = series['labels'].index(first_label)
+        assert series['values'][idx] == 1, (
             f"First bucket should have count=1 for the event at {event_ts.isoformat()}, "
-            f"got {result['values'][idx]}"
+            f"got {series['values'][idx]}"
         )
 
     @pytest.mark.asyncio
@@ -537,16 +592,16 @@ class TestQueueDepthTimeseries:
 
         async with aiosqlite.connect(str(merge_events_db)) as db:
             db.row_factory = aiosqlite.Row
-            result = await queue_depth_timeseries(db, hours=24, now=now)
+            series = fresh_read(await queue_depth_timeseries(db, hours=24, now=now), now)
 
         last_label = now_aligned.isoformat()
-        assert last_label in result['labels'], (
+        assert last_label in series['labels'], (
             f"Expected last bucket label {last_label!r} in labels"
         )
-        idx = result['labels'].index(last_label)
-        assert result['values'][idx] == 1, (
+        idx = series['labels'].index(last_label)
+        assert series['values'][idx] == 1, (
             f"Last bucket should have count=1 for the event at {event_ts.isoformat()}, "
-            f"got {result['values'][idx]}"
+            f"got {series['values'][idx]}"
         )
 
     @pytest.mark.asyncio
@@ -577,17 +632,202 @@ class TestQueueDepthTimeseries:
 
         async with aiosqlite.connect(str(merge_events_db)) as db:
             db.row_factory = aiosqlite.Row
-            result = await queue_depth_timeseries(db, hours=24, now=now)
+            series = fresh_read(await queue_depth_timeseries(db, hours=24, now=now), now)
 
         last_label = now_aligned.isoformat()
-        assert last_label in result['labels'], (
+        assert last_label in series['labels'], (
             f"Expected last bucket label {last_label!r} in labels"
         )
-        idx = result['labels'].index(last_label)
-        assert result['values'][idx] == 1, (
+        idx = series['labels'].index(last_label)
+        assert series['values'][idx] == 1, (
             f"Last bucket should have count=1 for the event at exact effective_now "
-            f"({event_ts.isoformat()}), got {result['values'][idx]}"
+            f"({event_ts.isoformat()}), got {series['values'][idx]}"
         )
+
+
+# ---------------------------------------------------------------------------
+# TestTrailingLandingRates — landings/day over the trailing window ending at each point
+# ---------------------------------------------------------------------------
+
+RATE_NOW = datetime(2026, 4, 11, 12, 7, 30, tzinfo=UTC)
+"""Deliberately off every bucket boundary: the points are anchored at the request instant."""
+
+
+def _rate_at(series: LandingRateSeries, instant: datetime) -> float:
+    return series['values'][series['labels'].index(instant.isoformat())]
+
+
+class TestTrailingLandingRates:
+    @pytest.mark.parametrize('hours,expected', [
+        (24, 1440),
+        (168, 1440),
+        (336, 1440),
+        (337, 10080),
+        (720, 10080),
+        (87600, 10080),
+    ])
+    def test_trailing_window_ladder_tiers(self, hours, expected):
+        assert trailing_landing_rates((), now=RATE_NOW, hours=hours)['trailing_minutes'] == expected
+
+    def test_the_trailing_ladder_ends_in_a_catch_all(self):
+        assert TRAILING_WINDOW_LADDER[-1][0] is None
+
+    @pytest.mark.parametrize('hours', [24, 168, 720, 87600])
+    def test_points_are_one_bucket_apart_from_the_window_start_to_now(self, hours):
+        series = trailing_landing_rates((), now=RATE_NOW, hours=hours)
+
+        step = _bucket_minutes_for_window(hours)
+        assert len(series['labels']) == hours * 60 // step + 1
+        instants = [datetime.fromisoformat(label) for label in series['labels']]
+        assert {later - earlier for earlier, later in pairwise(instants)} == {
+            timedelta(minutes=step),
+        }
+        assert series['labels'][-1] == RATE_NOW.isoformat()
+        assert instants[0] == RATE_NOW - timedelta(hours=hours)
+        assert series['values'] == [0] * len(series['labels'])
+
+    def test_the_rate_does_not_drop_to_zero_between_landings(self):
+        landed = [RATE_NOW - timedelta(hours=10), RATE_NOW - timedelta(hours=3)]
+
+        series = trailing_landing_rates(landed, now=RATE_NOW, hours=24)
+
+        assert series['values'][-1] == 2.0
+        assert _rate_at(series, RATE_NOW - timedelta(hours=5)) == 1.0
+        since_first = [
+            value for label, value in zip(series['labels'], series['values'], strict=True)
+            if datetime.fromisoformat(label) >= landed[0]
+        ]
+        assert since_first
+        assert 0 not in since_first
+
+    def test_the_first_point_counts_its_whole_trailing_window(self):
+        landed = [RATE_NOW - timedelta(hours=24 + 12)]
+
+        series = trailing_landing_rates(landed, now=RATE_NOW, hours=24)
+
+        assert series['values'][0] == 1.0
+
+    def test_a_seven_day_trailing_window_divides_by_seven(self):
+        week = [RATE_NOW - timedelta(days=day, hours=1) for day in range(6, -1, -1)]
+
+        assert trailing_landing_rates(week, now=RATE_NOW, hours=720)['values'][-1] == 1.0
+        assert trailing_landing_rates(week[-1:], now=RATE_NOW, hours=720)['values'][-1] == 0.14
+
+    def test_each_point_counts_the_half_open_trailing_window_ending_there(self):
+        trailing = timedelta(days=1)
+        landed = [RATE_NOW - trailing, RATE_NOW]
+
+        series = trailing_landing_rates(landed, now=RATE_NOW, hours=24)
+
+        assert series['values'][-1] == 1.0
+        assert _rate_at(series, RATE_NOW - trailing) == 1.0
+
+    def test_the_window_mean_is_per_day_of_the_window_not_an_average_of_points(self):
+        landed = [RATE_NOW - timedelta(hours=49), RATE_NOW - timedelta(hours=1)]
+
+        series = trailing_landing_rates(landed, now=RATE_NOW, hours=168)
+
+        assert series['window_mean_per_day'] == pytest.approx(2 / 7)
+        assert series['values'][0] == 0
+
+    def test_a_landing_in_the_trailing_lead_in_is_outside_the_window_mean(self):
+        landed = [RATE_NOW - timedelta(hours=24 + 12)]
+
+        series = trailing_landing_rates(landed, now=RATE_NOW, hours=24)
+
+        assert series['values'][0] == 1.0
+        assert series['window_mean_per_day'] == 0
+
+    def test_the_window_mean_counts_the_half_open_window_ending_now(self):
+        landed = [RATE_NOW - timedelta(hours=24), RATE_NOW]
+
+        series = trailing_landing_rates(landed, now=RATE_NOW, hours=24)
+
+        assert series['window_mean_per_day'] == 1.0
+
+    def test_the_window_mean_is_served_unrounded(self):
+        landed = [RATE_NOW - timedelta(hours=63 - 7 * k) for k in range(10)]
+
+        series = trailing_landing_rates(landed, now=RATE_NOW, hours=720)
+
+        assert series['window_mean_per_day'] == pytest.approx(10 / 30)
+
+    def test_a_window_with_no_landings_has_a_zero_mean(self):
+        assert trailing_landing_rates((), now=RATE_NOW, hours=24)['window_mean_per_day'] == 0
+
+    def test_landings_in_any_order_count_as_they_would_sorted(self):
+        landed = [RATE_NOW - timedelta(hours=h) for h in (3, 30, 1, 12, 20)]
+
+        assert trailing_landing_rates(landed, now=RATE_NOW, hours=24) == trailing_landing_rates(
+            sorted(landed), now=RATE_NOW, hours=24,
+        )
+
+
+# ---------------------------------------------------------------------------
+# TestLandingRate — the runs.db leg behind the throughput panel
+# ---------------------------------------------------------------------------
+
+def _done_merge(at: datetime, task_id: str, sha: str):
+    return (at, task_id, 'merge_finalized', {'state': 'done', 'merge_sha': sha})
+
+
+def _train_merged(at: datetime, members: list[str], sha: str):
+    return (at, members[-1], 'train_merged', {
+        'train_id': f'train-{sha}', 'member_task_ids': members,
+        'merge_commit_sha': sha, 'base_sha': 'b',
+    })
+
+
+class TestLandingRate:
+    async def test_train_members_land_one_each_beside_a_solo_merge(self, tmp_path):
+        store = write_runs_db(tmp_path / 'proj', [
+            _train_merged(RATE_NOW - timedelta(hours=2), ['21', '22', '23'], 'train-sha'),
+            _done_merge(RATE_NOW - timedelta(hours=5), '24', 'solo-sha'),
+        ])
+
+        series = fresh_read(await landing_rate(store, hours=24, now=RATE_NOW), RATE_NOW)
+
+        assert series['values'][-1] == 4.0
+        assert series['window_mean_per_day'] == 4.0
+        assert series['trailing_minutes'] == 1440
+
+    async def test_no_open_runs_db_is_unknown(self):
+        assert_unread(await landing_rate(None, hours=24, now=RATE_NOW), RATE_NOW, 'no runs.db is open')
+
+    async def test_a_missing_runs_db_is_unknown_not_zeros(self, tmp_path):
+        assert_unread(
+            await landing_rate(runs_db_path(tmp_path / 'proj'), hours=24, now=RATE_NOW),
+            RATE_NOW, 'TaskDbUnreadable', 'no such file',
+        )
+
+    async def test_a_runs_db_with_no_events_table_is_unknown_not_zeros(self, tmp_path):
+        store = write_runs_db(tmp_path / 'proj', [_done_merge(RATE_NOW - timedelta(hours=1), '31', 'sha')])
+        with sqlite3.connect(store) as conn:
+            conn.execute('DROP TABLE events')
+        conn.close()
+
+        assert_unread(
+            await landing_rate(store, hours=24, now=RATE_NOW), RATE_NOW, 'OperationalError', 'no such table: events',
+        )
+
+    async def test_an_unrecognised_train_payload_is_unknown_naming_it(self, tmp_path):
+        store = write_runs_db(tmp_path / 'proj', [
+            (RATE_NOW - timedelta(hours=1), '41', 'train_merged', {'train_id': 'x', 'verdict': 'other'}),
+        ])
+
+        assert_unread(
+            await landing_rate(store, hours=24, now=RATE_NOW), RATE_NOW, 'UnrecognisedTrainEvent',
+        )
+
+    async def test_a_readable_runs_db_with_no_landings_reads_measured_zeros(self, tmp_path):
+        store = write_runs_db(tmp_path / 'proj', [
+            (RATE_NOW - timedelta(hours=1), '51', 'merge_attempt', {'outcome': 'done'}),
+        ])
+
+        series = fresh_read(await landing_rate(store, hours=24, now=RATE_NOW), RATE_NOW)
+
+        assert series['values']
+        assert set(series['values']) == {0}
 
 
 # ---------------------------------------------------------------------------
@@ -597,10 +837,11 @@ class TestQueueDepthTimeseries:
 ATTEMPTS_NOW = datetime(2026, 4, 11, 12, 0, 0, tzinfo=UTC)
 """The injected instant every ``merge_attempts`` case reads its window against."""
 
-ZERO_LATENCY = {
-    'p50': 0, 'p95': 0, 'p99': 0, 'mean_ms': 0.0,
+UNTIMED_LATENCY = {
+    'p50': None, 'p95': None, 'p99': None, 'mean_ms': None,
     'with_duration': 0, 'without_duration': 0,
 }
+"""A window with no timed attempt: no centile is invented over zero samples."""
 
 
 def _attempt(minutes_ago, outcome, duration_ms=None):
@@ -634,18 +875,23 @@ async def _merge_attempts_over(tmp_path, events, *, hours=24):
         return await merge_attempts(conn, hours=hours, now=ATTEMPTS_NOW)
 
 
+async def _attempts_read_over(tmp_path, events, *, hours=24):
+    """The record of a readable window, once checked FRESH at :data:`ATTEMPTS_NOW`."""
+    return fresh_read(await _merge_attempts_over(tmp_path, events, hours=hours), ATTEMPTS_NOW)
+
+
 class TestMergeAttempts:
     """``merge_attempts`` reads the window once; the chart and latency agree."""
 
     async def test_the_chart_counts_every_attempt(self, tmp_path):
-        result = await _merge_attempts_over(tmp_path, FIVE_ATTEMPTS)
+        result = await _attempts_read_over(tmp_path, FIVE_ATTEMPTS)
 
         assert result.outcome_chart() == {
             'labels': ['conflict', 'done', 'blocked'], 'values': [2, 2, 1],
         }
 
     async def test_latency_reads_only_the_attempts_with_a_duration(self, tmp_path):
-        result = await _merge_attempts_over(tmp_path, FIVE_ATTEMPTS)
+        result = await _attempts_read_over(tmp_path, FIVE_ATTEMPTS)
 
         latency = result.latency()
         assert latency['with_duration'] == 3
@@ -657,7 +903,7 @@ class TestMergeAttempts:
 
     async def test_every_attempt_is_counted_once_in_the_latency_split(self, tmp_path):
         """Sketch #9: the donut total IS the latency block's attempt total."""
-        result = await _merge_attempts_over(tmp_path, FIVE_ATTEMPTS)
+        result = await _attempts_read_over(tmp_path, FIVE_ATTEMPTS)
 
         latency = result.latency()
         assert sum(result.outcome_chart()['values']) == (
@@ -671,13 +917,13 @@ class TestMergeAttempts:
             _attempt(3, 'done', 300), _attempt(4, 'done', 200),
             _attempt(5, 'done', 100),
         ]
-        result = await _merge_attempts_over(tmp_path, events)
+        result = await _attempts_read_over(tmp_path, events)
 
         assert result.durations == (100.0, 200.0, 300.0, 400.0, 500.0)
 
     async def test_populated_outcomes(self, tmp_path):
         outcomes = ['done'] * 3 + ['conflict'] * 2 + ['blocked', 'already_merged']
-        result = await _merge_attempts_over(
+        result = await _attempts_read_over(
             tmp_path, [_attempt(10, outcome) for outcome in outcomes],
         )
 
@@ -691,7 +937,7 @@ class TestMergeAttempts:
         outcomes = (
             ['conflict'] * 3 + ['blocked'] * 2 + ['done'] * 2 + ['zzz', 'aaa']
         )
-        result = await _merge_attempts_over(
+        result = await _attempts_read_over(
             tmp_path, [_attempt(5, outcome) for outcome in outcomes],
         )
 
@@ -702,7 +948,7 @@ class TestMergeAttempts:
 
     async def test_equal_counts_sorted_alphabetically(self, tmp_path):
         outcomes = ['already_merged', 'done', 'conflict', 'blocked']
-        result = await _merge_attempts_over(
+        result = await _attempts_read_over(
             tmp_path, [_attempt(5, outcome) for outcome in outcomes],
         )
 
@@ -712,7 +958,7 @@ class TestMergeAttempts:
 
     async def test_non_canonical_outcomes_are_counted(self, tmp_path):
         outcomes = ['done', 'done', 'wip_halted', 'done_wip_recovery']
-        result = await _merge_attempts_over(
+        result = await _attempts_read_over(
             tmp_path, [_attempt(5, outcome) for outcome in outcomes],
         )
 
@@ -722,7 +968,7 @@ class TestMergeAttempts:
         }
 
     async def test_an_unrecorded_outcome_counts_as_unknown(self, tmp_path):
-        result = await _merge_attempts_over(
+        result = await _attempts_read_over(
             tmp_path, [_attempt(5, None, 100), _attempt(6, 'done', 200)],
         )
 
@@ -734,9 +980,9 @@ class TestMergeAttempts:
         events = [
             _attempt(10 + i, 'done', ms) for i, ms in enumerate(range(100, 1100, 100))
         ]
-        latency = (await _merge_attempts_over(tmp_path, events)).latency()
+        latency = (await _attempts_read_over(tmp_path, events)).latency()
 
-        assert set(latency) == set(ZERO_LATENCY)
+        assert set(latency) == set(UNTIMED_LATENCY)
         assert latency['with_duration'] == 10
         assert latency['without_duration'] == 0
         assert latency['mean_ms'] == pytest.approx(550.0, abs=1e-6)
@@ -744,26 +990,36 @@ class TestMergeAttempts:
         assert latency['p95'] > latency['p50']
         assert latency['p99'] >= latency['p95']
 
-    async def test_all_null_durations_give_zero_latency_over_every_attempt(self, tmp_path):
+    async def test_all_null_durations_give_no_centile_over_every_attempt(self, tmp_path):
+        """Three untimed attempts are counted, and no centile is invented over zero samples."""
         events = [_attempt(i + 1, 'done', None) for i in range(3)]
-        result = await _merge_attempts_over(tmp_path, events)
+        result = await _attempts_read_over(tmp_path, events)
 
-        assert result.latency() == {**ZERO_LATENCY, 'without_duration': 3}
+        assert result.latency() == {**UNTIMED_LATENCY, 'without_duration': 3}
         assert sum(result.outcome_chart()['values']) == 3
 
-    async def test_no_db_is_an_empty_record(self):
-        result = await merge_attempts(None, hours=24, now=ATTEMPTS_NOW)
+    async def test_no_db_is_unknown(self):
+        """A project with no runs.db open has no attempts to count, not zero attempts."""
+        assert_unread(
+            await merge_attempts(None, hours=24, now=ATTEMPTS_NOW), ATTEMPTS_NOW,
+            'no runs.db is open',
+        )
 
-        assert result.outcome_chart() == {'labels': [], 'values': []}
-        assert result.latency() == ZERO_LATENCY
+    async def test_a_failed_read_is_unknown(self, tableless_runs_conn):
+        """with_db swallows the OperationalError; its default must still say the read failed."""
+        assert_unread(
+            await merge_attempts(tableless_runs_conn, hours=24, now=ATTEMPTS_NOW), ATTEMPTS_NOW,
+        )
 
     async def test_an_empty_db_is_an_empty_record(self, empty_merge_events_conn):
-        result = await merge_attempts(
-            empty_merge_events_conn, hours=24, now=ATTEMPTS_NOW,
+        """A readable empty window is measured: no outcomes, and no centiles."""
+        result = fresh_read(
+            await merge_attempts(empty_merge_events_conn, hours=24, now=ATTEMPTS_NOW),
+            ATTEMPTS_NOW,
         )
 
         assert result.outcome_chart() == {'labels': [], 'values': []}
-        assert result.latency() == ZERO_LATENCY
+        assert result.latency() == UNTIMED_LATENCY
 
     async def test_attempts_older_than_the_window_are_excluded(self, tmp_path):
         events = [
@@ -771,7 +1027,7 @@ class TestMergeAttempts:
             _attempt(90, 'conflict', 200),
             _attempt(95, 'conflict', None),
         ]
-        result = await _merge_attempts_over(tmp_path, events, hours=1)
+        result = await _attempts_read_over(tmp_path, events, hours=1)
 
         assert result.outcome_chart() == {'labels': ['done'], 'values': [1]}
         assert result.latency()['with_duration'] == 1
@@ -1336,7 +1592,7 @@ class TestBuildPerProjectMergeQueue:
         ):
             conn1.row_factory = aiosqlite.Row
             conn2.row_factory = aiosqlite.Row
-            project_dbs = [('/tmp/A', conn1), ('/tmp/B', conn2)]
+            project_dbs = [ProjectRunsDb('/tmp/A', conn1, db1_path), ProjectRunsDb('/tmp/B', conn2, db2_path)]
             result = await build_per_project_merge_queue(
                 project_dbs, hours=24, now=now,
             )
@@ -1345,9 +1601,10 @@ class TestBuildPerProjectMergeQueue:
         assert isinstance(result, dict)
         assert set(result.keys()) == {'/tmp/A', '/tmp/B'}
 
-        # (b) each value has the expected keys
+        # (b) each value has the expected keys; one attempts Datum, no split outcomes/latency
         for pid_data in result.values():
-            assert set(pid_data.keys()) >= {'depth_timeseries', 'outcomes', 'latency', 'recent', 'speculative'}
+            assert set(pid_data.keys()) >= {'depth_timeseries', 'attempts', 'recent', 'speculative'}
+            assert not {'outcomes', 'latency'} & set(pid_data.keys())
 
     async def test_per_project_isolation(self, tmp_path):
         """Each project's stats reflect only its own DB rows."""
@@ -1371,7 +1628,7 @@ class TestBuildPerProjectMergeQueue:
         ):
             conn1.row_factory = aiosqlite.Row
             conn2.row_factory = aiosqlite.Row
-            project_dbs = [('/tmp/A', conn1), ('/tmp/B', conn2)]
+            project_dbs = [ProjectRunsDb('/tmp/A', conn1, db1_path), ProjectRunsDb('/tmp/B', conn2, db2_path)]
             result = await build_per_project_merge_queue(
                 project_dbs, hours=24, now=now,
             )
@@ -1402,7 +1659,7 @@ class TestBuildPerProjectMergeQueue:
 
         async with aiosqlite.connect(str(db_path)) as conn:
             conn.row_factory = aiosqlite.Row
-            project_dbs = [('/tmp/A', conn)]
+            project_dbs = [ProjectRunsDb('/tmp/A', conn, db_path)]
             result = await build_per_project_merge_queue(project_dbs, hours=1, now=now)
 
         recent = result['/tmp/A']['recent']
@@ -1417,17 +1674,17 @@ class TestBuildPerProjectMergeQueue:
         from dashboard.data.merge_queue import build_per_project_merge_queue
 
         now = datetime(2026, 4, 11, 12, 0, 0, tzinfo=UTC)
-        project_dbs = [('/tmp/nofile', None)]
+        project_dbs = [ProjectRunsDb('/tmp/nofile', None, tmp_path / 'nofile.db')]
         result = await build_per_project_merge_queue(
             project_dbs, hours=24, now=now,
         )
 
         assert '/tmp/nofile' in result
         data = result['/tmp/nofile']
-        assert set(data.keys()) >= {'depth_timeseries', 'outcomes', 'latency', 'recent', 'speculative'}
-        assert data['depth_timeseries'] == {'labels': [], 'values': []}
-        assert data['outcomes'] == {'labels': [], 'values': []}
-        assert data['latency'] == ZERO_LATENCY
+        assert set(data.keys()) >= {'depth_timeseries', 'attempts', 'recent', 'speculative'}
+        assert not {'outcomes', 'latency'} & set(data.keys())
+        assert_unread(data['depth_timeseries'], now, 'no runs.db is open')
+        assert_unread(data['attempts'], now, 'no runs.db is open')
         assert data['recent'] == []
         for field in ('speculative', 'recent_total'):
             assert data[field].state is DatumState.UNKNOWN, field
@@ -1450,8 +1707,8 @@ class TestBuildPerProjectMergeQueue:
         async with aiosqlite.connect(str(db_path)) as conn:
             conn.row_factory = aiosqlite.Row
             project_dbs = [
-                ('/tmp/real', conn),
-                ('/tmp/none', None),
+                ProjectRunsDb('/tmp/real', conn, db_path),
+                ProjectRunsDb('/tmp/none', None, tmp_path / 'none.db'),
             ]
             result = await build_per_project_merge_queue(
                 project_dbs, hours=24, now=now,
@@ -1462,14 +1719,16 @@ class TestBuildPerProjectMergeQueue:
 
         # None-db entry produces defaults without crashing
         none_data = result['/tmp/none']
-        assert none_data['latency']['with_duration'] == 0
+        assert_unread(none_data['attempts'], now)
         assert none_data['recent'] == []
         for field in ('speculative', 'recent_total'):
             assert none_data[field].state is DatumState.UNKNOWN, field
 
         # Real-but-empty entry: its zeros were measured
         real_data = result['/tmp/real']
-        assert set(real_data.keys()) >= {'depth_timeseries', 'outcomes', 'latency', 'recent', 'speculative'}
+        assert set(real_data.keys()) >= {'depth_timeseries', 'attempts', 'recent', 'speculative'}
+        assert not {'outcomes', 'latency'} & set(real_data.keys())
+        assert fresh_read(real_data['attempts'], now).outcome_chart() == {'labels': [], 'values': []}
         assert real_data['speculative'].state is DatumState.FRESH
         assert real_data['speculative'].value['total'] == 0
         assert real_data['recent_total'].state is DatumState.FRESH
@@ -1477,6 +1736,43 @@ class TestBuildPerProjectMergeQueue:
         for data in result.values():
             for field in ('speculative', 'recent_total'):
                 validate_datum(data[field], now)
+
+    async def test_a_read_depth_is_spaced_at_the_windows_width_an_unread_one_is_unknown(self, tmp_path):
+        """A real empty project counted at the window's width; a (pid, None) one counted nothing."""
+        from dashboard.data.merge_queue import build_per_project_merge_queue
+
+        now = datetime(2026, 4, 11, 12, 0, 0, tzinfo=UTC)
+        db_path = _make_db(tmp_path, 'real.db', [])
+
+        async with aiosqlite.connect(str(db_path)) as conn:
+            conn.row_factory = aiosqlite.Row
+            result = await build_per_project_merge_queue(
+                [ProjectRunsDb('/tmp/real', conn, db_path), ProjectRunsDb('/tmp/none', None, tmp_path / 'none.db')],
+                hours=168, now=now,
+            )
+
+        series = fresh_read(result['/tmp/real']['depth_timeseries'], now)
+        assert 'bucket_minutes' not in series
+        starts = [datetime.fromisoformat(label) for label in series['labels']]
+        assert {later - earlier for earlier, later in pairwise(starts)} == {timedelta(minutes=60)}
+        assert_unread(result['/tmp/none']['depth_timeseries'], now)
+
+    async def test_the_landing_rate_reads_the_projects_runs_db_path_not_its_label(self, tmp_path):
+        """A label that names no directory still serves the landings its path records; a train lands once per member."""
+        from dashboard.data.merge_queue import build_per_project_merge_queue
+
+        store = write_runs_db(tmp_path / 'proj', [
+            _done_merge(RATE_NOW - timedelta(hours=3), '11', 'sha-11'),
+            _train_merged(RATE_NOW - timedelta(hours=1), ['12', '13'], 'train-13'),
+        ])
+
+        async with aiosqlite.connect(str(store)) as conn:
+            conn.row_factory = aiosqlite.Row
+            result = await build_per_project_merge_queue(
+                [ProjectRunsDb('not/a/root', conn, store)], hours=24, now=RATE_NOW,
+            )
+
+        assert fresh_read(result['not/a/root']['landing_rate'], RATE_NOW)['values'][-1] == 3.0
 
     async def test_the_outcome_total_is_the_latency_attempt_total(self, tmp_path):
         """Sketch #9, second half: one row set behind the donut and the latency."""
@@ -1492,12 +1788,12 @@ class TestBuildPerProjectMergeQueue:
 
         async with aiosqlite.connect(str(db_path)) as conn:
             conn.row_factory = aiosqlite.Row
-            result = await build_per_project_merge_queue([('/tmp/A', conn)], hours=24, now=now)
+            result = await build_per_project_merge_queue([ProjectRunsDb('/tmp/A', conn, db_path)], hours=24, now=now)
 
-        project = result['/tmp/A']
-        latency = project['latency']
+        attempts = fresh_read(result['/tmp/A']['attempts'], now)
+        latency = attempts.latency()
         assert (latency['with_duration'], latency['without_duration']) == (1, 1)
-        assert sum(project['outcomes']['values']) == (
+        assert sum(attempts.outcome_chart()['values']) == (
             latency['with_duration'] + latency['without_duration']
         )
 
@@ -1543,7 +1839,10 @@ class TestBuildPerProjectMergeQueue:
             c0.row_factory = aiosqlite.Row
             c1.row_factory = aiosqlite.Row
             c2.row_factory = aiosqlite.Row
-            project_dbs = [(f'/tmp/P{i}', c) for i, c in enumerate([c0, c1, c2])]
+            project_dbs = [
+                ProjectRunsDb(f'/tmp/P{i}', c, path)
+                for i, (c, path) in enumerate(zip([c0, c1, c2], db_paths, strict=True))
+            ]
 
             with patch(
                 'dashboard.data.merge_queue.merge_attempts',
@@ -1600,7 +1899,7 @@ class TestBuildPerProjectMergeQueue:
 
         async with aiosqlite.connect(str(db_path)) as conn:
             conn.row_factory = aiosqlite.Row
-            result = await build_per_project_merge_queue([('/tmp/P', conn)], hours=hours, now=now)
+            result = await build_per_project_merge_queue([ProjectRunsDb('/tmp/P', conn, db_path)], hours=hours, now=now)
 
         project = result['/tmp/P']
         assert [r['task_id'] for r in project['recent']] == expected_ids
@@ -1628,7 +1927,7 @@ class TestBuildPerProjectMergeQueue:
 
         async with aiosqlite.connect(str(db_path)) as conn:
             conn.row_factory = aiosqlite.Row
-            result = await build_per_project_merge_queue([('/tmp/P', conn)], hours=24, now=now)
+            result = await build_per_project_merge_queue([ProjectRunsDb('/tmp/P', conn, db_path)], hours=24, now=now)
 
         project = result['/tmp/P']
         assert [r['task_id'] for r in project['recent']] == [
@@ -1640,6 +1939,10 @@ class TestBuildPerProjectMergeQueue:
     @pytest.mark.parametrize('leg, field, sibling', [
         ('speculative_stats', 'speculative', 'recent_total'),
         ('recent_merges', 'recent_total', 'speculative'),
+        ('queue_depth_timeseries', 'depth_timeseries', 'speculative'),
+        ('merge_attempts', 'attempts', 'speculative'),
+        ('train_throughput_stats', 'train_throughput', 'speculative'),
+        ('landing_rate', 'landing_rate', 'speculative'),
     ])
     async def test_a_raising_leg_serves_unknown_not_zeros(self, tmp_path, leg, field, sibling):
         """A leg that raises is a hole in its own field; its siblings stay measured."""
@@ -1654,7 +1957,7 @@ class TestBuildPerProjectMergeQueue:
                 f'dashboard.data.merge_queue.{leg}',
                 new=AsyncMock(side_effect=RuntimeError('boom')),
             ):
-                result = await build_per_project_merge_queue([('/tmp/P', conn)], hours=24, now=now)
+                result = await build_per_project_merge_queue([ProjectRunsDb('/tmp/P', conn, db_path)], hours=24, now=now)
 
         project = result['/tmp/P']
         assert project[field].state is DatumState.UNKNOWN
@@ -1678,14 +1981,58 @@ class TestBuildPerProjectMergeQueue:
                 'dashboard.data.merge_queue.safe_gather_result',
                 side_effect=RuntimeError('boom'),
             ):
-                result = await build_per_project_merge_queue([('/tmp/P', conn)], hours=24, now=now)
+                result = await build_per_project_merge_queue([ProjectRunsDb('/tmp/P', conn, db_path)], hours=24, now=now)
 
         project = result['/tmp/P']
         assert project['recent'] == []
-        for field in ('speculative', 'recent_total'):
+        assert project['runs_db_present'] is True, 'a project whose build raised had a db'
+        for field in (
+            'speculative', 'recent_total', 'depth_timeseries', 'attempts', 'train_throughput',
+            'landing_rate',
+        ):
             assert project[field].state is DatumState.UNKNOWN, field
+            assert '/tmp/P' in (project[field].reason or ''), field
             assert 'RuntimeError: boom' in (project[field].reason or ''), field
             validate_datum(project[field], now)
+
+    async def test_a_root_with_no_runs_db_file_is_absent_not_unreadable(self, tmp_path):
+        """No file serves ``runs_db_present`` False; a file that did not open stays present."""
+        from dashboard.data.merge_queue import build_per_project_merge_queue
+
+        now = datetime(2026, 4, 23, 12, 0, 0, tzinfo=UTC)
+        db_path = _make_db(tmp_path, 'real.db', [])
+
+        async with aiosqlite.connect(str(db_path)) as conn:
+            conn.row_factory = aiosqlite.Row
+            result = await build_per_project_merge_queue(
+                [
+                    ProjectRunsDb('/tmp/real', conn, db_path),
+                    ProjectRunsDb('/tmp/nofile', None, tmp_path / 'nofile.db'),
+                    ProjectRunsDb('/tmp/unopenable', None, tmp_path / 'unopenable.db'),
+                ],
+                hours=24, now=now, runs_db_absent=frozenset({'/tmp/nofile'}),
+            )
+
+        presence = {pid: project['runs_db_present'] for pid, project in result.items()}
+        assert presence == {'/tmp/real': True, '/tmp/nofile': False, '/tmp/unopenable': True}
+        absent = result['/tmp/nofile']
+        for field in (
+            'depth_timeseries', 'attempts', 'recent_total', 'speculative', 'train_throughput',
+            'landing_rate',
+        ):
+            assert_unread(absent[field], now, 'no runs.db file')
+        assert (absent['recent'], absent['train_events']) == ([], [])
+        assert_unread(result['/tmp/unopenable']['attempts'], now, 'no runs.db is open')
+        fresh_read(result['/tmp/real']['attempts'], now)
+
+    async def test_absence_is_never_assumed(self, tmp_path):
+        """A caller that names no absent root leaves every None db present, so unread."""
+        from dashboard.data.merge_queue import build_per_project_merge_queue
+
+        now = datetime(2026, 4, 23, 12, 0, 0, tzinfo=UTC)
+        result = await build_per_project_merge_queue([ProjectRunsDb('/tmp/x', None, tmp_path / 'x.db')], hours=24, now=now)
+
+        assert result['/tmp/x']['runs_db_present'] is True
 
     @pytest.mark.asyncio
     async def test_cancelled_error_from_sub_query_propagates(self, tmp_path):
@@ -1714,7 +2061,7 @@ class TestBuildPerProjectMergeQueue:
                 side_effect=_raise_cancelled,
             ), pytest.raises(asyncio.CancelledError):
                 await build_per_project_merge_queue(
-                    [('/tmp/P', conn)],
+                    [ProjectRunsDb('/tmp/P', conn, db_path)],
                     hours=24,
                     now=now,
                 )
@@ -1880,7 +2227,7 @@ class TestRecentFollowsTheWindow:
         async with aiosqlite.connect(str(db_path)) as conn:
             conn.row_factory = aiosqlite.Row
             result = await build_per_project_merge_queue(
-                [(pid, conn)],
+                [ProjectRunsDb(pid, conn, db_path)],
                 hours=24,
                 now=now,
             )
@@ -1999,6 +2346,11 @@ class _PerPortHandler:
     ``snapshot_responses`` maps port → snapshot dict (the inner result of get_merge_queue).
     ``fail_ports`` raise httpx.ConnectError.
     ``slow_ports`` sleep before responding (drives the timeout path).
+    ``stall_ports`` BLOCK the loop thread (``time.sleep``) once per cold
+    probe, on its ``initialize`` leg — a starved xdist worker: host wall
+    clock moves while the loop cannot run.
+    Unlike ``slow_ports`` (an in-loop await), a stall cannot move a
+    shared/src/shared/testing_virtual_clock.py::virtual_clock_test loop clock.
     """
 
     def __init__(
@@ -2007,21 +2359,25 @@ class _PerPortHandler:
         *,
         fail_ports: set[int] | None = None,
         slow_ports: dict[int, float] | None = None,
+        stall_ports: dict[int, float] | None = None,
     ):
         self.snapshot_responses = snapshot_responses or {}
         self.fail_ports = fail_ports or set()
         self.slow_ports = slow_ports or {}
+        self.stall_ports = stall_ports or {}
 
     async def __call__(self, request: httpx.Request) -> httpx.Response:
         port = request.url.port
         assert port is not None
+        body = json.loads(request.content)
+        method = body.get('method', '')
+        request_id = body.get('id', 1)
+        if port in self.stall_ports and method == 'initialize':
+            time.sleep(self.stall_ports[port])
         if port in self.fail_ports:
             raise httpx.ConnectError('refused')
         if port in self.slow_ports:
             await asyncio.sleep(self.slow_ports[port])
-        body = json.loads(request.content)
-        method = body.get('method', '')
-        request_id = body.get('id', 1)
         if method == 'initialize':
             return mcp_init_response(request_id)
         if method.startswith('notifications/'):
@@ -2183,19 +2539,27 @@ class TestFetchLiveMergeQueuesFailure:
         assert result['proj8301']['entries'] == []
         assert 'error' in result['proj8301']
 
-    @pytest.mark.asyncio
+    @virtual_clock_test
     async def test_timeout_yields_unreachable(self, _clean_live_sessions):
-        """(b) Slow port with small per_call_timeout → {reachable: False}."""
+        """(b) Slow port with small per_call_timeout → {reachable: False}.
+
+        The answering project must beat the same deadline the slow one
+        misses, so this is a
+        shared/src/shared/testing_virtual_clock.py::virtual_clock_test and
+        host stalls cannot expire the deadline.
+        """
         from dashboard.data.merge_queue import fetch_live_merge_queues
 
+        probe_deadline = 0.05
         handler = _PerPortHandler(
             {8300: _snapshot([])},
             slow_ports={8302: 0.5},
+            stall_ports={8300: 2 * probe_deadline},
         )
         transport = httpx.MockTransport(handler)
         async with httpx.AsyncClient(transport=transport) as client:
             result = await fetch_live_merge_queues(
-                client, _live_urls(8300, 8302), per_call_timeout=0.05,
+                client, _live_urls(8300, 8302), per_call_timeout=probe_deadline,
             )
 
         assert result['proj8300']['reachable'] is True
@@ -2341,60 +2705,47 @@ class TestResolveActive:
 # TestTrainThroughputStats — step-6 RED / step-7+ GREEN
 # ---------------------------------------------------------------------------
 
-_TRAIN_THROUGHPUT_DEFAULT_KEYS = {
-    'trains_landed',
-    'tasks_landed_via_trains',
-    'train_verifies_per_landed_task',
-    'baseline_solo_landed',
-    'baseline_verifies_per_landed_task',
-    'verifies_per_landed_task_delta',
-    'train_cas_retry_rate',
-    'baseline_cas_retry_rate',
-    'cas_retry_rate_delta',
-    'improved',
-}
+_TRAIN_THROUGHPUT_KEYS = set(merge_queue.TrainThroughput.__annotations__)
 
 
 @pytest.mark.asyncio
 class TestTrainThroughputStats:
-    """Tests for train_throughput_stats(db, *, hours=24, now=None) -> dict.
+    """Tests for train_throughput_stats(db, *, hours=24, now=None) -> Datum[TrainThroughput].
 
-    step-6: default contract (None / empty DB → all-zeros).
+    step-6: an unread runs.db is unknown; a readable empty one is measured zeros.
     step-8: verifies-per-landed-task counting.
     step-10: CAS-retry rate.
     step-12: aggregator wiring.
     """
 
-    async def test_none_db_returns_all_zeros_default(self):
-        """train_throughput_stats(None) returns the all-zeros default dict."""
+    async def test_none_db_is_unknown(self):
+        """A project with no runs.db open has no throughput, not an all-zeros one."""
         from dashboard.data.merge_queue import train_throughput_stats
 
-        result = await train_throughput_stats(None)
+        now = datetime(2026, 1, 10, 12, 0, 0, tzinfo=UTC)
+        assert_unread(await train_throughput_stats(None, now=now), now, 'no runs.db is open')
 
-        assert set(result.keys()) == _TRAIN_THROUGHPUT_DEFAULT_KEYS, (
-            f"expected keys {_TRAIN_THROUGHPUT_DEFAULT_KEYS}, got: {set(result.keys())}"
-        )
-        assert result['trains_landed'] == 0
-        assert result['tasks_landed_via_trains'] == 0
-        assert result['train_verifies_per_landed_task'] == 0.0
-        assert result['baseline_solo_landed'] == 0
-        assert result['baseline_verifies_per_landed_task'] == 0.0
-        assert result['verifies_per_landed_task_delta'] == 0.0
-        assert result['train_cas_retry_rate'] == 0.0
-        assert result['baseline_cas_retry_rate'] == 0.0
-        assert result['cas_retry_rate_delta'] == 0.0
-        assert result['improved'] is False
+    async def test_a_failed_read_is_unknown(self, tableless_runs_conn):
+        """with_db swallows the OperationalError; its default must still say the read failed."""
+        from dashboard.data.merge_queue import train_throughput_stats
 
-    async def test_empty_db_returns_all_zeros_default(self, tmp_path):
-        """train_throughput_stats(db) on an empty events table returns the all-zeros default."""
+        now = datetime(2026, 1, 10, 12, 0, 0, tzinfo=UTC)
+        assert_unread(await train_throughput_stats(tableless_runs_conn, now=now), now)
+
+    async def test_a_readable_empty_window_is_measured_zeros(self, tmp_path):
+        """A readable empty events table is a measured all-zeros window."""
         from dashboard.data.merge_queue import train_throughput_stats
 
         db_path = _make_db(tmp_path, 'empty.db', [])
         async with aiosqlite.connect(str(db_path)) as conn:
             conn.row_factory = aiosqlite.Row
-            result = await train_throughput_stats(conn)
+            datum = await train_throughput_stats(conn)
 
-        assert set(result.keys()) == _TRAIN_THROUGHPUT_DEFAULT_KEYS
+        assert datum.state is DatumState.FRESH
+        assert datum.freshness_bound_seconds == merge_queue.RUNS_DB_READ_FRESHNESS_BOUND_SECONDS
+        result = datum.value
+        assert result is not None
+        assert set(result.keys()) == _TRAIN_THROUGHPUT_KEYS
         assert result['trains_landed'] == 0
         assert result['tasks_landed_via_trains'] == 0
         assert result['train_verifies_per_landed_task'] == 0.0
@@ -2463,7 +2814,7 @@ class TestTrainThroughputStats:
         db_path = _make_db(tmp_path, 'verifies.db', events)
         async with aiosqlite.connect(str(db_path)) as conn:
             conn.row_factory = aiosqlite.Row
-            result = await train_throughput_stats(conn, hours=24, now=now)
+            result = fresh_read(await train_throughput_stats(conn, hours=24, now=now), now)
 
         assert result['trains_landed'] == 1
         assert result['tasks_landed_via_trains'] == 2
@@ -2549,7 +2900,7 @@ class TestTrainThroughputStats:
         db_path = _make_db(tmp_path, 'cas_retry.db', events)
         async with aiosqlite.connect(str(db_path)) as conn:
             conn.row_factory = aiosqlite.Row
-            result = await train_throughput_stats(conn, hours=24, now=now)
+            result = fresh_read(await train_throughput_stats(conn, hours=24, now=now), now)
 
         assert result['tasks_landed_via_trains'] == 2
         assert result['baseline_solo_landed'] == 2
@@ -2575,19 +2926,19 @@ class TestAggregatorTrainThroughput:
 
     Verifies:
     - each project result dict contains a 'train_throughput' key
-    - its value is the train_throughput_stats dict (all-zeros for empty/None db)
+    - its value is the train_throughput_stats Datum (unknown for a None db)
     - populated with a train_merged row: trains_landed=1, tasks_landed=2
     """
 
-    async def test_none_db_includes_train_throughput_zeros(self):
-        """db=None project includes train_throughput with all-zeros default."""
+    async def test_none_db_train_throughput_is_unknown(self, tmp_path):
+        """A db=None project's train_throughput is an unknown Datum, not all-zeros."""
         from datetime import UTC, datetime
 
         from dashboard.data.merge_queue import build_per_project_merge_queue
 
         now = datetime(2026, 1, 10, 12, 0, 0, tzinfo=UTC)
         result = await build_per_project_merge_queue(
-            [('/tmp/proj-none', None)],
+            [ProjectRunsDb('/tmp/proj-none', None, tmp_path / 'proj-none.db')],
             hours=24,
             now=now,
         )
@@ -2595,10 +2946,7 @@ class TestAggregatorTrainThroughput:
         assert 'train_throughput' in result['/tmp/proj-none'], (
             "expected 'train_throughput' key in per-project result (got None-db path)"
         )
-        tt = result['/tmp/proj-none']['train_throughput']
-        assert tt['trains_landed'] == 0
-        assert tt['tasks_landed_via_trains'] == 0
-        assert tt['improved'] is False
+        assert_unread(result['/tmp/proj-none']['train_throughput'], now, 'no runs.db is open')
 
     async def test_populated_db_includes_train_throughput(self, tmp_path):
         """DB with a train_merged row → train_throughput has trains_landed=1."""
@@ -2621,7 +2969,7 @@ class TestAggregatorTrainThroughput:
         async with aiosqlite.connect(str(db_path)) as conn:
             conn.row_factory = aiosqlite.Row
             result = await build_per_project_merge_queue(
-                [('/tmp/proj-train', conn)],
+                [ProjectRunsDb('/tmp/proj-train', conn, db_path)],
                 hours=24,
                 now=now,
             )
@@ -2629,7 +2977,7 @@ class TestAggregatorTrainThroughput:
         assert 'train_throughput' in result['/tmp/proj-train'], (
             "expected 'train_throughput' key in per-project result"
         )
-        tt = result['/tmp/proj-train']['train_throughput']
+        tt = fresh_read(result['/tmp/proj-train']['train_throughput'], now)
         assert tt['trains_landed'] == 1
         assert tt['tasks_landed_via_trains'] == 2
 

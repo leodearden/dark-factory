@@ -1,6 +1,6 @@
 """Shared detector for leaked serialized tool-call XML fragments (task 3083).
 
-THE SINGLE SOURCE OF TRUTH for "what a tool-call XML leak looks like". Four
+THE SINGLE SOURCE OF TRUTH for "what a tool-call XML leak looks like". Six
 consumers depend on this module, and they must never drift apart:
 
 * ``scripts/scan_task_toolcall_leaks.py`` — the READ-ONLY Taskmaster task-DB
@@ -10,22 +10,33 @@ consumers depend on this module, and they must never drift apart:
   corpus sweep;
 * ``Mem0Backend.scan_payload_text`` / the ``scan_memory_content`` MCP tool —
   the read capability that makes the corpus sweepable at all;
+* ``fused_memory/backends/episode_toolcall_leak_scan.py`` — the Graphiti
+  episode discovery read (task 3233), the Graphiti counterpart of
+  ``scan_payload_text``;
+* ``fused-memory/scripts/sweep_episode_toolcall_xml_leak.py`` — the Graphiti
+  episode sweep built on that read (task 3233);
 * ``fused_memory/backends/task_text_markup_gate.py`` — the storage-layer
   tripwire that ``SqliteTaskBackend.add_task``/``update_task`` run on every
   write of task text (task 4419). It is the one consumer that runs at WRITE
   time, and it shares :data:`SCANNED_COLUMNS` with the task-DB sweep.
 
+:class:`LeakShape`, :func:`classify_leak_shape` and :func:`repair_leaked_text`
+are the shared repair definition: both sweeps classify and repair through
+them, so the Mem0 and Graphiti sweeps cannot disagree on which leaks are
+content-preservingly repairable.
+
 This detector is deliberately PRECISE: it requires real whitespace between the
 stray closing tag and the continuation, so prose that merely quotes the leak
 shape with an escaped ``\n`` is not a hit. That matters in both positions it
-is used from. The first three consumers run over ALREADY-STORED content, where
-a false positive would provoke an unnecessary rewrite of a user's memory. The
-storage gate runs at write time, where a false positive refuses a legitimate
-write that no caller is placed to resubmit.
+is used from. Every consumer but the storage gate runs over ALREADY-STORED
+content, where a false positive would provoke an unnecessary rewrite of a
+user's memory. The storage gate runs at write time, where a false positive
+refuses a legitimate write that no caller is placed to resubmit.
 
 It is NOT the MCP write-boundary guard. That is
-``fused_memory/server/markup_guard.py::install_markup_guard`` (task 4458,
-which replaced task 3141's in-line ``markup_tripwire`` gate). It is
+``fused_memory/server/markup_guard.py::build_markup_guard`` (task 4458,
+which replaced task 3141's in-line ``markup_tripwire`` gate), installed by
+``fused_memory/server/boundary_guards.py::install_boundary_guards``. It is
 deliberately calibrated the other way: a recall-first predicate that accepts
 over-reporting at the MCP boundary, where a false positive costs the live
 caller only a resubmission. The two are complementary and must not be
@@ -127,6 +138,7 @@ when that lands, revisit this section rather than trusting it.
 from __future__ import annotations
 
 import re
+from enum import StrEnum
 from typing import NamedTuple
 
 from shared.toolcall_markup import PARAMETER_CLOSER_NAMES, PREFILTER_NEEDLES
@@ -136,9 +148,12 @@ __all__ = [
     'PREFILTER_NEEDLES',
     'SCANNED_COLUMNS',
     'LeakHit',
+    'LeakShape',
+    'classify_leak_shape',
     'detect_leak',
     'find_toolcall_xml_leak',
     'has_toolcall_xml_leak',
+    'repair_leaked_text',
 ]
 
 # The task-text columns a leak counts in. `metadata` is deliberately excluded:
@@ -230,3 +245,83 @@ def detect_leak(text: object) -> str | None:
     """
     hits = find_toolcall_xml_leak(text)
     return hits[0].fragment if hits else None
+
+
+class LeakShape(StrEnum):
+    """Which leak shapes can be repaired without losing content.
+
+    The values are the vocabulary the committed Mem0 sweep artifacts carry, so
+    they are a persisted contract, not just labels.
+    """
+
+    CLEAN = 'clean'
+    REPAIRABLE_TAIL = 'repairable_tail'
+    REPAIRABLE_DUPLICATE = 'repairable_duplicate'
+    MANUAL_REVIEW = 'manual_review'
+
+
+def _split_at_leak(text: str) -> tuple[str, str] | None:
+    """Split *text* into (before, remainder) around the leak marker.
+
+    ``before`` is everything preceding the stray closing tag -- the text the
+    caller meant to write. ``remainder`` is everything AFTER the continuation
+    tag that follows it, which is what a repair would discard. Returns None
+    when *text* carries no leak.
+
+    The skip past the continuation tag's own ``>`` assumes no ``>`` inside its
+    quoted attribute value. A mis-split can only make ``remainder`` differ from
+    ``before``, which downgrades the text to manual review; it can never
+    manufacture a false repair.
+    """
+    stripped = text.rstrip()
+    match = LEAK_TAIL.search(stripped)
+    if match is None:
+        return None
+    before = stripped[: match.start()]
+    continuation = match.group(1)
+    tag_end = continuation.find('>')
+    remainder = continuation[tag_end + 1 :] if tag_end != -1 else ''
+    return before, remainder
+
+
+def classify_leak_shape(text: object) -> LeakShape:
+    """Classify *text* into a :class:`LeakShape`.
+
+    A non-str or empty value is CLEAN (nothing to repair). A leak at offset 0
+    is MANUAL_REVIEW, because dropping it would leave no content to keep. A
+    fragment with nothing after its marker is REPAIRABLE_TAIL; one whose
+    remainder is a verbatim copy of the body is REPAIRABLE_DUPLICATE; every
+    other leak is MANUAL_REVIEW.
+    """
+    if not text or not isinstance(text, str):
+        return LeakShape.CLEAN
+    split = _split_at_leak(text)
+    if split is None:
+        return LeakShape.CLEAN
+    before, remainder = split
+    if not before:
+        return LeakShape.MANUAL_REVIEW
+    if not remainder.strip():
+        return LeakShape.REPAIRABLE_TAIL
+    if remainder == before:
+        return LeakShape.REPAIRABLE_DUPLICATE
+    return LeakShape.MANUAL_REVIEW
+
+
+def repair_leaked_text(text: str | None) -> str | None:
+    """Return the content-preserving repair of *text*, or None to REFUSE.
+
+    None means exactly "do not mutate this record": it is returned for a leak
+    no repair can vouch for and for a None input. Clean text comes back
+    unchanged, which makes the repair idempotent.
+    """
+    if text is None:
+        return None
+    shape = classify_leak_shape(text)
+    if shape is LeakShape.CLEAN:
+        return text
+    if shape is LeakShape.MANUAL_REVIEW:
+        return None
+    split = _split_at_leak(text)
+    assert split is not None  # guaranteed by the repairable classification
+    return split[0]

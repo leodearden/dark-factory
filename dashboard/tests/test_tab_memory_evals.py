@@ -5,10 +5,9 @@ Tests parse JSX/JS/HTML source files as text and assert structural contracts
 Follows the idiom established in test_tab_escalations.py, test_tab_curator.py
 and test_index_html.py.
 
-There is no JS test runner for ``.jsx`` in this project (``dashboard/tests/js/``
-covers only plain ``.js`` modules), so JSX contracts are asserted as Python
-source-as-text tests over files fetched from ``/static/redux/`` through a
-module-scoped Starlette ``TestClient``.
+Render behaviour is covered by ``dashboard/tests/js/jsx_render.test.mjs``; this
+file keeps the wiring contracts, asserted over files fetched from
+``/static/redux/`` through a module-scoped Starlette ``TestClient``.
 """
 
 from __future__ import annotations
@@ -17,7 +16,7 @@ import re
 from typing import NamedTuple
 
 import pytest
-from _dashboard_helpers import (
+from _jsx_source_helpers import (
     assert_script_loads_before,
     extract_df_data_block,
     extract_function_body,
@@ -177,7 +176,7 @@ def _jsx_open_tag_containing(src: str, needle: str) -> str | None:
     so the test fails claiming the element is GONE — against behaviourally
     correct code.  The previous spelling pushed that onto future authors as a
     style rule ("hoist comparisons into locals"); this walks the tag instead
-    with ``_dashboard_helpers.py::jsx_open_tag_end``, the way
+    with ``_jsx_source_helpers.py::jsx_open_tag_end``, the way
     ``extract_function_body`` and ``_enclosing_function`` already walk braces
     rather than spanning them.  Its ``None`` means "not this candidate" here,
     since a miss is the expected answer while probing starts backwards.
@@ -215,7 +214,7 @@ def _extract_const_object(src: str, name: str, open_char: str = '{') -> str:
     delimiter pair, so one walk serves both the ``PARITY_REFINEMENT`` object
     and the ``PARITY_PLAIN`` array.
 
-    Stays LOCAL to this module rather than joining ``_dashboard_helpers``:
+    Stays LOCAL to this module rather than joining ``_jsx_source_helpers``:
     this anchor has exactly one consumer (memory_evals_fmt.js's two parity
     declarations), so hoisting it would move code no other suite can reach.
     The duplication worth removing was the walk, and that is gone.
@@ -823,16 +822,6 @@ _PRESENCE_CONTRACTS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
         (r'\bev\s*\.\s*metrics\b',),
     ),
     (
-        'metric row keyed on metric_id',
-        r'key=\{[^}]*\bmetric_id\b',
-        (r'key=\{\s*m\.metric_id\s*\}',),
-    ),
-    (
-        'per-metric escalation guard',
-        r'm\.escalation\s*&&',
-        (r'm\s*\.\s*escalation\s*&&\s*\(',),
-    ),
-    (
         # The producer end of the escalation-link contract, and the exact site
         # `test_memory_evals_escalation_id_contract.py` is built around: the
         # `(queue, id)` descriptor handed to `onNavigate` is what
@@ -1310,8 +1299,8 @@ def test_tab_memory_evals_renders_eval_cards_and_trends(
         'MemoryEvalsSection — not inside it.'
     )
 
-    # (e) reads DF_DATA.MEMORY_EVALS, maps evals keyed on eval_id, metrics on
-    #     metric_id
+    # (e) reads DF_DATA.MEMORY_EVALS, maps evals keyed on eval_id, and maps
+    #     metrics (row keying is a render test in jsx_render.test.mjs)
     assert re.search(
         _presence_pattern('window.DF_DATA read', code), code, re.MULTILINE
     ), (
@@ -1339,11 +1328,6 @@ def test_tab_memory_evals_renders_eval_cards_and_trends(
         _presence_pattern('metrics list read', code), code, re.MULTILINE
     ), (
         "tab_memory_evals.jsx must render each eval's `metrics` list."
-    )
-    assert re.search(
-        _presence_pattern('metric row keyed on metric_id', code), code, re.MULTILINE
-    ), (
-        'each metric row must be keyed on `metric_id`.'
     )
 
     # (f) the trend renders from the PARALLEL-ARRAY shape, holes intact
@@ -1838,13 +1822,15 @@ def test_verdict_badges_driven_by_persisted_verdict(
     #      read as coverage.
 
 
-# The six pure helpers task 3481 moved out of the .jsx into memory_evals_fmt.js.
+# The pure helpers the .jsx consumes from memory_evals_fmt.js: the six task 3481
+# moved out of it, plus splitVerdicts (task 10137).
 _FMT_HELPERS = (
     'chartForKind',
     'trendGaps',
     'dash',
     'ageText',
     'verdictBadge',
+    'splitVerdicts',
     'unmatchedReasonText',
 )
 
@@ -1853,7 +1839,7 @@ def test_pure_helpers_are_consumed_from_the_fmt_module(
     tab_memory_evals_jsx_code: str,
     memory_evals_fmt_js_code: str,
 ) -> None:
-    """The .jsx must CONSUME the six pure helpers, never redefine them.
+    """The .jsx must CONSUME the pure fmt helpers, never redefine them.
 
     Task 3481 moved them into a plain-JS classic script so `node --test` can
     execute their branching (dashboard/tests/js/memory_evals_fmt.test.mjs)
@@ -1864,7 +1850,7 @@ def test_pure_helpers_are_consumed_from_the_fmt_module(
     """
     code = tab_memory_evals_jsx_code
 
-    # (1) One module-top-level destructure naming all six.
+    # (1) One module-top-level destructure naming all of them.
     destructure = re.search(
         r'const\s*\{([^}]*)\}\s*=\s*window\.DF_MEMORY_EVALS_FMT\s*;', code
     )
@@ -1882,7 +1868,7 @@ def test_pure_helpers_are_consumed_from_the_fmt_module(
             'is a ReferenceError at render time.'
         )
 
-    # (2) None of the six may be REDEFINED here.
+    # (2) None of them may be REDEFINED here.
     for helper in _FMT_HELPERS:
         assert not re.search(rf'\bfunction\s+{helper}\s*\(', code), (
             f'tab_memory_evals.jsx still defines `function {helper}(...)`. It '
@@ -2518,10 +2504,12 @@ def test_escalation_links_and_storm_aggregate_banner(
     """
     code = tab_memory_evals_jsx_code
 
-    # (a) a metric row carrying an escalation renders a link, guarded so a null
-    #     projection renders no dead control.
+    # (a) a verdict entry carrying an escalation renders a link.  That ONLY
+    #     entries carrying one do, so a null projection renders no dead
+    #     control, is rendered and asserted by
+    #     js/jsx_render.test.mjs::assertRendersItsVerdicts.
     assert 'data-testid="memory-eval-escalation-link"' in code, (
-        'a metric row carrying `m.escalation` must render a '
+        'a verdict entry carrying an `escalation` must render a '
         'data-testid="memory-eval-escalation-link" control.'
     )
     assert re.search(r'\{\s*escalation\.id\b', code), (
@@ -2532,12 +2520,6 @@ def test_escalation_links_and_storm_aggregate_banner(
         'the escalation control must RENDER `escalation.summary` — an opaque '
         'id alone makes the operator click to find out what it is. Anchored to '
         'the JSX expression position, not a bare name grep.'
-    )
-    assert re.search(
-        _presence_pattern('per-metric escalation guard', code), code, re.MULTILINE
-    ), (
-        'the escalation control must be guarded by `m.escalation &&` so a null '
-        'projection renders nothing rather than a dead control.'
     )
 
     # (b) built from `id` only — the projection has no `url` field.

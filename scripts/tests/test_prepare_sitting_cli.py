@@ -11,19 +11,28 @@ from datetime import datetime
 from pathlib import Path
 
 import pytest
-from escalation.models import Escalation
-from orchestrator.session_registry import (
-    DecisionRecord,
-    SessionRecord,
-    Status,
-    normalize_escalations_dir,
-)
+from escalation.models import RESOLUTION_CLASSES, Escalation
+from orchestrator.decision_registry import DecisionRecord, normalize_escalations_dir
+from orchestrator.session_records import SessionRecord, Status
 from shared.project_id import fold_project_token
+from shared.task_statuses import TERMINAL
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 from sitting import ledger as ledger_mod
 from sitting import preparation as prep_mod
 from sitting import prepare_sitting as mod
-from sitting.inventory import escalation_key, key_str
+from sitting.inventory import (
+    AUDIT_KIND,
+    ItemKey,
+    Shortfall,
+    audit_key,
+    decision_key,
+    escalation_key,
+    key_str,
+)
+from sitting.ownership import ProbeResult
 from sitting.preparation import Manual, Standing
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 NOW = '2026-09-26T09:00:00+00:00'
 LATER = '2026-09-26T10:00:00+00:00'
@@ -45,12 +54,15 @@ class Env:
     df: Path
     fleet: Path
     sessions: Path
-    handover: Path
     state: Path
 
     @property
     def queue(self) -> Path:
         return self.df / 'data' / 'escalations'
+
+    @property
+    def handover(self) -> Path:
+        return self.queue / 'l2-handover.md'
 
     @property
     def preparation(self) -> Path:
@@ -75,7 +87,6 @@ class Env:
             *argv,
             '--decisions-root', str(decisions_root or self.fleet),
             '--sessions-root', str(sessions_root or self.sessions),
-            '--handover', str(self.handover),
             '--preparation', str(self.preparation),
             '--now', NOW,
         ]
@@ -123,13 +134,12 @@ def _held(evidence: str, source_kind: str = '') -> dict:
 @pytest.fixture
 def env(tmp_path, make_tasks_db) -> Env:
     df = tmp_path / 'src' / 'dark-factory'
-    e = Env(tmp_path, df, tmp_path / 'fleet', tmp_path / 'fleet' / 'sessions', tmp_path / 'handover.md',
-            tmp_path / 'state')
+    e = Env(tmp_path, df, tmp_path / 'fleet', tmp_path / 'fleet' / 'sessions', tmp_path / 'state')
     e.queue.mkdir(parents=True)
+    e.handover.write_text('# handover\n\nnothing relevant here\n')
     (df / '.taskmaster' / 'tasks').mkdir(parents=True)
     e.sessions.mkdir(parents=True)
     e.state.mkdir()
-    e.handover.write_text('# handover\n\nnothing relevant here\n')
     make_tasks_db([
         {'id': 100, 'status': 'blocked'},
         {'id': 200, 'status': 'deferred', 'metadata': {'x_coalesced_into': 201}},
@@ -237,6 +247,7 @@ class TestBuckets:
         }
         assert standing['esc-200-1']['standing']['kind'] == 'owned'
         assert 'task 201' in standing['esc-200-1']['standing']['owner']
+        assert standing['esc-200-1']['standing']['release']['task_status_is']['statuses'] == sorted(TERMINAL)
         assert standing['esc-200-1']['release']['observed'] == 'pending'
         assert standing['esc-200-1']['release']['released'] is False
         assert standing['esc-700-1']['release'] is None
@@ -302,11 +313,13 @@ class TestRecommendOnly:
         assert resolve['tool'] == 'resolve_issue'
         assert resolve['args']['escalation_id'] == 'esc-400-1'
         assert 'Leo 2026-09-20: esc-400-1 option A' in resolve['args']['resolution']
+        assert resolve['args']['ruled_by_human'] is True
+        assert resolve['args']['resolution_class'] in RESOLUTION_CLASSES
         assert close['tool'] == 'cli:session_registry'
-        argv = close['args'][-1]
-        assert argv[argv.index('close-decision') + 1:argv.index('close-decision') + 5] == [
-            '--id', f'{fold_project_token(env.df.name)}-esc-400-1', '--state', 'answered',
-        ]
+        (argv,) = close['args']
+        assert argv[2] == 'file-and-close-decision'
+        assert argv[argv.index('--id') + 1] == 'esc-400-1'
+        assert argv[argv.index('--state') + 1] == 'answered'
         assert argv[argv.index('--project') + 1] == closeable['esc-400-1']['project']
         assert argv[argv.index('--escalations-dir') + 1] == normalize_escalations_dir(env.queue)
         assert 'gate 6 sideways_check_ran: held' in argv[argv.index('--evidence') + 1]
@@ -357,7 +370,7 @@ class TestCloseCollision:
 
         runs = self._apply_the_close(env, capsys)
 
-        assert [run.returncode for run in runs] == [0, 0], [run.stderr for run in runs]
+        assert [run.returncode for run in runs] == [0], [run.stderr for run in runs]
         after = self._decision_files(env)
         closed = DecisionRecord.from_json(after.pop(f'{derived}.json').decode())
         assert after == before
@@ -370,15 +383,35 @@ class TestCloseCollision:
         other = self._seed_other_project(env, f'{fold_project_token(env.df.name)}-esc-400-1')
         before = self._decision_files(env)
 
-        write, close = self._apply_the_close(env, capsys)
+        (run,) = self._apply_the_close(env, capsys)
 
-        assert write.returncode == 0
-        assert close.returncode != 0
-        assert 'close-decision refused' in close.stderr
-        assert 'know_live' in close.stderr
+        assert run.returncode != 0
+        assert 'know_live' in run.stderr
         assert self._decision_files(env) == before
         untouched = DecisionRecord.from_json(other.read_text())
         assert (untouched.state, untouched.closing_evidence, untouched.closed_at) == ('open', '', '')
+
+    def test_a_same_project_legacy_record_at_the_bare_id_is_continued_and_closed(self, env, capsys):
+        """Task 7495: a closed record filed before ids were qualified by project stays unlinked, and still closes."""
+        project = fold_project_token(env.df.name)
+        legacy = DecisionRecord(id='esc-400-1', project=project, text='the earlier ask',
+                                filed_at='2026-08-01T09:00:00+00:00', state='dropped', escalation_id='esc-400-1',
+                                escalations_dir='')
+        (env.fleet / 'decisions' / 'esc-400-1.json').write_text(legacy.to_json())
+        names_before = set(self._decision_files(env))
+
+        (row,) = [r for r in _classify(capsys, env, '--apply-closes')['closeable'] if r['escalation_id'] == 'esc-400-1']
+        assert row['decision_id'] is None
+        runs = self._apply_the_close(env, capsys)
+
+        assert [run.returncode for run in runs] == [0], [run.stderr for run in runs]
+        files = self._decision_files(env)
+        assert set(files) == names_before
+        closed = DecisionRecord.from_json(files['esc-400-1.json'].decode())
+        assert closed.state == 'answered'
+        assert closed.closing_evidence
+        assert datetime.fromisoformat(closed.closed_at).tzinfo is not None
+        assert closed.escalations_dir == normalize_escalations_dir(env.queue)
 
 
 def _snapshot(*roots: Path) -> dict[Path, tuple[bytes, int]]:
@@ -436,6 +469,21 @@ class TestLedgerNumbering:
         assert [(_record_id(row), row['number']) for row in after['done']] == [('esc-100-1', 1)]
         assert rc == 0
         assert '**1.**' in out.split('## Done', 1)[1]
+
+    def test_an_open_audit_entry_is_neither_swept_nor_listed_done(self, env, capsys):
+        assert _run(capsys, 'brief', *env.args(), '--ledger', str(env.ledger))[0] == 0
+        audit = key_str(audit_key('dec-audited'))
+        seeded = ledger_mod.assign(
+            _saved_ledger(env.ledger), [audit], lambda key: 0, NOW, kinds=frozenset({AUDIT_KIND}),
+        )
+        ledger_mod.save(env.ledger, seeded)
+        number = seeded.entries[audit].number
+
+        rc, out, _ = _run(capsys, 'brief', *env.args(), '--ledger', str(env.ledger))
+
+        assert rc == 0
+        assert f'**{number}.**' not in out.split('## Done', 1)[1]
+        assert _saved_ledger(env.ledger).entries[audit] == seeded.entries[audit]
 
     def test_new_items_take_the_next_number_not_a_freed_one(self, env, capsys):
         _classify(capsys, env, '--ledger', str(env.ledger))
@@ -705,6 +753,128 @@ class TestProjectScope:
 
         assert 'esc-900-1' in _numbers(everything)
         assert set(_numbers(scoped)) == set(EXPECTED_NUMBERS)
+
+
+def _write_handover(root: Path, text: str) -> Path:
+    path = root / 'data' / 'escalations' / 'l2-handover.md'
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+    return path
+
+
+def _queue_key(root: Path, esc_id: str) -> ItemKey:
+    return escalation_key(normalize_escalations_dir(root / 'data' / 'escalations'), esc_id)
+
+
+def _sources(env: Env, roots: list[Path], override=None) -> mod.Sources:
+    return mod.read_sources(
+        project_roots=[str(root) for root in roots], decisions_root=env.fleet, sessions_root=env.sessions,
+        handover_override=override, preparation_path=env.preparation, project=None,
+        now=datetime.fromisoformat(NOW),
+    )
+
+
+def _handover_probes(env: Env, roots: list[Path], override=None) -> dict[ItemKey, ProbeResult]:
+    sources = _sources(env, roots, override)
+    classified = mod.classify(sources, recommend_only=True, ledger_standing={}, now=datetime.fromisoformat(NOW))
+    return {c.item.key: next(p for p in c.ownership.probes if p.probe == 'handover') for c in classified}
+
+
+def _handover_shortfalls(sources: mod.Sources) -> list[Shortfall]:
+    return [shortfall for shortfall in sources.shortfalls if shortfall.source == 'handover']
+
+
+class TestHandoverPerProject:
+    """Escalation ids are unique only within a queue, so each item reads its own project's handover."""
+
+    @pytest.fixture
+    def reify(self, env) -> Path:
+        reify = env.tmp / 'src' / 'reify'
+        _esc(reify / 'data' / 'escalations', id='esc-100-1')
+        _write_handover(env.df, '# handover\n\nesc-100-1 task 100: the dark-factory watcher holds this\n')
+        _write_handover(reify, '# handover\n\nesc-100-1 task 100: the reify watcher holds this\n')
+        return reify
+
+    @pytest.fixture
+    def third(self, env) -> Path:
+        third = env.tmp / 'src' / 'third'
+        _esc(third / 'data' / 'escalations', id='esc-950-1')
+        return third
+
+    @pytest.fixture
+    def elsewhere(self, env) -> Path:
+        path = env.tmp / 'elsewhere.md'
+        path.write_text('esc-100-1 task 100: read from the override\n')
+        return path
+
+    def test_each_item_reads_its_own_projects_handover(self, env, reify, third):
+        probes = _handover_probes(env, [env.df, reify, third])
+
+        df_probe, reify_probe = probes[_queue_key(env.df, 'esc-100-1')], probes[_queue_key(reify, 'esc-100-1')]
+        assert df_probe.status == reify_probe.status == 'mentions'
+        assert 'the dark-factory watcher' in df_probe.evidence
+        assert 'reify watcher' not in df_probe.evidence
+        assert 'the reify watcher' in reify_probe.evidence
+        assert 'dark-factory watcher' not in reify_probe.evidence
+        assert probes[_queue_key(third, 'esc-950-1')].status == 'unavailable'
+
+    def test_a_decision_item_reads_its_folded_projects_handover(self, env, reify):
+        record = DecisionRecord(id='dec-reify-1', project='Reify', text='keep the reify cockpit gate?',
+                                filed_at='2026-09-19T09:00:00+00:00', task_id='950')
+        (env.fleet / 'decisions' / 'dec-reify-1.json').write_text(record.to_json())
+        _write_handover(env.df, '# handover\n\ntask 950: the dark-factory watcher holds this\n')
+        _write_handover(reify, '# handover\n\ntask 950: the reify cockpit holds this\n')
+
+        probe = _handover_probes(env, [env.df, reify])[decision_key('dec-reify-1')]
+
+        assert probe.status == 'mentions'
+        assert 'the reify cockpit' in probe.evidence
+        assert 'dark-factory watcher' not in probe.evidence
+
+    def test_an_override_replaces_only_its_projects_handover(self, env, reify, elsewhere):
+        probes = _handover_probes(env, [env.df, reify], mod.HandoverOverride('reify', elsewhere))
+
+        assert 'read from the override' in probes[_queue_key(reify, 'esc-100-1')].evidence
+        assert 'the dark-factory watcher' in probes[_queue_key(env.df, 'esc-100-1')].evidence
+
+    def test_an_override_no_item_reads_is_a_stated_shortfall(self, env, reify, elsewhere):
+        read = _sources(env, [env.df, reify], mod.HandoverOverride('reify', elsewhere))
+        unread = _sources(env, [env.df, reify], mod.HandoverOverride('darkfactory', elsewhere))
+
+        assert _handover_shortfalls(read) == []
+        (shortfall,) = _handover_shortfalls(unread)
+        assert shortfall.path == str(elsewhere)
+        assert "'darkfactory'" in shortfall.reason
+
+    def test_an_override_naming_a_missing_file_is_unavailable_and_names_it(self, env, reify):
+        absent = env.tmp / 'absent.md'
+
+        probes = _handover_probes(env, [env.df, reify], mod.HandoverOverride('reify', absent))
+
+        probe = probes[_queue_key(reify, 'esc-100-1')]
+        assert probe.status == 'unavailable'
+        assert str(absent) in probe.evidence
+
+    def test_override_project_must_be_folded(self, env):
+        with pytest.raises(ValueError, match='Reify'):
+            mod.HandoverOverride('Reify', env.tmp / 'x.md')
+        with pytest.raises(ValueError):
+            mod.HandoverOverride('', env.tmp / 'x.md')
+
+    def test_the_flag_takes_project_equals_path_and_folds_the_project(self, env, capsys, reify, elsewhere):
+        rc, out, _ = _run(
+            capsys, 'brief', *env.args(project_roots=[env.df, reify]), '--handover', f'Reify={elsewhere}',
+        )
+
+        assert rc == 0
+        assert 'read from the override' in out
+
+    def test_a_bare_path_is_refused_naming_the_form(self, env, capsys, elsewhere):
+        with pytest.raises(SystemExit) as exited:
+            mod.main(['brief', *env.args(), '--handover', str(elsewhere)])
+
+        assert exited.value.code == 2
+        assert f'--handover takes PROJECT=PATH, got {str(elsewhere)!r}' in capsys.readouterr().err
 
 
 class TestMachineOutputs:

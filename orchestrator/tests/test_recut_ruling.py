@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from unittest.mock import AsyncMock
 
@@ -18,10 +18,16 @@ from orchestrator.recut_ruling import (
     RecutRulingUnreadable,
     RecutRulingViolation,
     RecutState,
+    RecutSupersession,
     carries_recut_ruling,
     enforce_recut_ruling,
     execution_record,
+    issue_ruling,
+    issued_ruling_was_dropped,
     read_recut_ruling,
+    reassert_ruling,
+    recut_supersession,
+    ruling_patch,
     ruling_to_enforce,
 )
 
@@ -343,3 +349,204 @@ class TestEnforceRecutRuling:
         assert PARKED.parked_branch is not None
         assert PARKED.parked_branch in gate.reason
         assert 're-dispatch is safe' in gate.reason
+
+
+ISSUED = RecutRuling(ruling_id='esc-5516-3', ruled_at=datetime(2026, 10, 30, 9, 15, tzinfo=UTC))
+OLDER = RecutRuling(ruling_id='esc-5516-1', ruled_at=datetime(2026, 10, 1, tzinfo=UTC))
+NEWER = RecutRuling(ruling_id='esc-5516-9', ruled_at=datetime(2026, 10, 31, tzinfo=UTC))
+
+
+class TestRulingPatch:
+    def test_patch_reads_back_as_the_pending_ruling(self):
+        patch = ruling_patch(ISSUED)
+        assert list(patch) == [RECUT_RULING_KEY]
+        task = {'id': '5516', 'metadata': patch}
+        reading = read_recut_ruling(task)
+        assert reading.state is RecutState.PENDING
+        assert reading.ruling == ISSUED
+        assert reading.ruling is not None and reading.ruling.ruled_at.tzinfo is not None
+        assert ruling_to_enforce(task) == ISSUED
+
+    def test_patch_survives_json_round_trip(self):
+        metadata = json.loads(json.dumps(ruling_patch(ISSUED)))
+        assert ruling_to_enforce({'id': '5516', 'metadata': metadata}) == ISSUED
+
+    def test_execution_record_satisfies_the_issued_ruling(self):
+        metadata = {
+            **ruling_patch(ISSUED),
+            RECUT_EXECUTED_KEY: execution_record(ISSUED, None, EXECUTED_AT),
+        }
+        task = {'id': '5516', 'metadata': metadata}
+        assert read_recut_ruling(task).state is RecutState.SATISFIED
+        assert ruling_to_enforce(task) is None
+
+    def test_newer_issued_ruling_over_an_older_execution_is_pending(self):
+        metadata = {
+            RECUT_EXECUTED_KEY: execution_record(OLDER, PARKED, EXECUTED_AT),
+            **ruling_patch(ISSUED),
+        }
+        task = {'id': '5516', 'metadata': metadata}
+        assert read_recut_ruling(task).state is RecutState.PENDING
+        assert ruling_to_enforce(task) == ISSUED
+
+
+@pytest.mark.asyncio
+class TestIssueRuling:
+    async def test_durable_write_returns_none(self):
+        persist = AsyncMock(return_value=True)
+        assert await issue_ruling(ISSUED, persist=persist) is None
+        persist.assert_awaited_once_with(ruling_patch(ISSUED))
+
+    async def test_store_reporting_failure_returns_a_reason(self):
+        failure = await issue_ruling(ISSUED, persist=AsyncMock(return_value=False))
+        assert isinstance(failure, str) and failure
+
+    async def test_store_raising_returns_a_reason_naming_the_exception(self):
+        failure = await issue_ruling(
+            ISSUED, persist=AsyncMock(side_effect=RuntimeError('store down')),
+        )
+        assert isinstance(failure, str)
+        assert 'store down' in failure
+
+
+class TestIssuedRulingWasDropped:
+    def test_ruling_still_carried_is_not_dropped(self):
+        assert not issued_ruling_was_dropped({'metadata': ruling_patch(ISSUED)}, ISSUED)
+
+    def test_ruling_gone_without_its_execution_is_dropped(self):
+        assert issued_ruling_was_dropped({'metadata': {'files': ['a.py']}}, ISSUED)
+
+    def test_ruling_gone_after_its_execution_is_not_dropped(self):
+        metadata = {RECUT_EXECUTED_KEY: execution_record(ISSUED, PARKED, EXECUTED_AT)}
+        assert not issued_ruling_was_dropped({'metadata': metadata}, ISSUED)
+
+    def test_ruling_gone_after_an_older_execution_is_dropped(self):
+        metadata = {RECUT_EXECUTED_KEY: execution_record(OLDER, PARKED, EXECUTED_AT)}
+        assert issued_ruling_was_dropped({'metadata': metadata}, ISSUED)
+
+    def test_a_newer_ruling_in_its_place_is_not_dropped(self):
+        assert not issued_ruling_was_dropped({'metadata': ruling_patch(NEWER)}, ISSUED)
+
+    def test_a_newer_executed_ruling_in_its_place_is_not_dropped(self):
+        metadata = {
+            **ruling_patch(NEWER),
+            RECUT_EXECUTED_KEY: execution_record(NEWER, PARKED, EXECUTED_AT),
+        }
+        assert not issued_ruling_was_dropped({'metadata': metadata}, ISSUED)
+
+    def test_an_older_pending_ruling_in_its_place_is_dropped(self):
+        assert issued_ruling_was_dropped({'metadata': ruling_patch(OLDER)}, ISSUED)
+
+    def test_an_older_executed_ruling_in_its_place_is_dropped(self):
+        metadata = {
+            **ruling_patch(OLDER),
+            RECUT_EXECUTED_KEY: execution_record(OLDER, PARKED, EXECUTED_AT),
+        }
+        assert issued_ruling_was_dropped({'metadata': metadata}, ISSUED)
+
+    def test_a_malformed_ruling_in_its_place_is_left_to_the_gate(self):
+        metadata = {RECUT_RULING_KEY: {'ruling_id': 'esc-5516-1'}}
+        assert not issued_ruling_was_dropped({'metadata': metadata}, ISSUED)
+
+    def test_unreadable_metadata_is_not_read_as_dropped(self):
+        assert not issued_ruling_was_dropped({'metadata': 'not-json{'}, ISSUED)
+
+
+@pytest.mark.asyncio
+class TestReassertRuling:
+    async def test_a_carried_ruling_is_not_rewritten(self):
+        persist = AsyncMock(return_value=True)
+        task = {'id': '5516', 'metadata': ruling_patch(ISSUED)}
+        assert await reassert_ruling(task, ISSUED, persist=persist) is None
+        persist.assert_not_awaited()
+
+    async def test_an_older_ruling_restored_in_its_place_is_overwritten(self):
+        persist = AsyncMock(return_value=True)
+        metadata = {
+            **ruling_patch(OLDER),
+            RECUT_EXECUTED_KEY: execution_record(OLDER, PARKED, EXECUTED_AT),
+        }
+        task = {'id': '5516', 'metadata': metadata}
+        assert await reassert_ruling(task, ISSUED, persist=persist) is None
+        persist.assert_awaited_once_with(ruling_patch(ISSUED))
+
+    async def test_a_failed_re_issue_returns_the_reason(self):
+        persist = AsyncMock(return_value=False)
+        task = {'id': '5516', 'metadata': {}}
+        failure = await reassert_ruling(task, ISSUED, persist=persist)
+        assert isinstance(failure, str) and failure
+
+
+class TestRecutSupersession:
+    @pytest.mark.parametrize('task', [
+        {'id': '2896'},
+        {'id': '2896', 'metadata': None},
+        {'id': '2896', 'metadata': _ruled()},
+    ], ids=['no-metadata', 'metadata-none', 'no-execution-record'])
+    def test_no_execution_record_reads_as_none(self, task: dict[str, Any]):
+        assert recut_supersession(task) is None
+
+    def test_reads_back_what_execution_record_writes(self):
+        task = _task({RECUT_EXECUTED_KEY: execution_record(RULING, PARKED, EXECUTED_AT)})
+        assert recut_supersession(task) == RecutSupersession(
+            parked_branch=PARKED.parked_branch, executed_at=EXECUTED_AT,
+        )
+
+    def test_nothing_parked_still_carries_the_execution_time(self):
+        task = _task({RECUT_EXECUTED_KEY: execution_record(RULING, None, EXECUTED_AT)})
+        assert recut_supersession(task) == RecutSupersession(
+            parked_branch=None, executed_at=EXECUTED_AT,
+        )
+
+    @pytest.mark.parametrize('executed_at', [None, 'not-a-date'], ids=['missing', 'unparseable'])
+    def test_unreadable_execution_time_keeps_the_parked_branch_and_warns(
+        self, executed_at: object, caplog: pytest.LogCaptureFixture,
+    ):
+        record = execution_record(RULING, PARKED, EXECUTED_AT)
+        if executed_at is None:
+            del record['executed_at']
+        else:
+            record['executed_at'] = executed_at
+        with caplog.at_level(logging.WARNING, logger='orchestrator.recut_ruling'):
+            supersession = recut_supersession(_task({RECUT_EXECUTED_KEY: record}))
+        assert supersession == RecutSupersession(
+            parked_branch=PARKED.parked_branch, executed_at=None,
+        )
+        assert any(
+            rec.levelno == logging.WARNING and '2896' in rec.getMessage()
+            for rec in caplog.records
+        )
+
+    @pytest.mark.parametrize('record', ['garbage', 7, ['a']], ids=['str', 'int', 'list'])
+    def test_a_record_that_is_not_an_object_reads_as_none(self, record: object):
+        assert recut_supersession(_task({RECUT_EXECUTED_KEY: record})) is None
+
+
+class TestRecutSupersessionSupersedes:
+    PARKED_REF = 'task/2896-20260901T123000Z'
+    OTHER_REF = 'task/2896-skip-attempt'
+
+    def _executed(self) -> RecutSupersession:
+        return RecutSupersession(parked_branch=self.PARKED_REF, executed_at=EXECUTED_AT)
+
+    def test_the_parked_ref_is_superseded_even_when_committed_later(self):
+        later = EXECUTED_AT + timedelta(days=1)
+        assert self._executed().supersedes(self.PARKED_REF, later)
+
+    @pytest.mark.parametrize('tip_committed_at', [
+        EXECUTED_AT - timedelta(seconds=1), EXECUTED_AT,
+    ], ids=['before', 'at'])
+    def test_another_ref_committed_by_the_execution_is_superseded(
+        self, tip_committed_at: datetime,
+    ):
+        assert self._executed().supersedes(self.OTHER_REF, tip_committed_at)
+
+    def test_another_ref_committed_after_the_execution_is_not(self):
+        later = EXECUTED_AT + timedelta(seconds=1)
+        assert not self._executed().supersedes(self.OTHER_REF, later)
+
+    def test_without_an_execution_time_only_the_parked_ref_is_superseded(self):
+        supersession = RecutSupersession(parked_branch=self.PARKED_REF, executed_at=None)
+        earlier = EXECUTED_AT - timedelta(days=1)
+        assert supersession.supersedes(self.PARKED_REF, earlier)
+        assert not supersession.supersedes(self.OTHER_REF, earlier)

@@ -19,22 +19,27 @@ import json
 from pathlib import Path
 
 import pytest
-from _merge_lane_ratchet_fixtures import blank_file_entry, metrics, synthetic_report
+from _merge_lane_ratchet_fixtures import (
+    blank_file_entry,
+    lane_cluster,
+    ratchet,
+    synthetic_report,
+)
 
 
 def _baseline_image(tmp_path: Path, name: str, report: dict) -> Path:
     """*report* written as committed baseline bytes, for a path-taking face."""
     target = tmp_path / name
-    target.write_text(metrics.render_baseline(report), encoding='utf-8')
+    target.write_text(ratchet.render_baseline(report), encoding='utf-8')
     return target
 
 
-def _violation_fields(violation: metrics.Violation) -> tuple[str, str, int, int]:
+def _violation_fields(violation: ratchet.Violation) -> tuple[str, str, int, int]:
     """The four fields a ledger record is projected from, message excluded.
 
     Asserting on the tuple rather than on ``message`` is what keeps these
     tests about the COMPARISON: the wording lives in ``Violation.rose`` and is
-    pinned by ``test_merge_lane_ratchet.py::TestViolationShape``, so
+    pinned by ``test_merge_lane_ratchet_write_gate.py::TestCheckAgainstBaseline``, so
     re-deriving it here would be a second copy that drifts.
     """
     return (
@@ -75,15 +80,15 @@ class TestCompareBaselineFiles:
             tmp_path, lambda report: report['files']['a.py'].__setitem__('cognitive', 125)
         )
 
-        raises = metrics.compare_baseline_files(previous, current)
+        raises = ratchet.compare_baseline_files(previous, current)
 
         # The per-path violation is field-for-field what the writer's own gate
         # would have produced, so a ledger record derived from either describes
         # the same raise. The total comes along because it is DERIVED -- moving
         # the mass to a new path is the shape that check exists for.
         assert [_violation_fields(v) for v in raises] == [
-            _violation_fields(metrics.Violation.rose('cognitive', 'a.py', 120, 125)),
-            ('total:cognitive', metrics.CLUSTER_TOTAL_KEY, 150, 155),
+            _violation_fields(ratchet.Violation.rose('cognitive', 'a.py', 120, 125)),
+            ('total:cognitive', ratchet.CLUSTER_TOTAL_KEY, 150, 155),
         ]
 
     def test_a_fall_is_clean(self, tmp_path: Path) -> None:
@@ -92,13 +97,13 @@ class TestCompareBaselineFiles:
         )
 
         # Lowering is the point of a ratchet, so it must never need authorizing.
-        assert metrics.compare_baseline_files(previous, current) == []
+        assert ratchet.compare_baseline_files(previous, current) == []
 
     def test_byte_identical_images_are_clean(self, tmp_path: Path) -> None:
         previous, current = self._pair(tmp_path, lambda report: None)
 
         assert previous.read_bytes() == current.read_bytes()
-        assert metrics.compare_baseline_files(previous, current) == []
+        assert ratchet.compare_baseline_files(previous, current) == []
 
     def test_the_argument_order_cannot_read_clean_when_crossed(
         self, tmp_path: Path
@@ -111,8 +116,8 @@ class TestCompareBaselineFiles:
             tmp_path, lambda report: report['files']['a.py'].__setitem__('cognitive', 125)
         )
 
-        assert metrics.compare_baseline_files(previous, current)
-        assert metrics.compare_baseline_files(current, previous) == []
+        assert ratchet.compare_baseline_files(previous, current)
+        assert ratchet.compare_baseline_files(current, previous) == []
 
     @pytest.mark.parametrize(
         'mutate',
@@ -140,13 +145,13 @@ class TestCompareBaselineFiles:
         # measured and stored, never ratcheted, per path or in the total.
         previous, current = self._pair(tmp_path, mutate)
 
-        assert metrics.compare_baseline_files(previous, current) == []
+        assert ratchet.compare_baseline_files(previous, current) == []
 
     def test_a_new_oversized_path_breaches_the_ceiling(self, tmp_path: Path) -> None:
         # Proves ``_check_ceilings`` is reached, not just the four rise arms: a
         # path ABSENT from the previous image is held to the ceiling, so writing
         # an oversized new file into the baseline cannot grandfather it.
-        oversized = metrics.FILE_LINE_CEILING + 1
+        oversized = lane_cluster.FILE_LINE_CEILING + 1
         previous, current = self._pair(
             tmp_path,
             lambda report: report['files'].__setitem__(
@@ -154,12 +159,12 @@ class TestCompareBaselineFiles:
             ),
         )
 
-        raises = metrics.compare_baseline_files(previous, current)
+        raises = ratchet.compare_baseline_files(previous, current)
 
         assert (
             'new_file_over_ceiling',
             'new_big.py',
-            metrics.FILE_LINE_CEILING,
+            lane_cluster.FILE_LINE_CEILING,
             oversized,
         ) in [_violation_fields(v) for v in raises]
 
@@ -169,8 +174,8 @@ class TestCompareBaselineFiles:
         previous = _baseline_image(tmp_path, 'previous.json', synthetic_report())
         absent = tmp_path / 'gone.json'
 
-        with pytest.raises(metrics.RatchetError) as excinfo:
-            metrics.compare_baseline_files(previous, absent)
+        with pytest.raises(ratchet.RatchetError) as excinfo:
+            ratchet.compare_baseline_files(previous, absent)
 
         assert str(absent) in str(excinfo.value)
 
@@ -179,8 +184,8 @@ class TestCompareBaselineFiles:
         broken = tmp_path / 'broken.json'
         broken.write_text('{"files": {', encoding='utf-8')
 
-        with pytest.raises(metrics.RatchetError) as excinfo:
-            metrics.compare_baseline_files(previous, broken)
+        with pytest.raises(ratchet.RatchetError) as excinfo:
+            ratchet.compare_baseline_files(previous, broken)
 
         message = str(excinfo.value)
         assert str(broken) in message
@@ -195,8 +200,8 @@ class TestCompareMergedBaselineFiles:
     MERGE_HEAD moved is a raise; read against either parent, keeping one side's
     stale value re-absorbs the other side's lowering. The bound is what git does
     to the file text, applied per measure against the merge base: a measure one
-    side moved stands at that side's value, up or down, and where both moved,
-    the higher side bounds it.
+    side moved stands at that side's value, up or down, and one both sides moved
+    is bounded by scripts/merge_lane_ratchet.py::_both_moved_bound.
 
     The seed's numbers: a.py cognitive 120, b.py cognitive 30, total:cognitive 150.
     """
@@ -223,7 +228,7 @@ class TestCompareMergedBaselineFiles:
         def image(name: str, report: dict | None) -> Path | None:
             return None if report is None else _baseline_image(tmp_path, name, report)
 
-        raises = metrics.compare_merged_baseline_files(
+        raises = ratchet.compare_merged_baseline_files(
             base=image('base.json', base),
             ours=image('ours.json', ours),
             theirs=image('theirs.json', theirs),
@@ -247,7 +252,7 @@ class TestCompareMergedBaselineFiles:
             theirs=theirs,
         ) == [
             ('cognitive', 'a.py', 125, 126),
-            ('total:cognitive', metrics.CLUSTER_TOTAL_KEY, 155, 156),
+            ('total:cognitive', ratchet.CLUSTER_TOTAL_KEY, 155, 156),
         ]
 
     @pytest.mark.parametrize('lowered_by', ['ours', 'theirs'])
@@ -267,7 +272,7 @@ class TestCompareMergedBaselineFiles:
             theirs=lowered if lowered_by == 'theirs' else seed,
         ) == [
             ('cognitive', 'a.py', 115, 120),
-            ('total:cognitive', metrics.CLUSTER_TOTAL_KEY, 145, 150),
+            ('total:cognitive', ratchet.CLUSTER_TOTAL_KEY, 145, 150),
         ]
 
     def test_own_moves_stand_per_measure_not_per_path(self, tmp_path: Path) -> None:
@@ -281,17 +286,19 @@ class TestCompareMergedBaselineFiles:
             tmp_path, theirs, base=synthetic_report(), ours=ours, theirs=theirs
         ) == [
             ('function_local_imports', 'a.py', 2, 3),
-            ('total:function_local_imports', metrics.CLUSTER_TOTAL_KEY, 3, 4),
+            ('total:function_local_imports', ratchet.CLUSTER_TOTAL_KEY, 3, 4),
         ]
 
-    def test_where_both_sides_moved_a_measure_the_higher_bounds_it(
-        self, tmp_path: Path
+    @pytest.mark.parametrize('raised_by', ['ours', 'theirs'])
+    def test_where_the_sides_moved_a_measure_oppositely_the_higher_side_bounds_it(
+        self, tmp_path: Path, raised_by: str
     ) -> None:
         seed = synthetic_report()
-        ours = self._moved(('a.py', 'cognitive', 110))
-        theirs = self._moved(('a.py', 'cognitive', 125))
+        raised = self._moved(('a.py', 'cognitive', 125))
+        lowered = self._moved(('a.py', 'cognitive', 110))
+        ours, theirs = (raised, lowered) if raised_by == 'ours' else (lowered, raised)
 
-        assert self._bounded(tmp_path, theirs, base=seed, ours=ours, theirs=theirs) == []
+        assert self._bounded(tmp_path, raised, base=seed, ours=ours, theirs=theirs) == []
         assert self._bounded(
             tmp_path,
             self._moved(('a.py', 'cognitive', 126)),
@@ -300,7 +307,51 @@ class TestCompareMergedBaselineFiles:
             theirs=theirs,
         ) == [
             ('cognitive', 'a.py', 125, 126),
-            ('total:cognitive', metrics.CLUSTER_TOTAL_KEY, 155, 156),
+            ('total:cognitive', ratchet.CLUSTER_TOTAL_KEY, 155, 156),
+        ]
+
+    def test_where_both_sides_raised_a_measure_the_raises_compose(
+        self, tmp_path: Path
+    ) -> None:
+        seed = synthetic_report()
+        ours = self._moved(('a.py', 'cognitive', 125))
+        theirs = self._moved(('a.py', 'cognitive', 123))
+
+        assert self._bounded(
+            tmp_path,
+            self._moved(('a.py', 'cognitive', 128)),
+            base=seed,
+            ours=ours,
+            theirs=theirs,
+        ) == []
+        assert self._bounded(
+            tmp_path,
+            self._moved(('a.py', 'cognitive', 129)),
+            base=seed,
+            ours=ours,
+            theirs=theirs,
+        ) == [
+            ('cognitive', 'a.py', 128, 129),
+            ('total:cognitive', ratchet.CLUSTER_TOTAL_KEY, 158, 159),
+        ]
+
+    def test_where_both_sides_lowered_a_measure_the_higher_still_bounds_it(
+        self, tmp_path: Path
+    ) -> None:
+        seed = synthetic_report()
+        ours = self._moved(('a.py', 'cognitive', 115))
+        theirs = self._moved(('a.py', 'cognitive', 110))
+
+        assert self._bounded(tmp_path, theirs, base=seed, ours=ours, theirs=theirs) == []
+        assert self._bounded(
+            tmp_path,
+            self._moved(('a.py', 'cognitive', 116)),
+            base=seed,
+            ours=ours,
+            theirs=theirs,
+        ) == [
+            ('cognitive', 'a.py', 115, 116),
+            ('total:cognitive', ratchet.CLUSTER_TOTAL_KEY, 145, 146),
         ]
 
     def test_moves_on_different_paths_add_up_in_the_derived_total(
@@ -321,7 +372,7 @@ class TestCompareMergedBaselineFiles:
         seed, ours = synthetic_report(), synthetic_report()
         del ours['files']['b.py']
 
-        assert ('total:cognitive', metrics.CLUSTER_TOTAL_KEY, 120, 150) in self._bounded(
+        assert ('total:cognitive', ratchet.CLUSTER_TOTAL_KEY, 120, 150) in self._bounded(
             tmp_path, seed, base=seed, ours=ours, theirs=seed
         )
 
@@ -337,7 +388,7 @@ class TestCompareMergedBaselineFiles:
             tmp_path, theirs, base=synthetic_report(), ours=ours, theirs=theirs
         ) == []
 
-    def test_an_absent_base_bounds_each_measure_by_the_higher_parent(
+    def test_an_absent_base_bounds_each_count_by_the_higher_parent(
         self, tmp_path: Path
     ) -> None:
         # No common ancestor, or no baseline at it: git merges such histories
@@ -402,18 +453,52 @@ class TestCompareMergedBaselineFiles:
             tmp_path, widened, base=seed, ours=ours, theirs=theirs
         )
 
+    def test_a_name_set_both_sides_widened_is_bounded_by_their_set_merge(
+        self, tmp_path: Path
+    ) -> None:
+        # 'qux', added by both sides, counts once, so name lists carry no
+        # overlap slack.
+        seed, ours, theirs = synthetic_report(), synthetic_report(), synthetic_report()
+        ours['tests']['t1.py']['patch_targets'] = ['foo', 'bar', 'qux', 'zap']
+        theirs['tests']['t1.py']['patch_targets'] = ['foo', 'bar', 'qux', 'wib']
+        merged = copy.deepcopy(ours)
+        merged['tests']['t1.py']['patch_targets'].append('wib')
+        widened = copy.deepcopy(merged)
+        widened['tests']['t1.py']['patch_targets'].append('extra')
+
+        assert self._bounded(tmp_path, merged, base=seed, ours=ours, theirs=theirs) == []
+        assert ('patch_targets', 't1.py', 5, 6) in self._bounded(
+            tmp_path, widened, base=seed, ours=ours, theirs=theirs
+        )
+
+    def test_an_absent_base_bounds_a_name_set_by_both_sides_names(
+        self, tmp_path: Path
+    ) -> None:
+        ours, theirs = synthetic_report(), synthetic_report()
+        ours['tests']['t1.py']['patch_targets'] = ['foo', 'bar', 'qux']
+        theirs['tests']['t1.py']['patch_targets'] = ['foo', 'bar', 'zap']
+        merged = copy.deepcopy(ours)
+        merged['tests']['t1.py']['patch_targets'].append('zap')
+        widened = copy.deepcopy(merged)
+        widened['tests']['t1.py']['patch_targets'].append('extra')
+
+        assert self._bounded(tmp_path, merged, base=None, ours=ours, theirs=theirs) == []
+        assert ('patch_targets', 't1.py', 4, 5) in self._bounded(
+            tmp_path, widened, base=None, ours=ours, theirs=theirs
+        )
+
 
 def _ledger_record(task_id: str, reason: str = 'net-additive work') -> dict:
     """One ledger entry, built by the real writer rather than hand-written."""
-    return metrics.authorization_record(
-        metrics.RaiseAuthorization(task_id=task_id, reason=reason),
-        [metrics.Violation.rose('lines', 'a.py', 1000, 1005)],
+    return ratchet.authorization_record(
+        ratchet.RaiseAuthorization(task_id=task_id, reason=reason),
+        [ratchet.Violation.rose('lines', 'a.py', 1000, 1005)],
     )
 
 
 def _listing(*records: dict) -> dict[str, str]:
     """Entry file name -> content identity, as the gate lists a tree or the index."""
-    return {metrics.entry_filename(record): metrics.render_entry(record) for record in records}
+    return {ratchet.entry_filename(record): ratchet.render_entry(record) for record in records}
 
 
 class TestOwnEntryNames:
@@ -427,63 +512,63 @@ class TestOwnEntryNames:
     def test_an_unchanged_ledger_adds_nothing(self) -> None:
         listing = _listing(_ledger_record('5485'))
 
-        assert metrics.own_entry_names([listing], dict(listing)) == []
+        assert ratchet.own_entry_names([listing], dict(listing)) == []
 
     def test_the_added_files_are_returned_sorted(self) -> None:
         history = _ledger_record('5485')
         first, second = _ledger_record('5723'), _ledger_record('5722')
 
-        added = metrics.own_entry_names(
+        added = ratchet.own_entry_names(
             [_listing(history)], _listing(history, first, second)
         )
 
         assert added == sorted(
-            [metrics.entry_filename(first), metrics.entry_filename(second)]
+            [ratchet.entry_filename(first), ratchet.entry_filename(second)]
         )
 
     def test_with_no_recorded_entries_every_staged_file_is_own(self) -> None:
         record = _ledger_record('5722')
 
-        assert metrics.own_entry_names([{}], _listing(record)) == [
-            metrics.entry_filename(record)
+        assert ratchet.own_entry_names([{}], _listing(record)) == [
+            ratchet.entry_filename(record)
         ]
 
     def test_dropping_a_recorded_entry_is_refused_by_name(self) -> None:
         kept, dropped = _ledger_record('5485'), _ledger_record('5675')
 
-        with pytest.raises(metrics.AppendOnlyViolation) as excinfo:
-            metrics.own_entry_names([_listing(kept, dropped)], _listing(kept))
+        with pytest.raises(ratchet.AppendOnlyViolation) as excinfo:
+            ratchet.own_entry_names([_listing(kept, dropped)], _listing(kept))
 
         assert 'append-only' in str(excinfo.value)
-        assert metrics.entry_filename(dropped) in str(excinfo.value)
+        assert ratchet.entry_filename(dropped) in str(excinfo.value)
 
     def test_rewriting_a_recorded_entry_under_its_name_is_refused(self) -> None:
         # Same NAME, different content: a count of files would pass this.
         history = _ledger_record('5485')
-        staged = {metrics.entry_filename(history): 'a different blob'}
+        staged = {ratchet.entry_filename(history): 'a different blob'}
 
-        with pytest.raises(metrics.AppendOnlyViolation):
-            metrics.own_entry_names([_listing(history)], staged)
+        with pytest.raises(ratchet.AppendOnlyViolation):
+            ratchet.own_entry_names([_listing(history)], staged)
 
     def test_a_merge_takes_either_parents_files_as_history(self) -> None:
         history = _ledger_record('5485')
         ours_own, theirs_own = _ledger_record('5722'), _ledger_record('3620')
         merge_own = _ledger_record('5792')
 
-        added = metrics.own_entry_names(
+        added = ratchet.own_entry_names(
             [_listing(history, ours_own), _listing(history, theirs_own)],
             _listing(history, ours_own, theirs_own, merge_own),
         )
 
         # A file either parent recorded is HISTORY: counting it as the merge's
         # own would be the standing permission LEDGER_README forbids.
-        assert added == [metrics.entry_filename(merge_own)]
+        assert added == [ratchet.entry_filename(merge_own)]
 
     def test_a_merge_dropping_the_other_parents_entry_is_refused(self) -> None:
         theirs_own = _ledger_record('3620')
 
-        with pytest.raises(metrics.AppendOnlyViolation):
-            metrics.own_entry_names([{}, _listing(theirs_own)], {})
+        with pytest.raises(ratchet.AppendOnlyViolation):
+            ratchet.own_entry_names([{}, _listing(theirs_own)], {})
 
 
 class TestRetireLegacyLedger:
@@ -496,7 +581,7 @@ class TestRetireLegacyLedger:
     def test_with_nothing_retired_own_entries_pass_through(self) -> None:
         first, second, _third = self._entries()
 
-        assert metrics.retire_legacy_ledger([], _listing(first, second), [first, second]) == [
+        assert ratchet.retire_legacy_ledger([], _listing(first, second), [first, second]) == [
             first,
             second,
         ]
@@ -505,34 +590,34 @@ class TestRetireLegacyLedger:
         entries = list(self._entries())
 
         # Split entries are HISTORY: the commit that moves them authorizes nothing.
-        assert metrics.retire_legacy_ledger(entries, _listing(*entries), entries) == []
+        assert ratchet.retire_legacy_ledger(entries, _listing(*entries), entries) == []
 
     def test_dropping_an_entry_in_the_split_is_refused(self) -> None:
         first, second, third = self._entries()
 
-        with pytest.raises(metrics.AppendOnlyViolation) as excinfo:
-            metrics.retire_legacy_ledger(
+        with pytest.raises(ratchet.AppendOnlyViolation) as excinfo:
+            ratchet.retire_legacy_ledger(
                 [first, second, third], _listing(first, second), [first, second]
             )
 
-        assert metrics.entry_filename(third) in str(excinfo.value)
+        assert ratchet.entry_filename(third) in str(excinfo.value)
 
     def test_rewriting_an_entry_in_the_split_is_refused(self) -> None:
         first, second, third = self._entries()
         rewritten = {**third, 'reason': 'actually it was a refactor'}
         staged = [first, second, rewritten]
 
-        with pytest.raises(metrics.AppendOnlyViolation):
-            metrics.retire_legacy_ledger([first, second, third], _listing(*staged), staged)
+        with pytest.raises(ratchet.AppendOnlyViolation):
+            ratchet.retire_legacy_ledger([first, second, third], _listing(*staged), staged)
 
     def test_an_authorization_of_its_own_in_the_split_is_refused(self) -> None:
         first, second, fresh = self._entries()
         staged = [first, second, fresh]
 
-        with pytest.raises(metrics.AppendOnlyViolation) as excinfo:
-            metrics.retire_legacy_ledger([first, second], _listing(*staged), staged)
+        with pytest.raises(ratchet.AppendOnlyViolation) as excinfo:
+            ratchet.retire_legacy_ledger([first, second], _listing(*staged), staged)
 
-        assert metrics.entry_filename(fresh) in str(excinfo.value)
+        assert ratchet.entry_filename(fresh) in str(excinfo.value)
 
     def test_a_merge_may_find_the_retired_entries_already_split_by_its_other_parent(
         self,
@@ -541,7 +626,7 @@ class TestRetireLegacyLedger:
         # files are staged as history, only the branch's own entry is new here.
         shared_history, branch_own, _other = self._entries()
 
-        assert metrics.retire_legacy_ledger(
+        assert ratchet.retire_legacy_ledger(
             [shared_history, branch_own], _listing(shared_history, branch_own), [branch_own]
         ) == []
 
@@ -555,16 +640,16 @@ class TestLegacyLedgerEntries:
     def test_a_malformed_retired_array_is_a_named_hard_failure(self, text: str) -> None:
         # Its entries are history being moved: one that cannot be read cannot be
         # checked into a file, and must never read as "nothing to move".
-        with pytest.raises(metrics.RatchetError) as excinfo:
-            metrics.legacy_ledger_entries(text)
+        with pytest.raises(ratchet.RatchetError) as excinfo:
+            ratchet.legacy_ledger_entries(text)
 
-        assert metrics.LEGACY_LEDGER_RELPATH in str(excinfo.value)
+        assert ratchet.LEGACY_LEDGER_RELPATH in str(excinfo.value)
 
     def test_the_entries_are_returned_in_order(self) -> None:
         first, second = _ledger_record('5485'), _ledger_record('5722')
         text = json.dumps({'_README': 'x', 'schema_version': 1, 'raises': [first, second]})
 
-        assert metrics.legacy_ledger_entries(text) == [first, second]
+        assert ratchet.legacy_ledger_entries(text) == [first, second]
 
 
 class TestUnrecordedRaises:
@@ -580,24 +665,24 @@ class TestUnrecordedRaises:
     """
 
     @staticmethod
-    def _record(raises: list[metrics.Violation], task_id: str = '5722') -> dict:
-        return metrics.authorization_record(
-            metrics.RaiseAuthorization(task_id=task_id, reason=f'reason {task_id}'),
+    def _record(raises: list[ratchet.Violation], task_id: str = '5722') -> dict:
+        return ratchet.authorization_record(
+            ratchet.RaiseAuthorization(task_id=task_id, reason=f'reason {task_id}'),
             raises,
         )
 
     @staticmethod
-    def _lines_raise() -> metrics.Violation:
-        return metrics.Violation.rose('lines', 'a.py', 1000, 1005)
+    def _lines_raise() -> ratchet.Violation:
+        return ratchet.Violation.rose('lines', 'a.py', 1000, 1005)
 
     @staticmethod
-    def _cognitive_raise() -> metrics.Violation:
-        return metrics.Violation.rose('cognitive', 'a.py', 120, 127)
+    def _cognitive_raise() -> ratchet.Violation:
+        return ratchet.Violation.rose('cognitive', 'a.py', 120, 127)
 
     def test_a_record_derived_from_the_raises_covers_them_all(self) -> None:
         raises = [self._lines_raise(), self._cognitive_raise()]
 
-        assert metrics.unrecorded_raises(raises, [self._record(raises)]) == []
+        assert ratchet.unrecorded_raises(raises, [self._record(raises)]) == []
 
     def test_no_records_leaves_every_raise_unrecorded_in_order(self) -> None:
         raises = [self._lines_raise(), self._cognitive_raise()]
@@ -605,89 +690,89 @@ class TestUnrecordedRaises:
         # The common refusal: a commit that staged a raising baseline and never
         # recorded an entry. Order is the input's, so the refusal message is
         # diffable run to run.
-        assert metrics.unrecorded_raises(raises, []) == raises
+        assert ratchet.unrecorded_raises(raises, []) == raises
 
     def test_a_record_authorizing_less_than_the_rise_covers_nothing(self) -> None:
         # A stale or hand-written entry names the right measure and key but a
         # smaller rise than the one this commit makes.
-        stale = self._record([metrics.Violation.rose('lines', 'a.py', 1000, 1002)])
+        stale = self._record([ratchet.Violation.rose('lines', 'a.py', 1000, 1002)])
         raises = [self._lines_raise()]
 
-        assert metrics.unrecorded_raises(raises, [stale]) == raises
+        assert ratchet.unrecorded_raises(raises, [stale]) == raises
 
     def test_a_record_for_an_unrelated_measure_covers_nothing(self) -> None:
         raises = [self._lines_raise()]
 
         unrelated = self._record([self._cognitive_raise()])
 
-        assert metrics.unrecorded_raises(raises, [unrelated]) == raises
+        assert ratchet.unrecorded_raises(raises, [unrelated]) == raises
 
     def test_records_of_different_measures_union(self) -> None:
         lines, cognitive = self._lines_raise(), self._cognitive_raise()
         records = [self._record([lines]), self._record([cognitive], task_id='5723')]
 
-        assert metrics.unrecorded_raises([lines, cognitive], records) == []
+        assert ratchet.unrecorded_raises([lines, cognitive], records) == []
 
     def test_records_of_one_key_sum(self) -> None:
         # An agent who runs --write-baseline --authorize-raise TWICE in one
         # commit records b->m and m->f, while the commit's delta reads b->f;
         # a branch landing several authorizing commits sums the same way.
         records = [
-            self._record([metrics.Violation.rose('lines', 'a.py', 1000, 1002)]),
-            self._record([metrics.Violation.rose('lines', 'a.py', 1002, 1005)], '5723'),
+            self._record([ratchet.Violation.rose('lines', 'a.py', 1000, 1002)]),
+            self._record([ratchet.Violation.rose('lines', 'a.py', 1002, 1005)], '5723'),
         ]
 
-        assert metrics.unrecorded_raises([self._lines_raise()], records) == []
+        assert ratchet.unrecorded_raises([self._lines_raise()], records) == []
 
     def test_three_partial_records_cover_exactly_their_sum(self) -> None:
         # No single record reaches the rise; only their SUM does. One count
         # short of it, the same records refuse.
         records = [
-            self._record([metrics.Violation.rose('lines', 'a.py', 1000, 1001)]),
-            self._record([metrics.Violation.rose('lines', 'a.py', 1001, 1002)], '5723'),
-            self._record([metrics.Violation.rose('lines', 'a.py', 1002, 1005)], '5724'),
+            self._record([ratchet.Violation.rose('lines', 'a.py', 1000, 1001)]),
+            self._record([ratchet.Violation.rose('lines', 'a.py', 1001, 1002)], '5723'),
+            self._record([ratchet.Violation.rose('lines', 'a.py', 1002, 1005)], '5724'),
         ]
 
-        assert metrics.unrecorded_raises([self._lines_raise()], records) == []
-        assert metrics.unrecorded_raises(
-            [metrics.Violation.rose('lines', 'a.py', 1000, 1006)], records
+        assert ratchet.unrecorded_raises([self._lines_raise()], records) == []
+        assert ratchet.unrecorded_raises(
+            [ratchet.Violation.rose('lines', 'a.py', 1000, 1006)], records
         ) != []
 
     def test_derived_total_rows_sum_across_records_too(self) -> None:
-        total = metrics.CLUSTER_TOTAL_KEY
+        total = ratchet.CLUSTER_TOTAL_KEY
         records = [
-            self._record([metrics.Violation.rose('total:lines', total, 1200, 1202)]),
-            self._record([metrics.Violation.rose('total:lines', total, 1300, 1303)], '5723'),
+            self._record([ratchet.Violation.rose('total:lines', total, 1200, 1202)]),
+            self._record([ratchet.Violation.rose('total:lines', total, 1300, 1303)], '5723'),
         ]
 
-        landed = metrics.Violation.rose('total:lines', total, 1400, 1405)
-        assert metrics.unrecorded_raises([landed], records) == []
+        landed = ratchet.Violation.rose('total:lines', total, 1400, 1405)
+        assert ratchet.unrecorded_raises([landed], records) == []
 
     def test_one_record_of_part_of_the_rise_does_not_cover_it(self) -> None:
         # The other half of the sum: the midpoint record alone authorized 3, and
         # the commit raised 5. (Under the retired absolute rule its matching
         # `current` covered the whole rise.)
-        midpoint = self._record([metrics.Violation.rose('lines', 'a.py', 1002, 1005)])
+        midpoint = self._record([ratchet.Violation.rose('lines', 'a.py', 1002, 1005)])
 
-        assert metrics.unrecorded_raises([self._lines_raise()], [midpoint]) == [
+        assert ratchet.unrecorded_raises([self._lines_raise()], [midpoint]) == [
             self._lines_raise()
         ]
 
     def test_a_record_measured_from_another_base_covers_the_same_rise(self) -> None:
         # A derived total authorized against base X covers the same raise
         # landing on X + a sibling's lines -- the case the absolute rule refused.
-        landed = metrics.Violation.rose('total:lines', metrics.CLUSTER_TOTAL_KEY, 1300, 1305)
+        landed = ratchet.Violation.rose('total:lines', ratchet.CLUSTER_TOTAL_KEY, 1300, 1305)
         authored = self._record(
-            [metrics.Violation.rose('total:lines', metrics.CLUSTER_TOTAL_KEY, 1200, 1205)]
+            [ratchet.Violation.rose('total:lines', ratchet.CLUSTER_TOTAL_KEY, 1200, 1205)]
         )
 
-        assert metrics.unrecorded_raises([landed], [authored]) == []
+        assert ratchet.unrecorded_raises([landed], [authored]) == []
 
     def test_a_ceiling_breach_is_covered_by_naming_it(self) -> None:
-        breach = metrics.Violation(
-            measure=metrics.NEW_FUNCTION_OVER_CEILING,
+        breach = ratchet.Violation(
+            measure=ratchet.NEW_FUNCTION_OVER_CEILING,
             key='a.py::new',
-            baseline=metrics.NEW_FUNCTION_COGNITIVE_CEILING,
+            baseline=lane_cluster.NEW_FUNCTION_COGNITIVE_CEILING,
             current=40,
             message='breach',
         )
@@ -695,8 +780,8 @@ class TestUnrecordedRaises:
             [dataclasses.replace(breach, current=19)]
         )
 
-        assert metrics.unrecorded_raises([breach], [named]) == []
-        assert metrics.unrecorded_raises([breach], [self._record([self._lines_raise()])]) == [
+        assert ratchet.unrecorded_raises([breach], [named]) == []
+        assert ratchet.unrecorded_raises([breach], [self._record([self._lines_raise()])]) == [
             breach
         ]
 
@@ -716,7 +801,7 @@ class TestUnrecordedRaises:
             record['measures'] = measures
         raises = [self._lines_raise()]
 
-        assert metrics.unrecorded_raises(raises, [record]) == raises
+        assert ratchet.unrecorded_raises(raises, [record]) == raises
 
     @pytest.mark.parametrize('current', ['1005', None, True], ids=['string', 'null', 'bool'])
     def test_a_row_whose_numbers_are_not_counts_authorizes_nothing(
@@ -725,6 +810,6 @@ class TestUnrecordedRaises:
         record = self._record([self._lines_raise()])
         record['measures'][0]['current'] = current
 
-        assert metrics.unrecorded_raises([self._lines_raise()], [record]) == [
+        assert ratchet.unrecorded_raises([self._lines_raise()], [record]) == [
             self._lines_raise()
         ]

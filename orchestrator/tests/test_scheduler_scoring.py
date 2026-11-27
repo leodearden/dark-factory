@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import csv
-import json
 import logging
 import math
 from collections import Counter
@@ -12,6 +11,11 @@ from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
+from _scheduler_candidate_fixture import (
+    fixture_as_tasks,
+    fixture_captured_at,
+    load_candidate_fixture,
+)
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 
@@ -35,28 +39,7 @@ from orchestrator.pending_age import read_pending_age
 from orchestrator.scheduler import Scheduler, TickContext
 
 REPO_ROOT = Path(orchestrator.__file__).resolve().parents[3]
-FIXTURE_DIR = REPO_ROOT / 'orchestrator' / 'tests' / 'fixtures' / 'scheduler_candidates'
 BASELINE_CSV = REPO_ROOT / 'plans' / 'evidence' / 'scheduler-scoring-2026-08-06' / 'candidates_scored.csv'
-
-
-def load_candidate_fixture() -> dict:
-    """The newest committed dump of scripts/dump_scheduler_candidate_fixture.py."""
-    dumps = sorted(FIXTURE_DIR.glob('*.json'))
-    assert dumps, f'no committed candidate fixture under {FIXTURE_DIR}'
-    return json.loads(dumps[-1].read_text())
-
-
-def fixture_captured_at(fixture: dict) -> datetime:
-    return datetime.fromisoformat(fixture['provenance']['captured_at'])
-
-
-def fixture_as_tasks(fixture: dict) -> list[dict]:
-    """The fixture's candidates as scheduler task dicts."""
-    return [
-        {'id': c['id'], 'status': 'pending', 'priority': c['tier'],
-         'metadata': {} if c['pending_since'] is None else {'pending_since': c['pending_since']}}
-        for c in fixture['candidates']
-    ]
 
 
 def load_baseline_rows() -> list[dict]:
@@ -354,13 +337,13 @@ def _population(first_id: int, *, anchored: int, anchorless: int) -> list[dict]:
 def _gate_tick(scheduler: Scheduler, tasks: list[dict]) -> TickContext:
     """A tick over *tasks* whose legacy ages are non-zero, as acquire_next's preamble leaves them."""
     max_id = max(int(t['id']) for t in tasks)
-    scheduler._update_age_anchors(tasks, max_id)
+    scheduler.age_anchors.observe(tasks, max_id)
     return _tick(tasks, {t['id']: int(t['id']) % 4 for t in tasks}, max_id)
 
 
 def _legacy_scores(scheduler: Scheduler, ctx: TickContext) -> dict[str, float]:
     return {t['id']: scheduler._compute_score_legacy(
-        t['priority'], scheduler._compute_age(t['id'], ctx.max_id), ctx.transitive_counts[t['id']])
+        t['priority'], scheduler.age_anchors.age(t['id'], ctx.max_id), ctx.transitive_counts[t['id']])
         for t in ctx.candidates}
 
 

@@ -17,6 +17,7 @@ from shared.testing_timeout_markers import (
     SweepFloors,
     TimeoutSite,
     TreeScan,
+    closest_timeout_site,
     inverts,
     judge_inversion_band,
     scan_python_tree,
@@ -244,10 +245,207 @@ def test_a_site_records_where_and_how_the_mark_is_spelled() -> None:
 
     assert timeout_marker_sites(tree, {'BIG': 540.0}) == (
         TimeoutSite('<module>', SiteKind.MODULE_PYTESTMARK, 120.0, 4, '120'),
-        TimeoutSite('TestThing', SiteKind.CLASS_DECORATOR, 540.0, 6, 'BIG'),
+        TimeoutSite('TestThing', SiteKind.CLASS_DECORATOR, 540.0, 6, 'BIG', 'BIG'),
         TimeoutSite('TestThing::<pytestmark>', SiteKind.CLASS_PYTESTMARK, None, 8, ''),
         TimeoutSite('TestThing::test_a', SiteKind.DECORATOR, 30.0, 10, '30'),
     )
+
+
+def test_a_site_names_the_constant_its_argument_is_spelled_through() -> None:
+    """The trailing identifier of a bare or dotted name; None for a literal, a computation or no argument."""
+    tree = _parsed(
+        """
+        import pytest
+
+        @pytest.mark.timeout(BIG)
+        def test_bare() -> None:
+            pass
+
+        @pytest.mark.timeout(whole_tree_guard_family.WHOLE_TREE_SCAN_TEST_TIMEOUT)
+        def test_dotted() -> None:
+            pass
+
+        @pytest.mark.timeout(timeout=BIG)
+        def test_keyword() -> None:
+            pass
+
+        @pytest.mark.timeout(300)
+        def test_literal() -> None:
+            pass
+
+        @pytest.mark.timeout(int(BIG * 2))
+        def test_computed() -> None:
+            pass
+
+        @pytest.mark.timeout()
+        def test_absent() -> None:
+            pass
+        """
+    )
+
+    assert {site.qualname: site.constant for site in timeout_marker_sites(tree, {})} == {
+        'test_bare': 'BIG',
+        'test_dotted': 'WHOLE_TREE_SCAN_TEST_TIMEOUT',
+        'test_keyword': 'BIG',
+        'test_literal': None,
+        'test_computed': None,
+        'test_absent': None,
+    }
+
+
+# ---------------------------------------------------------------------------
+# closest_timeout_site -- pytest's get_closest_marker, statically.
+# ---------------------------------------------------------------------------
+
+
+def _closest_spelling(source: str, class_chain: tuple[str, ...], function: str) -> str | None:
+    site = closest_timeout_site(
+        timeout_marker_sites(_parsed(source), _NO_SANCTIONED_NAMES), class_chain, function
+    )
+    return None if site is None else site.spelling
+
+
+_EVERY_LEVEL_MARKED_SOURCE = """
+    import pytest
+
+    pytestmark = pytest.mark.timeout(MODULE)
+
+    @pytest.mark.timeout(OUTER)
+    class TestOuter:
+        @pytest.mark.timeout(INNER)
+        class TestInner:
+            @pytest.mark.timeout(FUNCTION)
+            def test_marked(self) -> None:
+                pass
+
+            def test_unmarked(self) -> None:
+                pass
+
+        def test_outer_unmarked(self) -> None:
+            pass
+
+    def test_module_function() -> None:
+        pass
+    """
+
+
+def test_a_function_decorator_beats_its_classes_and_the_module() -> None:
+    assert _closest_spelling(_EVERY_LEVEL_MARKED_SOURCE, ('TestOuter', 'TestInner'), 'test_marked') == 'FUNCTION'
+
+
+def test_without_a_function_mark_the_innermost_class_wins() -> None:
+    assert _closest_spelling(_EVERY_LEVEL_MARKED_SOURCE, ('TestOuter', 'TestInner'), 'test_unmarked') == 'INNER'
+    assert _closest_spelling(_EVERY_LEVEL_MARKED_SOURCE, ('TestOuter',), 'test_outer_unmarked') == 'OUTER'
+
+
+def test_a_class_body_pytestmark_counts_as_its_class_level() -> None:
+    source = """
+        import pytest
+
+        pytestmark = pytest.mark.timeout(MODULE)
+
+        @pytest.mark.timeout(OUTER)
+        class TestOuter:
+            class TestInner:
+                pytestmark = pytest.mark.timeout(INNER_BODY)
+
+                def test_a(self) -> None:
+                    pass
+        """
+
+    assert _closest_spelling(source, ('TestOuter', 'TestInner'), 'test_a') == 'INNER_BODY'
+
+
+def test_with_no_class_site_the_module_pytestmark_applies() -> None:
+    assert _closest_spelling(_EVERY_LEVEL_MARKED_SOURCE, (), 'test_module_function') == 'MODULE'
+    source = """
+        import pytest
+
+        pytestmark = [pytest.mark.timeout(MODULE)]
+
+        class TestThing:
+            def test_a(self) -> None:
+                pass
+        """
+    assert _closest_spelling(source, ('TestThing',), 'test_a') == 'MODULE'
+
+
+def test_an_inherited_test_resolves_through_its_collecting_class_and_the_module() -> None:
+    """The function is not defined in the named class, so only the class and module levels can answer."""
+    source = """
+        import pytest
+
+        pytestmark = pytest.mark.timeout(MODULE)
+
+        class Base:
+            def test_inherited(self) -> None:
+                pass
+
+        @pytest.mark.timeout(CHILD)
+        class TestChild(Base):
+            pass
+
+        class TestPlainChild(Base):
+            pass
+        """
+
+    assert _closest_spelling(source, ('TestChild',), 'test_inherited') == 'CHILD'
+    assert _closest_spelling(source, ('TestPlainChild',), 'test_inherited') == 'MODULE'
+
+
+def test_no_site_at_any_level_is_none() -> None:
+    source = """
+        import pytest
+
+        @pytest.mark.timeout(ELSEWHERE)
+        def test_other() -> None:
+            pass
+
+        class TestThing:
+            def test_a(self) -> None:
+                pass
+        """
+
+    assert _closest_spelling(source, ('TestThing',), 'test_a') is None
+    assert _closest_spelling(source, (), 'test_absent') is None
+
+
+def test_at_the_function_level_the_decorator_nearest_def_wins() -> None:
+    """Decorators apply bottom-up, and pytest finds the mark applied first."""
+    source = """
+        import pytest
+
+        @pytest.mark.timeout(TOP)
+        @pytest.mark.timeout(NEAREST)
+        def test_a() -> None:
+            pass
+        """
+
+    assert _closest_spelling(source, (), 'test_a') == 'NEAREST'
+
+
+def test_at_a_class_level_the_body_pytestmark_beats_a_class_decorator() -> None:
+    """The body binds pytestmark when the class is created; its decorators append after it."""
+    source = """
+        import pytest
+
+        @pytest.mark.timeout(DECORATOR_TOP)
+        @pytest.mark.timeout(DECORATOR_NEAREST)
+        class TestThing:
+            pytestmark = [pytest.mark.timeout(BODY_FIRST), pytest.mark.timeout(BODY_SECOND)]
+
+            def test_a(self) -> None:
+                pass
+
+        @pytest.mark.timeout(DECORATOR_TOP)
+        @pytest.mark.timeout(DECORATOR_NEAREST)
+        class TestDecoratedOnly:
+            def test_a(self) -> None:
+                pass
+        """
+
+    assert _closest_spelling(source, ('TestThing',), 'test_a') == 'BODY_FIRST'
+    assert _closest_spelling(source, ('TestDecoratedOnly',), 'test_a') == 'DECORATOR_NEAREST'
 
 
 def test_site_kinds_are_the_closed_vocabulary_failure_messages_render() -> None:
@@ -284,8 +482,8 @@ def test_the_band_edges_are_exactly_where_the_design_puts_them() -> None:
         True,  # 150         -- measured, test_offline_lane_integration.py
         True,  # 180         -- measured, the most common in-band value (34 sites)
         True,  # 299         -- last inverting value
-        False,  # 300        -- WHOLE_TREE_SCAN / the CLI budget
-        False,  # 360        -- loosens under both
+        False,  # 300        -- the CLI budget
+        False,  # 360        -- a slow test's opt-out: at least what verify grants with no marker
         False,  # 960        -- PYTEST_TIMEOUT (warm-lane bash bucket)
     ]
 

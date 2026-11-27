@@ -12,12 +12,18 @@ from __future__ import annotations
 import contextlib
 import json
 import logging
+import re
+import sys
 import threading
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _git_fixtures import seed_repo
+
+from orchestrator import substrate_gate as gate
+from orchestrator.slot_lease import SlotLease
 
 # ---------------------------------------------------------------------------
 # Shared scaffolding (pre-1)
@@ -448,6 +454,181 @@ class TestRunSubstrateRecheck:
 
 
 # ---------------------------------------------------------------------------
+# Task 8372: the structured ``unverifiable`` marker on a fail-closed FLIP
+# ---------------------------------------------------------------------------
+
+_DEFAULT_DESCRIPTOR = make_probe_task()['metadata']['substrate_probe']
+_DEFAULT_ARGV = gate.build_checker_argv(_DEFAULT_DESCRIPTOR)
+
+
+def _raising_runner(argv, *, cwd, timeout):
+    raise OSError('spawn failed')
+
+
+class TestUnverifiableVerdict:
+    """``SubstrateVerdict.unverifiable`` marks a FLIP that no probe result backs."""
+
+    @pytest.mark.parametrize(
+        ('task', 'run_subprocess', 'exit_code', 'checker_ran'),
+        [
+            pytest.param(make_probe_task(), fake_checker(rc=127), 127, True, id='rc127'),
+            pytest.param(make_probe_task(), fake_checker(rc=255), 255, True, id='rc255'),
+            pytest.param(make_probe_task(), fake_checker(rc=99), 99, True, id='rc99-sentinel'),
+            pytest.param(make_probe_task(), _raising_runner, None, True, id='runner-raised'),
+            pytest.param(
+                {'id': '42', 'metadata': {'substrate_probe': 'oops'}},
+                fake_checker(rc=0), None, False, id='malformed',
+            ),
+            pytest.param(
+                {'id': '42', 'metadata': {'substrate_probe': {'probe_set': '', 'checker': ['py']}}},
+                fake_checker(rc=0), None, False, id='empty-probe-set',
+            ),
+            pytest.param(
+                {'id': '42', 'metadata': {'substrate_probe': {'probe_set': 'probes/foo.json', 'checker': []}}},
+                fake_checker(rc=0), None, False, id='no-checker',
+            ),
+        ],
+    )
+    def test_recheck_without_probe_result_is_unverifiable_flip(
+        self, task, run_subprocess, exit_code, checker_ran,
+    ):
+        verdict = gate.run_substrate_recheck(
+            task=task, worktree='/gate/wt', run_subprocess=run_subprocess,
+        )
+        assert verdict.verdict == gate.FLIP
+        assert verdict.unverifiable is True
+        assert verdict.exit_code == exit_code
+        if checker_ran:
+            assert verdict.checker_argv == _DEFAULT_ARGV
+            assert verdict.probe_set == _DEFAULT_DESCRIPTOR['probe_set']
+
+    @pytest.mark.parametrize(
+        ('task', 'rc', 'expected'),
+        [
+            pytest.param(make_probe_task(), 1, gate.FLIP, id='rc1-fail'),
+            pytest.param(make_probe_task(), 2, gate.FLIP, id='rc2-unprovable'),
+            pytest.param(make_probe_task(), 0, gate.PASS, id='rc0-pass'),
+            pytest.param({'id': '42', 'metadata': {}}, 0, gate.SKIP, id='no-descriptor'),
+        ],
+    )
+    def test_checker_result_or_skip_is_not_unverifiable(self, task, rc, expected):
+        verdict = gate.run_substrate_recheck(
+            task=task, worktree='/gate/wt', run_subprocess=fake_checker(rc=rc),
+        )
+        assert verdict.verdict == expected
+        assert verdict.unverifiable is False
+
+    def test_factory_builds_an_unverifiable_flip(self):
+        verdict = gate.unverifiable_verdict('boom', exit_code=7, probe_set='p.json')
+        assert verdict.verdict == gate.FLIP
+        assert verdict.flipped is True
+        assert verdict.unverifiable is True
+        assert verdict.reason == 'boom'
+        assert verdict.exit_code == 7
+        assert verdict.probe_set == 'p.json'
+        assert verdict.checker_argv is None
+        assert verdict.stdout == ''
+        assert verdict.stderr == ''
+
+    @pytest.mark.parametrize(
+        'non_flip', [pytest.param(gate.PASS, id='pass'), pytest.param(gate.SKIP, id='skip')],
+    )
+    def test_unverifiable_requires_flip_at_construction(self, non_flip):
+        with pytest.raises(ValueError, match=rf'unverifiable.*{re.escape(repr(non_flip))}'):
+            gate.SubstrateVerdict(
+                verdict=non_flip, exit_code=0, checker_argv=None, probe_set=None,
+                reason='x', unverifiable=True,
+            )
+
+
+def _recheck_with_rc(rc: int):
+    return gate.run_substrate_recheck(
+        task=make_probe_task(), worktree='/gate/wt', run_subprocess=fake_checker(rc=rc),
+    )
+
+
+_PROBE_FLIP_SUMMARY = 'SUBSTRATE_FLIP: probe set PASS→FAIL on current main (task 9)'
+
+
+def _assert_unverified_text(text) -> None:
+    """*text* (rendered or filed) claims nothing about the probe set."""
+    summary, detail = text.summary, text.detail
+    assert summary.startswith('SUBSTRATE_UNVERIFIED'), summary
+    assert 'nothing' in summary, summary
+    assert 'established' in summary, summary
+    for probe_claim in ('PASS→FAIL', 'FLIP'):
+        assert probe_claim not in summary, summary
+    assert 'not evidence' in detail.lower(), detail
+    assert 'do not re-spec' in detail.lower(), detail
+    assert 'unblock' in detail, detail
+    for probe_claim in ('PASS→FAIL', 'no longer holds', 're-spec required'):
+        assert probe_claim not in detail, detail
+
+
+class TestFlipEscalationText:
+    """``flip_escalation_text`` renders what each FLIP verdict actually established."""
+
+    @pytest.mark.parametrize(
+        'make_verdict',
+        [
+            pytest.param(lambda: _recheck_with_rc(1), id='rc1-fail'),
+            pytest.param(lambda: _recheck_with_rc(2), id='rc2-unprovable'),
+            pytest.param(lambda: _flip_verdict(), id='flip-fixture'),
+        ],
+    )
+    def test_probe_flip_keeps_the_pass_to_fail_text(self, make_verdict):
+        verdict = make_verdict()
+        text = gate.flip_escalation_text('9', verdict)
+        assert text.summary == _PROBE_FLIP_SUMMARY
+        assert f'Reason: {verdict.reason}' in text.detail
+        assert 're-spec required' in text.detail
+
+    def test_unverifiable_flip_claims_nothing_was_established(self):
+        reason = (
+            'substrate unverifiable / git worktree add failed (rc=128): '
+            'fatal: invalid reference: main'
+        )
+        text = gate.flip_escalation_text('9', gate.unverifiable_verdict(reason))
+
+        _assert_unverified_text(text)
+        assert text.summary.startswith('SUBSTRATE_UNVERIFIED: task 9 '), text.summary
+        assert f'Reason: {reason}' in text.detail, text.detail
+
+    def test_routes_on_the_field_not_the_reason_string(self):
+        scary_reason = gate.SubstrateVerdict(
+            verdict=gate.FLIP, exit_code=1, checker_argv=None, probe_set='p.json',
+            reason='substrate unverifiable / looks scary',
+        )
+        assert gate.flip_escalation_text('9', scary_reason).summary == _PROBE_FLIP_SUMMARY
+
+        malformed = gate.run_substrate_recheck(
+            task={'id': '9', 'metadata': {'substrate_probe': 'oops'}},
+            worktree='/gate/wt', run_subprocess=fake_checker(rc=0),
+        )
+        assert 'unverifiable' not in malformed.reason
+        assert gate.flip_escalation_text('9', malformed).summary.startswith('SUBSTRATE_UNVERIFIED')
+
+    def test_each_rendering_dedupes_on_its_own_task_scoped_root_cause(self):
+        root_causes = {
+            gate.flip_escalation_text(task_id, verdict).root_cause
+            for task_id in ('9', '10')
+            for verdict in (_flip_verdict(), gate.unverifiable_verdict('x'))
+        }
+        assert len(root_causes) == 4, root_causes
+
+    @pytest.mark.parametrize(
+        'make_verdict',
+        [
+            pytest.param(lambda: _pass_verdict(), id='pass'),
+            pytest.param(lambda: _skip_verdict(), id='skip'),
+        ],
+    )
+    def test_refuses_a_non_flip_verdict(self, make_verdict):
+        with pytest.raises(ValueError, match='requires a FLIP verdict'):
+            gate.flip_escalation_text('9', make_verdict())
+
+
+# ---------------------------------------------------------------------------
 # Step-7 RED: harness _run_substrate_gate + _block_and_escalate_substrate_flip
 # ---------------------------------------------------------------------------
 
@@ -492,9 +673,14 @@ def _make_harness(tmp_path: Path):
     return h
 
 
-def _make_assignment(task_id: str = '42', probe: bool = True):
-    """Build a minimal TaskAssignment-like object."""
-    task = make_probe_task() if probe else {'id': task_id, 'title': 'Plain', 'metadata': {}}
+def _make_assignment(
+    task_id: str = '42', probe: bool = True, checker: list[str] | None = None,
+):
+    """Build a minimal TaskAssignment-like object; *checker* overrides the probe's."""
+    task = (
+        make_probe_task(checker=checker) if probe
+        else {'id': task_id, 'title': 'Plain', 'metadata': {}}
+    )
     task['id'] = task_id
 
     from unittest.mock import MagicMock
@@ -786,30 +972,36 @@ def _fake_proc(returncode: int):
 class TestBlockAndEscalateSubstrateFlip:
     """Unit tests for ``Harness._block_and_escalate_substrate_flip``."""
 
-    @pytest.mark.asyncio
-    async def test_sets_task_blocked(self, tmp_path: Path):
-        """set_task_status('blocked') is called with the task_id."""
+    @staticmethod
+    def _harness_with_queue(tmp_path: Path):
         from escalation.queue import EscalationQueue
 
         h = _make_harness(tmp_path)
-        h._escalation_queue = EscalationQueue(tmp_path / 'esc')
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        h._escalation_queue = esc_queue
+        return h, esc_queue
 
-        verdict = _flip_verdict()
-        await h._block_and_escalate_substrate_flip('99', verdict=verdict)
+    @staticmethod
+    async def _block_flip(
+        h, task_id: str, verdict: gate.SubstrateVerdict | None = None,
+    ) -> None:
+        await h._block_and_escalate_substrate_flip(task_id, verdict=verdict or _flip_verdict())
+
+    @pytest.mark.asyncio
+    async def test_sets_task_blocked(self, tmp_path: Path):
+        """set_task_status('blocked') is called with the task_id."""
+        h, _ = self._harness_with_queue(tmp_path)
+
+        await self._block_flip(h, '99')
 
         h.scheduler.set_task_status.assert_awaited_once_with('99', 'blocked')  # type: ignore[attr-defined]
 
     @pytest.mark.asyncio
     async def test_files_l1_escalation_design_concern(self, tmp_path: Path):
         """Files exactly one L1 with category='design_concern' and severity='blocking'."""
-        from escalation.queue import EscalationQueue
+        h, esc_queue = self._harness_with_queue(tmp_path)
 
-        h = _make_harness(tmp_path)
-        esc_queue = EscalationQueue(tmp_path / 'esc')
-        h._escalation_queue = esc_queue
-
-        verdict = _flip_verdict()
-        await h._block_and_escalate_substrate_flip('77', verdict=verdict)
+        await self._block_flip(h, '77')
 
         pending = esc_queue.get_pending()
         l1s = [e for e in pending if e.task_id == '77' and e.level == 1]
@@ -819,21 +1011,60 @@ class TestBlockAndEscalateSubstrateFlip:
         assert esc.severity == 'blocking'
 
     @pytest.mark.asyncio
-    async def test_deduped_by_has_open_l1(self, tmp_path: Path):
+    async def test_deduped_while_its_l1_is_open(self, tmp_path: Path):
         """Second call with open L1 is suppressed (no duplicate filed)."""
-        from escalation.queue import EscalationQueue
+        h, esc_queue = self._harness_with_queue(tmp_path)
 
-        h = _make_harness(tmp_path)
-        esc_queue = EscalationQueue(tmp_path / 'esc')
-        h._escalation_queue = esc_queue
-
-        verdict = _flip_verdict()
-        await h._block_and_escalate_substrate_flip('55', verdict=verdict)
-        await h._block_and_escalate_substrate_flip('55', verdict=verdict)
+        await self._block_flip(h, '55')
+        await self._block_flip(h, '55')
 
         pending = esc_queue.get_pending()
         l1s = [e for e in pending if e.task_id == '55' and e.level == 1]
         assert len(l1s) == 1, f'Expected exactly 1 L1 after dedup; got {l1s!r}'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'unverified_first', [True, False], ids=['unverified-first', 'flip-first'],
+    )
+    async def test_unverified_and_probe_flip_l1s_do_not_cover_each_other(
+        self, tmp_path: Path, unverified_first: bool,
+    ):
+        """Their remedies are opposite, so an open L1 of one kind must not hide the other."""
+        h, esc_queue = self._harness_with_queue(tmp_path)
+        unverified = gate.unverifiable_verdict('substrate unverifiable / checker error rc=137')
+        order = [unverified, _flip_verdict()] if unverified_first else [_flip_verdict(), unverified]
+
+        for verdict in order * 2:
+            await self._block_flip(h, '56', verdict)
+
+        l1s = [e for e in esc_queue.get_pending() if e.task_id == '56' and e.level == 1]
+        assert len(l1s) == 2, f'Expected one L1 per kind after dedup; got {l1s!r}'
+        assert {e.root_cause for e in l1s} == {
+            gate.flip_escalation_text('56', verdict).root_cause for verdict in order
+        }
+
+    @pytest.mark.asyncio
+    async def test_open_l1_of_another_category_does_not_suppress(self, tmp_path: Path):
+        """The cross-repo gate's open L1 must not hide the flip's root cause."""
+        from orchestrator.cross_repo_gate import BLOCK, CrossRepoVerdict
+
+        h, esc_queue = self._harness_with_queue(tmp_path)
+        misfile = CrossRepoVerdict(
+            verdict=BLOCK,
+            owner_project='dark_factory',
+            signals=('cross_repo_marker', 'all_files_foreign'),
+            foreign_paths=('/home/leo/src/dark-factory/orchestrator/src/x.py',),
+            reason='all 1 declared metadata.files entries resolve outside project_root',
+        )
+        await h._block_and_escalate_cross_repo('45', verdict=misfile)
+
+        await self._block_flip(h, '45')
+
+        pending_l1s = [e for e in esc_queue.get_pending() if e.task_id == '45' and e.level == 1]
+        by_category = {e.category: e for e in pending_l1s}
+        assert len(pending_l1s) == 2, f'Expected one L1 per gate for task 45; got {pending_l1s!r}'
+        assert by_category['scope_violation'].summary.startswith('CROSS_REPO_MISFILE')
+        assert by_category['design_concern'].summary.startswith('SUBSTRATE_FLIP')
 
     @pytest.mark.asyncio
     async def test_noop_when_no_escalation_queue(self, tmp_path: Path):
@@ -841,9 +1072,8 @@ class TestBlockAndEscalateSubstrateFlip:
         h = _make_harness(tmp_path)
         h._escalation_queue = None  # bare-harness scenario
 
-        verdict = _flip_verdict()
         # Should not raise
-        await h._block_and_escalate_substrate_flip('33', verdict=verdict)
+        await self._block_flip(h, '33')
 
         # set_task_status is still called (blocking the task is unconditional)
         h.scheduler.set_task_status.assert_awaited_once_with('33', 'blocked')  # type: ignore[attr-defined]
@@ -923,7 +1153,7 @@ class TestRunSlotSubstrateGateWiring:
 
         with patch('orchestrator.harness.build_workflow') as MockWorkflow:
             MockWorkflow.return_value = _make_mock_workflow()
-            await h._run_slot(assignment, sem)
+            await h._run_slot(assignment, SlotLease(assignment.task_id, h.scheduler, sem))
 
         # (a1) TaskWorkflow must NOT have been constructed.
         assert not MockWorkflow.called, (
@@ -955,7 +1185,7 @@ class TestRunSlotSubstrateGateWiring:
         with patch('orchestrator.harness.build_workflow') as MockWorkflow:
             mock_wf = _make_mock_workflow()
             MockWorkflow.return_value = mock_wf
-            await h._run_slot(assignment, sem)
+            await h._run_slot(assignment, SlotLease(assignment.task_id, h.scheduler, sem))
 
         # (b1) TaskWorkflow must have been constructed.
         assert MockWorkflow.called, 'TaskWorkflow must be constructed on PASS gate verdict'
@@ -980,7 +1210,7 @@ class TestRunSlotSubstrateGateWiring:
         with patch('orchestrator.harness.build_workflow') as MockWorkflow:
             mock_wf = _make_mock_workflow()
             MockWorkflow.return_value = mock_wf
-            await h._run_slot(assignment, sem)
+            await h._run_slot(assignment, SlotLease(assignment.task_id, h.scheduler, sem))
 
         # (c1) _run_substrate_gate must NOT have been called.
         gate_mock.assert_not_awaited()
@@ -1014,7 +1244,7 @@ def _stub_old_carries_substrate_probe(h) -> None:
     dispatch gate run unconditionally and mask the defect — hence the explicit
     ``side_effect`` rather than a bare mock.
     """
-    from orchestrator.substrate_gate import extract_probe_set  # noqa: PLC0415
+    from orchestrator.substrate_gate import extract_probe_set
     h.scheduler.carries_substrate_probe = MagicMock(
         side_effect=lambda t: extract_probe_set(t) is not None
     )
@@ -1041,11 +1271,12 @@ class TestRunSlotSubstrateFailClosed:
         self, tmp_path: Path, *, task_id: str, metadata: dict,
     ) -> None:
         """Shared body for the two malformed-descriptor cases (a) and (b)."""
-        from escalation.queue import EscalationQueue  # noqa: PLC0415
+        from escalation.queue import EscalationQueue
 
         h = _make_slot_harness(tmp_path)
         _stub_old_carries_substrate_probe(h)
-        h._escalation_queue = EscalationQueue(tmp_path / 'esc')
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        h._escalation_queue = esc_queue
 
         assignment = MagicMock()
         assignment.task_id = task_id
@@ -1060,7 +1291,7 @@ class TestRunSlotSubstrateFailClosed:
             patch('orchestrator.harness.build_workflow') as MockWorkflow,
         ):
             MockWorkflow.return_value = _make_mock_workflow()
-            await h._run_slot(assignment, sem)
+            await h._run_slot(assignment, SlotLease(assignment.task_id, h.scheduler, sem))
 
         assert not MockWorkflow.called, (
             f'TaskWorkflow must NOT be constructed for malformed descriptor '
@@ -1068,11 +1299,11 @@ class TestRunSlotSubstrateFailClosed:
         )
         h.scheduler.set_task_status.assert_awaited_once_with(task_id, 'blocked')  # type: ignore[attr-defined]
 
-        pending = h._escalation_queue.get_pending()
+        pending = esc_queue.get_pending()
         l1s = [e for e in pending if e.task_id == task_id and e.level == 1]
         assert len(l1s) == 1, f'Expected exactly 1 L1 escalation for task {task_id}; got {l1s!r}'
         assert l1s[0].category == 'design_concern', f'Expected design_concern, got {l1s[0].category!r}'
-        assert l1s[0].summary.startswith('SUBSTRATE_FLIP'), f'Unexpected summary: {l1s[0].summary!r}'
+        assert l1s[0].summary.startswith('SUBSTRATE_UNVERIFIED'), f'Unexpected summary: {l1s[0].summary!r}'
 
         h.scheduler.release.assert_called_once()  # type: ignore[attr-defined]
         release_call = h.scheduler.release.call_args  # type: ignore[attr-defined]
@@ -1098,7 +1329,7 @@ class TestRunSlotSubstrateFailClosed:
     @pytest.mark.asyncio
     async def test_no_probe_key_allows_dispatch(self, tmp_path: Path):
         """(c) companion: no substrate_probe key at all — dispatch proceeds normally."""
-        from escalation.queue import EscalationQueue  # noqa: PLC0415
+        from escalation.queue import EscalationQueue
 
         h = _make_slot_harness(tmp_path)
         _stub_old_carries_substrate_probe(h)
@@ -1119,7 +1350,7 @@ class TestRunSlotSubstrateFailClosed:
         ):
             mock_wf = _make_mock_workflow()
             MockWorkflow.return_value = mock_wf
-            await h._run_slot(assignment, sem)
+            await h._run_slot(assignment, SlotLease(assignment.task_id, h.scheduler, sem))
 
         assert MockWorkflow.called, 'TaskWorkflow must be constructed when no probe is declared'
         mock_wf.run.assert_awaited_once()
@@ -1154,18 +1385,13 @@ class TestRunSlotSubstrateFailClosed:
 # ---------------------------------------------------------------------------
 
 
-async def _init_gate_repo(repo: Path) -> None:
+async def _init_unborn_repo(repo: Path) -> None:
     from orchestrator.git_ops import _run
 
     await _run(['git', 'init', '-b', 'main'], cwd=repo)
-    await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=repo)
-    await _run(['git', 'config', 'user.name', 'Test'], cwd=repo)
-    (repo / 'README.md').write_text('# Test\n')
-    await _run(['git', 'add', '-A'], cwd=repo)
-    await _run(['git', 'commit', '-m', 'Initial commit'], cwd=repo)
 
 
-def _make_real_git_harness(repo: Path):
+def _make_real_git_harness(repo: Path, *, escalation_queue=None):
     """Build a Harness whose ``git_ops`` is a REAL ``GitOps`` on *repo*.
 
     Unlike ``_make_harness`` (which replaces ``h.git_ops`` with a bare
@@ -1187,7 +1413,7 @@ def _make_real_git_harness(repo: Path):
     h.scheduler = MagicMock()
     h.scheduler.set_task_status = AsyncMock()
     h.scheduler.is_deterministic = MagicMock(return_value=False)
-    h._escalation_queue = None
+    h._escalation_queue = escalation_queue
     return h
 
 
@@ -1204,9 +1430,7 @@ class TestSubstrateGateForeignBandGuard:
         (gate_path, frozenset({'_substrate-gate-'}), 'substrate-gate-cleanup')."""
         from orchestrator.git_ops import _run
 
-        repo = tmp_path / 'repo'
-        repo.mkdir()
-        await _init_gate_repo(repo)
+        repo = seed_repo(tmp_path / 'repo')
         h = _make_real_git_harness(repo)
         assignment = _make_assignment()
 
@@ -1263,9 +1487,7 @@ class TestSubstrateGateForeignBandGuard:
         would fail on the still-registered path and the gate would FLIP)."""
         from orchestrator.git_ops import _run
 
-        repo = tmp_path / 'repo'
-        repo.mkdir()
-        await _init_gate_repo(repo)
+        repo = seed_repo(tmp_path / 'repo')
         h = _make_real_git_harness(repo)
         assignment = _make_assignment()
 
@@ -1388,9 +1610,7 @@ class TestSubstrateGatePruneChokepoint:
         gate proceeds normally rather than FLIPping on 'already exists'."""
         from orchestrator.git_ops import _run
 
-        repo = tmp_path / 'repo'
-        repo.mkdir()
-        await _init_gate_repo(repo)
+        repo = seed_repo(tmp_path / 'repo')
         h = _make_real_git_harness(repo)
         assignment = _make_assignment()
 
@@ -1415,3 +1635,100 @@ class TestSubstrateGatePruneChokepoint:
             'worktree must still be cleaned up (remove + chokepoint prune) '
             'so `git worktree add` does not fail with "already exists"'
         )
+
+
+# ---------------------------------------------------------------------------
+# Task 8372: an unverifiable recheck files an honest L1, end to end
+# ---------------------------------------------------------------------------
+
+
+def _single_l1(esc_queue, task_id: str):
+    l1s = [e for e in esc_queue.get_pending() if e.task_id == task_id and e.level == 1]
+    assert len(l1s) == 1, f'Expected exactly 1 L1 for task {task_id}; got {l1s!r}'
+    esc = l1s[0]
+    assert esc.category == 'design_concern', esc.category
+    assert esc.severity == 'blocking', esc.severity
+    return esc
+
+
+async def _blocked_gate_l1(tmp_path: Path, repo: Path, assignment):
+    """Run the REAL gate on ``repo``; assert it blocked; return its one L1."""
+    from escalation.queue import EscalationQueue
+
+    esc_queue = EscalationQueue(tmp_path / 'esc')
+    h = _make_real_git_harness(repo, escalation_queue=esc_queue)
+    set_status = AsyncMock()
+    h.scheduler.set_task_status = set_status
+
+    allowed = await h._run_substrate_gate(assignment)
+
+    assert allowed is False
+    set_status.assert_awaited_once_with(assignment.task_id, 'blocked')
+    return _single_l1(esc_queue, assignment.task_id)
+
+
+class TestUnverifiableRecheckEscalation:
+    """Task 8372: an unverifiable recheck, end to end.
+
+    Each test drives the REAL ``Harness._run_substrate_gate`` into the REAL
+    ``_block_and_escalate_substrate_flip`` and a REAL ``EscalationQueue``,
+    with a REAL ``GitOps`` on a tmp git repo.  The L1 a recheck with no
+    probe result files must claim nothing about the probe set; a real probe
+    failure must still file the PASS→FAIL claim.
+    """
+
+    @pytest.mark.asyncio
+    async def test_worktree_add_failure_files_unverified_l1(self, tmp_path: Path):
+        repo = tmp_path / 'repo'
+        repo.mkdir()
+        # An unborn `main`: resolve_branch_sha returns None, the gate falls
+        # back to the symbolic ref, and the real `git worktree add` fails.
+        await _init_unborn_repo(repo)
+
+        esc = await _blocked_gate_l1(tmp_path, repo, _make_assignment('8372'))
+
+        _assert_unverified_text(esc)
+        assert 'git worktree add failed' in esc.detail, esc.detail
+        # git's rc is in the Reason line; it is not the checker's exit code.
+        assert 'exit_code=None' in esc.detail, esc.detail
+
+    @pytest.mark.asyncio
+    async def test_recheck_crash_files_unverified_l1(self, tmp_path: Path):
+        repo = seed_repo(tmp_path / 'repo')
+
+        # run_substrate_recheck catches its own subprocess errors, so patching
+        # the public function is the honest way to reach the except branch
+        # (the task 4161 precedent).
+        with patch(
+            'orchestrator.substrate_gate.run_substrate_recheck',
+            side_effect=RuntimeError('checker host vanished'),
+        ):
+            esc = await _blocked_gate_l1(tmp_path, repo, _make_assignment('8372'))
+
+        _assert_unverified_text(esc)
+        assert 'RuntimeError' in esc.detail, esc.detail
+        assert 'checker host vanished' in esc.detail, esc.detail
+
+    @pytest.mark.asyncio
+    async def test_checker_that_cannot_launch_files_unverified_l1(self, tmp_path: Path):
+        repo = seed_repo(tmp_path / 'repo')
+        assignment = _make_assignment('8372', checker=[str(tmp_path / 'no-such-checker')])
+
+        esc = await _blocked_gate_l1(tmp_path, repo, assignment)
+
+        _assert_unverified_text(esc)
+        assert 'rc=99' in esc.detail, esc.detail
+        assert 'No such file or directory' in esc.detail, esc.detail
+
+    @pytest.mark.asyncio
+    async def test_real_probe_failure_still_files_substrate_flip(self, tmp_path: Path):
+        repo = seed_repo(tmp_path / 'repo')
+        # The probe_set path is appended as an argv the -c script ignores.
+        assignment = _make_assignment(
+            '8372', checker=[sys.executable, '-c', 'import sys; sys.exit(1)'],
+        )
+
+        esc = await _blocked_gate_l1(tmp_path, repo, assignment)
+
+        assert esc.summary == 'SUBSTRATE_FLIP: probe set PASS→FAIL on current main (task 8372)'
+        assert 're-spec required' in esc.detail, esc.detail

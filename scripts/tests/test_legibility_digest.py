@@ -15,9 +15,9 @@ real Claude Code JSONL schema (observed in
 
 Every helper below returns a plain dict (or writes one) — no behavior, pure
 scaffolding reused by every test class in this file. Import the target
-module as `import digest as mod`, resolved via scripts/tests/conftest.py's
-sys.path insertion (both scripts/ and scripts/legibility/ are on sys.path;
-no package __init__ needed).
+module as `from legibility import digest as mod`, the one spelling every
+legibility module is reached by (scripts/ is on sys.path via
+scripts/tests/conftest.py; no package __init__ needed).
 """
 from __future__ import annotations
 
@@ -26,28 +26,36 @@ import logging
 import re
 from pathlib import Path
 
-import digest as mod
 import pytest
 import yaml
 from legibility import detectors, reingestion
+from legibility import digest as mod
 from legibility import inventory as inventory_mod
 from legibility_carrier_fixtures import (
     CENSUS_MEMORY_CONTEXT_TURN,
     CENSUS_QUOTE_OF_THE_ESCALATION_PAYLOAD,
+    CLIENT_RENDERED_IDS,
+    CLIENT_RENDERED_TURNS,
     HUMAN_TURNS_NAMING_AN_INJECTED_PROMPT,
     NON_HUMAN_ORIGIN_IDS,
     NON_HUMAN_ORIGIN_TURNS,
+    SLASH_COMMAND_ARGLESS_TURN,
+    SLASH_COMMAND_WITH_ARGS_TURN,
     TASK_NOTIFICATION_TEXT,
     TRICKLE_CODER_PREAMBLE,
     UNKNOWN_PROVENANCE_TEXT,
+    UNMARKED_HEADLESS_SDK_PROMPT_TEXTS,
     WATCHER_ROTATION_PROMPT,
     briefing_text,
+    census_synthesis_prompt,
+    census_verifier_prompt,
     coder_judgment,
     json_fenced,
     merger_prompt,
     pre_5356_replan_prompt,
     prior_round_adjudicator_prompt,
     recon_run_review_text,
+    sdk_prompt,
     steward_continuation_prompt,
     with_origin,
 )
@@ -59,6 +67,8 @@ from orchestrator.agents.memory_recall import (
     MEMORY_SECTION_FAILURE_NOTICE,
 )
 from shared.cli_invoke import CAP_HIT_RESUME_PROMPT, CRASH_RECOVERY_RESUME_PROMPT
+
+USER_TURNS_HEADING = f"## {mod.SECTION_HEADINGS['user_turns']}"
 
 
 def _assistant(*blocks):
@@ -357,7 +367,7 @@ class TestAsUnreadableFileError:
 
 # ---------------------------------------------------------------------------
 # iter_user_turns — genuine non-sidechain, non-meta human turns only.
-# User corrections are gold (PRD Sec 5): this is the highest-priority section.
+# User turns are gold (PRD Sec 5): this is the highest-priority section.
 # ---------------------------------------------------------------------------
 
 class TestIterUserTurns:
@@ -1009,7 +1019,7 @@ class TestTrickleCoderSessionDigest:
         meta = yaml.safe_load(frontmatter_yaml)
         lines = digest.splitlines()
 
-        for key in ('self_corrections', 'user_corrections', 'df_guard'):
+        for key in ('self_corrections', 'user_turns', 'df_guard'):
             assert f'## {mod.SECTION_HEADINGS[key]}' not in lines
         assert meta['signal_counts'] == dict.fromkeys(mod.SIGNAL_COUNT_KEYS, 0)
         assert meta['n_user_turns'] == 0
@@ -1071,6 +1081,34 @@ class TestTrickleCoderSessionDigest:
         frontmatter_yaml, _ = _split_frontmatter(digest)
 
         assert yaml.safe_load(frontmatter_yaml)['instrument_version'] >= 7
+
+    def test_frontmatter_instrument_version_is_at_or_past_the_headless_sdk_prompt_generation(
+        self,
+    ):
+        """A version floor only. Generation 8 is the first whose gold section
+        and dialogue carriers exclude headless SDK-delivered prompts. The
+        exclusion itself is pinned by TestHeadlessSdkPromptFilter."""
+        digest = mod.render_digest(
+            [_with_session_meta(_user_text('please fix the bug'))], agent_class='interactive',
+        )
+
+        frontmatter_yaml, _ = _split_frontmatter(digest)
+
+        assert yaml.safe_load(frontmatter_yaml)['instrument_version'] >= 8
+
+    def test_frontmatter_instrument_version_is_at_or_past_the_census_prompt_generation(self):
+        """A version floor only. Generation 9 is the first whose gold section
+        and dialogue carriers exclude the periodic-census verifier and
+        synthesis prompts. The exclusion itself is pinned by the census params
+        of
+        TestHarnessInjectedTurnFilter.test_render_digest_injected_prose_prompt_session_has_no_gold_section."""
+        digest = mod.render_digest(
+            [_with_session_meta(_user_text('please fix the bug'))], agent_class='interactive',
+        )
+
+        frontmatter_yaml, _ = _split_frontmatter(digest)
+
+        assert yaml.safe_load(frontmatter_yaml)['instrument_version'] >= 9
 
 
 # ---------------------------------------------------------------------------
@@ -1727,6 +1765,7 @@ def _frontmatter_meta():
         'score': 12.5,
         'n_user_turns': 3,
         'truncated_items': 0,
+        'parent_session': '',
         'signal_counts': {
             'tool_error': 1,
             'self_correct': 2,
@@ -1759,7 +1798,7 @@ class TestRenderFrontmatter:
         assert top_level_keys == [
             'session', 'cwd', 'encoded_dir', 'agent_class', 'date',
             'size_bytes', 'score', 'n_user_turns', 'truncated_items',
-            'instrument_version', 'signal_counts',
+            'parent_session', 'instrument_version', 'signal_counts',
         ]
 
     def test_signal_counts_nested_in_contract_order(self):
@@ -1827,6 +1866,7 @@ class TestRenderFrontmatter:
         assert mod.FRONTMATTER_KEYS[:-1] == (
             'session', 'cwd', 'encoded_dir', 'agent_class', 'date',
             'size_bytes', 'score', 'n_user_turns', 'truncated_items',
+            'parent_session',
         )
 
     def test_instrument_version_emits_as_a_bare_numeric_scalar(self):
@@ -1936,7 +1976,7 @@ def _split_frontmatter(digest):
 # typed into the transcript as ordinary user-role text (isMeta=False -- it
 # really is the first "user" turn Claude Code sees), so it was previously
 # indistinguishable from a genuine human correction: it inflated both the
-# gold user_corrections section and score's n_user_turns component. Three
+# gold user_turns section and score's n_user_turns component. Three
 # shapes are covered, not two: the briefing preamble is excluded by CONTENT
 # co-occurrence (all three headings must co-occur, line-anchored, mirroring
 # ORCHESTRATED_TASK_MARKERS' all() guard) so an ordinary human turn that
@@ -2041,17 +2081,6 @@ def _resume_and_context_block_records():
     ]
 
 
-def _sdk_prompt(text):
-    """A prompt delivered over the SDK, shaped like the steward continuation
-    records sighted in reify session 77fb6617: promptSource and turnOrigin
-    'sdk', no 'origin', and the 'isMeta' key ABSENT rather than False."""
-    rec = _user_text(text)
-    rec.pop('isMeta')
-    rec['promptSource'] = 'sdk'
-    rec['turnOrigin'] = 'sdk'
-    return rec
-
-
 _BLOCKED_LITERAL = 'BLOCKED: merge gate refused the branch'
 
 INJECTED_PROSE_PROMPTS = (
@@ -2061,9 +2090,15 @@ INJECTED_PROSE_PROMPTS = (
     ),
     pytest.param(pre_5356_replan_prompt(_BLOCKED_LITERAL), id='pre_5356_replan'),
     pytest.param(WATCHER_ROTATION_PROMPT, id='watcher_rotation'),
+    pytest.param(
+        census_verifier_prompt(_BLOCKED_LITERAL, 'cat: x: No such file or directory'),
+        id='census_verifier',
+    ),
+    pytest.param(census_synthesis_prompt(_BLOCKED_LITERAL), id='census_synthesis'),
 )
-"""The generation-7 harness prose prompts. Two carry a df_guard literal in
-their review free text, which must not count as this session's signal."""
+"""Harness prose prompts that open a session. All but the watcher rotation
+embed free text quoting signal literals, review text or another session's
+cluster, which must not count as this session's signal."""
 
 
 class TestHarnessInjectedTurnFilter:
@@ -2132,7 +2167,7 @@ class TestHarnessInjectedTurnFilter:
         # '## Context' + '## Conventions' is a common human-authored
         # markdown shape in this repo's own plans/ and docs/ prose. Treating
         # it as an anchor silently drops a genuine human correction from the
-        # gold user_corrections section -- the exact pathology the
+        # gold user_turns section -- the exact pathology the
         # instrument exists to prevent.
         text = (
             '## Context\n\nWe are debugging the merge worker.\n\n'
@@ -2277,9 +2312,9 @@ class TestHarnessInjectedTurnFilter:
         # The 77fb6617 shape: two continuation prompts around real dialogue.
         continuation = steward_continuation_prompt(tmp_path)
         records = [
-            _sdk_prompt(continuation),
+            sdk_prompt(continuation, entrypoint=None),
             _user_text('please fix the bug'),
-            _sdk_prompt(continuation),
+            sdk_prompt(continuation, entrypoint=None),
         ]
 
         turns = mod.iter_user_turns(records)
@@ -2298,14 +2333,14 @@ class TestHarnessInjectedTurnFilter:
         prompt = steward_continuation_prompt(
             tmp_path, summary='BLOCKED: merge gate refused the branch',
         )
-        records = [_with_session_meta(_sdk_prompt(prompt)) for _ in range(2)]
+        records = [_with_session_meta(sdk_prompt(prompt, entrypoint=None)) for _ in range(2)]
 
         digest = mod.render_digest(records, agent_class='orchestrated-task')
 
         frontmatter_yaml, _ = _split_frontmatter(digest)
         meta = yaml.safe_load(frontmatter_yaml)
 
-        assert '## User Corrections' not in digest
+        assert USER_TURNS_HEADING not in digest
         assert meta['n_user_turns'] == 0
         assert meta['signal_counts'] == dict.fromkeys(mod.SIGNAL_COUNT_KEYS, 0)
 
@@ -2313,7 +2348,7 @@ class TestHarnessInjectedTurnFilter:
     def test_injected_prose_prompt_is_excluded_from_iter_user_turns(self, prompt):
         # The 16e1a37b / 2880c011 / 4aaf48b0 shape: the injected prompt is
         # the session's first user record.
-        records = [_sdk_prompt(prompt), _user_text('please fix the bug')]
+        records = [sdk_prompt(prompt, entrypoint=None), _user_text('please fix the bug')]
 
         turns = mod.iter_user_turns(records)
 
@@ -2322,13 +2357,13 @@ class TestHarnessInjectedTurnFilter:
     @pytest.mark.parametrize('prompt', INJECTED_PROSE_PROMPTS)
     def test_render_digest_injected_prose_prompt_session_has_no_gold_section(self, prompt):
         digest = mod.render_digest(
-            [_with_session_meta(_sdk_prompt(prompt))], agent_class='orchestrated-task',
+            [_with_session_meta(sdk_prompt(prompt, entrypoint=None))], agent_class='orchestrated-task',
         )
 
         frontmatter_yaml, _ = _split_frontmatter(digest)
         meta = yaml.safe_load(frontmatter_yaml)
 
-        assert '## User Corrections' not in digest
+        assert USER_TURNS_HEADING not in digest
         assert meta['n_user_turns'] == 0
         assert meta['signal_counts'] == dict.fromkeys(mod.SIGNAL_COUNT_KEYS, 0)
 
@@ -2429,7 +2464,7 @@ class TestHarnessInjectedTurnFilter:
             'tool_error', 'self_correct', 'not_found', 'df_guard', 'interrupt',
         }
         assert all(count == 0 for count in meta['signal_counts'].values())
-        assert '## User Corrections' not in digest
+        assert USER_TURNS_HEADING not in digest
         # n_user_turns inflation is gone: score_signals(all-zero counts, 0).
         assert meta['score'] == 0.0
         assert 'previous run was interrupted' not in body
@@ -2449,9 +2484,9 @@ class TestHarnessInjectedTurnFilter:
         frontmatter_yaml, body = _split_frontmatter(digest)
         meta = yaml.safe_load(frontmatter_yaml)
 
-        assert '## User Corrections' in digest
-        correction_lines = [line for line in body.splitlines() if line.startswith('- (turn')]
-        assert correction_lines == ['- (turn 3) This is wrong, please redo it.']
+        assert USER_TURNS_HEADING in digest
+        correction_lines = [line for line in body.splitlines() if line.startswith('- (record')]
+        assert correction_lines == ['- (record 3) This is wrong, please redo it.']
         assert 'previous run was interrupted' not in body
         assert '# Context' not in body
         assert meta['score'] == mod.score_signals(meta['signal_counts'], 1)
@@ -2576,7 +2611,7 @@ class TestNonHumanOriginFilter:
         frontmatter_yaml, body = _split_frontmatter(digest)
         meta = yaml.safe_load(frontmatter_yaml)
 
-        assert '## User Corrections' not in digest
+        assert USER_TURNS_HEADING not in digest
         assert meta['n_user_turns'] == 0
         assert meta['score'] == mod.score_signals(meta['signal_counts'], 0)
         assert '<task-notification>' not in body
@@ -2593,8 +2628,8 @@ class TestNonHumanOriginFilter:
         frontmatter_yaml, body = _split_frontmatter(digest)
         meta = yaml.safe_load(frontmatter_yaml)
 
-        correction_lines = [line for line in body.splitlines() if line.startswith('- (turn')]
-        assert correction_lines == [f'- (turn 1) {_GENUINE_CORRECTION}']
+        correction_lines = [line for line in body.splitlines() if line.startswith('- (record')]
+        assert correction_lines == [f'- (record 1) {_GENUINE_CORRECTION}']
         assert meta['n_user_turns'] == 1
 
     def test_df_guard_and_interrupt_ignore_a_task_notification_carrier(self):
@@ -2638,6 +2673,40 @@ class TestNonHumanOriginFilter:
 
         assert mod.iter_user_turns(records) == []
         assert detectors.classify_agent_class(_MAIN_DIR_PATH, records) == 'orchestrated-task'
+
+
+# ---------------------------------------------------------------------------
+# Headless-SDK prompt exclusion (task 6953): a prompt delivered to headless
+# `claude --print` (promptSource 'sdk', entrypoint 'sdk-cli') is excluded by
+# provenance alone, while a human turn typed into an SDK GUI client stays gold.
+# ---------------------------------------------------------------------------
+
+class TestHeadlessSdkPromptFilter:
+    def test_headless_prompts_are_excluded_and_dialogue_keeps_its_index(self):
+        gui_client_turn = sdk_prompt("what's the status of the PR?", entrypoint='sdk-ts')
+        typed_turn = {**_user_text('please fix the bug'), 'promptSource': 'typed', 'entrypoint': 'cli'}
+        records = [sdk_prompt(text) for text in UNMARKED_HEADLESS_SDK_PROMPT_TEXTS.values()]
+        records += [gui_client_turn, typed_turn]
+
+        turns = mod.iter_user_turns(records)
+
+        assert [(t['index'], t['text']) for t in turns] == [
+            (4, "what's the status of the PR?"),
+            (5, 'please fix the bug'),
+        ]
+
+    def test_render_digest_headless_prompt_session_has_no_gold_section(self):
+        records = [
+            _with_session_meta(sdk_prompt(f'{text}\nBLOCKED: merge gate refused the branch'))
+            for text in UNMARKED_HEADLESS_SDK_PROMPT_TEXTS.values()
+        ]
+
+        digest = mod.render_digest(records, agent_class='orchestrated-task')
+
+        meta = yaml.safe_load(_split_frontmatter(digest)[0])
+        assert USER_TURNS_HEADING not in digest
+        assert meta['n_user_turns'] == 0
+        assert meta['signal_counts'] == dict.fromkeys(mod.SIGNAL_COUNT_KEYS, 0)
 
 
 # ---------------------------------------------------------------------------
@@ -2738,12 +2807,86 @@ class TestRunReviewPromptTurnFilter:
         assert mod.signal_counts(with_report) == mod.signal_counts(base)
 
 
+# ---------------------------------------------------------------------------
+# Client-rendered turn exclusion (task 7442): a turn the client composed from
+# a UI action -- an arg-less slash command, a local command's output echo, the
+# bare interrupt marker -- holds no prose a human typed, so it is not gold.
+# The interrupt marker stays an INTERRUPT signal and leaves the Interrupts
+# section only.
+# ---------------------------------------------------------------------------
+
+class TestClientRenderedTurnFilter:
+    @pytest.mark.parametrize('text', CLIENT_RENDERED_TURNS, ids=CLIENT_RENDERED_IDS)
+    def test_client_rendered_turn_is_excluded(self, text):
+        assert mod.iter_user_turns([_user_text(text)]) == []
+
+    def test_slash_command_with_typed_args_is_kept_verbatim(self):
+        turns = mod.iter_user_turns([_user_text(SLASH_COMMAND_WITH_ARGS_TURN)])
+
+        assert [t['text'] for t in turns] == [SLASH_COMMAND_WITH_ARGS_TURN]
+
+    def test_render_digest_heads_kept_turns_user_turns_not_user_corrections(self):
+        question = 'why did the lint run fail?'
+        records = [
+            _with_session_meta(_user_text(SLASH_COMMAND_WITH_ARGS_TURN)),
+            _with_session_meta(_user_text(question)),
+        ]
+
+        digest = mod.render_digest(records, agent_class='interactive')
+
+        frontmatter_yaml, body = _split_frontmatter(digest)
+        meta = yaml.safe_load(frontmatter_yaml)
+
+        assert '## User Turns' in body.splitlines()
+        assert 'User Corrections' not in digest
+        section_start = body.index('## User Turns')
+        assert body.index(SLASH_COMMAND_WITH_ARGS_TURN) > section_start
+        assert body.index(question) > section_start
+        assert meta['n_user_turns'] == 2
+
+    def test_genuine_correction_between_client_rendered_turns_keeps_its_index(self):
+        records = [
+            _user_text(SLASH_COMMAND_ARGLESS_TURN),
+            _user_text(_GENUINE_CORRECTION),
+            _user_text('[Request interrupted by user]'),
+        ]
+
+        turns = mod.iter_user_turns(records)
+
+        assert [(t['index'], t['text']) for t in turns] == [(1, _GENUINE_CORRECTION)]
+
+    def test_interrupt_beside_a_tool_result_is_no_gold_turn_but_one_interrupt(self):
+        record = _tool_result('tu-1', 'partial output')
+        record['message']['content'].append(_text('[Request interrupted by user for tool use]'))
+
+        assert mod.iter_user_turns([record]) == []
+        assert len(mod.iter_interrupts([record])) == 1
+
+    def test_render_digest_reflect_then_interrupt_session_has_no_gold_section(self):
+        records = [
+            _with_session_meta(_user_text(SLASH_COMMAND_ARGLESS_TURN)),
+            _with_session_meta(_user_text('[Request interrupted by user]')),
+        ]
+
+        digest = mod.render_digest(records, agent_class='interactive')
+
+        frontmatter_yaml, body = _split_frontmatter(digest)
+        meta = yaml.safe_load(frontmatter_yaml)
+
+        assert USER_TURNS_HEADING not in digest
+        assert '<command-name>' not in body
+        assert meta['n_user_turns'] == 0
+        assert meta['signal_counts']['interrupt'] == 1
+        assert '## Interrupts' in body
+        assert meta['score'] == mod.score_signals(meta['signal_counts'], 0)
+
+
 class TestRenderDigest:
     def test_includes_heading_for_each_present_signal_class(self):
         digest = mod.render_digest(_all_signals_records(), agent_class='interactive')
 
         for heading in (
-            'User Corrections', 'Error Neighborhoods', 'Self-Corrections',
+            mod.SECTION_HEADINGS['user_turns'], 'Error Neighborhoods', 'Self-Corrections',
             'Retry Loops', 'Not Found', 'Guard Trips', 'Interrupts',
         ):
             assert f'## {heading}' in digest, f'missing heading: {heading}'
@@ -2753,7 +2896,7 @@ class TestRenderDigest:
 
         digest = mod.render_digest(records, agent_class='interactive')
 
-        assert '## User Corrections' in digest
+        assert USER_TURNS_HEADING in digest
         for heading in (
             'Error Neighborhoods', 'Self-Corrections', 'Retry Loops',
             'Not Found', 'Guard Trips', 'Interrupts',
@@ -2770,9 +2913,26 @@ class TestRenderDigest:
         assert meta['cwd'] == _DIGEST_CWD
         assert meta['date'] == '2026-07-11'
         assert meta['agent_class'] == 'interactive'
-        # No transcript path given -> encoded_dir falls back to the mirror of
-        # session_registry.encode_cwd (every '/', '.' and '_' maps to '-').
+        # No transcript path given -> encoded_dir falls back to
+        # inventory.encode_cwd (every '/', '.' and '_' maps to '-').
         assert meta['encoded_dir'] == '-home-leo-src-dark-factory'
+
+    # Observed on-disk ~/.claude/projects dir names, hard-coded as literals:
+    # an expected value computed by an encoder cannot catch that encoder's bug.
+    @pytest.mark.parametrize(('cwd', 'expected_dir'), [
+        ('/home/leo/src/dark-factory/.worktrees/2573', '-home-leo-src-dark-factory--worktrees-2573'),
+        ('/home/leo/src/warm-lanes/worktrees/_lane-39', '-home-leo-src-warm-lanes-worktrees--lane-39'),
+        ('/media/leo/data_lv_1/leo/reify-build', '-media-leo-data-lv-1-leo-reify-build'),
+    ])
+    def test_encoded_dir_fallback_matches_real_on_disk_dir_names(self, cwd, expected_dir):
+        records = [_with_session_meta(_user_text('hi'), cwd=cwd)]
+
+        digest = mod.render_digest(records, agent_class='interactive')
+
+        frontmatter_yaml, _ = _split_frontmatter(digest)
+        meta = yaml.safe_load(frontmatter_yaml)
+
+        assert meta['encoded_dir'] == expected_dir
 
     def test_encoded_dir_prefers_transcript_path_parent_dir_name(self, tmp_path):
         # An arbitrary dir name unrelated to cwd's mirror encoding, so a
@@ -2815,16 +2975,69 @@ class TestRenderDigest:
         assert meta['size_bytes'] == len(digest.encode('utf-8'))
 
 
+class TestItemRecordLabels:
+    """An item's (record N) is its record position in the transcript, not a user-turn ordinal (task 7439)."""
+
+    def test_not_found_in_a_session_with_no_user_turns_is_labelled_by_record(self):
+        records = [
+            _with_session_meta(_assistant(_tool_use('Read', {'file_path': '/x/missing.md'}, id='tu-r'))),
+            _with_session_meta(_tool_result('tu-r', 'File does not exist.', is_error=True)),
+        ]
+
+        digest = mod.render_digest(records, agent_class='interactive')
+
+        frontmatter_yaml, body = _split_frontmatter(digest)
+        meta = yaml.safe_load(frontmatter_yaml)
+        body_lines = body.splitlines()
+
+        assert meta['n_user_turns'] == 0
+        assert '- (record 1) does not exist' in body_lines
+        error_lines = body_lines[body_lines.index('## Error Neighborhoods') + 1:]
+        assert error_lines[0].startswith('- (record 1) Read(')
+
+    def test_every_indexed_section_labels_items_by_record_position(self):
+        digest = mod.render_digest(_all_signals_records(), agent_class='interactive')
+
+        _, body = _split_frontmatter(digest)
+        body_lines = body.splitlines()
+
+        for expected in (
+            '- (record 0) Please redo this, it is wrong.',
+            '- (record 3) [my mistake] My mistake, let me redo this.',
+            '- (record 9) request interrupted by user',
+            '- (record 8) done_gate_missing_files',
+            '- (record 2) Bash({"command": "false"}) -> [exit 1] Exit code 1',
+            '- (record 7) command not found',
+        ):
+            assert expected in body_lines, expected
+        assert '(turn ' not in digest
+
+    def test_designed_outcome_items_are_labelled_by_record_position(self):
+        digest = mod.render_digest(_designed_outcomes_only_records(), agent_class='interactive')
+
+        _, body = _split_frontmatter(digest)
+        body_lines = body.splitlines()
+        section = body_lines[body_lines.index('## Designed Outcomes') + 1:]
+        section_end = section.index('') if '' in section else len(section)
+        item_lines = [line for line in section[:section_end] if line.startswith('- ')]
+
+        assert len(item_lines) == 3
+        for line, prefix in zip(
+            item_lines, ('- (record 1) ', '- (record 3) ', '- (record 5) '), strict=True,
+        ):
+            assert line.startswith(prefix), line
+
+
 # ---------------------------------------------------------------------------
 # render_digest — 15KB soft-cap priority truncation. Over max_bytes, the
 # LOWEST-priority non-empty section is trimmed/dropped first (ascending
-# SECTION_PRIORITY), with gold (user_corrections) surviving longest — PRD
+# SECTION_PRIORITY), with gold (user_turns) surviving longest — PRD
 # Sec 7.2 "truncate lowest-signal sections last".
 # ---------------------------------------------------------------------------
 
 def _oversized_not_found_records(n=600):
     """One gold user-correction plus *n* not-found hits -- enough bytes to
-    exceed the default 15360-byte soft cap on its own."""
+    exceed the DEFAULT_MAX_BYTES soft cap on its own."""
     records = [_with_session_meta(_user_text('This approach is wrong, please redo it properly.'))]
     for i in range(n):
         records.append(_with_session_meta(
@@ -2853,8 +3066,8 @@ class TestRenderDigestTruncation:
     def test_default_cap_is_respected_and_gold_survives(self):
         digest = mod.render_digest(_oversized_not_found_records(), agent_class='interactive')
 
-        assert len(digest.encode('utf-8')) <= 15360
-        assert '## User Corrections' in digest
+        assert len(digest.encode('utf-8')) <= mod.DEFAULT_MAX_BYTES
+        assert USER_TURNS_HEADING in digest
         # truncation genuinely trimmed the low-signal section, not a no-op
         assert digest.count('command not found') < 600
 
@@ -2864,7 +3077,7 @@ class TestRenderDigestTruncation:
         )
 
         assert len(digest.encode('utf-8')) <= 2048
-        assert '## User Corrections' in digest
+        assert USER_TURNS_HEADING in digest
 
     def test_lowest_priority_section_dropped_before_higher_priority(self):
         digest = mod.render_digest(
@@ -2872,7 +3085,7 @@ class TestRenderDigestTruncation:
         )
 
         assert len(digest.encode('utf-8')) <= 2048
-        assert '## User Corrections' in digest
+        assert USER_TURNS_HEADING in digest
         # Higher-priority not_found (only 3 hits, ~120 bytes) survives
         # completely untouched -- the trimmer never reaches it as long as
         # the lower-priority retry_loops section still has items to give.
@@ -2882,21 +3095,52 @@ class TestRenderDigestTruncation:
         assert digest.count('Bash x3:') < 60
 
 
+class TestDefaultMaxBytes:
+    def test_default_max_bytes_is_the_prd_7_2_cap(self):
+        assert mod.DEFAULT_MAX_BYTES == 15360
+
+    def test_render_digest_defaults_to_the_module_cap(self):
+        records = _oversized_not_found_records()
+
+        default = mod.render_digest(records, agent_class='interactive')
+
+        assert default == mod.render_digest(
+            records, agent_class='interactive', max_bytes=mod.DEFAULT_MAX_BYTES,
+        )
+        assert default != mod.render_digest(
+            records, agent_class='interactive', max_bytes=mod.DEFAULT_MAX_BYTES - 1024,
+        )
+
+    def test_build_digest_defaults_to_the_module_cap(self, tmp_path):
+        path = _write_jsonl(tmp_path, _oversized_not_found_records())
+
+        assert mod.build_digest(path) == mod.build_digest(path, max_bytes=mod.DEFAULT_MAX_BYTES)
+
+    def test_cli_max_bytes_defaults_to_the_module_cap(self, tmp_path, capsys):
+        path = _write_jsonl(tmp_path, _oversized_not_found_records())
+
+        mod.main([str(path)])
+
+        assert capsys.readouterr().out == (
+            mod.build_digest(path, max_bytes=mod.DEFAULT_MAX_BYTES) + '\n'
+        )
+
+
 # ---------------------------------------------------------------------------
 # _cap_item / _item_byte_cap -- R2 part 1 (confusion census 2026-07-24 Sec
 # 4): a per-item byte cap applied at the single _build_sections choke
 # point, so ONE oversized item (an enormous pasted user turn, a huge
 # tool_result echo, ...) can never evict every sibling section before
 # being popped itself. Capping is byte-wise and UTF-8-safe: the whole
-# digest budget is measured in UTF-8 bytes (_resolve_size_bytes, the 15360
-# soft cap), so a naive character-wise slice would not actually bound it
+# digest budget is measured in UTF-8 bytes (_resolve_size_bytes, the
+# DEFAULT_MAX_BYTES soft cap), so a naive character-wise slice would not actually bound it
 # for non-ASCII content, and a naive byte slice can split a multi-byte
 # codepoint mid-sequence.
 # ---------------------------------------------------------------------------
 
 def _oversized_user_correction_records():
     """One ORDINARY (non-briefing-shaped) human user turn whose text alone
-    exceeds the default 15360-byte soft cap, plus a genuine is_error
+    exceeds the DEFAULT_MAX_BYTES soft cap, plus a genuine is_error
     tool_result error neighborhood and a 'command not found' not-found
     hit. Deliberately NOT briefing-shaped: R2 (whole-item truncation
     eviction) is a distinct pathology from R1 (harness-turn exclusion), so
@@ -2917,7 +3161,7 @@ def _oversized_user_correction_records():
 
 class TestPerItemByteCap:
     def test_cap_item_returns_short_line_byte_identical(self):
-        line = '- (turn 0) short line, well under any cap'
+        line = '- (record 0) short line, well under any cap'
 
         capped = mod._cap_item(line, cap=2048)
 
@@ -2925,7 +3169,7 @@ class TestPerItemByteCap:
         assert mod.ITEM_TRUNCATION_MARKER not in capped
 
     def test_cap_item_truncates_oversized_line_with_marker(self):
-        line = '- (turn 0) ' + ('x' * 5000)
+        line = '- (record 0) ' + ('x' * 5000)
         cap = 2048
 
         capped = mod._cap_item(line, cap)
@@ -2947,7 +3191,7 @@ class TestPerItemByteCap:
         # much, so a 20KB pasted turn capped to 2KB looks identical to one
         # capped by 40 bytes. The two numbers must be internally
         # consistent, not decorative.
-        line = '- (turn 0) ' + ('x' * 5000)
+        line = '- (record 0) ' + ('x' * 5000)
         cap = 2048
 
         capped = mod._cap_item(line, cap)
@@ -2970,8 +3214,8 @@ class TestPerItemByteCap:
         # leaves room for -- the cap must hold anyway, for ASCII and
         # multi-byte alike, with no mojibake.
         for line in (
-            '- (turn 0) ' + ('x' * 5000),
-            '- (turn 0) ' + ('é→' * 2000),
+            '- (record 0) ' + ('x' * 5000),
+            '- (record 0) ' + ('é→' * 2000),
         ):
             for cap in (256, 500, 1024, 2048):
                 capped = mod._cap_item(line, cap)
@@ -2992,7 +3236,7 @@ class TestPerItemByteCap:
     def test_cap_item_truncates_multibyte_text_without_mojibake(self):
         # The cap is a BYTE cap -- naive slicing on a multi-byte-character
         # string must not split a codepoint into a replacement character.
-        line = '- (turn 0) ' + ('é→' * 2000)
+        line = '- (record 0) ' + ('é→' * 2000)
         cap = 500
 
         capped = mod._cap_item(line, cap)  # must not raise
@@ -3020,18 +3264,18 @@ class TestPerItemByteCap:
         # unambiguously RED before the per-item cap exists.
         assert body.strip() != ''
 
-        assert '## User Corrections' in digest
+        assert USER_TURNS_HEADING in digest
         assert '## Error Neighborhoods' in digest
         assert '## Not Found' in digest
-        assert len(digest.encode('utf-8')) <= 15360
+        assert len(digest.encode('utf-8')) <= mod.DEFAULT_MAX_BYTES
         assert mod.ITEM_TRUNCATION_MARKER in digest
 
     def test_gold_section_still_precedes_error_neighborhoods_under_cap(self):
         digest = mod.render_digest(_oversized_user_correction_records(), agent_class='interactive')
 
-        assert '## User Corrections' in digest
+        assert USER_TURNS_HEADING in digest
         assert '## Error Neighborhoods' in digest
-        assert digest.index('## User Corrections') < digest.index('## Error Neighborhoods')
+        assert digest.index(USER_TURNS_HEADING) < digest.index('## Error Neighborhoods')
 
 
 # ---------------------------------------------------------------------------
@@ -3072,7 +3316,7 @@ def _multiple_oversized_items_records():
 
 class TestTruncatedItemsFrontmatter:
     def test_truncated_items_is_zero_when_nothing_was_truncated(self):
-        # _all_signals_records() is well under the 15360 default cap, so
+        # _all_signals_records() is well under the DEFAULT_MAX_BYTES cap, so
         # nothing is truncated and the key must say so rather than be absent.
         digest = mod.render_digest(_all_signals_records(), agent_class='interactive')
 
@@ -3510,7 +3754,7 @@ class TestEmitConsistencyGuard:
             },
         }
         sections = {key: [] for key in mod.SECTION_PRIORITY}
-        sections['not_found'] = ['- (turn 0) command not found']
+        sections['not_found'] = ['- (record 0) command not found']
 
         mod._warn_if_body_evicted(meta, sections, max_bytes=15360)
 
@@ -3567,7 +3811,7 @@ class TestEmitConsistencyGuard:
 
         _, body = _split_frontmatter(digest)
         assert body.strip() != ''
-        assert '## User Corrections' in digest
+        assert USER_TURNS_HEADING in digest
         assert 'This is wrong, please redo it.' in digest
         assert '## Error Neighborhoods' in digest
         assert '## Not Found' in digest
@@ -3626,10 +3870,12 @@ class TestBuildDigestBoundary:
 
         digest = mod.build_digest(path)
 
-        for heading in ('User Corrections', 'Error Neighborhoods', 'Self-Corrections', 'Retry Loops'):
+        for heading in (
+            mod.SECTION_HEADINGS['user_turns'], 'Error Neighborhoods', 'Self-Corrections', 'Retry Loops',
+        ):
             assert f'## {heading}' in digest, f'missing heading: {heading}'
 
-        assert len(digest.encode('utf-8')) <= 15360
+        assert len(digest.encode('utf-8')) <= mod.DEFAULT_MAX_BYTES
 
         frontmatter_yaml, _ = _split_frontmatter(digest)
         meta = yaml.safe_load(frontmatter_yaml)
@@ -3662,10 +3908,10 @@ class TestMainCLI:
         captured = capsys.readouterr()
         assert ret == 0
         assert captured.out.startswith('---\n')
-        assert '## User Corrections' in captured.out
+        assert USER_TURNS_HEADING in captured.out
         # print() appends exactly one trailing newline beyond the digest
         # itself -- strip it before checking the digest's own soft cap.
-        assert len(captured.out.rstrip('\n').encode('utf-8')) <= 15360
+        assert len(captured.out.rstrip('\n').encode('utf-8')) <= mod.DEFAULT_MAX_BYTES
 
     def test_agent_class_flag_overrides_frontmatter_class(self, tmp_path, capsys):
         path = _write_jsonl(tmp_path, _boundary_records())

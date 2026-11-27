@@ -1,6 +1,6 @@
 """invoke_with_cap_retry carries zero-server strict MCP scoping into the CLI argv.
 
-The wildcard-MCP scoping gate (``shared/tests/wildcard_mcp_scoping_scan.py``)
+The wildcard-MCP scoping gate (``tests/repo_guards/wildcard_mcp_scoping_scan.py``)
 counts a call site as closed when it spells
 ``mcp_config=no_mcp_servers_config()`` and ``strict_mcp_config=True``, and each
 site's own regression test checks only the kwargs handed to a patched

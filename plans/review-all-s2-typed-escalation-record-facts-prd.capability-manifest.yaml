@@ -1,0 +1,827 @@
+prd: plans/review-all-s2-typed-escalation-record-facts-prd.md
+schema_version: 1
+signal_leaves:
+- ι
+tasks:
+- label: "α"
+  task_id: 9687
+  title: "Typed escalation vocabulary: status, severity and resolve-action enums parsed at construction"
+  note: "Closes fk-bbb0a7b3c8a8 and the evidence half of fk-479375564c2f. Lands C1 (incl. the reader-side skip of an unparseable record; EscalationStatus's terminal values from shared.escalation_layout, S19 C9) and C2's columns. Deps: S3 kappa 9173, task 8562, S19 theta0. Task 6390 has landed (bbaa5f91e4); its former edge onto alpha is dropped."
+  capabilities:
+  - name: status-enum
+    binding: built here — escalation/src/escalation/models.py EscalationStatus with OPEN_STATUSES/TERMINAL_STATUSES (C1)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: "class EscalationStatus\\(StrEnum\\)"
+      paths:
+      - escalation/src/escalation/models.py
+      expect: present
+  - name: resolve-action-enum
+    binding: built here — escalation/src/escalation/models.py ResolveAction (C1)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: "class ResolveAction\\(StrEnum\\)"
+      paths:
+      - escalation/src/escalation/models.py
+      expect: present
+  - name: construction-parses-closed-fields
+    binding: built here — Escalation.__post_init__ parses status/severity/resolution_action and validates evidence entries, raising UnknownEscalationValue
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: "class UnknownEscalationValue\\(ValueError\\)"
+      paths:
+      - escalation/src/escalation/models.py
+      expect: present
+  - name: reader-skips-unparseable
+    binding: "built here — UnknownEscalationValue joins _SCAN_PARSE_ERRORS and EscalationQueue.get's tuple, so a listing skips, logs and counts the record (D3)"
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: UnknownEscalationValue
+      paths:
+      - escalation/src/escalation/queue.py
+      - escalation/src/escalation/scan.py
+      expect: present
+  - name: effect-row-record-disposition
+    binding: built here — escalation/src/escalation/action_effects.py TaskEffect.record_disposition (C2)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: "record_disposition: RecordDisposition"
+      paths:
+      - escalation/src/escalation/action_effects.py
+      expect: present
+  - name: status-names-from-shared-layout
+    binding: built here — EscalationStatus takes its terminal values from shared.escalation_layout (lead ruling S19/Q-C8)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: escalation_layout
+      paths:
+      - escalation/src/escalation/models.py
+      expect: present
+  - name: categories-registry-substrate
+    binding: "`grep:escalation/src/escalation/categories.py::EscalationCategory` substrate — task 5257's registry, imported unchanged (passes today)"
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: "class EscalationCategory\\(StrEnum\\)"
+      paths:
+      - escalation/src/escalation/categories.py
+      expect: present
+  - name: s19-layout-module-upstream
+    binding: "producer:S19-theta0 upstream (wave 3; shared/src/shared/escalation_layout.py, S19 C9) — sequencing prerequisite only, its own check is theta0's"
+    verdict: PASS
+  - name: s3-scan-module-upstream
+    binding: "producer:task-9162 upstream (S3 gamma creates escalation/scan.py and moves _SCAN_PARSE_ERRORS there); alpha reaches it through S3 kappa 9173 — sequencing prerequisite only"
+    verdict: PASS
+  - name: every-stored-record-parses
+    binding: "built here — measured 2026-11-10: 12,359 records in 11 queue dirs, every status/severity/action in the closed sets"
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: a reviewer confirms the orchestrator and fused-memory journals show no UnknownEscalationValue WARNING after both restart on alpha; a live-store property, not a tree property
+- label: β1
+  task_id: 9714
+  title: Persist the cascade parent on escalation records; every resolver-tier reader reads it
+  note: "Closes the field and reader half of fk-8c48269c7363 and the cascade-field half of fk-5332d25b1702. Lands C3's beta1 part. Deps: alpha, S3 beta 9157, S3 gamma 9162. Cancels 8777."
+  capabilities:
+  - name: cascade-parent-field
+    binding: built here — Escalation.cascade_parent_id persisted by EscalationQueue.resolve and park (C3)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: "cascade_parent_id: str \\| None = None"
+      paths:
+      - escalation/src/escalation/models.py
+      expect: present
+  - name: cascade-prefix-classifier-deleted
+    binding: anti-inversion — classify reads the field, never the l2-cascade prefix
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: "(^|[^A-Z_])_CASCADE_PREFIX"
+      paths:
+      - escalation/src/escalation/classify.py
+      expect: absent
+  - name: resolver-tier-readers-on-record
+    binding: anti-inversion — the late-resolution capture, the shadow-ruling report and the dashboard blocks classify the record, not the resolved_by string
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: "classify_resolver_tier\\("
+      paths:
+      - escalation/src/escalation/queue.py
+      - escalation/src/escalation/shadow_ruling.py
+      - dashboard/src/dashboard/data/escalation_analytics.py
+      expect: absent
+  - name: backfill-pass
+    binding: built here — escalation/src/escalation/sweep.py backfill_record_facts, idempotent startup-sweep pass
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def backfill_record_facts
+      paths:
+      - escalation/src/escalation/sweep.py
+      expect: present
+  - name: s3-mutation-primitive-upstream
+    binding: "producer:task-9157 upstream (S3 beta, C4 _mutate_pending/_mutate_terminal and deliver_on); beta1 depends on it — sequencing prerequisite only, its own check is 9157's"
+    verdict: PASS
+  - name: live-archive-backfilled
+    binding: INV-13 producer proof — the live startup sweep sets cascade_parent_id on every legacy cascade member
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: "a reviewer confirms, after the dark-factory orchestrator and fused-memory restart on beta1, that every data/escalations record whose parsed resolved_by starts with l2-cascade: carries cascade_parent_id, read by parsing each file (a grep also hits esc-8422-3, which carries the string in detail only)"
+- label: β2
+  task_id: 9717
+  title: The resolve callback receives a frozen event; cascade attribution leaves resolved_by
+  note: "Closes fk-8c48269c7363 and the cascade half of fk-5332d25b1702. Lands C3's beta2 part. Deps: beta1. Edges onto filed tasks: 9177 -> beta2 (sitting ruling S2-3 a), 9144 -> beta2 (lead ruling S2/OQ-5). Cancels 8784. 33 declared files, mechanical test migration onto two public seams, plus the L2 watcher skill's cascade passages."
+  capabilities:
+  - name: resolution-event
+    binding: built here — frozen ResolutionEvent with the effective action and the recut facts, delivered to the resolve callback (C3)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: class ResolutionEvent
+      paths:
+      - escalation/src/escalation/models.py
+      expect: present
+  - name: legacy-prefix-writer-and-parser-deleted
+    binding: anti-inversion — no code writes or parses the l2-cascade attribution after beta2 (the backfill reads the literal prefix inside the migration only)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: "cascade_resolved_by|_L2_CASCADE_RESOLVER_PREFIX|def cascade_parent_id"
+      paths:
+      - escalation/src/
+      - orchestrator/src/
+      expect: absent
+  - name: harness-legacy-action-map-deleted
+    binding: anti-inversion — the harness acts on ResolutionEvent.effective_action, never re-derives it
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def _resolve_escalation_action
+      paths:
+      - orchestrator/src/orchestrator/harness.py
+      expect: absent
+  - name: harness-callback-takes-event
+    binding: built here — Harness._on_escalation_resolved takes the event and builds the recut ruling from it alone
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: "def _on_escalation_resolved\\(self, event"
+      paths:
+      - orchestrator/src/orchestrator/harness.py
+      expect: present
+  - name: callback-test-seam
+    binding: built here — orchestrator/tests/_escalation_events.py deliver(harness, record_or_event), the public seam the direct callback tests move onto (tests-stance)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def deliver
+      paths:
+      - orchestrator/tests/_escalation_events.py
+      expect: present
+  - name: watcher-skill-cascade-prose
+    binding: "anti-inversion — the L2 watcher skill describes cascade_parent_id and the event, not resolved_by=l2-cascade:"
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: "resolved_by='l2-cascade:"
+      paths:
+      - skills/escalation-watcher/SKILL.md
+      expect: absent
+- label: γ
+  task_id: 9724
+  title: "Filer-declared escalation facts: filing site, failure signature, original severity, hypothesis"
+  note: "Closes fk-638cca2f65bb (record half), the hypothesis half of fk-479375564c2f and the field half of fk-5332d25b1702. Lands C4, incl. declared_failure_identity/failure_identity (lead ruling S2/OQ-3) and the four fields on S1's EscalationDraft. Deps: beta2, S3 iota 9181, S1 beta (every other escalation-package filer; through it S1 alpha, the filing entry point)."
+  capabilities:
+  - name: filing-site-enum
+    binding: built here — escalation/src/escalation/models.py FilingSite and Escalation.filing_site (C4)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: "class FilingSite\\(StrEnum\\)"
+      paths:
+      - escalation/src/escalation/models.py
+      expect: present
+  - name: one-failure-identity
+    binding: built here — escalation/src/escalation/models.py failure_identity, the one answer to which failure a record reports
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def failure_identity
+      paths:
+      - escalation/src/escalation/models.py
+      expect: present
+  - name: declared-failure-identity
+    binding: "built here — escalation/src/escalation/models.py declared_failure_identity: failure_signature, else the stored dedupe_fingerprint (C4)"
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def declared_failure_identity
+      paths:
+      - escalation/src/escalation/models.py
+      expect: present
+  - name: hypothesis-field
+    binding: built here — Escalation.hypothesis, written by escalate_info and escalate_blocker
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: "hypothesis: str \\| None = None"
+      paths:
+      - escalation/src/escalation/models.py
+      expect: present
+  - name: draft-carries-record-facts
+    binding: "built here — S1's EscalationDraft (escalation/src/escalation/filing.py, created by S1 alpha) carries failure_signature, filing_site, original_severity and hypothesis"
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: "failure_signature: str \\| None"
+      paths:
+      - escalation/src/escalation/filing.py
+      expect: present
+  - name: s1-filing-entry-point-upstream
+    binding: "producer:S1-alpha upstream (wave 3; escalation/src/escalation/filing.py with EscalationDraft, S1 C1) — gamma edits the draft after S1 lands it (sitting ruling S2-3 a)"
+    verdict: PASS
+  - name: downgrade-suffix-removed
+    binding: anti-inversion — the downgrade writes original_severity, never a summary suffix
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: "\\[downgraded:"
+      paths:
+      - escalation/src/
+      expect: absent
+  - name: evidence-cast-removed
+    binding: anti-inversion — evidence is parsed at construction (alpha), so the tools stop casting
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: "cast\\(list\\[EvidenceEntry\\]"
+      paths:
+      - escalation/src/
+      expect: absent
+- label: γ2
+  task_id: 9726
+  title: The five readers of the stored dedupe fingerprint read the one declared failure identity
+  note: "Closes the readers half of fk-638cca2f65bb and is the first half of the fingerprint retirement the lead's FINGERPRINT ruling (2026-11-13) gives this plan. Moves the Memory Evals join, the escalation-archive set, the recon harness's two re-file checks, EscalationQueue.has_open's filter and dedupe.py's fold keys onto declared_failure_identity; changes no write, so it can land before S1 omega. Deps: gamma, epsilon, eta, 9254. gamma3 (the field deleted) -> gamma2, S1 omega."
+  capabilities:
+  - name: fingerprint-consumers-read-declared-identity
+    binding: anti-inversion — the three consumer modules read declared_failure_identity, never the stored fingerprint attribute
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: "\\.dedupe_fingerprint"
+      paths:
+      - dashboard/src/dashboard/data/memory_evals.py
+      - fused-memory/src/fused_memory/reconciliation/escalation_archive.py
+      - fused-memory/src/fused_memory/reconciliation/harness.py
+      expect: absent
+  - name: fold-key-reads-declared-identity
+    binding: anti-inversion — dedupe.py content_fingerprint_key returns declared_failure_identity
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: "return esc\\.dedupe_fingerprint"
+      paths:
+      - escalation/src/escalation/dedupe.py
+      expect: absent
+  - name: declared-identity-upstream
+    binding: "producer:gamma upstream (models.declared_failure_identity, C4) — sequencing prerequisite only"
+    verdict: PASS
+  - name: readers-match-both-shapes
+    binding: "built here — boundary rows 24-25: each reader finds a legacy fingerprint-only record and a signature-only record"
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: a reviewer confirms boundary rows 24 and 25 run each of the five readers against both record shapes on a real queue dir
+- label: γ3
+  task_id: 9730
+  title: "Retire the stored dedupe fingerprint: every filer declares the failure signature and the field is deleted"
+  note: "Closes fk-638cca2f65bb: the second half of the fingerprint retirement (lead FINGERPRINT ruling, 2026-11-13). backfill_record_facts first copies a stored raw dedupe_fingerprint into failure_signature on every pending and archived record (Escalation.from_dict drops unknown keys); then every writer passes failure_signature, and Escalation.dedupe_fingerprint, EscalationDraft.dedupe_fingerprint and S1's fingerprint arguments (OpenAtLevel, has_open, Fingerprint) go. Deps: gamma2, S1 omega, theta1, theta2, task 8528 (declares merge_lane/worker.py; R55). About 66 files, mechanical; re-measured at dispatch."
+  capabilities:
+  - name: record-field-deleted
+    binding: anti-inversion — Escalation carries failure_signature only; the stored fingerprint field is gone
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: "dedupe_fingerprint: str"
+      paths:
+      - escalation/src/escalation/models.py
+      expect: absent
+  - name: writers-declare-signature
+    binding: anti-inversion — no production writer passes dedupe_fingerprint
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: "dedupe_fingerprint="
+      paths:
+      - orchestrator/src/
+      - fused-memory/src/
+      - fused-memory/scripts/
+      expect: absent
+  - name: legacy-fingerprint-migrated
+    binding: built here — sweep.py backfill_record_facts copies a stored raw dedupe_fingerprint into failure_signature before the field goes (INV-13)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: "'dedupe_fingerprint'"
+      paths:
+      - escalation/src/escalation/sweep.py
+      expect: present
+  - name: s1-closing-task-upstream
+    binding: "producer:S1-omega upstream (wave 3; after it every filer builds an EscalationDraft) — sequencing prerequisite only, its own check is omega's"
+    verdict: PASS
+  - name: live-panel-unchanged
+    binding: INV-13 producer proof — the live Memory Evals panel links the same open eval_regression escalations after the restart on gamma3
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: a reviewer compares the Memory Evals panel's linked escalations before and after the dark-factory orchestrator and fused-memory restart on gamma3; a live-store property, not a tree property
+- label: δ
+  task_id: 9758
+  title: resolve_issue branches on ACTION_EFFECTS record disposition; persisted duplicate_of (C5)
+  note: "Closes fk-e3b7459c681d and fk-d0e1094c99cb (high). Lands C5 for S25 xi 6770 (released onto delta). Deps: gamma, S3 iota 9181, S10 alpha 9180."
+  capabilities:
+  - name: dismiss-table-deleted
+    binding: "anti-inversion — the dismiss bit derives from the row's record_disposition; authority.py's docstring pointer is rewritten"
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: _DISMISS_ACTIONS
+      paths:
+      - escalation/src/
+      - scripts/
+      expect: absent
+  - name: action-list-copies-deleted
+    binding: anti-inversion — RESOLVE_ACTIONS is derived in action_effects.py; the server and sitting copies go
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: "RESOLVE_ACTIONS: tuple\\[str"
+      paths:
+      - escalation/src/
+      - scripts/
+      expect: absent
+  - name: park-branch-from-table
+    binding: anti-inversion — the KEEP_OPEN_AT_L2 disposition selects park
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: "if action == 'park'"
+      paths:
+      - escalation/src/
+      expect: absent
+  - name: row-preconditions-gate
+    binding: "built here — one gate in S3's RESOLVE_GATES evaluates the row's preconditions (producer:task-9181 upstream for the module)"
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: "\\.preconditions"
+      paths:
+      - escalation/src/escalation/ladder_gates.py
+      expect: present
+  - name: duplicate-of-field
+    binding: built here — Escalation.duplicate_of written only by EscalationQueue.resolve on an ARCHIVE_DISMISSED row (C5)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: "duplicate_of: str \\| None = None"
+      paths:
+      - escalation/src/escalation/models.py
+      expect: present
+  - name: effect-lookup-substrate
+    binding: "`grep:escalation/src/escalation/action_effects.py::effect_for` substrate — the lookup resolve_issue already calls (passes today)"
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def effect_for
+      paths:
+      - escalation/src/escalation/action_effects.py
+      expect: present
+- label: ε
+  task_id: 9760
+  title: One parse of escalation caller headers for every ladder tool, the channel stamped, and a self-explaining identity refusal (no denial yet)
+  note: "Closes fk-755f786c32be; names fk-ece88b7661b7 (closed later by omicron). Lands C6 except mcp_config_json: parse_caller_identity, AUTHORITY_BEARING, identity_required_refusal and its message (warned, not refused, until omicron), filed_via/resolved_via, HUMAN_IDENTITIES, resolver_detail, promote identity-first (lead S2/OQ-9 amended by S2-2), and the check script xi runs. Deps: delta, S3 kappa 9173, S1 beta."
+  capabilities:
+  - name: one-header-parser
+    binding: "built here — escalation/src/escalation/models.py parse_caller_identity, absorbing S3 kappa's read_caller_headers (C6)"
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def parse_caller_identity
+      paths:
+      - escalation/src/escalation/models.py
+      expect: present
+  - name: s3-header-reader-upstream
+    binding: "producer:task-9173 upstream (S3 kappa adds read_caller_headers/CallerHeaders and routes the five tools through it); epsilon deletes both, and iota's guard enforces that only parse_caller_identity reads the header constants — sequencing prerequisite only"
+    verdict: PASS
+  - name: one-ceiling-computation
+    binding: built here — escalation/src/escalation/authority.py effective_levels, called by every tool that gates on levels
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def effective_levels
+      paths:
+      - escalation/src/escalation/authority.py
+      expect: present
+  - name: unidentified-channel-recorded
+    binding: built here — Escalation.filed_via (written by the door) and resolved_via (resolve, park, promote) record the caller channel (sitting ruling S2-2)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: "resolved_via: CallerChannel \\| None"
+      paths:
+      - escalation/src/escalation/models.py
+      expect: present
+  - name: identity-required-refusal
+    binding: built here — authority.identity_required_refusal and IdentityRequired, code identity_required, message naming header, tool, action, level, config file and fix (C6)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: identity_required
+      paths:
+      - escalation/src/escalation/authority.py
+      expect: present
+  - name: identity-warning-before-denial
+    binding: built here — an UNIDENTIFIED authority-bearing call succeeds and answers with identity_warning until omicron flips it to a refusal
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: identity_warning
+      paths:
+      - escalation/src/
+      expect: present
+  - name: human-identities-one-set
+    binding: "built here — authority.HUMAN_IDENTITIES is the one human set; classify's human tier and PROMOTE_ALLOWED read it (D11)"
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: HUMAN_IDENTITIES
+      paths:
+      - escalation/src/escalation/classify.py
+      expect: present
+  - name: resolver-detail-field
+    binding: "built here — Escalation.resolver_detail keeps a human identity's own resolved_by argument (D11)"
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: "resolver_detail: str \\| None = None"
+      paths:
+      - escalation/src/escalation/models.py
+      expect: present
+  - name: unidentified-action-check-script
+    binding: built here — scripts/check_unidentified_escalation_actions.py, the read-only predicate xi runs
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def main
+      paths:
+      - scripts/check_unidentified_escalation_actions.py
+      expect: present
+- label: ε2
+  task_id: 9765
+  title: "Corroborated L2 auto-close: the task store decides whether a stale-task L2 may be closed automatically"
+  note: "Closes fk-48a76ee9f746 (high; sitting ruling S2-1 a-prime). Lands C7: PolicyRow.corroborate on both the watcher and the executor door. Deps: epsilon. Edges onto filed tasks: 9188 -> epsilon2, 5258 -> epsilon2, 8477/8478 -> epsilon2."
+  capabilities:
+  - name: auto-close-corroborated
+    binding: built here — PolicyRow.corroborate, evaluated by l2_auto_close_class and executor_refusal; stale_task_scoped authorises only on the task-status lookup (C7)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: "corroborate: Callable"
+      paths:
+      - escalation/src/escalation/authority.py
+      expect: present
+  - name: task-status-lookup-substrate
+    binding: "`grep:escalation/src/escalation/server.py::create_server` substrate — create_server already takes task_status_lookup (passes today)"
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: task_status_lookup
+      paths:
+      - escalation/src/escalation/server.py
+      expect: present
+- label: ζ
+  task_id: 9785
+  title: The escalation ladder role prompt renders dedupe and downgrade facts from escalation code
+  note: "Closes fk-89388166d3ca. Deps: gamma, S5 omicron0 9270 (lead ruling S2/OQ-11 a; an import-only codemod, droppable at decompose). Edges onto existing tasks: 7639 -> zeta, 7392 -> zeta."
+  capabilities:
+  - name: stale-window-claim-removed
+    binding: "anti-inversion — the window is rendered from DedupeConfig's default"
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: "short \\(600s\\) window"
+      paths:
+      - orchestrator/src/orchestrator/agents/roles.py
+      expect: absent
+  - name: false-bypass-claim-removed
+    binding: anti-inversion — the prompt states the downgrade to blocking
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: bypasses dedupe entirely
+      paths:
+      - orchestrator/src/orchestrator/agents/roles.py
+      expect: absent
+  - name: prompt-follows-code
+    binding: built here — orchestrator/tests/test_roles_escalation_ladder.py changes the default and sees the prompt change
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: "a reviewer confirms the test mutates DedupeConfig's default and asserts the rendered prompt, rather than asserting prompt text"
+- label: η
+  task_id: 9790
+  title: Dashboard and fused-memory readers compare escalation status through the shared vocabulary
+  note: "Closes fk-a65731424439 and part of fk-60b7c33ea0ad. Deps: alpha, beta1. Edge onto a filed task: S10 omicron 9285 -> eta."
+  capabilities:
+  - name: dashboard-status-copies-removed
+    binding: "anti-inversion — the dashboard imports C1's sets"
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: "_STATUS_KEYS|_CLOSED_ESCALATION_STATUSES|_OPEN_ESCALATION_STATUS"
+      paths:
+      - dashboard/src/
+      expect: absent
+  - name: terminal-tuple-literals-removed
+    binding: anti-inversion — no reader spells the terminal set
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: "\\('resolved', 'dismissed'\\)"
+      paths:
+      - dashboard/src/
+      - fused-memory/src/
+      expect: absent
+  - name: halt-record-status-typed
+    binding: "anti-inversion — BacklogPolicy._close_pending_halt_records compares an escalation record's status to EscalationStatus.PENDING (also keeps S10's task-status guard, task 9285, off it)"
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: "record.get\\('status'\\) != 'pending'"
+      paths:
+      - fused-memory/src/fused_memory/recon_state/backlog_policy.py
+      expect: absent
+  - name: one-unknown-status-policy
+    binding: built here — object readers report the unparseable-record skip count and raw-dict readers name the value, both as unknown_escalation_status, excluded from open and terminal counts
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: "a reviewer confirms boundary row 20: all five readers agree on a corpus holding an unknown status"
+- label: θ1
+  task_id: 9798
+  title: Harness and workflow read escalation record facts instead of summary text
+  note: "Closes the reader half of fk-5332d25b1702 and part of fk-60b7c33ea0ad. Deps: beta2, gamma, epsilon, mu, S8 omega 9236, S8 kappa1 9232, S1 delta, S1 eta2 (sitting ruling S2-3 a; lead ruling S2/OQ-11 a)."
+  capabilities:
+  - name: summary-substring-discriminator-removed
+    binding: anti-inversion — the orphan reaper reads filing_site
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: "metadata\\.files divergence detected'"
+      paths:
+      - orchestrator/src/orchestrator/harness.py
+      expect: absent
+  - name: reblock-signature-reads-failure-identity
+    binding: anti-inversion — the re-block guard calls failure_identity; its test moves onto the public models.failure_identity
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def _reblock_signature
+      paths:
+      - orchestrator/src/
+      expect: absent
+  - name: suggested-action-discriminator-removed
+    binding: anti-inversion — the done-step orphan class reads filing_site
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: "== 'verify_wip_reconciliation'"
+      paths:
+      - escalation/src/escalation/classify.py
+      expect: absent
+  - name: workflow-populates-filing-site
+    binding: "field-population — the workflow's two filers write a FilingSite member on the production path"
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: "filing_site=FilingSite\\."
+      paths:
+      - orchestrator/src/orchestrator/workflow.py
+      expect: present
+- label: θ2
+  task_id: 9799
+  title: Orchestrator modules compare escalation status, action and category through the vocabulary
+  note: "Part of fk-60b7c33ea0ad. Deps: alpha, mu, 9287, 9231, 9191, 9283, 9270 (lead ruling S2/OQ-11 a), S1 gamma, S1 kappa1, S1 kappa3, S1 kappa4 (sitting ruling S2-3 a). Mechanical (complexity simple)."
+  capabilities:
+  - name: pending-literal-compares-removed
+    binding: anti-inversion — the nine modules compare through C1
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: "\\.status (==|!=) 'pending'"
+      paths:
+      - orchestrator/src/orchestrator/steward.py
+      - orchestrator/src/orchestrator/digest.py
+      - orchestrator/src/orchestrator/escalation_router.py
+      - orchestrator/src/orchestrator/l0_promotion.py
+      - orchestrator/src/orchestrator/provenance_conflict.py
+      - orchestrator/src/orchestrator/sentinel_alarm_wrappers.py
+      expect: absent
+  - name: closed-state-copy-removed
+    binding: anti-inversion — offline_lane_episodes imports TERMINAL_STATUSES
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: CLOSED_ESCALATION_STATES
+      paths:
+      - orchestrator/src/
+      expect: absent
+- label: ι
+  task_id: 9809
+  title: "Escalation-vocabulary guard, the scripts' sites and invariant escalation-vocabulary-imported"
+  note: "Integration gate and signal leaf. Gates fk-60b7c33ea0ad and fk-a65731424439. Deps: beta1..theta2, gamma2, epsilon2 and task 6770; the wave-3 invariant chain in the lead's order (lead ruling S2/OQ-10 b). Performs the four-site lockstep edit; the INV number is the next free one at landing, the slug is the id. The rule names escalation.models, escalation.categories and shared.escalation_layout. The guard lives in scripts/tests (run by the full test_command's last segment on every merge)."
+  capabilities:
+  - name: invariant-registered
+    binding: built here — four-site lockstep edit guarded by scripts/tests/test_design_invariants_consistency.py
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: escalation-vocabulary-imported
+      paths:
+      - docs/legibility/design-invariants.md
+      expect: present
+  - name: guard-exists
+    binding: built here — scripts/tests/test_escalation_vocabulary_literals.py, the receiver-anchored literal-comparison scan
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def test_
+      paths:
+      - scripts/tests/test_escalation_vocabulary_literals.py
+      expect: present
+  - name: caller-header-reader-guarded
+    binding: "built here — the guard also enforces C6: no module but models.parse_caller_identity reads LEVELS_HEADER or IDENTITY_HEADER"
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: LEVELS_HEADER
+      paths:
+      - scripts/tests/test_escalation_vocabulary_literals.py
+      expect: present
+  - name: guard-names-shared-layout
+    binding: "built here — the guard and the invariant name shared.escalation_layout as the vocabulary's standard-library home (lead ruling S19/Q-C8)"
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: escalation_layout
+      paths:
+      - scripts/tests/test_escalation_vocabulary_literals.py
+      expect: present
+  - name: scripts-terminal-copies-removed
+    binding: anti-inversion — the scripts import TERMINAL_STATUSES
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: "STATUSES = (frozenset\\(\\{|\\()'resolved', 'dismissed'"
+      paths:
+      - scripts/
+      expect: absent
+  - name: member-chain-dict-read-typed
+    binding: "anti-inversion — member-chain-sweep.py::sweep_queue compares an escalation record's status to EscalationStatus.PENDING"
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: "record.get\\('status'\\) == 'pending'"
+      paths:
+      - scripts/member-chain-sweep.py
+      expect: absent
+  - name: guard-rejects-seeded-shapes
+    binding: rejection-mechanism — produced by iota; its fixture modules observe the flag firing per shape
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: "rejection quality is judged by the guard's own fixture tests (boundary row 23), not a grep"
+- label: κ
+  task_id: 9814
+  title: DedupeConfig fields named for what they configure, and the config frozen
+  note: "Closes fk-9c7ebc2b50b2 (low). Deps: gamma, gamma2, epsilon, epsilon2, zeta, eta, theta1, theta2, task 8528 (declares merge_lane/worker.py; parked per R55), S1 theta2, S1 iota2, S1 omega (sitting ruling S2-3 a); 6348 cancelled into S1 theta2, kappa -> S1 theta2 carries it. Re-measures infra_dedupe_ users at dispatch. Data files under fused-memory/calibration, docs and plans keep their historical spellings."
+  capabilities:
+  - name: historical-names-removed
+    binding: anti-inversion — enabled/window_secs/categories replace the infra_dedupe_ names in code
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: infra_dedupe_
+      paths:
+      - escalation/src/
+      - escalation/tests/
+      - fused-memory/src/
+      - fused-memory/tests/
+      - fused-memory/scripts/
+      - orchestrator/src/
+      - orchestrator/tests/
+      - scripts/
+      expect: absent
+  - name: config-frozen
+    binding: built here — DedupeConfig is a frozen dataclass
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: a reviewer confirms the DedupeConfig decorator is frozen=True; the decorator and class are on separate lines, which a single-line check cannot anchor
+- label: μ
+  task_id: 9817
+  title: Every dark-factory escalation client and every spawned agent sends an identity header
+  note: "Deploy step of sitting ruling S2-2 (names fk-ece88b7661b7). mcp_config_json requires an identity for an escalation entry; spawned agents send their dispatched agent id; .mcp.json, recon-watch/mcp.json and the two watcher skills send X-Escalation-Identity. Every spawned agent's environment also carries ESCALATION_IDENTITY=<its agent id>, so the ambient worktree .mcp.json entry sends the id too; cgl_eta_finalize_gate.py sends a header. Deps: epsilon. Per-file: a stated, measured exception to R54 for its one-line edits, confirmed by the lead 2026-11-13."
+  capabilities:
+  - name: spawned-agent-identity
+    binding: built here — McpLifecycle.mcp_config_json takes escalation_identity and refuses an escalation entry without one (C6)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: escalation_identity
+      paths:
+      - orchestrator/src/orchestrator/mcp_lifecycle.py
+      expect: present
+  - name: dispatched-identity-public
+    binding: built here — orchestrator/src/orchestrator/agents/briefing.py caller_agent_id, the one identity format, made public for the call sites
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def caller_agent_id
+      paths:
+      - orchestrator/src/orchestrator/agents/briefing.py
+      expect: present
+  - name: interactive-config-identity
+    binding: "built here — dark-factory's .mcp.json escalation entry sends X-Escalation-Identity"
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: X-Escalation-Identity
+      paths:
+      - .mcp.json
+      expect: present
+  - name: recon-watch-config-identity
+    binding: built here — recon-watch/mcp.json (and the copy the recon watcher skill prints) sends X-Escalation-Identity
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: X-Escalation-Identity
+      paths:
+      - recon-watch/mcp.json
+      expect: present
+  - name: spawned-agent-env-identity
+    binding: built here — every orchestrator invocation's environment carries ESCALATION_IDENTITY set to the dispatched agent id, so whichever escalation entry the CLI keeps sends it (boundary row 26a)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ESCALATION_IDENTITY
+      paths:
+      - orchestrator/src/orchestrator/workflow.py
+      expect: present
+  - name: script-client-identity
+    binding: built here — fused-memory/scripts/cgl_eta_finalize_gate.py, the one other dark-factory HTTP caller of resolve_issue, sends X-Escalation-Identity
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: X-Escalation-Identity
+      paths:
+      - fused-memory/scripts/cgl_eta_finalize_gate.py
+      expect: present
+  - name: eval-stub-stays-escalation-less
+    binding: built here — evals/runner.py _EvalMcpStub accepts the identity and still returns no escalation entry (D13, hermetic evals)
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: a reviewer confirms the test in orchestrator/tests/test_mcp_lifecycle_identity.py asserts the eval stub returns no escalation entry
+  - name: live-identity-attribution
+    binding: INV-13 producer proof — boundary row 27 on the live dark-factory server
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: a reviewer confirms, after the orchestrator restarts on mu, that a steward L0 close and an interactive resolve are archived with resolved_via identified and their identities in resolved_by
+- label: ν
+  task_id: 9843
+  title: "Operator gate: deploy the escalation identity header to every other project's MCP configuration (pre-authorised session)"
+  note: "Human gate in the program's operator-sweep shape (task_kind deterministic, always_escalates, no before_done, files []), carrying metadata.x_preauthorised_spawn, the key S16 chi's watcher rule reads. Its born-at-L2 escalation carries the /team brief and quotes Leo's 2026-11-12 pre-authorisation; one .mcp.json-only commit per repository and the twelve side checkouts fast-forwarded or edited in place; configuration only. reify/scripts/docs-truth-sweep.py gets its identity through a reify task the lead files at decompose (lead ruling 2026-11-13). Deps: epsilon, mu, S16 chi, reify:<id> (cross-project)."
+  capabilities:
+  - name: other-projects-identity-deployed
+    binding: "built here — the eleven other projects' .mcp.json escalation entries and the twelve side checkouts' copies send X-Escalation-Identity"
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: "the files live in other repositories, outside this tree; the gate's escalation records each repository's commit sha or skip reason before the resume"
+  - name: s16-preauthorised-spawn-upstream
+    binding: "producer:S16-chi upstream (wave 3; skills/escalation-watcher/SKILL.md's pre-authorised-gate exception keyed on metadata.x_preauthorised_spawn, which nu carries) — sequencing prerequisite only, its own check is chi's"
+    verdict: PASS
+  - name: reify-identity-task-upstream
+    binding: "producer:reify-task upstream (cross-project; the lead files it in reify's store at decompose: reify/scripts/docs-truth-sweep.py sends X-Escalation-Identity) — sequencing prerequisite only, checked in reify"
+    verdict: PASS

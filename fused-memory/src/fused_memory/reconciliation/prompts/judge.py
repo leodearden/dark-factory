@@ -1,29 +1,5 @@
 """System prompt for the LLM-as-Judge."""
 
-from fused_memory.reconciliation.task_count_snapshot_cadence import (
-    SNAPSHOT_PRUNED_STAT_KEY,
-    SNAPSHOT_WRITTEN_STAT_KEY,
-)
-
-_SNAPSHOT_STATS_ARE_MEM0_ONLY = f"""\
-**Task-count snapshot stats are Mem0-only.** Stage 2's `{SNAPSHOT_WRITTEN_STAT_KEY}` and \
-`{SNAPSHOT_PRUNED_STAT_KEY}` stats count operations on Mem0 `observations_and_summaries` \
-records ONLY — they make no claim about Graphiti. Per the Snapshot Discipline policy a \
-task-count snapshot is NEVER persisted as a Graphiti `temporal_facts` edge, for ANY project, \
-so `{SNAPSHOT_WRITTEN_STAT_KEY}=1` with no corresponding Graphiti edge or MCP `add_memory` \
-action is the CORRECT, expected state — not a stats-vs-reality mismatch, not a rejected \
-write, and never grounds for recommending that a project be added to a snapshot-write guard \
-exception list.
-"""
-
-# JUDGE_SYSTEM_PROMPT is assembled from two plain literals joined by the
-# f-string block above, rather than being one f-string, so the "## Output
-# Format" JSON braces below stay unescaped and byte-identical.  The
-# snapshot-stats note interpolates the LIVE stat-key constants (task 3045)
-# so a future rename cannot orphan the guidance — this is the reader that
-# JUDGE_SYSTEM_PROMPT explicitly instructs to cross-reference stage report
-# stats against MCP Actions, so it is the one most likely to reconstruct the
-# "stat claims a write but there is no Graphiti edge" false positive.
 JUDGE_SYSTEM_PROMPT = """\
 You are a Quality Judge reviewing a reconciliation run. You evaluate whether the reconciliation \
 agent made appropriate, well-reasoned decisions.
@@ -91,13 +67,8 @@ misbehaviour.
 fused-memory MCP server whenever a write operation executes. The stats in stage reports \
 (e.g., memories consolidated, tasks updated) reflect actual work performed via these MCP calls.
 
-**Journal Entries** may be empty for CLI-executed stages. This is expected — CLI stages log \
-their mutations through the MCP server (captured as MCP Actions), not through the journal_entries \
-table. Empty journal entries with non-zero MCP actions is normal, not a contradiction.
-
 When evaluating a run, cross-reference stage report stats against MCP Actions to verify \
-consistency. Do NOT flag a run as contradictory simply because journal entries are empty \
-while stats show mutations were performed.
+consistency.
 
 **Write counters count writes that LANDED, not writes that were accepted.** A write can be \
 accepted at enqueue and still never reach the backend, because the durable queue retries it \
@@ -131,7 +102,6 @@ A stage never self-reports `writes_dead_lettered` — it cannot know it, since d
 is decided after the stage ends. It is journal-derived only, so its absence from a stage's \
 `_reported` block is expected and is not a self-reporting failure.
 
-""" + _SNAPSHOT_STATS_ARE_MEM0_ONLY + """
 Evaluate this run on its own merits. Do not issue findings about trends or patterns across \
 runs — a separate code-side mechanism monitors verdict history and halts on systemic issues.
 
@@ -142,7 +112,6 @@ Respond with a JSON object:
   "severity": "ok|minor|moderate|serious",
   "findings": [
     {
-      "entry_id": "journal entry ID",
       "issue": "description of the problem",
       "severity": "ok|minor|moderate|serious",
       "recommendation": "what should be done"

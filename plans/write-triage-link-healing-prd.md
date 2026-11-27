@@ -80,7 +80,7 @@ A "parent absent" is a `None` from an id read, never an exception: a timeout or 
 
 **Writes.** Each action is exactly one call, through the running server's `update_memory` tool over `shared/mcp_post.py::post_mcp_tool_call`, with `agent_id = link-heal-<run8>` (8 hex) and `_causation_id = <run_id>`, so `server/mem0_update_authz.py::resolve_mem0_update_authorization` and the write journal apply unchanged. A detach is delete-only: `metadata_delete_keys=['parent_id']` plus `'kind'` when the kind is in CHILD_KINDS (an agent-invented kind such as `correction` or `extension` stays; it is census-only under `memory_metadata.enforce_kind_registry: false`), plus `'x_contested'` when the record carries one (H1 amendment 2026-10-19) and `'x_contested_by_triage'` when it carries that marker (H1 amendment 2026-10-12) — the `delete_payload` route. A relabel, flag or completion is patch-only (`metadata_patch={'kind': …, 'x_contested': True}` as the row says) — the `set_payload` route. A patch and a delete are never combined in one call (that is `MemoryService.update_memory`'s read-modify-overwrite route), and `None` is never patched (`parent_id: None` stores a null). A reply carrying `error_type` is a `failed` write. The journal `reason` is a pointer under 200 characters: `link-heal r=<run8> a=<action> prev_parent=<uuid> prev_kind=<k>`. A run that cannot reach the server refuses to start (INV-11).
 
-**Authorization.** `mem0_update.metadata_patch_allowed_agent_prefixes` gains `link-heal-` beside the schema defaults `recon-stage-` and `curator-` (the block is commented out in `config/config.yaml` today; α writes it with all three). The config comment names this PRD and task α (INV-12).
+**Authorization.** `link-heal-` is part of the metadata arm's schema default, `config/schema.py::Mem0UpdateConfig.metadata_patch_allowed_agent_prefixes` = `['recon-stage-', 'curator-', 'link-heal-']`, and is never on the content-amend arm, so every deployment, the config.yaml-less ones included, admits the executor without an override (H1 amendment 2026-11-25, task 6431: α first granted it as an active config.yaml list, which replaced the schema default wholesale). That field's description names this PRD and task α (INV-12).
 
 **Corroborate before, verify after (INV-3).** Immediately before each write the executor re-reads the child, and the parent where the row needs it, from the live store — never from the corpus or the ledger. It requires:
 - the child exists, and its `parent_id`, `kind`, `x_contested` and `x_contested_by_triage` equal the plan's pre-image;
@@ -219,7 +219,7 @@ Verified on main `4dfdccc2ad`:
   - `metadata_patch` sets or changes keys, and `metadata_delete_keys` removes them (`services/memory_service.py::MemoryService._apply_metadata_delta`).
   - A patch alone takes the `set_payload` route and a delete alone the `delete_payload` route. Each is an in-place Qdrant payload write that keeps the point id, `created_at`, embedding and content (`backends/mem0_client.py::Mem0Backend.set_payload` / `delete_payload`).
   - Each call journals a `write_ops` row with the patch, the delete keys and `reason[:200]`. There is no metadata before-image, hence H1's ledger.
-- `server/mem0_update_authz.py::resolve_mem0_update_authorization` is keyed on `mem0_update.metadata_patch_allowed_agent_prefixes` (`config/schema.py::Mem0UpdateConfig`, default `['recon-stage-', 'curator-']`, hot-reloadable). A delete-only call is gated the same way.
+- `server/mem0_update_authz.py::resolve_mem0_update_authorization` is keyed on `mem0_update.metadata_patch_allowed_agent_prefixes` (`config/schema.py::Mem0UpdateConfig`, default `['recon-stage-', 'curator-', 'link-heal-']` since task 6431 (amendment 2026-11-25; `['recon-stage-', 'curator-']` when this PRD was written), hot-reloadable). A delete-only call is gated the same way.
 - `tools.py::_extract_causation` carries `_causation_id`. `shared/mcp_post.py::post_mcp_tool_call` is the script-to-server transport.
 - Parent liveness on a changed `parent_id` comes from task 3197. It is warn-only under the shipped `memory_metadata.enforce: false`.
 - `MemoryService._count_children` and `count_memories_by_metadata` count children by `parent_id`. `MemoryService.get_memory_by_id(project_id, memory_id) -> dict | None` is a raw point read.
@@ -432,6 +432,8 @@ No waivers.
 - Γ_A, φ, θ: deterministic.
 
 **Threshold home and re-bases.** The filing-time values are above, and each value's home is its gate task's `before_done.args` (D9). Re-bases are appended here as dated lines.
+
+- 2026-11-13: task 7159 built ε's nightly sweep (`link_heal.py sweep`, windowed on child `created_at`, staging only `link_heal.sweep_actions`), the timer files (`scripts/fused-memory-link-heal.{sh,service,timer}`, `scripts/install-link-heal-timer.sh`), the 02:15 ladder row and the soak-calibration gate (`link_heal.py calibrate`; writes need `link_heal.writes` plus a passing calibration of the exact model and prompt, and at write time each sweep heal is written only when the adjudicator behind its verdict has one). Task 6188 keeps only ε's `summary.json`/`_7d` metrics residue.
 
 ## 10. Open questions (tactical)
 

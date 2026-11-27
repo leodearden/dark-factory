@@ -88,7 +88,7 @@ class TestBuildEvalUsageGate:
 
         assert gate is None
         shutdown.assert_awaited_once()
-        assert 'ZERO accounts' in caplog.text
+        assert 'no accounts resolved' in caplog.text
 
     async def test_a_failing_zero_account_teardown_still_degrades(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,

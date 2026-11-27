@@ -6,7 +6,9 @@ import asyncio
 import json
 import logging
 import time
-from dataclasses import dataclass, field
+from collections.abc import Callable, Iterator, Sequence
+from contextlib import contextmanager
+from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
 from typing import TYPE_CHECKING
@@ -20,7 +22,13 @@ from shared.cli_invoke import (
 from orchestrator.agents.invoke import invoke_agent
 from orchestrator.agents.roles import DEEP_REVIEWER, submit_only_instructions
 from orchestrator.config import OrchestratorConfig
+from orchestrator.l0_promotion import promote_l0_to_l1
 from orchestrator.relocated_venv import retire_relocated_venvs
+from orchestrator.review_pre_test import (
+    PreTestCommandResult,
+    render_pre_test_section,
+    run_pre_test_commands,
+)
 from orchestrator.review_working_tree import (
     Phase1WorkingTree,
     attribute_phase1,
@@ -36,10 +44,10 @@ from orchestrator.workflow_types import classify_failure
 if TYPE_CHECKING:
     from escalation.queue import EscalationQueue
     from shared.cost_store import CostStore
+    from shared.usage_gate import UsageGate
 
     from orchestrator.event_store import EventStore
     from orchestrator.mcp_lifecycle import McpLifecycle
-    from orchestrator.usage_gate import UsageGate
 
 logger = logging.getLogger(__name__)
 
@@ -73,6 +81,11 @@ NO_BRIEFING_NOTICE = (
     '`known_gaps`, `conventions` or `stability_concerns`. Judge findings from the '
     'code alone.'
 )
+
+
+def review_escalation_task_id(review_id: str) -> str:
+    """The task_id the deep reviewer files escalations under, and the one ReviewCheckpoint._promote_reviewer_escalations promotes from."""
+    return f'review-{review_id}'
 
 
 class ReviewOutcome(StrEnum):
@@ -116,17 +129,25 @@ class ReviewReport:
     duration_ms: int = 0
     parse_failed: bool = False
     phase1_working_tree: Phase1WorkingTree | None = None
+    pre_test: tuple[PreTestCommandResult, ...] = ()
 
     @property
     def ran(self) -> bool:
         return self.outcome is ReviewOutcome.RAN
 
 
+def _modules_of(merges: Sequence[tuple[str, ...]]) -> list[str]:
+    """The modules the merges touched, each once, in first-merged order."""
+    return list(dict.fromkeys(module for merge in merges for module in merge))
+
+
 class ReviewCheckpoint:
     """Coordinates periodic deep review checkpoints during an orchestrator run.
 
     Tracks successful merges, triggers focused reviews every N merges, and
-    optionally runs a full review after all tasks complete.
+    optionally runs a full review after all tasks complete.  A review's merge
+    scope is fixed when it starts: merges recorded while it runs stay
+    unreviewed and count toward the next review.
     """
 
     def __init__(
@@ -134,10 +155,13 @@ class ReviewCheckpoint:
         config: OrchestratorConfig,
         mcp: McpLifecycle,
         usage_gate: UsageGate | None,
+        *,
+        clock: Callable[[], float] = time.monotonic,
     ):
         self.config = config
         self.mcp = mcp
         self.usage_gate = usage_gate
+        self._clock = clock
         self.cost_store: CostStore | None = None
         self.escalation_queue: EscalationQueue | None = None
         self.run_id: str = ''
@@ -148,43 +172,54 @@ class ReviewCheckpoint:
         self.event_store: EventStore | None = None
 
         self._merge_count = 0
-        self._last_review_at_merge = 0
-        self._merged_modules: list[str] = []
+        # The modules of each merge no review that ran has covered, oldest first.
+        self._unreviewed_merges: list[tuple[str, ...]] = []
+        self._review_in_flight = False
         self._reports: list[ReviewReport] = []
 
         # Full-review rate-limit state (run-forever idle path).  Kept SEPARATE
-        # from the focused counters above because run_focused() advances
-        # _last_review_at_merge on every focused checkpoint that ran; the
-        # full-review ceiling must not be perturbed by focused cadence.
+        # from the unreviewed merges above, which every focused checkpoint that
+        # ran trims; the full-review ceiling must not be perturbed by focused
+        # cadence.
         self._last_full_review_time: float | None = None
         self._last_full_review_at_merge: int = 0
 
     def record_merge(self, modules: list[str]) -> None:
         """Record a successful task merge. Called by the harness after a DONE result."""
         self._merge_count += 1
-        # Deduplicate as we accumulate
-        for m in modules:
-            if m not in self._merged_modules:
-                self._merged_modules.append(m)
+        self._unreviewed_merges.append(tuple(modules))
         logger.debug(
-            'Review checkpoint: merge %d recorded, %d modules accumulated',
-            self._merge_count, len(self._merged_modules),
+            'Review checkpoint: merge %d recorded, %d unreviewed merges over %d modules',
+            self._merge_count, len(self._unreviewed_merges),
+            len(_modules_of(self._unreviewed_merges)),
         )
 
     def should_trigger(self) -> bool:
         """Return True when enough merges have accumulated since the last review."""
-        return (
-            self._merge_count - self._last_review_at_merge
-            >= self.config.review.interval
-        )
+        return len(self._unreviewed_merges) >= self.config.review.interval
+
+    @contextmanager
+    def _sole_review(self) -> Iterator[None]:
+        """Hold the one review slot: a review marks reviewed the merges unreviewed when it started, so two must never overlap."""
+        if self._review_in_flight:
+            raise RuntimeError(
+                'a review checkpoint is already running; reviews must not overlap, '
+                'because each marks reviewed the merges unreviewed when it started'
+            )
+        self._review_in_flight = True
+        try:
+            yield
+        finally:
+            self._review_in_flight = False
 
     async def run_focused(self) -> ReviewReport:
-        """Run a focused review scoped to modules that merged since the last checkpoint."""
-        modules = list(self._merged_modules)
-        report = await self._run_review('focused', modules)
-        if report.ran:
-            self._last_review_at_merge = self._merge_count
-            self._merged_modules.clear()
+        """Run a focused review scoped to the modules of the merges unreviewed when it starts."""
+        with self._sole_review():
+            covered = len(self._unreviewed_merges)
+            modules = _modules_of(self._unreviewed_merges)
+            report = await self._run_review('focused', modules)
+            if report.ran:
+                del self._unreviewed_merges[:covered]
         self._reports.append(report)
         return report
 
@@ -195,7 +230,8 @@ class ReviewCheckpoint:
         ``full_review_min_interval_secs`` since the last full review (the very
         first review is unconstrained on time — ``_last_full_review_time`` is
         None) AND at least ``full_review_min_tasks`` merges since the last full
-        review.  ``now`` is a ``time.monotonic()`` reading supplied by the
+        review.  ``now`` must be a reading of this checkpoint's
+        ``clock`` (``time.monotonic`` in production), supplied by the
         caller so it shares a clock with the timestamp ``run_full()`` records.
 
         Only consulted on the run-forever idle path; the exit / --until-idle
@@ -213,14 +249,16 @@ class ReviewCheckpoint:
         return time_gate and task_gate
 
     async def run_full(self) -> ReviewReport:
-        """Run a full review of the entire project."""
-        report = await self._run_review('full', [])
-        if report.ran:
-            self._last_review_at_merge = self._merge_count
-            # Record full-review trackers so should_run_full() re-closes the gate.
-            self._last_full_review_time = time.monotonic()
-            self._last_full_review_at_merge = self._merge_count
-            self._merged_modules.clear()
+        """Run a full review of the entire project, covering the merges recorded when it starts."""
+        with self._sole_review():
+            covered = len(self._unreviewed_merges)
+            merges_at_start = self._merge_count
+            report = await self._run_review('full', [])
+            if report.ran:
+                del self._unreviewed_merges[:covered]
+                # Record full-review trackers so should_run_full() re-closes the gate.
+                self._last_full_review_time = self._clock()
+                self._last_full_review_at_merge = merges_at_start
         self._reports.append(report)
         return report
 
@@ -234,11 +272,18 @@ class ReviewCheckpoint:
             )
 
         review_id = datetime.now(UTC).strftime('%Y%m%dT%H%M%S')
-        start = time.monotonic()
+        start = self._clock()
 
         logger.info(
             'Review checkpoint [%s] starting — mode=%s, modules=%s',
             review_id, mode, modules or 'all',
+        )
+
+        pre_test = await run_pre_test_commands(
+            self.config.review.pre_test_commands,
+            cwd=self.config.project_root,
+            timeout_secs=self.config.review.pre_test_timeout_secs,
+            env=self.config.verify_env,
         )
 
         phase1, working_tree = await self._run_phase1(review_id)
@@ -250,6 +295,7 @@ class ReviewCheckpoint:
         prompt = self._build_prompt(
             mode, phase1, modules, briefing_content, review_id,
             working_tree=working_tree,
+            pre_test=pre_test,
         )
 
         # Build MCP config for fused-memory + escalation access
@@ -270,15 +316,9 @@ class ReviewCheckpoint:
             role_name='deep_reviewer',
             role_defaults=RoleDefaults(
                 DEEP_REVIEWER.default_model,
-                # Layer-4 effort base kept == EffortConfig.deep_reviewer's
-                # default ('max') — the value config-layer-3 always supplies
-                # today, and the site's own pre-η getattr fallback was
-                # getattr(config.effort,'deep_reviewer','max'). AgentRole has no
-                # default_effort field, so effort is the one RoleDefaults field
-                # not sourced from DEEP_REVIEWER; matching the config default
-                # means a future EffortConfig field removal degrades to the same
-                # effort, not a silent 'max'→'high' drop.
-                'max',
+                # Kept == EffortConfig.deep_reviewer's default, pinned by
+                # orchestrator/tests/test_out_of_band_routing.py::TestDeepReviewerAdoptsResolveRoute
+                'xhigh',
                 DEEP_REVIEWER.default_budget, DEEP_REVIEWER.default_max_turns,
             ),
             config=self.config,
@@ -327,12 +367,13 @@ class ReviewCheckpoint:
                 tasks_created=[],
                 escalated_findings=0,
                 cost_usd=0.0,
-                duration_ms=int((time.monotonic() - start) * 1000),
+                duration_ms=int((self._clock() - start) * 1000),
                 phase1_working_tree=working_tree,
+                pre_test=pre_test,
             )
         completed_at = datetime.now(UTC).isoformat()
 
-        elapsed_ms = int((time.monotonic() - start) * 1000)
+        elapsed_ms = int((self._clock() - start) * 1000)
 
         if self.cost_store:
             try:
@@ -392,11 +433,9 @@ class ReviewCheckpoint:
                 review_id, result.success, (result.output or '')[:200],
             )
 
-        # Promote any L0 escalations emitted by the reviewer to L1.  The
-        # reviewer runs outside a task workflow, so the synthetic
-        # ``review-<id>`` task_id it uses has no steward that could pick
-        # these up; left alone they sit pending until the next orchestrator
-        # restart auto-dismisses them unread.
+        # Promote any L0 escalations the reviewer filed to L1.  The reviewer
+        # runs outside a task workflow, so no steward reads what it files
+        # under review_escalation_task_id(review_id).
         self._promote_reviewer_escalations(review_id)
 
         report = ReviewReport(
@@ -413,6 +452,7 @@ class ReviewCheckpoint:
             duration_ms=elapsed_ms,
             parse_failed=parse_failed,
             phase1_working_tree=working_tree,
+            pre_test=pre_test,
         )
 
         self._save_report(report, result.output)
@@ -455,16 +495,14 @@ class ReviewCheckpoint:
         """Promote pending L0 escalations from this review run to level 1.
 
         The deep reviewer runs outside a task workflow, so any escalations
-        it emits land against the synthetic ``review-<review_id>`` task_id
-        which has no steward.  Post-hoc, we promote them directly to L1
+        it emits land against review_escalation_task_id(review_id), which
+        has no steward.  Post-hoc, we promote them directly to L1
         (human-visible) and dismiss the L0.  Returns the number promoted.
         """
         if self.escalation_queue is None:
             return 0
 
-        from escalation.models import Escalation
-
-        synthetic_task_id = f'review-{review_id}'
+        synthetic_task_id = review_escalation_task_id(review_id)
         pending = self.escalation_queue.get_by_task(
             synthetic_task_id, status='pending', level=0,
         )
@@ -473,25 +511,14 @@ class ReviewCheckpoint:
 
         promoted = 0
         for esc in pending:
-            reesc = Escalation(
-                id=self.escalation_queue.make_id(synthetic_task_id),
-                task_id=synthetic_task_id,
+            promote_l0_to_l1(
+                self.escalation_queue, esc,
                 agent_role='review-checkpoint',
-                severity=esc.severity,
-                category=esc.category,
-                summary=esc.summary,
-                detail=esc.detail,
-                suggested_action='manual_intervention',
-                worktree=esc.worktree,
-                workflow_state=esc.workflow_state,
-                level=1,
-            )
-            self.escalation_queue.submit(reesc)
-            self.escalation_queue.resolve(
-                esc.id,
-                'Auto-promoted to level 1 — review checkpoint has no steward',
-                dismiss=True,
+                why='review checkpoint has no steward',
+                detail_suffix='',
+                filing_claimant_run_id=None,
                 resolved_by='review-checkpoint',
+                worktree=esc.worktree,
             )
             promoted += 1
 
@@ -529,10 +556,12 @@ class ReviewCheckpoint:
         review_id: str,
         *,
         working_tree: Phase1WorkingTree | None = None,
+        pre_test: Sequence[PreTestCommandResult] = (),
     ) -> str:
         """Assemble the user prompt for the deep review agent."""
         project_root = str(self.config.project_root)
         project_id = self.config.fused_memory.project_id
+        escalation_task_id = review_escalation_task_id(review_id)
 
         reflection_block = render_reflection_instructions(
             project_id=project_id, review_id=review_id
@@ -577,6 +606,7 @@ do NOT re-run these checks yourself.
 **Summary:** {qualified_phase1_summary(phase1, working_tree)}
 """
         phase1_block += render_working_tree_section(phase1, working_tree)
+        phase1_block += render_pre_test_section(pre_test)
         if not phase1.passed:
             if phase1.test_output:
                 phase1_block += f"""
@@ -604,6 +634,7 @@ do NOT re-run these checks yourself.
 ## Agent Identity
 
 - **agent_id:** `claude-review-{review_id}`
+- **task_id:** `{escalation_task_id}`
 - **project_id:** `{project_id}`
 - **project_root:** `{project_root}`
 
@@ -622,7 +653,7 @@ do NOT re-run these checks yourself.
 3. **Triage each finding** and act:
    - Clear-cut issues — submit a candidate (single step, no resolve_ticket):
 {submit_resolve_block}
-   - Ambiguous/architectural → `escalate_info(category=..., summary=...)`
+   - Ambiguous/architectural → `escalate_info(task_id="{escalation_task_id}", category=..., summary=...)`
    - Known/accepted → dismiss (don't report)
 
 {reflection_block}
@@ -671,6 +702,8 @@ do NOT re-run these checks yourself.
         }
         if report.phase1_working_tree is not None:
             data['phase1_working_tree'] = report.phase1_working_tree.to_dict()
+        if report.pre_test:
+            data['pre_test_commands'] = [asdict(r) for r in report.pre_test]
 
         path = reports_dir / f'review-{report.review_id}.json'
         path.write_text(json.dumps(data, indent=2))

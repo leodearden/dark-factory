@@ -24,6 +24,10 @@ the FIRST amendment round's own fixes):
 
 - TestPrecheckCreatedAtTypeSafety     (max() sort-key non-str created_at)
 - TestPrecheckReinvestigatedExactCount (reinvestigated == len(to_reinvestigate))
+
+Task 10086 (plans/live-task-facts-at-recall-prd.md C5):
+
+- TestPrecheckWritesLinkTheirSubject  (both writes declare the subject task, name no status)
 """
 
 from __future__ import annotations
@@ -32,6 +36,7 @@ from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
+from _code_writer_links import assert_writes_c5, subject_task
 
 
 class TestIsCrossProjectScopeCorrection:
@@ -271,10 +276,10 @@ class TestBuildScopeSnapshotMetadata:
         return build_scope_snapshot_metadata(**kwargs)
 
     def test_returns_canonical_payload(self):
+        from fused_memory.reconciliation.flag_identity import content_fingerprint
         from fused_memory.reconciliation.scope_freshness import (
             CONSOLIDATED_SCOPE_KIND,
             SCOPE_FRESHNESS_SOURCE,
-            _content_fingerprint,
         )
 
         metadata = self._build()
@@ -287,7 +292,7 @@ class TestBuildScopeSnapshotMetadata:
         assert metadata['subject_task_id'] == '2405'
         assert metadata['subject_status'] == 'pending'
         assert metadata['subject_updated_at'] == '2026-07-10T10:00:00Z'
-        assert metadata['subject_description_fingerprint'] == _content_fingerprint(
+        assert metadata['subject_description_fingerprint'] == content_fingerprint(
             'Some description text.',
         )
         assert metadata['run_id'] == 'run-1'
@@ -547,7 +552,7 @@ class TestPrecheckFreshSkip:
             task_id='2405', project_root='/roots/dark_factory',
         )
 
-        # A lightweight 'still blocked, no change' marker was written.
+        # A lightweight 'no change' marker was written.
         memory_service.add_memory.assert_awaited_once()
         _, add_kwargs = memory_service.add_memory.await_args
         assert add_kwargs['metadata']['kind'] == CONSOLIDATED_SCOPE_KIND
@@ -1319,3 +1324,84 @@ class TestPrecheckReinvestigatedExactCount:
         assert len(result.to_reinvestigate) == 3
         assert result.stats['scope_freshness_reinvestigated'] == 3
         assert result.stats['scope_freshness_skipped'] == len(result.skipped) == 0
+
+
+class TestPrecheckWritesLinkTheirSubject:
+    """C5: the snapshot and the 'no change' marker declare their subject task
+    and name no task status. The live task's fields are status-neutral except
+    its status, which only metadata may carry."""
+
+    WRITING_PROJECT = 'autopilot_video'
+    LIVE_TASK = {
+        'id': 2405, 'status': 'blocked', 'updatedAt': '2026-07-10T10:00:00Z',
+        'description': 'd', 'metadata': {},
+    }
+
+    @staticmethod
+    def _finding(subject_project_id: str) -> dict[str, Any]:
+        return {
+            'flag_type': 'cross_project',
+            'description': 'scope correction thread',
+            'cited_tasks': [{'project_id': subject_project_id, 'task_id': '2405', 'title': 'x'}],
+        }
+
+    async def _precheck(self, memory_service, subject_project_id: str):
+        from fused_memory.reconciliation.scope_freshness import precheck_scope_correction_freshness
+
+        taskmaster = AsyncMock()
+        taskmaster.get_task.return_value = dict(self.LIVE_TASK)
+        return await precheck_scope_correction_freshness(
+            memory_service=memory_service,
+            taskmaster=taskmaster,
+            project_id=self.WRITING_PROJECT,
+            resolve_project_root=lambda pid: f'/roots/{pid}',
+            run_id='run-2',
+            findings=[self._finding(subject_project_id)],
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'subject_project_id', ['dark_factory', 'autopilot-video'], ids=['foreign', 'own-project'],
+    )
+    async def test_the_first_sight_snapshot_declares_its_subject(self, subject_project_id):
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata.return_value = []
+
+        await self._precheck(memory_service, subject_project_id)
+
+        memory_service.add_memory.assert_awaited_once()
+        assert_writes_c5(
+            memory_service.add_memory.await_args.kwargs,
+            project_id=self.WRITING_PROJECT,
+            subject=subject_task(subject_project_id, '2405'),
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'subject_project_id', ['dark_factory', 'autopilot-video'], ids=['foreign', 'own-project'],
+    )
+    async def test_the_no_change_marker_declares_its_subject(self, subject_project_id):
+        from fused_memory.reconciliation.scope_freshness import build_scope_snapshot_metadata
+
+        prior_metadata = build_scope_snapshot_metadata(
+            task_ref=f'{subject_project_id}:2405', flag_key='cross_project',
+            subject_project_id=subject_project_id, subject_task_id='2405',
+            status='blocked', updated_at='2026-07-10T10:00:00Z', description='d',
+            run_id='run-1', snapshot_at='2026-07-10T14:29:33Z', skip_streak=1,
+        )
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata.return_value = [
+            {'id': 'a4ed9cad', 'created_at': '2026-07-10T14:29:33Z', 'metadata': prior_metadata},
+        ]
+
+        result = await self._precheck(memory_service, subject_project_id)
+
+        assert result.stats['scope_freshness_skipped'] == 1
+        written = memory_service.add_memory.await_args.kwargs
+        assert written['metadata']['no_change'] is True
+        assert written['metadata']['skip_streak'] == 2
+        assert_writes_c5(
+            written,
+            project_id=self.WRITING_PROJECT,
+            subject=subject_task(subject_project_id, '2405'),
+        )

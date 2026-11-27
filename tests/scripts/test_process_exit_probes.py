@@ -17,12 +17,23 @@ from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from df_pytest_isolation import (
     ProcState,
     read_proc_state,
     wait_pid_gone,
     wait_pids_exited,
+)
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
+
+#: A child that renames its own comm to bytes that are not UTF-8, then waits.
+_UNDECODABLE_COMM_SLEEPER = (
+    'import ctypes, time\n'
+    "ctypes.CDLL(None).prctl(15, b'\\xff\\xfe', 0, 0, 0)\n"
+    "print('ready', flush=True)\n"
+    'time.sleep(30)\n'
 )
 
 
@@ -102,6 +113,24 @@ class TestProcessExitProbes:
         finally:
             child.kill()
             child.wait()
+
+    @pytest.mark.timeout(15)
+    def test_read_proc_state_reads_a_live_child_with_an_undecodable_comm(self) -> None:
+        """A process sets its own comm, so bytes that are not UTF-8 still read as running."""
+        with subprocess.Popen(
+            [sys.executable, '-c', _UNDECODABLE_COMM_SLEEPER],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        ) as child:
+            try:
+                assert child.stdout is not None
+                assert child.stdout.readline().strip() == b'ready'
+                state = read_proc_state(child.pid)
+                assert state is not None
+                assert state.ppid == os.getpid()
+                assert state.exited is False
+            finally:
+                child.kill()
 
     def test_wait_pids_exited_decides_on_a_probe_taken_after_its_last_sleep(self) -> None:
         """A deadline crossed DURING the sleep still gets one fresh probe before the verdict.

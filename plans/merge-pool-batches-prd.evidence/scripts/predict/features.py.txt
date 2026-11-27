@@ -1,0 +1,119 @@
+"""Attach pre-verify features to labelled requests. Output rows.json"""
+import json,collections,sqlite3,subprocess,bisect,datetime as dt
+P='/tmp/gate-10069/predict/'; REPO='/home/leo/src/dark-factory'
+E=sorted((json.loads(l) for l in open(P+'events.jsonl')),key=lambda e:e['id'])
+def T(ts): return dt.datetime.fromisoformat(ts).timestamp()
+for e in E: e['t']=T(e['ts'])
+R=json.load(open(P+'requests.json')); TR=json.load(open(P+'trials.json'))
+trial={t['vid']:t for t in TR}
+wv=collections.defaultdict(list); rvc=collections.defaultdict(list); landed=[]
+for e in E:
+    if e['et']=='workflow_verify': wv[e['task']].append(e)
+    elif e['et']=='rebase_verify_cost': rvc[e['task']].append(e)
+    elif e['et']=='merge_finalized' and e['d']['state']=='done' and e['d'].get('merge_sha'): landed.append((e['t'],e['d']['merge_sha']))
+landed.sort(); landed_t=[x[0] for x in landed]
+def main_at(t):
+    i=bisect.bisect_right(landed_t,t)-1
+    return landed[i][1] if i>=0 else None
+# verify intervals for concurrency
+iv=[]
+for t in TR: iv.append((t['start_t'],t['t']))
+for ev in wv.values():
+    for e in ev:
+        d=e['d'].get('duration_ms')
+        if d: iv.append((e['t']-d/1000,e['t']))
+def conc(t): return sum(1 for a,b in iv if a<t<b)
+# task store
+c=sqlite3.connect('file:'+REPO+'/.taskmaster/tasks/tasks.db?mode=ro',uri=True)
+ts={}
+for i,pri,md,title in c.execute("select id,priority,metadata,title from tasks"):
+    try: m=json.loads(md or '{}')
+    except Exception: m={}
+    ts[str(i)]={'priority':pri,'task_kind':m.get('task_kind'),'complexity':m.get('complexity'),'spawn_context':m.get('spawn_context'),
+        'human_decomposed':bool(m.get('human_decomposed')),'has_prd':bool(m.get('prd_path')),'n_decl_files':len(m['files']) if isinstance(m.get('files'),list) else None,
+        'execution_class':m.get('execution_class')}
+_cnt={}
+def commits(a,b):
+    if not a or not b: return None
+    if (a,b) in _cnt: return _cnt[(a,b)]
+    p=subprocess.run(['git','-C',REPO,'rev-list','--count',f'{a}..{b}'],capture_output=True,text=True)
+    v=int(p.stdout.strip()) if p.returncode==0 and p.stdout.strip().isdigit() else None
+    _cnt[(a,b)]=v; return v
+_mb={}
+def behind(tip,m):
+    if not tip or not m: return None
+    if (tip,m) not in _mb:
+        p=subprocess.run(['git','-C',REPO,'merge-base',tip,m],capture_output=True,text=True)
+        _mb[(tip,m)]=p.stdout.strip() if p.returncode==0 and p.stdout.strip() else None
+    f=_mb[(tip,m)]
+    return commits(f,m) if f else None
+# solo verdict stream for rolling lane rate
+solo=[(t['t'],0 if t['passed'] else 1) for t in TR if t['k']==1 and not t['train_union'] and (t['passed'] or t['applied'])]
+solo.sort(); solo_t=[x[0] for x in solo]
+def lane_fail(t,n=30):
+    i=bisect.bisect_left(solo_t,t); w=solo[max(0,i-n):i]
+    return (sum(x[1] for x in w)/len(w)) if len(w)>=10 else None
+allv=[(t['t'],t['k'],t['passed']) for t in TR if not t['train_union'] and t['last_attempt']]
+allv.sort(); allv_t=[x[0] for x in allv]
+def table_est(t,n=30):
+    i=bisect.bisect_left(allv_t,t); w=allv[max(0,i-n):i]
+    if not w: return None
+    pr=sum(x[2] for x in w)/len(w); md=sum(x[1] for x in w)/len(w)
+    return pr**(1/md)
+by_task=collections.defaultdict(list)
+for r in R: by_task[r['task']].append(r)
+for rs in by_task.values(): rs.sort(key=lambda r:(r['enq_t'] or r['final_t'] or 9e18))
+rows=[]
+for task,rs in by_task.items():
+    for idx,r in enumerate(rs):
+        if r['label'] is None and not r['trials']: continue
+        vt=trial.get(r['verdict_trial']) if r['label'] is not None else trial.get(r['trials'][0][0])
+        vt_t=vt['t'] if vt else r['final_t']; start=vt['start_t'] if vt else (r['enq_t'] or r['final_t'])
+        enq=r['enq_t'] if r['enq_t'] else start
+        prev=rs[:idx]
+        prior_fail=sum(1 for p in prev if p['label_src']=='solo_fail')
+        prior_any=len(prev)
+        derail_before=bool(prev and prev[-1]['label_src'] in('train_derailed','train_unknown'))
+        prev=[p for p in prev if p['label_src'] not in('train_derailed','train_unknown','train_pass')]
+        prior_any=len(prev)
+        lastp=prev[-1] if prev else None
+        if lastp is None: resub='first'
+        elif lastp['label_src']=='solo_fail' or lastp['final_reason'].startswith(('Post-merge','Main-health')): resub='after_verify_block'
+        elif lastp['final_state'] in('conflict',) or lastp['final_reason'].startswith('Suffix'): resub='after_conflict'
+        elif lastp['label_src'] in('train_derailed',): resub='after_train_derail'
+        else: resub='after_other'
+        w=[e for e in wv.get(task,()) if e['t']<=enq+5]
+        lw=w[-1] if w else None
+        rb=[e for e in rvc.get(task,()) if e['t']<=enq+5]
+        lrb=rb[-1] if rb else None
+        base=(lrb['d'].get('new_base') if lrb else None) or (lw['d'].get('base_sha') if lw else None)
+        if lw and lrb and lw['t']>lrb['t']+5 and False: pass
+        row={'rid':r['rid'],'task':task,'branch':r['branch'],'y':r['label'],'src':r['label_src'],'verdict_t':vt_t,'start_t':start,'enq_t':enq,
+             'final_state':r['final_state'],
+             'prior_fail':prior_fail,'prior_reqs':prior_any,'resub':resub,
+             'red_chain_before':r['red_chain_before'],'void_fails':r['void_fails'],
+             'prev_red_batch':bool(r['red_chain_before']>0 or derail_before),
+             'n_task_verifies':len(w),'has_task_verify':bool(w),
+             'task_verify_age_h':((start-lw['t'])/3600 if (lw and vt) else None),
+             'queue_wait_h':((start-enq)/3600 if vt else None),
+             'wv_units':(lw['d'].get('n_units') if lw else None),'wv_site':(lw['d'].get('site') if lw else None),
+             'n_task_files':(lrb['d']['verify_scope'].get('n_task_files') if lrb and isinstance(lrb['d'].get('verify_scope'),dict) else None),
+             'n_modules':(lrb['d']['verify_scope'].get('n_modules') if lrb and isinstance(lrb['d'].get('verify_scope'),dict) else None),
+             'workspace':(lrb['d']['verify_scope'].get('workspace') if lrb and isinstance(lrb['d'].get('verify_scope'),dict) else None),
+             'rb_cohort':(lrb['d'].get('cohort') if lrb else None),'rb_distance':(lrb['d'].get('distance_commits') if lrb else None),
+             'n_rebases':len(rb),
+             'behind_enq':behind(lw['d'].get('tip_sha') if lw else None,main_at(enq)),'behind_start':behind(lw['d'].get('tip_sha') if lw else None,main_at(start)),
+             'hour':dt.datetime.fromtimestamp(start,dt.timezone.utc).hour,
+             'runner':vt['runner'] if vt else None,'base_relation':vt['base_relation'] if vt else None,'speculative':vt['speculative'] if vt else None,
+             'conc':conc(start),'lane_fail30':lane_fail(start),'table_est':table_est(start),
+             'lane':r.get('lane'),'tier':r.get('tier'),'pinned':r.get('pinned'),
+             'numeric_branch':task.isdigit(),'disposition':vt.get('disposition') if vt else None,
+             'red_units':vt.get('red_units') if vt else None,'block_reason':vt.get('block_reason') if vt else None}
+        row.update(ts.get(task,{'priority':None,'task_kind':None,'complexity':None,'spawn_context':None,'human_decomposed':None,'has_prd':None,'n_decl_files':None,'execution_class':None}))
+        rows.append(row)
+rows.sort(key=lambda r:r['verdict_t'])
+json.dump(rows,open(P+'rows_all.json','w'))
+rows=[r for r in rows if r['y'] is not None]
+json.dump(rows,open(P+'rows.json','w'))
+print(len(rows),collections.Counter(r['src'] for r in rows))
+print('behind_enq None:',sum(r['behind_enq'] is None for r in rows),'git pairs',len(_cnt))

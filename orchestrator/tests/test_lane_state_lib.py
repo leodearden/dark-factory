@@ -28,9 +28,11 @@ import json
 import shlex
 import shutil
 import subprocess
+from datetime import datetime
 from pathlib import Path
 
 import pytest
+from _orch_helpers import env_resolving_running_interpreter
 
 # Reused verbatim from the sibling shipped-script contract rather than
 # re-derived: WARM_LANE_SCRIPT_DIR is resolved from __file__ (not the process
@@ -39,7 +41,7 @@ import pytest
 # keys (REIFY_WARM_LANE_MOUNT, GIT_DIR, GIT_WORK_TREE) that git hooks and
 # `git rebase --exec` export — without which a passing result here could be an
 # artifact of the ambient checkout instead of the synthetic mount.
-from test_warm_lane_scripts_shipped import (  # noqa: E402
+from test_warm_lane_scripts_shipped import (
     WARM_LANE_SCRIPT_DIR,
     _sanitized_env,
 )
@@ -56,6 +58,24 @@ _BASH = shutil.which('bash') or '/bin/bash'
 # harness
 # ---------------------------------------------------------------------------
 
+def _sanitized_env_with_test_python3(
+    extra: dict[str, str] | None = None,
+) -> dict[str, str]:
+    """``_sanitized_env`` with a bare ``python3`` bound to the interpreter running this test.
+
+    That interpreter is capable by construction (this module imports
+    ``orchestrator.git_ops``), so a bridge case never depends on what the host's
+    ``PATH`` carries.  A ``PATH`` in *extra* is refused: prepending a capable
+    interpreter ahead of a stub would make a hostile-``PATH`` case pass vacuously.
+    """
+    if extra is not None and 'PATH' in extra:
+        raise ValueError(
+            "extra['PATH'] would be shadowed by the test interpreter's bin dir; "
+            'a PATH-stubbing case must call _sanitized_env directly',
+        )
+    return env_resolving_running_interpreter(_sanitized_env(extra=extra))
+
+
 def _run_sourced(
     snippet: str,
     *,
@@ -69,7 +89,9 @@ def _run_sourced(
     ``lane_protect_glob`` cases: unlike the pure-bash lane-state half, those
     pay a real ``python3`` interpreter start plus the ``orchestrator.git_ops``
     import chain, which on a loaded host (this repo's own fleet saturates it)
-    measures single-digit seconds cold.
+    measures single-digit seconds cold.  The default *env* binds a bare
+    ``python3`` to the running interpreter, so a bridge case never depends on
+    what the host's ``PATH`` carries.
     """
     script = f'source {shlex.quote(str(LIB))}\n{snippet}\n'
     return subprocess.run(
@@ -78,7 +100,7 @@ def _run_sourced(
         text=True,
         timeout=timeout,
         cwd=str(cwd if cwd is not None else WARM_LANE_SCRIPT_DIR),
-        env=_sanitized_env() if env is None else env,
+        env=_sanitized_env_with_test_python3() if env is None else env,
     )
 
 
@@ -610,6 +632,60 @@ class TestLaneStateReadPublishesUpdatedAt:
         assert published['UPDATED'] == '', (
             f'the pre-read default must be the unjudgeable reading; {published!r}'
         )
+
+
+def _epoch(timestamp: str) -> tuple[int, list[str]]:
+    """Run the SHIPPED ``lane_state_epoch`` on *timestamp*: its rc, and stdout lines."""
+    proc = _run_sourced(
+        f'lane_state_epoch {shlex.quote(timestamp)}\nprintf \'RC=%s\\n\' "$?"',
+    )
+    lines = proc.stdout.splitlines()
+    assert lines and lines[-1].startswith('RC='), (
+        f'the snippet did not report a return code; stdout={proc.stdout!r} '
+        f'stderr={proc.stderr!r}'
+    )
+    return int(lines[-1].removeprefix('RC=')), lines[:-1]
+
+
+class TestLaneStateEpoch:
+    """``lane_state_epoch`` is the ONE parse of a record's ``updated_at``.
+
+    Two consumers judge a lane's age by it (warm-lane-gc.sh's Pass-1 gate and
+    warm-lane-audit.sh's ``age_min``), so the unjudgeable readings must be the
+    same in both: a non-zero return and NOTHING on stdout.
+    """
+
+    @pytest.mark.parametrize(
+        'timestamp',
+        [
+            _ASSIGNED_RECORD['updated_at'],
+            # datetime.isoformat() of an aware datetime with microseconds: the
+            # shape LaneRecord actually stamps.
+            '2026-07-26T12:43:10.704531+00:00',
+        ],
+    )
+    def test_the_producers_shape_converts_to_epoch_seconds(self, timestamp: str) -> None:
+        rc, printed = _epoch(timestamp)
+        assert rc == 0, f'{timestamp!r} must be judgeable; printed={printed!r}'
+        # GNU date truncates the fractional seconds, as int() does.
+        assert printed == [str(int(datetime.fromisoformat(timestamp).timestamp()))], (
+            f'{timestamp!r} must print exactly its epoch seconds; got {printed!r}'
+        )
+
+    def test_the_empty_string_is_unjudgeable(self) -> None:
+        """The gotcha this function exists to own: GNU ``date -d ''`` exits 0.
+
+        It answers today's midnight, so a parse that handed it an unstamped
+        record's empty ``updated_at`` would read that record as stamped today.
+        """
+        rc, printed = _epoch('')
+        assert rc == 1, f'an empty stamp must be unjudgeable; rc={rc} printed={printed!r}'
+        assert printed == [], f'an unjudgeable stamp must print nothing; {printed!r}'
+
+    def test_garbage_is_unjudgeable(self) -> None:
+        rc, printed = _epoch('not-a-timestamp')
+        assert rc == 1, f'garbage must be unjudgeable; rc={rc} printed={printed!r}'
+        assert printed == [], f'an unjudgeable stamp must print nothing; {printed!r}'
 
 
 class TestLaneStateClass:
@@ -1455,7 +1531,9 @@ class TestLaneProtectGlobHonoursTheConfiguredIactBand:
         proc = _run_sourced(
             'lane_protect_glob _lane- _spec-',
             cwd=tmp_path,
-            env=_sanitized_env(extra={'REIFY_WARM_LANE_IACT_PREFIX': '_int-'}),
+            env=_sanitized_env_with_test_python3(
+                extra={'REIFY_WARM_LANE_IACT_PREFIX': '_int-'},
+            ),
             timeout=_BRIDGE_TIMEOUT,
         )
         assert proc.returncode == 0, proc.stderr
@@ -1482,7 +1560,9 @@ class TestLaneProtectGlobHonoursTheConfiguredIactBand:
         proc = _run_sourced(
             'lane_protect_glob',
             cwd=tmp_path,
-            env=_sanitized_env(extra={'REIFY_WARM_LANE_IACT_PREFIX': ''}),
+            env=_sanitized_env_with_test_python3(
+                extra={'REIFY_WARM_LANE_IACT_PREFIX': ''},
+            ),
             timeout=_BRIDGE_TIMEOUT,
         )
         assert proc.returncode == 0, proc.stderr
@@ -1525,6 +1605,39 @@ def _uncovered_bands(rendered: str, fallback: str) -> list[str]:
             fnmatch.fnmatchcase(_representative(band), pattern) for pattern in patterns
         )
     ]
+
+
+def _fallback_band_diff(rendered: str, fallback: str) -> tuple[list[str], list[str]]:
+    """(bands only in *rendered*, bands only in *fallback*), each in its own order."""
+    rendered_bands = [b for b in rendered.split(',') if b]
+    fallback_bands = [b for b in fallback.split(',') if b]
+    return (
+        [b for b in rendered_bands if b not in fallback_bands],
+        [b for b in fallback_bands if b not in rendered_bands],
+    )
+
+
+def _fallback_drift_report(rendered: str, fallback: str) -> str | None:
+    """``None`` iff *fallback* is byte-equal to *rendered*, else a fix-it report."""
+    if rendered == fallback:
+        return None
+    only_rendered, only_fallback = _fallback_band_diff(rendered, fallback)
+    lines = [
+        'LANE_PROTECT_GLOB_FALLBACK is not a verbatim render of PROTECTED_PREFIXES.',
+        f'  in the render, missing from the fallback: {only_rendered}',
+        f'  in the fallback, missing from the render: {only_fallback}',
+    ]
+    if not only_rendered and not only_fallback:
+        lines.append('  same bands, different order')
+    return '\n'.join([
+        *lines,
+        f'  rendered: {rendered}',
+        f'  fallback: {fallback}',
+        'Fix: in orchestrator/scripts/warm-lane/lib_lane_state.sh set',
+        f"  LANE_PROTECT_GLOB_FALLBACK='{rendered}'",
+        'Both gc suites pin REIFY_WARM_LANE_GC_PROTECT_GLOB to it, so until then '
+        'they exercise warm-lane-gc.sh with a protect set production never uses.',
+    ])
 
 
 @pytest.fixture
@@ -1620,3 +1733,85 @@ class TestProtectGlobFallbackDrift:
                 f'the fallback protects pool band {band!r} via {offenders!r} — a '
                 f'python3 outage would freeze reclaim instead of degrading it'
             )
+
+
+class TestProtectGlobFallbackIsAVerbatimRender:
+    """``LANE_PROTECT_GLOB_FALLBACK`` must equal the registry render byte for byte.
+
+    Both gc suites pin ``REIFY_WARM_LANE_GC_PROTECT_GLOB`` to the fallback, which
+    is behaviour-neutral only under that equality; production's python3-outage
+    backstop needs only :class:`TestProtectGlobFallbackDrift`'s containment.
+    """
+
+    @staticmethod
+    def _render() -> str:
+        from orchestrator import git_ops
+
+        return git_ops.render_protect_glob(owned=git_ops.PROTECT_GLOB_OWNED_POOL_BANDS)
+
+    @staticmethod
+    def _swap_registry(monkeypatch, registry: dict[str, str]) -> None:
+        """Replace the registry whole: ``delitem``'s undo re-inserts at the END."""
+        from orchestrator import git_ops
+
+        monkeypatch.setattr(git_ops, 'PROTECTED_PREFIXES', registry)
+
+    def test_the_fallback_is_a_verbatim_render_of_the_registry(self, fallback) -> None:
+        rendered = self._render()
+        assert _fallback_drift_report(rendered, fallback) is None, (
+            _fallback_drift_report(rendered, fallback)
+        )
+
+    def test_the_equality_gate_fires_on_an_unmirrored_new_band(
+        self, fallback, monkeypatch,
+    ) -> None:
+        from orchestrator import git_ops
+
+        monkeypatch.setitem(git_ops.PROTECTED_PREFIXES, '_newband-', 'test-only')
+        rendered = self._render()
+        assert _fallback_band_diff(rendered, fallback) == (['_newband-*'], [])
+        report = _fallback_drift_report(rendered, fallback)
+        assert report is not None
+        assert '_newband-*' in report, report
+        assert f"LANE_PROTECT_GLOB_FALLBACK='{rendered}'" in report, report
+
+    def test_the_equality_gate_catches_a_band_containment_waves_through(
+        self, fallback, monkeypatch,
+    ) -> None:
+        from orchestrator import git_ops
+
+        monkeypatch.setitem(git_ops.PROTECTED_PREFIXES, '_merge-extra', 'test-only')
+        rendered = self._render()
+        assert _uncovered_bands(rendered, fallback) == []
+        assert _fallback_band_diff(rendered, fallback) == (['_merge-extra'], [])
+        assert _fallback_drift_report(rendered, fallback) is not None
+
+    def test_the_equality_gate_catches_a_strict_superset_fallback(
+        self, fallback, monkeypatch,
+    ) -> None:
+        from orchestrator import git_ops
+
+        self._swap_registry(monkeypatch, {
+            key: owner
+            for key, owner in git_ops.PROTECTED_PREFIXES.items()
+            if key != '_solo-'
+        })
+        rendered = self._render()
+        assert _uncovered_bands(rendered, fallback) == []
+        assert _fallback_band_diff(rendered, fallback) == ([], ['_solo-*'])
+        assert _fallback_drift_report(rendered, fallback) is not None
+
+    def test_the_equality_gate_catches_an_order_only_difference(
+        self, fallback, monkeypatch,
+    ) -> None:
+        from orchestrator import git_ops
+
+        registry = dict(git_ops.PROTECTED_PREFIXES)
+        moved = registry.pop('_merge-')
+        self._swap_registry(monkeypatch, {**registry, '_merge-': moved})
+        rendered = self._render()
+        assert _fallback_band_diff(rendered, fallback) == ([], [])
+        report = _fallback_drift_report(rendered, fallback)
+        assert report is not None
+        assert 'same bands, different order' in report, report
+        assert f"LANE_PROTECT_GLOB_FALLBACK='{rendered}'" in report, report

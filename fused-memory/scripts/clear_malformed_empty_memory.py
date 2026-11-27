@@ -65,13 +65,18 @@ Usage
 
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
+
 import argparse
 import asyncio
 import json
 import logging
-import sys
 from typing import Any
 
+from fused_memory.utils.mem0_content_keys import mem0_payload_text
 from fused_memory.utils.store_mutation_preflight import assert_store_mutation_allowed
 
 logger = logging.getLogger('clear_malformed_empty_memory')
@@ -80,29 +85,6 @@ logger = logging.getLogger('clear_malformed_empty_memory')
 # ---------------------------------------------------------------------------
 # Pure core
 # ---------------------------------------------------------------------------
-
-# Payload keys tried in order when extracting a Mem0 memory's text content
-# from its raw Qdrant payload dict. Reused verbatim from
-# audit_duplicate_memories.py's _CONTENT_KEYS so 'empty content' is judged
-# identically to how the dedup sweep judges it ('data' is the canonical
-# Qdrant scroll-payload content key for infer=False writes).
-_CONTENT_KEYS: tuple[str, ...] = ('data', 'memory', 'content')
-
-
-def extract_content(payload: dict) -> str:
-    """Return the first non-empty string among payload['data'], ['memory'],
-    ['content'], trying _CONTENT_KEYS in order.
-
-    Returns '' when no key is present or every present value is empty/not a
-    string -- mirrors audit_duplicate_memories.fetch_procedural_memories's
-    content-extraction fallback exactly.
-    """
-    for key in _CONTENT_KEYS:
-        value = payload.get(key)
-        if isinstance(value, str) and value:
-            return value
-    return ''
-
 
 def is_malformed_empty_payload(payload: dict) -> bool:
     """True iff *payload* matches the malformed-empty fingerprint: empty
@@ -113,9 +95,9 @@ def is_malformed_empty_payload(payload: dict) -> bool:
     category, or a set agent_id) can NEVER match, so this predicate
     structurally cannot authorize deleting a real memory.
 
-    Note: 'empty content' is judged only over the recognized _CONTENT_KEYS
-    ('data', 'memory', 'content') -- this predicate assumes the standard
-    Mem0 payload shape. A record that stored its text under some other key
+    Note: 'empty content' is judged only over the recognized
+    ``fused_memory/utils/mem0_content_keys.py::MEM0_CONTENT_KEYS`` -- this
+    predicate assumes the standard Mem0 payload shape. A record that stored its text under some other key
     while also having category=None and agent_id=None would be
     misclassified as malformed. In practice this risk is very low (real
     observations_and_summaries records always carry a category, and the
@@ -124,7 +106,7 @@ def is_malformed_empty_payload(payload: dict) -> bool:
     pipeline.
     """
     return (
-        extract_content(payload) == ''
+        mem0_payload_text(payload) == ''
         and payload.get('category') is None
         and payload.get('agent_id') is None
     )
@@ -176,7 +158,7 @@ async def delete_point(qdrant_client, collection: str, memory_id: str) -> None:
     """Delete the *memory_id* point from *collection* via a direct Qdrant
     point delete (PointIdsList) -- NOT Mem0's AsyncMemory.delete(), which
     would KeyError on a null-payload record (module docstring)."""
-    from qdrant_client.http import models as qmodels  # noqa: PLC0415
+    from qdrant_client.http import models as qmodels
 
     await qdrant_client.delete(
         collection_name=collection,
@@ -359,26 +341,21 @@ def main() -> int:
     args = parser.parse_args()
 
     if args.config:
-        import os  # noqa: PLC0415
+        import os
         os.environ['CONFIG_PATH'] = str(args.config)
 
     async def _run_live() -> dict:
-        from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
-        from fused_memory.models.scope import Scope  # noqa: PLC0415
-        from fused_memory.services.memory_service import MemoryService  # noqa: PLC0415
+        from fused_memory.config.schema import FusedMemoryConfig
+        from fused_memory.maintenance._utils import maintenance_service
+        from fused_memory.models.scope import Scope
 
         config = FusedMemoryConfig()
-        memory = MemoryService(config)
-        try:
-            await memory.initialize()
+        async with maintenance_service(config=config) as (_, memory):
             collection = Scope(project_id=args.project_id).mem0_collection_name(
                 memory.mem0.config.mem0.collection_prefix,
             )
             qdrant = await memory.mem0._get_async_qdrant()
             return await run(args, qdrant, collection)
-        finally:
-            if hasattr(memory, 'close'):
-                await memory.close()
 
     try:
         report = asyncio.run(_run_live())

@@ -22,6 +22,7 @@ import pytest
 import pytest_asyncio
 from shared.project_layout import tasks_db
 from shared.task_statuses import ACTIVE
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.backends.metadata_lookup import InvalidMetadataLookupError
 from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend
@@ -30,6 +31,8 @@ from fused_memory.middleware.task_interceptor import TaskInterceptor
 from fused_memory.models.scope import resolve_project_id
 from fused_memory.reconciliation.event_buffer import EventBuffer
 from fused_memory.server.tools import RESULT_BYTE_BUDGET, create_mcp_server
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 _SLIM_ROW_KEYS = {'task_id', 'title', 'status', 'priority', 'updated_at'}
 _TOOL = 'find_tasks_by_metadata'
@@ -58,6 +61,11 @@ class LookupStack:
     async def call(self, **args: Any) -> Any:
         return await self.server._tool_manager.call_tool(
             _TOOL, {'project_root': self.root, **args},
+        )
+
+    async def get_task(self, task_id: int) -> dict[str, Any]:
+        return await self.server._tool_manager.call_tool(
+            'get_task', {'id': str(task_id), 'project_root': self.root},
         )
 
     def corrupt(self, task_id: int, raw: str) -> None:
@@ -146,6 +154,48 @@ async def test_rows_omit_the_value_unless_asked(lookup_stack):
 
 
 @pytest.mark.asyncio
+async def test_include_rows_adds_the_whole_metadata_and_sorted_dependencies(lookup_stack):
+    p1, _p2, p3 = [await lookup_stack.seed() for _ in range(3)]
+    dependent = await lookup_stack.seed('pending', {'x_k': 'v', 'x_other': {'nested': [1, 2]}})
+    loner = await lookup_stack.seed('pending', {'x_k': 'v'})
+    for depends_on in (p3, p1):
+        await lookup_stack.backend.add_dependency(
+            str(dependent), str(depends_on), lookup_stack.root,
+        )
+
+    found = await lookup_stack.interceptor.find_tasks_by_metadata(
+        lookup_stack.root, 'x_k', 'v', include_rows=True,
+    )
+
+    assert [row['task_id'] for row in found['results']] == [dependent, loner]
+    rows = {row['task_id']: row for row in found['results']}
+    for task_id, row in rows.items():
+        assert set(row) == _SLIM_ROW_KEYS | {'metadata', 'dependencies'}
+        stored = await lookup_stack.backend.get_task(str(task_id), lookup_stack.root)
+        assert row['metadata'] == stored['metadata']
+    assert rows[dependent]['dependencies'] == [p1, p3]
+    assert rows[loner]['dependencies'] == []
+
+
+@pytest.mark.asyncio
+async def test_in_process_include_rows_applies_no_byte_budget(lookup_stack):
+    metadata = {'x_blob': 'a' * 60_000}
+    assert len(json.dumps(metadata).encode('utf-8')) > RESULT_BYTE_BUDGET
+    task_id = await lookup_stack.seed('pending', metadata)
+
+    found = await lookup_stack.interceptor.find_tasks_by_metadata(
+        lookup_stack.root, 'x_blob', include_rows=True,
+    )
+
+    stored = await lookup_stack.backend.get_task(str(task_id), lookup_stack.root)
+    assert [row['task_id'] for row in found['results']] == [task_id]
+    row = found['results'][0]
+    assert row['metadata'] == stored['metadata']
+    assert row['metadata']['x_blob'] == metadata['x_blob']
+    assert 'truncated_row' not in row
+
+
+@pytest.mark.asyncio
 async def test_in_process_paging_tiles_the_match_set(lookup_stack):
     ids = [await lookup_stack.seed('pending', {'x_k': 'v'}) for _ in range(5)]
     lookup = lookup_stack.interceptor.find_tasks_by_metadata
@@ -167,6 +217,8 @@ async def test_in_process_paging_tiles_the_match_set(lookup_stack):
         ('key', {'key': 'a"b'}),
         ('value', {'value': True}),
         ('include_value', {'include_value': 'yes'}),
+        ('include_rows', {'include_rows': 'yes'}),
+        ('include_rows', {'include_rows': 1}),
         ('limit', {'limit': 0}),
         ('offset', {'offset': -1}),
         ('value', {'value': 2**63}),
@@ -327,6 +379,37 @@ async def test_include_value_must_be_a_real_bool(lookup_stack, unbacked_call, in
 
 
 @pytest.mark.asyncio
+async def test_include_rows_is_echoed_and_the_default_omits_rows(lookup_stack):
+    prerequisite = await lookup_stack.seed()
+    task_id = await lookup_stack.seed('pending', {'x_k': 'v'})
+    await lookup_stack.backend.add_dependency(
+        str(task_id), str(prerequisite), lookup_stack.root,
+    )
+
+    omitted = await lookup_stack.call(key='x_k', value='v')
+    declined = await lookup_stack.call(key='x_k', value='v', include_rows=False)
+    opted_in = await lookup_stack.call(key='x_k', value='v', include_rows=True)
+
+    assert omitted['include_rows'] is False
+    assert set(omitted['results'][0]) == _SLIM_ROW_KEYS
+    assert declined['include_rows'] is False
+    assert opted_in['include_rows'] is True
+    row = opted_in['results'][0]
+    assert row['metadata']['x_k'] == 'v'
+    assert row['dependencies'] == [prerequisite]
+    assert 'description' not in row
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('include_rows', ['yes', 1, None])
+async def test_include_rows_must_be_a_real_bool(lookup_stack, unbacked_call, include_rows):
+    response = await lookup_stack.call(key='x_k', include_rows=include_rows)
+    _assert_validation_error(response, 'include_rows', include_rows)
+    response = await unbacked_call(key='x_k', include_rows=include_rows)
+    _assert_validation_error(response, 'include_rows', include_rows)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize('statuses', ['cancelled', [None]])
 async def test_statuses_must_be_a_list_of_strings(lookup_stack, unbacked_call, statuses):
     _assert_validation_error(
@@ -424,6 +507,9 @@ async def test_the_default_omits_values_and_applies_no_byte_cut(lookup_stack):
     for row in response['results']:
         assert 'matched_value' not in row
         assert 'truncated_value' not in row
+        assert 'metadata' not in row
+        assert 'dependencies' not in row
+        assert 'truncated_row' not in row
 
 
 @pytest.mark.asyncio
@@ -440,7 +526,7 @@ async def test_a_store_error_is_an_error_payload_never_an_empty_page(lookup_stac
     assert 'results' not in response
 
 
-# ── MCP face: the include_value page budget ─────────────────────────────
+# ── MCP face: the page budget ───────────────────────────────────────────
 
 
 def _serialized_bytes(obj: Any) -> int:
@@ -486,9 +572,7 @@ async def test_a_lone_over_budget_row_is_elided_and_readable_through_get_task(lo
 
     first = await lookup_stack.call(key='x_blob', include_value=True)
     second = await lookup_stack.call(key='x_blob', include_value=True, offset=1)
-    task = await lookup_stack.server._tool_manager.call_tool(
-        'get_task', {'id': str(big_id), 'project_root': lookup_stack.root},
-    )
+    task = await lookup_stack.get_task(big_id)
 
     assert 'error' not in first
     assert [row['task_id'] for row in first['results']] == [big_id]
@@ -517,3 +601,63 @@ async def test_an_over_budget_row_after_a_fitting_one_starts_the_next_page(looku
     assert [row['task_id'] for row in second['results']] == [big_id]
     assert second['results'][0]['truncated_value'] is True
     assert second['pagination']['has_more'] is False
+
+
+@pytest.mark.asyncio
+async def test_include_rows_pages_are_cut_by_the_budget_and_still_tile(lookup_stack):
+    pads = {
+        await lookup_stack.seed('pending', {'x_blob': 'v', 'x_pad': pad}): pad
+        for pad in [f'{i}-'.ljust(10_000, 'x') for i in range(10)]
+    }
+
+    first = await lookup_stack.call(key='x_blob', value='v', include_rows=True, limit=10)
+    rows = await _page_through(
+        lookup_stack, key='x_blob', value='v', include_rows=True, limit=10,
+    )
+
+    assert first['pagination']['returned'] < 10
+    assert first['pagination']['has_more'] is True
+    assert first['pagination']['page_size'] == 10
+    assert _serialized_bytes(first['results']) <= RESULT_BYTE_BUDGET
+    assert [row['task_id'] for row in rows] == sorted(pads)
+    assert {row['task_id']: row['metadata']['x_pad'] for row in rows} == pads
+    assert not any('truncated_row' in row for row in rows)
+
+
+@pytest.mark.asyncio
+async def test_a_lone_over_budget_row_has_its_metadata_elided(lookup_stack):
+    prerequisite = await lookup_stack.seed()
+    big_id = await lookup_stack.seed('pending', {'x_blob': 'v', 'x_pad': 'a' * 60_000})
+    small_id = await lookup_stack.seed('pending', {'x_blob': 'v'})
+    await lookup_stack.backend.add_dependency(str(big_id), str(prerequisite), lookup_stack.root)
+
+    first = await lookup_stack.call(key='x_blob', value='v', include_rows=True)
+    second = await lookup_stack.call(key='x_blob', value='v', include_rows=True, offset=1)
+    task = await lookup_stack.get_task(big_id)
+
+    assert 'error' not in first
+    assert _ids(first) == [big_id]
+    row = first['results'][0]
+    assert row['truncated_row'] is True
+    assert row['metadata'] == {'_elided': True, 'bytes': _serialized_bytes(task['metadata'])}
+    assert row['dependencies'] == [prerequisite]
+    assert 'truncated_value' not in row
+    assert first['pagination']['has_more'] is True
+    assert _ids(second) == [small_id]
+    assert second['results'][0]['metadata']['x_blob'] == 'v'
+    assert 'truncated_row' not in second['results'][0]
+
+
+@pytest.mark.asyncio
+async def test_a_lone_over_budget_row_elides_every_opted_in_payload(lookup_stack):
+    pad = 'a' * 60_000
+    task_id = await lookup_stack.seed('pending', {'x_pad': pad})
+
+    response = await lookup_stack.call(key='x_pad', include_value=True, include_rows=True)
+    task = await lookup_stack.get_task(task_id)
+
+    row = response['results'][0]
+    assert row['matched_value'] == {'_elided': True, 'bytes': _serialized_bytes(pad)}
+    assert row['truncated_value'] is True
+    assert row['metadata'] == {'_elided': True, 'bytes': _serialized_bytes(task['metadata'])}
+    assert row['truncated_row'] is True

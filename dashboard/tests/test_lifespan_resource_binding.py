@@ -35,13 +35,19 @@ The contract asserted here has two halves, and the asymmetry is deliberate:
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
-from _dashboard_helpers import drive_metrics_loop
+from _dashboard_helpers import (
+    IDLE_BACKGROUND_LOOPS,
+    app_with_loops,
+    drive_metrics_loop,
+    enable_samplers,
+)
 from fastapi import FastAPI
 from starlette.testclient import TestClient
 
@@ -50,24 +56,16 @@ from dashboard.config import DashboardConfig
 from dashboard.loops import _BurndownStore, _MetricsStore
 
 
-async def _noop_burndown_loop(*args: object, **kwargs: object) -> None:
-    """Stand-in for _burndown_loop so nesting two lifespans stays hermetic.
-
-    The burndown loop fans out over HTTP; it is irrelevant to the resource
-    binding under test and is replaced so neither lifespan does real I/O.
-    """
-    return None
-
-
-def test_nested_lifespans_each_get_their_own_pool_and_client() -> None:
+def test_nested_lifespans_each_get_their_own_pool_and_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """A lifespan's metrics loop gets the DbPool/AsyncClient THAT lifespan built.
 
-    Nests two ``TestClient(app)`` contexts over the shared global ``app`` — the
+    Nests two ``TestClient(app)`` contexts over one shared ``app`` — the
     situation the suite creates routinely — and asserts each lifespan's loop was
     handed its own handles, not whatever ``app.state`` points at.
     """
-    from dashboard.app import app
-
+    enable_samplers(monkeypatch)
     recorded: list[dict[str, Any]] = []
 
     async def _recording_metrics_loop(
@@ -88,15 +86,8 @@ def test_nested_lifespans_each_get_their_own_pool_and_client() -> None:
             }
         )
 
-    with (
-        # Stays on `dashboard.app`: this patches the name as `lifespan`
-        # RESOLVES it, and app.py imports both loops back from
-        # dashboard.loops. Retargeting to `dashboard.loops.*` would
-        # silently no-op and let the real loop run under the test.
-        patch('dashboard.app._metrics_loop', new=_recording_metrics_loop),
-        patch('dashboard.app._burndown_loop', new=_noop_burndown_loop),
-        TestClient(app) as _outer,
-    ):
+    app = app_with_loops(replace(IDLE_BACKGROUND_LOOPS, metrics=_recording_metrics_loop))
+    with TestClient(app) as _outer:
         outer_pool = app.state.db
         outer_http = app.state.http_client
         with TestClient(app) as _inner:
@@ -169,12 +160,9 @@ def test_nested_lifespans_each_get_their_own_pool_and_client() -> None:
     )
 
 
-async def _noop_metrics_loop(*args: object, **kwargs: object) -> None:
-    """Stand-in for _metrics_loop where only the burndown binding is under test."""
-    return None
-
-
-def test_lifespan_binds_burndown_loop_to_the_config_it_built(tmp_path: Path) -> None:
+def test_lifespan_binds_burndown_loop_to_the_config_it_built(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     """Every startup read binds to the config THIS lifespan built, not a later swap.
 
     ``lifespan`` assigns ``app.state.config`` at the top of startup and then
@@ -212,8 +200,7 @@ def test_lifespan_binds_burndown_loop_to_the_config_it_built(tmp_path: Path) -> 
     a connection-pool bound and touches no path or handle, so a stale read
     there is inert.
     """
-    from dashboard.app import app
-
+    enable_samplers(monkeypatch)
     real_build_http_limits = _build_http_limits
     real_open = _BurndownStore.open
     captured: dict[str, Any] = {}
@@ -248,27 +235,15 @@ def test_lifespan_binds_burndown_loop_to_the_config_it_built(tmp_path: Path) -> 
     ) -> None:
         recorded.append(config)
 
-    config_before = getattr(app.state, 'config', None)
-    try:
-        with (
-            patch('dashboard.app._build_http_limits', new=_swapping_limits),
-            patch.object(_BurndownStore, 'open', _recording_open),
-            # Stays on `dashboard.app`: this patches the name as `lifespan`
-            # RESOLVES it, and app.py imports both loops back from
-            # dashboard.loops. Retargeting to `dashboard.loops.*` would
-            # silently no-op and let the real loop run under the test.
-            patch('dashboard.app._burndown_loop', new=_recording_burndown_loop),
-            patch('dashboard.app._metrics_loop', new=_noop_metrics_loop),
-            TestClient(app),
-        ):
-            # Read inside the lifespan: these are what startup actually built.
-            burndown_db_path = app.state.burndown_store.db_path
-            metrics_db_path = app.state.metrics_db_path
-    finally:
-        # Do not leak a hand-built config into sibling tests; every lifespan
-        # rebuilds it from_env anyway, so this only restores the idle state.
-        if config_before is not None:
-            app.state.config = config_before
+    app = app_with_loops(replace(IDLE_BACKGROUND_LOOPS, burndown=_recording_burndown_loop))
+    with (
+        patch('dashboard.app._build_http_limits', new=_swapping_limits),
+        patch.object(_BurndownStore, 'open', _recording_open),
+        TestClient(app),
+    ):
+        # Read inside the lifespan: these are what startup actually built.
+        burndown_db_path = app.state.burndown_store.db_path
+        metrics_db_path = app.state.metrics_db_path
 
     assert 'original' in captured, (
         'task 3771: _build_http_limits was never called -- the simulated interleave '

@@ -1,13 +1,19 @@
-"""Per-task persistent steward — autonomous escalation handler.
+"""Per-task steward — autonomous escalation handler.
 
-The steward maintains a single Claude session across all escalations for a task,
-accumulating context via ``--resume``.  It handles both blocking escalations
-(code fixes) and review suggestion triage (create tasks / write conventions /
-dismiss).
+``steward_session_mode`` decides what one escalation's session inherits from the
+last.  Under the default ``fresh_per_l0`` every handling starts a new Claude
+session with the full briefing plus a digest of the L0s this steward already
+concluded and a count of the sessions that already ran on this L0 without
+concluding it (both rendered by ``orchestrator/agents/steward_digest.py``);
+under ``resume`` one session is carried across escalations via ``--resume``.
+Both share the cap-hit resume within one L0.  The steward handles both blocking
+escalations (code fixes) and review suggestion triage (create tasks / write
+conventions / dismiss).
 
 Lifecycle:
 - Started lazily on first escalation (not at workflow start).
-- Each escalation either resumes the existing session or creates a fresh one.
+- Each handling starts a fresh session (``fresh_per_l0``) or resumes the carried
+  one (``resume``).
 - Budget-capped at $12 lifetime; auto-re-escalates to level-1 on exhaustion.
 - Each escalation gets up to steward_max_attempts total attempts (default 1) before re-escalating to level-1.
 - **Every give-up path dismisses its own L0 before publishing an outcome**
@@ -28,10 +34,11 @@ Lifecycle:
 The give-up contract is load-bearing for BOTH workflow waiters, which is why
 it lives here rather than in either consumer.  ``_mark_blocked`` →
 ``_await_steward_completion`` reads the published outcome off the in-process
-channel; ``run()``'s ESCALATED branch → ``_wait_for_resolution`` is
-escalation-queue-only and is woken ONLY by the dismissal (``resolve`` →
-``_resolve_callback`` → ``harness._on_escalation_resolved`` →
-``_escalation_events[task_id].set()``).  A new early return that publishes
+channel, where every outcome is tagged with the escalation it is about
+(``PublishedStewardOutcome``); ``run()``'s ESCALATED branch →
+``_wait_for_resolution`` is escalation-queue-only and is woken ONLY by the
+dismissal (``resolve`` → ``_resolve_callback`` →
+``harness._on_escalation_resolved`` → ``_escalation_events[task_id].set()``).  A new early return that publishes
 without dismissing is therefore invisible to the second waiter — it parks the
 workflow forever while this steward re-handles the record at loop speed, which
 is exactly what task 2248 shipped.
@@ -49,25 +56,29 @@ from datetime import timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from escalation.classify import classify_resolver_tier
+from escalation.classify import closed_by_non_sweep_resolver
 from shared.cli_invoke import (
     AllAccountsCappedException,
     invoke_with_cap_retry,
     is_timed_out_with_progress,
 )
 from shared.proc_group import terminate_process_group
+from shared.process_cost import next_resume_prior
 
 from orchestrator.agents.invoke import invoke_agent
 from orchestrator.agents.roles import STEWARD
-from orchestrator.event_store import EventStore, EventType
+from orchestrator.agents.steward_digest import EarlierAttempts, HandledL0
+from orchestrator.event_store import EventStore, EventType, cli_resume_failed_data
 from orchestrator.guard_state import PersistentMap, PersistentSet, guard_path
 from orchestrator.routing import RoleDefaults
 from orchestrator.routing_dispatch import resolve_and_record_route
 from orchestrator.workflow_types import (
+    PublishedStewardOutcome,
     StewardBudgetExhausted,
     StewardInterrupted,
     StewardReescalatedL1,
     StewardResolved,
+    WorkflowState,
     classify_failure,
 )
 
@@ -78,11 +89,11 @@ if TYPE_CHECKING:
     from escalation.queue import EscalationQueue
     from shared.config_dir import TaskConfigDir
     from shared.cost_store import CostStore
+    from shared.usage_gate import UsageGate
 
     from orchestrator.agents.briefing import BriefingAssembler
     from orchestrator.config import OrchestratorConfig
     from orchestrator.mcp_lifecycle import McpLifecycle
-    from orchestrator.usage_gate import UsageGate
     from orchestrator.workflow_types import StewardOutcome
 
 logger = logging.getLogger(__name__)
@@ -131,7 +142,7 @@ class StewardMetrics:
 
 
 class TaskSteward:
-    """Per-task persistent steward — handles escalations via a resumable session."""
+    """Per-task steward — handles each escalation in the session ``steward_session_mode`` selects."""
 
     def __init__(
         self,
@@ -160,6 +171,7 @@ class TaskSteward:
         self.cost_store = cost_store
 
         self._session_id: str | None = None
+        self._session_reported_total_usd: float | None = None
         self._stopped = False
         self._task: asyncio.Task | None = None
         # The four guards below are restart-durable and TTL-bounded (task
@@ -229,8 +241,10 @@ class TaskSteward:
         # for stewards built without that wiring (most of this module's
         # unit tests, and any other caller) — _publish_outcome is a no-op
         # and the wip-gated guards below default to wip=False in that case.
-        self._outcome_channel: asyncio.Queue | None = None
+        self._outcome_channel: asyncio.Queue[PublishedStewardOutcome] | None = None
         self._wip_probe: Callable[[], Awaitable[bool]] | None = None
+        # The L0s this instance concluded, oldest first.
+        self._handled: tuple[HandledL0, ...] = ()
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -243,10 +257,14 @@ class TaskSteward:
         )
         logger.info(f'Steward started for task {self.task_id}')
 
-    def set_outcome_channel(self, channel: asyncio.Queue) -> None:
+    def set_outcome_channel(
+        self, channel: asyncio.Queue[PublishedStewardOutcome],
+    ) -> None:
         """Register the in-process channel :meth:`_handle_escalation` publishes on.
 
-        Wired by :meth:`TaskWorkflow._ensure_steward_started`.  Left unset
+        Every publication is a :class:`PublishedStewardOutcome` tagged with the
+        escalation it is about.  Wired by
+        :meth:`TaskWorkflow._ensure_steward_started`.  Left unset
         (``None``) by every caller that does not need the typed outcome —
         :meth:`_publish_outcome` is then a no-op.
         """
@@ -262,8 +280,13 @@ class TaskSteward:
         """
         self._wip_probe = probe
 
-    def _publish_outcome(self, outcome: StewardOutcome) -> None:
-        """Put *outcome* on the registered channel; no-op when none is set.
+    def _publish_outcome(self, escalation: Escalation, outcome: StewardOutcome) -> None:
+        """Record *escalation*'s conclusion and put *outcome*, tagged with its id, on the channel.
+
+        Publication reaches the instance's handled-L0 record (``_handled``, the
+        digest a fresh session is briefed with) and the workflow channel.  The
+        record is kept whether or not a channel is set; the channel put is a
+        no-op when none is.
 
         Synchronous (``put_nowait``, not ``await queue.put``) so it is safe
         to call from both async call sites (``_handle_escalation``) and sync
@@ -271,8 +294,47 @@ class TaskSteward:
         unbounded by construction here, so ``put_nowait`` never raises
         ``QueueFull``.
         """
+        self._handled = (
+            *self._handled, HandledL0(escalation.id, escalation.category, outcome),
+        )
         if self._outcome_channel is not None:
-            self._outcome_channel.put_nowait(outcome)
+            self._outcome_channel.put_nowait(
+                PublishedStewardOutcome(escalation.id, outcome),
+            )
+
+    def _carries_session_across_l0s(self) -> bool:
+        """The one membership rule of the ``steward_session_mode`` axis.
+
+        Read at use time, so a hot reload applies from the next handling.
+        """
+        return self.config.steward_session_mode == 'resume'
+
+    def _briefing_digest(self) -> tuple[HandledL0, ...]:
+        """The concluded L0s a full briefing carries: ``self._handled`` under ``fresh_per_l0``.
+
+        Under ``resume`` it is ``()`` on every full briefing, including the ones
+        built for a session that holds no history (the first L0, the L0 after an
+        empty-output drop, a fresh retry after a rejected resume). That keeps the
+        resume arm byte-identical to the pre-5819 steward, which is what makes it
+        the shadow-eval comparison arm (task 5820).
+        """
+        return () if self._carries_session_across_l0s() else self._handled
+
+    def _earlier_attempts(self, escalation_id: str) -> EarlierAttempts:
+        """The sessions that already ran on *escalation_id* without concluding it, for a full briefing.
+
+        Read off the per-escalation guard counters under ``fresh_per_l0``, so a
+        re-handle after a timeout kill, a left-pending attempt or an empty
+        output knows it is not the first.  Under ``resume`` it is always empty,
+        for the same byte parity as :meth:`_briefing_digest`.
+        """
+        if self._carries_session_across_l0s():
+            return EarlierAttempts()
+        return EarlierAttempts(
+            timed_out=self._timeout_counts.get(escalation_id, 0),
+            left_pending=self._retry_counts.get(escalation_id, 0),
+            no_output=self._empty_output_counts.get(escalation_id, 0),
+        )
 
     async def stop(self) -> None:
         """Cancel the steward loop and cleanup."""
@@ -489,7 +551,7 @@ class TaskSteward:
     # ------------------------------------------------------------------
 
     async def _handle_escalation(self, escalation: Escalation) -> None:
-        """Handle a single escalation via the persistent session.
+        """Handle a single escalation: fresh session or carried one, per ``steward_session_mode``.
 
         **Every give-up path below dismisses its own L0 before publishing an
         outcome** (task 3170) — ``_auto_escalate_to_human`` does it as part of
@@ -621,6 +683,9 @@ class TaskSteward:
                 if self._give_up_if_lifetime_budget_spent(escalation):
                     return
 
+        if not self._carries_session_across_l0s():
+            self._drop_session()
+
         # Prompt: initial (full briefing) vs continuation (just the escalation)
         is_initial = self._session_id is None
         if is_initial:
@@ -635,6 +700,8 @@ class TaskSteward:
                 escalation=escalation.to_dict(),
                 pending_escalations=pending_dicts,
                 worktree=self.worktree,
+                handled=self._briefing_digest(),
+                earlier_attempts=self._earlier_attempts(escalation.id),
             )
         else:
             prompt = await self.briefing.build_steward_continuation_prompt(
@@ -676,7 +743,7 @@ class TaskSteward:
         if self.event_store:
             self.event_store.emit(
                 EventType.invocation_end,
-                task_id=self.task_id, phase='escalated', role='steward',
+                task_id=self.task_id, phase=WorkflowState.ESCALATED.value, role='steward',
                 cost_usd=result.cost_usd, duration_ms=result.duration_ms,
                 data={
                     'turns': result.turns, 'success': result.success,
@@ -692,6 +759,8 @@ class TaskSteward:
                     # denominator.
                     'ended_awaiting_background': result.ended_awaiting_background,
                     'retry_aborted': result.retry_aborted,
+                    'cost_basis': result.cost_basis.value,
+                    'cost_delta_clamped': result.cost_delta_clamped,
                 },
             )
 
@@ -730,7 +799,7 @@ class TaskSteward:
             # session id so the next attempt rebuilds a fresh initial prompt at the
             # current cwd instead of repeating the same instant failure.
             cleared = self._session_id is not None
-            self._session_id = None
+            self._drop_session()
             logger.warning(
                 f'Steward for task {self.task_id}: invocation produced no output '
                 f'(empty stdout) — retry_count NOT incremented '
@@ -765,7 +834,9 @@ class TaskSteward:
                 or result.output
                 or escalation.summary
             )
-            self._publish_outcome(StewardResolved(resolution_text=resolution_text))
+            self._publish_outcome(
+                escalation, StewardResolved(resolution_text=resolution_text),
+            )
 
     # ------------------------------------------------------------------
     # Session-aware invocation with cap-hit recovery
@@ -809,16 +880,24 @@ class TaskSteward:
         per_invocation_budget: float,
         escalation: Escalation,
     ):
-        """Invoke the steward agent, resuming the session if one exists.
+        """Invoke the steward agent, resuming the carried session if there is one.
 
         Delegates the account-failover cap-retry loop (usage-gate slot
         management, cap-hit detection, the zero-output wedge guard, 401/403
         auth routing) to the shared ``invoke_with_cap_retry``.  This method
         does only session-id bookkeeping: it forwards ``self._session_id``
         as ``resume_session_id`` when a prior session exists, and captures
-        the result's ``session_id`` for the next call.
+        the result's ``session_id`` for the next call.  A fresh session
+        replaces ``_session_id`` only after the CLI provably rejected the
+        armed resume, and that replacement is reported
+        (``_note_rejected_resume``).
 
-        The steward is always a LIVE continuation, never a crash-recovery
+        Under ``fresh_per_l0`` ``_handle_escalation`` has already dropped the
+        session, so nothing is carried in and the only resume left is the
+        shared loop's cap-hit resume within this L0; under ``resume`` the
+        session carried from the previous L0 is resumed.
+
+        A steward resume is always a LIVE continuation, never a crash-recovery
         resume: ``prompt`` (built by ``_handle_escalation``) carries the new
         escalation's content, which the resumed session has not seen yet.
         This passes ``resume_delivers_prompt=True`` so the shared loop
@@ -852,6 +931,8 @@ class TaskSteward:
                 ).to_dict(),
                 pending_escalations=pending_dicts,
                 worktree=self.worktree,
+                handled=self._briefing_digest(),
+                earlier_attempts=self._earlier_attempts(escalation.id),
             )
 
         # Route resolution (task η): resolve model/effort/max_turns through the
@@ -877,6 +958,7 @@ class TaskSteward:
             event_store=self.event_store,
             cost_store=self.cost_store,
             applied_budget_usd=per_invocation_budget,
+            phase=WorkflowState.ESCALATED,
         )
         kwargs: dict = dict(
             prompt=prompt,
@@ -892,6 +974,9 @@ class TaskSteward:
         )
         if self._session_id is not None:
             kwargs['resume_session_id'] = self._session_id
+            if self._session_reported_total_usd is not None:
+                kwargs['resume_prior_total_cost_usd'] = self._session_reported_total_usd
+        armed = kwargs.get('resume_session_id')
 
         # `backend` below reaches invoke_agent: invoke_with_cap_retry forwards
         # it into invoke_kwargs only when a custom invoke_fn is supplied, and
@@ -925,10 +1010,52 @@ class TaskSteward:
             **kwargs,
         )
 
-        if result.session_id:
-            self._session_id = result.session_id
+        self._note_rejected_resume(armed, result)
+        self._adopt_session(result)
 
         return result
+
+    def _note_rejected_resume(self, armed: str | None, result) -> None:
+        """Report that the CLI rejected the steward's own armed resume.
+
+        No resume-outcome-sink call: a steward resume is a live continuation,
+        never an adopted crash-recovery resume, so it must not feed the INV-4
+        storm streak.
+        """
+        data = cli_resume_failed_data(
+            armed_session_id=armed,
+            role=STEWARD.name,
+            fallbacks=result.resume_fallbacks,
+            dropped_session_ids=result.resume_fallback_session_ids,
+        )
+        if data is None:
+            return
+        logger.warning(
+            'Steward for task %s: the CLI rejected resume of session %s before '
+            'any model turn — adopting fresh session %s',
+            self.task_id, data['session_id'], result.session_id,
+        )
+        if self.event_store:
+            self.event_store.emit(
+                EventType.session_resume_failed, task_id=self.task_id, data=data,
+            )
+
+    def _adopt_session(self, result) -> None:
+        """Resume *result*'s session next time, carrying its reported total as the prior."""
+        if not result.session_id:
+            return
+        self._session_reported_total_usd = next_resume_prior(
+            armed_session_id=self._session_id,
+            armed_prior_usd=self._session_reported_total_usd,
+            result_session_id=result.session_id,
+            result_reported_total_usd=result.reported_total_cost_usd,
+        )
+        self._session_id = result.session_id
+
+    def _drop_session(self) -> None:
+        """Start the next invocation fresh: forget the session and its prior total together."""
+        self._session_id = None
+        self._session_reported_total_usd = None
 
     # ------------------------------------------------------------------
     # Pre-triage for large suggestion sets
@@ -983,6 +1110,7 @@ class TaskSteward:
             in_memory_task=self.task,
             event_store=self.event_store,
             cost_store=self.cost_store,
+            phase=WorkflowState.ESCALATED,
         )
         remaining = self._remaining_lifetime_budget()
         if remaining <= decision.budget_usd:
@@ -999,26 +1127,27 @@ class TaskSteward:
         suggestions = json.loads(_strip_hash_prefix(escalation.detail))
         prompt = build_triage_prompt(suggestions, self.task)
 
-        meta_root = TaskArtifacts.meta_root_for(self.worktree.parent, self.worktree.name)
-        if not meta_root.is_dir():
-            # TaskWorkflow._setup normally creates this (via artifacts.init())
-            # for this exact worktree before any steward is ever constructed
-            # against it. If it's still missing here, the verdict-tools
-            # server spawned below (same --meta-root) would silently no-op
-            # its write_verdict call, and read_verdict() further down would
-            # return None indistinguishably from a genuine triage failure —
-            # log distinctly and create it so a misconfigured meta-root is
-            # diagnosable instead of masquerading as an ordinary fallback.
+        artifacts = TaskArtifacts.for_task(self.worktree, self.task_id)
+        for root in (artifacts.lane_root, artifacts.task_root):
+            if root.is_dir():
+                continue
+            # TaskWorkflow._setup normally creates both roots (via
+            # artifacts.init()) for this exact dispatch before any steward is
+            # ever constructed against it. If one is still missing here, the
+            # verdict-tools server spawned below (same roots) would silently
+            # no-op its write_verdict call, and read_verdict() further down
+            # would return None indistinguishably from a genuine triage
+            # failure — log distinctly and create it so a misconfigured root
+            # is diagnosable instead of masquerading as an ordinary fallback.
             logger.warning(
-                'Steward for task %s: pre-triage meta-root %s did not '
+                'Steward for task %s: pre-triage artifact root %s did not '
                 'exist — creating it now. This should already have been '
                 'created by workflow setup; a missing root here means '
                 'pre-triage would otherwise silently and permanently '
                 'degrade to inline triage.',
-                self.task_id, meta_root,
+                self.task_id, root,
             )
-            meta_root.mkdir(parents=True, exist_ok=True)
-        artifacts = TaskArtifacts(self.worktree, meta_root)
+            root.mkdir(parents=True, exist_ok=True)
         artifacts.clear_verdict('triage')  # I-FRESH: never consume a stale verdict
 
         # Base the injected config on the steward's own fused-memory wiring
@@ -1032,6 +1161,7 @@ class TaskSteward:
         # escalation_url: TRIAGE grants no escalation tools.
         mcp_config = _inject_verdict_tools_mcp(
             self.mcp.mcp_config_json(), self.worktree, TRIAGE,
+            task_root=artifacts.task_root,
         )
 
         try:
@@ -1304,9 +1434,10 @@ class TaskSteward:
                 f'resume-plan interruption'
             )
             self._publish_outcome(
+                escalation,
                 StewardResolved(
                     resolution_text=stored.resolution or escalation.summary,
-                )
+                ),
             )
             return
 
@@ -1315,7 +1446,7 @@ class TaskSteward:
             f'({outcome.reason}) with WIP present — dismissed the L0 and '
             f'published a resume-plan interruption (no L1 filed)'
         )
-        self._publish_outcome(outcome)
+        self._publish_outcome(escalation, outcome)
 
     # ------------------------------------------------------------------
     # Auto-escalation to level-1 (human)
@@ -1374,6 +1505,7 @@ class TaskSteward:
             f'to level 1: {reason}'
         )
         self._publish_outcome(
+            escalation,
             outcome if outcome is not None else StewardReescalatedL1(esc_id=reesc.id),
         )
 
@@ -1428,18 +1560,14 @@ def _dismissal_was_overtaken(stored: Escalation) -> bool:
 
     ANOTHER automated sweep winning (``harness-orphan-reaper`` et al.) is
     deliberately NOT a lost race: it closed the record the same way this
-    steward was about to, carrying no agent finding to publish.  The tier test
-    goes through ``escalation.classify`` rather than an inline
-    ``'auto-dismissed'`` literal so that membership stays single-sited (INV-5).
+    steward was about to, carrying no agent finding to publish.
 
-    MagicMock-safe by construction, which is load-bearing for the ~150
-    ``test_steward.py`` cases whose mock queue returns a bare ``MagicMock``
-    from ``resolve()``: the status test is a membership check that a MagicMock
-    fails, and it short-circuits before the tier lookup ever sees one.
+    The rule lives in ``escalation/classify.py::closed_by_non_sweep_resolver``,
+    which keeps the sweep-tier membership single-sited (INV-5) and is
+    MagicMock-safe for the ``test_steward.py`` cases whose mock queue returns
+    a bare ``MagicMock`` from ``resolve()``.
     """
-    if stored.status not in ('resolved', 'dismissed'):
-        return False
-    return classify_resolver_tier(stored.resolved_by) != 'reaper-sweep'
+    return closed_by_non_sweep_resolver(stored)
 
 
 def _strip_hash_prefix(detail: str) -> str:

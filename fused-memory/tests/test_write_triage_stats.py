@@ -52,6 +52,49 @@ class TestWilson95:
         assert _mod().wilson95(0, 0) is None
 
 
+class TestWilsonBounds:
+    @pytest.mark.parametrize(('share', 'n', 'expected'), [
+        (9 / 15, 15, (0.357464427565077, 0.8017577191740534)),
+        (13 / 15, 15, (0.6211750079348376, 0.9626395301086407)),
+    ])
+    def test_is_the_unrounded_textbook_interval(
+        self, share: float, n: int, expected: tuple[float, float],
+    ) -> None:
+        assert _mod().wilson_bounds(share, n) == expected
+
+    def test_is_a_pair_of_floats(self) -> None:
+        bounds = _mod().wilson_bounds(0.5, 10)
+        assert isinstance(bounds, tuple)
+        assert [type(bound) for bound in bounds] == [float, float]
+
+    def test_is_clamped_to_the_unit_interval(self) -> None:
+        assert _mod().wilson_bounds(0.0, 20)[0] == 0.0
+        assert _mod().wilson_bounds(1.0, 10)[1] == 1.0
+
+    def test_takes_a_non_integer_n_and_an_explicit_z(self) -> None:
+        low, high = _mod().wilson_bounds(0.125, 6.4, z=1.959963984540054)
+        assert (round(low, 4), round(high, 4)) == (0.0191, 0.5123)
+
+    @pytest.mark.parametrize(('share', 'n'), [(0.0, 0), (0.5, -1)])
+    def test_a_non_positive_n_is_refused(self, share: float, n: int) -> None:
+        with pytest.raises(ValueError, match=f'n={n}'):
+            _mod().wilson_bounds(share, n)
+
+    @pytest.mark.parametrize('share', [-0.1, 1.5])
+    def test_a_share_outside_the_unit_interval_is_refused(self, share: float) -> None:
+        with pytest.raises(ValueError, match=f'share={share}, n=10'):
+            _mod().wilson_bounds(share, 10)
+
+
+class TestNearestRank95:
+    def test_is_the_2_5th_and_97_5th_nearest_rank_to_four_places(self) -> None:
+        assert _mod().nearest_rank95([k / 7 for k in range(40)]) == [0.0, 5.4286]
+
+    def test_an_empty_input_is_refused(self) -> None:
+        with pytest.raises(ValueError):
+            _mod().nearest_rank95([])
+
+
 class TestNearestRank:
     @pytest.mark.parametrize(('percent', 'expected'), [(50, 2), (95, 4), (100, 4), (25, 1)])
     def test_is_the_smallest_value_with_percent_at_or_below_it(

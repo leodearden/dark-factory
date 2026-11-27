@@ -13,11 +13,14 @@ from unittest.mock import patch
 
 import aiosqlite
 import pytest
+from shared.task_transitions import WORKFLOW_OUTCOMES
 
 from dashboard.data import performance, redux_api
 from dashboard.data.datum import DatumState, validate_datum
 from dashboard.data.performance import (
     _HISTORY_CACHE,
+    EMPTY_HISTORY,
+    PerformanceHistory,
     PerformanceListing,
     _cutoff,
     _hour_bucketed_history,
@@ -1154,7 +1157,7 @@ class TestAggregateLoopHistograms:
         """
         call_count = 0
 
-        async def _fake_get_loop_histograms(db, *, days, now, projects):  # noqa: ARG001
+        async def _fake_get_loop_histograms(db, *, days, now, projects):
             nonlocal call_count
             call_count += 1
             if call_count == 1:
@@ -1227,7 +1230,7 @@ class TestAggregateLoopHistograms:
         """
         call_count = 0
 
-        async def _fake_get_loop_histograms(db, *, days, now, projects):  # noqa: ARG001
+        async def _fake_get_loop_histograms(db, *, days, now, projects):
             nonlocal call_count
             call_count += 1
             if call_count == 1:
@@ -1301,7 +1304,7 @@ class TestAggregateLoopHistograms:
         """
         call_count = 0
 
-        async def _fake_get_loop_histograms(db, *, days, now, projects):  # noqa: ARG001
+        async def _fake_get_loop_histograms(db, *, days, now, projects):
             nonlocal call_count
             call_count += 1
             canonical_inner = {
@@ -1382,7 +1385,7 @@ class TestAggregateLoopHistograms:
             'values': [1, 1, 1, 1, 1, 1],
         }
 
-        async def _fake_get_loop_histograms(db, *, days, now, projects):  # noqa: ARG001
+        async def _fake_get_loop_histograms(db, *, days, now, projects):
             nonlocal call_count
             call_count += 1
             if call_count == 1:
@@ -2114,6 +2117,49 @@ class TestAggregatePerformanceHistoryWindowBoundary:
 
 
 # ---------------------------------------------------------------------------
+# One history_labels axis per project (task 10138)
+# ---------------------------------------------------------------------------
+
+TWO_HOURS = ('2026-09-30T10:00', '2026-09-30T11:00')
+
+
+class TestPerformanceHistory:
+    @pytest.mark.parametrize('series', ['p50', 'p95', 'one_pass', 'escalation'])
+    @pytest.mark.parametrize('length', [1, 3])
+    def test_a_series_off_the_axis_is_refused(self, series, length):
+        aligned = {'p50': (1, 2), 'p95': (3, 4), 'one_pass': (50.0, 100.0), 'escalation': (0.0, 25.0)}
+        misaligned = {**aligned, series: tuple(range(length))}
+
+        with pytest.raises(ValueError) as excinfo:
+            PerformanceHistory(labels=TWO_HOURS, **misaligned)
+
+        message = str(excinfo.value)
+        assert series in message
+        assert str(length) in message
+        assert '2' in message
+
+    def test_the_wire_carries_one_axis_and_label_less_blocks(self):
+        history = PerformanceHistory(
+            labels=TWO_HOURS, p50=(1, 2), p95=(3, 4), one_pass=(50.0, 100.0), escalation=(0.0, 25.0),
+        )
+
+        assert history.to_wire() == {
+            'history_labels': ['2026-09-30T10:00', '2026-09-30T11:00'],
+            'time_centiles_history': {'p50': [1, 2], 'p95': [3, 4]},
+            'one_pass_history': {'values': [50.0, 100.0]},
+            'escalation_history': {'values': [0.0, 25.0]},
+        }
+
+    def test_the_empty_history_is_the_same_shape_with_no_hours(self):
+        assert EMPTY_HISTORY.to_wire() == {
+            'history_labels': [],
+            'time_centiles_history': {'p50': [], 'p95': []},
+            'one_pass_history': {'values': []},
+            'escalation_history': {'values': []},
+        }
+
+
+# ---------------------------------------------------------------------------
 # Cards and sparklines share one wall-clock window (task 5594)
 # ---------------------------------------------------------------------------
 
@@ -2232,7 +2278,7 @@ class TestCardsShareTheWallClockWindow:
             [active_idle_conn], days=CARDS_DAYS, now=CARDS_NOW,
         )
         assert sum(entry['count'] for entry in paths['active']) == 3
-        assert history['active']['time_centiles_history']['labels'] == ACTIVE_IN_WINDOW_HOURS
+        assert history['active'].labels == tuple(ACTIVE_IN_WINDOW_HOURS)
 
     @pytest.mark.asyncio
     async def test_default_now_is_the_wall_clock(self, tmp_path, empty_escalations_dir):
@@ -2453,14 +2499,15 @@ class TestPerformanceCardsDatum:
         active = performance_by_label['active']
         assert active['cards']['state'] == 'fresh'
         assert sum(entry['count'] for entry in active['cards']['value']['paths']) == 3
-        assert active['time_centiles_history']['labels'] == ACTIVE_IN_WINDOW_HOURS
+        assert active['history_labels'] == ACTIVE_IN_WINDOW_HOURS
 
         idle = performance_by_label['idle']
         assert idle['cards']['state'] == 'stale'
         assert idle['cards']['as_of'] == (CARDS_NOW - timedelta(days=20)).isoformat()
-        assert idle['time_centiles_history'] == {'labels': [], 'p50': [], 'p95': []}
-        assert idle['one_pass_history'] == {'labels': [], 'values': []}
-        assert idle['escalation_history'] == {'labels': [], 'values': []}
+        assert idle['history_labels'] == []
+        assert idle['time_centiles_history'] == {'p50': [], 'p95': []}
+        assert idle['one_pass_history'] == {'values': []}
+        assert idle['escalation_history'] == {'values': []}
 
     def test_an_unknown_listing_is_served_as_the_unknown_wire_datum(self):
         listing = unread_listing('no runs.db could be read (1 of 1)', days=CARDS_DAYS)
@@ -2755,12 +2802,9 @@ class TestCancelOutcomesAreNotCounted:
             [cancels_conn], days=CARDS_DAYS, now=CARDS_NOW,
         )
         proj = history['proj']
-        assert proj['one_pass_history'] == {
-            'labels': ['2026-09-30T10:00', '2026-09-30T11:00'], 'values': [0.0, 100.0],
-        }
-        assert proj['escalation_history'] == {
-            'labels': ['2026-09-30T10:00', '2026-09-30T11:00'], 'values': [0.0, 0.0],
-        }
+        assert proj.labels == ('2026-09-30T10:00', '2026-09-30T11:00')
+        assert proj.one_pass == (0.0, 100.0)
+        assert proj.escalation == (0.0, 0.0)
         assert 'drained' not in history
 
     @pytest.mark.asyncio
@@ -2802,3 +2846,130 @@ class TestCancelOutcomesAreNotCounted:
         assert idle.value is not None and idle.value.to_wire()['paths'] == []
         for datum in cards.values():
             validate_datum(datum, CARDS_NOW)
+
+
+# ---------------------------------------------------------------------------
+# Every workflow outcome lands in a decided completion-path slice (task 6427)
+# ---------------------------------------------------------------------------
+
+# The slice a row with review_cycles=0, steward_invocations=0 and no
+# escalation lands in, transcribed BY HAND: deliberately not derived from
+# performance.py's _READING_BY_OUTCOME, so it is an independent oracle. None
+# means the row is counted by no slice.
+_SLICE_OF_A_CLEAN_ATTEMPT: dict[str, str | None] = {
+    'done': 'one-pass',
+    # Passed; its merge waits on a train or a coalesced merge, and the merge
+    # worker usually flips it done with no new row. Some are instead re-run in
+    # a later orchestrator run and record a done row too: the card counts
+    # attempts, not tasks, so such a task reads as two passes. Accepted.
+    'merge-deferred': 'one-pass',
+    # The exit re-pends the row and the scheduler re-dispatches it.
+    'requeued': 'requeued',
+    # Never a run() exit; the orchestrator's exit router reads it as a requeue.
+    'planned': 'requeued',
+    'blocked': 'blocked',
+    # The exit leaves the row 'blocked', the same as a block, with an L1 open.
+    'escalated': 'blocked',
+    # Cancels: see TestCancelOutcomesAreNotCounted.
+    'cancelled': None,
+    'soft-cancelled': None,
+}
+
+
+@contextlib.asynccontextmanager
+async def _runs_conn_of(tmp_path, rows: list[tuple]):
+    db_path = _make_runs_db(tmp_path, 'taxonomy.db', rows)
+    async with aiosqlite.connect(str(db_path)) as conn:
+        conn.row_factory = aiosqlite.Row
+        yield conn
+
+
+class TestCompletionPathTaxonomy:
+    """Each workflow outcome reads as one decided completion-path slice: a
+    merge-deferred attempt passed, a requeue is its own slice, an escalation
+    is a block, and a cancel is not counted."""
+
+    @pytest.fixture(autouse=True)
+    def _clear_history_cache(self):
+        _HISTORY_CACHE.clear()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('outcome', sorted(WORKFLOW_OUTCOMES))
+    async def test_a_clean_attempt_lands_in_its_outcomes_slice(
+        self, tmp_path, empty_escalations_dir, outcome,
+    ):
+        assert outcome in _SLICE_OF_A_CLEAN_ATTEMPT, (
+            f'no completion-path reading has been decided for outcome {outcome!r}: '
+            'add it to dashboard/src/dashboard/data/performance.py::_READING_BY_OUTCOME '
+            'and to this oracle'
+        )
+        rows = [_task_row('t1', 'proj', CARDS_NOW - timedelta(hours=1), outcome=outcome)]
+        async with _runs_conn_of(tmp_path, rows) as conn:
+            result = await get_completion_paths(
+                conn, empty_escalations_dir, days=CARDS_DAYS, now=CARDS_NOW, projects=['proj'],
+            )
+        expected_slice = _SLICE_OF_A_CLEAN_ATTEMPT[outcome]
+        expected = [] if expected_slice is None else [
+            {'path': expected_slice, 'count': 1, 'pct': 100.0},
+        ]
+        assert result['proj'] == expected
+
+    @pytest.mark.asyncio
+    async def test_a_merge_deferred_attempt_is_sliced_by_how_it_passed(self, tmp_path):
+        at = CARDS_NOW - timedelta(hours=1)
+        rows = [
+            _task_row('m1', 'proj', at, outcome='merge-deferred'),
+            _task_row('m2', 'proj', at, outcome='merge-deferred', review_cycles=1),
+            _task_row('m3', 'proj', at, outcome='merge-deferred', steward_invocations=1),
+            _task_row('m4', 'proj', at, outcome='merge-deferred'),
+        ]
+        escalations_dir = _make_escalations_dir(
+            tmp_path, 'escalations', [{'task_id': 'm4', 'level': 1, 'status': 'resolved'}],
+        )
+        async with _runs_conn_of(tmp_path, rows) as conn:
+            result = await get_completion_paths(
+                conn, escalations_dir, days=CARDS_DAYS, now=CARDS_NOW, projects=['proj'],
+            )
+        assert {p['path']: p['count'] for p in result['proj']} == {
+            'one-pass': 1, 'multi-pass': 1, 'via-steward': 1, 'via-interactive': 1,
+        }
+
+    @pytest.mark.asyncio
+    async def test_the_one_pass_denominator_is_every_counted_attempt(
+        self, tmp_path, empty_escalations_dir,
+    ):
+        at = CARDS_NOW - timedelta(hours=1)
+        rows = [
+            _task_row('d1', 'proj', at),
+            _task_row('m1', 'proj', at, outcome='merge-deferred'),
+            _task_row('r1', 'proj', at, outcome='requeued'),
+            _task_row('b1', 'proj', at, outcome='blocked'),
+            _task_row('c1', 'proj', at, outcome='cancelled'),
+        ]
+        async with _runs_conn_of(tmp_path, rows) as conn:
+            result = await aggregate_completion_paths(
+                [conn], [empty_escalations_dir], days=CARDS_DAYS, now=CARDS_NOW,
+            )
+        assert {p['path']: p['pct'] for p in result['proj']} == {
+            'one-pass': 50.0, 'requeued': 25.0, 'blocked': 25.0,
+        }
+
+    @pytest.mark.asyncio
+    async def test_the_one_pass_history_reads_a_merge_deferred_pass_as_a_pass(self, tmp_path):
+        """The sparkline agrees with the card on what a pass is, while time to
+        complete stays done-only: a merge-deferred row's duration stops at the park."""
+        rows = [
+            _task_row('d1', 'proj', CARDS_NOW - timedelta(minutes=30), duration_ms=1000),
+            _task_row(
+                'm1', 'proj', CARDS_NOW - timedelta(minutes=40),
+                outcome='merge-deferred', duration_ms=9000,
+            ),
+            _task_row('r1', 'proj', CARDS_NOW - timedelta(minutes=50), outcome='requeued'),
+        ]
+        async with _runs_conn_of(tmp_path, rows) as conn:
+            history = await aggregate_performance_history([conn], days=CARDS_DAYS, now=CARDS_NOW)
+        proj = history['proj']
+        assert proj.labels == ('2026-09-30T11:00',)
+        assert proj.one_pass == (66.7,)
+        assert proj.p50 == (1000,)
+        assert proj.p95 == (1000,)

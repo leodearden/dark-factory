@@ -1,13 +1,10 @@
 /* tab_memory_evals.jsx — memory-eval monitoring section, rendered INSIDE the
    Memory tab (PRD DD3: not a thirteenth top-level tab, no Rail entry).
 
-   The JSX/React wiring here is verified via Python source-assertion tests in
-   dashboard/tests/test_tab_memory_evals.py — no JSX runner exists (this file
-   is transformed by CDN Babel at runtime and the repo has no node_modules).
+   Render behaviour is covered by dashboard/tests/js/jsx_render.test.mjs.
    The pure, JSX-free logic that used to live here was moved to
-   /static/redux/memory_evals_fmt.js (task 3481) so it could escape that
-   limitation; WHY, in full, is in that file's header, which is the one place
-   that account is kept.
+   /static/redux/memory_evals_fmt.js (task 3481); WHY, in full, is in that
+   file's header, which is the one place that account is kept.
 
    LOAD ORDER IS THE CONTRACT, in both directions.
 
@@ -61,6 +58,7 @@ const {
   dash,
   ageText,
   verdictBadge,
+  splitVerdicts,
   unmatchedReasonText,
 } = window.DF_MEMORY_EVALS_FMT;
 
@@ -103,7 +101,47 @@ function EscalationLink({ escalation, onOpenEscalation }) {
   );
 }
 
-// ── One metric row ──
+// ── One verdict entry ──
+//
+// One fingerprint identity's judgement: its badge, then why it has no link
+// (a storm) or the link itself, then its fingerprint when the payload carries
+// one.  A quiet tripwire item ships neither verdict_detail nor fingerprint, so
+// both simply render nothing.
+function MemoryEvalVerdict({ entry, onOpenEscalation }) {
+  const badge = verdictBadge(entry);
+  return (
+    <div>
+      {/* verdict_detail carries the evaluator's own words, untranslated. */}
+      <span className={badge.cls} title={entry.verdict_detail || undefined}>
+        {badge.label}
+      </span>
+      {/* Under storm the per-metric escalations were deliberately collapsed
+          into the one aggregate, so the absence of a link here is explained
+          rather than left looking like a missing link. */}
+      {entry.parity === 'storm_collapsed'
+        ? (
+          <div className="mono" style={{ fontSize: 10, color: 'var(--fg-3)' }}>
+            link suppressed — storm aggregate
+          </div>
+        )
+        : entry.escalation && (
+          <div style={{ marginTop: 4 }}>
+            <EscalationLink escalation={entry.escalation} onOpenEscalation={onOpenEscalation} />
+          </div>
+        )}
+      {/* Fingerprints are rendered whole — never parsed. They are the
+          producer's private construction
+          (memory_evals._escalation_projection()). */}
+      {entry.fingerprint && (
+        <div className="mono" style={{ fontSize: 10, color: 'var(--fg-3)' }}>
+          fp {entry.fingerprint}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── One metric: its own row, then one row per item verdict ──
 function MemoryEvalMetricRow({ metric, onOpenEscalation }) {
   const m = metric;
   const trend = m.trend || { labels: [], values: [] };
@@ -180,8 +218,11 @@ function MemoryEvalMetricRow({ metric, onOpenEscalation }) {
   const span = labels.length
     ? `${labels[0]} → ${labels[labels.length - 1]}`
     : 'no runs';
-  const badge = verdictBadge(m);
+  // `own` judges the metric as a whole and renders in this row; each of
+  // `items` judges one tripwire item and gets a row of its own below.
+  const { own, items } = splitVerdicts(m.verdicts);
   return (
+    <>
     <tr>
       <td className="mono" style={{ color: 'var(--fg-1)' }}>{m.metric_id}</td>
       <td className="mono" style={{ fontSize: 11, color: 'var(--fg-2)' }}>
@@ -189,35 +230,12 @@ function MemoryEvalMetricRow({ metric, onOpenEscalation }) {
         <div style={{ fontSize: 10, color: 'var(--fg-3)' }}>{m.rule_kind}</div>
       </td>
       <td>
-        {/* verdict_detail carries the evaluator's own words, untranslated. */}
-        <span className={badge.cls} title={m.verdict_detail || undefined}>
-          {badge.label}
-        </span>
+        {own.map((entry, i) => (
+          <MemoryEvalVerdict key={i} entry={entry} onOpenEscalation={onOpenEscalation} />
+        ))}
         {m.limit_ref && (
           <div className="mono" style={{ fontSize: 10, color: 'var(--fg-3)' }}>
             {m.limit_ref}
-          </div>
-        )}
-        {/* Under storm the per-metric escalations were deliberately collapsed
-            into the one aggregate, so the absence of a link here is explained
-            rather than left looking like a missing link. */}
-        {m.parity === 'storm_collapsed'
-          ? (
-            <div className="mono" style={{ fontSize: 10, color: 'var(--fg-3)' }}>
-              link suppressed — storm aggregate
-            </div>
-          )
-          : m.escalation && (
-            <div style={{ marginTop: 4 }}>
-              <EscalationLink escalation={m.escalation} onOpenEscalation={onOpenEscalation} />
-            </div>
-          )}
-        {/* Fingerprints are rendered whole — never parsed. They are the
-            producer's private construction
-            (memory_evals._escalation_projection()). */}
-        {m.fingerprint && (
-          <div className="mono" style={{ fontSize: 10, color: 'var(--fg-3)' }}>
-            fp {m.fingerprint}
           </div>
         )}
       </td>
@@ -349,6 +367,17 @@ function MemoryEvalMetricRow({ metric, onOpenEscalation }) {
         </div>
       </td>
     </tr>
+    {items.map(entry => (
+      <tr key={entry.item}>
+        <td className="mono" style={{ fontSize: 10, color: 'var(--fg-3)', paddingLeft: 16 }}>
+          item {entry.item}
+        </td>
+        <td />
+        <td><MemoryEvalVerdict entry={entry} onOpenEscalation={onOpenEscalation} /></td>
+        <td colSpan={6} />
+      </tr>
+    ))}
+    </>
   );
 }
 
@@ -574,7 +603,11 @@ function MemoryEvalCard({ ev, onOpenEscalation }) {
           </thead>
           <tbody>
             {metrics.map(m => (
-              <MemoryEvalMetricRow key={m.metric_id} metric={m} onOpenEscalation={onOpenEscalation} />
+              <MemoryEvalMetricRow
+                key={m.metric_id}
+                metric={m}
+                onOpenEscalation={onOpenEscalation}
+              />
             ))}
           </tbody>
         </table>

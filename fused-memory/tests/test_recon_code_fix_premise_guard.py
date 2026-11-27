@@ -11,7 +11,13 @@ import dataclasses
 import shutil
 from pathlib import Path
 
+import pytest
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
 from fused_memory.middleware.curator_types import CandidateTask
+from fused_memory.utils.safe_yaml import YamlListFileError
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # task-1972 step-03 RED: TestLoadPremiseRegistry
@@ -63,47 +69,44 @@ class TestLoadPremiseRegistry:
         assert sa.must_contain == ["invalid_at"]
         assert sa.must_not_contain == []
 
-    def test_load_missing_path_returns_empty_and_warns(self, tmp_path, caplog):
-        """(b) Missing file returns [] and emits exactly one WARNING."""
+    def test_load_missing_path_raises(self, tmp_path):
+        """(b) A missing file raises YamlListFileError naming the path."""
         from fused_memory.middleware.recon_code_fix_premise_guard import load_premise_registry
 
         missing = tmp_path / "does_not_exist.yaml"
-        with caplog.at_level("WARNING"):
-            entries = load_premise_registry(missing)
+        with pytest.raises(YamlListFileError) as excinfo:
+            load_premise_registry(missing)
 
-        assert entries == []
-        warnings = [r for r in caplog.records if r.levelname == "WARNING"]
-        assert len(warnings) == 1
+        assert excinfo.value.path == missing
+        assert str(excinfo.value) == f"file not found: {missing}"
 
-    def test_load_malformed_yaml_returns_empty_and_warns(self, tmp_path, caplog):
-        """(c) Malformed YAML returns [] and emits exactly one WARNING."""
+    def test_load_malformed_yaml_raises(self, tmp_path):
+        """(c) Malformed YAML raises YamlListFileError."""
         from fused_memory.middleware.recon_code_fix_premise_guard import load_premise_registry
 
         bad_yaml = tmp_path / "bad.yaml"
         bad_yaml.write_text("key: [unclosed bracket\n: invalid\n", encoding="utf-8")
 
-        with caplog.at_level("WARNING"):
-            entries = load_premise_registry(bad_yaml)
+        with pytest.raises(YamlListFileError) as excinfo:
+            load_premise_registry(bad_yaml)
 
-        assert entries == []
-        warnings = [r for r in caplog.records if r.levelname == "WARNING"]
-        assert len(warnings) == 1
+        assert excinfo.value.path == bad_yaml
+        assert "YAML parse error" in str(excinfo.value)
 
     # task-4483 step-01 RED: undecodable-encoding registry
-    def test_load_undecodable_encoding_returns_empty_and_warns(self, tmp_path, caplog):
-        """(c2) File with bytes that are not valid UTF-8 returns [] and emits exactly one WARNING."""
+    def test_load_undecodable_encoding_raises(self, tmp_path):
+        """(c2) A file whose bytes are not valid UTF-8 raises YamlListFileError."""
         from fused_memory.middleware.recon_code_fix_premise_guard import load_premise_registry
 
         bad_encoding = tmp_path / "bad_encoding.yaml"
         bad_encoding.write_bytes(b"\xff\xfe- name: x\x00")
 
-        with caplog.at_level("WARNING"):
-            entries = load_premise_registry(bad_encoding)
+        with pytest.raises(YamlListFileError) as excinfo:
+            load_premise_registry(bad_encoding)
 
-        assert entries == []
-        warnings = [r for r in caplog.records if r.levelname == "WARNING"]
-        assert len(warnings) == 1
-        assert str(bad_encoding) in warnings[0].message
+        assert excinfo.value.path == bad_encoding
+        assert str(bad_encoding) in str(excinfo.value)
+        assert "UTF-8" in str(excinfo.value)
 
     def test_load_entry_missing_required_field_skips_and_warns(self, tmp_path, caplog):
         """(d) Entry missing title_substrings is skipped with WARNING; well-formed entries returned."""
@@ -368,7 +371,7 @@ class TestVerifyPremiseRefuted:
     """Tests for verify_premise_refuted() from
     fused_memory.middleware.recon_code_fix_premise_guard.
 
-    source_root is a tmp_path standing in for the fused-memory server cwd;
+    source_root is a tmp_path standing in for the curator's source root;
     each SourceAssertion.file is relative to it.
     """
 
@@ -623,47 +626,47 @@ class TestPremiseRefutedEntry:
 
 class TestSeedRegistryRealSource:
     """Loads the SHIPPED fused-memory/config/recon_code_fix_premise_registry.yaml
-    and re-verifies its entries against the REAL fused-memory source root — not
-    a tmp_path fixture.
+    and re-verifies its entries against the real source root the deployed
+    curator verifies against (the repo root) — not a tmp_path fixture.
 
     The COUNT is deliberately not stated here: it lives in exactly one place,
     `test_shipped_registry_has_five_entries`, which reds when the registry grows
     rather than going quietly stale the way a prose count does.
 
     Confirmed base-branch facts (see task-1972 analysis):
-    - src/fused_memory/services/memory_service.py contains "invalid_at".
-    - tests/test_stages.py contains
+    - fused-memory/src/fused_memory/services/memory_service.py contains "invalid_at".
+    - fused-memory/tests/test_stages.py contains
       "test_stage1_flag_marker_fp_key_is_never_consumed_by_stage2".
-    - src/fused_memory/server/recon_report.py does NOT contain "max_length".
+    - fused-memory/src/fused_memory/server/recon_report.py does NOT contain "max_length".
 
     Confirmed facts for the fourth entry (task 3023):
-    - ../escalation/src/escalation/queue.py contains "def get_by_task" and
+    - escalation/src/escalation/queue.py contains "def get_by_task" and
       "_iter_archive_paths" — the archive-inclusive scan that refutes the
       "escalation record was never written" premise.
-    - src/fused_memory/reconciliation/prompts/__init__.py contains
+    - fused-memory/src/fused_memory/reconciliation/prompts/__init__.py contains
       "_GATE_CLOSURE_ARCHIVE_GUIDANCE" and "get_task_escalations" — the shared
       guidance prose naming the disconfirming tool. The literal tool name lives
       HERE, not in the stage modules, because the guidance is a constant
       interpolated into each stage's f-string.
-    - src/fused_memory/reconciliation/prompts/stage2.py contains
+    - fused-memory/src/fused_memory/reconciliation/prompts/stage2.py contains
       "render_escalation_boundary_note(can_escalate=True)" — the guidance is
       wired into the stage that files remediation tasks. It rides along with
       the shared escalation-store boundary note (rendered as a subsection of
       it), so that render call is the wiring token, not the constant name.
 
     Confirmed facts for the expired_at entry (task 4984):
-    - src/fused_memory/backends/graphiti_client.py contains
+    - fused-memory/src/fused_memory/backends/graphiti_client.py contains
       "_ALL_VALID_EDGES_MATCH", "def get_valid_edges_for_node" and
       "WHERE e.invalid_at IS NULL", and does NOT contain "e.expired_at IS NULL"
       — the absence being what makes the premise refuted AND self-correcting.
-    - src/fused_memory/services/memory_service.py contains
+    - fused-memory/src/fused_memory/services/memory_service.py contains
       "_restore_falsely_superseded_sibling_edges" and "clear_invalid_at=True" —
       the restore hooks an expired_at filter would re-hide the edges of.
     """
 
-    # tests/test_recon_code_fix_premise_guard.py -> tests/ -> fused-memory/
-    SOURCE_ROOT = Path(__file__).resolve().parent.parent
-    REGISTRY_PATH = SOURCE_ROOT / "config" / "recon_code_fix_premise_registry.yaml"
+    # tests/ -> fused-memory/ -> repo root, the TaskCurator cwd in the deployed unit
+    SOURCE_ROOT = Path(__file__).resolve().parents[2]
+    REGISTRY_PATH = SOURCE_ROOT / "fused-memory" / "config" / "recon_code_fix_premise_registry.yaml"
 
     def _load_entries(self):
         from fused_memory.middleware.recon_code_fix_premise_guard import load_premise_registry
@@ -789,10 +792,10 @@ class TestSeedRegistryRealSource:
         assert premise_refuted_entry(candidate, entries, self.SOURCE_ROOT) is not None
 
     # Candidate shared by the over-broad-anchoring guard and its inverse control.
-    # The title carries BOTH anchor tokens ("deterministic", "escalation") BY
-    # CONSTRUCTION — match_candidate requires ALL title_substrings, so without
-    # both tokens the candidate would die at the TITLE gate and the description
-    # anchor these tests exist to pin would never be exercised.
+    # The title carries EVERY title anchor ("deterministic", "escalation",
+    # "gate") BY CONSTRUCTION — match_candidate requires ALL title_substrings,
+    # so without them the candidate would die at the TITLE gate and the
+    # description anchor these tests exist to pin would never be exercised.
     _LEGITIMATE_PROPOSAL_TITLE = (
         "Expose an archive-inclusive escalation lookup for deterministic gate tasks"
     )
@@ -801,7 +804,7 @@ class TestSeedRegistryRealSource:
         """Over-broad-anchoring guard: task 3023's OWN framing must still reach
         the architect.
 
-        The title carries both anchor tokens by construction (see
+        The title carries every title anchor by construction (see
         _LEGITIMATE_PROPOSAL_TITLE) — that is precisely what makes the
         DESCRIPTION anchor reachable, so this test rejects on the anchor it
         claims to pin rather than on the title gate. The description mentions
@@ -863,8 +866,9 @@ class TestSeedRegistryRealSource:
 
         Pins the description anchor from the other side: with an identical
         title to the legitimate-proposal case above, adding
-        "no escalation record exists" is sufficient to match the entry. The
-        pair together CHARACTERISES the anchor instead of sampling one side.
+        "gate_escalated_at but no escalation record" is sufficient to match the
+        entry. The pair together CHARACTERISES the anchor instead of sampling
+        one side.
         """
         from fused_memory.middleware.recon_code_fix_premise_guard import match_candidate
 
@@ -881,6 +885,116 @@ class TestSeedRegistryRealSource:
             "them."
         )
         assert entry.name == "deterministic_gate_escalation_record_archived_not_missing"
+
+    _GATE_ESCALATION_ENTRY = "deterministic_gate_escalation_record_archived_not_missing"
+    _TASK_8211_TITLE = (
+        "Put the AgentFailureKind name into orchestrator agent-failure escalation "
+        "reasons so the steward can match its failure-kind guide deterministically"
+    )
+    _FOLLOWUP_BOILERPLATE = (
+        "Follow-up filed by task 6468's implementer during its review-amendment pass "
+        "(reviewer_comprehensive suggestion 6, design-coherence). No escalation record "
+        "exists for it."
+    )
+
+    def _gate_escalation_entry(self, entries):
+        return next(e for e in entries if e.name == self._GATE_ESCALATION_ENTRY)
+
+    def test_task_8211_followup_is_not_refuted_as_a_gate_absence_claim(self):
+        """Task 8211 was a code task the live guard would have refused (task 10112,
+        esc-task-curator-37's go-live watch list).
+
+        "No escalation record exists for it." is agent-followup boilerplate meaning
+        the follow-up carries no escalation id, not a claim that a gate's record is
+        missing. "deterministic" matched the adverb "deterministically" in its title.
+        So the bare "no escalation record exists" anchor became "that no escalation
+        record exists"; that description anchor is the real protection. The added
+        title anchor "gate" also rejects this title, but only as a weak secondary
+        filter: as a substring it matches "investigate", "mitigate", "propagate",
+        "delegate" and "aggregate", so it does not make a title name a gate.
+        """
+        from fused_memory.middleware.recon_code_fix_premise_guard import (
+            match_candidate,
+            premise_refuted_entry,
+        )
+
+        entries = self._load_entries()
+        candidate = CandidateTask(
+            title=self._TASK_8211_TITLE,
+            description=(
+                self._FOLLOWUP_BOILERPLATE
+                + " Agent-failure escalations from the orchestrator carry "
+                "AgentFailureClass.summary prose; kind.name never reaches the steward."
+            ),
+        )
+
+        matched = match_candidate(candidate, entries)
+        assert matched is None, f"8211 matched {matched.name if matched else None}"
+        assert premise_refuted_entry(candidate, entries, self.SOURCE_ROOT) is None
+
+    def test_followup_boilerplate_does_not_satisfy_the_description_anchor(self):
+        from fused_memory.middleware.recon_code_fix_premise_guard import match_candidate
+
+        entries = self._load_entries()
+        candidate = CandidateTask(
+            title=self._LEGITIMATE_PROPOSAL_TITLE,
+            description=self._FOLLOWUP_BOILERPLATE,
+        )
+
+        matched = match_candidate(candidate, entries)
+        assert matched is None, f"boilerplate matched {matched.name if matched else None}"
+
+        widened = dataclasses.replace(
+            self._gate_escalation_entry(entries),
+            description_substrings=["no escalation record exists"],
+        )
+        assert match_candidate(candidate, [widened]) is not None, (
+            "the candidate must pass the title gate, so the description anchor "
+            "alone is what protects it"
+        )
+
+    def test_gate_absence_phrasing_under_a_non_gate_title_does_not_match(self):
+        from fused_memory.middleware.recon_code_fix_premise_guard import match_candidate
+
+        entries = self._load_entries()
+        candidate = CandidateTask(
+            title=self._TASK_8211_TITLE,
+            description="task stamped gate_escalated_at but no escalation record exists",
+        )
+
+        matched = match_candidate(candidate, entries)
+        assert matched is None, f"non-gate title matched {matched.name if matched else None}"
+
+        widened = dataclasses.replace(
+            self._gate_escalation_entry(entries),
+            title_substrings=["deterministic", "escalation"],
+        )
+        assert match_candidate(candidate, [widened]) is not None, (
+            "the description must satisfy an anchor, so the title gate alone is "
+            "what protects the candidate"
+        )
+
+    def test_task_2807_absence_claim_still_matches(self):
+        """Recall control: the real recurrence the old bare anchor covered."""
+        from fused_memory.middleware.recon_code_fix_premise_guard import match_candidate
+
+        entries = self._load_entries()
+        candidate = CandidateTask(
+            title=(
+                "Investigate DeterministicRunner pure-gate escalation-filing silent "
+                "failure — task 2799 stamped gate_escalated_at with no matching "
+                "escalation record"
+            ),
+            description=(
+                "get_pending_escalations(level=2) also returned empty. This is a live, "
+                "authoritative confirmation (not a memory-search miss) that no "
+                "escalation record exists anywhere in the queue for this task."
+            ),
+        )
+
+        matched = match_candidate(candidate, entries)
+        assert matched is not None
+        assert matched.name == self._GATE_ESCALATION_ENTRY
 
     #: The name of the entry the four tests below are about, spelled once.
     _EXPIRED_AT_ENTRY = "valid_edge_query_expired_at_filter_refuted"
@@ -1058,7 +1172,7 @@ class TestSeedRegistryRealSource:
             "the copied tree must reproduce the live verdict before it is edited"
         )
 
-        client = tmp_path / "src/fused_memory/backends/graphiti_client.py"
+        client = tmp_path / "fused-memory/src/fused_memory/backends/graphiti_client.py"
         client.write_text(
             client.read_text(encoding="utf-8")
             + "\n_FUTURE = 'WHERE e.invalid_at IS NULL AND e.expired_at IS NULL'\n",

@@ -19,11 +19,13 @@ the clock says when the validator happens to run.
 from __future__ import annotations
 
 import enum
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import Any, Generic, Protocol, TypeVar, runtime_checkable
 
 T = TypeVar('T')
+U = TypeVar('U')
 
 
 @runtime_checkable
@@ -36,6 +38,9 @@ class WireShaped(Protocol):
     """
 
     def to_wire(self) -> dict[str, object]: ...
+
+
+_PLAIN_JSON_TYPES = frozenset({dict, str, int, float, bool, type(None)})
 
 
 def _render(value: object) -> object:
@@ -59,7 +64,12 @@ def _render(value: object) -> object:
     other container — a dict, a set — passes through, so its producer renders
     it; ``test_datum.py`` pins that boundary so a later leaf meets it at this
     seam.
+
+    An exact builtin scalar or ``dict`` short-circuits the Protocol check,
+    because no instance of one can carry a ``to_wire`` and so satisfy it.
     """
+    if type(value) in _PLAIN_JSON_TYPES:
+        return value
     if isinstance(value, WireShaped):
         return value.to_wire()
     if isinstance(value, (list, tuple)):
@@ -145,6 +155,9 @@ class DatumInvariant(enum.StrEnum):
     the payload declares as a ``Datum`` holds one. A shaper raises it instead
     of inventing an ``unknown`` placeholder, because a field its route never
     filled is a wiring bug, not a measurement.
+
+    ``VALUE_CONTRACT`` is also a payload's rule: the value broke its payload
+    family's own declared invariant, and that family's validator names which.
     """
 
     UNKNOWN_TRIAD = 'unknown_triad'
@@ -152,6 +165,7 @@ class DatumInvariant(enum.StrEnum):
     REASON_REQUIRED = 'reason_required'
     FRESHNESS_BOUND = 'freshness_bound'
     DATUM_REQUIRED = 'datum_required'
+    VALUE_CONTRACT = 'value_contract'
 
 
 class DatumContractError(ValueError):
@@ -249,6 +263,20 @@ def validate_datum(datum: Datum, served_at: datetime) -> None:
                 f'freshness_bound_seconds={datum.freshness_bound_seconds!r}, '
                 f'as_of={datum.as_of!r}, served_at={served_at!r}',
             )
+
+
+def map_datum(datum: Datum[T], project: Callable[[T], U]) -> Datum[U]:
+    """*datum*'s provenance over ``project(value)``; an unknown datum stays unknown.
+
+    Pure: *project* never runs on an unknown datum, and no clock is read.
+    """
+    return Datum(
+        value=None if datum.value is None else project(datum.value),
+        as_of=datum.as_of,
+        state=datum.state,
+        reason=datum.reason,
+        freshness_bound_seconds=datum.freshness_bound_seconds,
+    )
 
 
 def aged_at(datum: Datum[T], served_at: datetime) -> Datum[T]:

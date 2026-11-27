@@ -22,15 +22,15 @@ the pre-2406 Mem0 records with no in-cycle collector. That gap has since been pa
 closed: task 2853 restored an automatic, in-cycle, per-project collector —
 ``_sweep_stale_mem0_flag_markers`` (``reconciliation/stages/task_knowledge_sync.py``),
 called unconditionally every cycle from ``TaskKnowledgeSync.run()`` via the shared
-``_sweep_stale_mem0_pool`` helper, whose only enumeration filter is ``source`` (no
-``kind`` predicate) — it enumerates on ``{'source': 'stage1_flag_marker'}`` and
-age-GCs at 14 days, for every project, not just ``dark_factory`` (the only project
-this script's own systemd timer targets by default); see
+``_sweep_stale_mem0_pool`` helper. It enumerates both the ``source`` and ``kind``
+spellings of the pool (``_STAGE1_FLAG_MARKER_MEM0_ENUM_FILTER_VARIANTS``, task
+3915), a cohort wider than this script's ``source``-only scroll, withholds records
+that declare a foreign ``kind`` (task 6241), and age-GCs at 14 days for every
+project, as this script's nightly timer has also done since task 2917; see
 ``_sweep_stale_mem0_flag_markers``'s own docstring for the gap it documents closing.
 
-That "only enumeration filter is ``source``" claim is true of
-``_sweep_stale_mem0_flag_markers`` but materially incomplete as a description of
-the in-cycle drain as a whole (task 3897). Task 2966 shipped a SECOND in-cycle
+``_sweep_stale_mem0_flag_markers`` is not the whole in-cycle drain, though
+(task 3897). Task 2966 shipped a SECOND in-cycle
 collector, ``_sweep_stale_mem0_flag_for_stage2_markers``, which enumerates on
 ``{'flag_for_stage2': True}`` (``_FLAG_FOR_STAGE2_ENUM_FILTERS``) and is likewise
 wired unconditionally per-project every cycle
@@ -55,10 +55,20 @@ The pre-2406 Mem0 records remain pure dead weight (nothing reads them — see
 ``find_stale_markers``/``find_terminal_task_markers`` docstrings); they are simply
 no longer *uncollected* dead weight. This script is therefore a manual adjunct to
 that automatic drain, not the only thing standing between the repo and an unbounded
-pool — it remains useful for the targeted predicates the in-cycle drain does not
-implement (``--delete-ids``, ``--terminal-drain``) and for the deterministic
-``--check --max-backlog`` gate. In passing: the in-cycle drain's filter matches on
-``source`` alone and never on ``kind``, so it already collects those task-1659
+pool. Task 3498 ruled this script KEPT, but corrected *why*: its load-bearing
+role is the task-3897 ``cross_check`` census — the only instrument that renders
+``orphan_count: 0`` legible as "saw nothing" rather than "there was nothing" —
+and NOT the drain. ``--delete-ids`` and ``--terminal-drain`` read the same
+``source``-filtered ``members`` scroll every predicate reads (``targeted`` is
+the intersection of ``delete_ids`` with ``members``), and task 3923 retired the
+``--check --max-backlog`` gate for want of any ``before_done`` consumer. The
+delete-set predicates are retained per task 3897's own MEASURED-ZERO-RETAINED
+ruling; full rationale in ``docs/flag-marker-sweep-recurring.md`` §"Decision
+(task 3498)". In passing: the in-cycle drain's ``source`` variant matches
+records that carry no ``kind`` at all, and its foreign-kind arm withholds only a
+DECLARED different kind
+(``fused-memory/src/fused_memory/reconciliation/mem0_tombstone.py::is_foreign_kind_record``
+returns False when ``kind`` is None), so it already collects those task-1659
 missing-``kind`` orphans that are older than 14 days and carry a parseable
 ``created_at``; records with a missing or unparseable ``created_at`` are skipped by
 ``_sweep_stale_mem0_pool``'s fail-safe KEEP-on-uncertainty age filter (see that
@@ -77,7 +87,8 @@ MEASURED-ZERO, RETAINED (task 3897, work item (c)). Both predicates below —
 (missing ``task_id``) — operate on a population that measures 0 in every project
 probed, and are deliberately KEPT rather than retired: they remain this script's
 delete-set contract, stay reachable through ``--delete-ids``, are the only
-collector for any not-yet-probed project's legacy pool, and the blind-spot
+collector for dead weight the in-cycle 14-day age GC never reaches (markers
+younger than 14 days or undated), and the blind-spot
 cross-check is DEFINED as the comparison between this ``source`` enumeration and
 the adjacent population. Full rationale and the dated census:
 ``docs/flag-marker-sweep-recurring.md``.
@@ -176,14 +187,15 @@ boundary: the two surviving reasons are each independently sufficient.
 Task 5286 ported the THIRD guard ``_sweep_stale_mem0_pool`` applies —
 ``mem0_tombstone.is_protected_audit_record`` / ``PROTECTED_AUDIT_KINDS`` (task
 4375), added after the age-only rule destroyed the 40 ``kind='cadence_check'``
-audit records described above — and added a primary arm of this script's own,
-the FOREIGN-KIND arm (:func:`protection_reason`): a record declaring any
-``kind`` other than ``MARKER_KIND`` belongs to another pool and is never
-deleted here. The denylist alone is not enough in this script, because
-``find_orphan_markers`` nominates every foreign-kind record on the first run at
-any age, and ``--terminal-drain`` inverts the terminal-task-closure gate that
-is the in-cycle collector's primary defence. The decision record is
-``docs/flag-marker-sweep-recurring.md``.
+audit records described above — and added a primary arm, the FOREIGN-KIND arm
+(:func:`protection_reason`): a record declaring any ``kind`` other than
+``MARKER_KIND`` belongs to another pool and is never deleted here. Task 6241
+gave the in-cycle collector the same arm; both call
+``mem0_tombstone.is_foreign_kind_record``. The denylist alone is not enough in
+this script, because ``find_orphan_markers`` nominates every foreign-kind
+record on the first run at any age, and ``--terminal-drain`` inverts the
+terminal-task-closure gate that is the ``flag_for_stage2`` collector's primary
+defence. The decision record is ``docs/flag-marker-sweep-recurring.md``.
 
 SINGLE SOURCE OF TRUTH for the dated census (which filter matched how many
 records, in which project, when), for the full censused-never-deleted
@@ -218,8 +230,9 @@ from functools import partial
 from pathlib import Path
 from typing import Any
 
-from fused_memory.reconciliation.flag_dedup import is_content_fingerprint_task_id
+from fused_memory.reconciliation.flag_identity import is_content_fingerprint_task_id
 from fused_memory.reconciliation.mem0_tombstone import (
+    is_foreign_kind_record,
     is_protected_audit_record,
     is_protected_mirror_record,
     record_mem0_deletion_tombstones,
@@ -575,15 +588,15 @@ def protection_reason(metadata: Any) -> ProtectionReason | None:
       (task 3041/4435).
     - ``PROTECTED_AUDIT_KIND`` — ``mem0_tombstone.is_protected_audit_record``,
       the ``PROTECTED_AUDIT_KINDS`` denylist (task 4375).
-    - ``FOREIGN_KIND`` — this sweep's PRIMARY arm (task 5286): a ``kind`` that
-      is present and is not :data:`MARKER_KIND`. The legacy pool's shape is
-      exactly "kind absent or MARKER_KIND", so a declared different kind is
-      positive evidence that the record belongs to another pool. The arm is
-      structurally opt-in: an UNREGISTERED audit kind is protected without
+    - ``FOREIGN_KIND`` — this sweep's PRIMARY arm (task 5286):
+      ``mem0_tombstone.is_foreign_kind_record`` against :data:`MARKER_KIND`,
+      shared with the in-cycle collector (task 6241). The legacy pool's shape
+      is exactly "kind absent or MARKER_KIND", so a declared different kind
+      is positive evidence that the record belongs to another pool. The arm
+      is structurally opt-in: an UNREGISTERED audit kind is protected without
       anyone editing ``PROTECTED_AUDIT_KINDS``. It does not consult task
       status, so ``--terminal-drain``, which inverts the in-cycle
-      terminal-closure gate, cannot weaken it. It compares with ``!=``, never
-      set membership, so a list- or dict-valued ``kind`` cannot raise.
+      terminal-closure gate, cannot weaken it.
 
     The order IS the attribution: a mirror or audit record is reported under
     its specific reason, never as merely foreign.
@@ -594,10 +607,7 @@ def protection_reason(metadata: Any) -> ProtectionReason | None:
         return ProtectionReason.CYCLE_SUMMARY_MIRROR
     if is_protected_audit_record(metadata):
         return ProtectionReason.PROTECTED_AUDIT_KIND
-    if not isinstance(metadata, dict):
-        return None
-    kind = metadata.get('kind')
-    if kind is not None and kind != MARKER_KIND:
+    if is_foreign_kind_record(metadata, MARKER_KIND):
         return ProtectionReason.FOREIGN_KIND
     return None
 
@@ -625,8 +635,9 @@ def find_protected_markers(members: list[dict]) -> list[dict]:
 
     Restores parity with the in-cycle collector
     ``stages/task_knowledge_sync.py::_sweep_stale_mem0_pool`` on its two
-    denylist guards, and adds the foreign-kind arm that collector does not
-    need. The decision record is ``docs/flag-marker-sweep-recurring.md``.
+    denylist guards. Both collectors also apply the foreign-kind arm, through
+    ``mem0_tombstone.is_foreign_kind_record`` (task 6241). The decision
+    record is ``docs/flag-marker-sweep-recurring.md``.
 
     The two ``mem0_tombstone`` predicates are deliberately IMPORTED rather
     than copied here, and stay separate predicates there. A local copy would
@@ -1677,6 +1688,10 @@ def _build_parser() -> argparse.ArgumentParser:
     the new ``--max-age-days``, ``--delete-ids``, ``--terminal-drain``,
     ``--check``, and ``--max-backlog`` flags — is testable without any live
     I/O.
+
+    ``allow_abbrev=False`` makes ``--apply`` the only spelling of a
+    deletion, which is what lets ``scripts/fused-memory-flag-marker-check.sh``
+    keep its read-only promise by refusing that one literal (task 3498).
     """
     parser = argparse.ArgumentParser(
         description=(
@@ -1684,6 +1699,7 @@ def _build_parser() -> argparse.ArgumentParser:
             'records: missing kind/task_id, stale by age, referencing only '
             'terminal tasks, or explicitly targeted for correction.'
         ),
+        allow_abbrev=False,
     )
     parser.add_argument(
         '--apply', action='store_true', default=False,
@@ -1944,7 +1960,7 @@ def _known_projects_map() -> dict[str, str]:
         built it; ``{}`` on any failure.
     """
     try:
-        from fused_memory.models import scope  # noqa: PLC0415
+        from fused_memory.models import scope
 
         # PROJECT_ROOT is the var the wrapper already exports; fall back to
         # this checkout (scripts/ -> fused-memory/ -> repo root).
@@ -2022,7 +2038,7 @@ def _known_projects_coverage_issue(known: dict[str, str]) -> str | None:
         diagnostic, and it must never be the thing that breaks the drain.
     """
     try:
-        from fused_memory.models import scope  # noqa: PLC0415
+        from fused_memory.models import scope
 
         named_roots = scope.known_project_roots_from_env()
         if not named_roots:
@@ -2163,11 +2179,11 @@ async def _resolve_terminal_task_ids(project_id: str) -> tuple[set[str], str]:
           ``'resolution-failed'``    the backend raised; see the WARNING.
     """
     try:
-        from shared.task_statuses import TERMINAL as TERMINAL_STATUSES  # noqa: PLC0415
+        from shared.task_statuses import TERMINAL as TERMINAL_STATUSES
 
-        from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend  # noqa: PLC0415
-        from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
-        from fused_memory.models import scope  # noqa: PLC0415
+        from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend
+        from fused_memory.config.schema import FusedMemoryConfig
+        from fused_memory.models import scope
 
         config = FusedMemoryConfig()
         if config.taskmaster is None:
@@ -2306,11 +2322,10 @@ def main() -> int:
         return 0
 
     async def _run_live() -> dict:
-        from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
-        from fused_memory.services.memory_service import MemoryService  # noqa: PLC0415
+        from fused_memory.config.schema import FusedMemoryConfig
+        from fused_memory.maintenance._utils import maintenance_service
 
         config = FusedMemoryConfig()
-        memory = MemoryService(config)
         now_dt = datetime.now(UTC)
         if args.terminal_drain:
             terminal_task_ids, drain_mode = await _resolve_terminal_task_ids(
@@ -2329,14 +2344,10 @@ def main() -> int:
             args.project_id,
             _effective_mode_label(drain_mode, terminal_task_ids),
         )
-        try:
-            await memory.initialize()
+        async with maintenance_service(config=config) as (_, memory):
             return await run(
                 args, memory, now=now_dt, terminal_task_ids=terminal_task_ids,
             )
-        finally:
-            if hasattr(memory, 'close'):
-                await memory.close()
 
     try:
         report = asyncio.run(_run_live())

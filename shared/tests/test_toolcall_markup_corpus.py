@@ -27,9 +27,9 @@ import toolcall_markup_corpus_extract as extract
 # The D5 assertion helper is imported, NOT re-derived: it is the one check in
 # the replay that is non-circular with respect to the machine-generated
 # expectation column, so it must be the SAME code the hand-authored specimen
-# tests run. Bare import works via conftest's tests/ sys.path insert (the
-# capability_manifest_corpus.py precedent).
-from test_toolcall_markup import assert_repair_invariants
+# tests run. Its home is cross_suite_helpers/toolcall_repair_invariants.py,
+# which conftest inserts onto sys.path.
+from toolcall_repair_invariants import assert_repair_invariants
 
 from shared.toolcall_markup import INVOKE_CLOSER, repair
 

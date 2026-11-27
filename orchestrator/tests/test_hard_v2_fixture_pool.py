@@ -310,7 +310,7 @@ class TestCurationMdIsGenerated:
 
 @pytest.fixture(scope='module')
 def pool() -> list[dict]:
-    from orchestrator.cli import _load_fixture_dir
+    from orchestrator.evals.cli import _load_fixture_dir
     return _load_fixture_dir(POOL_DIR)
 
 
@@ -365,9 +365,10 @@ class TestMintedPool:
     def test_ceilings_are_pinned_fixture_side(
         self, pool: list[dict], manifest: dict,
     ) -> None:
-        # runner.py reads both straight off the task record (task.get with
-        # 50 / 60 defaults), so pinning them is pure data — but EVERY fixture
-        # must carry them or that fixture silently runs at the wrong ceiling.
+        # The evals package reads both straight off the task record (task.get
+        # with its own defaults), so pinning them is pure data — but
+        # EVERY fixture must carry them or that fixture silently runs at the
+        # wrong ceiling.
         for f in pool:
             assert f['max_architect_turns'] == 120, f['id']
             assert f['timeout_minutes'] == manifest['ceilings']['timeout_minutes'], \
@@ -578,7 +579,7 @@ class TestStandingCorpusIsolation:
         # test named for the v2 hard pool. What β1 actually guarantees — no
         # collision with the standing corpus — is asserted by
         # `test_the_only_id_overlap_is_the_declared_continuity_set` below.
-        from orchestrator.cli import _load_fixture_dir
+        from orchestrator.evals.cli import _load_fixture_dir
         standing = _load_fixture_dir(STANDING_TASKS_DIR)
         assert len(standing) >= 22
         assert len({f['id'] for f in standing}) == len(standing)
@@ -591,14 +592,14 @@ class TestStandingCorpusIsolation:
         # design — they are the same three tasks re-banded into the v2
         # cohort — so the overlap is pinned to exactly that declared set
         # rather than left as an open-ended allowance.
-        from orchestrator.cli import _load_fixture_dir
+        from orchestrator.evals.cli import _load_fixture_dir
         standing_ids = {f['id'] for f in _load_fixture_dir(STANDING_TASKS_DIR)}
         declared = {e['id'] for e in manifest['continuity']['fixtures']}
         overlap = standing_ids & {f['id'] for f in pool}
         assert overlap == declared
 
     def test_standing_corpus_carries_no_v2_cohort_fixture(self) -> None:
-        from orchestrator.cli import _load_fixture_dir
+        from orchestrator.evals.cli import _load_fixture_dir
         for f in _load_fixture_dir(STANDING_TASKS_DIR):
             assert f.get('cohort') != 'fable-trial-v2-hard', f['id']
 
@@ -779,7 +780,7 @@ class TestMetaLayout:
         # inside _meta/ it is unreachable.
         assert META_DIR.is_dir()
         assert not (POOL_DIR / 'curation.json').exists()
-        from orchestrator.cli import _load_fixture_dir
+        from orchestrator.evals.cli import _load_fixture_dir
         loaded_from_meta = _load_fixture_dir(META_DIR)
         # The glob does reach _meta/*.json if pointed AT _meta — the guarantee
         # is that nothing points at it. What matters is that pointing at the

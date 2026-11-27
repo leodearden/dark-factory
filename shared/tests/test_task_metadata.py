@@ -16,6 +16,7 @@ from __future__ import annotations
 import copy
 import json
 import re
+from datetime import UTC, datetime, timedelta
 from typing import get_args
 
 import pytest
@@ -41,6 +42,9 @@ from shared.task_metadata import (
     script_root_kind_conflict,
     validate_model_overrides,
 )
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 
 def _assert_only_test_owned_registry_keys(added: set[str]) -> None:
@@ -677,6 +681,77 @@ class TestMilestone:
         m = Milestone(mode='delayed', after_secs=604800, x_extra='keep')  # type: ignore[call-arg]
         dumped = m.model_dump()
         assert dumped['x_extra'] == 'keep'
+
+
+
+class TestMilestoneFired:
+    """``Milestone.fired(anchor, now)`` — the pure home of milestone semantics."""
+
+    NOW = datetime(2026, 11, 4, 12, 0, tzinfo=UTC)
+
+    @staticmethod
+    def _dated(at: str) -> Milestone:
+        return Milestone.model_validate({'mode': 'dated', 'at': at})
+
+    @staticmethod
+    def _delayed(after_secs: int = 3600) -> Milestone:
+        return Milestone.model_validate({'mode': 'delayed', 'after_secs': after_secs})
+
+    def test_dated_in_the_past_fires(self):
+        assert self._dated('2026-11-03T12:00:00+00:00').fired(None, self.NOW)
+
+    def test_dated_at_now_fires(self):
+        assert self._dated(self.NOW.isoformat()).fired(None, self.NOW)
+
+    def test_dated_in_the_future_does_not_fire(self):
+        assert not self._dated('2026-11-05T12:00:00+00:00').fired(None, self.NOW)
+
+    def test_dated_naive_at_is_read_as_utc(self):
+        milestone = self._dated('2026-11-04T12:00:00')
+        assert milestone.fired(None, self.NOW)
+        assert not milestone.fired(None, self.NOW - timedelta(seconds=1))
+
+    def test_dated_ignores_anchor(self):
+        milestone = self._dated('2026-11-05T12:00:00+00:00')
+        assert not milestone.fired('2020-01-01T00:00:00+00:00', self.NOW)
+
+    @pytest.mark.parametrize('anchor', [None, ''], ids=['none', 'empty'])
+    def test_delayed_without_anchor_never_fires(self, anchor):
+        assert not self._delayed().fired(anchor, self.NOW)
+
+    def test_delayed_at_anchor_plus_after_secs_fires(self):
+        anchor = (self.NOW - timedelta(seconds=3600)).isoformat()
+        assert self._delayed(3600).fired(anchor, self.NOW)
+
+    def test_delayed_before_anchor_plus_after_secs_does_not_fire(self):
+        anchor = (self.NOW - timedelta(seconds=3599)).isoformat()
+        assert not self._delayed(3600).fired(anchor, self.NOW)
+
+    def test_delayed_naive_anchor_is_read_as_utc(self):
+        milestone = self._delayed(3600)
+        assert milestone.fired('2026-11-04T11:00:00', self.NOW)
+        assert not milestone.fired('2026-11-04T11:00:01', self.NOW)
+
+    def test_delayed_unparseable_anchor_raises(self):
+        with pytest.raises(ValueError):
+            self._delayed().fired('not-a-timestamp', self.NOW)
+
+    @pytest.mark.parametrize('anchor', [12345, 0], ids=['int', 'falsy_int'])
+    def test_delayed_non_string_anchor_raises_value_error(self, anchor):
+        with pytest.raises(ValueError):
+            self._delayed().fired(anchor, self.NOW)
+
+    @pytest.mark.parametrize(
+        ('after_secs', 'anchor'),
+        [
+            pytest.param(10**12, '2026-11-01T00:00:00+00:00', id='date_out_of_range'),
+            pytest.param(10**15, '2026-11-01T00:00:00+00:00', id='int_too_large_for_c'),
+            pytest.param(1, '9999-12-31T23:59:59', id='anchor_at_datetime_max'),
+        ],
+    )
+    def test_delayed_unrepresentable_deadline_raises_value_error(self, after_secs, anchor):
+        with pytest.raises(ValueError):
+            self._delayed(after_secs).fired(anchor, self.NOW)
 
 
 class TestRecurrence:
@@ -1558,8 +1633,7 @@ class TestMigrations:
         assert upgraded['memory_hints'] == {'entities': ['E'], 'queries': ['Q']}
 
     def test_missing_schema_version_treated_as_v0_and_stamped_to_2(self):
-        # Chains v0->v1->v2 (no legacy retry-ledger counters present, so the
-        # v1->v2 step is a no-op beyond the version stamp).
+        # Chains v0->v1->v2.
         upgraded = apply_migrations({})
         assert upgraded['schema_version'] == 2
 
@@ -1577,17 +1651,16 @@ class TestMigrations:
         assert blob == original
 
 
-class TestRetryLedgerCounterMigration:
-    """v1->v2 migration: lift legacy top-level infra-resume counters into retry_ledger.
+class TestV1ToV2IsStampOnly:
+    """v1->v2 only stamps ``schema_version=2``.
 
-    ``consecutive_infra_resume_failures`` / ``last_infra_resume_iteration_count``
-    are :class:`RetryLedger` fields, but some legacy blobs (pre-2172
-    placement) still carry them as TOP-LEVEL metadata keys. RED: no v1->v2
-    migration exists yet, so the counters stay top-level (surfacing as
-    unknown_key warnings) and a v1 blob never reaches schema_version 2.
+    The lift of the legacy top-level infra-resume counters into
+    ``retry_ledger`` that this step once carried was retired by task 7135
+    after the stored blobs were migrated, so a top-level counter is now an
+    ordinary unknown key.
     """
 
-    def test_v1_blob_with_top_level_counters_lifted_into_retry_ledger(self):
+    def test_top_level_counters_stay_top_level(self):
         blob = {
             'schema_version': 1,
             'consecutive_infra_resume_failures': 4,
@@ -1595,88 +1668,23 @@ class TestRetryLedgerCounterMigration:
         }
         upgraded = apply_migrations(blob)
         assert upgraded['schema_version'] == 2
-        assert 'consecutive_infra_resume_failures' not in upgraded
-        assert 'last_infra_resume_iteration_count' not in upgraded
-        assert upgraded['retry_ledger'] == {
-            'consecutive_infra_resume_failures': 4,
-            'last_infra_resume_iteration_count': 9,
-        }
-
-    def test_v0_blob_chains_through_v1_to_v2_and_lifts_counters(self):
-        # No schema_version key at all -- chains v0->v1 (stamps 1) -> v1->v2
-        # (lifts the counters, stamps 2) in one apply_migrations call.
-        blob = {
-            'consecutive_infra_resume_failures': 2,
-            'last_infra_resume_iteration_count': 3,
-        }
-        upgraded = apply_migrations(blob)
-        assert upgraded['schema_version'] == 2
-        assert 'consecutive_infra_resume_failures' not in upgraded
-        assert 'last_infra_resume_iteration_count' not in upgraded
-        assert upgraded['retry_ledger'] == {
-            'consecutive_infra_resume_failures': 2,
-            'last_infra_resume_iteration_count': 3,
-        }
-
-    def test_nested_retry_ledger_value_wins_on_conflict(self):
-        blob = {
-            'schema_version': 1,
-            'consecutive_infra_resume_failures': 4,
-            'last_infra_resume_iteration_count': 9,
-            'retry_ledger': {'consecutive_infra_resume_failures': 99},
-        }
-        upgraded = apply_migrations(blob)
-        assert upgraded['schema_version'] == 2
-        assert 'consecutive_infra_resume_failures' not in upgraded
-        assert 'last_infra_resume_iteration_count' not in upgraded
-        assert upgraded['retry_ledger'] == {
-            'consecutive_infra_resume_failures': 99,
-            'last_infra_resume_iteration_count': 9,
-        }
-
-    def test_non_dict_retry_ledger_left_untouched_no_lift(self):
-        blob = {
-            'schema_version': 1,
-            'consecutive_infra_resume_failures': 4,
-            'last_infra_resume_iteration_count': 9,
-            'retry_ledger': 'oops',
-        }
-        upgraded = apply_migrations(blob)
-        assert upgraded['schema_version'] == 2
-        assert upgraded['retry_ledger'] == 'oops'
         assert upgraded['consecutive_infra_resume_failures'] == 4
         assert upgraded['last_infra_resume_iteration_count'] == 9
+        assert 'retry_ledger' not in upgraded
 
-    def test_non_dict_retry_ledger_with_counters_warning_set_is_locked(self):
-        # apply_migrations alone (above) has no warnings to inspect -- this
-        # goes through parse_metadata to pin the resulting CENSUS signal for
-        # this corner. Because the malformed retry_ledger blocks the lift,
-        # the legacy counters stay top-level and unblessed, so they surface
-        # their own unknown_key warnings *in addition to* the invalid_field
-        # warning for the malformed retry_ledger value itself. This double
-        # signal is intentional (malformed data should be loud, not silently
-        # swallowed) -- this test locks it down as such.
+    def test_dict_retry_ledger_left_as_is_beside_top_level_counters(self):
+        ledger = {'consecutive_infra_resume_failures': 99, 'consecutive_no_plan_failures': 1}
         blob = {
             'schema_version': 1,
             'consecutive_infra_resume_failures': 4,
             'last_infra_resume_iteration_count': 9,
-            'retry_ledger': 'oops',
+            'retry_ledger': dict(ledger),
         }
-        model, warnings = parse_metadata(blob, direction='read')
-
-        by_code: dict[str, set[str]] = {}
-        for w in warnings:
-            by_code.setdefault(w.code, set()).add(w.field)
-
-        assert by_code.get('invalid_field') == {'retry_ledger'}
-        assert by_code.get('unknown_key') == {
-            'consecutive_infra_resume_failures',
-            'last_infra_resume_iteration_count',
-        }
-        dumped = model.model_dump()
-        assert dumped['retry_ledger'] == 'oops'
-        assert dumped['consecutive_infra_resume_failures'] == 4
-        assert dumped['last_infra_resume_iteration_count'] == 9
+        upgraded = apply_migrations(blob)
+        assert upgraded['schema_version'] == 2
+        assert upgraded['retry_ledger'] == ledger
+        assert upgraded['consecutive_infra_resume_failures'] == 4
+        assert upgraded['last_infra_resume_iteration_count'] == 9
 
     def test_v1_blob_with_no_counters_still_upgraded_to_v2(self):
         blob = {'schema_version': 1, 'files': ['a.py']}
@@ -1684,36 +1692,7 @@ class TestRetryLedgerCounterMigration:
         assert upgraded['schema_version'] == 2
         assert upgraded['files'] == ['a.py']
 
-    def test_does_not_mutate_caller_input(self):
-        blob = {
-            'schema_version': 1,
-            'consecutive_infra_resume_failures': 4,
-            'retry_ledger': {'consecutive_no_plan_failures': 1},
-        }
-        original = copy.deepcopy(blob)
-        upgraded = apply_migrations(blob)
-        assert blob == original
-        # Mutating the *returned* nested dict must not reach back into the
-        # caller's blob -- the ledger sub-dict is copied, not shared.
-        upgraded['retry_ledger']['consecutive_no_plan_failures'] = 999
-        assert blob['retry_ledger']['consecutive_no_plan_failures'] == 1
-
-    def test_does_not_mutate_caller_input_when_no_counters_to_lift(self):
-        # No top-level legacy counters at all -- there is nothing to lift,
-        # but an existing dict retry_ledger must still be copied (never the
-        # same object as blob['retry_ledger']), not just when a lift occurs.
-        blob = {
-            'schema_version': 1,
-            'retry_ledger': {'consecutive_no_plan_failures': 1},
-        }
-        original = copy.deepcopy(blob)
-        upgraded = apply_migrations(blob)
-        assert blob == original
-        assert upgraded['retry_ledger'] is not blob['retry_ledger']
-        upgraded['retry_ledger']['consecutive_no_plan_failures'] = 999
-        assert blob['retry_ledger']['consecutive_no_plan_failures'] == 1
-
-    def test_parse_metadata_suppresses_legacy_counter_unknown_key_warnings(self):
+    def test_parse_metadata_reports_top_level_counters_as_unknown_keys(self):
         model, warnings = parse_metadata(
             {
                 'consecutive_infra_resume_failures': 5,
@@ -1722,11 +1701,9 @@ class TestRetryLedgerCounterMigration:
             direction='read',
         )
         unknown_key_fields = {w.field for w in warnings if w.code == 'unknown_key'}
-        assert 'consecutive_infra_resume_failures' not in unknown_key_fields
-        assert 'last_infra_resume_iteration_count' not in unknown_key_fields
-        assert model.retry_ledger is not None
-        assert model.retry_ledger.consecutive_infra_resume_failures == 5
-        assert model.retry_ledger.last_infra_resume_iteration_count == 2
+        assert 'consecutive_infra_resume_failures' in unknown_key_fields
+        assert 'last_infra_resume_iteration_count' in unknown_key_fields
+        assert model.retry_ledger is None
 
 
 class TestParseMetadataCore:
@@ -1977,6 +1954,23 @@ class TestParseMetadataFailurePolicy:
         register_metadata_submodel(_DEPLOY_STATE_STUB_KEY, _DeployStateStub)
         with pytest.raises((ValidationError, TypeError)):
             parse_metadata({_DEPLOY_STATE_STUB_KEY: [1, 2]}, direction='write', enforce=True)
+
+    # A RootModel submodel raises a bare ValueError, not ValidationError, when
+    # the splatted mapping carries a `root` key beside any other key.
+    @pytest.mark.parametrize(
+        'raw',
+        [
+            pytest.param({'deferral': {'root': 1, 'kind': 'x'}}, id='deferral'),
+            pytest.param(
+                {'cancel_dispositions': [{'root': 1, 'parent': 'x'}]}, id='cancel_dispositions'
+            ),
+        ],
+    )
+    def test_a_root_model_slice_with_a_root_key_read_warns_never_raises(self, raw):
+        (key,) = raw
+        model, warnings = parse_metadata(raw, direction='read')
+        assert [(w.field, w.code) for w in warnings] == [(key, 'invalid_submodel')]
+        assert model.model_dump()[key] == raw[key]
 
     def test_x_prefixed_unknown_key_silent_zero_warnings(self):
         model, warnings = parse_metadata({'x_experimental': 'v'}, direction='write')
@@ -2274,6 +2268,27 @@ class TestParseMetadataFailurePolicy:
             f'Expected no unknown_key warning for last_blocked_at; got: {offending}'
         )
 
+    @pytest.mark.parametrize(
+        ('key', 'value'),
+        [
+            ('merge_first_enqueued_at', 1751800000.25),
+            ('merge_phase_liveness', {'entered_at': '2026-11-15T00:00:00+00:00'}),
+        ],
+    )
+    def test_merge_lane_stamp_metadata_key_is_blessed(self, key, value):
+        """Merge-lane machine stamps are blessed rather than x_-renamed (task 5281).
+
+        Their census and rationale have one copy, the `_BLESSED_METADATA_KEYS`
+        comment in shared/src/shared/task_metadata.py.
+        """
+        model, warnings = parse_metadata({key: value}, direction='read')
+        offending = [w for w in warnings if w.code == 'unknown_key' and w.field == key]
+        assert offending == [], f'Expected no unknown_key warning for {key}; got: {offending}'
+        assert (model.model_extra or {})[key] == value
+
+        _, write_warnings = parse_metadata({key: value}, direction='write', enforce=True)
+        assert [w for w in write_warnings if w.field == key] == []
+
     def test_pending_since_metadata_keys_are_blessed(self):
         """The scheduler's pending-wait anchor must not census-warn (task 3816).
 
@@ -2389,6 +2404,23 @@ class TestParseMetadataFailurePolicy:
             f'{near_miss_alias} must stay unblessed so its drift line keeps appearing '
             f'in the census; got warnings: {warnings}'
         )
+
+    def test_cancel_with_children_keys_are_known(self):
+        """`superseded_by` and `cancel_dispositions` never census-warn (plans/cancel-with-children-prd.md §4.8)."""
+        _, warnings = parse_metadata(
+            {'superseded_by': [8032], 'cancel_dispositions': []}, direction='read'
+        )
+
+        assert [w for w in warnings if w.code == 'unknown_key'] == []
+
+    def test_superseded_by_tier_b_alias_still_warns(self):
+        """`subsumed_by` is the one un-prefixed Tier-B alias of `superseded_by`, so it carries the drift line.
+
+        The row's `x_`-prefixed aliases are Tier-C silent by the parser's `x_` rule (esc-8142-1).
+        """
+        _, warnings = parse_metadata({'subsumed_by': [8032]}, direction='read')
+
+        assert 'subsumed_by' in {w.field for w in warnings if w.code == 'unknown_key'}
 
     def test_execution_class_metadata_key_is_blessed(self):
         """The recon-stage execution-class discriminator must not census-warn (task 3780).
@@ -2759,7 +2791,7 @@ class TestParseMetadataFailurePolicy:
 
     @pytest.mark.parametrize('blob', _NON_OBJECT_BLOBS)
     def test_non_object_blob_read_warns_never_raises(self, blob):
-        model, warnings = parse_metadata(blob, direction='read')  # type: ignore[arg-type]
+        model, warnings = parse_metadata(blob, direction='read')
         assert model == TaskMetadata()
         assert len(warnings) == 1
         assert warnings[0].code == 'not_an_object'
@@ -2767,7 +2799,7 @@ class TestParseMetadataFailurePolicy:
 
     @pytest.mark.parametrize('blob', _NON_OBJECT_BLOBS)
     def test_non_object_blob_write_warn_mode_accepts(self, blob):
-        model, warnings = parse_metadata(  # type: ignore[arg-type]
+        model, warnings = parse_metadata(
             blob, direction='write', enforce=False
         )
         assert model == TaskMetadata()
@@ -2777,7 +2809,20 @@ class TestParseMetadataFailurePolicy:
     @pytest.mark.parametrize('blob', _NON_OBJECT_BLOBS)
     def test_non_object_blob_write_enforce_raises(self, blob):
         with pytest.raises((TypeError, ValueError)):
-            parse_metadata(blob, direction='write', enforce=True)  # type: ignore[arg-type]
+            parse_metadata(blob, direction='write', enforce=True)
+
+    def test_non_str_non_dict_python_value_is_not_an_object(self):
+        results = [
+            (parse_metadata(42, direction='read'), 'int'),
+            (parse_metadata(1.5, direction='read'), 'float'),
+            (parse_metadata(False, direction='read'), 'bool'),
+            (parse_metadata(['a'], direction='read'), 'list'),
+        ]
+        for (model, warnings), type_name in results:
+            assert model == TaskMetadata()
+            assert len(warnings) == 1, (type_name, warnings)
+            assert warnings[0].code == 'not_an_object'
+            assert warnings[0].message.endswith(f'got {type_name}')
 
 
 class _CheckStub(BaseModel):

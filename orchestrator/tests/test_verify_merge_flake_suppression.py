@@ -293,18 +293,20 @@ class TestWithPytestTimeoutStr:
         cmd = 'mypy src/'
         assert _with_pytest_timeout_str(cmd, 300) == cmd
 
-    def test_composes_with_serial_pytest_str(self):
+    def test_composes_with_serial_confirm_pytest_str(self):
         """The α confirm command is
-        _with_pytest_timeout_str(_serial_pytest_str(scoped)) — both flags
-        must survive composition (serial recovery + generous per-test timeout).
+        _with_pytest_timeout_str(_serial_confirm_pytest_str(scoped)) — both
+        flags must survive composition (serial + generous per-test timeout).
+        With no config and no ``-n`` there is no xdist in play, so the serial
+        part is the recovery form.
         """
-        from orchestrator.verify import _serial_pytest_str, _with_pytest_timeout_str
+        from orchestrator.verify import _serial_confirm_pytest_str, _with_pytest_timeout_str
 
         base = (
             'uv run --project orchestrator --directory orchestrator '
             'pytest tests/ --tb=short -q'
         )
-        composed = _with_pytest_timeout_str(_serial_pytest_str(base, invocation_dir=None), 300)
+        composed = _with_pytest_timeout_str(_serial_confirm_pytest_str(base, invocation_dir=None), 300)
         assert composed is not None
         assert '-p no:xdist' in composed
         assert '-o addopts=' in composed

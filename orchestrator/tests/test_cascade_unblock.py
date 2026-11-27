@@ -488,7 +488,7 @@ class TestCascadeUnblockIntegration:
 
         harness.scheduler.get_status = AsyncMock(return_value='blocked')
 
-        queue.resolve(l2.id, 'dismissed resolution', dismiss=True)
+        queue.resolve(l2.id, 'dismissed resolution', dismiss=True, resolution_class='benign')
         await asyncio.gather(*list(harness._background_tasks))
 
         # Member has status='dismissed', so the helper should NOT flip
@@ -545,7 +545,7 @@ class TestCascadeUnblockIntegration:
         harness.scheduler.get_task = AsyncMock(side_effect=_get_task_side_effect)
 
         with caplog.at_level(logging.DEBUG):
-            queue.resolve(l2.id, 'root cause fixed', dismiss=False)
+            queue.resolve(l2.id, 'root cause fixed', dismiss=False, resolution_class='actionable')
             await asyncio.gather(*list(harness._background_tasks))
 
         # blocked task was flipped
@@ -587,7 +587,7 @@ class TestCascadeUnblockIntegration:
         harness.scheduler.get_status = AsyncMock(return_value='blocked')
 
         # queue.resolve is synchronous; wake events should be set immediately after it returns
-        queue.resolve(l2.id, 'wake regression test', dismiss=False)
+        queue.resolve(l2.id, 'wake regression test', dismiss=False, resolution_class='actionable')
 
         # Wake events must be set SYNCHRONOUSLY — before any async gather
         assert event_a.is_set(), "Wake event for task-a must be set synchronously"

@@ -10,6 +10,7 @@ from fused_memory.config.schema import FusedMemoryConfig
 from fused_memory.models.enums import ClassificationFallback, MemoryCategory
 from fused_memory.models.memory import ClassificationResult
 from fused_memory.routing.json_extract import extract_json
+from fused_memory.routing.openai_client import LazyOpenAIClient, routing_chat_params
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +57,14 @@ Respond as JSON:
 }"""
 
 
+def _optional_category(value: object) -> MemoryCategory | None:
+    """The secondary category, or None for any answer that names none ("null", "none", 42, ...)."""
+    try:
+        return MemoryCategory(value)
+    except ValueError:
+        return None
+
+
 class WriteClassifier:
     """Classifies content into a MemoryCategory for write routing.
 
@@ -66,22 +75,11 @@ class WriteClassifier:
         self, config: FusedMemoryConfig, *, openai_client: AsyncOpenAI | None = None,
     ):
         self.config = config
-        self._openai_client: AsyncOpenAI | None = openai_client
-
-    def _get_openai_client(self) -> AsyncOpenAI:
-        if self._openai_client is None:
-            cfg = self.config.llm
-            api_key = None
-            if cfg.providers.openai:
-                api_key = cfg.providers.openai.api_key
-            self._openai_client = AsyncOpenAI(api_key=api_key)
-        return self._openai_client
+        self._openai = LazyOpenAIClient(config, openai_client)
 
     async def close(self) -> None:
-        """Release the AsyncOpenAI connection pool this classifier holds, built or injected."""
-        client, self._openai_client = self._openai_client, None
-        if client is not None:
-            await client.close()
+        """Release the AsyncOpenAI this classifier holds, built or injected."""
+        await self._openai.close()
 
     async def classify(self, content: str) -> ClassificationResult:
         """Classify content — heuristic first, LLM fallback."""
@@ -139,16 +137,14 @@ class WriteClassifier:
 
     async def _llm_classify(self, content: str) -> ClassificationResult:
         """Use LLM for classification."""
-        client = self._get_openai_client()
         try:
+            client = self._openai.get()
             response = await client.chat.completions.create(
-                model=self.config.llm.model,
                 messages=[
                     {'role': 'system', 'content': CLASSIFICATION_SYSTEM_PROMPT},
                     {'role': 'user', 'content': content[:2000]},
                 ],
-                temperature=0.0,
-                max_tokens=256,
+                **routing_chat_params(self.config),
             )
             raw = response.choices[0].message.content or ''
 
@@ -165,7 +161,7 @@ class WriteClassifier:
 
             data = json.loads(json_str)
             primary = MemoryCategory(data['primary'])
-            secondary = MemoryCategory(data['secondary']) if data.get('secondary') else None
+            secondary = _optional_category(data.get('secondary'))
             confidence = float(data.get('confidence', 0.7))
             reasoning = data.get('reasoning', '')
 

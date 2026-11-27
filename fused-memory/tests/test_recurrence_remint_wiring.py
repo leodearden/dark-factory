@@ -16,7 +16,7 @@ import pathlib
 import pytest
 import pytest_asyncio
 from _ast_guard import calls_named, parse_python_module
-from _fm_helpers import poll_until
+from _fm_polling import poll_until
 
 from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend
 from fused_memory.config.schema import TaskmasterConfig

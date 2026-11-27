@@ -13,7 +13,7 @@ import pytest
 from sampler.metrics import SampleKey
 
 RUNQ = SampleKey('runqueue_ratio')
-VERIFY = SampleKey('verify_concurrency')
+DEPTH = SampleKey('occt_queue_depth')
 PSI_CPU = SampleKey('psi_cpu_some_avg10')
 
 # ---------------------------------------------------------------------------
@@ -145,7 +145,7 @@ CREATE TABLE IF NOT EXISTS meta (
 
 _LegacyRow = tuple[int, str, float, float | None, float | None]
 
-_LEAF_INDEXES = ['idx_samples_metric_leaf_ts', 'idx_samples_metric_ts_leaf']
+_CURRENT_INDEXES = ['idx_samples_metric_leaf_ts', 'idx_samples_metric_ts_leaf', 'idx_samples_ts']
 
 
 def _legacy_store(db_path: Path, rows: list[_LegacyRow]) -> None:
@@ -254,7 +254,7 @@ class TestLoadSampleStoreSchema:
             'ts', 'metric', 'value', 'window_mean', 'window_max', 'leaf'
         ]
 
-    def test_the_indexes_are_metric_ts_leaf_and_a_per_leaf_metric_leaf_ts(
+    def test_the_indexes_are_metric_ts_leaf_a_per_leaf_metric_leaf_ts_and_ts(
         self, tmp_path: Path
     ):
         from sampler.store import LoadSampleStore
@@ -263,7 +263,7 @@ class TestLoadSampleStoreSchema:
         LoadSampleStore(db_path)
 
         _columns, indexes = _shape(db_path)
-        assert indexes == _LEAF_INDEXES
+        assert indexes == _CURRENT_INDEXES
         conn = sqlite3.connect(str(db_path))
         try:
             indexed = {
@@ -278,10 +278,12 @@ class TestLoadSampleStoreSchema:
         assert indexed == {
             'idx_samples_metric_leaf_ts': ['metric', 'leaf', 'ts'],
             'idx_samples_metric_ts_leaf': ['metric', 'ts', 'leaf'],
+            'idx_samples_ts': ['ts'],
         }
         assert partial == {
             'idx_samples_metric_leaf_ts': True,
             'idx_samples_metric_ts_leaf': False,
+            'idx_samples_ts': False,
         }
 
     def test_SCHEMA_on_a_blank_file_has_the_shape_the_store_creates(self, tmp_path: Path):
@@ -349,7 +351,7 @@ class TestLoadSampleStoreSchema:
         store = LoadSampleStore(db_path)
 
         ts = int(time.time())
-        store.insert_sample(ts, VERIFY, 3.0, window_mean=2.5, window_max=4.0)
+        store.insert_sample(ts, DEPTH, 3.0, window_mean=2.5, window_max=4.0)
 
         conn = sqlite3.connect(str(db_path))
         row = conn.execute(
@@ -495,7 +497,7 @@ class TestLeafMigration:
 
         columns, indexes = _shape(legacy)
         assert columns[-1][1] == 'leaf', 'the next construction did not retry the migration'
-        assert indexes == _LEAF_INDEXES
+        assert indexes == _CURRENT_INDEXES
 
 
 # ---------------------------------------------------------------------------
@@ -519,12 +521,12 @@ class TestTrailingWindow:
         now = 1_000_000
 
         # Insert two prior values
-        store.insert_sample(now - 20, VERIFY, 10.0)
-        store.insert_sample(now - 10, VERIFY, 20.0)
+        store.insert_sample(now - 20, DEPTH, 10.0)
+        store.insert_sample(now - 10, DEPTH, 20.0)
 
         # trailing_window called with current value 30.0
         # -> window = [10.0, 20.0, 30.0], mean=20.0, max=30.0
-        mean, mx = store.trailing_window(VERIFY, 30.0)
+        mean, mx = store.trailing_window(DEPTH, 30.0)
         assert mean == pytest.approx(20.0)
         assert mx == pytest.approx(30.0)
 
@@ -536,8 +538,8 @@ class TestTrailingWindow:
 
         store.insert_sample(now - 10, SampleKey('other_metric'), 999.0)
 
-        # No prior rows for 'verify_concurrency'
-        mean, mx = store.trailing_window(VERIFY, 5.0)
+        # No prior rows for 'occt_queue_depth'
+        mean, mx = store.trailing_window(DEPTH, 5.0)
         assert mean == pytest.approx(5.0)
         assert mx == pytest.approx(5.0)
 
@@ -613,7 +615,7 @@ class TestTrailingWindow:
         [
             (SampleKey('own_cpu_some10', 'new.service'), SampleKey('own_cpu_some10', 'busy.service'), range(0)),
             (SampleKey('own_cpu_some10', 'back.service'), SampleKey('own_cpu_some10', 'busy.service'), range(3)),
-            (RUNQ, VERIFY, range(3)),
+            (RUNQ, DEPTH, range(3)),
         ],
         ids=['a-leaf-with-no-rows', 'a-leaf-with-fewer-rows-than-a-window', 'a-host-level-metric'],
     )
@@ -644,6 +646,12 @@ class TestTrailingWindow:
 # ---------------------------------------------------------------------------
 # Step-9 tests: cleanup_old, should_vacuum, maybe_vacuum
 # ---------------------------------------------------------------------------
+
+
+def _end_tick(store, now: int) -> None:
+    """The store calls that close a tick, in ``__main__.main``'s order."""
+    store.cleanup_old(now)
+    store.maybe_vacuum(now)
 
 
 class TestRetentionAndVacuum:
@@ -698,7 +706,7 @@ class TestRetentionAndVacuum:
         store = LoadSampleStore(tmp_path / 'db.sqlite')
         now = 1_000_000
 
-        store.maybe_vacuum(now)
+        _end_tick(store, now)
         # Call again at now + 1 (less than 86400s later) -> should be False
         assert store.should_vacuum(now + 1) is False
 
@@ -708,7 +716,7 @@ class TestRetentionAndVacuum:
         store = LoadSampleStore(tmp_path / 'db.sqlite')
         now = 1_000_000
 
-        store.maybe_vacuum(now)
+        _end_tick(store, now)
         assert store.should_vacuum(now + 86400) is True
 
     def test_maybe_vacuum_runs_and_records_timestamp(self, tmp_path: Path):
@@ -759,9 +767,9 @@ class TestRetentionAndVacuum:
         store = LoadSampleStore(tmp_path / 'db.sqlite')
         now = 1_000_000
 
-        store.maybe_vacuum(now)
+        _end_tick(store, now)
         # Second call on same day should be a no-op (no error)
-        store.maybe_vacuum(now + 3600)
+        _end_tick(store, now + 3600)
 
         # should_vacuum still False (only 1h elapsed)
         assert store.should_vacuum(now + 3600) is False
@@ -781,6 +789,14 @@ def _count_at(db_path: Path, ts: int) -> int:
         return conn.execute(
             'SELECT COUNT(*) FROM samples WHERE ts = ?', (ts,)
         ).fetchone()[0]
+    finally:
+        conn.close()
+
+
+def _count_all(db_path: Path) -> int:
+    conn = sqlite3.connect(str(db_path))
+    try:
+        return conn.execute('SELECT COUNT(*) FROM samples').fetchone()[0]
     finally:
         conn.close()
 
@@ -924,43 +940,17 @@ class TestThirtyDayRetention:
 class TestCleanupIsIntervalGated:
     """Why this gate exists, pinned so it cannot be "simplified" away.
 
-    The retention DELETE cannot use either index — both lead with metric, and a
-    leading-column index does not serve a bare-ts predicate — so every call is
-    a full table SCAN. Measured at 2.5M rows, a NO-OP cleanup (nothing
-    old enough to delete) costs 106.7 ms; extrapolated to the 12.96M-row
-    30-day steady state that is ~550 ms every 5 s, forever, to delete nothing.
+    Task 3592 measured the retention DELETE as a full table SCAN: at 2.5M
+    rows a NO-OP cleanup cost 106.7 ms, ~550 ms at the then 30-day steady
+    state, every 5 s, forever, to delete nothing. The gate amortises that to
+    once per interval, and it still caps the cleanup at once a day.
 
-    Two fixes were measured. Adding idx_samples_ts makes the plan an index
-    SEARCH at ~0 ms but grew the probe file 33% (98 -> 130 MB, i.e. 1.62 ->
-    ~2.15 GB at 30 d). The interval gate amortises the same scan to once per
-    interval, where 550 ms is irrelevant, and costs zero bytes. The gate wins
-    on 530 MB and on reusing the should_vacuum/last_vacuum_ts machinery next
-    door; its only cost is up to one interval of over-retention, which is
-    meaningless for a calibration corpus. Doing both would make the index dead
-    weight, so exactly one is taken.
+    Task 10456 added idx_samples_ts as well, which task 3592 had declined for
+    its file growth: at the 2026-11 corpus (26.6M rows) the once-a-day scan
+    took 70.2 s, and the per-consumer group multiplies the table about 8x.
+    The DELETE is now an index search
+    (sampler/tests/test_due_groups.py::TestTheCleanupDeleteIsAnIndexSearch).
     """
-
-    def test_the_cleanup_delete_is_still_a_full_scan(self, tmp_path: Path):
-        """The measured fact the gate is the answer to — read off the schema."""
-        from sampler.store import LoadSampleStore
-
-        db_path = tmp_path / 'db.sqlite'
-        LoadSampleStore(db_path)
-
-        conn = sqlite3.connect(str(db_path))
-        try:
-            plan = ' '.join(
-                str(row[3])
-                for row in conn.execute(
-                    'EXPLAIN QUERY PLAN DELETE FROM samples WHERE ts < ? OR ts > ?',
-                    (0, 0),
-                ).fetchall()
-            )
-        finally:
-            conn.close()
-
-        assert 'SCAN samples' in plan, plan
-        assert 'USING INDEX' not in plan, plan
 
     def test_virgin_store_is_due_and_running_prunes_and_stamps(self, tmp_path: Path):
         from sampler.store import LoadSampleStore
@@ -1125,6 +1115,97 @@ class TestCleanupIsIntervalGated:
         assert store.should_vacuum(now) is True
 
 
+class TestRetentionIsBoundedPerTick:
+    """No tick deletes more than ``max_rows``; a backlog drains over the ticks after."""
+
+    def test_a_backlog_over_budget_drains_over_several_ticks_never_more_than_the_budget(
+        self, tmp_path: Path
+    ):
+        from sampler.store import LoadSampleStore
+
+        db_path = tmp_path / 'db.sqlite'
+        store = LoadSampleStore(db_path)
+        now = 10_000_000
+        _bulk_insert(db_path, RUNQ.metric, now - THIRTY_DAYS - DAY, 25, step=1)
+        _bulk_insert(db_path, RUNQ.metric, now + THIRTY_DAYS + DAY, 7, step=1)
+        kept = (now - 60, now, now + 60)
+        for ts in kept:
+            store.insert_sample(ts, RUNQ, 1.0)
+
+        returns: list[int] = []
+        last_tick = now
+        for k in range(10):
+            last_tick = now + 5 * k
+            before = _count_all(db_path)
+            deleted = store.cleanup_old(last_tick, max_rows=10)
+            assert deleted <= 10, returns
+            assert before - _count_all(db_path) == deleted, returns
+            returns.append(deleted)
+            if deleted < 10:
+                break
+
+        assert returns == [10, 10, 10, 2]
+        assert _count_all(db_path) == 3
+        assert [_count_at(db_path, ts) for ts in kept] == [1, 1, 1]
+        assert store.should_cleanup(last_tick) is False
+        assert store.cleanup_old(last_tick + 5, max_rows=10) == 0
+
+    def test_a_full_chunk_leaves_the_sweep_due_and_its_clock_unstamped(self, tmp_path: Path):
+        from sampler.store import LoadSampleStore
+
+        db_path = tmp_path / 'db.sqlite'
+        store = LoadSampleStore(db_path)
+        now = 10_000_000
+        _bulk_insert(db_path, RUNQ.metric, now - THIRTY_DAYS - DAY, 15, step=1)
+
+        assert store.cleanup_old(now, max_rows=10) == 10
+        assert _meta(db_path, 'last_cleanup_ts') is None
+        assert store.should_cleanup(now) is True
+
+        assert store.cleanup_old(now + 5, max_rows=10) == 5
+        assert _meta(db_path, 'last_cleanup_ts') == str(now + 5)
+
+    def test_a_backlog_exactly_one_budget_deep_finishes_on_a_zero_row_call(
+        self, tmp_path: Path
+    ):
+        from sampler.store import LoadSampleStore
+
+        db_path = tmp_path / 'db.sqlite'
+        store = LoadSampleStore(db_path)
+        now = 10_000_000
+        _bulk_insert(db_path, RUNQ.metric, now - THIRTY_DAYS - DAY, 10, step=1)
+
+        assert store.cleanup_old(now, max_rows=10) == 10
+        assert _meta(db_path, 'last_cleanup_ts') is None
+
+        assert store.cleanup_old(now + 5, max_rows=10) == 0
+        assert _meta(db_path, 'last_cleanup_ts') == str(now + 5)
+
+    @pytest.mark.parametrize('sweep_due', [True, False], ids=['due', 'not-due'])
+    @pytest.mark.parametrize('bad', [0, -1])
+    def test_a_budget_below_one_row_is_refused(
+        self, tmp_path: Path, bad: int, sweep_due: bool
+    ):
+        """0 would never finish a sweep; -1 is an unbounded LIMIT in SQLite."""
+        from sampler.store import LoadSampleStore
+
+        db_path = tmp_path / 'db.sqlite'
+        store = LoadSampleStore(db_path)
+        now = 10_000_000
+        if not sweep_due:
+            store.cleanup_old(now - 5)
+        stamp = _meta(db_path, 'last_cleanup_ts')
+        assert store.should_cleanup(now) is sweep_due
+        stale = now - THIRTY_DAYS - 60
+        store.insert_sample(stale, RUNQ, 1.0)
+
+        with pytest.raises(ValueError, match=rf'max_rows .* got {bad}$'):
+            store.cleanup_old(now, max_rows=bad)
+
+        assert _count_at(db_path, stale) == 1
+        assert _meta(db_path, 'last_cleanup_ts') == stamp
+
+
 # ---------------------------------------------------------------------------
 # Review suggestion 1: the daily VACUUM was sized for 24h retention, not 30d
 # ---------------------------------------------------------------------------
@@ -1198,9 +1279,11 @@ class TestVacuumIsGatedOnThereBeingSomethingToReclaim:
         store = LoadSampleStore(tmp_path / 'db.sqlite', connect=spy)
         _bulk_insert(store.db_path, 'psi_cpu_some_avg10', 1_000_000, 5000)
 
-        store.maybe_vacuum(1_000_000)
+        _end_tick(store, 1_000_000)
 
-        assert spy.opened, 'the connect spy never fired, so the absence below pins nothing'
+        assert store.should_vacuum(1_000_000 + 1) is False, (
+            'the vacuum gate was never evaluated, so the absence below pins nothing'
+        )
         assert not [sql for sql in spy.executed if _is_vacuum(sql)], (
             'VACUUM rewrote a file with no free pages'
         )
@@ -1219,7 +1302,7 @@ class TestVacuumIsGatedOnThereBeingSomethingToReclaim:
         store = LoadSampleStore(tmp_path / 'db.sqlite')
         _bulk_insert(store.db_path, 'psi_cpu_some_avg10', 1_000_000, 5000)
 
-        store.maybe_vacuum(1_000_000)
+        _end_tick(store, 1_000_000)
 
         assert store.should_vacuum(1_000_000 + 1) is False
         assert store.should_vacuum(1_000_000 + 86400) is True
@@ -1242,6 +1325,34 @@ class TestVacuumIsGatedOnThereBeingSomethingToReclaim:
         )
         assert spy.vacuums_ran_on() == [True]
         assert store.db_path.stat().st_size < size_before
+
+    def test_a_prune_spread_over_several_ticks_is_judged_whole(self, tmp_path: Path):
+        """Ticks run as ``__main__.main`` does: ``cleanup_old`` then ``maybe_vacuum``."""
+        from sampler.store import LoadSampleStore
+
+        spy = ConnectSpy()
+        store = LoadSampleStore(tmp_path / 'db.sqlite', connect=spy)
+        _bulk_insert(store.db_path, 'psi_cpu_some_avg10', 1_000_000, 20_000)
+        now = 1_000_000 + 20_000 * 5
+        chunk = 1_000
+
+        tick = now
+        while store.cleanup_old(tick, retain_seconds=100, max_rows=chunk) == chunk:
+            store.maybe_vacuum(tick)
+            tick += 5
+
+        assert tick > now, 'the prune fit one chunk, so this is not a multi-tick sweep'
+        assert _meta(store.db_path, 'last_vacuum_ts') is None, (
+            'the vacuum gate was evaluated, and its clock stamped, mid-sweep'
+        )
+        assert not [sql for sql in spy.executed if _is_vacuum(sql)], 'compacted mid-sweep'
+
+        store.maybe_vacuum(tick)
+
+        assert spy.vacuums_ran_on() == [True], (
+            'the finished prune left the file mostly free pages, yet it was not compacted'
+        )
+        assert _meta(store.db_path, 'last_vacuum_ts') == str(tick)
 
 
 # ---------------------------------------------------------------------------
@@ -1277,7 +1388,7 @@ class TestWriteTickIsOneConnectionAndOneTransaction:
             now,
             unwindowed={PSI_CPU: 1.0, SampleKey('psi_mem_full_avg10'): 2.0},
             windowed={
-                VERIFY: 3.0,
+                DEPTH: 3.0,
                 **{SampleKey('own_cpu_some10', f'leaf{i}'): float(i) for i in range(leaves)},
             },
         )
@@ -1406,7 +1517,7 @@ class TestWriteTickIsOneConnectionAndOneTransaction:
         store.write_tick(
             1_000_000,
             unwindowed={PSI_CPU: 1.5},
-            windowed={VERIFY: 4.0},
+            windowed={DEPTH: 4.0},
         )
 
         conn = sqlite3.connect(str(store.db_path))
@@ -1420,7 +1531,7 @@ class TestWriteTickIsOneConnectionAndOneTransaction:
         finally:
             conn.close()
         assert rows['psi_cpu_some_avg10'] == (None, None)
-        assert rows['verify_concurrency'] == (4.0, 4.0)
+        assert rows['occt_queue_depth'] == (4.0, 4.0)
 
     def test_the_batched_windows_agree_with_the_trailing_window_helper(
         self, tmp_path: Path
@@ -1435,11 +1546,11 @@ class TestWriteTickIsOneConnectionAndOneTransaction:
 
         store = LoadSampleStore(tmp_path / 'db.sqlite')
         for i in range(5):
-            store.insert_sample(1_000_000 + i, VERIFY, float(i))
-        expected = store.trailing_window(VERIFY, 99.0)
+            store.insert_sample(1_000_000 + i, DEPTH, float(i))
+        expected = store.trailing_window(DEPTH, 99.0)
 
         store.write_tick(
-            1_000_010, unwindowed={}, windowed={VERIFY: 99.0}
+            1_000_010, unwindowed={}, windowed={DEPTH: 99.0}
         )
 
         conn = sqlite3.connect(str(store.db_path))

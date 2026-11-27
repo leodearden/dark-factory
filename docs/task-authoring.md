@@ -151,7 +151,8 @@ marked `done` on the strength of an unverified claim.
 | `merged` | Landed via the normal merge queue | `commit` required |
 | `found_on_main` | Discovered already on `main` (e.g. stranded-task recovery) | `commit` **and** `note` required; `stamped_at` written server-side (see below) |
 | `deterministic-deploy` | `DeterministicRunner` cross-unit deploy completed | — |
-| `deterministic-deploy-scheduled` | `DeterministicRunner` self-restart scheduled via detached `systemd-run` | — |
+| `deterministic-deploy-scheduled` | `DeterministicRunner` self-restart scheduled via detached `systemd-run`; dependents wait until the restart is verified (see `docs/deterministic-runner.md` §2) | — |
+| `deterministic-deploy-unverified` | `DeterministicRunner` cross-unit deploy with no `before_done.target_unit`: the script exited 0 (or a human resolved its gate or failure); no unit was inspected or verified | — |
 | `deterministic-gate` | A pure deterministic gate (no `before_done`) resolved | `escalation_id` **required on write** — cites the resolving gate escalation, recorded verbatim (no cross-service lookup) |
 | `deterministic-milestone` | A `kind='predicate'` milestone check exited `0` | — |
 | `operational-verified` | A `normal`-task no-code operational ask closed via a resolved escalation, not a merge | `escalation_id` **and** `note` required |
@@ -168,7 +169,10 @@ for every kind:
 - **Evidence is type-checked, not filtered.** A wrongly-typed field such as
   `pid: "abc"` or `fire_delay_secs: "soon"` refuses the whole write with
   `done_provenance_invalid`; it is not silently dropped. A well-typed field
-  the kind does not record (for example `pid` on `merged`) is discarded.
+  the kind does not record (for example `pid` on `merged`, or an
+  `escalation_id` on a kind whose row above does not name it) is
+  discarded, so cite a resolving escalation in `note` when the kind does
+  not record one.
 - **The `deterministic-gate` `escalation_id` requirement is write-time
   only.** New `done` writes must carry it, while stored blobs written before
   task 5241, which lack it, still read without a schema warning.
@@ -183,7 +187,7 @@ callers, on both the fresh `done` transition and the same-status
 `done`→`done` repair path — a recon stage may never self-authorize an
 operational close.
 
-The four `deterministic-*` kinds carry a caller bar of the same shape, with
+The five `deterministic-*` kinds carry a caller bar of the same shape, with
 two factors (PRD `plans/memory-auto-consolidation-prd.md` C5/D11, where the
 rationale lives). They are accepted only from a caller whose resolved
 identity matches a prefix in
@@ -306,6 +310,18 @@ mechanism. A task dispatches only once every local dependency reaches a
 TERMINAL status (`done`/`cancelled`); an intra-atomic-train
 `merge-deferred` sibling is also accepted as satisfying.
 
+The store refuses an edge that would close a cycle.
+`add_dependency(A, B)` and `update_task(A, dependencies=[…B…])` walk from
+B over the local table at every status: a `done` or `cancelled` task's
+edges count, so reopening it cannot revive a cycle. A refusal carries
+`error_type` `DependencyCycle` and `cycle` `[A, B, …, A]`, and nothing is
+written: remove one of the named edges rather than retrying the call.
+Self-loops and missing ids are refused on both; `update_task` exempts a
+missing id already stored for the task, since writing it back adds no
+edge. The graph is local only:
+qualified external deps (§3.2) are not walked. The rule's home is
+`shared/src/shared/dependency_cycle.py`.
+
 ### 3.2 Cross-project external dependencies
 
 A task can declare a dependency on a task in **another** project using the
@@ -390,6 +406,15 @@ another project's files. A submission from an **unregistered** filer, or one
 that **mixes** local and foreign files, is **not** tagged and stays a hard
 path-scope reject (the task-2206 anti-bypass guard is preserved).
 
+Ownership of a **relative** `metadata.files` entry is resolved against the
+filing project's own root first: an entry whose leading directory exists in
+the filing project is that project's, even when another registered project
+has a same-named top-level directory (a stream_touch `sessions/…` entry is
+never credited to mission_control). Only an entry whose leading directory
+exists solely in another project makes the task cross-repo; generic names
+such as `docs/` or `src/` count for neither side. The rule has one home:
+`fused-memory/src/fused_memory/middleware/project_prefix_registry.py::ProjectPrefixRegistry.attributed_owner`.
+
 When the marker is present, the orchestrator pre-merge narrowing gate treats
 the task as a cross-repo deliverable: instead of flagging "files not
 touched" and forcing a dishonest plan-narrowing pass, it routes the merge
@@ -431,9 +456,17 @@ its own advisory escalation at submit time; here it only supplies an owner
 Metadata that is present but unreadable is a logged **SKIP** — dispatch
 proceeds (an unparseable blob is not evidence of a misfile) but the gate says
 loudly that it read nothing, so a skipped check never passes for a clean one.
-Absent metadata is the ordinary shape and is silent. The fix for a blocked task
-is to **refile it under the owning project** (or correct its `metadata.files`),
-not to unblock it in place.
+Absent metadata is the ordinary shape and is silent. When one of the two legs
+fired, the fix for the blocked task is to **refile it under the owning project**
+(or correct its `metadata.files`), not to unblock it in place.
+
+If the classifier itself raises, the gate fails **CLOSED**: the task is blocked
+(same `block_reason='cross_repo_misfile'`) and an L1 is filed whose summary
+starts `CROSS_REPO_UNVERIFIED` and states that nothing about the task's paths
+was established. That L1's advice is the opposite of the refile advice: the fix
+is in the orchestrator (fix the classifier or the metadata shape that crashed
+it, then unblock the task), **not** a refile. Both renderings live in
+`orchestrator/src/orchestrator/cross_repo_gate.py::block_escalation_text`.
 
 The merge-time `OutcomeKind.plan_files_cross_repo` route above is unchanged
 and still applies to a task that reaches merge by another path. It was
@@ -604,7 +637,7 @@ gates):
 |---|---|---|
 | `vacuous_present` | `expect: present` check already passes at authoring (the pattern matches, or every listed path exists) | task **5799** asserted `present` for patterns its own diff was scoped to *remove* — necessarily present already, which is what made them removable; the wedge landed on dependent 5919 |
 | `vacuous_present_self_referential` | the only matches are the descriptor's own `pattern:` line in a manifest | task **2863**'s `fable-architect-eval-decision`, whose first match was the sidecar declaring it |
-| `vacuous_present_comment_only` | the only matches are comments, not code | task **2792**'s `archive_task_transcripts`, matching one fossil comment in `git_ops.py` |
+| `vacuous_present_comment_only` | the only matches are comments, not code; in a markdown file only an HTML `<!--` comment line counts, and a heading or bullet is content | task **2792**'s `archive_task_transcripts`, matching one fossil comment in `git_ops.py` |
 | `vacuous_absent` | `expect: absent` check already passes at authoring (the pattern does not match, or no listed path exists) | the mirror cell: nothing to remove, so the check is green before any work starts |
 | `filename_shaped` | `kind: grep`, `expect: present` pattern has zero content matches and either names a tracked **filename**, or is exactly the basename or stem of a file the task declares in `metadata.files` inside the check's `paths` (the file need not exist yet) | task **3536**'s `test_workflow_merge_gating_strand` — authored before 3536 created that module, and a test module does not mention its own name, so `git grep` (which reads *contents*) could never see it. The rejection names the `kind: "path"` descriptor that says what was meant (see *Choosing a descriptor*) |
 | `shim_path` | a `kind: grep`, `expect: present` check whose `paths` names a `.py` file that rebinds `sys.modules[__name__]`: an alias shim, so the code it asserts lives elsewhere | task **5036** left `orchestrator/src/orchestrator/merge_queue.py`, `landing_evidence.py`, `merge_gates.py` and others as 12-line shims over `orchestrator/merge_lane/`, stranding checks of 2886, 2887, 4033, 4646–4648, 4651, 4652, 4830 and 5388 |
@@ -684,8 +717,11 @@ only on `broken` (a done producer whose capability is nowhere on main),
 check) and an actionable stale path (a live producer, or a done one with open
 dependents; the rest are listed report-only); `superseded` — a correct
 descriptor that later work legitimately undid — is reported and never
-actionable. A separate report-only section lists sidecar
-descriptors carrying a structural code (`vacuous_present_self_referential`,
+actionable. Grep and path descriptors both get a disposition; a grep's
+supersession is read from the commits that changed its pattern's occurrences,
+a path's from the commits that deleted it (expect: present) or created it
+(expect: absent). A separate report-only
+section lists sidecar descriptors carrying a structural code (`vacuous_present_self_referential`,
 `vacuous_present_comment_only`, `filename_shaped`). Those codes are measured
 against today's tree, and a reworded comment or a later file flips them, so
 they never affect the exit code and no gating test sweeps them.
@@ -694,7 +730,15 @@ they never affect the exit code and no gating test sweeps them.
 mis-authored now carries an `AUTHORING DIAGNOSIS` block in its `detail`,
 naming the code and a remedy. Without it a malformed check and a genuinely
 undelivered capability produce identical records, and they need opposite
-responses.
+responses. Every such escalation also names the check's OWNER, which is the
+dependency whose `metadata.delivered_checks` declares it, never the blocked
+dependent. It says where the check is declared both as data in
+`delivered_check_owner` (`escalation/src/escalation/models.py::DeliveredCheckOwner`:
+the owner task, the check name, and the owner's sidecar with whether it declares
+the check on `main`) and as the `Check owner:` / `Declared in:` / `Sidecar:`
+lines of `detail`, which are rendered from that same value. A stale or
+mis-authored check is corrected at the owner's sites (see "Stale scope paths");
+the blocked dependent is only re-pended.
 
 **Dispatch-time policy**
 
@@ -702,7 +746,7 @@ responses.
 |---|---|
 | All checks DELIVERED on `main@SHA` | Satisfied — dep counts toward dispatch |
 | ≥1 check FAILED, consecutive-fail streak `< grace_cycles` | Withheld; `delivered_check_gate_held` event emitted each held tick (hold-visibility only) |
-| ≥1 check FAILED, streak reaches `grace_cycles` | Born-at-L2 `dependency_capability` escalation naming the failed check/pattern-or-script/dep id/`main` SHA; dependent → `blocked`; streak cleared (re-fires on a later re-crossing) |
+| ≥1 check FAILED, streak reaches `grace_cycles` | Born-at-L2 `dependency_capability` escalation naming the failed check/pattern-or-script/dep id/`main` SHA and the check's owner and declaration sites (`delivered_check_owner`); dependent → `blocked`; streak cleared (re-fires on a later re-crossing) |
 | A check ERRORS (git/script failure) or exceeds `check_timeout_secs` | Fail-safe wait — dep left uncached, **no** streak bump on either counter, retried next tick |
 | `delivered_checks.enabled = false` | Gate entirely inert — no sweep, no cache, no streaks, no escalation; the dep gate takes its legacy arm-off path as if the metadata didn't exist |
 
@@ -749,6 +793,24 @@ consequence it does not spell out: a missing, non-executable, or malformed
 and no escalation. That is a SILENT, indefinite hold on the dependent. Pin the
 script's existence and executability with a test.
 
+Every orchestrator, escalation and shared reader takes
+`metadata.delivered_checks` through
+`shared/src/shared/declared_checks.py::declared_checks`, so all of them read a
+malformed declaration the same way. Three tooling readers still read the key
+raw, by their own rules, and are not migrated yet:
+`scripts/audit_manifest_descriptor_drift.py::_delivered_check_entries`,
+`skills/review-all/scripts/program/clerk_batch.py::_checks` and
+`skills/review-all/scripts/program/seam_scan.py::_anchored`.
+
+An entry that is not a dict (a JSON object), or a value that is neither a list
+nor empty (a bare dict, a string, a number), is never a check and never
+"nothing declared". Both gates count it as ERRORED, but they degrade
+differently. The dependency gate holds the dependent: the same silent
+fail-safe hold as above. The mark-done gate withholds done and logs a WARNING,
+and its caller takes its own no-landing-evidence path, which degrades toward
+re-delivery. Landing evidence ignores the entry, and the briefing shows it as
+a malformed entry. Repair the record rather than wait it out.
+
 See `plans/write-triage-attach-target-contradiction.md` for the worked example
 (tasks 4762 / 4810 / 3169).
 
@@ -787,6 +849,7 @@ from it.
 | `grace_cycles` | `3` | Consecutive FAILED ticks (per dependent, dep pair) before the born-at-L2 escalation fires |
 | `check_timeout_secs` | `120` | Per-check wall-clock timeout; a hung check maps to the same fail-safe outcome as a runner error |
 | `max_checks_per_tick` | `50` | Per-tick fan-out budget across all checked deps |
+| `max_record_fetches_per_tick` | `50` | Per-tick fetch budget for terminal dep records, which the delivered-check gate and the scheduled self-deploy hold read (`docs/deterministic-runner.md` §2). Lowering it slows the cold-cache warm-up after a restart; one slot per tick is kept for never-cached deps |
 
 **Manual re-pend recipe:** exactly like the external-dep gate, a dependent
 blocked by this escalation is **not auto-re-pended**. Once the underlying
@@ -794,6 +857,200 @@ capability actually lands on `main` (or the check itself is fixed), an
 operator must manually set the dependent back to `pending` to reopen it —
 resolving the escalation records the human decision but does not by itself
 unblock the task.
+
+### 3.4 The follow-up holder (`metadata.followup_holder`)
+
+Each project has at most one **follow-up holder**: a task that never
+dispatches. Low-priority follow-ups wait behind it, parked by an ordinary
+local dependency edge, until a promotion removes that edge. The contract is
+`plans/follow-up-filing-shape-prd.md` §3 decisions 9–15 and §4.3. The one
+implementation is `fused-memory/src/fused_memory/middleware/followup_hold.py`.
+
+**The hold rule** (`followup_hold.py::hold_scope`). A task is held if its
+priority is `low` or `polish`, its `task_kind` is `normal` or absent, it
+carries no `execution_class`, and one of two arms matches:
+
+- **an uncited follow-up**: it was filed as a follow-up
+  (`metadata.source == 'agent-followup'` or
+  `metadata.spawn_context == 'review_suggestions'`) and carries none of
+  `prd_path`, `x_finding_key` or `human_decomposed`;
+- **a finding-set member**: it carries `x_finding_key` and a valid
+  `metadata.finding_set_hold {ruling}`, whatever its `source`, `prd_path`
+  or `human_decomposed`. The marker records a ruling that a review-finding
+  cleanup set is not to be scheduled individually; `ruling` names who ruled,
+  when, and on which finding. A marker that holds nothing logs one WARNING
+  naming `finding_set_hold` and the task (the backfill names the task id; a
+  filing not yet created is named `None`). That covers a malformed marker
+  and a valid one on a task the rule refuses, such as a medium priority or a
+  missing `x_finding_key`, and the WARNING says which condition failed.
+
+Every planning-mode birth carries `human_decomposed`, so the first arm never
+holds a PRD decompose, and neither arm holds a task that a finding cites
+unless it carries the marker. To keep a follow-up out of the hold, file it at
+a higher priority, or attach the finding key or PRD that makes it wanted.
+
+**Held means a dependency edge on the holder.** The edge decides whether a
+task is held now. `metadata.followup_hold`
+(`{holder, held_at, promoted?}`) is the record of the hold, and it stays on
+the task after a promotion as history. Every promotion trigger finds a held
+task through that record, so only `followup_hold.py` writes it: an
+`update_task` that would drop or rewrite it, a `replace` included, writes
+the stored record back unchanged (`followup_hold.py::carry_hold_record`). A
+held task can also carry other dependencies; the edges compose by AND.
+
+**Hold at filing.** A ticket-path `submit_task` that the rule matches is
+created already held. The holder id is appended to its `dependencies`, and
+its `followup_hold` record is written in the same `add_task`, so the
+scheduler never sees it ready. A `followup_held {task_id, holder_id}` event
+is journaled beside `task_created`, and the ticket's stored outcome
+(`result_json`) carries `held_by`, the holder's id; `resolve_ticket` does
+not return it. A `planning_mode` submission the rule matches, which can only
+be a marked finding-set member, is born `deferred` AND held the same way and
+journals the same `followup_held` event, so the set stays held after
+`commit_planning`. Its synchronous answer carries `held_by`, the holder's
+id, and an answer without `held_by` means the birth was not held. A failure
+of the hold, such as `DuplicateFollowupHolderError`, is answered like any
+failed planning insert, `{error, error_type}`, and the task is not created.
+Both paths share one helper,
+`followup_hold.py::hold_birth`. The holder is minted the first time a project needs one, and
+its mint journals a `task_created` event with `source:
+'followup-holder-mint'`, whether a filing or the backfill minted it.
+
+**The backfill.** Each fused-memory start runs the hold over every known
+project before the server serves
+(`fused-memory/src/fused_memory/server/main.py::backfill_followup_holds_at_startup`,
+walking the primary root plus `DASHBOARD_KNOWN_PROJECT_ROOTS`). It holds
+every `pending` task the rule matches unless the task already depends on the
+holder or already carries a `followup_hold` record, so a promoted or released
+task is never re-held and a second start holds nothing. It also leaves unheld
+any pending follow-up that an active, non-deferred task waits on, directly or
+through other stock follow-ups, whether that task is in the same project or in
+another known project that cites it in `metadata.external_deps`
+(`fused-memory/src/fused_memory/middleware/followup_hold.py::backfill`). Such
+a wait existed before the hold, and none of promotion's triggers
+(`plans/follow-up-filing-shape-prd.md` §3 decision 14) fires for it, so
+holding the follow-up would jam its dependent silently. An edge between two
+follow-ups the backfill holds stays held, since promotion's closure releases
+them together. If the backfill cannot read a known project's store, that
+project's backfill fails rather than holding blind. Each task's edge and
+record land in one backend write, with no `task_modified` event. Each
+project emits exactly one `followup_hold_backfilled {project_id, count}`
+event, even when `count` is 0. One project's failure is logged at ERROR and
+does not block startup or the other projects. The config key
+`followup_hold.backfill_enabled` (default `true`) is restart-only.
+
+**The holder's shape.** It is a deterministic pure gate:
+`task_kind='deterministic'`, `always_escalates=true`,
+`execution_class='decision'`, priority `low`, no dependencies, a
+`deferred_watch` text, and the marker `metadata.followup_holder`
+(`{project_id, minted_at}`). The store's marker is the only record of which
+task is the holder. If a lookup finds two live markers in one project, it
+raises `DuplicateFollowupHolderError` naming both ids. Then every filing in
+that project that the hold rule matches fails and creates no task, and so
+does the project's backfill, until all but one holder is released with
+`release_holder=True`. The holder is never a curator pool entry or a combine
+target.
+
+**Protection.** A `cancelled` or `done` dependency counts as satisfied, so one
+status write on the holder would release the whole held backlog at once.
+
+- `set_task_status` refuses `done`, `cancelled` and `deferred` on the holder
+  unless `release_holder` is the literal `true`. Releasing is a human act,
+  and it promotes every held follow-up at once (below), whichever of the
+  three statuses the holder takes.
+- `update_task` refuses a write that strips `followup_holder`, strips
+  `deferred_watch` or sets `trigger_met` on the holder. That covers a
+  `replace` that leaves either key out; an unchanged echo passes.
+
+Both refusals return error `followup_holder_protected`
+(`followup_hold.py::FollowupHolderProtectedError`). The error carries the
+holder's `held_count`, the number of active tasks that depend on it, and a
+`protection` field naming the rule that refused. Each refusal journals a
+`followup_holder_protected` event. `release_holder` is ignored on any task
+other than the holder.
+
+**Promotion** removes a held task's holder edge and stamps
+`followup_hold.promoted {by, at, ref}` in one backend write
+(`followup_hold.py::promote`), then journals one
+`followup_promoted {task_id, by, ref}` event. The exception is a human
+`update_task` replacement. There, the caller's own write drops the edge, and
+the stamp follows as a second write under the same lock, only once that
+write has landed (`followup_hold.py::promote_after_update`). It never writes
+`metadata.pending_since`, so a promoted task keeps its wait age. The
+contract is `plans/follow-up-filing-shape-prd.md` §3 decision 14 and §4.3.
+Every trigger runs under the project's write lock:
+
+- **An edge from a pending, unheld task** (`by: dependent`, `ref`: the
+  dependent's id): `add_dependency`, a task born with the edge through
+  `submit_task`, or an `update_task` `dependencies` replacement. An edge
+  between two held tasks promotes neither.
+- **A landing on `pending` from `deferred`** promotes the held tasks the
+  landing task depends on, the same way: `commit_planning` of a batch task,
+  a plain `set_task_status`, or the deferral-expiry sweep, which flips
+  through the same chokepoint. A held task landing back on `pending` stays
+  held.
+- **A citation** (`by: citation`, `ref`: the first finding key, else the PRD
+  path): an `update_task` on a held task whose metadata payload carries
+  `x_finding_key` or `prd_path`, the keys that keep a filing out of the hold.
+  A held task carrying `finding_set_hold` is the exception: its citation is
+  deferred before any registered guard runs, journaling
+  `followup_promotion_deferred` with `guard: finding_set_hold` and a reason
+  naming the ruling, and it stays held. Every other cause below promotes it
+  as usual; a human removal or the explicit release is how the set leaves the
+  hold.
+- **A combine** (`by: combine`, `ref`: the candidate's ticket id): the
+  curator combining a candidate the hold rule does not match into a held
+  target. A candidate the rule matches leaves its held target held.
+- **A human removal of the holder edge** (`by: human`):
+  `remove_dependency(task, holder)` (`ref: remove_dependency`), or an
+  `update_task` `dependencies` replacement that drops the holder id
+  (`ref: update_task`). The replacement is refused for every machine actor
+  class (orchestrator, harness, steward, reconciliation, escalation,
+  deterministic) with error `followup_holder_edge_strip_refused`, and
+  nothing is written: keep the holder id in the list. Removing any other
+  edge of a held task leaves it held.
+- **The explicit release** (`by: human`, `ref: release_holder`):
+  `set_task_status(holder, done|cancelled|deferred, release_holder=True)`
+  promotes every active held follow-up before targeted reconciliation runs,
+  so the cancelled-dependency sweep finds no held dependents. The same call
+  on a holder already at that status releases whatever is still held, so a
+  release that stopped partway, or that a guard deferred in part, can be
+  finished. Measured on 2026-11-22, df's holder had 2,903 held follow-ups;
+  releasing that many on a test SQLite store held the project's write lock
+  for 22.6 s. It also journals one `followup_promoted` per task, which is
+  more than the default reconciliation backlog limit of 500
+  (`reconciliation.backlog_hard_limit`). Until reconciliation drains those
+  events, the project's backlog gate escalates writes while an orchestrator
+  is live, and refuses them otherwise.
+
+**When a promotion fails.** A promotion that another write set off runs
+after that write has landed, and its failure never fails the write: the
+error appears in the result's `post_write_warnings` (`post_create_warnings`
+on a filing), and the write's event and reconciliation still run. Every
+trigger is safe to repeat, because a promoted task is skipped. A
+`remove_dependency` of the holder edge is different: the promotion is that
+call's own write, so its failure is the call's failure.
+
+**The closure.** Promoting a task also promotes every held task it depends
+on, transitively and each task once, with `by: dependent` and `ref` the id
+of the promoted task that depends on it.
+
+**Guards.** `followup_hold.py::register_promotion_guard` adds a function
+that every promotion consults with the live row, the cause and the ref. A
+`PromotionDeferral {guard, reason}` answer leaves that task held, journals
+`followup_promotion_deferred {task_id, by, ref, guard, reason}` and promotes
+none of its dependencies. A guard that raises counts as a deferral, with
+`guard` its name and `reason` naming the exception, so a faulty guard keeps
+its task held instead of failing the trigger. A human removal that a guard
+defers returns error `followup_promotion_deferred` with the guard and
+reason, and writes nothing. None is registered by default. A caller outside
+the interceptor passes `TaskInterceptor.hold_emit(project_root)` as the
+`emit` every promotion function takes, so its events are journaled like the
+interceptor's own.
+
+`by` is one of `dependent`, `citation`, `combine`, `pack`, `rider` or
+`human`; the packer and riders call `followup_hold.py::promote` themselves.
+Held does not expire: there is no age-out (decision 15).
 
 ---
 
@@ -832,11 +1089,20 @@ token (`migration`, `architecture`, `integration test`, `design ... new`,
 **Hard escape:** `metadata.force_full_path = true` always forces the full
 architect path regardless of `complexity`.
 
+**Curator complexity hint:** not on main yet; task 8376 adds it, and this
+paragraph describes that task's specification. Once it lands, on every curated
+`create` the curator stamps
+`metadata.x_curator_complexity_hint` (`"simple"` or null) from the criteria
+above. On the treated arm of experiment `routing-exp-2` it also applies
+`metadata.complexity = "simple"` when the hint is `simple` and the task names
+files; the untreated arm records the hint only. A filer's own `complexity`
+always wins, and `planning_mode` batches are untouched.
+
 ### `execution_class` routes to a HUMAN — it is not "non-code work"
 
 `metadata.execution_class` answers **who executes the task at dispatch**, not
 what kind of edit it is. `'operational'` (and `'decision'`) are converted **at
-submit** by `TaskInterceptor._inject_deterministic_pure_gate` into
+submit** by `shared/src/shared/pure_gate_provenance.py::pure_gate_stamped` into
 `task_kind='deterministic'` + `always_escalates=True` — a pure gate whose only
 dispatch action is a born-at-L2 escalation **to a human**. Human attention is
 the bottleneck; use these values only for work that genuinely requires an
@@ -847,8 +1113,18 @@ operator (a ruling, an action no agent can take).
 docs edits). This mistake — declaring a mechanical docs leaf `'operational'`
 because it "isn't code" — has been made by multiple independent sessions
 (ruled by Leo 2026-08-24; tasks 4626/4671/4675/4680 were retyped out of it).
-The conversion is currently **silent** in the `submit_task` response; a
-submit-time notice + metadata provenance stamp is filed as its own task.
+The conversion is not silent. On both the ticket and the `planning_mode`
+path the `submit_task` response carries `routing_notice` (`pure_gate_from`,
+`detail`, `hint`), and the stored task carries `metadata.pure_gate_from`
+naming the trigger: `execution_class=operational`, `execution_class=decision`,
+or `operational_ask_registry` (vocabulary:
+`shared/src/shared/pure_gate_provenance.py::PureGateTrigger`). The last is the
+curator's route for an untagged ask matching the operational-ask registry. The
+curator decides that after `submit_task` has returned, so that path gets the
+stamp and `resolve_ticket`'s `route_deterministic` reason, but no response
+notice. Only a submission whose routing the conversion actually rewrites is
+marked: one that already declares the pure-gate shape, such as recon's
+consolidation gate, gets neither `routing_notice` nor `pure_gate_from`.
 
 ---
 
@@ -871,13 +1147,43 @@ dependency gate as every other task (§3).
 {
   script: "<repo-relative path>",  # must exist & be executable
   args: [],                         # list[str], default []
-  env: {},                          # dict[str,str], default {}
-  cwd: "<project_root>",            # default: project_root
+  env: {},                          # dict[str,str], default {}; reaches the script on every path, see below
+  cwd: "<project_root>",            # str|None; default project_root
   timeout_secs: 120,                # int, required; runner kills + escalates on timeout
   target_unit: None,                # str|None; None → cross-unit (no self-kill)
   kind: "deploy",                   # "deploy" | "predicate"; default "deploy" — see §6 for "predicate"
+  script_root: "project",           # "project" | "factory"; default "project" — see below
+  recheck_secs: None,               # int|None; strict int >= 300; predicate only — see below
 }
 ```
+
+**`before_done.recheck_secs`** (`int | None`, default `None`) declares that a
+predicate may answer "not yet" (exit `75`, §6) and how many seconds the
+runner then advances `metadata.milestone.at`. It is a **strict** int
+(`true`, `"86400"` and `86400.0` are rejected, not coerced) with a floor of
+`300`. It is valid only with `kind='predicate'` **and** a `dated`
+`metadata.milestone`; it is forbidden on `kind='deploy'` and with a
+`delayed` or absent milestone. The kind half is checked by `BeforeDone`, the
+milestone half by `TaskMetadata`'s cross-field validator, so the milestone
+half also holds on `update_task`. The rule is PRD C1
+(`plans/completion-driven-triggers-prd.md`, "C1 — the predicate exit-code
+contract gains a re-arm verdict"); the verdicts it unlocks are §6's table.
+
+**`before_done.script_root`** (`'project'` | `'factory'`, default
+`'project'`) selects what a relative `script` resolves against.
+`'project'` is the orchestrator's configured `project_root`, as above.
+`'factory'` resolves `script` against the dark-factory checkout
+(`shared/src/shared/repo_paths.py::resolve_dark_factory_root`), with the same
+containment, existence and executable-bit checks, so a predicate that ships
+with the factory can gate a task in any project. `'factory'` is allowed
+**only** with `kind='predicate'`; a deploy that asks for it is rejected.
+`cwd` is unchanged (`project_root`). An unresolvable factory root is a
+structured rejection at `submit_task`. A root that resolves at submit but not
+when the runner runs the check is a no-verdict leg (§6): an escalation with
+the summary "Predicate script root unresolvable", task `blocked`, no
+`gate_escalated_at`. The rule is PRD C6
+(`plans/completion-driven-triggers-prd.md`, "C6 — factory-rooted predicate
+scripts").
 
 A relative `script` (even when `cwd` is set) and a relative `cwd` resolve
 against the orchestrator's **configured** `project_root` — the `project_root` in its
@@ -885,6 +1191,20 @@ against the orchestrator's **configured** `project_root` — the `project_root` 
 validates the script under — never against the orchestrator process's
 working directory. See
 `shared/src/shared/before_done_paths.py::resolve_before_done_paths`.
+
+`env` reaches the script on every path. A predicate, no-target or
+cross-unit deploy runs the script with `env` overlaid on the
+orchestrator's own environment. A self-target deploy (`target_unit` is the
+orchestrator's own unit) runs the script in a `systemd-run` transient unit
+as `/bin/sh -c 'KEY=value … <script> <args>'`. That script starts from the
+systemd user manager's environment plus `env`, not from the
+orchestrator's, because `systemd-run` passes on none of its caller's
+environment. The assignments prefix the script alone, so the unit's RP-4
+on-failure escalation submit sees none of `env`. Keys must be portable
+environment variable names, matching `[A-Za-z_][A-Za-z0-9_]*`. A deploy
+(`target_unit` set) refuses any other key with a born-at-L2 `infra_issue`
+and does not run the script. The mechanism is
+`orchestrator/src/orchestrator/proc_supervision.py::RestartPlan`.
 
 **`metadata.always_escalates`** (`bool`, default `false`) — file a
 born-at-L2 escalation after the action completes (or immediately if no
@@ -896,7 +1216,7 @@ action); task goes `blocked` until resolved.
 |---|---|---|---|
 | present | `false` | run action; escalate only on failure; else `done` | **auto-deploy** |
 | present | `true` | run action; then escalate born-at-L2; `done` after `resume` | act-then-ask (incompatible with `human_curator_gate`) |
-| absent | `true` | escalate born-at-L2 immediately; `done` after `resume` | **pure gate** |
+| absent | `true` | escalate born-at-L2 immediately; `done` on `resume` (immediately, unless it waits on a dependency, milestone or `deferred_watch`, or carries any `external_deps` or delivered-check dependency — see `docs/deterministic-runner.md` §"Resuming a pure gate"); re-fires instead if resumed behind a new dependency, external dependency or milestone | **pure gate** |
 | absent | `false` | **rejected** at `submit_task` (ill-formed no-op) | — |
 
 **Validation (enforced at `submit_task`):** `task_kind='deterministic'`
@@ -916,17 +1236,32 @@ open (quiescence guard — no re-dispatch, no churn).
 
 - `before_done.target_unit` equals this orchestrator's own unit → detached
   `systemd-run --user` with `--on-failure` (done = `scheduled`; the
-  dispatching orchestrator is **not** killed).
-- `before_done.target_unit` differs from own unit (or is `None`) →
-  blocking subprocess + fresh `MainPID`/`ActiveEnterTimestamp` verify
-  against a pre-run baseline (done = `deployed-and-verified`).
+  dispatching orchestrator is **not** killed). The script is re-checked for
+  existence and the executable bit before the unit is registered; an
+  unrunnable script blocks the task instead of marking it `scheduled`
+  (`docs/deterministic-runner.md` §2).
+- `before_done.target_unit` names a unit other than own → blocking
+  subprocess + fresh `MainPID`/`ActiveEnterTimestamp` verify against a
+  pre-run baseline (done = deployed-and-verified, kind
+  `deterministic-deploy`).
+- `before_done.target_unit` is `None` or omitted → blocking subprocess
+  driven on the script's exit code ALONE, with no baseline inspect and no
+  fresh-PID verify, because there is no unit to inspect (task 2632 /
+  esc-2585-1). Done means the script exited 0. Every done write for such a
+  deploy, the crash, human-resolution and gate resumes included, records
+  kind `deterministic-deploy-unverified`; the rule's home is
+  `orchestrator/src/orchestrator/deterministic_runner.py::_deploy_done_kind`.
 
 **Runner stamps** (written by `DeterministicRunner`, never
 author-supplied): `before_done_ran_at`, `before_done_verified_at`,
-`gate_escalated_at`, and `done_provenance` (stamped for all four
+`gate_escalated_at`, `gate_escalated_preconditions` (pure gates only), and
+`done_provenance` (stamped for all five
 `deterministic-*` kinds — see the requirement table in §2 for
 per-kind semantics; `deterministic-milestone` is stamped on both the
 first-pass check and the post-escalation re-check described in §6).
+Both gate stamps are removed by fused-memory when the task enters or
+leaves `done`/`cancelled` (task 3638), so a closed gate carries neither
+and a reopened one files afresh.
 
 A **pure-gate** close cites the resolving `milestone_gate` record via
 `done_provenance.escalation_id`, exactly as the curator-gate close already
@@ -934,6 +1269,22 @@ does (§8, "The human-curator-gate contract") — both go through one rule in
 `orchestrator/src/orchestrator/deterministic_runner.py::_cite_gate_escalation_id`.
 The two closes keep distinct `note` text, which is what makes a genuine
 curator closure distinguishable from a generic one in the audit trail.
+
+**A gate that fired prematurely.** Hold it first, resume it second. Add the
+dependency (by CLAUDE.md's `planning_mode=True` → `add_dependency` →
+`commit_planning` rule) and/or a `milestone` (§6), then
+`resolve_issue(action='resume')`. When the hold lands, the runner files a
+fresh gate escalation itself, because the task now waits on more than its
+`gate_escalated_preconditions` record (rationale:
+`docs/deterministic-runner.md` §3), so nobody clears `gate_escalated_at` by
+hand. The hold must be wired BEFORE the resume: a resume with nothing new
+to wait on closes the gate at once, at resolution time (task 3638). One
+transitional exception: a gate whose metadata has no
+`gate_escalated_preconditions` record fired before task 9520 deployed, and
+closes when the hold lands. For it, set `gate_escalated_at` to null after
+wiring the hold and before the resume; with no stamp it is not a held pure
+gate, so the resume re-pends it and it files afresh on dispatch. The
+exception can go once no blocked gate lacks the record.
 
 **`done_provenance.kind='operational-verified'`** — a related but distinct
 closure path (see §2), used for `normal`-task no-code operational asks
@@ -970,7 +1321,13 @@ satisfied:
 
 A path whose extension is not on the lock-charter allowlist (for example
 `tasks.db`) is refused earlier, as a "directory declaration" with
-`LockCharterViolation`, so this lint never sees it.
+`LockCharterViolation`, so this lint never sees it. That rejection lists
+such paths under `unrecognised_extension_paths`, and its hint gives the same
+`task_kind='deterministic'` routing as this lint. An upper-case spelling of a
+listed extension, such as `README.MD`, is not listed there: it gets only the
+advice to lowercase the extension. Leave a gitignored path out
+of `metadata.files` whatever the `task_kind`: the lock-charter check runs
+first and classifies it as a directory either way.
 
 **Posture.** By default the lint only warns. When the submission succeeds,
 it merges a `gitignored_deliverable_warning` key into the result and logs a
@@ -993,12 +1350,16 @@ path.
 
 `metadata.milestone` is an orthogonal, time-based dispatch gate — **not**
 a new `task_kind`. Setting it holds a task out of dispatch until its time
-trigger fires; once fired, the task dispatches through its normal path
-unchanged. It is allowed on **both** `normal` and `deterministic` tasks
-(orthogonal to `task_kind`), so it can gate a normal LLM-agent task, a
-deterministic predicate check (below), or a pure human gate (a `dated`
-milestone on a deterministic task with `always_escalates=True` and no
-`before_done`).
+trigger fires. Once it fires, a deterministic predicate
+(`before_done.kind='predicate'`) or pure gate carrying it dispatches ahead
+of the tier-scored queue, whatever its `priority` (task 11330;
+`orchestrator/src/orchestrator/timed_gates.py::is_timed_gate`). Any other
+milestone task (a normal task, or a deploy) dispatches through its normal
+tier-scored path unchanged. A milestone is allowed on **both** `normal` and
+`deterministic` tasks (orthogonal to `task_kind`), so it can gate a normal
+LLM-agent task, a deterministic predicate check (below), or a pure human
+gate (a `dated` milestone on a deterministic task with
+`always_escalates=True` and no `before_done`).
 
 Two time modes:
 
@@ -1030,8 +1391,9 @@ and never persisted.
 `milestone_deps_satisfied_at` (`delayed` mode only — the frozen-once
 wall-clock UTC anchor, stamped the first tick all of the task's
 dependencies go `done`) and, only on a predicate check failure,
-`gate_escalated_at` (shared with §5).  A task author never sets either
-field.
+`gate_escalated_at` (shared with §5). A predicate re-arm (below) adds
+`milestone.scheduled_fire_at`. A task author never sets any of these
+fields.
 
 **Predicate exit-code contract (`before_done.kind`):** `before_done` gains
 a discriminator, `'deploy' | 'predicate'` (default `'deploy'` — every
@@ -1044,14 +1406,46 @@ script and decides by **exit code only** — it parses no output:
 | Exit code | Outcome |
 |---|---|
 | `0` | task `done`, `done_provenance.kind='deterministic-milestone'` (a **bounded structured verdict** carried as `note` — see below) |
-| non-`0` | born-at-L2 `milestone_check_failed` escalation (detail carries the exit code + stdout tail) + task `blocked` |
+| non-`0` (other than the `75` rows below) | born-at-L2 `milestone_check_failed` escalation (detail carries the exit code + stdout tail) + task `blocked` |
+| `75`, `before_done.recheck_secs` declared, milestone `dated`, stall streak below `deterministic.predicate_recheck_stall_cap` | **re-arm**: the task returns to `pending` with `milestone.at` advanced to now + `recheck_secs`, stamps nothing terminal and files **no** escalation. The runner records `predicate_recheck` and `predicate_verdict` and emits a `predicate_rearmed` event. A re-arm that cannot be written is a no-verdict leg instead (see below) |
+| `75`, the streak reaches the cap (default 30) | born-at-L2 `milestone_check_stalled` (`critical`, `agent_role='orchestrator-deterministic'`), stamps `gate_escalated_at`, resets the streak to 0, task `blocked`. `resume` keeps waiting with a fresh streak. `abandon` cancels the gate, which releases its dependents because a cancelled dependency satisfies. To end a trigger chain, abandon its human gate first, then this gate |
+| `75` **without** the declaration (no `recheck_secs`, or the milestone is not `dated`, e.g. a post-submit edit — task 3093) | today's `milestone_check_failed` escalation, plus one detail line naming the missing declaration. Never a silent re-arm |
 | timeout / runner error (**no verdict**) | born-at-L2 escalation + task `blocked`, **no** `gate_escalated_at` stamp in *either* case — the check is simply re-attempted on the next dispatch. Category is `infra_issue` for an ordinary predicate, `milestone_check_failed` for a task carrying `metadata.recurrence` (§6.1) |
 
-The last row covers **three** ways a run produces no exit code — the outer
+Exit `75` is `os.EX_TEMPFAIL`. The runner reads it as "not yet", a re-arm,
+only when `before_done.recheck_secs` is declared **and** the milestone is
+`dated` (`orchestrator/src/orchestrator/predicate_recheck.py::recheck_declaration`).
+Otherwise it is an ordinary failing verdict, the third `75` row:
+`milestone_check_failed`, `gate_escalated_at` stamped, task `blocked`. The
+re-arm rewrites the `milestone` dict whole (`metadata_mode='merge'` is shallow) and writes three
+keys in one update: `milestone`, `predicate_recheck`
+(`{consecutive, first_rearmed_at, last_checked_at, next_check_at}`) and
+`predicate_verdict`. The rewritten milestone keeps the link's first `at` as
+`milestone.scheduled_fire_at`, which later re-arms never move; the scheduler
+still reads only `at` (`shared/src/shared/milestone_rearm.py::rearmed_milestone`).
+A re-arm whose metadata write is refused, or whose milestone has no readable
+ISO fire time, re-pends nothing: it files the no-verdict category and blocks,
+since an unadvanced `at` would re-dispatch at once into the same `75`. The
+streak cap is the config leaf
+`deterministic.predicate_recheck_stall_cap` (default `30`, hot-reloadable).
+`predicate_verdict` is the parsed trailing-JSON tier of the payload described
+below, refreshed on every verdict-bearing exit (`0`, `75`, other non-`0`) so a
+stamp never outlives the check that produced it. A predicate that wants its
+"not yet" share preserved emits it as a trailing JSON object. The authority is PRD C1 (`plans/completion-driven-triggers-prd.md`,
+"C1 — the predicate exit-code contract gains a re-arm verdict"); the chain
+that consumes it is PRD C2 and `docs/quality-findings-contract.md` §11. The
+filing calls themselves live in `skills/_shared/filing-the-trigger-chain.md`.
+
+The no-verdict row covers every way a run produces no exit code — the outer
 wall-clock guard, the script overrunning its own `before_done.timeout_secs`,
-and an unexpected error in the runner seam. Only a **non-zero exit** — a real
-verdict — stamps `gate_escalated_at` and thereby latches the task into the
-resume/resolve-to-done path.
+a `script_root='factory'` whose factory root does not resolve at run time
+(summary "Predicate script root unresolvable"), a stored `before_done` record
+the runner refuses (a missing, non-string or blank `script`, a non-string
+`cwd`, or a `script_root` the record may not use, reaching it through
+`update_task`; summary "Predicate before_done refused
+(check not run)"), and an unexpected error in the runner seam. Only a **non-zero exit** other than a declared re-arm `75` — a
+real verdict — stamps `gate_escalated_at` and thereby latches the task into
+the resume/resolve-to-done path.
 
 **What the `rc == 0` `note` carries (task 3286):** `predicate check passed
 (rc=0)`, plus — when the script emitted one — a single extracted payload:
@@ -1085,8 +1479,9 @@ read-only recurrence guard.
 
 A predicate is **read-only**, so resolving the escalation (`resume`)
 safely **re-runs** the check rather than trusting the resolution blindly —
-it drives to `done` or re-files `milestone_check_failed` from whatever the
-check reports this time. `kind='predicate'` **forbids**
+it drives to `done`, re-files `milestone_check_failed`, or, for a gate
+declaring `recheck_secs`, re-arms (§6's `75` rows) from whatever the check
+reports this time. `kind='predicate'` **forbids**
 `before_done.target_unit` (no unit to verify — no systemd inspect /
 PID-verify on a read-only check) and forbids top-level
 `always_escalates=True` (predicate escalation is already conditional on a
@@ -1111,6 +1506,13 @@ immediately. `mode='dated'` simply withholds while `now < at`. A malformed
 or unrecognized `metadata.milestone` value fails safe — withhold dispatch
 indefinitely, with a one-time WARNING log — rather than dispatch early or
 crash the tick.
+
+Moving or adding a pure gate's milestone after it fired re-arms it (§5, "A
+gate that fired prematurely"). One caveat: a new dependency does not
+restart a `delayed` milestone's frozen-once `milestone_deps_satisfied_at`
+anchor, so a gate that already carried that anchor re-fires as soon as the
+dependency lands rather than `after_secs` later. It asks early; it never
+skips the human.
 
 **Exemplar** (autonomous — no human involvement unless the check fails):
 "one week after task X lands, check merge flakiness is under 5%, else
@@ -1137,6 +1539,30 @@ comparison, per its header.) The anchor stamps when X reaches `done`;
 (same `agent_role` / severity / level as the born-at-L2 escalations in
 §5) — predicate mode reuses the `DeterministicRunner` (§5), and the
 delayed anchor waits on the same dependency gate described in §3.
+
+**Exemplar — a predicate that may answer "not yet"** (re-checks daily,
+until the check exits `0`). The complete `submit_task` metadata, with a
+`dated` milestone (`recheck_secs` forbids `delayed`) and a factory-rooted
+script:
+
+```json
+{
+  "task_kind": "deterministic",
+  "milestone": {"mode": "dated", "at": "2026-12-01T00:00:00+00:00"},
+  "before_done": {
+    "kind": "predicate",
+    "script": "scripts/check_run_completion.py",
+    "script_root": "factory",
+    "args": ["--run", "review-dark_factory-20261004", "--threshold", "0.7", "--project-root", "<project_root>"],
+    "timeout_secs": 120,
+    "recheck_secs": 86400
+  }
+}
+```
+
+(`milestone.at` is the first check; every `75` moves it forward by
+`recheck_secs`. The script's arguments are owned by PRD C3,
+`plans/completion-driven-triggers-prd.md`.)
 
 ### 6.1 Recurring chains (`metadata.recurrence`)
 
@@ -1210,6 +1636,16 @@ re-verify the carrier of the link it renews, through
 consumer acting on a chain link should likewise re-verify rather than assume
 submit-time validation still holds.
 
+**75 re-arms in place; never mints.** A carrier whose predicate declares
+`recheck_secs`, whose milestone is still `dated`, and which exits `75` (§6's
+re-arm row) is not terminal: it returns to `pending`
+with its own `milestone.at` advanced, so no successor is minted and the chain
+holds one live link throughout. Minting happens only when the link completes
+`done`. The chain gauge and the successor's run label read the link's
+scheduled fire time (`shared/src/shared/milestone_rearm.py::scheduled_fire_at`),
+not the re-armed `at`, so a carrier still re-arming past its fire time plus
+grace reads overdue.
+
 **Forbidden until ruled.** `recurrence` on a *deploy*-kind deterministic
 task — or on any non-predicate `before_done`, or on `task_kind='normal'` —
 is rejected. This is deliberately **unruled, not unimplemented** (PRD "Out
@@ -1233,11 +1669,14 @@ restriction; until one exists, the rejection *is* the contract.
 ```
 
 **What a carrier gets today.** Every escalation a carrier's deterministic
-run files carries `category='milestone_check_failed'` — the deny-listed
-category (`escalation/src/escalation/authority.py::L2_AUTO_CLOSE_DENY_CATEGORIES`),
+run files carries `category='milestone_check_failed'`, with one exception:
+the stall-cap escalation of a carrier declaring `recheck_secs` is
+`milestone_check_stalled` (§6's stall row). Both are deny-listed
+(`escalation/src/escalation/authority.py::L2_AUTO_CLOSE_DENY_CATEGORIES`),
 so a recurring job's failures are discriminable instead of disappearing into
-the crowded `infra_issue` bucket. That covers the no-verdict legs in §6's
-table as well as the non-zero-exit verdict; the **stamp** rule in that table
+the crowded `infra_issue` bucket; an alarm or route keyed on a carrier's
+failures must match both. `milestone_check_failed` covers the no-verdict legs
+in §6's table as well as the non-zero-exit verdict; the **stamp** rule in that table
 is unchanged either way. A non-carrier predicate's no-verdict legs stay
 `infra_issue`, and so do `kind='deploy'` deterministic tasks — the
 deterministic-recon sweep's Source B auto-closer keys on that category to
@@ -1377,7 +1816,7 @@ flows) — is exempted from the `unknown_key` scan even though these are not
 (yet) typed `TaskMetadata` fields. This is `_BLESSED_METADATA_KEYS` in
 `shared/src/shared/task_metadata.py`:
 
-<!-- tier-a-blessed-keys-mirror -->
+<!-- tier-a-blessed-keys-mirror:begin -->
 ```
 source, modules, spawn_context, complexity, force_full_path,
 branch_base_sha, _causation_id, dry_run_proposals, reblock_guard,
@@ -1385,17 +1824,20 @@ agent_id, escalation_id, suggestion_hash, prd_path, prd_task_label,
 user_observable_signal, consumer_ref, substrate_confirmed,
 human_decomposed, grammar_confirmed, invariants, optimistic_path,
 capability_manifest, curator_action, curator_justification, combined_at,
-dedupe_skipped, gate_escalated_at, before_done_ran_at, before_done_verified_at,
+dedupe_skipped, gate_escalated_at, gate_escalated_preconditions,
+before_done_ran_at, before_done_verified_at,
 before_done_verified_pid, files_tagged_at, files_tagged_empty,
 source_finding_id, stage1_finding_id, origin_finding_id,
 related_memory_ids, related_tasks, spawned_from, program, program_stream,
 stream, cross_repo, cross_repo_project, human_curator_gate,
-human_curator_adjudicated_at, last_blocked_at, recurrence,
-execution_class, merge_lane, pending_since, pending_since_backfilled,
-claimant_exception, audit_trail_rotation, plan_text_fp, plan_authored_at,
-main_health_signature
+human_curator_adjudicated_at, last_blocked_at, merge_first_enqueued_at,
+merge_phase_liveness, recurrence, execution_class, pure_gate_from, merge_lane, pending_since,
+pending_since_backfilled, claimant_exception, audit_trail_rotation,
+plan_text_fp, plan_authored_at,
+main_health_signature, superseded_by, cancel_dispositions, trigger_chain,
+predicate_recheck, predicate_verdict
 ```
-<!-- /tier-a-blessed-keys-mirror -->
+<!-- tier-a-blessed-keys-mirror:end -->
 
 This listing is **machine-checked** against the live frozenset by
 `tests/scripts/test_task_authoring_blessed_keys_drift.py` (task 3780), which
@@ -1406,14 +1848,53 @@ copy was hand-maintained prose: task 4372 had to mirror two keys across in a
 separate follow-up commit, and the frozenset's own header comment sat stale
 across two blessings.
 
-`recurrence` (§6.1) is unusual for a Tier-A entry: it is *also* a registered
-submodel, so it is doubly exempt from the `unknown_key` scan (a registered
-key is already in `known_fields`). The blessing is deliberate
-belt-and-braces — it keeps the key suppressed if the registration is ever
-moved or made lazy, and it is what makes
+`recurrence` (§6.1), `cancel_dispositions` and `trigger_chain`
+(`plans/completion-driven-triggers-prd.md` C2) are unusual for Tier-A
+entries: each is *also* a registered submodel, so each is doubly exempt from
+the `unknown_key` scan (a registered key is already in `known_fields`). The
+blessing is deliberate belt-and-braces — it keeps the key suppressed if the
+registration is ever moved or made lazy, and it is what makes
 `fused-memory/scripts/migrate_task_metadata_to_x_namespace.py` refuse to
 `x_`-namespace it, which for a submodel-backed key with live readers is the
 correct refusal. Every other key in this list is unregistered.
+
+Three of the entries belong to the completion-driven trigger chain
+(`plans/completion-driven-triggers-prd.md` C1/C2;
+`docs/quality-findings-contract.md` §11):
+
+- **`trigger_chain`** — author-set, typed
+  (`shared/src/shared/task_metadata.py::TriggerChain`):
+  `{role: 'completion_gate' | 'human_gate', skill: 'review' | 'hotspot-survey' | 'review-all', run_id, superseded_by}`.
+  `skill` is the bare name (no leading slash) and `run_id` must start with
+  `<skill>-`. The submit guard enforces the carrier rules (a completion gate
+  is a dated `recheck_secs` predicate; a human gate is a pure gate) and allows
+  one open chain per project and skill. Both are submit-time only (task 3093).
+  The filing calls are in `skills/_shared/filing-the-trigger-chain.md`.
+- **`predicate_recheck`** — runner-stamped, never author-supplied: the
+  re-arm streak `{consecutive, first_rearmed_at, last_checked_at, next_check_at}`
+  (§6).
+- **`predicate_verdict`** — runner-stamped, never author-supplied: the
+  predicate's trailing JSON-object payload, parsed; or
+  `{"elided": true, "chars": N}` over the 400-char cap; or `null` when a
+  declared `75` carried no JSON object (§6).
+
+`gate_escalated_preconditions` is runner-stamped, never author-supplied:
+`{dependencies, external_deps, milestone}`, what a pure gate waited on when
+it escalated, written beside `gate_escalated_at` (§5).
+
+`pure_gate_from` is machine-written at conversion, never author-supplied: the
+`submit_task` tool drops a caller-supplied value (metadata cloned from
+`get_task`, say), and `shared/src/shared/pure_gate_provenance.py::pure_gate_stamped`
+stamps it with a
+`shared/src/shared/pure_gate_provenance.py::PureGateTrigger` value (§4). It
+is written only when the conversion rewrote the submission's routing: a
+submission that already declared the pure-gate shape
+(`task_kind='deterministic'` with `always_escalates=True` and no
+`before_done`) is never stamped, whatever its `execution_class` (the rule is
+`shared/src/shared/pure_gate_provenance.py::is_pure_gate_shape`). It is history,
+not current state: `update_task`'s shallow metadata merge keeps it after a
+retype, so a watcher or retype workflow pairs it with the current
+`task_kind`/`always_escalates` before treating a task as a mis-filed conversion.
 
 `deferral` is, like `milestone`, a registered submodel
 (`shared/src/shared/task_deferral.py::DeferralRecord`) and deliberately not
@@ -1422,6 +1903,74 @@ Tier-A blessed. Only the status writers write it: `set_task_status` and
 `update_task` and `submit_task` refuse any add, alter or removal with
 `deferral_write_authority`; an unchanged echo of the stored record passes.
 Its shapes and use are §9 "Deferring a task".
+
+`superseded_by` and `cancel_dispositions` are the cancel-with-children
+vocabulary (contract `plans/cancel-with-children-prd.md` §4.8). Their shapes
+live in `shared/src/shared/cancel_dispositions.py`; read them there. A
+cancelled parent carries `superseded_by: list[int]`, the tasks that replace
+it. Each child carries `cancel_dispositions`, a list holding one entry per
+cancelled parent. An entry's `parent` is always qualified as
+`"<project_id>:<id>"`, because an external dependent's entry lives in another
+project's store, where a bare id names a different task.
+
+`declared_scope` is the size a task declared when it was filed. It is a
+registered submodel (`shared/src/shared/declared_scope.py::DeclaredScope`,
+cardinality dict), machine-only and deliberately not Tier-A blessed. Its
+`band` is one of `undeclared`, `narrow`, `moderate`, `broad`; the thresholds
+live only in that module's `derive_declared_scope`. `submit_task` stamps it
+once, `basis='submit'`, on both creation paths (ticket and planning mode).
+`submit_task` and `update_task` refuse any add, alter or removal with
+`declared_scope_write_authority`; an unchanged echo passes, so a replace-mode
+write must carry it verbatim. The refusal's `reason` is `added`, `altered` or
+`removed` (a replace that omits the key), and its `stored` is the stamp on the
+row, or null when it has none. It is never re-derived at plan refinement or at
+`done`. The only re-stamp is a curator combine (`basis='combine'`, task
+8415). An absent key, on a task filed before the stamp existed, means no
+information, never `undeclared`. The modules allowed to import it are pinned
+by `tests/repo_guards/test_declared_scope_readers.py`
+(`plans/follow-up-filing-shape-prd.md` §3 decisions 6–8), and no verify,
+merge-lane, triage or routing path may read it: the same test fails if one of
+those modules names the key or anything `shared.declared_scope` exports.
+
+`followup_items` is the list of observations one follow-up task was filed to
+address. It is a registered submodel
+(`shared/src/shared/followup_items.py::FollowupItem`, cardinality list),
+machine-keyed and deliberately not Tier-A blessed. Each item is `{key,
+summary, files, origin_task, origin_escalation_id}`: `summary` is one line of
+at most 300 chars and `files` is non-empty. On creation `submit_task` derives
+every R4 key server-side, on both creation paths
+(`shared/src/shared/followup_items.py::with_derived_bundle_keys`):
+`origin_task` is `spawned_from`, or `unparented` without one; each item's
+`key`; the top-level `escalation_id` `agent-followup-<parent>`, absent when
+unparented; and the top-level `suggestion_hash` over the sorted item keys. Any
+caller value for these is overwritten. It refuses, with error
+`followup_items_refused` and a `reason` of `not_a_list`, `invalid_item`,
+`item_count`, `duplicate_key` or `undeclared_files`, a bundle outside 1..5
+items, one that repeats a key, or one with an item file missing from
+`metadata.files`. A submission without the key keeps its caller-supplied R4
+keys: steward and review-cycle filings, and pre-bundle singles, which
+`legacy_item` reads as one item. `merge_items` is the one union every later
+writer uses. The architect briefing renders the list numbered, and in v1 only
+architect and implementer filers bundle (`plans/follow-up-filing-shape-prd.md`
+§4.1 and §3 decisions 1 and 3–5). As for `shared.defects`, the registration is
+an import side effect of `shared.followup_items`, so a process that never
+imports it would census the key as `unknown_key`.
+
+`followup_holder` and `followup_hold` are the follow-up holder's marker and a
+held task's record (§3.4). Both are registered submodels
+(`shared/src/shared/followup_hold_records.py::FollowupHolder` and
+`::FollowupHold`, cardinality dict), registered in
+`shared/src/shared/task_metadata.py` itself, so every process that parses
+task metadata knows them. Both are machine-written only and deliberately not
+Tier-A blessed. Only `fused-memory/src/fused_memory/middleware/followup_hold.py`
+writes them: the mint writes the marker, and the hold at filing and the
+startup backfill write the record. A held task's `followup_hold.promoted`
+(`by` one of `dependent`, `citation`, `combine`, `pack`, `rider`, `human`) is
+the history of its release. The dependency edge on the holder, not this
+record, decides whether the task is held now. `finding_set_hold` is a third
+registered submodel (`shared/src/shared/followup_hold_records.py::FindingSetHold`,
+cardinality dict), written by the filing instrument at filing and not by
+`followup_hold.py`, which only reads it (§3.4).
 
 `claimant_exception` is the machine ledger entry
 `{claimant_run_id, target_status, agent_id, tag, stamped_at}`. The
@@ -1521,7 +2070,7 @@ ahead of the queue.
 request inherits `metadata.merge_lane`, under the precedence **`lane`
 argument > `metadata.merge_lane` > `'normal'`**. An unrecognised value in a
 task's *metadata* is silently normalised to `'normal'` by
-`orchestrator/src/orchestrator/merge_lane/worker.py::_normalize_lane`, so a typo
+`orchestrator/src/orchestrator/merge_lane/intake.py::normalize_lane`, so a typo
 *here* is a silent downgrade — which is exactly why the companion `lane`
 parameter rejects an unknown value loudly instead (see its docstring in
 `escalation/src/escalation/server.py::merge_request` for that contract). The
@@ -1655,8 +2204,9 @@ after which the resume path nonetheless closed the task.
 
 These aliases are deliberately *not* on the Tier-A allowlist, so each still
 emits `code=unknown_key` as a greppable drift signal until the caller is
-fixed to use the canonical spelling — with one documented exception,
-`origin_finding_id`, noted under the table.
+fixed to use the canonical spelling — with documented exceptions noted under
+the table: `origin_finding_id`, and the `x_`-prefixed aliases of
+`superseded_by`.
 
 Every key in the **Canonical** column is itself Tier-A blessed and therefore
 **silent**, so the `code=unknown_key` drift signal is **alias-only** and
@@ -1667,7 +2217,7 @@ new row whose canonical is unblessed fails the suite rather than silently
 re-creating that task's defect, where authors were told to migrate to
 `related_tasks` and still minted a census line.
 
-<!-- tier-b-canonical-keys -->
+<!-- tier-b-canonical-keys:begin -->
 
 | Canonical | Aliases to avoid |
 |---|---|
@@ -1675,8 +2225,9 @@ re-creating that task's defect, where authors were told to migrate to
 | `invariants` | `inv` |
 | `related_tasks` | `related_task`, `related_df_tasks`, `related_task_examples` |
 | `source_finding_id` | `origin_finding_id`, `origin_finding`, `origin_stage1_finding_id`, `source_finding`, `finding_id` |
+| `superseded_by` | `x_superseded_by`, `x_subsumed_by`, `subsumed_by`, `x_coalesced_into`, `x_replacement` |
 
-<!-- /tier-b-canonical-keys -->
+<!-- tier-b-canonical-keys:end -->
 
 **The finding-provenance row splits into two classes** (ruling:
 `esc-3796-1`, 2026-08-17). `origin_finding_id` is the **retired** alias and
@@ -1708,6 +2259,18 @@ key in its own right, naming the Stage-1 finding specifically, and is
 deliberately **not** something to migrate to `source_finding_id` — only the
 `origin_`-prefixed near-miss `origin_stage1_finding_id` is drift.
 
+**The `superseded_by` row's `x_`-prefixed spellings emit no drift line**
+(`esc-8142-1`). They sit in the Tier-C `x_` namespace below, which the parser
+never warns on, so the row lists them only as spellings to avoid in new
+writes. Only `subsumed_by` warns, pinned by
+`test_superseded_by_tier_b_alias_still_warns`
+(`shared/tests/test_task_metadata.py`). `x_coalesced_into` keeps its legacy
+readers, and the deferral `carried_by` record stays a hold with a carrier,
+not a supersession; neither is folded into `superseded_by`. The task key
+deliberately does not reuse the Mem0 memory key `x_superseded_by`: one name
+for a different store and shape would mislead. Contract:
+`plans/cancel-with-children-prd.md` §4.8.
+
 ### Tier-C: ad-hoc keys
 
 One-off, timestamped, or id-suffixed annotation keys (e.g.
@@ -1722,8 +2285,8 @@ other top-level key through `find_tasks_by_metadata` (§9).
 sweep (exceptions are owned or ratified; PRD
 `plans/inv12-exceptions-owned-or-ratified-prd.md`, D11).
 `x_inv12_finding` is the sweep's idempotence key, one per
-`(scope, dead owner)` where scope is a governed `list_id` or `inline`; the
-sweep skips filing while a live task or pending escalation carries it.
+`(scope, dead owner)` where scope is a governed `list_id` or `inline`; what
+counts as already raised is `scripts/exception_owner_sweep.py::decide`.
 `x_inv12_owns` is a note the sweep merges into a live owner task, saying
 which exception entries cite it. A sweep-filed task asks the implementer to
 re-dispose each entry whose owner is dead: fix the underlying type or code so
@@ -1731,6 +2294,43 @@ the suppression can go, or cite a live follow-up ticket on the marker. The
 accepted marker and declaration spellings are
 `shared.governed_exceptions.INLINE_MARKER_FORMS` and `DECLARATION_FORMS`;
 read them there rather than from a copy here.
+
+### Gate-enforced x_ keys: x_enumeration_scope and the liveness stamp
+
+Three `x_` keys are not free-form annotations. A write-time gate on
+`recon-stage-*` `submit_task` and `update_task` calls owns them (task
+3056). They stay in the `x_` namespace, so they need no blessed-key
+registration and mint no `unknown_key` census line.
+
+- **`x_enumeration_scope`** is a structured object stating which stores
+  and categories an enumeration of Mem0 ids was drawn from, and whether
+  that sweep was exhaustive. Filing a gate that enumerates Mem0 ids
+  without one is rejected (`EnumerationScopeMissing`), and a value of any
+  other shape is rejected on every write (`EnumerationScopeMalformed`).
+- **`x_liveness_reverified_at` and `x_liveness_exceptions`** are written
+  only by the gate. Never author them. Each exception record's `outcome`
+  is an `enumeration_guard.py::EnumeratedIdOutcome` value.
+
+When you write an enumeration:
+- List full 36-char UUIDs, never fragments. A fragment is rejected on
+  filing (`EnumeratedIdTruncated`).
+- Update it with an overwriting merge: `metadata_mode='merge'` (the
+  default) or `'replace'`, never an additive one
+  (`EnumerationUpdateNotOverwriting`). Both modes replace what you send
+  wholesale. `'merge'` replaces each top-level key you supply, so read the
+  task with `get_task` and send the COMPLETE list, never only the ids being
+  added. `'replace'` replaces the whole blob, so send every stored key,
+  `x_liveness_exceptions` included as read: the gate carries forward the
+  records for ids that write did not re-check.
+- Send a `memory_hints` attach as a separate update.
+
+The rules themselves live in the module docstring of
+`fused-memory/src/fused_memory/reconciliation/enumeration_guard.py`: what
+counts as an enumeration and as a gate, how filing and updating differ,
+and the residuals the gate leaves open. The guidance Stage 2 is shown is
+rendered by `enumeration_guard.py::render_enumeration_guard_section`, and
+`enumeration_guard.py::enumeration_scope_example` returns a well-formed
+scope.
 
 ### `allow_mcp_markup`: a write-time flag, not a metadata key
 
@@ -1794,6 +2394,23 @@ oblige every future task write quoting this section to set the override,
 which is precisely the loop this section exists to break. For the full
 picture see `docs/mcp-toolcall-xml-leak.md` §4, "The boundary rejection".
 
+### `allow_uuid_prefix`: a write-time flag, not a metadata key
+
+`metadata={'allow_uuid_prefix': True}` (a literal `True` only) is the
+sanctioned move for a write that **deliberately quotes a bare truncated
+uuid**, such as a correction record citing a bad citation verbatim: the
+uuid-prefix boundary guard then forwards the call without resolving or
+expanding the prefix. It is honoured only on tools that declare
+`metadata`, and it is stripped before persistence exactly as
+`allow_mcp_markup` is, so it never lands in stored metadata. It is
+**never** the remedy for an `ambiguous_uuid_prefix` rejection: that
+rejection means the prefix names more than one record, so put the full
+uuid you meant into the rejection's `original_call` and resubmit that. The
+guard's policy is stated once, in `plans/uuid-prefix-resolution-prd.md`
+§4 C3 (**Override.**), and the strip lives in
+`shared/src/shared/uuid_prefix.py::strip_uuid_prefix_override`; neither is
+restated here.
+
 ### Promoting a convention
 
 A key only stops warning once it's added to the `_BLESSED_METADATA_KEYS`
@@ -1824,15 +2441,30 @@ it. Generalising: prefer blessing when validation is context-dependent, when
 the live corpus already contains values a type would reject, or when the
 apparent enum is not the thing writers are actually held to.
 
-### Known gaps (re-measured 2026-10-02 — none open)
+### Known gaps (re-measured 2026-11-15 — one tracked by a follow-up ticket)
 
-No tracked `unknown_key` source is open. All counts are a snapshot of a
-**growing** corpus, not an invariant: 4748 tasks carried dict metadata at
-the latest corpus-wide measurement
-(2026-08-31), up from 4204 on 2026-08-18 and 3553 when this section was
-first written. Across that corpus 1516 tasks emit at least one
-`unknown_key` line, 3130 lines over 1028 distinct spellings; those are
-untracked Tier-C keys, not gaps this section owns.
+All counts are a snapshot of a **growing** corpus, not an invariant: 9950
+tasks carried dict metadata at the latest corpus-wide measurement
+(2026-11-15, submodel registrations imported), up from 4748 on 2026-08-31
+and 3553 when this section was first written. Across that corpus 1614 tasks
+emit at least one `unknown_key` line, 3416 lines over 1055 distinct
+spellings; most are untracked Tier-C keys, not gaps this section owns.
+
+The largest remaining machine-written `unknown_key` source is the flake
+ledger's `flake_debt_*` keys
+(`orchestrator/src/orchestrator/flake_ledger.py::_deflake_metadata`, 128
+carriers each for `test`, `open_count` and `opened_at`), filed as follow-up
+ticket `tkt_0RX0D4E9Y4DDHGVS4J3MSYFDQP`.
+
+**The merge-lane stamps `merge_first_enqueued_at` and
+`merge_phase_liveness` are CLOSED** — task 5281 blessed both into Tier-A.
+Recorded in the same shape as the rows below so a reader arriving from an
+older revision does not re-open them: the fork was **decided, not
+deferred**. Typing was rejected because `merge_phase_liveness` has no
+reader left, and `x_`-renaming because one key has a live writer and the
+other a live reader. See the frozenset entry in
+`shared/src/shared/task_metadata.py` for the census and the writer/reader
+trail; the figures are not restated here.
 
 **The two rows this table last carried are CLOSED**, recorded in the same
 shape as the `execution_class` row below so a reader arriving from an older
@@ -2018,7 +2650,14 @@ are paged: follow `pagination.has_more` with `offset += returned`.
 48,000 B page budget
 (`fused-memory/src/fused_memory/server/tools.py::RESULT_BYTE_BUDGET`);
 a single row over that budget comes back alone with `truncated_value: true`
-and its value elided, so read that task with `get_task`. `tasks_with_key`
+and its value elided, so read that task with `get_task`.
+`include_rows=True` adds each row's whole `metadata` object and its
+`dependencies` (integer ids, ascending, `[]` when none), under the same
+48,000 B page budget; a single row over that budget comes back alone with
+`truncated_row: true` and its `metadata` elided, so read that task with
+`get_task`. `description` is not returned. The response always echoes
+`include_rows`, so a stdlib client can tell a server that honoured the
+argument from one that dropped it. `tasks_with_key`
 counts the tasks in the searched statuses that carry the key, so without a
 `statuses` filter `tasks_with_key == 0` means no task carries it at all (a
 misspelt key, or no producer has written it yet). An unknown status is
@@ -2032,7 +2671,9 @@ than removing and resubmitting — resubmission loses the task's id (and
 anything depending on that id), history, and any escalations already
 attached to it. To retire a task instead of correcting it, cancel it
 (`status="cancelled"`) rather than removing it, so the record and its id
-remain resolvable by anything that referenced it.
+remain resolvable by anything that referenced it. A task with live children
+is retired with `/cancel-with-children <id>`, which decides and passes a
+disposition for every child (contract `plans/cancel-with-children-prd.md`).
 
 **Adding an escalation category.** Every filed category must be a member of
 `escalation/src/escalation/categories.py::EscalationCategory`; its module
@@ -2127,6 +2768,84 @@ within the grace window.
 a dead holder's row and a lapsed `expires_at` stay `deferred` until someone
 releases them. A session that ends without landing its hold releases it
 first.
+
+### Amending a planned task's text
+
+When a task is planned, the orchestrator stamps a fingerprint of its
+description and details into `metadata.plan_text_fp`, with the plan's time
+in `metadata.plan_authored_at`. An `update_task` that supplies `title`,
+`description`, `details` or `prompt` is compared against that stamp. So is
+a reconciliation write whose audit-trail rotation (§10) rewrote the
+description. If the fingerprint of the post-write description and details
+no longer matches, the result carries `amendment_advisory`:
+
+| Field | Meaning |
+|---|---|
+| `task_id` | the amended task |
+| `plan_authored_at` | when the current plan was written |
+| `fields_changed` | the text fields this write supplied, plus `description` when the rotation rewrote it |
+| `will_replan` | False for a `done` or `cancelled` task, whose amendment reaches no work |
+| `plan_text_fp_before` | the stamped plan fingerprint |
+| `task_text_fp_after` | the fingerprint of the text now stored |
+
+A task with no stamp, a metadata-only write that rotates nothing, and a
+whitespace-only reflow get no advisory. The running agent of an
+`in-progress` task does not see the amendment. Its next dispatch takes the
+revalidation path (task 4031) and re-plans against the new text.
+
+`will_replan` True is a prediction, not an observation. It assumes the
+orchestrator's default `plan_text_fp_gate_enabled: true`, which fused-memory
+cannot read, and a later dispatch. An `in-progress` task whose running agent
+marks it done first never gets one.
+
+Every such amendment also journals a `task_text_amended` reconciliation
+event carrying the advisory plus `writer_source` (`update_task` or
+`curator_combine`) and `agent_id`. That includes a curator combine
+rewriting a planned task's text, which no caller is told about. Contract:
+`plans/task-amendment-delivery-prd.md` §9 C7.
+
+### Superseding another task's plan
+
+A frozen `plan.json` is not inert:
+`orchestrator/src/orchestrator/workflow.py::TaskWorkflow._plan` picks its
+branch from the plan file. A plan with steps, a `_session_id` and a
+resolvable revalidation base (`TaskWorkflow._revalidation_base`) is
+revalidated. A description or details amendment declines the Lever-B skip
+(previous subsection), but the revalidating architect is still handed the
+old plan to confirm, update or recreate. A metadata-only correction changes
+no fingerprint. So with `revalidation_skip_enabled`, no overlap with main's
+changes and `TaskWorkflow._can_skip_revalidation` passing, the orchestrator
+stamps `_revalidated_at` and proceeds without invoking the architect at all.
+Moving `plan.json` out of the way is the reliable way to force fresh
+planning.
+
+No task lane can remove or rewrite another task's plan. The OS sandbox
+grants only `orchestrator/src/orchestrator/agents/write_set.py::WriteSet.writable_paths`,
+whose only `.task-meta` entries are the dispatch's own lane and task dirs.
+A resolution's `granted_files` folds into plan files and locks, never into
+the sandbox. A plan step that writes another task's `.task-meta/` is
+therefore unimplementable (task 4822's step 5d; task 4825).
+
+plan-tools flags such a step when it is authored. The `add_plan_step`,
+`add_prerequisite`, `replace_plan_step` and `confirm_plan` responses carry
+`foreign_task_meta` (`{paths: {<step id>: [<path>]}, note}`) for any
+absolute, `~/` or worktree-relative `../` path inside another lane's or
+task's `.task-meta` dir
+(`WriteSet.is_foreign_task_meta`). The flag is advisory: prose cannot tell a
+read from a write, and reads are fine.
+
+The route: to make another task plan fresh, resolve an escalation whose
+`task_id` is THAT task's with `resolve_issue(action='restart', recut=True)`
+(task 5516; `escalation/src/escalation/server.py::resolve_issue`). Its next
+dispatch parks the branch, quarantines the worktree and moves `.task-meta`
+aside, deleting nothing, then cuts fresh from main and plans fresh.
+`resolve_issue` acts on the task its escalation names, so restart+recut on
+the requesting task's own escalation recuts the requesting task, not the
+target. A task that needs this files `escalate_blocker` for itself instead
+of scheduling the write as a step, with a `suggested_action` naming the
+target task id. The handler then resolves a pending escalation for the
+target, filing one with `escalate_blocker(task_id=<target id>)` first if
+there is none.
 
 ## 10. Rotating a long-running audit-trail task
 
@@ -2225,6 +2944,9 @@ were prose.
   on any scalar collision, and never removes a key. So append to `details`
   in one call, and rotate `description` and `metadata` in a separate call
   with `append` omitted and `metadata_mode='replace'`.
+- A call that supplies none of `prompt`, `metadata`, `title`, `description`,
+  `details`, `priority` or `dependencies` is refused with
+  `NoFieldsToUpdateError` (task 4867), and nothing is written.
 - No column has a length cap of its own. The only size guidance is the
   whole-task threshold above, and no write is refused for exceeding it.
 - Re-read the task from the store afterwards and confirm the status, the

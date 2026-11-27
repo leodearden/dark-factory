@@ -1265,7 +1265,7 @@ NEVER_WIDEN_A_TIMEOUT = (
 RESPONSIBILITY_FIX_ROOT_DEFECT = (
     'You are responsible for finding and fixing the ROOT DEFECT behind this observation'
 )
-RESPONSIBILITY_REMOVE_FROM_LEDGER = (
+RESPONSIBILITY_KEEP_NODE_ID_STABLE = (
     'You do NOT write to the flake ledger, and must not ask anyone to: the ledger '
     'closes this debt cycle itself once it observes this task done. Your part is to '
     'keep the test\'s pytest node-id byte-identical (no rename, no parametrize, no '
@@ -1461,7 +1461,7 @@ def _lane_task_text(row: DebtRow, ctx: DebtContext) -> tuple[str, str]:
         + (f'\n{evidence}' if evidence else '')
         + f'\n'
         f'{RESPONSIBILITY_FIX_ROOT_DEFECT}.\n'
-        f'{RESPONSIBILITY_REMOVE_FROM_LEDGER}.\n'
+        f'{RESPONSIBILITY_KEEP_NODE_ID_STABLE}.\n'
         f'\n'
         f'{NEVER_WIDEN_A_TIMEOUT}\n'
         f'\n'
@@ -1499,7 +1499,7 @@ def _merge_gate_task_text(row: DebtRow, ctx: DebtContext | None) -> tuple[str, s
         f'bug, task 3552). Diagnose before you conclude the test is at fault.\n'
         f'\n'
         f'{RESPONSIBILITY_FIX_ROOT_DEFECT}.\n'
-        f'{RESPONSIBILITY_REMOVE_FROM_LEDGER}.\n'
+        f'{RESPONSIBILITY_KEEP_NODE_ID_STABLE}.\n'
         f'\n'
         f'{NEVER_WIDEN_A_TIMEOUT}\n'
         f'\n'
@@ -2002,13 +2002,14 @@ async def _ensure_owner_task(
         if liveness == 'done':
             # The resolution did not land this call (see this function's docstring).  Keep the
             # pointer and file nothing, the unreadable-status branch's fail-safe
-            # direction: the next lazy resolve_debt closes the cycle through it, where a
-            # replacement would erase it for good.
+            # direction: the next resolve_debt, lazy or eager, closes the cycle through
+            # it, where a replacement would erase it for good.
             logger.warning(
                 'flake_ledger: owner %s of test_id=%s is done but its debt cycle could not '
                 'be closed — KEEPING the owner rather than replacing it; '
                 'regressed_after_resolution detection is DEFERRED to the next suppression '
-                "(or θ's sweep)",
+                '(or the hourly resolution sweep); `orchestrator flake-ledger` shows the row '
+                'as OWNER DONE',
                 row.owner_task_id,
                 row.test_id,
             )
@@ -2323,10 +2324,11 @@ async def open_debt(
     forward) instead of ζ quietly replacing a finished owner.  That makes recurrence
     detection race-free with no sweep at all: ``owner_task_id`` changes only inside this
     function, so the done owner is still on the row when the next suppression arrives,
-    whether or not an eager sweep has run.  The eager sweep is task θ's.  The close's
-    live ``get_task`` read of the owner is also the read ζ's enforcement acts on, so one
-    call reads its owner once; ``get_statuses`` is only the fallback when that read
-    failed.
+    whether or not the eager sweep
+    (``orchestrator/src/orchestrator/flake_debt_drain.py::DebtResolutionSweep``) has run.
+    The close's live ``get_task`` read of the owner is also the read ζ's enforcement acts
+    on, so one call reads its owner once; ``get_statuses`` is only the fallback when that
+    read failed.
 
     The close's owner read is the only network wait BEFORE the upsert, so it is bounded
     by *resolve_budget_secs*: a slow or hung read fails like any other, costing the
@@ -2646,8 +2648,9 @@ async def resolve_debt(
     timestamps, so it records when the ledger SAW the owner done.
 
     CALLERS.  :func:`open_debt` is the LAZY one, before its upsert, so a recurrence after
-    a landed fix re-enters the cycle instead of quietly replacing the owner.  Task θ's
-    periodic sweep is the intended EAGER one.
+    a landed fix re-enters the cycle instead of quietly replacing the owner.  The EAGER
+    one is ``orchestrator/src/orchestrator/flake_debt_drain.py::DebtResolutionSweep``
+    (task 8409), hourly.
 
     COUPLING RULE (§5.9): the ledger reads task state and never writes it; the live read
     is the only client call made here.
@@ -2764,7 +2767,13 @@ async def _resolve(
 
 
 def list_open_debt(db_path: Path) -> list[DebtRow]:
-    """Every test currently in debt, oldest first.
+    """:func:`read_open_debt`, with a failed read as ``[]``."""
+    rows = read_open_debt(db_path)
+    return [] if rows is None else rows
+
+
+def read_open_debt(db_path: Path) -> list[DebtRow] | None:
+    """Every test currently in debt, oldest first; ``None`` when the read failed (B12).
 
     Ordering is part of the contract (``opened_at`` then ``test_id``) because ι prints
     this list.
@@ -2785,4 +2794,4 @@ def list_open_debt(db_path: Path) -> list[DebtRow]:
             db_path,
             exc_info=True,
         )
-        return []
+        return None

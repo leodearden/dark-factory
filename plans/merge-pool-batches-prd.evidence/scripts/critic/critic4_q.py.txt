@@ -1,0 +1,33 @@
+import sqlite3, sys, json
+DB = "file:/home/leo/src/dark-factory/.taskmaster/tasks/tasks.db?mode=ro"
+con = sqlite3.connect(DB, uri=True)
+con.row_factory = sqlite3.Row
+def st(i):
+    r = con.execute("select status from tasks where id=?", (i,)).fetchone()
+    return r["status"] if r else "MISSING"
+def show(i, full=True, maxlen=None):
+    rows = con.execute("select * from tasks where id=?", (i,)).fetchall()
+    for r in rows:
+        print("="*100)
+        print(f"ID {r['id']} tag={r['tag']} status={r['status']} priority={r['priority']} updated={r['updated_at']} claimant={r['claimant_run_id']} hb={r['heartbeat_at']}")
+        print("TITLE:", r["title"])
+        deps = [d[0] for d in con.execute("select depends_on from dependencies where task_id=?", (i,))]
+        dents = [d[0] for d in con.execute("select task_id from dependencies where depends_on=?", (i,))]
+        print("DEPENDS ON:", ", ".join(f"{d}({st(d)})" for d in deps))
+        print("DEPENDENTS:", ", ".join(f"{d}({st(d)})" for d in dents))
+        if full:
+            d = r["description"] or ""
+            t = r["details"] or ""
+            print("DESCRIPTION:", d if not maxlen else d[:maxlen])
+            print("DETAILS:", t if not maxlen else t[:maxlen])
+            print("METADATA:", (r["metadata"] or "")[: (maxlen or 100000)])
+if __name__ == "__main__":
+    full = True
+    maxlen = None
+    args = sys.argv[1:]
+    if args and args[0].startswith("--max="):
+        maxlen = int(args[0][6:]); args = args[1:]
+    if args and args[0] == "--brief":
+        full = False; args = args[1:]
+    for a in args:
+        show(int(a), full, maxlen)

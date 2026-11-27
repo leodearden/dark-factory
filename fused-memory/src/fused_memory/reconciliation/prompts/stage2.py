@@ -1,12 +1,22 @@
 """System prompt for Stage 2: Task-Knowledge Sync."""
 
 from fused_memory.memory_metadata import render_metadata_vocabulary_guidance
+from fused_memory.middleware.task_text_write_guard import (
+    TASK_TEXT_FP_KEY,
+    TEXT_BASE_REQUIRED,
+    TEXT_BASE_STALE,
+    TEXT_VERIFIED_KEY,
+    TEXT_WRITE_UNCONFIRMED_FLAG_TYPE,
+)
 from fused_memory.reconciliation.audit_trail_rotation import (
     render_audit_trail_rotation_section,
 )
 from fused_memory.reconciliation.blocked_gate_audit_section import BLOCKED_GATE_AUDIT_HEADER
 from fused_memory.reconciliation.consolidation_gate import (
     render_consolidation_gate_section,
+)
+from fused_memory.reconciliation.enumeration_guard import (
+    render_enumeration_guard_section,
 )
 from fused_memory.reconciliation.graphiti_degradation_probe import (
     render_graphiti_degradation_probe_section,
@@ -25,11 +35,11 @@ from fused_memory.reconciliation.predicate_contradiction import (
     render_predicate_contradiction_section,
 )
 from fused_memory.reconciliation.prompts import (
-    _STAGE2_GRAPHITI_QUEUED_GUIDANCE,
-    _STAGE2_PROJECT_ID_GUIDELINE,
     AMEND_AND_EPISODE_TOOLS_BLOCK,
     CITATION_REPAIR_TOOL_BLOCK,
     DUPLICATE_FINDING_SALVAGE_GUIDANCE,
+    GRAPHITI_QUEUED_GUIDANCE,
+    PROJECT_ID_GUIDELINE,
     REFERENT_DECLARATION_GUIDANCE,
     STAGE2_SUPPRESS_GUARD_KIND,
     STALE_KNOWLEDGE_ANNOTATION_NORM,
@@ -92,20 +102,24 @@ Task creation is a two-phase operation:
 priority=..., metadata={{..., "_causation_id": <run_id>}})` → returns \
 `{{"ticket": "tkt_..."}}`. The `_causation_id` is what lets the framework journal the \
 curator's outcome against this run (see `## Task-Creation Accounting`).
-2. Call `mcp__fused-memory__resolve_ticket(ticket=..., project_root=...)` → blocks until \
-the curator decides, then returns `{{"status": ..., "task_id"?: ..., "reason"?: ...}}`.
+2. Call `mcp__fused-memory__resolve_ticket(ticket=..., project_root=...)` → waits while \
+the ticket is pending, then returns `{{"status": ..., "task_id"?: ..., "ticket"?: ..., "reason"?: ...}}`.
 
 Interpreting the status:
 - `status="created"` — new task was created; capture the returned `task_id`.
 - `status="combined"` — candidate was merged into an existing task; a `task_id` is still \
 returned. Treat as success, not failure.
-- `status="failed"` — timeout or server error; inspect `reason` and do not retry silently.
+- `status="pending"` — NON-terminal: the wait ended before the curator decided (`reason` is `wait_timeout`, `wait_interrupted` or `store_unavailable`). NO `task_id` is returned; the answer carries the `ticket`. Call `resolve_ticket` once more with the same ticket; never re-submit.
 - `status="awaiting_curation"` — NON-terminal: the curator could not judge the submission yet (`reason` says why), so the ticket is durably parked and retried automatically until it gets a verdict. NO `task_id` is returned yet. Do not re-submit it, do not count it, and do not flag it as a discrepancy.
+- `status="failed"` — terminal: no task was created; inspect `reason` and do not retry silently.
+- `status="cancelled"` — terminal: the ticket was withdrawn; NO `task_id` is returned.
 - `status="refused"` — a deterministic guard (cancelled-premise blocklist / recon premise registry) rejected the candidate. NO task was created and NO `task_id` is returned. This is an intended, terminal outcome — not an error and not a discrepancy. Do not retry it, and do not record a task id for it; `reason` carries the justification.
 
 {render_finding_provenance_section(can_file_tasks=True)}
 
 {render_execution_class_section()}
+
+{render_enumeration_guard_section()}
 
 {render_source_completion_section(can_file_tasks=True)}
 
@@ -202,16 +216,16 @@ finding stops re-escalating every cycle. (2) If no local task is the subject —
 in the target project with no local anchor — then cite_task on the TARGET project would return \
 unknown_project and attach nothing, so this finding has no cited-task anchor and is deduped by its \
 normalised description until an operator registers the project or routes the work.
-- Re-scoping or deleting an existing local task because its scope belongs elsewhere is fine \
-— follow the Authority Model rules for that.
+- Re-scoping or cancelling (set_task_status('cancelled')) an existing local task because its scope \
+belongs elsewhere is fine — follow the Authority Model rules for that.
 
 ## Guidelines
 - Review Stage 1's flagged items first — they identify task-relevant findings.
 - Always review the **Proactive Task Sample** section: check in-progress tasks for completion \
 knowledge that should be captured, blocked tasks for unblock conditions that may now be met, \
 and done tasks for missing knowledge capture. **For each done task in the sample, you MUST \
-call `mcp__fused-memory__count_memories_by_metadata(project_id, \
-{{'task_id': str(task_id), 'stage2_suppress': True}})` as the PRIMARY suppression gate, \
+call `mcp__fused-memory__count_memories_by_metadata(project_id=..., \
+filters={{'task_id': str(task_id), 'stage2_suppress': True}})` as the PRIMARY suppression gate, \
 BEFORE any semantic search or finding** — if `count > 0`, skip that done task entirely \
 (no search, no completion note, no missing_knowledge finding). This gate applies to ALL \
 done tasks in the proactive sample, not just those already flagged by Stage 1.
@@ -221,8 +235,8 @@ reconciliation cycle boundary (via an `updatedAt`-window scan) — it is the AUT
 surface for done-task completion-memory coverage and SUPERSEDES the 5-item **Proactive \
 Task Sample** for that purpose (the sample is a small mixed-status spot-check and \
 systematically under-covers done tasks). For EACH task in the audit section, run the same \
-`stage2_suppress` count-gate FIRST — call `mcp__fused-memory__count_memories_by_metadata(project_id, \
-{{'task_id': str(task_id), 'stage2_suppress': True}})`; if `count > 0`, skip that task \
+`stage2_suppress` count-gate FIRST — call `mcp__fused-memory__count_memories_by_metadata(project_id=..., \
+filters={{'task_id': str(task_id), 'stage2_suppress': True}})`; if `count > 0`, skip that task \
 entirely; otherwise search for related memories and, if completion knowledge is genuinely \
 missing, write a completion note tagged `metadata={{'stage2_suppress': True, 'task_id': \
 str(task_id), 'kind': '{STAGE2_SUPPRESS_GUARD_KIND}'}}` (see the Completion-Note \
@@ -246,7 +260,7 @@ as full coverage.
 - Be conservative with task cancellation — prefer re-scoping or adding context. When you do \
 cancel, use `set_task_status('cancelled')`; do not route the status change through \
 `update_task` — the server rejects status writes there.
-- {_STAGE2_PROJECT_ID_GUIDELINE}
+- {PROJECT_ID_GUIDELINE}
 - **Report channel — recon_report MCP tools (PRD γ §9)**: For each inconsistency or finding \
 (including cross_project_routing findings emitted above): \
 {get_recon_report_tool_guidance()}
@@ -269,8 +283,8 @@ aren't in the diff, even if they look topically related or appear in \
 2. **Note-provenance tasks** (no commit recorded): Do NOT write "shipped via X" \
 edges. You MAY write a neutral relationship edge like "Task N references \
 <file>" or "<file> exists in the codebase" ONLY if you have directly verified \
-via the `Read` or `Glob` tool that the file exists at the cited path on the \
-current working tree. If unverified, write a single \
+via the `Read` or `Glob` tool that the file exists at the cited path under \
+this project's `project_root` (use an absolute path). If unverified, write a single \
 `observations_and_summaries` entry quoting the note instead.
 3. **Unknown-provenance tasks** (legacy, no provenance recorded): Do NOT write \
 any file-linked edges. Write at most a single `observations_and_summaries` \
@@ -296,16 +310,20 @@ investigation cycle before it surfaced. Do not repeat this failure mode.
 1. **Verify before you file**: Before embedding, in a FILED TASK's \
 description, any specific code-level claim you attribute to a completed \
 task/commit/ACTION — a metadata key, a stamp like `foo=true`, or a named \
-identifier — you MUST verify the cited token actually exists by running \
-`git grep <token>` and/or `git log --all -S '<token>'` against the current \
-working tree and its full history.
-2. **Absent from both means not fact**: If the token appears in NEITHER the \
-tree NOR history, do NOT state the claim as verified fact. Either drop the \
-specific claim, or mark it explicitly "(unverified — pending human \
-confirmation)" so a human reviews it before it propagates further.
-3. **A history-only hit still verifies**: A token found only in git history \
-(e.g. legitimately removed by a later commit) counts as verified — do not \
-flag a true claim about work that was done and later reverted or removed.
+identifier — you MUST verify the cited token actually exists with the `Grep` \
+tool. This stage has no shell and no commit history, so the files are all you \
+can check. Pass an absolute `path` under the root of the project the claim is \
+about: this project's `project_root` line in the payload or, for a claim about \
+a cross-project task, that project's root in the "Known Projects" section. \
+Never pass a relative path: the stage's working directory is the dark-factory \
+checkout for every project.
+2. **Not found means not fact**: If Grep does not find the token under that \
+root, do NOT state the claim as verified fact. Either drop the specific claim, \
+or mark it explicitly "(unverified — pending human confirmation)" so a human \
+reviews it before it propagates further.
+3. **Removed work reads as absent too**: A claim about work that a later \
+commit removed will also read as absent, so mark it unverified rather than \
+stating it as fact.
 4. **Scope**: This applies to claims about what OTHER (completed) tasks or \
 commits did. It does not apply to your own prospective proposals for new \
 work (e.g. suggesting a new `metadata.foo` field as a next step is not a \
@@ -315,8 +333,8 @@ claim about completed work and needs no verification).
 Before writing ANY completion note or "task marked done, no knowledge captured" memory \
 for an already-done task, you MUST first call:
 
-  `mcp__fused-memory__count_memories_by_metadata(project_id, \
-{{'task_id': str(task_id), 'stage2_suppress': True}})`
+  `mcp__fused-memory__count_memories_by_metadata(project_id=..., \
+filters={{'task_id': str(task_id), 'stage2_suppress': True}})`
 
 If this call returns `count > 0`, SKIP the completion-note write entirely — one or more \
 guard memories already exist for this task (carrying `stage2_suppress: True` in their \
@@ -371,9 +389,9 @@ new information.
 After calling `mcp__fused-memory__add_memory`, inspect the `memory_ids` field in the \
 response. An empty list means Mem0 deduplicated or filtered the write and no new memory \
 was created — count it as a no-op, not a successful addition. Your stats \
-(`memories_written`) must reflect actual IDs returned, not calls attempted.
+(`memories_added`) must reflect actual IDs returned, not calls attempted.
 
-{_STAGE2_GRAPHITI_QUEUED_GUIDANCE}
+{GRAPHITI_QUEUED_GUIDANCE}
 
 **Per-Cycle Counter Schema** — include all six of the following fields in your \
 structured `stats` output (omitting them causes Stage 3's flag-accounting audit to \
@@ -456,12 +474,12 @@ After `mcp__fused-memory__resolve_ticket` returns `status="created"` or \
 `status="combined"` with a `task_id`, treat as authoritative success — increment \
 `tasks_created` for `created` and `tasks_combined` for `combined` (never \
 `tasks_created`: a combined candidate mints no new task id). If `status="refused"`, the candidate was deliberately rejected by a deterministic guard: no task was created, no `task_id` is present, and this is CORRECT — never count it toward `tasks_created`, never retry it, and never flag it as a discrepancy. \
-If `status="awaiting_curation"`, the ticket is parked, not lost: no `task_id` is present yet, and this is CORRECT — never count it toward `tasks_created`, never re-submit it, and never flag it as a discrepancy. \
+If `status="pending"` or `status="awaiting_curation"`, the ticket is open, not lost: no `task_id` is present yet, and this is CORRECT — count it toward neither `tasks_created` nor `tasks_combined`, never flag it as a discrepancy, and never re-submit it. Re-poll `resolve_ticket` once with the same ticket, then record the ticket id. \
 Otherwise, if `task_id` is missing from the `resolve_ticket` response, \
-skip the `tasks_created` increment and flag the discrepancy in your structured report. \
+skip the `tasks_created` increment and flag the discrepancy with `mcp__recon-report__add_finding`. \
 `status="failed"` is never counted toward `tasks_created` regardless of whether a \
 `task_id` is present — inspect `reason` and do not retry silently. \
-If the status is anything other than `created`/`combined`/`failed`/`refused`/`awaiting_curation` but a `task_id` \
+If the status is anything other than `created`/`combined`/`failed`/`refused`/`cancelled`/`pending`/`awaiting_curation` but a `task_id` \
 is present, call \
 `mcp__fused-memory__get_task` with that id to verify — only count if it returns a \
 valid record, otherwise flag the discrepancy.
@@ -474,7 +492,7 @@ is absent. Only increment the relevant task-success counter (e.g., `tasks_reopen
 if `newStatus` matches the requested status. If the response is missing or ambiguous, \
 call `mcp__fused-memory__get_task` with the same task id to confirm. If the confirmed \
 status differs from the requested one, skip the counter increment and flag the \
-discrepancy in your structured report. If the response contains `"no_op": true`, the \
+discrepancy with `mcp__recon-report__add_finding`. If the response contains `"no_op": true`, the \
 task was already in the requested status — treat as a successful no-op (do not \
 increment a success counter, do not flag as a discrepancy). When `task_id` is a \
 comma-separated list, the response is wrapped as `{{"success": bool, "results": \
@@ -507,7 +525,7 @@ automatically by the backend (no pre-write baseline fetch is required). Only inc
 the newly-attached entries — it MUST contain every newly-attached entity and query; it \
 MAY also contain pre-existing entries that were preserved through the union merge. If \
 the returned hints are missing any newly-attached entry, skip the \
-`tasks_hints_updated` increment and flag the discrepancy in your structured report.
+`tasks_hints_updated` increment and flag the discrepancy with `mcp__recon-report__add_finding`.
 
 NEVER combine a `details` rewrite with a metadata append in ONE \
 `mcp__fused-memory__update_task` call. `append` is NOT scoped to metadata: the same \
@@ -522,7 +540,7 @@ a new section to `details`, pass ONLY the new section text with `append=True` an
 the backend do the concatenation — never re-send the existing body. Either way, verify \
 by reading the response's `updated_task.details` field (the post-write body lives \
 THERE — the response has no top-level `details` key) or a follow-up \
-`mcp__fused-memory__get_task`, and flag a duplicated body in your structured report.
+`mcp__fused-memory__get_task`, and flag a duplicated body with `mcp__recon-report__add_finding`.
 
 The additive union above ALSO covers a task whose stored `memory_hints` are in the \
 LEGACY list format (`[{{entity, query}}, ...]`) rather than the canonical \
@@ -558,10 +576,33 @@ were extending the field destroyed the entire original description instead, with
 and no warning. To EXTEND a task's description (or title), do the same read-modify-write \
 as the RESHAPE case above: call `mcp__fused-memory__get_task(id=<task_id>, \
 project_root=<project_root>)` to read the FULL current text, concatenate your addition \
-locally, then write the COMPLETE new `description` with `append` OMITTED. If a write \
-genuinely means to REPLACE the field, omit `append` (or pass `append=False`) to confirm \
-it; if the `append=True` was meant for `metadata` or `details`, split it into a separate \
-`update_task` call.
+locally, then write the COMPLETE new `description` with `append` OMITTED and \
+`expected_text_fp` set to that read's `{TASK_TEXT_FP_KEY}` (the compare-and-swap rule \
+below). If a write genuinely means to REPLACE the field, omit `append` (or pass \
+`append=False`) to confirm it; if the `append=True` was meant for `metadata` or \
+`details`, split it into a separate `update_task` call. An `update_task` that supplies \
+no field to write is likewise REJECTED with a `TASKMASTER_TOOL_ERROR` (`error_type` \
+`NoFieldsToUpdateError`, whose message lists the writable fields) and writes nothing.
+
+TASK-TEXT AMENDMENTS (compare-and-swap + readback). The server enforces both halves of \
+this rule on every `description`/`details` amendment you make:
+1. Immediately before composing the amendment, call \
+`mcp__fused-memory__get_task(id=<task_id>, project_root=<project_root>)` and compose \
+against THAT read's text — never a copy read earlier in the cycle.
+2. Pass `expected_text_fp` set to that response's `{TASK_TEXT_FP_KEY}`. A write that \
+replaces `description`, or `details`/`prompt` without `append=True`, is REJECTED without \
+it (`error_type` `{TEXT_BASE_REQUIRED}`). If the text changed since your read, the write \
+is REJECTED with `{TEXT_BASE_STALE}`: re-read with `get_task`, recompose against the NEW \
+text, and resend with the fresh `{TASK_TEXT_FP_KEY}` — never resend the same text.
+3. For a pure ADDITION to `details`, prefer `details` carrying ONLY the new section with \
+`append=True`: it needs no token, because the backend appends onto the stored body itself.
+4. Count a text amendment as applied — in `stats.task_text_amendments_confirmed` and in \
+any finding resolution or report claim — ONLY when the `update_task` response carries \
+`{TEXT_VERIFIED_KEY}: true`. The server sets it from a fresh read under the write lock, \
+the same contract as Stage 1's `edges_updated`, which counts only on `verified: true`. A \
+self-reported "VERIFIED via get_task" never suffices. On `{TEXT_VERIFIED_KEY}: false`, do \
+NOT count it and report it as unconfirmed; the server has already filed a \
+`{TEXT_WRITE_UNCONFIRMED_FLAG_TYPE}` finding, so do not file another.
 
 {render_audit_trail_rotation_section()}
 
@@ -788,7 +829,7 @@ through the recon_report channel (`mcp__recon-report__add_finding`); the reconci
 harness owns their persistence-gated escalation path. The sanctioned scope of \
 `escalate_blocker` itself is stated once, under `## Escalation Store Boundary` below.
 
-One of these is now handled for you: the before/after `get_task` self-check \
+The harness enforces one check for you: the before/after `get_task` self-check \
 around a write to a live in-progress task — reading status/`claimant_run_id`/ \
 `heartbeat_at` immediately before and after, and flagging unexpected \
 divergence — is a CODE-ENFORCED harness backstop, not just this prompt's \
@@ -854,11 +895,13 @@ lifecycle; the rules below say how to confirm it.
    cancel-and-remint never is. Identify the carrier by `metadata.gate_subject` (the \
    "## Source-Completion" section is the authority for that canonical key and its \
    read-side aliases). AMEND HAZARD: a carrier's `description` is REPLACE-ONLY, so \
-   amending one is a read-modify-write — READ the current text first, then write the \
-   COMPLETE merged text with `append` OMITTED, and verify the echoed `updated_task` \
-   reflects it. Pairing `description` with `append=True` is REJECTED; the \
-   REPLACE-ONLY rule under "## Verifying Task Operations" states that contract once \
-   and is the authority for it. Re-filing is not an escape \
+   amending one is a read-modify-write — READ the current text with `get_task` first, \
+   then write the COMPLETE merged text with `append` OMITTED and `expected_text_fp` set \
+   to that read's `{TASK_TEXT_FP_KEY}`, and treat the amend as applied only when the \
+   response carries `{TEXT_VERIFIED_KEY}: true`. Pairing `description` with \
+   `append=True` is REJECTED; the REPLACE-ONLY rule and the TASK-TEXT AMENDMENTS rule \
+   under "## Verifying Task Operations" state that contract once and are the authority \
+   for it. Re-filing is not an escape \
    from this rule: the `submit_task` boundary now REJECTS a second gate for a subject \
    whose carrier is still non-terminal.
 

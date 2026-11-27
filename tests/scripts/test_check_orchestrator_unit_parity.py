@@ -88,6 +88,9 @@ from setup_host_sections import (
     systemctl_calls,
     write_checker,
 )
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 CHECKER_PATH = REPO_ROOT / "scripts" / "check_orchestrator_unit_parity.py"
@@ -2372,9 +2375,10 @@ def test_force_all_still_cannot_copy_a_source_that_does_not_exist(
     Measured before this guard existed: DF_INSTALL_ORCH_UNITS=1 with one
     committed template deleted exits 1 at `cp: cannot stat ...`, and under
     `set -euo pipefail` that aborts setup-host.sh outright — no daemon-reload,
-    no enables, and every LATER section of the host installer (jCodeMunch,
-    Claude config, ...) silently never runs. The operator asked to install over
-    a reported drift; they did not ask to halt the host setup.
+    no enables, and every LATER section of the host installer (dashboard
+    units, skill symlinks, git hooks, ...) silently never runs. The operator
+    asked to install over a reported drift; they did not ask to halt the host
+    setup.
 
     The guard is deliberately PHYSICAL (does the source file exist) rather than
     a fourth verdict arm, because it must also hold for a unit the gate never
@@ -2426,7 +2430,8 @@ def test_a_unit_that_cannot_be_copied_does_not_abort_the_installer(
     writing. `cp` exits 1 at "cannot create regular file: Permission denied",
     and under `set -euo pipefail` a bare `cp` would abort setup-host.sh right
     there: no daemon-reload, no enables, and every LATER section of the host
-    installer (jCodeMunch, Claude config, ...) silently never runs.
+    installer (dashboard units, skill symlinks, git hooks, ...) silently never
+    runs.
 
     The unwritable unit is deliberately ordered BEFORE the survivor in
     `_orch_units`, so a run that aborts on it cannot accidentally satisfy the

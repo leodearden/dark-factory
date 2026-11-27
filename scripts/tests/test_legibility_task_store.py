@@ -4,10 +4,15 @@ docs/quality-findings-contract.md §8). Every case drives McpTaskStore through
 its injected ``post`` callable."""
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable
 from typing import Any
+from unittest.mock import MagicMock
 
 import pytest
+from fused_memory.middleware import ticket_store as fused_memory_ticket_store
+from fused_memory.middleware.task_curator import CorpusSearchError, TaskCurator
+from fused_memory.middleware.task_interceptor import TaskInterceptor
 from legibility import task_store
 
 _URL = "http://fused-memory.test/mcp"
@@ -102,6 +107,64 @@ def test_an_error_payload_from_any_tool_raises_store_unreachable_naming_tool_and
 
     assert tool in str(raised.value)
     assert "store is down" in str(raised.value)
+    assert not isinstance(raised.value, task_store.StoreDegraded)
+
+
+def test_an_error_reply_not_flagged_degraded_is_unreachable_not_an_outage() -> None:
+    post = _RecordingPost({"search_tasks": [{**_error_reply(), "degraded": False}]})
+
+    with pytest.raises(task_store.StoreUnreachable) as raised:
+        _store(post).search_tasks(_ROOT, query="q", score_threshold=0.6)
+
+    assert not isinstance(raised.value, task_store.StoreDegraded)
+
+
+_DEGRADED_SEARCH_REPLY = {
+    "results": [],
+    "degraded": True,
+    "error": "curator corpus search failed for project p: RateLimitError: insufficient_quota",
+    "error_type": "RateLimitError",
+    "billing_exhausted": "api_key_credits",
+}
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        _DEGRADED_SEARCH_REPLY,
+        {key: value for key, value in _DEGRADED_SEARCH_REPLY.items() if key not in ("error", "error_type")},
+    ],
+    ids=["documented-shape", "flag-without-error"],
+)
+def test_a_degraded_search_reply_raises_store_degraded_never_no_match(reply) -> None:
+    post = _RecordingPost({"search_tasks": [reply]})
+
+    with pytest.raises(task_store.StoreDegraded) as raised:
+        _store(post).search_tasks(_ROOT, query="q", score_threshold=0.6)
+
+    assert isinstance(raised.value, task_store.StoreUnreachable)
+    assert "search_tasks" in str(raised.value)
+    if "error" in reply:
+        assert "insufficient_quota" in str(raised.value)
+
+
+async def _fused_memorys_search_reply_with_qdrant_down() -> dict[str, Any]:
+    curator = MagicMock(spec=TaskCurator)
+    curator.search_corpus.side_effect = CorpusSearchError("p", ConnectionError("qdrant is down"))
+    interceptor = TaskInterceptor(None, None, MagicMock(), curator=curator)
+    try:
+        return await interceptor.search_tasks(_ROOT, "q", score_threshold=0.6)
+    finally:
+        await interceptor.close()
+
+
+def test_fused_memorys_own_outage_reply_is_read_as_store_degraded() -> None:
+    post = _RecordingPost({"search_tasks": [asyncio.run(_fused_memorys_search_reply_with_qdrant_down())]})
+
+    with pytest.raises(task_store.StoreDegraded) as raised:
+        _store(post).search_tasks(_ROOT, query="q", score_threshold=0.6)
+
+    assert "search_tasks" in str(raised.value)
 
 
 def test_a_raising_post_becomes_store_unreachable_chaining_the_original() -> None:
@@ -233,7 +296,40 @@ def test_a_timed_out_wait_is_undecided_and_any_other_failure_is_not() -> None:
 @pytest.mark.parametrize(
     "reply",
     [
-        {"status": "pending"},
+        {"status": "pending", "ticket": "tkt_1", "reason": "wait_timeout"},
+        {"status": "awaiting_curation", "ticket": "tkt_1", "reason": "curation-deferred: llm-failed"},
+    ],
+    ids=["pending", "awaiting-curation"],
+)
+def test_an_open_ticket_is_undecided_and_names_no_task(reply) -> None:
+    outcome = _resolve(reply)
+
+    assert outcome.undecided is True
+    assert outcome.task_id is None
+
+
+def test_a_cancelled_ticket_is_decided_and_names_no_task() -> None:
+    outcome = _resolve({"status": "cancelled", "reason": "user_cancelled"})
+
+    assert outcome == task_store.TicketOutcome(task_store.TicketStatus.CANCELLED, None, "user_cancelled")
+    assert outcome.undecided is False
+    assert outcome.task_id is None
+    assert _resolve({"status": "cancelled", "reason": "user_cancelled", "task_id": 7}).task_id is None
+
+
+def test_the_census_parses_exactly_fused_memorys_ticket_statuses() -> None:
+    census = {status.value for status in task_store.TicketStatus}
+    canonical = {status.value for status in fused_memory_ticket_store.TicketStatus}
+
+    assert census == canonical, (
+        f"census-only statuses {sorted(census - canonical)}; "
+        f"fused-memory-only statuses {sorted(canonical - census)}"
+    )
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        {"status": "exploded"},
         {"status": "created"},
         {"status": "combined", "task_id": "not-a-number"},
         {"status": "created", "task_id": True},

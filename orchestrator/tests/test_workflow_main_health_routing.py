@@ -20,7 +20,8 @@ from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps
 from orchestrator.main_health_actions import MainHealthNextAction
-from orchestrator.merge_lane.worker import MAIN_HEALTH_RED_REASON_PREFIX, MergeOutcome
+from orchestrator.merge_lane.main_health_probe import MAIN_HEALTH_RED_REASON_PREFIX
+from orchestrator.merge_lane.worker import MergeOutcome
 from orchestrator.scheduler import TaskAssignment
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
 
@@ -177,7 +178,7 @@ class TestSubmitToMergeQueueMainHealthRouting:
 
         workflow.merge_queue = asyncio.Queue()
         with patch(
-            'orchestrator.merge_lane.worker.enqueue_merge_request', _fake_enqueue,
+            'orchestrator.merge_lane.intake.enqueue_merge_request', _fake_enqueue,
         ):
             result = asyncio.run(
                 workflow._submit_to_merge_queue('task/42', pre_rebased=False, merge_phase=True)
@@ -223,7 +224,7 @@ class TestSubmitToMergeQueueMainHealthRouting:
 
         workflow.merge_queue = asyncio.Queue()
         with patch(
-            'orchestrator.merge_lane.worker.enqueue_merge_request', _fake_enqueue,
+            'orchestrator.merge_lane.intake.enqueue_merge_request', _fake_enqueue,
         ):
             result = asyncio.run(
                 workflow._submit_to_merge_queue('task/42', pre_rebased=False, merge_phase=False)

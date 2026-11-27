@@ -35,8 +35,8 @@ so a diff touching only THIS file produces a FILE_SCOPED run of exactly this
 file; ``session.items`` would then hold only this module's own items, and the
 guard would pass while checking nothing else — the exact silent-vacuity trap
 this repo refuses (cf. ``test_warm_lane_bash_bucket_placement.py``). A disk
-sweep of ``tests_dir.rglob('*.py')`` reads every file regardless of what a
-given invocation happened to collect.
+sweep of every ``*.py`` under the tests tree reads every file regardless of
+what a given invocation happened to collect.
 
 RESIDUAL GAPS, deliberately out of scope and recorded rather than silently
 omitted:
@@ -51,7 +51,9 @@ omitted:
   use the alias only for ``.raises``, never ``.mark``, so this is a real but
   currently-inert gap;
 * sibling packages (shared, fused-memory, escalation) have their own markers
-  (e.g. ``integration``) and no equivalent guard.
+  (e.g. ``integration``) and no equivalent guard, except for ``defect`` and
+  ``criterion``: ``TestDefectMarkersRegisteredInEveryMember`` requires both in
+  the root pyproject and in every ``[tool.uv.workspace]`` member's.
 
 This module is built in two halves, in that order: unit tests of the pure
 static helpers against synthetic strings/trees (``TestAppliedMarkerNames``,
@@ -61,28 +63,31 @@ the REAL pytest config (``TestMarkerRegistrationDrift``).
 from __future__ import annotations
 
 import ast
+import dataclasses
+import functools
 import tomllib
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 import pytest
-from _orch_helpers import WHOLE_TREE_SCAN_TEST_TIMEOUT
+from _orch_helpers import ORCH_DIR, ORCH_PYPROJECT
+from _tree_scan import (
+    ORCHESTRATOR_TESTS,
+    TESTS_DIR,
+    TREE_PASS_XDIST_GROUP,
+    ParsedModule,
+    TreeAnalysis,
+    TreePass,
+    python_files,
+)
 from shared.pytest_mark_grammar import mark_elements, marker_name, pytestmark_value
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
-# This guard sweeps every *.py under orchestrator/tests/ -- 535 files at
-# authorship time -- and ast.parse()s each one; its module-scoped
-# `_real_tree_sweep` fixture measured ~5.6s for ~494 files.
-# This module-level mark is the SINGLE budget for every test here, as
-# test_whole_tree_scan_timeout_guard.py demands of every whole-tree scanner: a
-# MODULE-LEVEL pytestmark is a sound LOWER bound on every collected item, where
-# "some timeout mark somewhere in the file" is only an UPPER bound -- which is
-# why this file is the 12th member of that family rather than an exception to
-# it.  A per-test decorator here would REPLACE the mark, not add to it.
-# WHY that budget, the thread-mode os._exit() cost model it clears, and the
-# guard that ENFORCES this mark rather than trusting it to be sprinkled: see
-# WHOLE_TREE_SCAN_TEST_TIMEOUT in _orch_helpers.py, and
-# test_whole_tree_scan_timeout_guard.py (task 4215).
-pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
+# The family mark and shared group: shared/src/shared/whole_tree_guard_family.py::WHOLE_TREE_SCAN_TEST_TIMEOUT, _tree_scan.py.
+pytestmark = [
+    pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT),
+    pytest.mark.xdist_group(TREE_PASS_XDIST_GROUP),
+]
 
 
 def _applied_marker_names(source: str) -> frozenset[str]:
@@ -112,7 +117,11 @@ def _applied_marker_names(source: str) -> frozenset[str]:
     being swallowed into an empty set, because a silent empty set here would
     make a drift guard built on top of this silently vacuous.
     """
-    tree = ast.parse(source)
+    return _applied_marker_names_in(ast.parse(source))
+
+
+def _applied_marker_names_in(tree: ast.Module) -> frozenset[str]:
+    """:func:`_applied_marker_names` over an already-parsed module."""
     elements: list[ast.expr] = []
     for node in ast.walk(tree):
         if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
@@ -136,42 +145,40 @@ def _registered_marker_names(ini_lines: Sequence[str]) -> frozenset[str]:
     return frozenset(line.split(':', 1)[0].split('(', 1)[0].strip() for line in ini_lines)
 
 
+def _module_applied_markers(module: ParsedModule) -> frozenset[str]:
+    return _applied_marker_names_in(module.tree)
+
+
+ANALYSIS = TreeAnalysis(
+    name=Path(__file__).stem, files=ORCHESTRATOR_TESTS, extract=_module_applied_markers,
+)
+TREE_ANALYSES = (ANALYSIS,)
+
+
+def _markers_by_file(facts: Mapping[Path, frozenset[str]], root: Path) -> dict[str, set[str]]:
+    """``{marker_name: {paths relative to *root*}}`` folded from per-file facts."""
+    applied: dict[str, set[str]] = {}
+    for path, names in facts.items():
+        relative = str(path.relative_to(root))
+        for name in names:
+            applied.setdefault(name, set()).add(relative)
+    return applied
+
+
 def _sweep_applied_markers(tests_dir: Path) -> dict[str, set[str]]:
     """``{marker_name: {relative file paths}}`` for EVERY marker applied
     anywhere under *tests_dir* — unfiltered by any notion of "registered".
 
-    Sweeps every ``*.py`` file from DISK (``sorted(tests_dir.rglob('*.py'))``
-    — sorted for deterministic failure messages under xdist), never pytest's
-    own collection, so the result does not depend on what any one invocation
-    happened to collect (see the module docstring's rejected-alternative
-    note). Reported paths are relative to *tests_dir*.
-
-    A file that fails to parse or read (``SyntaxError``/``OSError``) is
-    re-raised as an ``AssertionError`` naming the offending file — never
-    swallowed, never silently skipped, the same loud-on-failure polarity as
-    ``_applied_marker_names`` itself.
-
-    Factored out of ``_unregistered_markers`` (task 3532 amendment pass,
-    reviewer finding: sweeping the real ~494-file tree measured at ~5.6s, and
-    ``TestMarkerRegistrationDrift`` was paying that cost independently in two
-    tests) so callers that need the full applied-marker map — the drift diff
-    and the real-tree non-vacuity check alike — can share ONE pass.
+    Runs this module's own :data:`ANALYSIS` over every ``*.py`` under
+    *tests_dir* from DISK, never pytest's own collection, so the result does
+    not depend on what any one invocation happened to collect (see the module
+    docstring's rejected-alternative note). Reported paths are relative to
+    *tests_dir*. A file that fails to read or parse fails the pass loudly,
+    naming it — never swallowed, never silently skipped, the same
+    loud-on-failure polarity as ``_applied_marker_names`` itself.
     """
-    applied: dict[str, set[str]] = {}
-    for path in sorted(tests_dir.rglob('*.py')):
-        relative = str(path.relative_to(tests_dir))
-        try:
-            names = _applied_marker_names(path.read_text())
-        except (SyntaxError, OSError) as exc:
-            raise AssertionError(
-                f'{relative} could not be read/parsed while sweeping '
-                f'{tests_dir} for applied pytest markers: {exc!r}. Fix the '
-                f'file — a silently-skipped file would make this guard '
-                f'vacuous for it.'
-            ) from exc
-        for name in names:
-            applied.setdefault(name, set()).add(relative)
-    return applied
+    analysis = dataclasses.replace(ANALYSIS, files=functools.partial(python_files, tests_dir))
+    return _markers_by_file(TreePass.run((analysis,)).facts(analysis), tests_dir.resolve())
 
 
 def _unregistered_markers(tests_dir: Path, registered: frozenset[str]) -> dict[str, set[str]]:
@@ -444,11 +451,10 @@ class TestUnregisteredMarkers:
             _unregistered_markers(tmp_path, frozenset({'slow'}))
 
     def test_an_unreadable_file_fails_loudly_naming_the_file(self, tmp_path: Path):
-        """The ``OSError`` half of the ``except (SyntaxError, OSError)``
-        branch — only the ``SyntaxError`` half had a case before (reviewer
-        finding, task 3532 amendment pass). A dangling symlink triggers
-        ``FileNotFoundError`` (an ``OSError`` subclass) on
-        ``Path.read_text()`` without being root-UID-dependent the way
+        """The ``OSError`` half of loud failure; the ``SyntaxError`` half is
+        the case above (reviewer finding, task 3532 amendment pass). A
+        dangling symlink triggers ``FileNotFoundError`` (an ``OSError``
+        subclass) on read without being root-UID-dependent the way
         ``chmod(0o000)`` would be (a root process can still read a 0o000
         file, so that path wouldn't reliably raise here) — same technique as
         test_merge_liveness.py's
@@ -456,7 +462,7 @@ class TestUnregisteredMarkers:
         """
         broken = tmp_path / 'test_dangling.py'
         broken.symlink_to(tmp_path / 'does-not-exist-target.py')
-        with pytest.raises(AssertionError, match='test_dangling.py'):
+        with pytest.raises(AssertionError, match='test_dangling.py: FileNotFoundError'):
             _unregistered_markers(tmp_path, frozenset({'slow'}))
 
     def test_recurses_into_nested_subdirs_and_ignores_non_py_siblings(self, tmp_path: Path):
@@ -474,13 +480,6 @@ class TestUnregisteredMarkers:
 # ---------------------------------------------------------------------------
 # The wired guard — REAL tests/ tree vs REAL pytest config
 # ---------------------------------------------------------------------------
-
-# Resolved from THIS FILE, never the process CWD: merge-verify runs pytest
-# from the orchestrator/ cwd (orchestrator/orchestrator.yaml) while a plain
-# `pytest orchestrator/tests` runs from the repo root, and this must resolve
-# identically under both. Same idiom as test_warm_lane_bash_bucket_placement.py.
-TESTS_DIR = Path(__file__).resolve().parent
-ORCH_PYPROJECT = Path(__file__).resolve().parents[1] / 'pyproject.toml'
 
 #: A floor, not an equality — 494 measured at authorship time — so adding
 #: test files over time never breaks this guard.
@@ -521,18 +520,9 @@ _PLUGIN_PROVIDED_MARKERS = {
 
 
 @pytest.fixture(scope='module')
-def _real_tree_sweep() -> dict[str, set[str]]:
-    """The one on-disk applied-marker sweep of ``TESTS_DIR``, shared by every
-    test below that needs it.
-
-    Measured at ~5.6s for the ~494 files under orchestrator/tests/;
-    ``test_every_marker_applied_under_tests_is_registered`` and
-    ``test_the_sweep_is_not_vacuous`` used to each perform this independently
-    (~11s combined — uncomfortably close to this suite's 60s per-test
-    timeout under load, per the addopts loadavg note above) (reviewer
-    finding, task 3532 amendment pass).
-    """
-    return _sweep_applied_markers(TESTS_DIR)
+def _real_tree_sweep(tree_pass: TreePass) -> dict[str, set[str]]:
+    """The applied-marker map of ``TESTS_DIR``, projected from the shared tree pass."""
+    return _markers_by_file(tree_pass.facts(ANALYSIS), TESTS_DIR)
 
 
 class TestMarkerRegistrationDrift:
@@ -591,14 +581,16 @@ class TestMarkerRegistrationDrift:
             f'in tests/conftest.py.' + note
         )
 
-    def test_the_sweep_is_not_vacuous(self, _real_tree_sweep: dict[str, set[str]]):
+    def test_the_sweep_is_not_vacuous(
+        self, tree_pass: TreePass, _real_tree_sweep: dict[str, set[str]]
+    ):
         """A broken extractor returning ``frozenset()`` would make the guard
         above pass forever. In the spirit of
         test_warm_lane_bash_bucket_placement.py's live ``--collect-only``
         probe, pin that the sweep actually visits the real tree and actually
         finds markers spanning every extraction path this module supports.
         """
-        files = sorted(TESTS_DIR.rglob('*.py'))
+        files = tree_pass.facts(ANALYSIS)
         assert len(files) >= _MIN_EXPECTED_TEST_FILES, (
             f'only found {len(files)} .py files under {TESTS_DIR}, expected '
             f'at least {_MIN_EXPECTED_TEST_FILES}. The sweep may be looking '
@@ -644,3 +636,54 @@ class TestMarkerRegistrationDrift:
             'set — tests/conftest.py may have stopped registering it '
             '(task 2418).'
         )
+
+
+_ROOT_PYPROJECT = ORCH_DIR.parent / 'pyproject.toml'
+_DEFECT_TEST_MARKERS = frozenset({'defect', 'criterion'})
+_MEMBERS_NAMED_BY_THE_TASK = frozenset({
+    'client-feed', 'cockpit', 'dashboard', 'escalation',
+    'fused-memory', 'orchestrator', 'sampler', 'shared',
+})
+
+
+def _load_toml(path: Path) -> dict:
+    with path.open('rb') as handle:
+        return tomllib.load(handle)
+
+
+def _workspace_members() -> list[str]:
+    return _load_toml(_ROOT_PYPROJECT)['tool']['uv']['workspace']['members']
+
+
+class TestDefectMarkersRegisteredInEveryMember:
+    """``defect`` and ``criterion`` are registered in every pytest config of the workspace.
+
+    The injected plugin registers both at run time, but a local run has no
+    plugin, so each member registers them itself (plans/defect-tests-prd.md
+    decision 19). The member list is read from the root pyproject's
+    ``[tool.uv.workspace]`` table, never hard-coded.
+    """
+
+    def test_root_and_every_member_register_both_markers(self):
+        pyprojects = [_ROOT_PYPROJECT] + [
+            ORCH_DIR.parent / member / 'pyproject.toml' for member in _workspace_members()
+        ]
+        registered_by_file = {
+            str(path.relative_to(ORCH_DIR.parent)): _registered_marker_names(
+                _load_toml(path).get('tool', {}).get('pytest', {}).get('ini_options', {}).get('markers', []),
+            )
+            for path in pyprojects
+        }
+        missing = {
+            name: sorted(_DEFECT_TEST_MARKERS - registered)
+            for name, registered in registered_by_file.items()
+            if _DEFECT_TEST_MARKERS - registered
+        }
+        assert missing == {}, (
+            f'These pyprojects do not register the defect-test markers: {missing!r}. '
+            'Add the missing entries to [tool.pytest.ini_options].markers.'
+        )
+
+    def test_the_member_list_is_not_vacuous(self):
+        absent = _MEMBERS_NAMED_BY_THE_TASK - set(_workspace_members())
+        assert not absent, f'workspace members {sorted(absent)} were not read from {_ROOT_PYPROJECT}'

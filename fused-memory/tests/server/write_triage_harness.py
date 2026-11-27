@@ -6,6 +6,9 @@ entities and completion-claim tool suites.
   hop, so ``config.write_triage.enabled`` would read as a Mock rather than a
   bool — which is exactly the shape the resolvers are built to REFUSE, and the
   test would silently exercise the flag-off path while claiming otherwise.
+* ``mock_service.add_memory`` returns an explicit ``MagicMock``. The same
+  auto-chaining makes an unspecced return value's ``model_dump()`` an
+  unawaited coroutine, so the tool's ack would never be a dict.
 
 A plain module rather than a cross-suite import or a conftest fixture, for the
 reasons ``tests/reconciliation/consolidator_fixtures.py`` records.
@@ -14,7 +17,7 @@ reasons ``tests/reconciliation/consolidator_fixtures.py`` records.
 from __future__ import annotations
 
 import types
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 from fused_memory.config.schema import ProceduralTopicCluster
 from fused_memory.models.enums import MemoryCategory, SourceStore
@@ -71,6 +74,23 @@ def search_candidate(
             **(extra_metadata or {}),
         },
     )
+
+
+def configure_pass_through_add_memory(
+    mock_service: AsyncMock, dump: dict | None = None,
+) -> MagicMock:
+    """Make ``mock_service.add_memory`` return a result that dumps to a plain dict.
+
+    Every ``model_dump()`` call returns a fresh copy of *dump*, which defaults
+    to ``{'id': 'new-id'}``. ``tools.py::add_memory`` mutates the ack it gets
+    from ``model_dump()`` in place, so a shared dict would carry one write's
+    ack keys into the next write's result and into the caller's *dump*.
+    """
+    base = {'id': 'new-id'} if dump is None else dict(dump)
+    result = MagicMock()
+    result.model_dump.side_effect = lambda *_args, **_kwargs: dict(base)
+    mock_service.add_memory.return_value = result
+    return result
 
 
 def configure_triage_config(

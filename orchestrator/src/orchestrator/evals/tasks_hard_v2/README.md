@@ -65,7 +65,7 @@ that is what makes the artifact regenerable rather than hand-transcribed.
 
 ## Why this directory can never leak into a default eval run
 
-`cli._load_fixture_dir` (`orchestrator/src/orchestrator/cli.py`) globs
+`_load_fixture_dir` (`orchestrator/src/orchestrator/evals/cli.py`) globs
 `*.json` **non-recursively** against a single `tasks_dir`:
 
 ```python
@@ -94,9 +94,16 @@ resolves this path by default.
 
 Every fixture in here carries `max_architect_turns` and `timeout_minutes`
 overlaid from `_meta/curation.json`'s `ceilings` block. Both keys are read
-straight off the task record by `evals/runner.py` (`task.get(...)` with 50 /
-60 defaults), so pinning them is pure data — no runner change. The derivation
-of `timeout_minutes` and its headroom multiples are recorded in `CURATION.md`.
+straight off the task record, so pinning them is pure data — no runner change.
+A fixture without them falls back to the code defaults: for
+`max_architect_turns`, the one in
+`orchestrator/src/orchestrator/evals/architect_eval.py::architect_invocation`;
+for `timeout_minutes`,
+`orchestrator/src/orchestrator/evals/runner.py::WORKFLOW_CELL_TIMEOUT_MINUTES`
+for a workflow cell and
+`orchestrator/src/orchestrator/evals/runner.py::ARCHITECT_CELL_TIMEOUT_MINUTES`
+for an architect cell. The derivation of `timeout_minutes` and its headroom
+multiples are recorded in `CURATION.md`.
 
 ## Two mint modes
 
@@ -104,9 +111,8 @@ A **landing merge** is written under either of two subject spellings, and both
 are accepted — `Merge task/<id> into main` and `Merge task/<id>: <subject>`.
 Both are in live use (censused over reify's `main`: 2741 of the first, 74 of
 the second), and the single derivation both are matched from is
-`shared.merge_subject.merge_subject_pattern`, mirroring
-`orchestrator/src/orchestrator/git_ops.py::_merge_subject`'s
-writer-and-reader-share-one-derivation discipline.
+`shared.merge_subject.merge_subject_pattern`, which shares its fragments
+with the writer, `shared/src/shared/merge_subject.py::format_merge_subject`.
 
 Two scopings keep a commit that never landed from answering as a landing
 merge, both in `::find_merge_sha`. The walk is over **`main`**, not `--all`, so

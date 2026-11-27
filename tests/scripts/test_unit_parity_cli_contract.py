@@ -35,6 +35,9 @@ import types
 from collections.abc import Callable, Mapping
 
 import pytest
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 SCRIPTS_DIR = pathlib.Path(__file__).parents[2] / "scripts"
 
@@ -342,14 +345,18 @@ def _fm_unit(service_lines: tuple[str, ...]) -> str:
     return "[Unit]\nDescription=golden\n\n[Service]\n" + "".join(f"{line}\n" for line in service_lines)
 
 
+# A real fused-memory unit's ExecStartPre runs the FalkorDB AOF gate (task
+# 6330), and the checker reports one that does not; no scenario here is about
+# that rule, so both units carry it.
+FM_EXEC_START_PRE = "ExecStartPre=/usr/bin/python3 /srv/golden/scripts/falkordb_aof_gate.py --compose-file /srv/golden/c.yml"
 FM_CLEAN = _fm_unit(
     (
         *_load("check_fused_memory_unit_parity").REQUIRED_SERVICE_DIRECTIVES,
-        "ExecStartPre=/bin/true",
+        FM_EXEC_START_PRE,
         "ExecStopPost=/bin/true",
     )
 )
-FM_DRIFTED = _fm_unit(("Restart=on-failure", "RestartSec=5", "ExecStartPre=/bin/true"))
+FM_DRIFTED = _fm_unit(("Restart=on-failure", "RestartSec=5", FM_EXEC_START_PRE))
 FM_TEMPLATE_DRIFTED = FM_CLEAN.replace("WatchdogSec=120\n", "")
 
 
@@ -476,6 +483,7 @@ GOLDENS: dict[str, tuple[int, str, str]] = {
             '[fused_memory_unit_parity]   - RestartSteps=4\n'
             '[fused_memory_unit_parity]   - TimeoutStartSec=300\n'
             '[fused_memory_unit_parity]   - TimeoutStopSec=90\n'
+            '[fused_memory_unit_parity]   - KillMode=mixed\n'
             '[fused_memory_unit_parity]   - ExecStopPost=\n'
         ),
         (
@@ -513,6 +521,7 @@ GOLDENS: dict[str, tuple[int, str, str]] = {
             '[fused_memory_unit_parity]   - RestartSteps=4\n'
             '[fused_memory_unit_parity]   - TimeoutStartSec=300\n'
             '[fused_memory_unit_parity]   - TimeoutStopSec=90\n'
+            '[fused_memory_unit_parity]   - KillMode=mixed\n'
             '[fused_memory_unit_parity]   - ExecStopPost=\n'
         ),
         (

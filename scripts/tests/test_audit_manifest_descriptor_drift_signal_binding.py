@@ -1,0 +1,434 @@
+"""Tests for scripts/audit_manifest_descriptor_drift.py's signal-binding check
+(task 6582), end to end: the scan, the audit rows, both formatters and the exit
+code.
+"""
+from __future__ import annotations
+
+import json
+
+import pytest
+from audit_manifest_descriptor_drift import (
+    _SIGNAL_BINDING_CAVEAT,
+    EXIT_DRIFT,
+    StaleSignalBinding,
+    _is_dirty,
+    audit_project,
+    format_json,
+    format_report,
+    load_task_store_scan,
+)
+from dashboard.data.prd_attribution import lineage_entry
+from dashboard.data.prd_view import PrdDocument, SignalCause, signal_of
+from manifest_drift_fixtures import labelled_row, make_project, run_cli
+from shared.capability_manifest import load_capability_manifest
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
+
+# ---------------------------------------------------------------------------
+# THE SIGNAL-BINDING CHECK (task 6582).
+#
+# A sidecar's `signal_leaves` names the block(s) whose task status the
+# dashboard reads as the PRD's signal (plans/dashboard-prd-lanes-prd.md §4.7,
+# §5.2). A signal leaf bound to a task this store lacks, or to a task whose own
+# PRD field is another PRD, is reported as a StaleSignalBinding row, never mixed
+# into the other lists.
+# ---------------------------------------------------------------------------
+
+_SIGNAL_SIDECAR = "plans/x-prd.capability-manifest.yaml"
+
+
+def _signalling(prd, blocks, signal_leaves, *, external=None):
+    """A sidecar binding *blocks* — ``[(label, task_id), ...]`` — with no
+    capabilities, naming *signal_leaves* (the key is omitted when None).
+    *external* maps a label to the external_task_id its block binds instead."""
+    external = external or {}
+    tasks = []
+    for label, task_id in blocks:
+        block: dict[str, object] = {"label": label, "task_id": task_id, "capabilities": []}
+        if label in external:
+            block["external_task_id"] = external[label]
+        tasks.append(block)
+    doc: dict[str, object] = {"prd": prd, "schema_version": 1, "tasks": tasks}
+    if signal_leaves is not None:
+        doc["signal_leaves"] = signal_leaves
+    return doc
+
+
+def _prd_row(task_id, prd_path):
+    """A task row carrying only a prd_path, so it binds no label of its own."""
+    return {"id": task_id, "status": "pending", "metadata": {"prd_path": prd_path}}
+
+
+def _row6_project(tmp_path, make_tasks_db, *, name="row6", signal_label="ζ",
+                  signal_leaves=True):
+    """Boundary row 6: the signal leaf is bound to another PRD's task (8)."""
+    return make_project(
+        tmp_path, make_tasks_db, name=name,
+        tasks=[_prd_row(7, "plans/x-prd.md"), _prd_row(8, "plans/other-prd.md")],
+        manifests=[(_SIGNAL_SIDECAR, _signalling(
+            "plans/x-prd.md", [("α", 7), (signal_label, 8)],
+            [signal_label] if signal_leaves else None))],
+    )
+
+
+_ROW6 = StaleSignalBinding(
+    manifest=_SIGNAL_SIDECAR, label="ζ", task_id=8, reason="prd_mismatch",
+    sidecar_prd="plans/x-prd.md", task_prd="plans/other-prd.md")
+
+
+def test_scan_collects_each_rows_coalesced_prd(make_tasks_db):
+    """Taken in the SAME one scan, so the signal check reads the snapshot the
+    other two directions read. Each task's PRD field is read the way the
+    dashboard coalesces it: prd_path, else prd, else prd_ref, the first
+    non-empty string once any '#' or '§' suffix is stripped. The tag='master'
+    pin covers it too."""
+    db = make_tasks_db([
+        labelled_row(7, prd_path="plans/x-prd.md"),
+        _prd_row(8, "plans/y-prd.md"),
+        {"id": 9, "status": "pending", "metadata": {"prd_path": 5}},
+        {"id": 10, "status": "pending", "metadata": {}},
+        {"id": 11, "status": "pending", "metadata": {"prd_path": ""}},
+        {**_prd_row(12, "plans/z-prd.md"), "tag": "other-tag"},
+        {"id": 13, "status": "pending", "metadata": {"prd": "plans/w-prd.md"}},
+        {"id": 14, "status": "pending", "metadata": {"prd_ref": "plans/v-prd.md#§2"}},
+        {"id": 15, "status": "pending",
+         "metadata": {"prd_path": "", "prd": "plans/u-prd.md"}},
+        {"id": 16, "status": "pending",
+         "metadata": {"prd_path": "plans/t-prd.md §5.2", "prd": "plans/other-prd.md"}},
+    ])
+
+    scan = load_task_store_scan(str(db))
+
+    assert scan.task_prds == {
+        7: "plans/x-prd.md", 8: "plans/y-prd.md", 13: "plans/w-prd.md",
+        14: "plans/v-prd.md", 15: "plans/u-prd.md", 16: "plans/t-prd.md",
+    }
+    assert scan.row_ids == {7, 8, 9, 10, 11, 13, 14, 15, 16}
+    assert scan.delivered_checks == {}
+    assert [b.task_id for b in scan.manifest_bindings] == [7]
+
+
+def test_a_signal_label_bound_to_another_prds_task_is_reported(tmp_path, make_tasks_db):
+    """THE ROW-6 SCENARIO, and nothing else moves: the drift findings and every
+    coverage counter but the signal check's own two equal those of the same
+    project with no signal_leaves."""
+    audit = audit_project(str(_row6_project(tmp_path, make_tasks_db)))
+    unsignalled = audit_project(str(_row6_project(
+        tmp_path, make_tasks_db, name="unsignalled", signal_leaves=False)))
+
+    assert audit.stale_signal_bindings == [_ROW6]
+    assert audit.findings == []
+    assert (audit.coverage.signal_leaves_named, audit.coverage.signal_leaves_checked) == (1, 1)
+    assert audit.coverage == unsignalled.coverage._replace(
+        signal_leaves_named=1, signal_leaves_checked=1)
+
+
+def test_a_signal_label_bound_to_a_task_missing_from_the_store_is_reported(
+        tmp_path, make_tasks_db):
+    root = make_project(
+        tmp_path, make_tasks_db,
+        tasks=[_prd_row(7, "plans/x-prd.md")],
+        manifests=[(_SIGNAL_SIDECAR, _signalling(
+            "plans/x-prd.md", [("α", 7), ("ζ", 9)], ["ζ"]))],
+    )
+
+    assert audit_project(str(root)).stale_signal_bindings == [StaleSignalBinding(
+        manifest=_SIGNAL_SIDECAR, label="ζ", task_id=9, reason="task_missing",
+        sidecar_prd="plans/x-prd.md", task_prd=None)]
+
+
+def test_a_signal_leaf_task_with_no_prd_path_is_a_mismatch(tmp_path, make_tasks_db):
+    root = make_project(
+        tmp_path, make_tasks_db,
+        tasks=[_prd_row(7, "plans/x-prd.md"),
+               {"id": 8, "status": "pending", "metadata": {}}],
+        manifests=[(_SIGNAL_SIDECAR, _signalling(
+            "plans/x-prd.md", [("α", 7), ("ζ", 8)], ["ζ"]))],
+    )
+
+    assert audit_project(str(root)).stale_signal_bindings == [StaleSignalBinding(
+        manifest=_SIGNAL_SIDECAR, label="ζ", task_id=8, reason="prd_mismatch",
+        sidecar_prd="plans/x-prd.md", task_prd=None)]
+
+
+def test_an_agreeing_signal_binding_is_no_row(tmp_path, make_tasks_db):
+    root = make_project(
+        tmp_path, make_tasks_db,
+        tasks=[_prd_row(7, "plans/x-prd.md"), _prd_row(8, "plans/x-prd.md")],
+        manifests=[(_SIGNAL_SIDECAR, _signalling(
+            "plans/x-prd.md", [("α", 7), ("ζ", 8)], ["ζ"]))],
+    )
+
+    assert audit_project(str(root)).stale_signal_bindings == []
+
+
+def _leaf_project(tmp_path, make_tasks_db, leaf_metadata, *, sidecar_prd="plans/x-prd.md"):
+    """Task 7 names plans/x-prd.md; the signal leaf ζ binds task 8, whose
+    metadata is *leaf_metadata*, in a sidecar whose prd is *sidecar_prd*."""
+    return make_project(
+        tmp_path, make_tasks_db,
+        tasks=[_prd_row(7, "plans/x-prd.md"),
+               {"id": 8, "status": "pending", "metadata": leaf_metadata}],
+        manifests=[(_SIGNAL_SIDECAR, _signalling(
+            sidecar_prd, [("α", 7), ("ζ", 8)], ["ζ"]))],
+    )
+
+
+def _rooted(metadata, root):
+    """*metadata* with *root* in place of each '{root}' in a string value."""
+    return {key: value.replace("{root}", str(root)) if isinstance(value, str) else value
+            for key, value in metadata.items()}
+
+
+# Task-8 metadata naming plans/x-prd.md in each spelling the dashboard's
+# coalesce_prd reads as that PRD.
+_X_PRD_SPELLINGS = [
+    pytest.param({"prd": "plans/x-prd.md"}, id="prd-only"),
+    pytest.param({"prd_ref": "plans/x-prd.md"}, id="prd_ref-only"),
+    pytest.param({"prd_path": "plans/x-prd.md#goal"}, id="anchor-suffix"),
+    pytest.param({"prd_path": "plans/x-prd.md §5.2"}, id="section-suffix"),
+    pytest.param({"prd_path": "", "prd": "plans/x-prd.md"}, id="empty-prd_path-falls-through"),
+    pytest.param({"prd_path": 5, "prd": "plans/x-prd.md"}, id="non-string-prd_path-skipped"),
+]
+
+# Task-8 metadata naming plans/x-prd.md by a path the dashboard's
+# normalise_prd_key keys to it; '{root}' is the project root (see _rooted).
+_X_PRD_EQUIVALENT_PATHS = [
+    pytest.param({"prd_path": "./plans/x-prd.md"}, id="dot-slash"),
+    pytest.param({"prd_path": "{root}/plans/x-prd.md"}, id="absolute-inside-root"),
+]
+
+_FOREIGN_X_PRD = "/elsewhere/plans/x-prd.md"
+
+# Every task-8 shape the audit and the dashboard must give one verdict on.
+_PARITY_SHAPES = [
+    *_X_PRD_SPELLINGS,
+    *_X_PRD_EQUIVALENT_PATHS,
+    pytest.param({"prd_path": "plans/x-prd.md"}, id="exact"),
+    pytest.param({"prd_path": "plans/other-prd.md", "prd": "plans/x-prd.md"},
+                 id="prd_path-wins"),
+    pytest.param({"prd": "plans/other-prd.md#a"}, id="other-prd-with-anchor"),
+    pytest.param({"prd_path": _FOREIGN_X_PRD}, id="outside-the-root"),
+    pytest.param({}, id="no-prd-field"),
+]
+
+
+@pytest.mark.parametrize("leaf_metadata", _X_PRD_SPELLINGS)
+def test_a_signal_leaf_naming_the_sidecars_prd_in_any_dashboard_spelling_is_no_row(
+        tmp_path, make_tasks_db, leaf_metadata):
+    root = _leaf_project(tmp_path, make_tasks_db, leaf_metadata)
+
+    assert audit_project(str(root)).stale_signal_bindings == []
+
+
+def _leaf_8_mismatch(*, sidecar_prd="plans/x-prd.md", task_prd):
+    return [StaleSignalBinding(
+        manifest=_SIGNAL_SIDECAR, label="ζ", task_id=8, reason="prd_mismatch",
+        sidecar_prd=sidecar_prd, task_prd=task_prd)]
+
+
+def test_prd_path_takes_precedence_over_prd_for_a_signal_leaf(tmp_path, make_tasks_db):
+    root = _leaf_project(tmp_path, make_tasks_db,
+                         {"prd_path": "plans/other-prd.md", "prd": "plans/x-prd.md"})
+
+    assert audit_project(str(root)).stale_signal_bindings == _leaf_8_mismatch(
+        task_prd="plans/other-prd.md")
+
+
+def test_a_mismatch_row_reports_the_coalesced_task_prd(tmp_path, make_tasks_db):
+    """The value a fixer edits: the field coalesce_prd chose, suffix stripped,
+    not the raw metadata value and not the normalised key."""
+    root = _leaf_project(tmp_path, make_tasks_db, {"prd": "./plans/other-prd.md#a"})
+
+    assert audit_project(str(root)).stale_signal_bindings == _leaf_8_mismatch(
+        task_prd="./plans/other-prd.md")
+
+
+@pytest.mark.parametrize("leaf_metadata", _X_PRD_EQUIVALENT_PATHS)
+def test_a_signal_leaf_naming_the_sidecars_prd_by_an_equivalent_path_is_no_row(
+        tmp_path, make_tasks_db, leaf_metadata):
+    root = tmp_path / "proj"
+    _leaf_project(tmp_path, make_tasks_db, _rooted(leaf_metadata, root))
+
+    assert audit_project(str(root)).stale_signal_bindings == []
+
+
+def test_a_sidecar_prd_spelled_by_an_equivalent_path_is_keyed_too(tmp_path, make_tasks_db):
+    root = _leaf_project(tmp_path, make_tasks_db, {"prd_path": "plans/x-prd.md"},
+                         sidecar_prd="./plans/x-prd.md")
+
+    assert audit_project(str(root)).stale_signal_bindings == []
+
+
+def test_an_absolute_in_root_prd_agrees_under_a_relative_project_root(
+        tmp_path, make_tasks_db, monkeypatch):
+    """The dashboard keys against its absolute configured root, so the audit
+    does too, however --project-root was spelled."""
+    root = tmp_path / "proj"
+    _leaf_project(tmp_path, make_tasks_db, {"prd_path": f"{root}/plans/x-prd.md"})
+    monkeypatch.chdir(tmp_path)
+
+    assert audit_project("proj").stale_signal_bindings == []
+
+
+def test_a_signal_leaf_naming_a_prd_outside_the_root_is_a_mismatch(tmp_path, make_tasks_db):
+    """A PRD outside the project root is foreign to it, and never agrees."""
+    root = _leaf_project(tmp_path, make_tasks_db, {"prd_path": _FOREIGN_X_PRD})
+
+    assert audit_project(str(root)).stale_signal_bindings == _leaf_8_mismatch(
+        task_prd=_FOREIGN_X_PRD)
+
+
+def test_a_leaf_and_sidecar_naming_the_same_foreign_prd_are_a_mismatch(
+        tmp_path, make_tasks_db):
+    """Equal foreign values do not agree: neither keys to a PRD of this root."""
+    root = _leaf_project(tmp_path, make_tasks_db, {"prd_path": _FOREIGN_X_PRD},
+                         sidecar_prd=_FOREIGN_X_PRD)
+
+    assert audit_project(str(root)).stale_signal_bindings == _leaf_8_mismatch(
+        sidecar_prd=_FOREIGN_X_PRD, task_prd=_FOREIGN_X_PRD)
+
+
+@pytest.mark.parametrize("leaf_metadata", _PARITY_SHAPES)
+def test_audit_and_dashboard_agree_on_which_signal_leaves_are_stale_bindings(
+        tmp_path, make_tasks_db, leaf_metadata):
+    """The audit's prd_mismatch row is the dashboard's STALE_BINDING cause
+    (dashboard/src/dashboard/data/prd_view.py::signal_of), read off one store."""
+    root = tmp_path / "proj"
+    task_8_metadata = _rooted(leaf_metadata, root)
+    _leaf_project(tmp_path, make_tasks_db, task_8_metadata)
+
+    audit = audit_project(str(root))
+    entries = {7: lineage_entry(_prd_row(7, "plans/x-prd.md")["metadata"], str(root)),
+               8: lineage_entry(task_8_metadata, str(root))}
+    document = PrdDocument(
+        title=None, sidecar=load_capability_manifest(root / _SIGNAL_SIDECAR))
+    signal = signal_of("plans/x-prd.md", document, {7: "pending", 8: "pending"}, entries)
+
+    assert any(row.reason == "prd_mismatch" for row in audit.stale_signal_bindings) == (
+        signal.cause is SignalCause.STALE_BINDING)
+
+
+@pytest.mark.parametrize("external", [None, {"ζ": "reify:5613"}],
+                         ids=["unbound", "external"])
+def test_unbound_and_external_signal_leaves_are_no_row(tmp_path, make_tasks_db, external):
+    """Nothing LOCAL to check: an unbound leaf binds no task yet, and an external
+    one names another registry, which plans/dashboard-prd-lanes-prd.md §10
+    leaves unresolved. Such a leaf is NAMED but not CHECKED."""
+    root = make_project(
+        tmp_path, make_tasks_db,
+        tasks=[_prd_row(7, "plans/x-prd.md")],
+        manifests=[(_SIGNAL_SIDECAR, _signalling(
+            "plans/x-prd.md", [("α", 7), ("ζ", None)], ["ζ"], external=external))],
+    )
+
+    audit = audit_project(str(root))
+
+    assert audit.stale_signal_bindings == []
+    assert (audit.coverage.signal_leaves_named, audit.coverage.signal_leaves_checked) == (1, 0)
+
+
+def test_a_sidecar_without_signal_leaves_yields_no_row(tmp_path, make_tasks_db):
+    root = _row6_project(tmp_path, make_tasks_db, signal_leaves=False)
+
+    audit = audit_project(str(root))
+
+    assert audit.stale_signal_bindings == []
+    assert (audit.coverage.signal_leaves_named, audit.coverage.signal_leaves_checked) == (0, 0)
+
+
+def test_signal_leaf_counters_sum_across_sidecars(tmp_path, make_tasks_db):
+    """Every named leaf is counted, and every locally bound one is checked,
+    whether or not it turns out stale."""
+    root = make_project(
+        tmp_path, make_tasks_db,
+        tasks=[_prd_row(7, "plans/x-prd.md"), _prd_row(8, "plans/other-prd.md"),
+               _prd_row(9, "plans/y-prd.md")],
+        manifests=[
+            (_SIGNAL_SIDECAR, _signalling(
+                "plans/x-prd.md", [("α", 7), ("ζ", 8), ("η", None)], ["α", "ζ", "η"])),
+            ("plans/y-prd.capability-manifest.yaml", _signalling(
+                "plans/y-prd.md", [("β", 9)], ["β"])),
+        ],
+    )
+
+    audit = audit_project(str(root))
+
+    assert [row.label for row in audit.stale_signal_bindings] == ["ζ"]
+    assert (audit.coverage.signal_leaves_named, audit.coverage.signal_leaves_checked) == (4, 3)
+
+
+def _row6_lines(text, label="ζ"):
+    """The lines of *text* naming every value boundary row 6 requires the
+    report to name (label, task and both PRD values), spelled as literals so
+    they are checked independently of the formatter."""
+    fields = (f"manifest={_SIGNAL_SIDECAR}", f"label={label}", "task_id=8",
+              "reason=prd_mismatch", "sidecar_prd=plans/x-prd.md",
+              "task_prd=plans/other-prd.md")
+    return [line for line in text.splitlines() if all(field in line for field in fields)]
+
+
+def test_report_names_the_stale_signal_binding_under_its_own_section(
+        tmp_path, make_tasks_db):
+    report = format_report([audit_project(str(_row6_project(tmp_path, make_tasks_db)))])
+
+    assert "  -- stale signal bindings (1) --" in report.splitlines()
+    assert _SIGNAL_BINDING_CAVEAT in report
+    assert len(_row6_lines(report)) == 1
+
+
+def test_the_signal_binding_section_prints_even_when_empty(tmp_path, make_tasks_db):
+    """Looked and found none, as opposed to never looked — and the coverage
+    block says how many leaves there were to look at."""
+    root = _row6_project(tmp_path, make_tasks_db, signal_leaves=False)
+
+    report = format_report([audit_project(str(root))])
+    lines = report.splitlines()
+
+    assert "  -- stale signal bindings (0) --" in lines
+    assert _SIGNAL_BINDING_CAVEAT in report
+    assert "    signal leaves named:                0" in lines
+    assert "    signal leaves checked:              0" in lines
+
+
+def test_coverage_block_counts_the_signal_leaves_as_aligned_rows(
+        tmp_path, make_tasks_db):
+    report = format_report([audit_project(str(_row6_project(tmp_path, make_tasks_db)))])
+    lines = report.splitlines()
+
+    assert "    signal leaves named:                1" in lines
+    assert "    signal leaves checked:              1" in lines
+
+
+def test_format_json_carries_stale_signal_bindings_and_their_caveat(
+        tmp_path, make_tasks_db):
+    payload = json.loads(format_json(
+        [audit_project(str(_row6_project(tmp_path, make_tasks_db)))]))
+
+    (project,) = payload["projects"]
+    assert project["stale_signal_bindings"] == [
+        {"manifest": _SIGNAL_SIDECAR, "label": "ζ", "task_id": 8,
+         "reason": "prd_mismatch", "sidecar_prd": "plans/x-prd.md",
+         "task_prd": "plans/other-prd.md"},
+    ]
+    assert project["coverage"]["signal_leaves_named"] == 1
+    assert project["coverage"]["signal_leaves_checked"] == 1
+    assert payload["stale_signal_bindings_caveat"] == _SIGNAL_BINDING_CAVEAT
+
+
+def test_a_stale_signal_binding_alone_makes_the_run_dirty(tmp_path, make_tasks_db):
+    """No historical exemption: the dashboard reads a signal leaf whatever its
+    task's status."""
+    assert _is_dirty([audit_project(str(_row6_project(tmp_path, make_tasks_db)))])
+
+
+def test_main_exit_1_when_a_stale_signal_binding_is_the_only_issue(
+        tmp_path, make_tasks_db):
+    """An ASCII label, so no assertion depends on the child's stdout encoding."""
+    root = _row6_project(tmp_path, make_tasks_db, signal_label="zeta")
+
+    result = run_cli("--project-root", str(root))
+
+    assert result.returncode == EXIT_DRIFT, result.stdout
+    assert len(_row6_lines(result.stdout, label="zeta")) == 1

@@ -31,6 +31,7 @@ from test_workflow import (
     _CheckSequence,
     _make_workflow,
     _merge_attempt_outcomes,
+    _wire_scope_backend,
 )
 
 from orchestrator.agents.invoke import AgentResult
@@ -39,7 +40,7 @@ from orchestrator.merge_lane import PLAN_FILES_NOT_TOUCHED_REASON_PREFIX
 from orchestrator.merge_lane.gates import PlanFilesTouchedResult
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome, WorkflowState
 
-_CLAIMED_COMMIT = '4e175c0732abc'
+_CLAIMED_COMMIT = '4e175c0732' + '0' * 30
 _TASK_ID = '2656'
 
 
@@ -95,6 +96,10 @@ def _arm_gate(
     monkeypatch.setattr(wf, '_invoke', fake_invoke)
     wf.briefing.build_plan_tightening_prompt = AsyncMock(return_value='PROMPT')
 
+    # The narrowing pass reconciles scope through the scheduler, so held
+    # modules and metadata.files must be consistent with the plan it narrows.
+    _wire_scope_backend(wf, ['a.py', 'b.py', 'c.py'])
+
     merge_queue: asyncio.Queue = asyncio.Queue()
     wf.merge_queue = merge_queue
 
@@ -107,7 +112,7 @@ def _arm_gate(
     mark_done = AsyncMock()
     wf.scheduler.mark_done = mark_done
     wf.git_ops.get_main_sha = AsyncMock(return_value='mainsha0001')
-    wf.git_ops.is_ancestor = AsyncMock(return_value=commit_on_main)
+    wf.git_ops.is_ancestor_checked = AsyncMock(return_value=commit_on_main)
     wf.git_ops.get_merge_commit_diff_files = AsyncMock(return_value=(['a.py'], None))
     wf.git_ops.commit_effect_present_in_main = AsyncMock(return_value=True)
     monkeypatch.setattr(wf, '_reconcile_metadata_files_for_done', AsyncMock())
@@ -304,6 +309,11 @@ async def test_merge_phase_returns_a_terminal_done_without_running_the_merge_suc
     wf.config.max_merge_retries = 1
     wf.config.max_pre_merge_retries = 1
     wf.git_ops.rebase_onto_main = AsyncMock(return_value=True)
+    # A branch still beyond main at merge entry, so the merge attempt runs.
+    wf.git_ops.is_ancestor = AsyncMock(return_value=False)
+    wf.git_ops.is_ancestor_checked = AsyncMock(return_value=False)
+    wf.git_ops.resolve_branch_sha = AsyncMock(return_value=None)
+    wf.git_ops.has_uncommitted_work = AsyncMock(return_value=False)
     finalise_merged_done = AsyncMock(return_value=WorkflowOutcome.DONE)
     write_completion = AsyncMock()
     clear_retry_pending = AsyncMock()

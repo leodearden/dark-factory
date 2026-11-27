@@ -9,8 +9,9 @@ from dataclasses import replace
 from typing import Any
 
 import pytest
-from shared.cli_invoke import _SubprocessResult
+from shared.cli_invoke import SubprocessResult
 from shared.invocation_outcome import CapHit, Failure, classify_invocation
+from shared.process_cost import ProcessCostBasis
 
 from orchestrator.agents.invoke import (
     _estimate_cost,
@@ -22,6 +23,7 @@ from orchestrator.agents.invoke import (
     _warn_if_argv_near_arg_max,
     _write_pi_mcp_config,
 )
+from orchestrator.agents.token_pricing import TokenUsage, price_tokens
 from orchestrator.config import PriceEntry
 
 
@@ -30,9 +32,9 @@ def _make_subprocess_result(
     stderr: str = '',
     returncode: int = 0,
     duration_ms: int = 100,
-) -> _SubprocessResult:
-    """Construct a _SubprocessResult with sensible defaults."""
-    return _SubprocessResult(
+) -> SubprocessResult:
+    """Construct a SubprocessResult with sensible defaults."""
+    return SubprocessResult(
         stdout=stdout,
         stderr=stderr,
         returncode=returncode,
@@ -80,6 +82,7 @@ class TestParseGeminiValidStats:
         # gemini-3-flash: input=0.075/1M, output=0.30/1M
         # cost = (100 * 0.075 + 50 * 0.30) / 1_000_000 = 0.0000225
         assert agent_result.cost_usd > 0.0
+        assert agent_result.cost_basis is ProcessCostBasis.USAGE_ESTIMATE
 
 
 class TestParseCodexNullUsage:
@@ -136,6 +139,7 @@ class TestParseCodexValidUsage:
         # o4-mini: input=1.10/1M, output=4.40/1M
         # cost = (200 * 1.10 + 100 * 4.40) / 1_000_000 = 0.00066
         assert agent_result.cost_usd > 0.0
+        assert agent_result.cost_basis is ProcessCostBasis.USAGE_ESTIMATE
 
 
 class TestParseCodexOutputConfigPrices:
@@ -209,7 +213,7 @@ class TestParseGeminiOutputConfigPrices:
 
 class TestParseCodexOutputUnknownModelFallback:
     """An un-listed model must never silently fall back — it logs a WARNING
-    and uses the single defined `_FALLBACK_PRICE` (task 2459)."""
+    and uses the single defined `token_pricing.FALLBACK_PRICE` (task 2459)."""
 
     def test_unknown_model_logs_warning_and_uses_fallback_price(self, caplog):
         events = [
@@ -228,7 +232,7 @@ class TestParseCodexOutputUnknownModelFallback:
         assert any('totally-unknown-model' in r.getMessage() for r in warning_records), (
             f'expected a WARNING mentioning the unknown model; got: {[r.getMessage() for r in warning_records]}'
         )
-        # _FALLBACK_PRICE: input=2.0/1M, output=8.0/1M
+        # FALLBACK_PRICE: input=2.0/1M, output=8.0/1M
         assert agent_result.cost_usd == pytest.approx((200 * 2.0 + 100 * 8.0) / 1_000_000)
 
 
@@ -277,8 +281,27 @@ class TestEstimateCostCachedInput:
     def test_fallback_price_without_cached_key_does_not_raise(self) -> None:
         cost = _estimate_cost('totally-unknown-model', 300, 100, {}, cached_input_tokens=200)
 
-        # _FALLBACK_PRICE has no cached rate: (300 * 2.0 + 100 * 8.0) / 1e6
+        # FALLBACK_PRICE has no cached rate: (300 * 2.0 + 100 * 8.0) / 1e6
         assert cost == pytest.approx((300 * 2.0 + 100 * 8.0) / 1_000_000)
+
+
+class TestEstimateCostPricesThroughTheSharedFormula:
+    """The runtime estimator prices through agents.token_pricing.price_tokens,
+    the formula eval pricing uses too, so the two cannot drift apart again."""
+
+    @pytest.mark.parametrize('entry', [
+        {'input_per_1m': 1.40, 'output_per_1m': 4.40, 'cached_input_per_1m': 0.26},
+        {'input_per_1m': 1.40, 'output_per_1m': 4.40},
+    ], ids=['with_cached_rate', 'without_cached_rate'])
+    def test_estimate_cost_agrees_with_price_tokens(self, entry):
+        uncached, cached, out = 1_193, 1_370_402, 12_537
+
+        estimated = _estimate_cost(
+            'm', uncached + cached, out, {'m': entry}, cached_input_tokens=cached,
+        )
+
+        usage = TokenUsage(input_tokens=uncached, output_tokens=out, cache_read_tokens=cached)
+        assert estimated == price_tokens(entry, usage).cost_usd
 
 
 # Measured verbatim from codex-cli 0.154.0 on 2026-09-11, carried by both an
@@ -295,7 +318,7 @@ _CODEX_MODEL_METADATA_WARNING = (
 )
 
 
-def _codex_stream(*events: dict[str, Any]) -> _SubprocessResult:
+def _codex_stream(*events: dict[str, Any]) -> SubprocessResult:
     return _make_subprocess_result(stdout='\n'.join(json.dumps(e) for e in events), returncode=0)
 
 
@@ -459,7 +482,7 @@ _ASTRA_PRICES = {
 }
 
 
-def _codex_turns(*usages: dict[str, int]) -> _SubprocessResult:
+def _codex_turns(*usages: dict[str, int]) -> SubprocessResult:
     return _codex_stream(
         {'type': 'thread.started', 'thread_id': 'tid-usage'},
         {'type': 'item.completed', 'item': {'type': 'agent_message', 'text': 'done'}},
@@ -565,7 +588,7 @@ class TestPiToolName:
         """A wildcard `mcp__server__*` spec is not expressible as a single
         direct-tool name — callers drop it from --tools (with a logged
         warning; see TestInvokePiFlags)."""
-        assert _pi_tool_name('mcp__jcodemunch__*') is None
+        assert _pi_tool_name('mcp__verdict-tools__*') is None
 
 
 class TestPiThinking:
@@ -603,7 +626,7 @@ class TestParsePiEmptyOutput:
     def test_empty_stdout_propagates_timed_out(self):
         """timed_out propagates on the empty-stdout path too (a timeout
         with nothing captured yet still routes through this branch)."""
-        result = _SubprocessResult(
+        result = SubprocessResult(
             stdout='', stderr='timeout', returncode=1, duration_ms=100, timed_out=True,
         )
         agent_result = _parse_pi_output(result, 'anthropic/claude-haiku-4-5')
@@ -790,6 +813,7 @@ class TestParsePiCostFallback:
         )
         assert agent_result.success is True
         assert agent_result.cost_usd == pytest.approx((400 * 100.0 + 200 * 100.0) / 1_000_000)
+        assert agent_result.cost_basis is ProcessCostBasis.USAGE_ESTIMATE
 
     def test_zero_native_cost_falls_back_to_price_table(self):
         """`cost.total`==0.0 (present but zero) is treated the same as
@@ -801,6 +825,7 @@ class TestParsePiCostFallback:
             prices={'o4-mini': {'input_per_1m': 100.0, 'output_per_1m': 100.0}},
         )
         assert agent_result.cost_usd == pytest.approx((400 * 100.0 + 200 * 100.0) / 1_000_000)
+        assert agent_result.cost_basis is ProcessCostBasis.USAGE_ESTIMATE
 
     def test_nonzero_native_cost_wins_over_price_table(self):
         """`cost.total` present and >0 -> the native value is used verbatim;
@@ -813,6 +838,7 @@ class TestParsePiCostFallback:
             prices={'o4-mini': {'input_per_1m': 100.0, 'output_per_1m': 100.0}},
         )
         assert agent_result.cost_usd == pytest.approx(0.01234)
+        assert agent_result.cost_basis is ProcessCostBasis.REPORTED
 
 
 class TestWritePiMcpConfig:

@@ -48,6 +48,7 @@ from orchestrator.flake_ledger import (
     build_deflake_task_arguments,
     debt_context_to_json,
     enqueue_debt,
+    list_open_debt,
     open_debt,
     read_debt,
     read_due_items,
@@ -92,7 +93,8 @@ class _FakeLedgerTaskClient:
     of every method (a test's clock advance).  *folds_titles* (toggleable) is the task
     store's candidate key: a submission whose title matches an existing task that is not
     cancelled is answered as COMBINED into that task, a ``done`` one included.
-    *get_task_hangs* (toggleable) makes ``get_task`` never answer.
+    *get_task_hangs* (toggleable) makes ``get_task`` never answer, setting
+    :attr:`get_task_entered` first.
     """
 
     def __init__(
@@ -128,6 +130,7 @@ class _FakeLedgerTaskClient:
         self.commit_hangs = commit_hangs
         self.submit_entered = asyncio.Event()
         self.commit_entered = asyncio.Event()
+        self.get_task_entered = asyncio.Event()
         self._on_call = on_call
         self.submit_raises = submit_raises
         self._status_after_submit = status_after_submit
@@ -179,6 +182,7 @@ class _FakeLedgerTaskClient:
         self._enter('get_task')
         self.task_calls.append(task_id)
         if self.get_task_hangs:
+            self.get_task_entered.set()
             await asyncio.Event().wait()
         if self.unreachable:
             return None, ConnectionError('unreachable')
@@ -654,7 +658,7 @@ class TestRegressionFromTheDrain:
 
         (esc,) = queue.regressions()
         assert _item(db, A).last_error == DueFailure.TASK_CLIENT_FAILED.value
-        queue.resolve(esc.id, 'looked at it by hand', resolved_by='interactive')
+        queue.resolve(esc.id, 'looked at it by hand', resolved_by='interactive', resolution_class='actionable')
         client.submit_raises = None
         clock.advance(timedelta(minutes=6))
         await _pass(db, client, clock, queue=queue)
@@ -947,7 +951,7 @@ class TestPassBounds:
         unopenable = tmp_path / 'not-a-db'
         unopenable.mkdir()
         assert await _pass(unopenable, _FakeLedgerTaskClient(), clock) == DrainPassReport(
-            0, 0, 0, None,
+            0, 0, 0, DrainStop.LEDGER_UNREADABLE,
         )
 
 
@@ -1020,6 +1024,33 @@ class TestStaleItemEscalation:
         assert resolved.resolved_by == STALE_DUE_ESCALATION_ROLE
         assert len([e for e in queue.submitted if e.task_id == STALE_DUE_ESCALATION_SENTINEL]) == 2
 
+    async def test_a_parked_stale_record_closes_with_a_resolution_class(
+        self, tmp_path: Path,
+    ) -> None:
+        """A watcher's park promotes the record to level 2, whose close must be classified."""
+        db, clock = _db(tmp_path), _Clock()
+        client = _FakeLedgerTaskClient(unreachable=True)
+        queue = _RecordingQueue(tmp_path / 'queue')
+
+        async def _at(minutes: int) -> None:
+            clock.now = T0 + timedelta(minutes=minutes)
+            await _pass(db, client, clock, queue=queue)
+
+        _enqueue(db, A, 0, at=T0)
+        await _at(0)
+        await _at(31)
+        (stale,) = queue.stale_records()
+        queue.park(stale.id, 'parked for a human')
+
+        client.unreachable = False
+        await _at(140)
+        await _at(141)
+
+        closed = queue.get(stale.id)
+        assert closed is not None
+        assert closed.status != 'pending'
+        assert closed.resolution_class is not None
+
     async def test_the_stale_record_is_filed_before_any_client_call(self, tmp_path: Path) -> None:
         db, clock = _db(tmp_path), _Clock()
         client = _FakeLedgerTaskClient(submit_hangs=True)
@@ -1085,3 +1116,249 @@ class TestTaskClientBounds:
 
         assert report.stop is DrainStop.TASK_CLIENT_FAILED
         assert _item(db, A).last_error == DueFailure.TASK_CLIENT_FAILED.value
+
+
+# ---------------------------------------------------------------------------
+# The eager resolution sweep (plans/flake-ledger-prd.md task θ, task 8409)
+# ---------------------------------------------------------------------------
+
+
+async def _resolution_pass(
+    db: Path,
+    client: FlakeLedgerTaskClient,
+    clock: _Clock,
+    sweep: flake_debt_drain.DebtResolutionSweep | None = None,
+) -> flake_debt_drain.ResolutionPassReport:
+    return await (sweep or flake_debt_drain.DebtResolutionSweep()).run_pass(
+        db, PROJECT, task_client=client, clock=clock,
+    )
+
+
+async def _open_owned(db: Path, client: _FakeLedgerTaskClient, test_id: str) -> str:
+    """Open *test_id*'s first cycle through the real ``open_debt`` and return its owner."""
+    await open_debt(db, PROJECT, test_id, task_client=client)
+    row = read_debt(db, test_id)
+    assert row is not None and row.owner_task_id is not None, row
+    return row.owner_task_id
+
+
+def _resolved(db: Path, test_id: str) -> bool:
+    row = read_debt(db, test_id)
+    assert row is not None, test_id
+    return row.resolved_at is not None
+
+
+@pytest.mark.asyncio
+class TestResolutionSweep:
+    async def test_a_pass_closes_every_open_cycle_whose_owner_is_done(
+        self, tmp_path: Path,
+    ) -> None:
+        db, clock, client = _db(tmp_path), _Clock(), _FakeLedgerTaskClient()
+        owner_a = await _open_owned(db, client, A)
+        owner_b = await _open_owned(db, client, B)
+        await open_debt(db, PROJECT, C)
+        client.finish(owner_a, commit=FIX)
+        reads, filings = len(client.task_calls), len(client.submit_calls)
+
+        report = await _resolution_pass(db, client, clock)
+
+        assert report == flake_debt_drain.ResolutionPassReport(
+            examined=2, resolved=1, owner_unreadable=0, stop=None,
+        )
+        row_a = read_debt(db, A)
+        assert row_a is not None and row_a.resolved_at is not None
+        assert row_a.prior_resolving_commit == FIX
+        assert not _resolved(db, B) and not _resolved(db, C)
+        assert A not in [row.test_id for row in list_open_debt(db)]
+        assert client.task_calls[reads:] == [owner_a, owner_b], 'the unowned row is never read'
+        assert client.submit_calls[filings:] == [], 'the pass files nothing'
+
+    async def test_a_second_pass_finds_nothing_left_to_close(self, tmp_path: Path) -> None:
+        db, clock, client = _db(tmp_path), _Clock(), _FakeLedgerTaskClient()
+        owner_a = await _open_owned(db, client, A)
+        owner_b = await _open_owned(db, client, B)
+        await open_debt(db, PROJECT, C)
+        client.finish(owner_a, commit=FIX)
+        sweep = flake_debt_drain.DebtResolutionSweep()
+        await _resolution_pass(db, client, clock, sweep)
+        reads = len(client.task_calls)
+
+        again = await _resolution_pass(db, client, clock, sweep)
+
+        assert again == flake_debt_drain.ResolutionPassReport(
+            examined=1, resolved=0, owner_unreadable=0, stop=None,
+        )
+        assert client.task_calls[reads:] == [owner_b]
+
+
+def _numbered(n: int) -> str:
+    return f'orchestrator/tests/test_x.py::test_{n:03d}'
+
+
+@pytest.mark.asyncio
+class TestResolutionPassBounds:
+    async def test_an_unreadable_owner_stops_the_pass_and_is_counted(
+        self, tmp_path: Path,
+    ) -> None:
+        db, clock, client = _db(tmp_path), _Clock(), _FakeLedgerTaskClient()
+        for test_id in (A, B, C):
+            client.finish(await _open_owned(db, client, test_id), commit=FIX)
+        client.unreachable = True
+        reads = len(client.task_calls)
+
+        report = await _resolution_pass(db, client, clock)
+
+        assert report == flake_debt_drain.ResolutionPassReport(
+            examined=1, resolved=0, owner_unreadable=1, stop=DrainStop.TASK_CLIENT_FAILED,
+        )
+        assert report.event_data() == {
+            'examined': 1, 'resolved': 0, 'owner_unreadable': 1, 'stop': 'task_client_failed',
+        }
+        assert not any(_resolved(db, test_id) for test_id in (A, B, C))
+        assert len(client.task_calls[reads:]) == 1
+
+    async def test_a_pass_stops_at_its_time_budget(self, tmp_path: Path) -> None:
+        db, clock, seeding = _db(tmp_path), _Clock(), _FakeLedgerTaskClient()
+        owners = [await _open_owned(db, seeding, test_id) for test_id in (A, B, C)]
+        client = _FakeLedgerTaskClient(
+            statuses={owner: 'done' for owner in owners},
+            on_call=lambda: clock.advance(timedelta(minutes=3)),
+        )
+
+        report = await _resolution_pass(db, client, clock)
+
+        assert report == flake_debt_drain.ResolutionPassReport(
+            examined=2, resolved=2, owner_unreadable=0, stop=DrainStop.BUDGET,
+        )
+        assert (_resolved(db, A), _resolved(db, B), _resolved(db, C)) == (True, True, False)
+
+    async def test_a_pass_examines_at_most_fifty_rows(self, tmp_path: Path) -> None:
+        db, clock, client = _db(tmp_path), _Clock(), _FakeLedgerTaskClient()
+        owners = [await _open_owned(db, client, _numbered(n)) for n in range(51)]
+        reads = len(client.task_calls)
+
+        report = await _resolution_pass(db, client, clock)
+
+        assert report.examined == 50
+        assert owners[50] not in client.task_calls[reads:]
+
+    async def test_a_resolution_pass_never_raises(self, tmp_path: Path) -> None:
+        clock = _Clock()
+        unopenable = tmp_path / 'not-a-db'
+        unopenable.mkdir()
+        assert await _resolution_pass(
+            unopenable, _FakeLedgerTaskClient(), clock,
+        ) == flake_debt_drain.ResolutionPassReport(0, 0, 0, DrainStop.LEDGER_UNREADABLE)
+
+        db = _db(tmp_path)
+        await _open_owned(db, _FakeLedgerTaskClient(), A)
+        broken: FlakeLedgerTaskClient = _RaisingTaskClient()
+        assert await _resolution_pass(db, broken, clock) == flake_debt_drain.ResolutionPassReport(
+            examined=1, resolved=0, owner_unreadable=1, stop=DrainStop.TASK_CLIENT_FAILED,
+        )
+
+    async def test_a_cancellation_inside_a_resolution_pass_propagates(
+        self, tmp_path: Path,
+    ) -> None:
+        db, clock, client = _db(tmp_path), _Clock(), _FakeLedgerTaskClient()
+        await _open_owned(db, client, A)
+        client.get_task_hangs = True
+
+        sweep = asyncio.create_task(_resolution_pass(db, client, clock))
+        await client.get_task_entered.wait()
+        sweep.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await sweep
+
+
+@pytest.mark.asyncio
+class TestResolutionSweepResumes:
+    """One sweep across passes: a window that rows with open owners fill must not starve
+    the rows behind it."""
+
+    async def test_the_next_pass_resumes_after_the_fiftieth_row_and_then_wraps(
+        self, tmp_path: Path,
+    ) -> None:
+        db, clock, client = _db(tmp_path), _Clock(), _FakeLedgerTaskClient()
+        owners = [await _open_owned(db, client, _numbered(n)) for n in range(51)]
+        sweep = flake_debt_drain.DebtResolutionSweep()
+
+        assert (await _resolution_pass(db, client, clock, sweep)).examined == 50
+        reads = len(client.task_calls)
+        assert (await _resolution_pass(db, client, clock, sweep)).examined == 1
+        assert client.task_calls[reads:] == [owners[50]]
+        reads = len(client.task_calls)
+        assert (await _resolution_pass(db, client, clock, sweep)).examined == 50
+        assert client.task_calls[reads] == owners[0], 'the window wrapped'
+
+    async def test_the_pass_after_an_unreadable_owner_resumes_past_it(
+        self, tmp_path: Path,
+    ) -> None:
+        db, clock, client = _db(tmp_path), _Clock(), _FakeLedgerTaskClient()
+        owner_a, owner_b, owner_c = [await _open_owned(db, client, t) for t in (A, B, C)]
+        for owner in (owner_a, owner_b, owner_c):
+            client.finish(owner, commit=FIX)
+        sweep = flake_debt_drain.DebtResolutionSweep()
+        client.unreachable = True
+        assert (await _resolution_pass(db, client, clock, sweep)).owner_unreadable == 1
+        client.unreachable = False
+        reads = len(client.task_calls)
+
+        past = await _resolution_pass(db, client, clock, sweep)
+
+        assert past == flake_debt_drain.ResolutionPassReport(
+            examined=2, resolved=2, owner_unreadable=0, stop=None,
+        )
+        assert client.task_calls[reads:] == [owner_b, owner_c]
+        assert (await _resolution_pass(db, client, clock, sweep)).resolved == 1
+        assert _resolved(db, A)
+
+    async def test_an_unreadable_ledger_is_reported_and_keeps_the_cursor(
+        self, tmp_path: Path,
+    ) -> None:
+        """A failed ledger read is not an empty backlog: the report says so, and the next
+        pass resumes where the last readable one stopped."""
+        db, clock, client = _db(tmp_path), _Clock(), _FakeLedgerTaskClient()
+        owners = [await _open_owned(db, client, _numbered(n)) for n in range(51)]
+        unopenable = tmp_path / 'not-a-db'
+        unopenable.mkdir()
+        sweep = flake_debt_drain.DebtResolutionSweep()
+        assert (await _resolution_pass(db, client, clock, sweep)).examined == 50
+
+        unread = await _resolution_pass(unopenable, client, clock, sweep)
+
+        assert unread == flake_debt_drain.ResolutionPassReport(
+            0, 0, 0, DrainStop.LEDGER_UNREADABLE,
+        )
+        assert unread.event_data()['stop'] == 'ledger_unreadable'
+        reads = len(client.task_calls)
+        assert (await _resolution_pass(db, client, clock, sweep)).examined == 1
+        assert client.task_calls[reads:] == [owners[50]]
+
+    async def test_the_pass_after_a_budget_stop_starts_at_the_row_it_did_not_reach(
+        self, tmp_path: Path,
+    ) -> None:
+        """A and B stay open through the budget-stopped pass, so only the cursor, not
+        the open set, can make the next pass start at C."""
+        db, clock, seeding = _db(tmp_path), _Clock(), _FakeLedgerTaskClient()
+        owners = [await _open_owned(db, seeding, test_id) for test_id in (A, B, C)]
+        slow = _FakeLedgerTaskClient(
+            statuses={owner: 'pending' for owner in owners},
+            on_call=lambda: clock.advance(timedelta(minutes=3)),
+        )
+        sweep = flake_debt_drain.DebtResolutionSweep()
+        assert await _resolution_pass(db, slow, clock, sweep) == (
+            flake_debt_drain.ResolutionPassReport(
+                examined=2, resolved=0, owner_unreadable=0, stop=DrainStop.BUDGET,
+            )
+        )
+        client = _FakeLedgerTaskClient(statuses={owner: 'done' for owner in owners})
+
+        resumed = await _resolution_pass(db, client, clock, sweep)
+
+        assert client.task_calls == [owners[2]]
+        assert resumed == flake_debt_drain.ResolutionPassReport(
+            examined=1, resolved=1, owner_unreadable=0, stop=None,
+        )
+        assert (_resolved(db, A), _resolved(db, B), _resolved(db, C)) == (False, False, True)

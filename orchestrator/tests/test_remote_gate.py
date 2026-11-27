@@ -19,16 +19,19 @@ import fcntl
 import json
 import os
 import shlex
+import shutil
 import signal
 import subprocess
 import time
-from collections.abc import Awaitable, Callable
+import typing
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, ClassVar
 
 import pytest
 from _gate_fixtures import without_push_ssh_config
+from _task_verify_fixtures import task_verify_spec
 from click.testing import CliRunner
 from df_pytest_isolation import read_leaked_pid
 from shared.proc_group import (
@@ -49,10 +52,12 @@ from orchestrator.remote_gate import (
     classify_remote_exit,
     ensure_script_text,
     local_gate_identity,
+    off_wire_field,
     parse_ensure_report,
     parse_gate_identity,
     reap_script_text,
     wire_classes,
+    wire_fields,
     wire_fingerprint,
 )
 from orchestrator.verify import VerifyResult
@@ -80,16 +85,17 @@ FAKE_FINGERPRINT = 'a' * 64
 def test_wire_fingerprint_is_pinned_for_todays_wire_classes():
     """A changed vector means a wire shape changed: re-pin it deliberately.
 
-    ``fused-memory/scripts/check_bare_magicmock_config.py`` keeps a second,
-    exhaustive copy of ``VerifyResult``'s field list for its mock-shape rule;
-    a field change must update it too (folding the two is a follow-up).
+    The Rule B mock-shape registry
+    (``fused-memory/scripts/check_bare_magicmock_config.py::_DATACLASS_SHAPES``)
+    derives ``VerifyResult``'s fields from the same class definition, so a field
+    change re-pins only this vector.
     """
     assert wire_fingerprint(wire_classes()) == (
-        'a1d128e7f274c216c5c8f2570853fa4a0f25fe791a58f74d80f88e9cd1dac637'
+        '817ad4d80d1f101b92bdfb8d1b9c87487b04889df2bc3e1706d02397c6dbd641'
     )
 
 
-def _one_class(name: str, *fields_: tuple[str, object]) -> type:
+def _one_class(name: str, *fields_: tuple[str, object] | tuple[str, object, object]) -> type:
     return dataclasses.make_dataclass(name, list(fields_))
 
 
@@ -126,9 +132,98 @@ def test_class_order_does_not_matter():
     assert wire_fingerprint([a, b]) == wire_fingerprint([b, a])
 
 
+def test_an_off_wire_field_leaves_the_fingerprint_and_the_wire_fields():
+    on_wire = _one_class('Verdict', ('passed', bool))
+    with_off_wire = _one_class(
+        'Verdict', ('passed', bool), ('record', 'object | None', off_wire_field(default=None)),
+    )
+
+    assert wire_fingerprint([with_off_wire]) == wire_fingerprint([on_wire])
+    assert [f.name for f in wire_fields(with_off_wire)] == ['passed']
+
+
 def test_local_gate_identity_pairs_the_sha_with_this_process_fingerprint():
     identity = local_gate_identity('1' * 40)
     assert identity == GateIdentity('1' * 40, wire_fingerprint(wire_classes()))
+
+
+def _component_types(tp: object) -> list[object]:
+    """*tp*'s origin and arguments, with a Callable's parameter list flattened."""
+    origin = typing.get_origin(tp)
+    args = [a for arg in typing.get_args(tp) for a in (arg if isinstance(arg, list) else [arg])]
+    return args if origin is None else [origin, *args]
+
+
+def _nested_dataclasses(cls: type) -> dict[str, frozenset[type]]:
+    hints = typing.get_type_hints(cls)
+    nested: dict[str, frozenset[type]] = {}
+    for f in wire_fields(cls):
+        found: set[type] = set()
+        stack: list[object] = [hints[f.name]]
+        while stack:
+            tp = stack.pop()
+            if isinstance(tp, type) and dataclasses.is_dataclass(tp):
+                found.add(tp)
+            else:
+                stack.extend(_component_types(tp))
+        if found:
+            nested[f.name] = frozenset(found)
+    return nested
+
+
+def test_nested_dataclass_walk_sees_through_optional_tuple_and_mapping():
+    inner = _one_class('Inner', ('x', int))
+    outer = _one_class(
+        'Outer',
+        ('maybe', inner | None),
+        ('many', tuple[inner, ...]),
+        ('by_id', Mapping[str, inner]),
+        ('plain', str),
+    )
+    assert _nested_dataclasses(outer) == {'maybe': {inner}, 'many': {inner}, 'by_id': {inner}}
+
+
+_T = typing.TypeVar('_T')
+
+
+@dataclass
+class _Box(typing.Generic[_T]):
+    x: _T
+
+
+def test_nested_dataclass_walk_sees_a_generic_dataclass_and_a_callable_parameter():
+    inner = _one_class('Inner', ('x', int))
+    outer = _one_class(
+        'Outer',
+        ('parameterised', _Box[int]),
+        ('hook', Callable[[inner], None]),
+    )
+    assert _nested_dataclasses(outer) == {'parameterised': {_Box}, 'hook': {inner}}
+
+
+def test_nested_dataclass_walk_skips_a_dataclass_behind_an_off_wire_field():
+    unlisted = _one_class('Unlisted', ('x', int))
+    outer = _one_class(
+        'Outer', ('plain', str), ('record', unlisted | None, off_wire_field(default=None)),
+    )
+    assert _nested_dataclasses(outer) == {}
+
+
+def test_every_dataclass_nested_in_a_wire_class_is_a_wire_class():
+    """A nested shape outside wire_classes() could change without moving the fingerprint."""
+    wire = set(wire_classes())
+    unlisted = sorted(
+        f'{cls.__qualname__}.{name} -> {nested.__module__}.{nested.__qualname__}'
+        for cls in wire
+        for name, found in _nested_dataclasses(cls).items()
+        for nested in found - wire
+    )
+    assert unlisted == [], (
+        'a dataclass nested in a wire class\'s fields is wire shape the fingerprint '
+        'does not hash: add it to '
+        'orchestrator/src/orchestrator/remote_gate.py::wire_classes and re-pin '
+        'test_wire_fingerprint_is_pinned_for_todays_wire_classes'
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -261,10 +356,12 @@ def test_gate_identity_cli_fails_without_a_checkout(monkeypatch):
 
 # Fake `uv sync`: "builds" a gate binary that answers gate-identity with its own
 # checkout's HEAD.  $FAKE_UV_LOG counts builds; $FAKE_UV_BROKEN builds a binary
-# that fails; $FAKE_UV_SLEEP widens the race window.
+# that fails; $FAKE_UV_EXIT fails the sync itself with that status;
+# $FAKE_UV_SLEEP widens the race window.
 _FAKE_UV = r'''#!/usr/bin/env bash
 set -eu
 echo "uv $*" >> "$FAKE_UV_LOG"
+[[ -z ${FAKE_UV_EXIT:-} ]] || exit "$FAKE_UV_EXIT"
 sleep "${FAKE_UV_SLEEP:-0}"
 mkdir -p .venv/bin
 if [[ -n ${FAKE_UV_BROKEN:-} ]]; then
@@ -482,6 +579,96 @@ def test_every_ensure_refreshes_the_gate_dir_mtime(remote: _Remote):
 def test_the_build_lock_file_is_left_in_place(remote: _Remote):
     assert remote.ensure().returncode == 0
     assert (remote.root / f'.build-{remote.sha}.lock').is_file()
+
+
+@pytest.mark.parametrize(('failure_env', 'status'), [
+    pytest.param({'FAKE_UV_BROKEN': '1'}, 70, id='handshake-die'),
+    pytest.param({'FAKE_UV_EXIT': '1'}, 1, id='build-set-e-abort'),
+])
+def test_a_failed_ensure_unlinks_its_build_lock(
+    remote: _Remote, failure_env: dict[str, str], status: int,
+):
+    result = remote.ensure(**failure_env)
+
+    assert result.returncode == status, result.stderr
+    assert remote.gate.exists(), 'the clone runs only under the lock, so this run held it'
+    assert not (remote.root / f'.build-{remote.sha}.lock').exists()
+
+
+def _path_with_fake_flock(bindir: Path, script: str, path: str) -> str:
+    """*path* behind a *bindir* holding a ``flock`` that runs *script*."""
+    bindir.mkdir()
+    (bindir / 'flock').write_text(script)
+    (bindir / 'flock').chmod(0o755)
+    return f'{bindir}:{path}'
+
+
+def test_an_ensure_that_times_out_on_the_build_lock_leaves_it_in_place(
+    remote: _Remote, tmp_path: Path,
+):
+    """Only the run holding the lock unlinks it, never one that failed to take it."""
+    path = _path_with_fake_flock(tmp_path / 'flockbin', '#!/usr/bin/env bash\nexit 1\n', remote.env['PATH'])
+    remote.root.mkdir(parents=True)
+    lock_path = remote.root / f'.build-{remote.sha}.lock'
+    with lock_path.open('w') as held:
+        fcntl.flock(held, fcntl.LOCK_EX)
+
+        result = remote.ensure(PATH=path)
+
+        assert result.returncode == 75, result.stderr
+        assert lock_path.exists()
+        assert os.fstat(held.fileno()).st_ino == lock_path.stat().st_ino
+
+
+def _a_child_flock_waits_on(parent: int, handle: typing.IO[str]) -> bool:
+    """Whether a child of *parent* is blocked in flock on the file *handle* has open.
+
+    A waiter row reads ``<id>: -> FLOCK <mode> <access> <pid> <maj:min:inode> ...``.
+    Its device is the superblock's, which can differ from st_dev, so only the
+    inode is matched; the parent keeps another process's waiter from matching.
+    """
+    inode = f':{os.fstat(handle.fileno()).st_ino}'
+    for line in Path('/proc/locks').read_text().splitlines():
+        match line.split():
+            case [_, '->', 'FLOCK', _, _, pid, file_id, *_] if file_id.endswith(inode):
+                waiter = read_stat_fields(Path('/proc', pid), skip_malformed=True)
+                if waiter is not None and waiter.ppid == parent:
+                    return True
+    return False
+
+
+_ENSURE_EXIT_CEILING_SECS = 60
+
+
+def test_an_ensure_whose_lock_file_is_replaced_while_it_waits_locks_the_new_file(remote: _Remote):
+    """A holder may unlink the lock: winning a file no longer at the lock path is no lock."""
+    remote.root.mkdir(parents=True)
+    lock = remote.root / f'.build-{remote.sha}.lock'
+    handles = [lock.open('w')]
+    fcntl.flock(handles[0], fcntl.LOCK_EX)
+    proc = remote.popen()
+    try:
+        first = handles[0]
+        assert _holds_within(lambda: _a_child_flock_waits_on(proc.pid, first), 30)
+
+        lock.unlink()
+        second = lock.open('w')
+        handles.append(second)
+        fcntl.flock(second, fcntl.LOCK_EX)
+        first.close()
+
+        assert _holds_within(lambda: _a_child_flock_waits_on(proc.pid, second), 10)
+        assert remote.builds() == 0
+
+        second.close()
+        _, stderr = proc.communicate(timeout=_ENSURE_EXIT_CEILING_SECS)
+        assert proc.returncode == 0, stderr
+        assert remote.builds() == 1
+    finally:
+        for handle in handles:
+            handle.close()
+        proc.kill()
+        proc.communicate(timeout=_ENSURE_EXIT_CEILING_SECS)
 
 
 def test_ensure_never_exits_with_the_ssh_transport_status(remote: _Remote):
@@ -1086,7 +1273,7 @@ async def test_the_default_transport_hands_ssh_the_dispatchers_own_locale(
         code_checkout=str(tmp_path),
     )
 
-    rc, stdout, _ = await runner.env_probe_run()(['true'])
+    rc, stdout, _ = await (await runner.env_probe_run())(['true'])
 
     assert (rc, stdout) == (0, 'unset|en_GB.UTF-8')
 
@@ -1102,7 +1289,58 @@ async def test_a_failed_publish_is_classed_on_the_push_channel_and_runs_no_ensur
     exc = await _unavailable(transport)
 
     assert exc.kind == kind
-    assert transport.roles() == ['publish']
+    assert transport.roles() == (['publish'] if kind == 'transport' else ['publish', 'publish'])
+
+
+_LOCKED_GATE_REF = (1, '', f"error: cannot lock ref 'refs/gate/{_SHA}': reference already exists")
+
+
+def _publishes(*replies: tuple[int, str, str]) -> Callable[[], Awaitable[tuple[int, str, str]]]:
+    """A publish reply answering *replies* in turn, then success."""
+    remaining = list(replies)
+
+    async def publish() -> tuple[int, str, str]:
+        return remaining.pop(0) if remaining else (0, '', '')
+
+    return publish
+
+
+@pytest.mark.asyncio
+async def test_a_publish_colliding_on_the_gate_ref_is_retried_once():
+    transport = _Scripted(publish=_publishes(_LOCKED_GATE_REF))
+
+    result = await _scripted_runner(transport).run_merge_verify('mergesha', _spec())
+
+    assert result == _VERDICT
+    assert transport.roles() == ['publish', 'publish', 'ensure', 'verify_push', 'verify', 'delete']
+
+
+@pytest.mark.asyncio
+async def test_a_task_and_a_merge_verify_publishing_one_gate_sha_at_once_both_get_their_verdict():
+    transport = _Scripted(publish=_publishes(_LOCKED_GATE_REF))
+    task_runner, merge_runner = _scripted_runner(transport), _scripted_runner(transport)
+
+    results = await asyncio.gather(
+        task_runner.run_task_verify(
+            task_verify_spec('a' * 40, 'pytest'), task_id='t1', archive_root=None,
+        ),
+        merge_runner.run_merge_verify('mergesha', _spec()),
+    )
+
+    assert results == [_VERDICT, _VERDICT]
+    assert transport.roles().count('publish') == 3
+    verifies = [argv for role, argv, _ in transport.calls if role == 'verify']
+    assert sorted(gate_argv_for(argv[-1])[0] for argv in verifies) == ['verify-merge', 'verify-task']
+
+
+@pytest.mark.asyncio
+async def test_a_publish_refused_twice_is_a_gate_failure_with_no_ensure():
+    transport = _Scripted(publish=_publishes(_LOCKED_GATE_REF, _LOCKED_GATE_REF))
+
+    exc = await _unavailable(transport)
+
+    assert exc.kind == 'gate'
+    assert transport.roles() == ['publish', 'publish']
 
 
 @pytest.mark.asyncio
@@ -1381,10 +1619,52 @@ def test_the_reaper_leaves_an_unmarked_root_alone(gate_root: Path):
 def test_the_reaper_skips_a_sha_whose_build_lock_is_held(gate_root: Path):
     sha = '4' * 40
     idle = _dir(gate_root, sha, days=30)
-    with open(gate_root / f'.build-{sha}.lock', 'w') as lock:
+    lock_path = gate_root / f'.build-{sha}.lock'
+    with open(lock_path, 'w') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         assert _reap(gate_root).returncode == 0
+        assert lock_path.exists()
+        assert os.fstat(lock.fileno()).st_ino == lock_path.stat().st_ino
     assert idle.exists()
+
+
+def test_a_reaped_sha_leaves_no_build_lock(gate_root: Path):
+    sha = '1' * 40
+    idle = _dir(gate_root, sha, days=8)
+    lock = gate_root / f'.build-{sha}.lock'
+    lock.touch()
+
+    result = _reap(gate_root)
+
+    assert result.returncode == 0, result.stderr
+    assert not idle.exists()
+    assert not lock.exists()
+
+
+# A `flock` that replaces the file on the fd it is handed (its last argument)
+# before locking it: the reaper's open-to-flock window, held open.
+_REPLACING_FLOCK = r"""#!/usr/bin/env bash
+path=$(readlink "/proc/$$/fd/${!#}")
+unlink "$path"
+: > "$path"
+exec "$REAL_FLOCK" "$@"
+"""
+
+
+def test_a_reaper_whose_lock_file_was_replaced_before_it_locked_reaps_nothing(
+    gate_root: Path, tmp_path: Path,
+):
+    sha = '5' * 40
+    idle = _dir(gate_root, sha, days=30)
+    path = _path_with_fake_flock(tmp_path / 'flockbin', _REPLACING_FLOCK, os.environ['PATH'])
+    real_flock = shutil.which('flock')
+    assert real_flock is not None
+
+    result = _reap(gate_root, PATH=path, REAL_FLOCK=real_flock)
+
+    assert result.returncode == 0, result.stderr
+    assert idle.exists()
+    assert (gate_root / f'.build-{sha}.lock').exists()
 
 
 def test_the_reaper_rejects_a_relative_root(gate_root: Path):

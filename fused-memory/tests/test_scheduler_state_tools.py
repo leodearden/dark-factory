@@ -20,11 +20,17 @@ from unittest.mock import AsyncMock
 
 import pytest
 from orchestrator.config import OrchestratorConfig
+from orchestrator.pause_policy import PauseClass
 from orchestrator.pin_reservation import PinOrder
 from orchestrator.scheduler import Scheduler
 from shared.project_layout import scheduler_state_json
+from shared.scheduler_state import SchedulerStateSnapshot
 
-from fused_memory.mcp_tools.scheduler_state import read_scheduler_state
+from fused_memory.mcp_tools.scheduler_state import (
+    SchedulerStateUnreadable,
+    read_scheduler_state,
+    read_scheduler_state_strict,
+)
 from fused_memory.server.tools import create_mcp_server
 
 # ---------------------------------------------------------------------------
@@ -79,9 +85,13 @@ _COLD_START = {
     'pin_queue': [],
     'overrides': {},
     'current_holders': {},
+    'held_by_task': {},
+    'holder_limits': {},
+    'successor_of': {},
     'lock_depth': None,
     'is_paused': False,
     'pause_reason': None,
+    'pause_class': None,
     'requeue_cooldowns': {},
     'snapshot_at': None,
 }
@@ -187,7 +197,7 @@ class TestGetSchedulerStateTool:
     async def test_cold_start_returns_every_key_and_a_null_snapshot_at(
         self, tmp_path, mcp_server
     ):
-        """B6: with no scheduler_state.json, all 13 keys come back empty."""
+        """B6: with no scheduler_state.json, every key comes back empty."""
         result = await _get_scheduler_state(mcp_server, tmp_path)
         assert result == _COLD_START
 
@@ -213,6 +223,21 @@ class TestGetSchedulerStateTool:
         assert 'P' in result['pin_reservations']
         assert set(result['requeue_cooldowns']['T1']) == _REQUEUE_COOLDOWN_FIELDS
         assert isinstance(result['snapshot_at'], str)
+
+    @pytest.mark.asyncio
+    async def test_reports_the_structured_pause_class_a_scheduler_holds(
+        self, tmp_path, mcp_server
+    ):
+        scheduler = Scheduler(OrchestratorConfig(project_root=tmp_path, max_per_module=1))
+        scheduler.finish_startup()
+        scheduler.pause('cost_ceiling_orch_exceeded', PauseClass.COST_CEILING)
+        await scheduler.flush_state_snapshot()
+
+        result = await _get_scheduler_state(mcp_server, tmp_path)
+
+        assert result['is_paused'] is True
+        assert result['pause_reason'] == 'cost_ceiling_orch_exceeded'
+        assert result['pause_class'] == 'cost_ceiling'
 
     @pytest.mark.asyncio
     async def test_unknown_key_from_a_newer_producer_is_not_returned(
@@ -282,6 +307,45 @@ class TestGetSchedulerStateTool:
         assert result['park_stacks'] == _PARK_STACKS_FIXTURE, (
             f'Expected park_stacks surfaced end-to-end, got {result.get("park_stacks")!r}'
         )
+
+
+class TestReadSchedulerStateStrict:
+    """The strict reader tells an absent snapshot from one it cannot read."""
+
+    def test_an_absent_snapshot_reads_as_none(self, tmp_path):
+        assert read_scheduler_state_strict(tmp_path) is None
+
+    def test_a_present_snapshot_is_returned_with_its_holders(self, tmp_path):
+        _write_snapshot(
+            tmp_path, {'current_holders': {'m/src': '42'}, 'held_by_task': {'7': ['m/src']}},
+        )
+
+        result = read_scheduler_state_strict(tmp_path)
+
+        assert result is not None
+        assert result.holder_task_ids() == frozenset({'42', '7'})
+
+    @pytest.mark.parametrize(
+        'body', ['', '{not json', '[]', '{"lock_depth": true}'],
+        ids=['empty', 'invalid-json', 'non-object', 'malformed-shape'],
+    )
+    def test_an_unparseable_snapshot_raises_naming_the_path(self, tmp_path, body):
+        _write_snapshot_text(tmp_path, body)
+
+        with pytest.raises(SchedulerStateUnreadable) as exc:
+            read_scheduler_state_strict(tmp_path)
+
+        assert exc.value.path == scheduler_state_json(tmp_path)
+        assert str(scheduler_state_json(tmp_path)) in str(exc.value)
+        assert read_scheduler_state(tmp_path) == SchedulerStateSnapshot.empty()
+
+    def test_an_unreadable_path_raises_rather_than_reading_as_absent(self, tmp_path):
+        scheduler_state_json(tmp_path).mkdir(parents=True)
+
+        with pytest.raises(SchedulerStateUnreadable):
+            read_scheduler_state_strict(tmp_path)
+
+        assert read_scheduler_state(tmp_path) == SchedulerStateSnapshot.empty()
 
 
 # ===========================================================================

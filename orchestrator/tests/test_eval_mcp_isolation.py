@@ -37,6 +37,7 @@ from orchestrator.evals.architect_eval import ArchitectEvalDeps
 from orchestrator.evals.compare import Synthesis, _assess_task, compare_models
 from orchestrator.evals.configs import EvalConfig
 from orchestrator.evals.judge import judge_plan_quality, run_judge
+from orchestrator.evals.metrics import RoleUnderTest
 from orchestrator.evals.results import EvalResult, ResultStore
 from orchestrator.git_ops import GitOps
 from orchestrator.scheduler import TaskAssignment
@@ -113,7 +114,7 @@ async def _drive_architect_eval(tmp_path: Path) -> dict:
     )
 
     cfg = EvalConfig(name='architect-probe', backend='claude', model='opus',
-                     effort='high', role='architect')
+                     effort='high', role=RoleUnderTest.ARCHITECT)
     await runner.run_architect_eval(
         _write_fixture(tmp_path), cfg,
         base_config=OrchestratorConfig(project_root=tmp_path / 'proj'),

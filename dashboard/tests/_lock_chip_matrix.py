@@ -21,7 +21,8 @@ import subprocess
 from collections.abc import Iterable
 from typing import Any
 
-from _dashboard_helpers import extract_function_body, find_function_params, node_path
+from _dashboard_helpers import node_path
+from _jsx_source_helpers import extract_function_body, find_function_params
 
 _REDUX_DIR = pathlib.Path(__file__).parent.parent / 'src/dashboard/static/redux'
 SCHED_UTILS_PATH = str(_REDUX_DIR / 'scheduler_utils.jsx')
@@ -44,11 +45,18 @@ CELL_MATRIX: dict[str, dict[str, Any]] = {
         'holder': 'A', 'holder_project': ROW_PROJECT, 'parked_by': ROW_TASK, 'parked_owner_live': True,
     },
     'parked by a dead owner': {'parked_by': 'C', 'parked_owner_live': False},
+    'co-holder of a shared key': {
+        'holder': 'A', 'holders': ['A', ROW_TASK], 'holder_project': ROW_PROJECT, 'at_holder_limit': False,
+    },
+    'held below its limit by another': {'holder': 'A', 'holders': ['A'], 'at_holder_limit': False},
 }
 
 
 def heatmap_module(**fields: Any) -> dict[str, Any]:
+    """A SCHEDULER.modules entry; a lone holder fills the key unless *fields* say otherwise."""
+    holder = fields.get('holder')
     return {'project': ROW_PROJECT, 'path': MODULE_PATH, 'holder': None, 'holder_project': None,
+            'holders': [holder] if holder else [], 'at_holder_limit': bool(holder),
             'parked_by': None, 'parked_owner_live': None, **fields}
 
 
@@ -78,6 +86,35 @@ def lock_chip_states_for(cases: Iterable[tuple[Any, str, str]]) -> list[dict[str
     """lockChipStateFor(module, task_id, project) for each case, in one node process."""
     result = subprocess.run(
         [node_path(), '-e', _CHIP_DRIVER, SCHED_UTILS_PATH, json.dumps(list(cases))],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return json.loads(result.stdout.strip())
+
+
+_PREDICATE_DRIVER = r"""
+const vm = require('vm');
+const fs = require('fs');
+const [utilsPath, casesJson] = process.argv.slice(1);
+const context = vm.createContext({ console, window: {} });
+vm.runInContext(fs.readFileSync(utilsPath, 'utf8'), context, { filename: utilsPath });
+context.__cases = JSON.parse(casesJson);
+const out = vm.runInContext(
+  `__cases.map(([module, taskId, project]) => ({
+    isLockHolder: window.DF_SCHED_UTILS.isLockHolder(module, taskId, project),
+    lockHeldAgainst: window.DF_SCHED_UTILS.lockHeldAgainst(module, taskId, project),
+  }))`,
+  context,
+);
+process.stdout.write(JSON.stringify(out) + '\n');
+"""
+
+
+def lock_predicates_for(cases: Iterable[tuple[Any, str, str]]) -> list[dict[str, bool]]:
+    """{isLockHolder, lockHeldAgainst}(module, task_id, project) for each case, in one node process."""
+    result = subprocess.run(
+        [node_path(), '-e', _PREDICATE_DRIVER, SCHED_UTILS_PATH, json.dumps(list(cases))],
         capture_output=True,
         text=True,
         check=True,

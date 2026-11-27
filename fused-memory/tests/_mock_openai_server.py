@@ -24,15 +24,22 @@ from __future__ import annotations
 
 import json
 import threading
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
+
+CannedResponse = tuple[int, dict[str, Any]] | tuple[int, dict[str, Any], Mapping[str, str]]
+"""``(status, body)`` or ``(status, body, extra_headers)``."""
+
+_Canned = tuple[int, dict[str, Any], Mapping[str, str]]
 
 # Long enough to survive graphiti's OpenAIEmbedder, which TRUNCATES the vector
 # to embedding_dim — a short vector would surface as a length mismatch and be
 # misread as a plumbing bug.
 DEFAULT_EMBEDDING_LEN = 1536
+
+DEFAULT_SERVED_MODEL = 'mock-embedding-model'
 
 
 def chat_completion_body(content: str) -> dict[str, Any]:
@@ -91,6 +98,16 @@ def responses_body(text: str, *, input_tokens: int = 3, output_tokens: int = 4) 
     }
 
 
+def _models_body(model_ids: Sequence[str]) -> dict[str, Any]:
+    return {
+        'object': 'list',
+        'data': [
+            {'id': m, 'object': 'model', 'created': 0, 'owned_by': 'mock'}
+            for m in model_ids
+        ],
+    }
+
+
 def _embeddings_body(count: int, length: int) -> dict[str, Any]:
     return {
         'object': 'list',
@@ -102,7 +119,7 @@ def _embeddings_body(count: int, length: int) -> dict[str, Any]:
             }
             for i in range(max(count, 1))
         ],
-        'model': 'mock-embedding-model',
+        'model': DEFAULT_SERVED_MODEL,
         'usage': {'prompt_tokens': 1, 'total_tokens': 1},
     }
 
@@ -116,11 +133,13 @@ class MockOpenAIServer:
         # ThreadingHTTPServer serves concurrently — guard the record list.
         self._lock = threading.Lock()
         self._requests: list[dict[str, Any]] = []
-        self._responses: dict[str, list[tuple[int, dict[str, Any]]]] = {}
+        self._responses: dict[str, list[_Canned]] = {}
         self.chat_content = '{"ok": true}'
         self.chat_responder: Callable[[Any], str] | None = None
         """When set, each chat reply's content is computed from that request's JSON body."""
         self.embedding_len = DEFAULT_EMBEDDING_LEN
+        self.served_models: list[str] = [DEFAULT_SERVED_MODEL]
+        """The ids GET /models lists."""
 
     @property
     def base_url(self) -> str:
@@ -143,13 +162,19 @@ class MockOpenAIServer:
         self.set_response_sequence(path_suffix, [(200, body)])
 
     def set_response_sequence(
-        self, path_suffix: str, bodies: Sequence[tuple[int, dict[str, Any]]]
+        self, path_suffix: str, bodies: Sequence[CannedResponse]
     ) -> None:
-        """Serve ``(status, body)`` pairs in order for ``path_suffix``; the last one repeats."""
+        """Serve canned responses in order for ``path_suffix``; the last one repeats.
+
+        Each is ``(status, body)``, or ``(status, body, extra_headers)``.
+        """
         if not bodies:
             raise ValueError('a response sequence needs at least one (status, body) pair')
+        canned = [
+            (entry[0], entry[1], entry[2] if len(entry) == 3 else {}) for entry in bodies
+        ]
         with self._lock:
-            self._responses[path_suffix] = list(bodies)
+            self._responses[path_suffix] = canned
 
     # -- internals used by the handler --
 
@@ -157,7 +182,7 @@ class MockOpenAIServer:
         with self._lock:
             self._requests.append(entry)
 
-    def _canned(self, path: str) -> tuple[int, dict[str, Any]] | None:
+    def _canned(self, path: str) -> _Canned | None:
         with self._lock:
             for suffix, sequence in self._responses.items():
                 if path.endswith(suffix):
@@ -169,18 +194,41 @@ def _make_handler(state: MockOpenAIServer) -> type[BaseHTTPRequestHandler]:
     class Handler(BaseHTTPRequestHandler):
         protocol_version = 'HTTP/1.1'
 
-        def log_message(self, *args: Any) -> None:  # noqa: A002 - stdlib signature
+        def log_message(self, *args: Any) -> None:  # stdlib signature
             """Silence the default stderr access log."""
 
-        def _send_json(self, status: int, body: dict[str, Any]) -> None:
+        def _send_json(
+            self, status: int, body: dict[str, Any], extra_headers: Mapping[str, str] | None = None,
+        ) -> None:
             payload = json.dumps(body).encode()
             self.send_response(status)
             self.send_header('Content-Type', 'application/json')
             self.send_header('Content-Length', str(len(payload)))
+            for name, value in (extra_headers or {}).items():
+                self.send_header(name, value)
             self.end_headers()
             self.wfile.write(payload)
 
-        def do_POST(self) -> None:  # noqa: N802 - stdlib naming
+        def do_GET(self) -> None:  # stdlib naming
+            state._record({
+                'path': self.path,
+                'method': 'GET',
+                'headers': dict(self.headers),
+                'json_body': None,
+            })
+
+            canned = state._canned(self.path)
+            if canned is not None:
+                self._send_json(*canned)
+                return
+
+            if self.path.endswith('/models'):
+                self._send_json(200, _models_body(state.served_models))
+                return
+
+            self._send_json(404, {'error': {'message': f'unhandled path {self.path}'}})
+
+        def do_POST(self) -> None:  # stdlib naming
             length = int(self.headers.get('Content-Length') or 0)
             raw = self.rfile.read(length) if length else b''
             try:

@@ -307,12 +307,11 @@ async def test_aggregate_performance_history_buckets_by_hour(tmp_path: Path):
     finally:
         await db.close()
     block = result['proj-a']
-    h = block['time_centiles_history']
-    assert len(h['labels']) == 2
-    assert len(h['p50']) == 2
+    assert len(block.labels) == 2
+    assert len(block.p50) == 2
     # First bucket has 2 done tasks, p50 = avg of 1000 and 3000.
-    assert h['p50'][0] in (1000, 2000, 3000)
-    # one_pass_history first bucket: 1 of 2 done tasks is one-pass = 50%.
-    assert block['one_pass_history']['values'][0] == 50.0
-    # escalation_history first bucket: 1 of 2 had steward_invocations > 0 = 50%.
-    assert block['escalation_history']['values'][0] == 50.0
+    assert block.p50[0] in (1000, 2000, 3000)
+    # one_pass first bucket: 1 of 2 done tasks is one-pass = 50%.
+    assert block.one_pass[0] == 50.0
+    # escalation first bucket: 1 of 2 had steward_invocations > 0 = 50%.
+    assert block.escalation[0] == 50.0

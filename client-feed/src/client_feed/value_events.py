@@ -12,9 +12,11 @@ from typing import Any, Final
 from client_feed.contract import (
     Branch,
     BranchSnapshot,
+    DefectFiled,
     FactoryState,
     FeedEvent,
     FeedState,
+    FiledDefect,
     PrdUpserted,
     RevealBudget,
     TaskStatus,
@@ -22,9 +24,10 @@ from client_feed.contract import (
     TreeSnapshot,
 )
 from client_feed.envelope import Stamp, payload
-from client_feed.sources.events import FactoryStatus, OpenEscalations
+from client_feed.sources.escalations import OpenEscalations
+from client_feed.sources.events import FactoryStatus
 from client_feed.sources.prds import PrdText, summarize_prd
-from client_feed.sources.tasks import TaskRow, waiting_on
+from client_feed.sources.tasks import DefectCarrier, TaskRow, waiting_on
 from client_feed.sources.tree import VisibleTree
 
 IDLE_RESOLUTION_SECONDS: Final = 60
@@ -78,7 +81,7 @@ def task_events(
     """Each read row the state does not already say; then, given the open escalations, each unread task whose waiting_on they change.
 
     With the escalations unknown (None), a read row whose status the state already records keeps the
-    recorded waiting_on, so an unreadable runs.db holds who a task waits on rather than clearing it.
+    recorded waiting_on, so an unreadable escalation queue holds who a task waits on rather than clearing it.
     """
     rows = tuple(rows)
     events = _read_task_events(rows, state, stamp, escalations_known=escalations is not None)
@@ -175,3 +178,17 @@ def budget_event(
     if state.tree is None or state.tree.budget == budget:
         return None
     return TreeSnapshot(**stamp(now), **{**payload(state.tree), 'budget': budget})
+
+
+def defect_filed_events(
+    carriers: Iterable[DefectCarrier], *, state: FeedState, stamp: Stamp, now: datetime
+) -> tuple[DefectFiled, ...]:
+    """Each carrier whose filing the state's defects_filed does not already say; a filing is never retracted."""
+    events: list[DefectFiled] = []
+    for carrier in sorted(carriers, key=lambda carrier: carrier.ref):
+        said = FiledDefect(
+            block=carrier.block, report=carrier.report, task_id=carrier.task_id, gated=carrier.gated
+        )
+        if state.defects_filed.get(carrier.ref) != said:
+            events.append(DefectFiled(**stamp(now), ref=carrier.ref, **said.model_dump()))
+    return tuple(events)

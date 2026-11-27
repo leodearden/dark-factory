@@ -28,6 +28,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from _workflow_helpers import _Fixture, _make
 
+from orchestrator.config import DeliveredChecksConfig
 from orchestrator.workflow import WorkflowOutcome
 
 _CITATION = 'citationsha123'
@@ -143,13 +144,13 @@ class TestFallbackStampsTheTasksOwnCitation:
         assert outcome is None
         f.mark_done.assert_not_awaited()
 
-    async def test_validates_the_tasks_own_branch_tip_checks_and_pattern(
+    async def test_validates_the_tasks_own_branch_tip_base_checks_and_pattern(
         self, tmp_path: Path, guard: _Guard, note: str, tip: str,
     ) -> None:
         """DISCOVERY mode, shaped like the harness dispatch gate's ancestry arm."""
         f = _fixture(tmp_path)
         checks = [{'name': 'cap-x', 'kind': 'grep', 'pattern': 'y', 'expect': 'present'}]
-        f.wf.task['metadata'] = {'delivered_checks': checks}
+        f.wf.task['metadata'] = {'delivered_checks': checks, 'branch_base_sha': 'b' * 40}
         validate = AsyncMock(return_value=SimpleNamespace(
             accepted=False, evidence_sha=None, reason='no_citation',
         ))
@@ -165,7 +166,44 @@ class TestFallbackStampsTheTasksOwnCitation:
         assert kwargs['branch_tip_sha'] == tip
         assert kwargs['pattern_template'] == f.wf.git_ops.config.commit_citation_pattern
         assert kwargs['delivered_checks'] == checks
+        assert kwargs['branch_base_sha'] == 'b' * 40
         assert 'candidate_sha' not in kwargs
+
+    async def test_forwards_only_the_declared_check_descriptors(
+        self, tmp_path: Path, guard: _Guard, note: str, tip: str,
+    ) -> None:
+        f = _fixture(tmp_path)
+        check = {'name': 'cap-x', 'kind': 'grep', 'pattern': 'y', 'expect': 'present'}
+        f.wf.task['metadata'] = {'delivered_checks': ['junk', check]}
+        validate = AsyncMock(return_value=SimpleNamespace(
+            accepted=False, evidence_sha=None, reason='no_citation',
+        ))
+
+        with patch(_VALIDATE_TARGET, validate):
+            await guard(f)
+
+        assert validate.await_args is not None
+        assert validate.await_args.kwargs['delivered_checks'] == [check]
+
+    @pytest.mark.parametrize('enabled', [True, False])
+    async def test_forwards_the_projects_delivered_checks_leaf(
+        self, tmp_path: Path, guard: _Guard, note: str, tip: str, enabled: bool,
+    ) -> None:
+        """The kill switch reaches the validator from the project config,
+        because a real ``GitOps.config`` cannot carry it."""
+        f = _fixture(tmp_path)
+        f.wf.config.delivered_checks = DeliveredChecksConfig(enabled=enabled)
+        checks = [{'name': 'cap-x', 'kind': 'grep', 'pattern': 'y', 'expect': 'present'}]
+        f.wf.task['metadata'] = {'delivered_checks': checks}
+        validate = AsyncMock(return_value=SimpleNamespace(
+            accepted=False, evidence_sha=None, reason='no_citation',
+        ))
+
+        with patch(_VALIDATE_TARGET, validate):
+            await guard(f)
+
+        assert validate.await_args is not None
+        assert validate.await_args.kwargs['checks_enabled'] is enabled
 
     async def test_the_real_validation_asks_git_about_the_tasks_branch(
         self, tmp_path: Path, guard: _Guard, note: str, tip: str,

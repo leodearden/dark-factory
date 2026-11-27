@@ -1213,7 +1213,7 @@ The Qwen model emits hermes-format tool calls; vLLM's `--tool-call-parser hermes
 - `tokens_per_second: 29.06` — model was actually serving
 - `input_tokens: 390358` (10 × 39k)
 - `output_tokens: 1217` (10 × 121)
-- `is_local_model: true` — orchestrator correctly detected local routing
+- `is_local_model: true` — `ANTHROPIC_BASE_URL` was set, so the CLI's own cost figure was not trusted (Invariant P5). It never meant the model was local; the field is `cli_cost_untrusted` since task 9970. The endpoint itself is recorded since task 9970 as `endpoint_kind`, which for this config reads `self_hosted_vllm`.
 - `composite_score: 0.0`
 
 **Interpretation:** The model is serving and responding with a tool call after each 39k-token prompt. The Claude CLI runs `claude --print --output-format json --model sonnet …` against the vLLM endpoint (via `ANTHROPIC_BASE_URL=http://localhost:8100`). Something in that chain — either vLLM's returned format, or the CLI's parsing — is mishandling the tool call response. The fact that the first iteration took 24s (real inference) and subsequent ones took 1.5-3s suggests the vLLM endpoint started returning cached responses fast, which is suspicious.

@@ -9,7 +9,9 @@ config there.  Field classification (the task-5295 audit pattern):
   so the host never diffs against a main ref it does not maintain),
   ``force_workspace``, ``verify_env`` (task 5496: the spec wins, host-only
   keys survive), ``scope_cargo``, ``verify_cold_preprovision_command``
-  (non-empty replaces the host's; '' keeps the host's own).
+  (non-empty replaces the host's; '' keeps the host's own), ``verify_cache``
+  (the dispatcher's registry view, plans/verify-result-cache-prd.md A5; set
+  only by RemoteRunner.run_task_verify).
 - IDENTITY: ``attempt_id``, ``task_id``, ``tip_sha`` (the pushed ref's target).
 - HOST-SHAPED, deliberately absent: role (the type is the role), pytest_n /
   verify_admission_pytest_n, base_sha, every timeout, verify_timeout_retries,
@@ -33,6 +35,7 @@ from types import MappingProxyType
 from typing import Literal
 
 from orchestrator.config import ModuleConfig, OrchestratorConfig
+from orchestrator.verify_cache.remote_view import ShippedView
 from orchestrator.verify_spec_shared import (
     VerifyCommand,
     apply_spec_to_host_config,
@@ -69,6 +72,7 @@ class TaskVerifySpec:
     attempt_id: int
     task_id: str
     tip_sha: str
+    verify_cache: ShippedView | None = None
 
     def __post_init__(self) -> None:
         _require('verify_commands', self.verify_commands,
@@ -84,6 +88,7 @@ class TaskVerifySpec:
         _require('attempt_id', self.attempt_id, _is_int, 'an int')
         _require('task_id', self.task_id, _is_str, 'a str')
         _require('tip_sha', self.tip_sha, _is_str, 'a str')
+        _require('verify_cache', self.verify_cache, _is_optional_view, 'a ShippedView or None')
         if not _FULL_SHA.fullmatch(self.tip_sha):
             raise ValueError(
                 f'TaskVerifySpec.tip_sha must be a full 40-hex lowercase SHA, '
@@ -113,6 +118,10 @@ def _is_optional_command(value: object) -> bool:
     return value is None or isinstance(value, VerifyCommand)
 
 
+def _is_optional_view(value: object) -> bool:
+    return value is None or isinstance(value, ShippedView)
+
+
 def _is_str_mapping(value: object) -> bool:
     return isinstance(value, Mapping) and all(
         isinstance(key, str) and isinstance(item, str) for key, item in value.items()
@@ -134,7 +143,7 @@ class CollapsedOverride:
 def collapsed_module_overrides(
     module_configs: Iterable[ModuleConfig],
 ) -> tuple[CollapsedOverride, ...]:
-    """The per-module overrides a TaskVerifySpec cannot carry, in module order."""
+    """The per-module overrides module_config_from_command drops, which no VerifyCommand-built spec can carry, in module order."""
     collapsed: list[CollapsedOverride] = []
     for mc in module_configs:
         if mc.verify_env:
@@ -186,15 +195,21 @@ def apply_task_verify_spec(
     """The remote host's half: its own *config* with *spec* applied, plus the rebuilt modules.
 
     The modules are host-shaped (no per-module env, no cold timeout): the spec
-    env is applied once, at config level.
+    env is applied once, at config level. Each module's verify_cache rides its
+    VerifyCommand. A shipped view pins the task role's cache mode in place of
+    the host's.
     """
     module_configs = [module_config_from_command(vc) for vc in spec.verify_commands]
+    field_overrides: dict[str, object] = {'scope_cargo': spec.scope_cargo}
+    if spec.verify_cache is not None:
+        field_overrides['verify_cache'] = config.verify_cache.with_mode('task', spec.verify_cache.mode)
     applied = apply_spec_to_host_config(
         config,
         verify_env=spec.verify_env,
         global_verify_command=spec.global_verify_command,
         module_configs=module_configs,
-        field_overrides={'scope_cargo': spec.scope_cargo},
+        field_overrides=field_overrides,
+        git_field_overrides={},
         verify_cold_preprovision_command=spec.verify_cold_preprovision_command,
     )
     return applied, module_configs
@@ -220,6 +235,7 @@ def spec_to_dict(spec: TaskVerifySpec) -> dict:
         'attempt_id': spec.attempt_id,
         'task_id': spec.task_id,
         'tip_sha': spec.tip_sha,
+        'verify_cache': spec.verify_cache.to_wire() if spec.verify_cache is not None else None,
     }
 
 
@@ -243,6 +259,7 @@ def spec_from_dict(d: dict) -> TaskVerifySpec:
         )
     raw_global = d['global_verify_command']
     raw_files = d['task_files']
+    raw_view = d['verify_cache']
     return TaskVerifySpec(
         verify_commands=tuple(_command_from_dict(c) for c in commands),
         global_verify_command=(
@@ -256,6 +273,7 @@ def spec_from_dict(d: dict) -> TaskVerifySpec:
         attempt_id=d['attempt_id'],
         task_id=d['task_id'],
         tip_sha=d['tip_sha'],
+        verify_cache=ShippedView.from_wire(raw_view) if raw_view is not None else None,
     )
 
 

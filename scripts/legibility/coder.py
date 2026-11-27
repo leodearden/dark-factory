@@ -23,7 +23,7 @@ CLI.
 
 What this module still takes from ``shared`` directly is one pure function,
 ``cap_markers.looks_like_blocking_banner``: the loose OR-substring DEFER GATE
-``census.preflight_headroom`` also uses, applied on one path only -- a reply
+``census_headroom.preflight_headroom`` also uses, applied on one path only -- a reply
 that came back as a SUCCESS yet could not be parsed into a verdict. A real
 usage cap never arrives that way: the CLI delivers it as a failed result, which
 the runner's gate sees (task 6213). What does arrive unparseable is prose such
@@ -71,8 +71,8 @@ from pathlib import Path
 # (scripts/legibility/, not scripts/). Unconditional -- deliberately NOT
 # inside a `__main__` guard -- because the `shared.cap_markers` import it
 # enables is module-level, so it must resolve under pytest and package import
-# too. orchestrator/src is bound the same way, for the code-quality slicer
-# `orchestrator.agents.code_quality` (stdlib-only): under
+# too. orchestrator/src is bound the same way, for the code-quality
+# Definition accessor `orchestrator.agents.code_quality` (stdlib-only): under
 # `uv run --project shared` nothing else puts it on sys.path.
 _SHARED_SRC = Path(__file__).resolve().parents[2] / "shared" / "src"
 if str(_SHARED_SRC) not in sys.path:
@@ -88,8 +88,8 @@ if str(_ORCH_SRC) not in sys.path:
 if __name__ == "__main__":
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-import codebook as codebook_mod  # noqa: E402
 import yaml  # noqa: E402
+from legibility import codebook as codebook_mod  # noqa: E402  # debt: task 6760
 from legibility import invariants, session_runner  # noqa: E402
 from orchestrator.agents import code_quality  # noqa: E402
 from shared.cap_markers import looks_like_blocking_banner  # noqa: E402
@@ -217,23 +217,6 @@ def parse_frontmatter(digest_text: str) -> dict:
 # build_prompt — instructions + codebook index + digest, embedded verbatim
 # ---------------------------------------------------------------------------
 
-_DEFINITION_HEADING = "## Definition"
-
-
-def _quality_definition() -> str:
-    """The normative code-quality doc's ``## Definition`` body, read on every
-    call. A renamed, removed or emptied section raises ValueError, so it fails
-    every digest in the batch (a coder storm) instead of the import."""
-    doc_text = code_quality.NORMATIVE_DOC.read_text(encoding="utf-8")
-    definition = code_quality.section(doc_text, _DEFINITION_HEADING).strip()
-    if not definition:
-        raise ValueError(
-            f"section {_DEFINITION_HEADING!r} of {code_quality.NORMATIVE_DOC} is "
-            "empty, so the coder has no minting test"
-        )
-    return definition
-
-
 def _invariant_slugs_block(invariant_slugs: Sequence[str]) -> str:
     if not invariant_slugs:
         return (
@@ -258,7 +241,7 @@ def _prescribed_reply() -> dict[str, list[dict[str, str | None]]]:
     return {
         _MATCHES_KEY: [{
             "entry_id": "...", "origin_phase": "...", "manifested_phase": "...",
-            "invariant_violated": None, "note": "...",
+            "invariant_violated": None, "note": "...", "evidence_quote": "...",
         }],
         _CANDIDATES_KEY: [{
             "title": "...", "cause": "...", "area": "...", "origin_phase": "...",
@@ -269,6 +252,24 @@ def _prescribed_reply() -> dict[str, list[dict[str, str | None]]]:
 
 _REPLY_KEYS = tuple(_prescribed_reply())
 """The reply schema code_digest reads: exactly the keys build_prompt prescribes."""
+
+_RULE_STAMP_FIELD = "attached_by"
+"""The finding field only a census rule writes: how an attach placed a
+sighting, which ``sighting_fit`` counts without a fit check."""
+
+
+def _without_rule_stamps(findings: object) -> object:
+    """*findings* with any rule stamp a reply claims removed. Every other field
+    passes through: the schema gate refuses a malformed one, and the merger's
+    never-delete guard names a removal action rather than letting it land as
+    a plain match."""
+    if not isinstance(findings, list):
+        return findings
+    return [
+        {field: value for field, value in finding.items() if field != _RULE_STAMP_FIELD}
+        if isinstance(finding, dict) else finding
+        for finding in findings
+    ]
 
 
 def build_prompt(
@@ -282,6 +283,8 @@ def build_prompt(
     output shape (PRD §7.3), the code-quality Definition as the test a
     confusion must meet to be minted as a candidate, and the observed
     project's *invariant_slugs* (an empty list is stated, not omitted).
+    The Definition is read on every call, so a renamed, removed, emptied or
+    braced section fails every digest in the batch rather than the import.
     The slugs are guidance only: the merger is what enforces them.
     """
     phases = ", ".join(codebook_mod.PHASES)
@@ -293,6 +296,9 @@ def build_prompt(
         "causes not yet in the codebook (candidates).\n\n"
         "Never guess a phase you can't support from the evidence — use "
         '"unknown" instead. Legal phase values: ' + phases + ".\n\n"
+        "Match an entry only when the digest shows the mechanism that "
+        "entry's title names, not merely a related theme, and copy the "
+        "digest text that shows it into the match's evidence_quote.\n\n"
         "Respond with STRICT JSON ONLY (no prose, no markdown fences), "
         "exactly this shape:\n"
         + json.dumps(_prescribed_reply()) + "\n"
@@ -302,7 +308,7 @@ def build_prompt(
         "Mint a candidate only for a confusion that meets this definition, "
         "that is, one that shows a cost or risk to the next change. "
         "Otherwise do not mint one.\n"
-        + _quality_definition() + "\n\n"
+        + code_quality.definition() + "\n\n"
         "=== INVARIANT SLUGS ===\n" + _invariant_slugs_block(invariant_slugs) + "\n\n"
         "=== CODEBOOK INDEX ===\n" + codebook_index + "\n\n"
         "=== SESSION DIGEST ===\n" + digest_text
@@ -405,8 +411,9 @@ def code_digest(
     parse its strict-JSON judgment ->
     assemble a §7.3 coding record with a DETERMINISTIC header
     (session/date/agent_class from the digest's own frontmatter; project
-    from *project* — the LLM never supplies the header) -> schema-gate it
-    via codebook.validate_coding_record.
+    from *project* — the LLM never supplies the header; nor a rule stamp,
+    which is removed from every finding) -> schema-gate it via
+    codebook.validate_coding_record.
 
     Never-fabricate contract: unparseable/malformed digest frontmatter, an
     invocation error, a usage/auth CAP, unparseable LLM output, a reply
@@ -455,9 +462,9 @@ def code_digest(
         #
         # Scanning only AFTER the parse has failed is census's
         # split-on-parse-success rule, adopted unchanged (see
-        # ``census._build_default_verify_fn``'s docstring, which records the
-        # live defect): scanning arbitrary model output with the loose marker
-        # list aborted the census on cap-THEMED clusters, because this repo's
+        # ``census_verify.build_verify_fn``'s detector (a)): scanning
+        # arbitrary model output with the loose marker list aborted the
+        # census on cap-THEMED clusters, because this repo's
         # codebook is dominated by clusters ABOUT usage and weekly limits, so
         # the markers match ordinary HEALTHY content. The coder is exposed
         # identically -- a judgment's model-authored
@@ -502,7 +509,7 @@ def code_digest(
         "date": meta.get("date"),
         "project": project,
         "agent_class": meta.get("agent_class"),
-        **{key: judgment[key] for key in _REPLY_KEYS},
+        **{key: _without_rule_stamps(judgment[key]) for key in _REPLY_KEYS},
     }
 
     errors = codebook_mod.validate_coding_record(record)
@@ -599,13 +606,14 @@ def code_digests(
 
     WARNING rather than ERROR, deliberately: one failed digest does not by
     itself fail the run. Only the storm does, and that branch's ERROR is
-    emitted by ``nightly.post_escalation``. The reason is logged unbounded;
-    ``session_runner`` already tail-bounds the output streams it embeds.
+    the trickle's alarm, journaled by ``alarm.raise_alarm``. The reason is
+    logged unbounded; ``session_runner`` already tail-bounds the output
+    streams it embeds.
 
     TWO CONSUMERS, VERY DIFFERENT VOLUMES — and everything above is the
     TRICKLE's argument. ``nightly.run_nightly`` codes exactly ONE small
     batch per night, so its worst case is a handful of lines.
-    ``census.mine_to_saturation`` calls this once per MINED BATCH, in a loop that
+    ``census_mining.mine_to_saturation`` calls this once per MINED BATCH, in a loop that
     runs until novelty saturates or the batch source exhausts — and a storm
     batch explicitly does NOT stop mining. So under a SYSTEMIC failure (the
     ENOENT-on-``claude`` shape) a census emits one WARNING per failed digest
@@ -619,7 +627,7 @@ def code_digests(
     Bounding it inside this function cannot work: the flood comes from the
     batch COUNT, which only the mining loop knows, and a per-batch cap would
     buy nothing when a batch is already only a handful of digests. The bound
-    lives in ``scripts/legibility/census.py::mine_to_saturation`` (see its
+    lives in ``scripts/legibility/census_mining.py::mine_to_saturation`` (see its
     ``_bounded_coder_warnings``). Do NOT silence this line or drop it to
     DEBUG: that restores the sub-storm blind spot above for EVERY caller,
     including the trickle, to spare a flood only one of them can produce.

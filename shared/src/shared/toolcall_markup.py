@@ -55,6 +55,13 @@ the sweep's bare list items, prose scans), and an optional keyword would make
 each site's blindness ungreppable. The predicates split by NAME so a reader can
 see at a glance which gates are parameter-aware.
 
+:func:`only_inert_html_closers` refines the REFUSAL path and narrows no gate
+(task **10396**). Three closer names, :data:`HTML_COLLIDING_CLOSER_NAMES`, are
+also ordinary markup element names, so a value quoting an HTML block carries
+their closers. The predicate says whether every needle :func:`detect_for` sees
+is such a closer and terminates no envelope boundary of the call. Callers ask
+it only after :func:`repair` declines, so every value it can fix is still fixed.
+
 ## What ``repair`` guarantees about its OWN output — and what it does not
 
 Two outputs, two different contracts. Confusing them is how this module's one
@@ -72,25 +79,19 @@ narrowing (task **4502**) reads as a weakening when it is not.
   quotes the pattern that tripped the tripwire. Refusing to deliver it drops
   the caller's own characters on the floor — the exact information loss this
   module exists to end. Boundary row B5 is therefore an alternative-boundary
-  test (:func:`_inner_markup_blocks`), not a bare substring refusal.
+  test (:func:`_inner_closer_blocks`), not a bare substring refusal.
 
 The C2 middleware makes that quoting COUNTABLE rather than silent: it publishes
 the recovered parameter names whose delivered value still trips
 :func:`detect` on the ``markup_detected`` fact and on both policy payloads.
 
-## Staged API — the consumer of :func:`repair` and :func:`detect`
+## The consumer of this module's predicates and :func:`repair`
 
-This is task ALPHA of a staged PRD: it shipped its API one task ahead of the
-consumer. That consumer has since landed —
-:mod:`shared.mcp_markup_middleware` (``MarkupGuardMiddleware``, task **3689**,
-contract C2) wires :func:`detect` and :func:`repair` at the FastMCP boundary,
-and is a pure boundary layer over them, contributing policy, facts and the
-storm escape but no parsing of its own. Task **3690** registers that middleware
-on the servers.
-
-Until 3690 lands, the middleware is CONSTRUCTED only by its own tests, so a
-dead-code sweep can still misread this chain as unreachable. It is intentional
-staging — check 3690 before concluding otherwise.
+:mod:`shared.mcp_markup_middleware` (``MarkupGuardMiddleware``, contract C2)
+consumes this module's predicates and :func:`repair` at the FastMCP boundary of
+every server that registers it, as a pure boundary layer over them: it adds
+policy, facts and the storm escape, and parses nothing itself. Which predicate
+gates there is stated once, where that module imports them.
 
 ## Sentinel-literal hazard — DO NOT "helpfully" un-escape these
 
@@ -104,10 +105,10 @@ file and silently dropping the sibling arguments of that same call. ``\\x3c`` is
 byte-identical at runtime and never appears verbatim in the file text, so it is
 immune. Leave it escaped.
 Runtime text quoting them gets the same spelling via :func:`escape_envelope_literals`.
+``tests/scripts/raw_envelope_literal_guard.py`` enforces the rule, repo-wide via
 ``tests/scripts/test_no_raw_envelope_literal.py::test_no_markup_handling_file_spells_a_raw_envelope_literal``
-enforces the rule on every ``.py`` source that already spells the bracket as
-``chr(60)`` or ``\\x3c``, or imports this module; a source spelling envelope
-literals only raw is outside that population.
+and per module in each ``lint_command``. Which files it covers is stated once,
+in that guard's POPULATION paragraph.
 
 This module is pure and stdlib-only (``re``, ``json``). It deliberately imports
 nothing from ``fused_memory``, ``orchestrator`` or ``escalation`` so that every
@@ -127,6 +128,7 @@ from typing import Any, NamedTuple
 __all__ = [
     'CANONICAL_OPENER_PREFIX',
     'ENVELOPE_LITERALS',
+    'HTML_COLLIDING_CLOSER_NAMES',
     'INVOKE_CLOSER',
     'MARKUP_OVERRIDE_KEY',
     'MCP_MARKUP_PATTERNS',
@@ -138,8 +140,11 @@ __all__ = [
     'detect_for',
     'escape_envelope_literals',
     'markup_override_requested',
+    'only_inert_html_closers',
     'repair',
+    'scan_parameter_values',
     'strip_markup_override',
+    'swallowed_markup_override',
 ]
 
 # ---------------------------------------------------------------------------
@@ -207,6 +212,17 @@ PREFILTER_NEEDLES: tuple[str, ...] = tuple(
 ENVELOPE_LITERALS: tuple[str, ...] = tuple(
     dict.fromkeys((*PREFILTER_NEEDLES, *MCP_MARKUP_PATTERNS))
 )
+
+#: The closer names that are also ordinary markup element names, so prose
+#: quoting an HTML block spells their closers. Read only by
+#: :func:`only_inert_html_closers`.
+HTML_COLLIDING_CLOSER_NAMES: frozenset[str] = frozenset(
+    (_NAME_DESCRIPTION, _NAME_DETAILS, _NAME_CONTENT)
+)
+
+_HTML_COLLIDING_CLOSERS: dict[str, str] = {
+    closer_for(name): name for name in HTML_COLLIDING_CLOSER_NAMES
+}
 
 
 #: ONE pass over the whole literal set, as an alternation in tuple order.
@@ -329,7 +345,7 @@ def _extra_names(param: str, schema_params: frozenset[str]) -> frozenset[str]:
       widening vocabulary is held exactly equal to the repairer's candidate
       grammar, so a needle can never be spelled for a name :func:`repair` would
       refuse to qualify. It also bounds what a caller-controlled *param* can
-      turn into a cache key: ``_first_markup_argument`` passes each key of the
+      turn into a cache key: ``_markup_arguments`` passes each key of the
       caller's argument mapping straight through.
     """
     names = set(schema_params)
@@ -393,6 +409,49 @@ def detect_for(
     return match.group(0) if match is not None else None
 
 
+def only_inert_html_closers(
+    value: object,
+    param: object,
+    schema_params: object,
+) -> bool:
+    """Is every needle :func:`detect_for` sees in *value* a quoted HTML closer?
+
+    True iff *value* carries at least one needle of the alternation
+    ``detect_for(value, param, schema_params)`` scans, every occurrence is the
+    closer of a :data:`HTML_COLLIDING_CLOSER_NAMES` name, and every such closer
+    whose name could close a parameter of this call (*param* or a
+    *schema_params* member) leaves the parser short of an item boundary, per
+    :func:`_at_item_boundary`. A closer meeting that terminates no envelope
+    boundary and has no swallowed parameter behind it.
+
+    Any canonical opener, invoke closer, ``parameter`` closer, or closer of a
+    non-colliding *param* or schema name answers False: those are unambiguous
+    harness markup. An empty or unusable schema answers False too (fail-closed,
+    the direction :func:`repair` takes): with no schema nothing can be judged.
+
+    Callers ask this only AFTER :func:`repair` returned ``None``; it widens no
+    gate and replaces no refusal :func:`repair` can turn into a fix.
+
+    Pure, total and one scan of *value*. Each boundary test passes a position,
+    never a slice; see :func:`_at_item_boundary`'s *pos*.
+    """
+    if not value or not isinstance(value, str):
+        return False
+    schema = _as_name_set(schema_params)
+    if not schema:
+        return False
+    own_name = param if isinstance(param, str) else ''
+    seen = False
+    for match in _widened_re(_extra_names(own_name, schema)).finditer(value):
+        name = _HTML_COLLIDING_CLOSERS.get(match.group(0))
+        if name is None:
+            return False
+        if (name == own_name or name in schema) and _at_item_boundary(value, match.end()):
+            return False
+        seen = True
+    return seen
+
+
 # ---------------------------------------------------------------------------
 # Repair — recovering the parameters the harness parser silently dropped.
 # ---------------------------------------------------------------------------
@@ -416,21 +475,20 @@ _CANONICAL_OPENER_RE = re.compile(r'\x3cparameter\s+name="([^"]+)"\s*"?>')
 # by the closing bracket) nor with any closing tag (``/`` is not a name char).
 _ECHO_OPENER_RE = re.compile(r'\x3c(' + _TAG_NAME + r')"?>')
 
-# "an opener in EITHER dialect", for the one caller that does not care which:
-# _inner_markup_blocks, which asks only whether _parse_body would have opened a
-# sibling item here. An ALTERNATION rather than two searches, so the common
-# no-opener case scans the value ONCE — this runs on the repair path, where the
-# cost claims are measured and load-bearing. Exactly equivalent to searching
-# both: the two patterns are disjoint by the note above, so neither can mask a
-# match of the other (verified over 4054 generated fragments, 0 divergences).
-# The group numbering of the parts is deliberately not relied on; this pattern
-# answers a boolean and the two names are never read back off it.
+# "An opener in EITHER dialect", for the one caller that does not care which:
+# scan_parameter_values, which routes a refused payload's preservation record
+# by the pseudo-parameters leaked into it. An ALTERNATION rather than two
+# searches, so the common no-opener case scans the value ONCE. Exactly
+# equivalent to searching each part in turn: neither part can match a prefix of
+# a match of the other (verified over 4054 generated fragments, 0 divergences).
+# The group numbering of the parts is deliberately not relied on; each hit is
+# re-read through _item_opener_at and the names are never read off this pattern.
 _ANY_OPENER_RE = re.compile(
     _CANONICAL_OPENER_RE.pattern + '|' + _ECHO_OPENER_RE.pattern
 )
 
 # Structural bounds. repair() must be total for adversarial input WITHOUT a
-# blanket try/except (that is signature (b) of shared/tests/silent_fallthrough_scan.py
+# blanket try/except (that is signature (b) of tests/repo_guards/silent_fallthrough_scan.py
 # and would demand an allowlist entry), so the two unbounded loops are bounded
 # by construction instead. Both ceilings are far above any real call: no MCP
 # tool has 64 parameters, and a value carrying 64 qualifying closers is prose
@@ -533,7 +591,7 @@ def _item_opener_at(body: str, pos: int) -> _ItemOpener | None:
     """The item opener at *pos* in *body*, in the parser's order, else ``None``.
 
     The ONE definition of "an item opens here", shared by :func:`_parse_body`
-    and condition (ii) of :func:`_inner_markup_blocks`, so the boundary rule
+    and condition (ii) of :func:`_inner_closer_blocks`, so the boundary rule
     cannot drift from the parser it reasons about. Canonical first, because
     its closer is ``parameter`` while a name-echoing opener closes on its own
     name.
@@ -569,14 +627,14 @@ def _at_item_boundary(body: str, pos: int) -> bool:
     return pos >= len(body) or _item_opener_at(body, pos) is not None
 
 
-def _inner_markup_blocks(
+def _inner_closer_blocks(
     body: str,
     value_start: int,
     item_value: str,
     name: str,
     closer_name: str,
 ) -> bool:
-    """Does markup inside a recovered item's value make its boundary a GUESS?
+    """Is a closing tag inside a recovered item's value a SECOND mis-close?
 
     Boundary row B5's real question, asked properly (task **4502**). B5 refuses
     a recovered item whose "value is itself doubly corrupted, so its boundary
@@ -622,60 +680,22 @@ def _inner_markup_blocks(
         genuine AMBIGUITY B5's own wording describes, where the item's boundary
         really is a guess.
 
-    Otherwise the occurrence is QUOTED PROSE and recovery proceeds.
-
-    CONDITION (i)'S OPENER MIRROR (task **5620**). A well-formed parameter
-    OPENER anywhere in the value — EITHER dialect's, exactly as (i) lists
-    either dialect's closer — blocks outright, before any closer is examined.
-    4502 fixed the CLOSER side of this class (condition (i)'s separately-listed
-    ``parameter``, esc-4502-3) but reasoned only about closers, so the opener
-    side was admitted by OMISSION: a sibling opener was glued into the value
-    verbatim while the parameter it named went silently UNRECOVERED — the
-    record-25 failure below, reached through an opener instead of a closer. The
-    PRD's B5 entry owns the archaeology and the measured blast radius.
-
-    It is stated CATEGORICALLY, for condition (i)'s own three reasons:
-
-    * An opener naming a parameter is a shape :func:`_parse_body` would have
-      opened a SIBLING ITEM on, so reading it as prose is a guess about where
-      this item ends — precisely what B5 refuses — and guessing wrong writes
-      one argument's text into another and reports it ``repaired``.
-    * Condition (ii) cannot decide it: it reads only the position after an
-      inner CLOSER, and the remainder ahead of such an opener begins mid-prose.
-    * BOTH DIALECTS, via :data:`_ANY_OPENER_RE`, because :func:`_parse_body`
-      tries the canonical opener first and falls back to the name-echoing one:
-      both are shapes it would have opened on — a property of the PARSER, not
-      of the enclosing item's dialect, which is why ``parameter`` sits in (i)
-      independent of that dialect too. The echo half is deliberately BROAD (any
-      identifier-named tag); qualifying it on schema membership was available
-      and rejected, because this function is not given the schema and taking it
-      would couple the boundary rule to the caller's tool. Breadth is the
-      conservative direction here: refusing costs a ``None`` the caller
-      survives, accepting wrongly is unrecoverable.
-
-    ONE BOUNDED SEARCH, once per (candidate, tail item) and never inside the
-    inner-closer loop, over a string the prefilter has just scanned and only
-    when it fired — nothing is added to the innermost of the three multiplying
-    ceilings :data:`_MAX_CANDIDATES` warns about. IT MUST NOT TOUCH
-    ``considered``, whose final ``return considered == 0`` is the
-    malformed-closer fallback (negative control (e)) and has to keep meaning
-    "no WELL-FORMED CLOSER was present".
-
-    THE RULE STOPS AT THE PREFILTER. A value carrying a sibling opener and NO
-    closing tag anywhere never reaches this function at all, so it is still
-    swallowed; that shape predates 4502 and is owned by task **5639**.
+    Otherwise the occurrence is QUOTED PROSE and recovery proceeds. A
+    parameter OPENER in the value is not this function's question:
+    :func:`repair` asks it of every recovered value at accept time, closer or
+    no closer (see :func:`_hides_parameter_opener`).
 
     CONDITION (i) IS NOT REDUNDANT, and dropping it is the single most likely
     way a reimplementation goes wrong. Condition (ii) alone — or qualifying
     inner closers only on schema membership — accepts a mis-close of this item
     followed by trailing text that is not an item boundary, silently
     swallowing that text into the recovered value: a no-silent-partial-repair
-    failure, strictly worse than ``None``. The original witness is
-    committed-corpus record 25 (``mcp__plan-tools__add_design_decision`` /
-    ``decision``), a canonical ``rationale`` closed by the name-echoing
-    ``rationale`` closer and followed by the head of a whole NEXT invoke
-    block. Since 5620 the opener mirror refuses that record first, so the
-    live witnesses are negative controls (b) and (d).
+    failure, strictly worse than ``None``. The witness is committed-corpus
+    record 25 (``mcp__plan-tools__add_design_decision`` / ``decision``), a
+    canonical ``rationale`` closed by the name-echoing ``rationale`` closer
+    and followed by the head of a whole NEXT invoke block. Negative control
+    (a) pins that shape; (b) and (d) pin the mis-close in values that carry
+    no opener at all.
 
     *value_start* is *item_value*'s offset within *body*, so (ii) reads the
     position after an inner closer from the shared string rather than copying
@@ -687,9 +707,6 @@ def _inner_markup_blocks(
     anchored matches — so it never recurses. Beyond the budget the answer is
     BLOCK, the conservative direction.
     """
-    if _ANY_OPENER_RE.search(item_value) is not None:
-        return True  # (i)'s OPENER MIRROR: a sibling this parser would have opened
-
     considered = 0
     for inner in _CLOSER_RE.finditer(item_value):
         considered += 1
@@ -713,7 +730,7 @@ def _parse_body(body: str) -> dict[str, str] | None:
     """The item loop of :func:`_parse_tail`, after the invoke closer is stripped.
 
     Each item opens through :func:`_skip_blank` and :func:`_item_opener_at`,
-    the same opening step condition (ii) of :func:`_inner_markup_blocks` takes
+    the same opening step condition (ii) of :func:`_inner_closer_blocks` takes
     through :func:`_at_item_boundary`, so B5's boundary test and this parser
     share one definition of where an item may open.
 
@@ -740,7 +757,7 @@ def _parse_body(body: str) -> dict[str, str] | None:
 
         # THE CHEAP PREFILTER, retained verbatim so the clean path pays exactly
         # what it paid before: one substring scan, and nothing else.
-        if '\x3c/' in item_value and _inner_markup_blocks(
+        if '\x3c/' in item_value and _inner_closer_blocks(
             body, opener.end, item_value, opener.name, opener.closer_name
         ):
             return None  # a SECOND mis-close: the boundary is a guess (B5)
@@ -767,14 +784,15 @@ def _parse_tail(tail: str) -> dict[str, str] | None:
     the next candidate's prefix. The prefix-clean accept-time condition in
     :func:`repair` is what closes that gap.
 
-    BOUNDARY ROW B5 lives in :func:`_inner_markup_blocks`, which this delegates
-    to via :func:`_parse_body`. As of tasks **4502** and **5620** it is an
+    BOUNDARY ROW B5 lives in :func:`_inner_closer_blocks`, which this delegates
+    to via :func:`_parse_body`. As of task **4502** it is an
     ALTERNATIVE-BOUNDARY test rather than a bare substring refusal: markup
     inside a recovered item's value blocks recovery when a closing tag
-    mis-closes THAT item or spans a tool-call boundary, when reading it as the
-    terminator leaves the parser at an item boundary, or when the value carries
-    a well-formed parameter OPENER in either dialect — but NOT when a closer is
-    merely quoted prose. A recovered value is verbatim caller
+    mis-closes THAT item or spans a tool-call boundary, or when reading it as
+    the terminator leaves the parser at an item boundary — but NOT when a
+    closer is merely quoted prose. A parameter OPENER in the value is refused
+    by :func:`repair`'s accept-time parameter-opener condition instead. A
+    recovered value is verbatim caller
     text under invariant D5, and a faithful report of a markup leak necessarily
     quotes the leak; ``clean_value``'s envelope-free post-condition is
     untouched, because that is the value the repairer REWROTE.
@@ -786,6 +804,26 @@ def _parse_tail(tail: str) -> dict[str, str] | None:
         body = body[: -len(INVOKE_CLOSER)].rstrip()
 
     return _parse_body(body)
+
+
+def _hides_parameter_opener(item_value: str, schema: frozenset[str]) -> bool:
+    """Does a value carry a canonical opener, or an echo opener for a *schema* name?
+
+    The invariant: a recovered value must not hide a parameter opener, whether
+    or not it also carries a closer. The canonical opener blocks for ANY name,
+    because it is unambiguous harness markup, including a spill into another
+    tool's call whose names fall outside *schema*. The name-echoing opener
+    blocks only for a *schema* name: its grammar is any identifier tag, which
+    collides with placeholder prose, and a non-schema name is nothing B8 would
+    let :func:`repair` recover. Measurements: the PRD's B5 entry.
+    """
+    if '\x3c' not in item_value:
+        return False
+    if _CANONICAL_OPENER_RE.search(item_value) is not None:
+        return True
+    return any(
+        match.group(1) in schema for match in _ECHO_OPENER_RE.finditer(item_value)
+    )
 
 
 def repair(
@@ -806,7 +844,8 @@ def repair(
     ``parameter`` closer. For each candidate the remaining tail is parsed by
     :func:`_parse_tail`; the EARLIEST candidate is accepted for which the tail
     parses with zero leftover, every recovered name is in *schema_params*, no
-    recovered name is in *supplied*, and the resulting ``clean_value`` is
+    recovered name is in *supplied*, no recovered value hides a parameter
+    opener (:func:`_hides_parameter_opener`), and the resulting ``clean_value`` is
     itself envelope-free. Otherwise ``None`` — never a guess, and never a
     PARTIAL repair.
 
@@ -835,7 +874,7 @@ def repair(
     caller text under invariant D5, and a faithful report of a markup leak
     quotes the leak. Boundary row B5 is an alternative-boundary test rather
     than a bare substring refusal precisely so those characters are recovered
-    instead of dropped — see :func:`_inner_markup_blocks` for the rule and for
+    instead of dropped — see :func:`_inner_closer_blocks` for the rule and for
     why its own-name condition is not redundant. The C2 middleware surfaces
     which recovered names carry a literal rather than letting it pass silently.
 
@@ -931,15 +970,19 @@ def repair(
             continue
         if not recovered.keys().isdisjoint(already_supplied):
             continue
+        # B8's value-side mirror: B8 asks that every recovered NAME be a
+        # parameter, this that no recovered VALUE hide one.
+        if any(_hides_parameter_opener(v, schema) for v in recovered.values()):
+            continue
         clean_value = value[: candidate.start()]
-        # PREFIX-CLEAN, the third accept-time condition. The scan steps over a
+        # PREFIX-CLEAN, an accept-time condition. The scan steps over a
         # candidate whose tail does not parse, which leaves that closer sitting
         # inside every LATER candidate's prefix — and if it is itself an
         # envelope literal, accepting would hand back a clean_value that still
         # trips the detector while permanently dropping whatever arguments hide
-        # in the residue. `continue` rather than `return None` keeps all three
-        # refusals one shape; the outcome is identical either way because
-        # candidate start positions increase monotonically, so a poisoned
+        # in the residue. `continue` rather than `return None` keeps every
+        # accept-time refusal one shape; the outcome is identical either way
+        # because candidate start positions increase monotonically, so a poisoned
         # prefix stays poisoned — but `continue` needs no such argument to be
         # correct.
         #
@@ -957,14 +1000,15 @@ def repair(
 
         misclose = candidate.group(0)
         # Both union scans run on the ACCEPT PATH ONLY — the prefix scan just
-        # above fires only after a tail has already parsed and passed B8/B9,
-        # and this one only after the prefix came back clean. repair() refuses
-        # far more often than it reaches either: every value with no qualifying
-        # candidate at all, plus every ordinary argument that merely happens to
-        # contain a closing tag. Hoisting a detect() above the loop would
-        # instead pay a full-string scan on that overwhelmingly common no-op
-        # path, at a per-tool-call middleware boundary (PRD contract C2) over
-        # values the corpus shows reaching tens of KB. That argument is
+        # above fires only after a tail has already parsed and passed every
+        # other accept-time condition, and this one only after the prefix
+        # came back clean. repair() refuses far more often than it reaches
+        # either: every value with no qualifying candidate at all, plus every
+        # ordinary argument that merely happens to contain a closing tag.
+        # Hoisting a detect() above the loop would instead pay a full-string
+        # scan on that overwhelmingly common no-op path, at a per-tool-call
+        # middleware boundary (PRD contract C2) over values the corpus shows
+        # reaching tens of KB. That argument is
         # unchanged by task 4696: the accept path now pays the WIDENED scan
         # above, and the refuse path still pays neither.
         #
@@ -1003,6 +1047,47 @@ def repair(
         )
 
     return None
+
+
+# ---------------------------------------------------------------------------
+# The non-validating residue scan — ROUTING a refused payload, never a write.
+# ---------------------------------------------------------------------------
+
+#: A residue carrying more openers than this is refused whole: an uninspected
+#: remainder could contradict whatever the inspected part found. Far above the
+#: 15 openers the largest committed residue-loss specimen carries.
+_MAX_SCAN_OPENERS = 256
+
+
+def scan_parameter_values(value: object, names: Iterable[str]) -> dict[str, str]:
+    """Best-effort ``name -> value`` for pseudo-parameters leaked into *value*.
+
+    Every opener in either dialect whose name is in *names* contributes the
+    verbatim slice up to its own closer, or to end of string when none follows.
+    A name seen with two different values is dropped: ambiguity refuses. A
+    non-``str`` *value* yields ``{}``.
+
+    NON-VALIDATING, and for ROUTING a preservation record only: never believe
+    it for a write. It is independent of :func:`repair`, whose accept-time
+    validation and NO SILENT PARTIAL REPAIR contract it neither shares nor
+    loosens.
+    """
+    if not isinstance(value, str):
+        return {}
+    wanted = _as_name_set(names)
+    found: dict[str, str] = {}
+    ambiguous: set[str] = set()
+    for inspected, match in enumerate(_ANY_OPENER_RE.finditer(value)):
+        if inspected >= _MAX_SCAN_OPENERS:
+            return {}
+        opener = _item_opener_at(value, match.start())
+        if opener is None or opener.name not in wanted:
+            continue
+        closer = _closer_re(opener.closer_name).search(value, opener.end)
+        item_value = value[opener.end: closer.start() if closer else len(value)]
+        if found.setdefault(opener.name, item_value) != item_value:
+            ambiguous.add(opener.name)
+    return {name: item for name, item in found.items() if name not in ambiguous}
 
 
 # ---------------------------------------------------------------------------
@@ -1105,6 +1190,19 @@ def markup_override_requested(metadata: object) -> bool:
     if parsed is None:
         return False
     return parsed.get(MARKUP_OVERRIDE_KEY) is True
+
+
+def swallowed_markup_override(value: object) -> bool:
+    """Return True iff *value* absorbed a ``metadata`` override set to ``True``.
+
+    A leak swallows only the parameters that FOLLOW the leaking one, so an
+    override found inside a value is evidence of a real leak: it is reported,
+    never honoured. Reads both dialects through :func:`scan_parameter_values`
+    and the flag fail-closed through :func:`markup_override_requested`.
+    """
+    return markup_override_requested(
+        scan_parameter_values(value, ('metadata',)).get('metadata')
+    )
 
 
 def strip_markup_override(metadata: Any) -> Any:

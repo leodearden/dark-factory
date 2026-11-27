@@ -114,9 +114,9 @@ genuine unknown, which is precisely the state a human has to adjudicate.
 
 Scope
 -----
-Mem0/Qdrant ONLY. Graphiti episodes are NOT covered -- Graphiti-side discovery
-is deliberately out of scope and filed as a follow-up; the residual episode
-d12b0eb4 has its own content-preserving redaction path.
+Mem0/Qdrant ONLY. Graphiti episodes are swept by
+``scripts/sweep_episode_toolcall_xml_leak.py``, which shares this script's
+repair-shape rule.
 
 This script + its test suite are MOCK-unit only (AsyncMock service, no live
 Qdrant), matching every precedent cleanup script in this directory. The live
@@ -154,30 +154,36 @@ Usage
 
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
+
 import argparse
 import asyncio
 import json
 import logging
-import sys
 from typing import Any
 
-from fused_memory.backends.mem0_client import (
-    _MEM0_TEXT_KEYS,
-    MEM0_MANAGED_METADATA_KEYS,
-)
+from fused_memory.backends.mem0_client import MEM0_MANAGED_METADATA_KEYS
 from fused_memory.memory_metadata import validate_memory_metadata
 from fused_memory.models import MEM0_PRIMARY, MemoryCategory
+from fused_memory.utils.mem0_content_keys import MEM0_CONTENT_KEYS, mem0_payload_text
 from fused_memory.utils.store_mutation_preflight import assert_store_mutation_allowed
-from fused_memory.utils.toolcall_xml_leak import LEAK_TAIL
+from fused_memory.utils.toolcall_xml_leak import (
+    LeakShape,
+    classify_leak_shape,
+    repair_leaked_text,
+)
 
 logger = logging.getLogger('sweep_toolcall_xml_leak')
 
-CLEAN = 'clean'
-REPAIRABLE_TAIL = 'repairable_tail'
-REPAIRABLE_DUPLICATE = 'repairable_duplicate'
-MANUAL_REVIEW = 'manual_review'
+CLEAN = LeakShape.CLEAN
+REPAIRABLE_TAIL = LeakShape.REPAIRABLE_TAIL
+REPAIRABLE_DUPLICATE = LeakShape.REPAIRABLE_DUPLICATE
+MANUAL_REVIEW = LeakShape.MANUAL_REVIEW
 
-CLASSIFICATIONS = (CLEAN, REPAIRABLE_TAIL, REPAIRABLE_DUPLICATE, MANUAL_REVIEW)
+CLASSIFICATIONS = tuple(LeakShape)
 
 # The four per-record outcomes that leave a record needing HUMAN adjudication
 # -- see resolve_exit_code()'s docstring for what each one means and why. This
@@ -214,17 +220,6 @@ HUMAN_ADJUDICATION_FLAGS: tuple[str, ...] = (
 # Pure core
 # ---------------------------------------------------------------------------
 
-# Payload keys tried in order when extracting a Mem0 memory's text content from
-# its raw Qdrant payload dict. BOUND to mem0_client's tuple rather than
-# re-spelled, so "what counts as a memory's content" is judged by the same
-# object the backend judges it by ('data' is the canonical Qdrant
-# scroll-payload content key for infer=False writes). Two further mirrors of
-# this tuple survive -- ``memory_service._MEM0_CONTENT_KEYS`` and
-# ``clear_malformed_empty_memory._CONTENT_KEYS`` -- and consolidating those is
-# outside this task's lock scope; this script at least does not add a fifth.
-_CONTENT_KEYS: tuple[str, ...] = _MEM0_TEXT_KEYS
-
-
 # Payload keys that mem0/Qdrant OWN or re-derive on write, and which must
 # therefore never be forged back into an ``add_memory(metadata=...)`` call.
 #
@@ -237,16 +232,16 @@ _CONTENT_KEYS: tuple[str, ...] = _MEM0_TEXT_KEYS
 # copy would silently fail to grow when mem0's payload shape does, and the
 # repair would start forging a newly-owned key back into metadata.
 #
-# The four additions are owned by this repair's own mechanics rather than by
+# The additions are owned by this repair's own mechanics rather than by
 # mem0's payload contract, which is why they are not in the shared set:
+#   MEM0_CONTENT_KEYS    every spelling of the memory text, which goes back in
+#                        as ``content=``;
 #   'id'                 the Qdrant point id, assigned by the new write;
-#   'memory'/'content'   historical spellings of the memory text, which goes
-#                        back in as ``content=``;
 #   'category'           overwritten by the service anyway
-#                        (memory_service.py:2193 ``meta['category'] = ...``)
+#                        (``MemoryService.add_memory`` sets ``meta['category']``)
 #                        and passed back as ``category=``.
 _MEM0_OWNED_KEYS: frozenset[str] = MEM0_MANAGED_METADATA_KEYS | {
-    'id', 'memory', 'content', 'category',
+    *MEM0_CONTENT_KEYS, 'id', 'category',
 }
 
 # The subset of the owned keys that the repair DOES carry, just not as metadata:
@@ -257,7 +252,7 @@ _MEM0_OWNED_KEYS: frozenset[str] = MEM0_MANAGED_METADATA_KEYS | {
 # ``project_id=args.project_id``. Reporting any of these as "dropped" would be a
 # false alarm that buries the genuinely-lost ones.
 _ARGUMENT_CARRIED_KEYS: frozenset[str] = frozenset({
-    'data', 'memory', 'content', 'category', 'agent_id', 'run_id', 'user_id',
+    *MEM0_CONTENT_KEYS, 'category', 'agent_id', 'run_id', 'user_id',
 })
 
 
@@ -304,99 +299,24 @@ def carried_metadata(payload: dict, memory_id: Any) -> tuple[dict, list[str]]:
     return metadata, dropped
 
 
-def extract_content(payload: dict) -> str:
-    """Return the first non-empty string among payload['data'], ['memory'],
-    ['content'], trying _CONTENT_KEYS in order.
-
-    Returns '' when no key is present or every present value is empty/not a
-    string -- identical to clear_malformed_empty_memory.extract_content.
-    """
-    for key in _CONTENT_KEYS:
-        value = payload.get(key)
-        if isinstance(value, str) and value:
-            return value
-    return ''
-
-
-def _split_at_leak(text: str) -> tuple[str, str] | None:
-    """Split *text* into (before, remainder) around the leak marker.
-
-    ``before`` is everything preceding the stray closing tag -- the text the
-    caller actually meant to write. ``remainder`` is everything AFTER the
-    continuation tag that follows it, which is what a repair would discard.
-
-    Returns None when *text* carries no leak.
-
-    The leak pattern itself is never re-spelled here: ``LEAK_TAIL`` from the
-    shared module is the sole oracle, and this function only skips past the
-    continuation tag's own closing ``>`` to find where the discarded remainder
-    begins. That skip assumes a continuation tag contains no ``>`` inside its
-    quoted attribute value -- true of every recorded specimen. A mis-split
-    could only ever make ``remainder`` fail to match ``before``, which
-    downgrades the record to ``manual_review``; it can never manufacture a
-    false repair. Fail-safe in the only direction that matters.
-    """
-    stripped = text.rstrip()
-    match = LEAK_TAIL.search(stripped)
-    if match is None:
-        return None
-    before = stripped[: match.start()]
-    continuation = match.group(1)
-    tag_end = continuation.find('>')
-    remainder = continuation[tag_end + 1 :] if tag_end != -1 else ''
-    return before, remainder
-
-
 def classify_record(payload: dict) -> str:
     """Classify a raw Qdrant payload into one of :data:`CLASSIFICATIONS`.
 
-    Returns:
-        'clean' when the extracted content carries no leak (including a
-        payload with no extractable content at all -- nothing to repair);
-        'repairable_tail' when the fragment carries nothing after its marker
-        and dropping it leaves non-empty text;
-        'repairable_duplicate' when the text after the marker is a VERBATIM
-        duplicate of the text before it;
-        'manual_review' for every other leak -- including a leak at offset 0,
-        where no repair could preserve content because there is none to keep.
+    The shape rule is the shared one,
+    ``fused_memory.utils.toolcall_xml_leak.classify_leak_shape``; a payload with
+    no extractable content is 'clean' (nothing to repair).
     """
-    content = extract_content(payload)
-    split = _split_at_leak(content)
-    if split is None:
-        return CLEAN
-
-    before, remainder = split
-    if not before:
-        # Dropping the fragment would leave an empty memory: refuse.
-        return MANUAL_REVIEW
-    if not remainder.strip():
-        return REPAIRABLE_TAIL
-    if remainder == before:
-        return REPAIRABLE_DUPLICATE
-    return MANUAL_REVIEW
+    return classify_leak_shape(mem0_payload_text(payload))
 
 
 def repair_content(text: str | None) -> str | None:
     """Return the content-preserving repair of *text*, or None to REFUSE.
 
-    None means exactly one thing: "do not mutate this record". It is returned
-    for a leak this function cannot vouch for, and for a None input, so a
-    refusal can never be mistaken for a repair.
-
-    Clean text is returned UNCHANGED rather than as None. That is what makes
-    the repair idempotent -- ``repair_content(repair_content(x)) ==
-    repair_content(x)`` -- since a repaired string is itself clean.
+    Delegates to the shared
+    ``fused_memory.utils.toolcall_xml_leak.repair_leaked_text``, the one repair
+    definition both leak sweeps use.
     """
-    if text is None:
-        return None
-    classification = classify_record({'data': text})
-    if classification == CLEAN:
-        return text
-    if classification in (REPAIRABLE_TAIL, REPAIRABLE_DUPLICATE):
-        split = _split_at_leak(text)
-        assert split is not None  # noqa: S101 - guaranteed by the classification
-        return split[0]
-    return None
+    return repair_leaked_text(text)
 
 
 def readd_persisted(response: Any) -> tuple[bool, str]:
@@ -495,7 +415,7 @@ async def probe_delete_landed(
         )
     try:
         found = await getter(project_id=project_id, memory_id=memory_id)
-    except Exception as exc:  # noqa: BLE001 - the probe must never mask the delete error
+    except Exception as exc:  # the probe must never mask the delete error
         return None, (
             f'delete-landed probe FAILED ({type(exc).__name__}: {exc}); whether the '
             'point survived is unknown. The original delete error is preserved.'
@@ -541,9 +461,7 @@ def routes_to_mem0(payload: dict) -> tuple[bool, str]:
     return True, ''
 
 
-def metadata_accepted(
-    metadata: dict, *, enforce: bool, enforce_kind_registry: bool
-) -> tuple[bool, str]:
+def metadata_accepted(metadata: dict, *, enforce: bool) -> tuple[bool, str]:
     """Return (True, '') only when the re-add's metadata would survive validation.
 
     Pure, no I/O -- ``validate_memory_metadata`` is a synchronous SHAPE check
@@ -555,26 +473,23 @@ def metadata_accepted(
     ``memory_metadata.enforce`` is on and at least one violation is fatal. The
     corpus this sweep walks is precisely the OLD, harness-corrupted one, so a
     record whose carried metadata predates the task-3195 vocabulary can be
-    fatal-invalid TODAY -- an unknown ``kind`` under ``enforce_kind_registry``,
-    a scalar-but-malformed ``supersedes`` member, a non-bool ``canonical``. The
-    add would then throw AFTER the delete already landed, and the record would
-    become ``content_lost_in_flight`` with the text surviving only on stdout.
-    Checking first turns that into a no-op skip.
+    fatal-invalid TODAY -- a scalar-but-malformed ``supersedes`` member, a
+    non-bool ``canonical``. The add would then throw AFTER the delete already
+    landed, and the record would become ``content_lost_in_flight`` with the
+    text surviving only on stdout. Checking first turns that into a no-op skip.
+    An unknown ``kind`` is never fatal (PRD §10 OQ1, option (b)), so it never
+    skips a repair.
 
     ``enforce`` is honoured rather than assumed: under warn-mode (the shipped
     default) a fatal violation does NOT reject the write, so skipping on it
-    would refuse repairs the store would happily have accepted -- and unknown
-    ``kind`` values are the common case, not the exception (242 of 329 live
-    values are singletons).
+    would refuse repairs the store would happily have accepted.
 
     *metadata* is never mutated: ``validate_memory_metadata`` normalizes
     ``supersedes`` in place, so it is handed a COPY.
     """
     if not enforce:
         return True, ''
-    violations = validate_memory_metadata(
-        dict(metadata), enforce_kind_registry=enforce_kind_registry
-    )
+    violations = validate_memory_metadata(dict(metadata))
     fatal = [violation for violation in violations if violation.fatal]
     if not fatal:
         return True, ''
@@ -585,34 +500,32 @@ def metadata_accepted(
     )
 
 
-def resolve_metadata_enforcement(memory_service: Any) -> tuple[bool, bool]:
-    """Read the ACTIVE ``(enforce, enforce_kind_registry)`` off *memory_service*.
+def resolve_metadata_enforcement(memory_service: Any) -> bool:
+    """Read the ACTIVE ``memory_metadata.enforce`` off *memory_service*.
 
-    Pure w.r.t. the store -- attribute reads only. The flags come from the live
-    ``config.memory_metadata`` rather than being assumed, because they decide
+    Pure w.r.t. the store -- attribute reads only. The flag comes from the live
+    ``config.memory_metadata`` rather than being assumed, because it decides
     whether :func:`metadata_accepted` may block a repair, and guessing either
     way is wrong: guessing OFF re-opens the post-delete rejection this
     pre-flight exists to close, guessing ON refuses repairs the store would
     have accepted.
 
-    When they cannot be read as real bools the answer is the FAIL-SAFE one --
-    both ON, so a questionable record is skipped rather than deleted -- and it
-    is logged, never silent. A live ``MemoryService`` always carries a real
+    When it cannot be read as a real bool the answer is the FAIL-SAFE one --
+    ON, so a questionable record is skipped rather than deleted -- and it is
+    logged, never silent. A live ``MemoryService`` always carries a real
     ``FusedMemoryConfig``, so this branch means a stub, not a supported mode.
     """
     section = getattr(getattr(memory_service, 'config', None), 'memory_metadata', None)
     enforce = getattr(section, 'enforce', None)
-    enforce_kind_registry = getattr(section, 'enforce_kind_registry', None)
-    if isinstance(enforce, bool) and isinstance(enforce_kind_registry, bool):
-        return enforce, enforce_kind_registry
+    if isinstance(enforce, bool):
+        return enforce
     logger.warning(
-        'sweep_toolcall_xml_leak: could not read config.memory_metadata enforcement '
-        'flags off the memory service (enforce=%r, enforce_kind_registry=%r). '
-        'Assuming BOTH ON, so a record whose carried metadata looks invalid is '
-        'skipped rather than deleted-then-rejected.',
-        enforce, enforce_kind_registry,
+        'sweep_toolcall_xml_leak: could not read config.memory_metadata.enforce '
+        'off the memory service (enforce=%r). Assuming ON, so a record whose '
+        'carried metadata looks invalid is skipped rather than deleted-then-rejected.',
+        enforce,
     )
-    return True, True
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -638,7 +551,7 @@ def build_report(
     its own incompleteness rather than presenting a partial count as the
     incidence rate.
     """
-    counts = {name: 0 for name in CLASSIFICATIONS}
+    counts: dict[str, int] = {name: 0 for name in CLASSIFICATIONS}
     for record in records:
         classification = record.get('classification')
         if classification in counts:
@@ -748,7 +661,7 @@ async def run(args: Any, memory_service: Any, progress: dict | None = None) -> d
     # Resolved ONCE, before any mutation, so every record in a run is judged
     # against the same enforcement setting even if the config object is edited
     # mid-sweep.
-    enforcement = resolve_metadata_enforcement(memory_service)
+    enforce = resolve_metadata_enforcement(memory_service)
 
     # Fail-CLOSED capability preflight, one probe per run, BEFORE the scan.
     #
@@ -786,8 +699,8 @@ async def run(args: Any, memory_service: Any, progress: dict | None = None) -> d
     # READ from the scan result, never re-derived here. The alternative --
     # spelling ``Scope(project_id=...).mem0_collection_name(prefix)`` a second
     # time inside this script -- would be a second copy of the
-    # scope-to-collection rule, the same duplication the ``_CONTENT_KEYS`` /
-    # ``_MEM0_OWNED_KEYS`` bindings above exist to avoid, and it would go
+    # scope-to-collection rule, the same duplication the ``_MEM0_OWNED_KEYS``
+    # binding above exists to avoid, and it would go
     # silently wrong the day that mapping changes. The value the scan actually
     # swept is the only value worth printing.
     collection = scan.get('collection') or ''
@@ -814,7 +727,7 @@ async def run(args: Any, memory_service: Any, progress: dict | None = None) -> d
 
     for match in matches:
         payload = match.get('metadata') or {}
-        content = extract_content(payload)
+        content = mem0_payload_text(payload)
         classification = classify_record(payload)
         record: dict = {
             'id': match.get('id'),
@@ -833,7 +746,7 @@ async def run(args: Any, memory_service: Any, progress: dict | None = None) -> d
         try:
             if not dry_run and classification in (REPAIRABLE_TAIL, REPAIRABLE_DUPLICATE):
                 await _repair_record(
-                    memory_service, args, match, payload, record, enforcement=enforcement
+                    memory_service, args, match, payload, record, enforce=enforce
                 )
             elif not dry_run and classification == MANUAL_REVIEW:
                 logger.warning(
@@ -843,7 +756,7 @@ async def run(args: Any, memory_service: Any, progress: dict | None = None) -> d
                     'human review.',
                     match.get('id'),
                 )
-        except Exception as exc:  # noqa: BLE001 - one bad record must not void the run
+        except Exception as exc:  # one bad record must not void the run
             # ONE rule, consulted rather than re-derived: _repair_record has
             # already settled whether this record's delete landed, so the
             # catch-all reads that field instead of writing record_error
@@ -885,7 +798,7 @@ async def _repair_record(
     payload: dict,
     record: dict,
     *,
-    enforcement: tuple[bool, bool] = (False, False),
+    enforce: bool = False,
 ) -> None:
     """Delete the corrupted point, then re-add the repaired text.
 
@@ -900,7 +813,7 @@ async def _repair_record(
         that would not be re-written to mem0 is skipped entirely -- no delete,
         no add -- and flagged ``skipped_not_mem0_routed``.
       * :func:`metadata_accepted` must vouch for the metadata the re-add would
-        carry, under the *enforcement* flags resolved for this run. A record
+        carry, under the *enforce* flag resolved for this run. A record
         whose carried metadata would be REJECTED by ``add_memory``'s own
         validation is flagged ``skipped_metadata_would_be_rejected``. Without
         this the rejection lands AFTER the delete, and a record the sweep was
@@ -968,10 +881,7 @@ async def _repair_record(
     record['metadata_preserved'] = sorted(set(payload) - _MEM0_OWNED_KEYS)
     record['metadata_dropped'] = dropped
 
-    enforce, enforce_kind_registry = enforcement
-    accepted, metadata_reason = metadata_accepted(
-        metadata, enforce=enforce, enforce_kind_registry=enforce_kind_registry
-    )
+    accepted, metadata_reason = metadata_accepted(metadata, enforce=enforce)
     if not accepted:
         record[SKIPPED_METADATA_WOULD_BE_REJECTED] = True
         record['error'] = metadata_reason
@@ -989,7 +899,7 @@ async def _repair_record(
             store='mem0',
             project_id=args.project_id,
         )
-    except Exception as delete_exc:  # noqa: BLE001 - adjudicated, then reported
+    except Exception as delete_exc:  # adjudicated, then reported
         # A raised delete does NOT mean the point survived. mem0 removes the
         # Qdrant point BEFORE writing its SQLite history, so the measured
         # 7d073281 failure raised with the content already gone. Ask the store
@@ -1185,7 +1095,7 @@ def main() -> int:
     args = parser.parse_args()
 
     if args.config:
-        import os  # noqa: PLC0415
+        import os
         os.environ['CONFIG_PATH'] = str(args.config)
 
     # Owned HERE, not inside run(), so the report survives an abort. For any
@@ -1195,17 +1105,12 @@ def main() -> int:
     progress = new_progress()
 
     async def _run_live() -> dict:
-        from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
-        from fused_memory.services.memory_service import MemoryService  # noqa: PLC0415
+        from fused_memory.config.schema import FusedMemoryConfig
+        from fused_memory.maintenance._utils import maintenance_service
 
         config = FusedMemoryConfig()
-        memory = MemoryService(config)
-        try:
-            await memory.initialize()
+        async with maintenance_service(config=config) as (_, memory):
             return await run(args, memory, progress)
-        finally:
-            if hasattr(memory, 'close'):
-                await memory.close()
 
     exit_code = 0
     try:

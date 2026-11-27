@@ -27,8 +27,14 @@ from typing import TYPE_CHECKING, Literal, NamedTuple, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from _live_merge_worker import REAL_GIT_MERGE_RESULT_TIMEOUT, running_merge_worker
-from _merge_lane_fakes import FakeClock, FakeVerifier, hangs_until
+from _git_fixtures import seed_repo
+from _live_merge_worker import (
+    REAL_GIT_MERGE_RESULT_TIMEOUT,
+    REAL_GIT_TRAIN_MAX_WALL_S,
+    REAL_GIT_TRAIN_TIMEOUT,
+    running_merge_worker,
+)
+from _merge_lane_fakes import FakeClock, FakeVerifier, hangs_until, lane_scene_config
 from _orch_helpers import make_placeholder_future, wait_responsive
 
 from orchestrator.merge_lane.landing_evidence import LandingEvidenceVerdict
@@ -61,17 +67,9 @@ class TestConfigAndEventType:
         """
         import tempfile
 
-        from orchestrator.config import GitConfig, OrchestratorConfig
+        from orchestrator.config import OrchestratorConfig
         with tempfile.TemporaryDirectory() as tmp:
-            cfg = OrchestratorConfig(
-                project_root=Path(tmp),
-                git=GitConfig(
-                    main_branch='main',
-                    branch_prefix='task/',
-                    remote='origin',
-                    worktree_dir='.worktrees',
-                ),
-            )
+            cfg = OrchestratorConfig(project_root=Path(tmp))
             assert cfg.merge_train_coalesce_enabled is False
 
     def test_event_type_train_coalesced(self):
@@ -83,10 +81,10 @@ class TestConfigAndEventType:
 # ─── helpers shared across steps ────────────────────────────────────────────
 
 def _make_config(tmp_path: Path, *, coalesce_enabled: bool = False) -> OrchestratorConfig:
-    from orchestrator.config import GitConfig, OrchestratorConfig
-    return OrchestratorConfig(
-        project_root=tmp_path,
-        git=GitConfig(
+    from orchestrator.config import GitConfig
+    return lane_scene_config(
+        tmp_path,
+        GitConfig(
             main_branch='main',
             branch_prefix='task/',
             remote='origin',
@@ -196,13 +194,13 @@ class TestNoOpGuards:
 
         req1 = _make_single_req('t1', config=cfg)
         req2 = _make_single_req('t2', config=cfg)
-        worker._lane_buffers['normal'].append(req1)
-        worker._lane_buffers['normal'].append(req2)
+        worker._intake.buffer_owned_request(req1)
+        worker._intake.buffer_owned_request(req2)
 
         result = await worker._maybe_coalesce_waiting_singles()
 
         assert result is False, 'should return False when knob is disabled'
-        buf = list(worker._lane_buffers['normal'])
+        buf = list(worker._intake.buffered('normal'))
         assert buf == [req1, req2], 'buffer must be unchanged'
         # No futures resolved
         assert not req1.result.done()
@@ -215,12 +213,12 @@ class TestNoOpGuards:
         worker = _make_worker(queue, cfg, factory=_stub_factory())
 
         req1 = _make_single_req('t1', config=cfg)
-        worker._lane_buffers['normal'].append(req1)
+        worker._intake.buffer_owned_request(req1)
 
         result = await worker._maybe_coalesce_waiting_singles()
 
         assert result is False
-        assert list(worker._lane_buffers['normal']) == [req1]
+        assert list(worker._intake.buffered('normal')) == [req1]
         assert not req1.result.done()
 
     async def test_no_factory_returns_false(self, tmp_path: Path):
@@ -231,8 +229,8 @@ class TestNoOpGuards:
 
         req1 = _make_single_req('t1', config=cfg)
         req2 = _make_single_req('t2', config=cfg)
-        worker._lane_buffers['normal'].append(req1)
-        worker._lane_buffers['normal'].append(req2)
+        worker._intake.buffer_owned_request(req1)
+        worker._intake.buffer_owned_request(req2)
 
         result = await worker._maybe_coalesce_waiting_singles()
 
@@ -243,22 +241,9 @@ class TestNoOpGuards:
 
 # ─── git repo fixtures ───────────────────────────────────────────────────────
 
-async def _setup_repo(repo: Path) -> None:
-    from orchestrator.git_ops import _run
-    await _run(['git', 'init', '-b', 'main'], cwd=repo)
-    await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=repo)
-    await _run(['git', 'config', 'user.name', 'Test'], cwd=repo)
-    (repo / 'README.md').write_text('# Test\n')
-    await _run(['git', 'add', '-A'], cwd=repo)
-    await _run(['git', 'commit', '-m', 'Initial commit'], cwd=repo)
-
-
 @pytest.fixture
 def git_repo(tmp_path: Path) -> Path:
-    repo = tmp_path / 'repo'
-    repo.mkdir()
-    asyncio.run(_setup_repo(repo))
-    return repo
+    return seed_repo(tmp_path / 'repo')
 
 
 @pytest.fixture
@@ -281,8 +266,7 @@ def git_ops(git_config, git_repo: Path):
 
 @pytest.fixture
 def config(git_repo: Path, git_config) -> OrchestratorConfig:
-    from orchestrator.config import OrchestratorConfig
-    return OrchestratorConfig(project_root=git_repo, git=git_config)
+    return lane_scene_config(git_repo, git_config)
 
 
 @pytest.fixture
@@ -294,10 +278,10 @@ def coalesce_config(git_repo: Path, git_config) -> OrchestratorConfig:
     these scenes would otherwise assert trains under whatever cap the
     operational yaml (loaded via conftest's ``ORCH_CONFIG_PATH``) ships.
     """
-    from orchestrator.config import MergeDeepConfig, OrchestratorConfig
-    return OrchestratorConfig(
-        project_root=git_repo,
-        git=git_config,
+    from orchestrator.config import MergeDeepConfig
+    return lane_scene_config(
+        git_repo,
+        git_config,
         merge_train_coalesce_enabled=True,
         merge_deep=MergeDeepConfig(chain_cap=0),
     )
@@ -420,7 +404,7 @@ class TestCoreFormation:
         req1 = _make_req('t1', 'task/t1', wt1, coalesce_config)
         req2 = _make_req('t2', 'task/t2', wt2, coalesce_config)
         req3 = _make_req('t3', 'task/t3', wt3, coalesce_config)
-        worker._lane_buffers['normal'].extend([req1, req2, req3])
+        worker._intake.replace_lane('normal', [req1, req2, req3])
 
         # ── invoke ──────────────────────────────────────────────────────────
         result = await worker._maybe_coalesce_waiting_singles()
@@ -429,7 +413,7 @@ class TestCoreFormation:
         assert result is True, 'should return True when a train is formed'
 
         # (b) buffer has exactly 1 GroupMergeRequest; all 3 singles removed.
-        buf = list(worker._lane_buffers['normal'])
+        buf = list(worker._intake.buffered('normal'))
         assert len(buf) == 1, f'Expected 1 item in buffer, got {len(buf)}: {buf}'
         group_req = buf[0]
         assert isinstance(group_req, GroupMergeRequest), (
@@ -490,7 +474,7 @@ class TestExclusionIdempotency:
         """(a) IN-FLIGHT NEVER ABSORBED.
 
         A request registered at ItemLifecycleState.MERGING (not in
-        _lane_buffers) must never be touched by the pass — its future remains
+        the lane buffers) must never be touched by the pass — its future remains
         unresolved and its task_id does not appear in the train's
         member_task_ids.
         """
@@ -521,7 +505,7 @@ class TestExclusionIdempotency:
         worker._register_item(req0, initial=ItemLifecycleState.MERGING)
 
         # Only req1 and req2 are in the buffer.
-        worker._lane_buffers['normal'].extend([req1, req2])
+        worker._intake.replace_lane('normal', [req1, req2])
 
         result = await worker._maybe_coalesce_waiting_singles()
 
@@ -534,7 +518,7 @@ class TestExclusionIdempotency:
         )
 
         # req0's task_id must not appear in the formed train's member_task_ids.
-        buf = list(worker._lane_buffers['normal'])
+        buf = list(worker._intake.buffered('normal'))
         assert len(buf) == 1 and isinstance(buf[0], GroupMergeRequest)
         group_req = buf[0]
         assert 'in0' not in group_req.member_task_ids, (
@@ -574,7 +558,7 @@ class TestExclusionIdempotency:
         req3.result.cancel()
         assert req3.result.cancelled(), 'precondition: req3 future is cancelled'
 
-        worker._lane_buffers['normal'].extend([req1, req2, req3])
+        worker._intake.replace_lane('normal', [req1, req2, req3])
 
         result = await worker._maybe_coalesce_waiting_singles()
 
@@ -586,7 +570,7 @@ class TestExclusionIdempotency:
         )
 
         # req3 must still be in the buffer (it was not absorbed).
-        buf = list(worker._lane_buffers['normal'])
+        buf = list(worker._intake.buffered('normal'))
         task_ids_in_buf = [
             r.task_id for r in buf if not isinstance(r, GroupMergeRequest)
         ]
@@ -650,7 +634,7 @@ class TestExclusionIdempotency:
         )
 
         # Put the existing group first, then the 2 singles.
-        worker._lane_buffers['normal'].extend([existing_group, req1, req2])
+        worker._intake.replace_lane('normal', [existing_group, req1, req2])
 
         await worker._maybe_coalesce_waiting_singles()
 
@@ -660,7 +644,7 @@ class TestExclusionIdempotency:
         )
 
         # (c2) The existing GroupMergeRequest must still be in the buffer.
-        buf = list(worker._lane_buffers['normal'])
+        buf = list(worker._intake.buffered('normal'))
         group_reqs = [r for r in buf if isinstance(r, GroupMergeRequest)]
         group_train_ids = {gr.train_id for gr in group_reqs}
         assert 'train-existing' in group_train_ids, (
@@ -712,7 +696,7 @@ class TestPartialStackability:
         req2 = _make_req('ov2', 'task/ov2', tmp_path / 'wt-ov2', coalesce_config)
         req3 = _make_req('ov3', 'task/ov3', tmp_path / 'wt-ov3', coalesce_config)
 
-        worker._lane_buffers['normal'].extend([req1, req2, req3])
+        worker._intake.replace_lane('normal', [req1, req2, req3])
 
         # ov1 and ov2 both touch file_a.py lines 1–5 / 3–7 → overlapping → NOT stackable.
         # ov3 touches file_b.py only → disjoint from both → stackable with ov1.
@@ -733,7 +717,7 @@ class TestPartialStackability:
 
         assert result is True, 'pass must form a train from the 2 stackable tasks'
 
-        buf = list(worker._lane_buffers['normal'])
+        buf = list(worker._intake.buffered('normal'))
         # ov2 must remain as a solo in the buffer (not absorbed).
         solos = [r for r in buf if not isinstance(r, GroupMergeRequest)]
         assert len(solos) == 1, f'Expected 1 solo; got {[r.task_id for r in solos]}'
@@ -778,9 +762,9 @@ class TestPartialStackability:
         req2 = _make_req('ej2', 'task/ej2', tmp_path / 'wt-ej2', coalesce_config)
         req3 = _make_req('ej3', 'task/ej3', tmp_path / 'wt-ej3', coalesce_config)
 
-        worker._lane_buffers['normal'].extend([req1, req2, req3])
+        worker._intake.replace_lane('normal', [req1, req2, req3])
 
-        # All disjoint → _select_train_members selects all 3.
+        # All disjoint → select_train_members selects all 3.
         async def _mock_gcr(task_id: str):
             return {
                 'ej1': {'fa.py': [(1, 2)]},
@@ -800,7 +784,7 @@ class TestPartialStackability:
 
         assert result is True, 'pass must form a train from ej1+ej2 survivors'
 
-        buf = list(worker._lane_buffers['normal'])
+        buf = list(worker._intake.buffered('normal'))
         # ej3 must remain in the buffer as a solo.
         solos = [r for r in buf if not isinstance(r, GroupMergeRequest)]
         assert len(solos) == 1 and solos[0].task_id == 'ej3', (
@@ -850,7 +834,7 @@ class TestPartialStackability:
         req2 = _make_req('ns2', 'task/ns2', tmp_path / 'wt-ns2', coalesce_config)
         req3 = _make_req('ns3', 'task/ns3', tmp_path / 'wt-ns3', coalesce_config)
 
-        worker._lane_buffers['normal'].extend([req1, req2, req3])
+        worker._intake.replace_lane('normal', [req1, req2, req3])
 
         async def _mock_gcr(task_id: str):
             return {}  # all disjoint → all selected
@@ -866,7 +850,7 @@ class TestPartialStackability:
         assert result is False, 'must return False when survivors < 2'
 
         # All 3 candidates must remain in the buffer unchanged.
-        buf = list(worker._lane_buffers['normal'])
+        buf = list(worker._intake.buffered('normal'))
         buf_ids = [r.task_id for r in buf]
         assert set(buf_ids) == {'ns1', 'ns2', 'ns3'}, (
             f'all candidates must remain in buffer; got {buf_ids}'
@@ -908,7 +892,7 @@ class TestDebounce:
 
         req1 = _make_req('db1', 'task/db1', tmp_path / 'wt-db1', coalesce_config)
         req2 = _make_req('db2', 'task/db2', tmp_path / 'wt-db2', coalesce_config)
-        worker._lane_buffers['normal'].extend([req1, req2])
+        worker._intake.replace_lane('normal', [req1, req2])
 
         # Spy on get_changed_line_ranges (non-stackable: both touch the same file).
         call_count = 0
@@ -959,7 +943,7 @@ class TestDebounce:
 
         req1 = _make_req('ra1', 'task/ra1', tmp_path / 'wt-ra1', coalesce_config)
         req2 = _make_req('ra2', 'task/ra2', tmp_path / 'wt-ra2', coalesce_config)
-        worker._lane_buffers['normal'].extend([req1, req2])
+        worker._intake.replace_lane('normal', [req1, req2])
 
         call_count = 0
 
@@ -985,7 +969,7 @@ class TestDebounce:
 
             # Add a new request — different signature → must re-run.
             req3 = _make_req('ra3', 'task/ra3', tmp_path / 'wt-ra3', coalesce_config)
-            worker._lane_buffers['normal'].append(req3)
+            worker._intake.buffer_owned_request(req3)
 
             await worker._maybe_coalesce_waiting_singles()
             assert call_count > calls_after_first, (
@@ -1019,7 +1003,7 @@ class TestDebounce:
 
         req1 = _make_req('sc1', 'task/sc1', wt1, coalesce_config)
         req2 = _make_req('sc2', 'task/sc2', wt2, coalesce_config)
-        worker._lane_buffers['normal'].extend([req1, req2])
+        worker._intake.replace_lane('normal', [req1, req2])
 
         # First call: successful coalesce (real git: disjoint files → stackable).
         result = await worker._maybe_coalesce_waiting_singles()
@@ -1275,14 +1259,14 @@ class TestMergeReadyPredicateSeam:
         req1 = _make_req('p1', 'task/p1', wt1, coalesce_config)
         req2 = _make_req('p2', 'task/p2', wt2, coalesce_config)
         req3 = _make_req('p3', 'task/p3', wt3, coalesce_config)
-        worker._lane_buffers['normal'].extend([req1, req2, req3])
+        worker._intake.replace_lane('normal', [req1, req2, req3])
 
         result = await worker._maybe_coalesce_waiting_singles()
 
         # (a) returns True — a train was formed
         assert result is True, 'pass must form a train with the 2 eligible candidates'
 
-        buf = list(worker._lane_buffers['normal'])
+        buf = list(worker._intake.buffered('normal'))
         trains = [r for r in buf if isinstance(r, GroupMergeRequest)]
         solos = [r for r in buf if not isinstance(r, GroupMergeRequest)]
 
@@ -1370,13 +1354,13 @@ class TestBlockedHistoryGate:
         req1 = _make_req('bh1', 'task/bh1', wt1, coalesce_config)
         req2 = _make_req('bh2', 'task/bh2', wt2, coalesce_config)
         req3 = _make_req('bh3', 'task/bh3', wt3, coalesce_config)
-        worker._lane_buffers['normal'].extend([req1, req2, req3])
+        worker._intake.replace_lane('normal', [req1, req2, req3])
 
         result = await worker._maybe_coalesce_waiting_singles()
 
         assert result is True, 'pass must form a train from the 2 clean candidates'
 
-        buf = list(worker._lane_buffers['normal'])
+        buf = list(worker._intake.buffered('normal'))
         trains = [r for r in buf if isinstance(r, GroupMergeRequest)]
         solos = [r for r in buf if not isinstance(r, GroupMergeRequest)]
 
@@ -1438,13 +1422,13 @@ class TestBlockedHistoryGate:
         req1 = _make_req('nh1', 'task/nh1', wt1, coalesce_config)
         req2 = _make_req('nh2', 'task/nh2', wt2, coalesce_config)
         req3 = _make_req('nh3', 'task/nh3', wt3, coalesce_config)
-        worker._lane_buffers['normal'].extend([req1, req2, req3])
+        worker._intake.replace_lane('normal', [req1, req2, req3])
 
         result = await worker._maybe_coalesce_waiting_singles()
 
         assert result is True, 'pass must form a train when no risk signals'
 
-        buf = list(worker._lane_buffers['normal'])
+        buf = list(worker._intake.buffered('normal'))
         trains = [r for r in buf if isinstance(r, GroupMergeRequest)]
         assert len(trains) == 1
         assert set(trains[0].member_task_ids) == {'nh1', 'nh2', 'nh3'}
@@ -1505,13 +1489,13 @@ class TestOneStrikeExclusion:
         req1 = _make_req('os1', 'task/os1', wt1, coalesce_config)
         req2 = _make_req('os2', 'task/os2', wt2, coalesce_config)
         req3 = _make_req('os3', 'task/os3', wt3, coalesce_config)
-        worker._lane_buffers['normal'].extend([req1, req2, req3])
+        worker._intake.replace_lane('normal', [req1, req2, req3])
 
         result = await worker._maybe_coalesce_waiting_singles()
 
         assert result is True, 'pass must form a train from the 2 clean candidates'
 
-        buf = list(worker._lane_buffers['normal'])
+        buf = list(worker._intake.buffered('normal'))
         trains = [r for r in buf if isinstance(r, GroupMergeRequest)]
         solos = [r for r in buf if not isinstance(r, GroupMergeRequest)]
 
@@ -1729,7 +1713,7 @@ class TestSuppressionObservability:
 
         req1 = _make_req('sup1', 'task/sup1', wt1, coalesce_config)
         req2 = _make_req('sup2', 'task/sup2', wt2, coalesce_config)
-        worker._lane_buffers['normal'].extend([req1, req2])
+        worker._intake.replace_lane('normal', [req1, req2])
 
         result = await worker._maybe_coalesce_waiting_singles()
 
@@ -1739,7 +1723,7 @@ class TestSuppressionObservability:
         )
 
         # No train formed in the buffer
-        buf = list(worker._lane_buffers['normal'])
+        buf = list(worker._intake.buffered('normal'))
         trains = [r for r in buf if isinstance(r, GroupMergeRequest)]
         assert len(trains) == 0, f'no train must form; found {len(trains)}'
 
@@ -2877,7 +2861,12 @@ class TestCoalesceAfterHealthyMerge:
                     f'got {outcome.status!r}'
                 )
 
-            warm_outcome = await asyncio.wait_for(warm_req.result, timeout=120)
+            warm_outcome = await wait_responsive(
+                warm_req.result,
+                timeout=REAL_GIT_TRAIN_TIMEOUT,
+                max_wall_s=REAL_GIT_TRAIN_MAX_WALL_S,
+                label='warm-up hm0 landed beside the coalesced train',
+            )
             assert warm_outcome.status == 'done', (
                 f'warm-up merge must land cleanly; got {warm_outcome.status!r}'
             )
@@ -2946,11 +2935,11 @@ class TestCoalesceAfterHealthyMerge:
         two candidates.  That is a healthy outcome, not a lost train: every
         item lands, through the chain, and no train forms.
         """
-        from orchestrator.config import MergeDeepConfig
+        from orchestrator.config import DepthRow, MergeDeepConfig
         from orchestrator.git_ops import _run
 
         deep_config = coalesce_config.model_copy(
-            update={'merge_deep': MergeDeepConfig(chain_cap=6)},
+            update={'merge_deep': MergeDeepConfig(chain_cap=6, depth_table=[DepthRow(0.0, 6)])},
         )
         async with _healthy_burst(git_ops, deep_config, tmp_path) as burst:
             all_reqs = {'hm0': burst.warm_req, **burst.follower_reqs}

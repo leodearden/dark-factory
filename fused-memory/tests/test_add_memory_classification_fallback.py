@@ -12,8 +12,9 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import pytest_asyncio
-from _fm_helpers import poll_until
+from _fm_polling import poll_until
 from _sdk_client_stubs import completion_client, raising_client
+from shared.testing_timeout_headroom import UNDER_LOAD_HEADROOM_FACTOR
 
 from fused_memory.middleware import _folded_escalation
 from fused_memory.models.enums import ClassificationFallback, MemoryCategory
@@ -79,15 +80,32 @@ def _fails_once_per_fact() -> AsyncMock:
     return AsyncMock(side_effect=add)
 
 
+# Both episode-path drains overran poll_until's 10s default in full-suite xdist verifies (esc-8417-2, task 7715).
+_DRAIN_OVERRAN_UNDER_LOAD_S = 10.0
+_DRAIN_BUDGET_S = _DRAIN_OVERRAN_UNDER_LOAD_S * UNDER_LOAD_HEADROOM_FACTOR
+
+
 async def _drain(service: MemoryService, *, completed: int) -> None:
     queue = service.durable_queue
     assert queue is not None
+    last_counts: dict = {}
 
-    async def _done() -> bool:
-        stats = await queue.get_stats()
-        return stats['counts'].get('completed') == completed
+    async def _reached_or_unreachable() -> bool:
+        nonlocal last_counts
+        last_counts = (await queue.get_stats())['counts']
+        return last_counts.get('completed', 0) >= completed or bool(last_counts.get('dead'))
 
-    await poll_until(_done, message=f'the queue never completed {completed} item(s)')
+    try:
+        await poll_until(_reached_or_unreachable, timeout=_DRAIN_BUDGET_S)
+    except AssertionError as exc:
+        raise AssertionError(
+            f'the queue never completed {completed} item(s) within {_DRAIN_BUDGET_S}s; '
+            f'last counts={last_counts}'
+        ) from exc
+    assert last_counts.get('completed') == completed, (
+        f'the queue can no longer complete exactly {completed} item(s); '
+        f'last counts={last_counts}'
+    )
 
 
 def _add_memory_params(journal: MagicMock) -> list[dict]:
@@ -99,7 +117,7 @@ def _add_memory_params(journal: MagicMock) -> list[dict]:
 
 
 def _pending(tmp_path: Path) -> list:
-    from escalation.queue import EscalationQueue  # noqa: PLC0415
+    from escalation.queue import EscalationQueue
 
     return EscalationQueue(tmp_path / 'data' / 'escalations').get_pending()
 
@@ -127,7 +145,12 @@ def service(llm_config, journal, failing_client) -> MemoryService:
 
 @pytest_asyncio.fixture
 async def queued_service(llm_config, journal, failing_client, tmp_path):
-    """The service over a REAL durable queue, so add_episode's facts run as queued writes."""
+    """The service over a REAL durable queue, so add_episode's facts run as queued writes.
+
+    Its per-write timeout is widened to the drain budget, so load can slow a
+    write but never turn it into a timeout retry that the tests would count.
+    """
+    llm_config.queue.write_timeout_seconds = _DRAIN_BUDGET_S
     svc = _service(llm_config, journal, failing_client)
     svc.graphiti = MagicMock()
     svc.graphiti.initialize = AsyncMock()

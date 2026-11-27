@@ -59,10 +59,15 @@ from orchestrator.agents.invoke import AgentResult
 from orchestrator.agents.roles import IMPLEMENTER
 from orchestrator.config import GitConfig, OrchestratorConfig, TimeoutsConfig
 from orchestrator.git_ops import GitOps, _run
+from orchestrator.resume_resolution import CarriedResolution
 from orchestrator.scheduler import TaskAssignment
 from orchestrator.steward import TaskSteward
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
-from orchestrator.workflow_types import StewardInterrupted, StewardReescalatedL1
+from orchestrator.workflow_types import (
+    PublishedStewardOutcome,
+    StewardInterrupted,
+    StewardReescalatedL1,
+)
 
 # ---------------------------------------------------------------------------
 # Fixtures (local — mirrors test_workflow_status_on_resume.py)
@@ -244,7 +249,7 @@ def _wire_resolve_callback(queue: EscalationQueue, workflow: TaskWorkflow) -> No
     the ONLY thing that wakes ``_wait_for_resolution`` in production, so a test
     that omits it does not reproduce the production wake path at all.
     """
-    def _on_resolved(esc) -> None:  # noqa: ARG001 — signature parity with harness
+    def _on_resolved(esc) -> None:  # signature parity with harness
         event = workflow._escalation_event
         if event is not None:
             event.set()
@@ -280,7 +285,7 @@ def _time_the_wait(workflow: TaskWorkflow) -> dict[str, float]:
     timing: dict[str, float] = {}
     original = workflow._wait_for_resolution
 
-    async def _timed() -> str:
+    async def _timed() -> tuple[CarriedResolution, ...]:
         started = asyncio.get_running_loop().time()
         try:
             return await original()
@@ -342,7 +347,7 @@ def _make_silent_steward() -> type:
     """
 
     class _FakeSteward:
-        def __init__(self, wt_path, cfg_dir):  # noqa: ARG002
+        def __init__(self, wt_path, cfg_dir):
             self._outcome_channel = None
             self._wip_probe = None
 
@@ -386,7 +391,7 @@ def _make_dismiss_and_publish_steward(
     """
 
     class _FakeSteward:
-        def __init__(self, wt_path, cfg_dir):  # noqa: ARG002
+        def __init__(self, wt_path, cfg_dir):
             self._outcome_channel = None
             self._wip_probe = None
             self.give_up_task: asyncio.Task | None = None
@@ -407,10 +412,11 @@ def _make_dismiss_and_publish_steward(
                     dismiss=True,
                     resolved_by='auto-dismissed',
                 )
-            if self._outcome_channel is not None:
-                self._outcome_channel.put_nowait(
-                    StewardInterrupted('attempt_cap', wip_commits_present=True),
-                )
+                if self._outcome_channel is not None:
+                    self._outcome_channel.put_nowait(PublishedStewardOutcome(
+                        esc.id,
+                        StewardInterrupted('attempt_cap', wip_commits_present=True),
+                    ))
 
         async def start(self) -> None:
             self.give_up_task = asyncio.create_task(self._give_up())
@@ -652,7 +658,7 @@ class TestStaleOutcomeHygiene:
         assert await scheduler.get_status(task_assignment.task_id) not in (
             'done', 'cancelled', 'deferred',
         ), 'a terminal status would short-circuit _await_steward_completion'
-        outcome = await asyncio.wait_for(workflow._await_steward_completion(), 10)
+        outcome = await asyncio.wait_for(workflow._await_steward_completion(escalation_id=None), 10)
 
         assert isinstance(outcome, StewardInterrupted), (
             f'nothing is published in this second cycle, so the grace period '
@@ -715,6 +721,7 @@ def _make_steward_config(project_root: Path) -> MagicMock:
     cfg.steward_completion_timeout = 300.0
     cfg.steward_max_timeouts_per_escalation = 3
     cfg.steward_max_empty_outputs_per_escalation = 2
+    cfg.steward_session_mode = OrchestratorConfig.model_fields['steward_session_mode'].default
     cfg.timeouts.steward = 1800.0
     return cfg
 
@@ -913,7 +920,7 @@ def _make_slow_healthy_steward(
     """
 
     class _FakeSteward:
-        def __init__(self, wt_path, cfg_dir):  # noqa: ARG002
+        def __init__(self, wt_path, cfg_dir):
             self._outcome_channel = None
             self._wip_probe = None
             self.give_up_task: asyncio.Task | None = None
@@ -935,10 +942,11 @@ def _make_slow_healthy_steward(
                     dismiss=True,
                     resolved_by=resolved_by,
                 )
-            if self._outcome_channel is not None:
-                self._outcome_channel.put_nowait(
-                    StewardInterrupted('attempt_cap', wip_commits_present=True),
-                )
+                if self._outcome_channel is not None:
+                    self._outcome_channel.put_nowait(PublishedStewardOutcome(
+                        esc.id,
+                        StewardInterrupted('attempt_cap', wip_commits_present=True),
+                    ))
 
         async def start(self) -> None:
             self.give_up_task = asyncio.create_task(self._give_up())
@@ -1132,7 +1140,7 @@ def _make_progressing_steward(
             self.subprocess_attempts = 0
 
     class _FakeSteward:
-        def __init__(self, wt_path, cfg_dir):  # noqa: ARG002
+        def __init__(self, wt_path, cfg_dir):
             self._outcome_channel = None
             self._wip_probe = None
             self.metrics = _Metrics()
@@ -1162,10 +1170,11 @@ def _make_progressing_steward(
                     dismiss=True,
                     resolved_by=resolved_by,
                 )
-            if self._outcome_channel is not None:
-                self._outcome_channel.put_nowait(
-                    StewardInterrupted('attempt_cap', wip_commits_present=True),
-                )
+                if self._outcome_channel is not None:
+                    self._outcome_channel.put_nowait(PublishedStewardOutcome(
+                        esc.id,
+                        StewardInterrupted('attempt_cap', wip_commits_present=True),
+                    ))
 
         async def start(self) -> None:
             self.work_task = asyncio.create_task(self._work())
@@ -1423,7 +1432,7 @@ def _make_silent_marking_steward(
             self.invocations = 0
 
     class _FakeSteward:
-        def __init__(self, wt_path, cfg_dir):  # noqa: ARG002
+        def __init__(self, wt_path, cfg_dir):
             self._outcome_channel = None
             self._wip_probe = None
             self.metrics = _Metrics()
@@ -1532,7 +1541,7 @@ def _make_reescalating_steward(queue: EscalationQueue, task_id: str) -> type:
     """
 
     class _FakeSteward:
-        def __init__(self, wt_path, cfg_dir):  # noqa: ARG002
+        def __init__(self, wt_path, cfg_dir):
             self._outcome_channel = None
             self._wip_probe = None
 
@@ -1549,8 +1558,10 @@ def _make_reescalating_steward(queue: EscalationQueue, task_id: str) -> type:
                     esc.id, 'Auto-dismissed: re-escalated to human',
                     dismiss=True, resolved_by='auto-dismissed',
                 )
-            if self._outcome_channel is not None:
-                self._outcome_channel.put_nowait(StewardReescalatedL1(esc_id=l1.id))
+                if self._outcome_channel is not None:
+                    self._outcome_channel.put_nowait(PublishedStewardOutcome(
+                        esc.id, StewardReescalatedL1(esc_id=l1.id),
+                    ))
 
         async def stop(self) -> None:
             pass

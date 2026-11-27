@@ -87,6 +87,28 @@ def test_resolver_unavailable_is_an_exception_carrying_the_failed_store() -> Non
     assert 'mem0' in str(error)
 
 
+def test_unavailable_reasons_are_exactly_the_three_declared_ones() -> None:
+    assert {r.value for r in guard.UnavailableReason} == {'unreachable', 'timed_out', 'bad_response'}
+
+
+def test_an_outage_with_no_stated_reason_is_unreachable() -> None:
+    """The default keeps the type's existing meaning, so every current raiser stays correct."""
+    assert guard.ResolverUnavailable('mem0').reason is guard.UnavailableReason.UNREACHABLE
+
+
+def test_an_outage_carries_why_beside_which_store() -> None:
+    error = guard.ResolverUnavailable('fused-memory', reason=guard.UnavailableReason.TIMED_OUT)
+    assert error.store == 'fused-memory'
+    assert error.reason is guard.UnavailableReason.TIMED_OUT
+    assert 'fused-memory' in str(error)
+    assert 'timed_out' in str(error)
+
+
+def test_a_timed_out_outage_does_not_claim_the_store_was_unreachable() -> None:
+    error = guard.ResolverUnavailable('fused-memory', reason=guard.UnavailableReason.TIMED_OUT)
+    assert 'could not be reached' not in str(error)
+
+
 # --- the fact and tool-class vocabularies -------------------------------
 
 
@@ -579,6 +601,7 @@ def detection_fact(**overrides: Any) -> dict[str, Any]:
         'namespace': 'mem0',
         'agent_id': AGENT,
         'project': PROJECT,
+        'reason': None,
     }
     fact.update(overrides)
     return fact
@@ -1310,7 +1333,7 @@ class TestB12ResolverUnavailable:
         """"The resolver is down" is not actionable; "mem0 is down" is."""
         h = outage_harness()
         result = await h.call('add_memory', dict(self.CALL))
-        assert repair_of(result) == {'resolver': 'unavailable', 'store': OUTAGE}
+        assert repair_of(result) == {'resolver': 'unavailable', 'store': OUTAGE, 'reason': 'unreachable'}
 
     async def test_one_fact_with_outcome_resolver_unavailable(self) -> None:
         """No candidates were ever enumerated, so the record says so."""
@@ -1321,6 +1344,7 @@ class TestB12ResolverUnavailable:
                 outcome='resolver_unavailable',
                 candidate_ids=[],
                 namespace=None,
+                reason='unreachable',
             )
         ]
 
@@ -1334,6 +1358,7 @@ class TestB12ResolverUnavailable:
             'threshold': 3,
             'window_seconds': 3600.0,
             'outcome': 'resolver_unavailable',
+            'reason': 'unreachable',
             'project': PROJECT,
         }
 
@@ -1384,12 +1409,66 @@ class TestAnOutageAbandonsAnAlreadyResolvedExpansion:
         """No `substitutions` key claiming an expansion that was abandoned."""
         h = self.harness()
         result = await h.call('add_memory', dict(self.CALL))
-        assert repair_of(result) == {'resolver': 'unavailable', 'store': OUTAGE}
+        assert repair_of(result) == {'resolver': 'unavailable', 'store': OUTAGE, 'reason': 'unreachable'}
 
     async def test_no_expanded_fact_is_emitted_for_the_abandoned_token(self) -> None:
         h = self.harness()
         await h.call('add_memory', dict(self.CALL))
         assert [f['outcome'] for f in h.facts] == ['resolver_unavailable']
+
+
+class TestTheOutageReason:
+    """WHY there was no resolution rides on meta, on the fact and in the storm key.
+
+    The guard's action is the same whatever the reason — it forwards unchanged
+    — so the reason qualifies the outcome rather than being a fifth one. What
+    it buys is that a slow resolver and an unreachable one fire separate storms.
+    """
+
+    CALL = {'content': f'see {BFF}', 'project_id': PROJECT, 'agent_id': AGENT}
+
+    @pytest.mark.parametrize('reason', list(guard.UnavailableReason))
+    async def test_each_reason_reaches_meta_and_the_fact(self, reason: guard.UnavailableReason) -> None:
+        h = build_harness(raises={BFF: guard.ResolverUnavailable(OUTAGE, reason=reason)}, project_for=project_of)
+        result = await h.call('add_memory', dict(self.CALL))
+        assert repair_of(result) == {'resolver': 'unavailable', 'store': OUTAGE, 'reason': reason}
+        assert [fact['reason'] for fact in h.facts] == [reason]
+
+    def timed_out_harness(self) -> Harness:
+        return build_harness(
+            raises={
+                BFF: guard.ResolverUnavailable(OUTAGE, reason=guard.UnavailableReason.TIMED_OUT),
+                AMB: guard.ResolverUnavailable(OUTAGE),
+            },
+            project_for=project_of,
+            time_provider=_Clock(),
+        )
+
+    async def test_timeouts_and_refusals_are_separate_storm_buckets(self) -> None:
+        h = self.timed_out_harness()
+        results = []
+        for _ in range(2):
+            results.append(await h.call('add_memory', dict(self.CALL)))
+            results.append(await h.call('add_memory', {'content': f'see {AMB}', 'project_id': PROJECT}))
+        assert all('storm' not in (repair_of(r) or {}) for r in results)
+        assert h.escalations == []
+
+    async def test_a_burst_of_timeouts_fires_its_own_storm(self) -> None:
+        h = self.timed_out_harness()
+        for _ in range(3):
+            result = await h.call('add_memory', dict(self.CALL))
+        storm = (repair_of(result) or {})['storm']
+        for record in (storm, h.escalations[0]):
+            assert (record['outcome'], record['reason']) == ('resolver_unavailable', 'timed_out')
+
+    async def test_the_reason_leaves_as_its_plain_value(self) -> None:
+        """A sink rendering ``key=value!r`` must read ``'timed_out'``, not the enum's repr."""
+        h = self.timed_out_harness()
+        for _ in range(3):
+            result = await h.call('add_memory', dict(self.CALL))
+        repair = repair_of(result) or {}
+        reasons = [repair['reason'], repair['storm']['reason'], h.facts[-1]['reason'], h.escalations[0]['reason']]
+        assert [type(reason) for reason in reasons] == [str] * 4
 
 
 class TestAResolverBugIsNotAnOutage:
@@ -2180,7 +2259,7 @@ class TestTheDistinctTokensResolveConcurrently:
         h = build_harness(resolver=resolver)
         result = await h.call('add_memory', prose([first, second]))
         assert h.resolver.prefixes == [second, first], 'the second answered first'
-        assert repair_of(result) == {'resolver': 'unavailable', 'store': 'mem0'}
+        assert repair_of(result) == {'resolver': 'unavailable', 'store': 'mem0', 'reason': 'unreachable'}
         assert [fact['token'] for fact in h.facts] == [first]
 
 
@@ -2371,4 +2450,197 @@ class TestTheApplyPhaseIsOneDoorCallPerGuardedCall:
         )
         assert door.calls == 0
         assert h.recorder.args['content'] == submitted
-        assert repair_of(result) == {'resolver': 'unavailable', 'store': OUTAGE}
+        assert repair_of(result) == {'resolver': 'unavailable', 'store': OUTAGE, 'reason': 'unreachable'}
+
+
+# ---------------------------------------------------------------------------
+# A declared exempt PATH is never repaired.
+# ---------------------------------------------------------------------------
+#
+# A value the tool accepts only as a verbatim echo of what it stored: a repair
+# there could only turn an accepted call into a refused one. Like an exempt
+# tool, a declaration is not a detection, so it costs no walk, no fact and no
+# meta, and it does not count toward the ceiling.
+
+DONE_PROVENANCE = ('metadata', 'done_provenance')
+
+
+def path_exempt_harness(*paths: tuple[str | int, ...]) -> Harness:
+    """A harness that KNOWS BFF, so only the exemption can keep it unexpanded."""
+    return build_harness(
+        answers={BFF: unique(BFF_FULL)},
+        exempt_paths={'update_task': frozenset(paths or (DONE_PROVENANCE,))},
+    )
+
+
+def provenance_call(**extra: Any) -> dict[str, Any]:
+    return {
+        'task_id': '7',
+        'project_root': PROJECT,
+        'metadata': {'done_provenance': {'kind': 'merged', 'note': f'per observation {BFF}'}},
+        **extra,
+    }
+
+
+class TestADeclaredExemptPathIsNeverRepaired:
+    async def test_the_exempt_value_reaches_the_tool_verbatim(self) -> None:
+        h = path_exempt_harness()
+        result = await h.call('update_task', provenance_call())
+        assert h.recorder.args['metadata']['done_provenance']['note'] == f'per observation {BFF}'
+        assert h.resolver.prefixes == []
+        assert repair_of(result) is None
+        assert h.facts == []
+
+    async def test_a_sibling_argument_is_still_repaired(self) -> None:
+        h = path_exempt_harness()
+        result = await h.call('update_task', provenance_call(description=f'see {BFF}'))
+        assert h.recorder.args['description'] == f'see {BFF_FULL}'
+        assert h.recorder.args['metadata']['done_provenance']['note'] == f'per observation {BFF}'
+        repair = repair_of(result)
+        assert repair is not None
+        assert [record['path'] for record in repair['substitutions']] == [['description']]
+
+    async def test_the_exemption_is_scoped_to_the_named_tool(self) -> None:
+        h = path_exempt_harness()
+        call = provenance_call()
+        del call['task_id']
+        await h.call('submit_task', {**call, 'title': 't', 'description': 'd'})
+        assert h.recorder.args['metadata']['done_provenance']['note'] == f'per observation {BFF_FULL}'
+
+    async def test_a_path_is_matched_per_segment_not_as_a_string_prefix(self) -> None:
+        h = path_exempt_harness(('metadata', 'done'))
+        await h.call('update_task', provenance_call())
+        assert h.recorder.args['metadata']['done_provenance']['note'] == f'per observation {BFF_FULL}'
+
+    async def test_a_deeper_path_exempts_only_that_leaf(self) -> None:
+        h = path_exempt_harness(('metadata', 'done_provenance', 'note'))
+        call = provenance_call()
+        call['metadata']['done_provenance']['x'] = f'see {BFF}'
+        await h.call('update_task', call)
+        provenance = h.recorder.args['metadata']['done_provenance']
+        assert provenance['note'] == f'per observation {BFF}'
+        assert provenance['x'] == f'see {BFF_FULL}'
+
+    async def test_an_exempt_token_does_not_count_toward_the_ceiling(self) -> None:
+        h = path_exempt_harness()
+        call = provenance_call(description=f'see {BFF}')
+        call['metadata']['done_provenance']['notes'] = hex_tokens(
+            guard.MAX_DISTINCT_PREFIXES_PER_CALL + 1
+        )
+        result = await h.call('update_task', call)
+        assert h.resolver.prefixes == [BFF]
+        assert h.recorder.args['description'] == f'see {BFF_FULL}'
+        repair = repair_of(result)
+        assert repair is not None
+        assert 'resolver' not in repair
+
+    async def test_the_declared_paths_are_empty_by_default(self) -> None:
+        middleware = guard.UuidPrefixGuardMiddleware(_FakeResolver({}), lambda arguments: PROJECT)
+        assert middleware.exempt_paths == {}
+
+    async def test_an_empty_path_is_refused_at_construction(self) -> None:
+        with pytest.raises(ValueError, match='update_task'):
+            guard.UuidPrefixGuardMiddleware(
+                _FakeResolver({}),
+                lambda arguments: PROJECT,
+                exempt_paths={'update_task': frozenset({()})},
+            )
+
+    @pytest.mark.parametrize(
+        ('declaration', 'offending'),
+        [
+            pytest.param(
+                {'update_task': ('metadata', 'done_provenance')}, 'metadata', id='bare-path'
+            ),
+            pytest.param(
+                {'update_task': [['metadata', 'done_provenance']]},
+                ['metadata', 'done_provenance'],
+                id='list-path',
+            ),
+            pytest.param(
+                {'update_task': [('metadata', None)]}, ('metadata', None), id='non-segment'
+            ),
+        ],
+    )
+    async def test_a_malformed_path_is_refused_at_construction(
+        self, declaration: Mapping[str, Any], offending: object
+    ) -> None:
+        """An untyped caller's slip, which would otherwise silently match nothing."""
+        with pytest.raises(ValueError, match='update_task') as excinfo:
+            guard.UuidPrefixGuardMiddleware(
+                _FakeResolver({}), lambda arguments: PROJECT, exempt_paths=declaration
+            )
+        assert f'declares {offending!r},' in str(excinfo.value)
+
+
+# ---------------------------------------------------------------------------
+# A JSON-string metadata is walked as structure.
+# ---------------------------------------------------------------------------
+#
+# The shape task 7135's migration script sends. Its values get the same
+# structured paths a dict metadata's do, so a declared exempt path holds in
+# both wire shapes, and the tool receives the string shape it was sent.
+
+
+class TestAJsonStringMetadataIsWalkedAsStructure:
+    async def test_the_exempt_value_survives_and_a_sibling_key_is_expanded(self) -> None:
+        h = path_exempt_harness()
+        sent = json.dumps({
+            'done_provenance': {'kind': 'merged', 'note': f'per observation {BFF}'},
+            'x_note': f'see {BFF}',
+        })
+        result = await h.call('update_task', {'task_id': '7', 'project_root': PROJECT, 'metadata': sent})
+        received = h.recorder.args['metadata']
+        assert isinstance(received, str)
+        decoded = json.loads(received)
+        assert decoded['done_provenance']['note'] == f'per observation {BFF}'
+        assert decoded['x_note'] == f'see {BFF_FULL}'
+        repair = repair_of(result)
+        assert repair is not None
+        assert [(r['path'], r['field']) for r in repair['substitutions']] == [
+            (['metadata', 'x_note'], 'metadata')
+        ]
+
+    async def test_a_string_whose_only_token_is_exempt_is_forwarded_byte_identical(self) -> None:
+        h = path_exempt_harness()
+        sent = json.dumps(
+            {'done_provenance': {'kind': 'merged', 'note': f'per observation {BFF}'}}, indent=2
+        )
+        result = await h.call('update_task', {'task_id': '7', 'project_root': PROJECT, 'metadata': sent})
+        assert h.recorder.args['metadata'] == sent
+        assert h.resolver.prefixes == []
+        assert repair_of(result) is None
+
+    async def test_an_untouched_string_beside_an_expansion_is_forwarded_byte_identical(self) -> None:
+        h = path_exempt_harness()
+        sent = json.dumps({'kind': 'merged', 'note': 'no identifiers'}, indent=2)
+        await h.call(
+            'update_task',
+            {'task_id': '7', 'project_root': PROJECT, 'description': f'see {BFF}', 'metadata': sent},
+        )
+        assert h.recorder.args['description'] == f'see {BFF_FULL}'
+        assert h.recorder.args['metadata'] == sent
+
+    async def test_the_decoded_walk_is_uniform_across_tools(self) -> None:
+        h = build_harness(answers={BFF: unique(BFF_FULL)})
+        sent = json.dumps({'source': f'see {BFF}'})
+        result = await h.call(
+            'add_memory', {'content': 'c', 'project_id': PROJECT, 'metadata': sent}
+        )
+        received = h.recorder.args['metadata']
+        assert isinstance(received, str)
+        assert json.loads(received) == {'source': f'see {BFF_FULL}'}
+        repair = repair_of(result)
+        assert repair is not None
+        assert [r['path'] for r in repair['substitutions']] == [['metadata', 'source']]
+
+    async def test_a_rejection_bounces_the_callers_own_string(self) -> None:
+        h = build_harness(answers={AMB: AMBIGUOUS})
+        sent = json.dumps({'supersedes': f'see {AMB}'}, indent=2)
+        with pytest.raises(ToolError) as excinfo:
+            await h.call(
+                'submit_task',
+                {'title': 't', 'description': 'd', 'project_root': PROJECT, 'metadata': sent},
+            )
+        assert h.recorder.calls == []
+        assert rejection_payload(excinfo)['original_call']['metadata'] == sent

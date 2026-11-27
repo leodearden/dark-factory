@@ -1,0 +1,86 @@
+"""Item 5: does 'admit the n-th member while q < 1/n' bind below the depth actually chosen?
+
+q = per-request failure probability at dispatch. Rule max depth with constant q: n_max = max n with n*q < 1.
+(b): q = 1 - chain_depth_reason.pass_estimate, recorded at dispatch.
+(a): no recorded estimate; q reconstructed two ways at each chain's START (end_ts - duration):
+  E1 = the 8528 estimator replayed (chain_policy.seed_from_rows semantics: every merge_verify row so far,
+       last attempt per merge_sha, newest 30, pass_rate ** (1/mean chain_items));
+  E2 = rolling failure rate of the newest 30 non-gate single-request verifies.
+Binds = n_max < chain_items actually verified. Also counted: chains whose chain_items exceeded the n_max."""
+import sys, math
+sys.path.insert(0, '/tmp/gate-10069/measure')
+from collections import Counter
+from common import verifies
+
+V = sorted(verifies('2026-10-25'), key=lambda r: r['end_ts'])
+
+
+def n_max(q):
+    if q <= 0:
+        return 10 ** 6
+    n = math.ceil(1 / q) - 1
+    return max(n, 0) if n * q < 1 else n - 1
+
+
+def e1(before):
+    last = {}
+    for i, v in enumerate(before):
+        last[v['merge_sha'] or ('u', i)] = (i, v)
+    rows = [v for _, v in sorted(last.values(), key=lambda t: t[0])][-30:]
+    if not rows:
+        return None
+    pr = sum(r['passed'] for r in rows) / len(rows)
+    mk = sum(r['k'] for r in rows) / len(rows)
+    return pr ** (1 / mk)
+
+
+def e2(before):
+    s = [r for r in before if r['k'] == 1 and not r['gate']][-30:]
+    return sum(r['passed'] for r in s) / len(s) if s else None
+
+
+res = Counter()
+hist = Counter()
+for v in V:
+    if v['ts'] < '2026-11-05' or v['k'] < 2:
+        continue
+    before = [r for r in V if r['end_ts'] < v['start_ts']]
+    if v['win'] == 'b':
+        p = v['cdr']['pass_estimate']
+        nm = n_max(1 - p)
+        res[('b', 'recorded', 'n')] += 1
+        res[('b', 'recorded', 'binds')] += nm < v['k']
+        res[('b', 'recorded', 'equal')] += nm == v['k']
+        hist[('b', 'recorded', v['k'], nm if nm < 50 else '50+')] += 1
+        # sanity: table row choice consistent
+        continue
+    for name, f in (('E1_8528_estimator', e1), ('E2_rolling30_singles', e2)):
+        p = f(before)
+        nm = n_max(1 - p)
+        res[('a', name, 'n')] += 1
+        res[('a', name, 'binds')] += nm < v['k']
+        res[('a', name, 'equal')] += nm == v['k']
+        hist[('a', name, v['k'], nm if nm < 50 else '50+')] += 1
+for k in sorted(res):
+    print(k, res[k])
+print()
+for k in sorted(hist, key=str):
+    print(k, hist[k])
+# check the table rule against the recorded pass_estimate for (b)
+print()
+for v in V:
+    if v['win'] == 'b' and v['k'] >= 2:
+        c = v['cdr']
+        print(v['ts'][:16], 'k', v['k'], 'p', round(c['pass_estimate'], 3), 'row', c['row'], 'queue', c['queue_depth'], 'n_max(q<1/n)', n_max(1 - c['pass_estimate']))
+
+print('\n(a) outcome of chains where the rule binds vs not')
+oc = Counter()
+for v in V:
+    if v['ts'] < '2026-11-05' or v['k'] < 2 or v['win'] != 'a':
+        continue
+    before = [r for r in V if r['end_ts'] < v['start_ts']]
+    for name, f in (('E1', e1), ('E2', e2)):
+        b = n_max(1 - f(before)) < v['k']
+        oc[(name, 'binds' if b else 'not', 'pass' if v['passed'] else 'red')] += 1
+for k in sorted(oc):
+    print(k, oc[k])

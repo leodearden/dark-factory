@@ -8,14 +8,17 @@ import os
 import sys
 import tempfile
 import time
-from collections.abc import Mapping
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import anyio
 import httpx
-from shared.jcodemunch_launch import jcodemunch_server_config
+from shared.mcp_envelope import (  # noqa: F401 — re-exported for agents/memory_recall.py  # debt: task 7688
+    tool_error_text,
+    tool_text_blocks,
+)
 from shared.mcp_session import McpSession
 from shared.proc_group import terminate_process_group
 
@@ -65,8 +68,6 @@ def apply_mcp_startup_env(
 # task venvs.  Skipping the implicit pre-run sync (--no-sync) and lockfile
 # re-resolution (--frozen) eliminates the resolve/build stall that caused the
 # 0-turn MCP-startup wedge under load (reify esc-4415-240, esc-4437-123).
-# This is the plan_tools analog of the jcodemunch "don't re-resolve/rebuild
-# per launch" durable fix.
 _PLAN_TOOLS_FAST_START_FLAGS: tuple[str, ...] = ('--no-sync', '--frozen')
 
 
@@ -96,13 +97,15 @@ def _stdio_mcp_server(
     worktree: Path,
     python_executable: str | None = None,
     meta_root: Path | None = None,
+    task_root: Path | None = None,
     extra_args: tuple[str, ...] = (),
 ) -> dict:
     """Shared launch-dict factory for stdio MCP servers (task 2482 amendment).
 
     :func:`plan_tools_mcp_server` and :func:`verdict_tools_mcp_server` both
-    delegate here — they differ only by *module_path* and an optional
-    *extra_args* tail (verdict-tools' ``('--verdict-role', role)``), so the
+    delegate here — they differ only by *module_path* and their *extra_args*
+    tail (plan-tools' ``--grants-enforced`` marker and ``--grant`` pairs,
+    verdict-tools' ``('--verdict-role', role)``), so the
     no-uv hot path vs. ``uv --no-sync --frozen`` fallback branch and the
     ``meta_root`` passthrough now live in exactly one place instead of two
     near-identical copies.
@@ -133,14 +136,19 @@ def _stdio_mcp_server(
             ``--meta-root``.  When ``None`` (default), no ``--meta-root``
             flag is emitted and args are byte-identical to before this
             parameter existed.
+        task_root: Optional task-lifetime root (see
+            ``TaskArtifacts.task_root_for``), passed as ``--task-root``
+            right after the ``--meta-root`` pair; ``None`` emits nothing.
         extra_args: Additional tokens appended after the ``--worktree``/
-            ``--meta-root`` args (e.g. verdict-tools' ``--verdict-role``
-            pair).  Empty by default — exactly plan-tools' shape.
+            ``--meta-root``/``--task-root`` args: plan-tools'
+            ``--grants-enforced`` marker and ``--grant`` pairs, or
+            verdict-tools' ``--verdict-role`` pair.  Empty by default.
 
     Returns:
         Claude Code MCP server config dict with ``command`` and ``args``.
     """
     meta_root_args = ['--meta-root', str(meta_root)] if meta_root is not None else []
+    task_root_args = ['--task-root', str(task_root)] if task_root is not None else []
     if python_executable:
         # Direct-interpreter no-uv hot path: eliminates the uv futex wedge.
         return {
@@ -148,6 +156,7 @@ def _stdio_mcp_server(
             'args': [
                 '-m', module_path, '--worktree', str(worktree),
                 *meta_root_args,
+                *task_root_args,
                 *extra_args,
             ],
             # Suppress FastMCP's banner + synchronous PyPI update-check so the
@@ -166,6 +175,7 @@ def _stdio_mcp_server(
             'python', '-m', module_path,
             '--worktree', str(worktree),
             *meta_root_args,
+            *task_root_args,
             *extra_args,
         ],
         # Same FastMCP banner/update-check suppression as the hot path above;
@@ -179,6 +189,9 @@ def plan_tools_mcp_server(
     worktree: Path,
     python_executable: str | None = None,
     meta_root: Path | None = None,
+    task_root: Path | None = None,
+    granted_tools: Iterable[str] = (),
+    caller_role: str | None = None,
 ) -> dict:
     """Return a stdio MCP server config dict for the plan-tools server.
 
@@ -186,7 +199,7 @@ def plan_tools_mcp_server(
     supplied, the config launches plan-tools directly via that interpreter
     without involving ``uv`` at all::
 
-        <python_executable> -m orchestrator.mcp.plan_tools --worktree <wt>
+        <python_executable> -m orchestrator.mcp.plan_tools --worktree <wt> [root args] --grants-enforced [--grant <name> ...]
 
     This eliminates the ``uv``-induced startup stalls that caused 0-turn
     ``error_empty_output`` failures under load: ``uv run`` acquires a
@@ -201,9 +214,9 @@ def plan_tools_mcp_server(
 
     **uv fallback (backward-compat, tasks 1775/this):** When
     *python_executable* is ``None`` (default), the existing fast-start form is
-    returned unchanged::
+    returned, with the same arguments after ``-m``::
 
-        uv run --project <orch> --no-sync --frozen python -m orchestrator.mcp.plan_tools --worktree <wt>
+        uv run --project <orch> --no-sync --frozen python -m orchestrator.mcp.plan_tools --worktree <wt> ...
 
     The fallback preserves task 1775's ``TestPlanToolsLaunchFastStart``
     regression tests and serves any caller that cannot supply an interpreter.
@@ -229,15 +242,28 @@ def plan_tools_mcp_server(
             plan-tools server as ``--meta-root``, so the agent-side plan.json
             writer targets the same relocated artifacts root as the
             orchestrator (worktree-lane-lifecycle PRD task ε1). When
-            ``None`` (default), no ``--meta-root`` flag is emitted and args
-            are byte-identical to before this parameter existed.
+            ``None`` (default), no ``--meta-root`` flag is emitted.
+        task_root: Optional task-lifetime root passed as ``--task-root``.
+        granted_tools: The tool names the launched server exposes. The
+            ``--grants-enforced`` marker is always emitted after the root
+            args, so the default exposes no tool
+            (``orchestrator.mcp.plan_tools.server_from_argv``). One
+            ``--grant <name>`` pair per name follows it, sorted.
+        caller_role: The role the launched server serves, emitted as
+            ``--caller-role <role>`` after the grants. Attribution on markup
+            records only (task 5055); ``None`` (default) emits no flag.
 
     Returns:
         Claude Code MCP server config dict with ``command`` and ``args``.
     """
     return _stdio_mcp_server(
         'orchestrator.mcp.plan_tools', orch_project_dir, worktree,
-        python_executable=python_executable, meta_root=meta_root,
+        python_executable=python_executable, meta_root=meta_root, task_root=task_root,
+        extra_args=(
+            '--grants-enforced',
+            *(token for name in sorted(set(granted_tools)) for token in ('--grant', name)),
+            *(() if caller_role is None else ('--caller-role', caller_role)),
+        ),
     )
 
 
@@ -247,12 +273,13 @@ def verdict_tools_mcp_server(
     role: str,
     python_executable: str | None = None,
     meta_root: Path | None = None,
+    task_root: Path | None = None,
 ) -> dict:
     """Return a stdio MCP server config dict for the verdict-tools server.
 
     Launch target is α's ``orchestrator.mcp.verdict_tools`` CLI (task 2481):
     ``<interpreter> -m orchestrator.mcp.verdict_tools --worktree <wt>
-    [--meta-root <mr>] --verdict-role <role>``. *role* is the
+    [--meta-root <mr>] [--task-root <tr>] --verdict-role <role>``. *role* is the
     ``--verdict-role`` value — the authoritative selector for both which
     single tool the server registers (judge/merger/reviewer-name, see
     ``verdict_tools.create_server``) and the ``verdicts/<role>.json``
@@ -261,8 +288,8 @@ def verdict_tools_mcp_server(
     Delegates to the shared :func:`_stdio_mcp_server` helper (task 2482
     amendment) — same direct-interpreter no-uv hot path vs. ``uv --no-sync
     --frozen`` fallback branch, same ``meta_root`` passthrough as
-    :func:`plan_tools_mcp_server`, differing only by module path and the
-    added ``('--verdict-role', role)`` extra-args tail.
+    :func:`plan_tools_mcp_server`, differing only by module path and its
+    ``('--verdict-role', role)`` extra-args tail.
 
     The returned dict carries the shared ``_FASTMCP_STDIO_QUIET_ENV``
     (``FASTMCP_SHOW_SERVER_BANNER='false'`` / ``FASTMCP_CHECK_FOR_UPDATES=
@@ -301,13 +328,14 @@ def verdict_tools_mcp_server(
             ``--meta-root``, so the agent-side verdict-tools server targets
             the same relocated artifacts root as the orchestrator. When
             ``None`` (default), no ``--meta-root`` flag is emitted.
+        task_root: Optional task-lifetime root passed as ``--task-root``.
 
     Returns:
         Claude Code MCP server config dict with ``command`` and ``args``.
     """
     return _stdio_mcp_server(
         'orchestrator.mcp.verdict_tools', orch_project_dir, worktree,
-        python_executable=python_executable, meta_root=meta_root,
+        python_executable=python_executable, meta_root=meta_root, task_root=task_root,
         extra_args=('--verdict-role', role),
     )
 
@@ -451,35 +479,6 @@ async def verify_plan_tools_startup(
 
     probes = await _run_all()
     return PlanToolsStartupReport(probes=probes)
-
-
-def tool_error_text(reply: Mapping[str, Any]) -> str | None:
-    """The error prose of a tool-level failure, or None if the tool succeeded.
-
-    An MCP tool reports its own failure in the response body, as a
-    well-formed envelope carrying ``isError``, not by breaking the transport.
-    Nothing about that envelope's shape says it failed, so a reader that
-    checks only the shape would take the error prose for a result.
-    """
-    if not reply.get('isError'):
-        return None
-    texts = tool_text_blocks(reply)
-    return texts[0] if texts else ''
-
-
-def tool_text_blocks(reply: Mapping[str, Any]) -> tuple[str, ...]:
-    """The text of each ``text`` content block of a tool result, in order.
-
-    An envelope whose ``content`` is missing, null or not a list carries no text.
-    """
-    content = reply.get('content')
-    if not isinstance(content, list):
-        return ()
-    return tuple(
-        str(block.get('text', ''))
-        for block in content
-        if isinstance(block, dict) and block.get('type') == 'text'
-    )
 
 
 # The orchestrator's one self-identification spelling. clientInfo reaches only
@@ -732,7 +731,6 @@ class McpLifecycle:
                     'type': 'http',
                     'url': f'{self.config.url}/mcp',
                 },
-                'jcodemunch': jcodemunch_server_config(),
             },
         }
         if escalation_url:

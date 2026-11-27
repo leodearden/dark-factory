@@ -19,10 +19,11 @@ implementation here and reify's Bash ``_is_file_path`` in
 equivalent *by construction*: same extension allowlist, same extension-less
 filename allowlist, same strip/segment/ext algorithm.
 
-The drift-guard test in ``tests/test_lock_charter_guard.py`` pins
-``sorted(FILE_EXTENSIONS)`` to the shared α/γ canonical vector printed by
-``lock-charter-guard.sh --list-extensions``, so divergence is caught at CI
-time.
+The drift guards in ``tests/test_lock_charter_guard.py`` pin both vectors to
+canonical literals and to ``shared.locking``'s copy.  Agreement with reify's
+``lock-charter-guard.sh`` is checked OFF the merge gate: the nightly
+``scripts/check_lock_charter_drift.py`` reports a divergence and files one
+heal task for it (task 11623; ``OPERATIONS.md`` section 9a).
 
 STATUS — cross-repo agreement on the extension-less vector (#3248)
 -------------------------------------------------------------------
@@ -35,14 +36,9 @@ script — the two vectors are identical, and ``classify hooks/project-checks``
 returns ACCEPT, not REJECT.  So this change CONVERGED the seam rather than
 opening one; no reify follow-up is owed.
 
-The extension-half Tier-2 drift guard
-(``test_extension_drift_guard_vs_reify_script``) compares
-``sorted(FILE_EXTENSIONS)`` against ``--list-extensions``, i.e. an EXTENSION
-vector only, and is structurally blind to this frozenset.  That gap is closed
-by its extension-less sibling
-(``test_extensionless_drift_guard_vs_reify_script``), which pins this vector
-against ``--list-extensionless`` so three-way α/γ/bash agreement is ENFORCED
-rather than merely asserted in prose.
+Comparing ``--list-extensions`` alone, an EXTENSION vector, would be blind to
+this frozenset, so the nightly check compares ``--list-extensionless`` too, and
+three-way α/γ/bash agreement is checked rather than merely asserted in prose.
 
 Extension allowlist rationale (reify PRD §11 Q2):
 - PRD-explicit: rs ri toml cpp c h hpp md json yaml yml lock py sh ts tsx js txt step stl
@@ -96,20 +92,10 @@ tests:
 
 from __future__ import annotations
 
-import json
-import logging
 from typing import Any
 
-from shared.task_metadata import parse_metadata
-
-logger = logging.getLogger(__name__)
-
-# SchemaWarning codes (shared.task_metadata) that mean the WHOLE metadata
-# value was discarded — parse_metadata could not produce any dict at all.
-# Only these are loud here; 'unknown_key'/'invalid_field'/'invalid_submodel'
-# etc. are expected on legitimate curator-internal metadata and belong to
-# the write boundary (W3-β), not this read-path guard.
-_DISCARD_CODES = frozenset({'unparseable_json', 'not_an_object'})
+from fused_memory.middleware.deterministic_task_guard import DETERMINISTIC_ROUTING_HINT
+from fused_memory.middleware.metadata_dict import raw_metadata_dict
 
 # ---------------------------------------------------------------------------
 # Canonical extension allowlist — kept in sync with shared.locking.FILE_EXTENSIONS.
@@ -151,7 +137,7 @@ FILE_EXTENSIONS: frozenset[str] = frozenset({
     'lock', 'log',
     'manifest', 'md', 'mjs', 'mts',
     'npmrc', 'png', 'py', 'python-version',
-    'ri', 'rs', 'scss', 'service', 'sh', 'step', 'stl', 'svg',
+    'ri', 'rs', 'scss', 'service', 'sh', 'stderr', 'step', 'stl', 'svg',
     'template', 'timer', 'tombstones', 'toml', 'ts', 'tsv', 'tsx', 'txt', 'typed',
     'yaml', 'yml',
 })
@@ -169,7 +155,8 @@ FILE_EXTENSIONS: frozenset[str] = frozenset({
 # to the 2026-07-31 measurement) — every tracked path whose final segment
 # contains no '.'.  dark-factory contributes Dockerfile LICENSE pre-commit
 # pre-merge-commit project-checks; reify adds cargo cargo-audit-orphans
-# reference-transaction.  Union = the 8 below.
+# reference-transaction, and sccache (scripts/canon-bin/guard/sccache, reify
+# task 10232, measured on reify main 2026-11-23).  Union = the 9 below.
 #
 # GITLINK EXCLUSION — load-bearing, and a deliberate decision rather than an
 # accident of the sweep: `git ls-files -s` entries with mode 160000 are submodule
@@ -192,9 +179,10 @@ FILE_EXTENSIONS: frozenset[str] = frozenset({
 # CROSS-PROJECT SCOPE — the limitation this enumeration knowingly accepts, and
 # the reason the admission rule above is stricter than it looks.  Members are
 # matched as BARE FINAL SEGMENTS and several are generic: `cargo`, `Dockerfile`,
-# `LICENSE`, `pre-commit`.  The collision guard that bounds this risk
-# (test_no_canonical_extensionless_name_is_also_a_directory) sweeps only the
-# dark-factory and reify checkouts — but this predicate governs lock charters
+# `LICENSE`, `pre-commit`.  The collision checks that bound this risk
+# (test_no_canonical_extensionless_name_is_also_a_directory on the gate, and
+# scripts/check_lock_charter_drift.py::check_extensionless nightly) sweep only
+# the dark-factory and reify checkouts — but this predicate governs lock charters
 # for EVERY project the orchestrator targets.  In a third project containing
 # `tools/cargo/` or `docker/Dockerfile/` as a real DIRECTORY, that directory now
 # classifies as a FILE: directory_locks stops rejecting it and derive_modules
@@ -208,8 +196,8 @@ FILE_EXTENSIONS: frozenset[str] = frozenset({
 # Drift guard (this γ copy): fused-memory/tests/test_lock_charter_guard.py::test_extensionless_drift_guard
 # Drift guard (shared copy in shared/locking.py): shared/tests/test_locking.py::TestExtensionlessFilenamesDriftGuard
 # Self-audit (both copies): test_every_tracked_extensionless_file_is_allowlisted
-#   sweeps both repos' tracked corpora, so the 9th extension-less file surfaces
-#   as a red test rather than as another LockCharterViolation incident.
+#   sweeps both repos' tracked corpora, so a newly tracked extension-less file
+#   surfaces as a red test rather than as another LockCharterViolation incident.
 # ---------------------------------------------------------------------------
 
 EXTENSIONLESS_FILENAMES: frozenset[str] = frozenset({
@@ -221,6 +209,7 @@ EXTENSIONLESS_FILENAMES: frozenset[str] = frozenset({
     'pre-merge-commit',
     'project-checks',
     'reference-transaction',
+    'sccache',
 })
 
 
@@ -328,56 +317,86 @@ def extract_files(metadata: str | dict[str, Any] | None) -> list[str]:
         across module boundaries.
 
     Rules:
-    - ``None`` → []
-    - ``dict`` → use directly
-    - ``str`` → ``json.loads``; on failure or non-dict result → []
+    - *metadata* resolves to a dict through
+      :func:`fused_memory.middleware.metadata_dict.raw_metadata_dict`, so
+      absent metadata is empty and unreadable metadata is empty and logged.
     - If the resolved dict has no ``files`` key → []
     - If ``files`` is not a list → []
     - Return only the string entries of the list.
-
-    The ``str`` branch delegates its malformed-input policy to
-    :func:`shared.task_metadata.parse_metadata` (``direction='read'``) and
-    emits a ``task_metadata.schema_warning`` WARNING when *metadata* cannot
-    be resolved to a JSON object at all (unparseable JSON / non-object) — I4:
-    this replaces a silent ``[]`` coercion. The dict-path extraction below is
-    untouched, so mixed-type-list filtering and non-list-``files`` behaviour
-    are unchanged.
     """
-    if metadata is None:
-        return []
-
-    parsed: dict[str, Any] | None = None
-    if isinstance(metadata, dict):
-        parsed = metadata
-    elif isinstance(metadata, str) and not metadata:
-        # Empty string is benign-absent, not a discard — mirrors the
-        # pre-collapse `isinstance(raw, str) and raw` guard.
-        return []
-    elif isinstance(metadata, str):
-        _, warnings = parse_metadata(metadata, direction='read')
-        discard = [w for w in warnings if w.code in _DISCARD_CODES]
-        if discard:
-            reason = '; '.join(w.message for w in discard) or 'unrecognised shape'
-            logger.warning(
-                'task_metadata.schema_warning source=lock_charter_guard.extract_files '
-                'error=%s (type=%s); metadata discarded',
-                reason,
-                type(metadata).__name__,
-            )
-            return []
-        # parse_metadata already confirmed this parses to a JSON object —
-        # reparse independently for the raw dict (see docstring above: never
-        # model_dump()).
-        parsed = json.loads(metadata)
-
-    if parsed is None:
-        return []
-
+    parsed = raw_metadata_dict(metadata, source='lock_charter_guard.extract_files')
     files = parsed.get('files')
     if not isinstance(files, list):
         return []
 
     return [f for f in files if isinstance(f, str)]
+
+
+def _allowlist_lockstep(vector: str, reify_var: str, test_vector: str) -> str:
+    """Name every home of the allowlist *vector*, which must all change together."""
+    return (
+        f'{vector} in BOTH shared/src/shared/locking.py and '
+        'fused-memory/src/fused_memory/middleware/lock_charter_guard.py, '
+        f'AND to reify scripts/lock-charter-guard.sh {reify_var} (all three '
+        'must agree — the nightly scripts/check_lock_charter_drift.py reports '
+        f'a mismatch and files the heal task), plus the {test_vector} vector '
+        'in both test copies.'
+    )
+
+
+_DIRECTORY_HINT = (
+    'Replace each directory with the specific file paths it contains, '
+    'or use files=[] (the defer-to-architect value) to leave scope '
+    'unspecified. Directory strings in metadata.files are rejected '
+    'because they create over-wide lock charters that block unrelated '
+    'work in the same directory. '
+    'Note: extension matching is case-sensitive against a lowercase '
+    'allowlist (e.g. "README.MD" or "config.YAML" is classified as a '
+    'directory — use lowercase extensions like "README.md" instead). '
+    'If the offending path has NO extension at all, "replace it with '
+    'the files it contains" may be unfollowable because it IS a file '
+    '(e.g. "hooks/project-checks"): an extension-less final segment '
+    'counts as a file only when its exact name is listed in '
+    'EXTENSIONLESS_FILENAMES. If it is a genuinely new extension-less '
+    'tracked file, add its name to '
+    + _allowlist_lockstep(
+        'EXTENSIONLESS_FILENAMES', '_EXTLESS', '_CANONICAL_EXTENSIONLESS',
+    )
+)
+
+
+def _has_unrecognised_extension(path: str) -> bool:
+    """True iff *path* is not slash-terminated and its final segment's extension is unlisted in any case."""
+    segment = path.rsplit('/', 1)[-1]
+    return (
+        not path.endswith('/')
+        and '.' in segment
+        and segment.rsplit('.', 1)[1].lower() not in FILE_EXTENSIONS
+    )
+
+
+def _unrecognised_extension_error(paths: list[str]) -> str:
+    path_list = ', '.join(repr(p) for p in paths)
+    return (
+        f' {path_list} may instead be a FILE whose extension is not on the '
+        'allowlist; if it is gitignored, files=[] will not help, because a '
+        "task_kind='normal' task cannot deliver a gitignored file — file such "
+        "work as task_kind='deterministic' (see hint)."
+    )
+
+
+def _unrecognised_extension_hint(paths: list[str]) -> str:
+    path_list = ', '.join(repr(p) for p in paths)
+    return (
+        f' {path_list} may be a FILE whose extension is not on the '
+        'FILE_EXTENSIONS allowlist. A gitignored file can never be committed, '
+        "so a task_kind='normal' task cannot deliver it, and files=[] only "
+        f'hands the same failure to the architect. {DETERMINISTIC_ROUTING_HINT} '
+        'Whatever the task_kind, leave a gitignored path out of '
+        'metadata.files: this check classifies it as a directory either way. '
+        'If it is instead a TRACKED file, add its extension to '
+        + _allowlist_lockstep('FILE_EXTENSIONS', '_EXTS', '_CANONICAL_EXTENSIONS')
+    )
 
 
 def lock_charter_error(
@@ -387,7 +406,8 @@ def lock_charter_error(
     """Return a structured LockCharterViolation error dict.
 
     Shape mirrors ``_done_gate_error`` / ``PathGuardVerdict.to_error_dict``
-    so MCP callers handle it uniformly.
+    so MCP callers handle it uniformly.  ``unrecognised_extension_paths``
+    lists the rejected paths whose extension is unlisted in any case, i.e. may be files.
 
     Args:
         directories: The offending directory-like path strings.
@@ -396,35 +416,21 @@ def lock_charter_error(
     """
     task_clause = f' (task {task_id})' if task_id else ''
     dir_list = ', '.join(repr(d) for d in directories)
+    unrecognised = [d for d in directories if _has_unrecognised_extension(d)]
+    error = (
+        f'metadata.files contains directory declarations{task_clause}: '
+        f'{dir_list}. '
+        f'Declare individual file paths (e.g. "src/foo.py") or use '
+        f'files=[] to defer scope to the architect.'
+    )
+    hint = _DIRECTORY_HINT
+    if unrecognised:
+        error += _unrecognised_extension_error(unrecognised)
+        hint += _unrecognised_extension_hint(unrecognised)
     return {
-        'error': (
-            f'metadata.files contains directory declarations{task_clause}: '
-            f'{dir_list}. '
-            f'Declare individual file paths (e.g. "src/foo.py") or use '
-            f'files=[] to defer scope to the architect.'
-        ),
+        'error': error,
         'error_type': 'LockCharterViolation',
         'directory_paths': directories,
-        'hint': (
-            'Replace each directory with the specific file paths it contains, '
-            'or use files=[] (the defer-to-architect value) to leave scope '
-            'unspecified. Directory strings in metadata.files are rejected '
-            'because they create over-wide lock charters that block unrelated '
-            'work in the same directory. '
-            'Note: extension matching is case-sensitive against a lowercase '
-            'allowlist (e.g. "README.MD" or "config.YAML" is classified as a '
-            'directory — use lowercase extensions like "README.md" instead). '
-            'If the offending path has NO extension at all, "replace it with '
-            'the files it contains" may be unfollowable because it IS a file '
-            '(e.g. "hooks/project-checks"): an extension-less final segment '
-            'counts as a file only when its exact name is listed in '
-            'EXTENSIONLESS_FILENAMES. If it is a genuinely new extension-less '
-            'tracked file, add its name to EXTENSIONLESS_FILENAMES in BOTH '
-            'shared/src/shared/locking.py and '
-            'fused-memory/src/fused_memory/middleware/lock_charter_guard.py, '
-            'AND to reify scripts/lock-charter-guard.sh _EXTLESS (all three '
-            'must agree — the Tier-2 --list-extensionless drift guard goes RED '
-            'otherwise), plus the _CANONICAL_EXTENSIONLESS vector in both test '
-            'copies.'
-        ),
+        'unrecognised_extension_paths': unrecognised,
+        'hint': hint,
     }

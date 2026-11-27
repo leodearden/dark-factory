@@ -8,7 +8,7 @@ Covers the SHA-sensitive merge_request submit gate enforced at
 - same branch + new SHA + QUEUED (verify not started) → REPLACE iff descendant (D2)
 - same branch + new SHA + IN VERIFY → structured REJECT ``duplicate_in_verify`` (D3)
 
-Imports of ``orchestrator.merge_lane.worker`` symbols are done LOCALLY inside each
+Imports of ``orchestrator.merge_lane`` symbols are done LOCALLY inside each
 test so a not-yet-defined symbol never breaks collection during RED.
 """
 
@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from _git_fixtures import seed_repo
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore
@@ -37,16 +38,6 @@ from orchestrator.merge_lane.types import (
 # test_remove_merge_worktree_guarded.py:47-84; merge_queue symbols imported
 # LOCALLY inside each test so a not-yet-defined symbol never breaks collection).
 # ---------------------------------------------------------------------------
-
-
-async def _setup_repo(repo: Path) -> None:
-    """Initialise a git repository with a single commit on main."""
-    await _run(['git', 'init', '-b', 'main'], cwd=repo)
-    await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=repo)
-    await _run(['git', 'config', 'user.name', 'Test'], cwd=repo)
-    (repo / 'README.md').write_text('# Test\n')
-    await _run(['git', 'add', '-A'], cwd=repo)
-    await _run(['git', 'commit', '-m', 'Initial commit'], cwd=repo)
 
 
 async def _head_sha(repo: Path) -> str:
@@ -70,10 +61,7 @@ async def _commit(repo: Path, name: str) -> str:
 
 @pytest.fixture
 def git_repo(tmp_path: Path) -> Path:
-    repo = tmp_path / 'repo'
-    repo.mkdir()
-    asyncio.run(_setup_repo(repo))
-    return repo
+    return seed_repo(tmp_path / 'repo')
 
 
 @pytest.fixture
@@ -177,7 +165,7 @@ class _ScratchSpy:
         self.removed: list[tuple[Path, str]] = []
         self.find_calls = 0
 
-    async def find_inflight_merge_worktree(self, branch: str) -> Path | None:  # noqa: ARG002
+    async def find_inflight_merge_worktree(self, branch: str) -> Path | None:
         self.find_calls += 1
         return self._scratch
 
@@ -187,7 +175,7 @@ class _ScratchSpy:
             shutil.rmtree(path)
         return 'removed'
 
-    async def cleanup_merge_worktree(self, merge_wt: Path) -> None:  # noqa: ARG002
+    async def cleanup_merge_worktree(self, merge_wt: Path) -> None:
         return None
 
 
@@ -262,7 +250,7 @@ class TestDecideC3SubmitAction:
 
     async def test_same_not_verifying_coalesces(self):
         """SAME + not verifying → COALESCE (D1)."""
-        from orchestrator.merge_lane.worker import (
+        from orchestrator.merge_lane.tip_relation import (
             C3SubmitAction,
             TipRelation,
             decide_c3_submit_action,
@@ -271,7 +259,7 @@ class TestDecideC3SubmitAction:
 
     async def test_same_verifying_coalesces(self):
         """SAME + verifying → COALESCE (D1: same SHA never rejects/replaces even during verify)."""
-        from orchestrator.merge_lane.worker import (
+        from orchestrator.merge_lane.tip_relation import (
             C3SubmitAction,
             TipRelation,
             decide_c3_submit_action,
@@ -280,7 +268,7 @@ class TestDecideC3SubmitAction:
 
     async def test_subset_not_verifying_coalesces(self):
         """SUBSET + not verifying → COALESCE (stale retry / patch-id-equivalent twin)."""
-        from orchestrator.merge_lane.worker import (
+        from orchestrator.merge_lane.tip_relation import (
             C3SubmitAction,
             TipRelation,
             decide_c3_submit_action,
@@ -289,7 +277,7 @@ class TestDecideC3SubmitAction:
 
     async def test_subset_verifying_coalesces(self):
         """SUBSET + verifying → COALESCE (containment coalesces regardless of verify state)."""
-        from orchestrator.merge_lane.worker import (
+        from orchestrator.merge_lane.tip_relation import (
             C3SubmitAction,
             TipRelation,
             decide_c3_submit_action,
@@ -298,7 +286,7 @@ class TestDecideC3SubmitAction:
 
     async def test_superset_not_verifying_replaces(self):
         """SUPERSET + not verifying (QUEUED) → REPLACE (D2: drop old queued, dispatch fresh)."""
-        from orchestrator.merge_lane.worker import (
+        from orchestrator.merge_lane.tip_relation import (
             C3SubmitAction,
             TipRelation,
             decide_c3_submit_action,
@@ -307,7 +295,7 @@ class TestDecideC3SubmitAction:
 
     async def test_superset_verifying_rejects(self):
         """SUPERSET + verifying (IN VERIFY) → REJECT (D3: structured duplicate_in_verify)."""
-        from orchestrator.merge_lane.worker import (
+        from orchestrator.merge_lane.tip_relation import (
             C3SubmitAction,
             TipRelation,
             decide_c3_submit_action,
@@ -316,13 +304,13 @@ class TestDecideC3SubmitAction:
 
     async def test_divergent_raises_value_error(self):
         """DIVERGENT → ValueError (must resolve via resolve_divergent first)."""
-        from orchestrator.merge_lane.worker import TipRelation, decide_c3_submit_action
+        from orchestrator.merge_lane.tip_relation import TipRelation, decide_c3_submit_action
         with pytest.raises(ValueError, match='DIVERGENT'):
             decide_c3_submit_action(TipRelation.DIVERGENT, verifying=False)
 
     async def test_divergent_verifying_also_raises(self):
         """DIVERGENT + verifying → ValueError (same resolve-first constraint)."""
-        from orchestrator.merge_lane.worker import TipRelation, decide_c3_submit_action
+        from orchestrator.merge_lane.tip_relation import TipRelation, decide_c3_submit_action
         with pytest.raises(ValueError, match='DIVERGENT'):
             decide_c3_submit_action(TipRelation.DIVERGENT, verifying=True)
 
@@ -358,7 +346,7 @@ class TestC3SubmitGateInVerify:
         test — the reject must actually fire.  The live in-flight entry must be
         left UNDISTURBED (still registered, primary future not cancelled).
         """
-        from orchestrator.merge_lane.worker import coalesce_or_enqueue_merge_request
+        from orchestrator.merge_lane.intake import coalesce_or_enqueue_merge_request
 
         sha1 = await _commit(git_repo, 'c1')
         sha2 = await _commit(git_repo, 'c2')  # strict descendant of sha1 → SUPERSET
@@ -402,7 +390,7 @@ class TestC3SubmitGateInVerify:
         self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path, tmp_path: Path,
     ) -> None:
         """(b) SAME SHA while IN VERIFY → coalesce, NOT reject (D1)."""
-        from orchestrator.merge_lane.worker import coalesce_or_enqueue_merge_request
+        from orchestrator.merge_lane.intake import coalesce_or_enqueue_merge_request
 
         sha1 = await _commit(git_repo, 'c1')
 
@@ -458,7 +446,7 @@ class TestC3SubmitGateQueued:
     ) -> None:
         """(a) REPLACE: NEW descendant SHA while QUEUED → drop old entry, dispatch
         fresh, clean the dropped scratch via the C1 guarded primitive (D2)."""
-        from orchestrator.merge_lane.worker import coalesce_or_enqueue_merge_request
+        from orchestrator.merge_lane.intake import coalesce_or_enqueue_merge_request
 
         sha1 = await _commit(git_repo, 'c1')
         sha2 = await _commit(git_repo, 'c2')  # strict descendant → SUPERSET
@@ -508,7 +496,7 @@ class TestC3SubmitGateQueued:
     ) -> None:
         """(b) SUBSET stale retry: an ancestor SHA → coalesce, old entry retained,
         scratch NOT cleaned."""
-        from orchestrator.merge_lane.worker import coalesce_or_enqueue_merge_request
+        from orchestrator.merge_lane.intake import coalesce_or_enqueue_merge_request
 
         sha1 = await _commit(git_repo, 'c1')
         sha2 = await _commit(git_repo, 'c2')  # sha1 is ancestor of sha2
@@ -549,7 +537,7 @@ class TestC3SubmitGateQueued:
     ) -> None:
         """(c) Patch-id-equivalent DIVERGENT (rebased twin) → coalesce (amendment):
         resolve_divergent folds it to SUBSET, so genuine content is never lost."""
-        from orchestrator.merge_lane.worker import coalesce_or_enqueue_merge_request
+        from orchestrator.merge_lane.intake import coalesce_or_enqueue_merge_request
 
         tip_old, tip_new = await _make_patch_equivalent_twin(git_repo)
 
@@ -590,7 +578,7 @@ class TestC3SubmitGateQueued:
     ) -> None:
         """(d) Genuine force-push DIVERGENT (new content) while QUEUED → REPLACE
         and log a divergence WARNING (D2)."""
-        from orchestrator.merge_lane.worker import coalesce_or_enqueue_merge_request
+        from orchestrator.merge_lane.intake import coalesce_or_enqueue_merge_request
 
         tip_old, tip_new = await _make_divergent_forcepush(git_repo)
 

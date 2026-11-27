@@ -34,7 +34,14 @@ from types import SimpleNamespace
 
 import pytest
 from shared import toolcall_markup
-from shared.mcp_markup_middleware import MARKUP_RECURRENCE_ROUTING, OUTCOMES
+from shared.markup_residue_custody import MARKUP_REFUSAL_CUSTODY_CAVEAT, residue_prose
+from shared.mcp_markup_middleware import (
+    MARKUP_RECURRENCE_ROUTING,
+    MARKUP_UNRECOVERED_PARAM_ERROR_TYPE,
+    MARKUP_UNREPAIRABLE_ERROR_TYPE,
+    OUTCOMES,
+    residue_header_lines,
+)
 
 from fused_memory.server import markup_tripwire
 from fused_memory.server.markup_tripwire import (
@@ -335,9 +342,10 @@ class TestEmitMarkupStormEscalation:
         re-spelling the three words here, so an outcome added there arrives with
         a test rather than with a silently unasserted record. The earlier
         revision pinned two of the three, and the one it left out is the one
-        that matters most at this filer's live call site: ``install_markup_guard``
-        refuses any policy but ``REJECT_WITH_REPAIR``, so ``repaired`` cannot
-        fire here at all while ``unrepairable`` — the burst that LOSES the
+        that matters most at this filer's live call site:
+        ``boundary_guards.py::boundary_guard_chain`` declares
+        ``REJECT_WITH_REPAIR``, so ``repaired`` cannot fire there at all while
+        ``unrepairable`` — the burst that LOSES the
         caller's data — can. 'unrepairable' also carries no 'reject' stem, so
         the stem needle below would not have caught it being mislabelled.
 
@@ -1007,9 +1015,8 @@ class TestDelegatesToTheSharedHelper:
     def test_the_residue_filer_opts_OUT_of_dedupe_and_forwards_the_record(
         self, tmp_path, monkeypatch,
     ):
-        """Each residue record is the only surviving copy of a DIFFERENT caller
-        payload, so folding two together would destroy the data the record
-        exists to preserve."""
+        """Each residue record holds a DIFFERENT caller's payload, so folding
+        two together would destroy one of them."""
         seen: dict = {}
 
         def _spy(project_root, **kwargs):
@@ -1097,3 +1104,98 @@ class TestTheResidueRecordRouting:
             f'must carry the ONE shared routing sentence, not a local copy: '
             f'{payload["detail"]!r}'
         )
+
+
+# ---------------------------------------------------------------------------
+# Whose call the residue record names, and what its custody proves (task 5055).
+# ---------------------------------------------------------------------------
+
+
+class TestTheResidueRecordNamesItsCaller:
+    """The filer renders the one shared caller rendering and the custody caveat."""
+
+    RAW_VALUE = (
+        'The memory the caller meant to write.' + toolcall_markup.closer_for('content')
+        + '\n' + toolcall_markup.CANONICAL_OPENER_PREFIX + '"not_a_parameter">stray'
+    )
+
+    def _filed_detail(self, tmp_path, record: dict) -> str:
+        pytest.importorskip('escalation')
+        esc_id = markup_tripwire.emit_markup_residue_escalation(
+            str(tmp_path), record, anchor_task_id='markup-residue',
+        )
+        assert esc_id is not None
+        [filed] = (tmp_path / 'data' / 'escalations').glob('esc-*.json')
+        payload = json.loads(filed.read_text())
+        assert payload['id'] == esc_id
+        return payload['detail']
+
+    def test_every_caller_line_the_record_carries_is_rendered(self, tmp_path):
+        record = {
+            'error_type': 'mcp_markup_unrepairable',
+            'tool': 'add_memory',
+            'field': 'content',
+            'subject_task_id': '7349',
+            'subject_agent_role': 'implementer',
+            'agent_id': 'claude-task-7349-implementer',
+            'project': 'dark_factory',
+            'override_swallowed': True,
+            'raw_value': self.RAW_VALUE,
+        }
+
+        detail = self._filed_detail(tmp_path, record)
+
+        missing = set(residue_header_lines(record)) - set(detail.splitlines())
+        assert not missing, f'the residue detail lacks caller lines {sorted(missing)}'
+        assert MARKUP_REFUSAL_CUSTODY_CAVEAT in detail
+        assert 'only surviving copy' not in detail
+        assert self.RAW_VALUE in detail
+
+    def test_a_record_with_no_caller_keys_renders_each_as_None(self, tmp_path):
+        detail = self._filed_detail(
+            tmp_path, {'tool': 'add_memory', 'field': 'content', 'raw_value': 'bytes'},
+        )
+
+        missing = set(residue_header_lines({})) - set(detail.splitlines())
+        assert not missing, f'the residue detail lacks caller lines {sorted(missing)}'
+
+
+class TestTheResidueRecordStatesItsKind:
+    """The filer states what happened to the call in the record kind's own terms."""
+
+    RAW_VALUE = 'The value the leak swallowed.'
+
+    def _filed(self, tmp_path, error_type: str) -> dict:
+        pytest.importorskip('escalation')
+        record = {
+            'error_type': error_type,
+            'tool': 'add_memory',
+            'field': 'metadata',
+            'raw_value': self.RAW_VALUE,
+        }
+        esc_id = markup_tripwire.emit_markup_residue_escalation(
+            str(tmp_path), record, anchor_task_id='markup-residue',
+        )
+        assert esc_id is not None
+        [filed] = (tmp_path / 'data' / 'escalations').glob('esc-*.json')
+        return json.loads(filed.read_text())
+
+    @pytest.mark.parametrize(
+        'error_type',
+        [MARKUP_UNREPAIRABLE_ERROR_TYPE, MARKUP_UNRECOVERED_PARAM_ERROR_TYPE],
+        ids=['refused', 'dropped-slice'],
+    )
+    def test_the_detail_states_the_kinds_outcome_and_custody(self, tmp_path, error_type):
+        detail = self._filed(tmp_path, error_type)['detail']
+
+        prose = residue_prose({'error_type': error_type})
+        assert prose.outcome in detail
+        assert prose.custody in detail
+        assert self.RAW_VALUE in detail
+
+    def test_a_dropped_slice_claims_no_refusal(self, tmp_path):
+        payload = self._filed(tmp_path, MARKUP_UNRECOVERED_PARAM_ERROR_TYPE)
+
+        assert 'REFUSED' not in payload['detail']
+        assert MARKUP_REFUSAL_CUSTODY_CAVEAT not in payload['detail']
+        assert 'unrepairable' not in payload['summary'].lower()

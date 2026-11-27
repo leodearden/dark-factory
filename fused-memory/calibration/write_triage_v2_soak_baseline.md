@@ -1,5 +1,6 @@
 # Write-triage reader report (rubric v2.1)
 
+Rater brief: v2.1, sha256 b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f.
 Items: 673 (decided 671, unclear 2). By outcome: amended 100, contested 473, restated 100, stored 0.
 Sampled per stratum: amended-sample 100, contested-census 473, restated-sample 100.
 Stratum populations: amended-sample 1224, contested-census 473, restated-sample 125.
@@ -10,7 +11,7 @@ Bootstrap: 10000 resamples, seed 7157.
 | metric | n | hits | rate | Wilson 95% | population rate | population 95% | unclear |
 |---|---|---|---|---|---|---|---|
 | M1 | 91 | 34 | 0.3736 | [0.2812, 0.4762] | 0.3744 | [0.2766, 0.4752] | 1 |
-| M1 as amended | 91 | 35 | 0.3846 | [0.2913, 0.4873] | 0.3833 | [0.2857, 0.4835] | 1 |
+| M1 as amended | 91 | 24 | 0.2637 | [0.1841, 0.3625] | 0.2621 | [0.1739, 0.3559] | 1 |
 | M2 amended | 100 | 31 | 0.31 | [0.2278, 0.4063] | 0.31 | [0.22, 0.4] | 0 |
 | M2 contested | 472 | 322 | 0.6822 | [0.6389, 0.7226] | 0.6822 | [0.6385, 0.7246] | 1 |
 | M2 restated | 99 | 23 | 0.2323 | [0.1601, 0.3246] | 0.2323 | [0.1515, 0.3163] | 1 |
@@ -38,7 +39,7 @@ Bootstrap: 10000 resamples, seed 7157.
 |---|---|---|---|---|
 | hidden_detail | 13 | 0 | 1 | A restated write adds something a reader acting on its record would need (HOME, LOSS, no CONFLICT), and a sighting is only counted, never shown. |
 | hidden_conflict | 25 | 0 | 3 | A restated write disputes its record (CONFLICT), and the dispute sits in a sighting a reader of the record never sees. |
-| digest_conflict | 14 | 0 | 2 | An amended write disputes its record (CONFLICT), and a reader of the record meets the dispute only as an untagged 240-character digest. |
+| digest_conflict | 14 | 0 | 2 | An amended write disputes its record (CONFLICT), and a reader of the record meets the dispute only as an untagged amendment, not as a correction. |
 | wrong_home | 233 | 0 | 1 | An attached write is not about its record's claim (HOME=NO); a contest whose dispute is true is never a wrong home (ruling 5b). |
 | false_conflict | 140 | 0 | 2 | A contested write does not dispute its record (CONFLICT=NO), so a reader is told a sound record is in doubt. |
 | duplicate_clutter | 0 | 31 | 0.5 | A standalone write restates an earlier record and adds nothing a reader needs (HOME, no LOSS, no CONFLICT). |

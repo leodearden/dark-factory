@@ -20,13 +20,14 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
-import time
-from unittest.mock import AsyncMock, Mock
+from datetime import UTC, datetime, timedelta
+from unittest.mock import ANY, AsyncMock, Mock
 
 import pytest
 from _workflow_helpers import FakeScheduler
 
 from orchestrator.config import OrchestratorConfig, StarvationWatchdogConfig
+from orchestrator.pause_policy import PauseClass
 from orchestrator.scheduler import Scheduler, SchedulerCallbacks
 
 
@@ -46,6 +47,7 @@ class TestSchedulerCallbacksDataclass:
         assert callbacks.on_warm_base_resolve is None
         assert callbacks.suppress_blocked_write is None
         assert callbacks.read_already_landed_tick_view is None
+        assert callbacks.read_pending_escalations_by_task is None
 
     def test_field_set_is_exact(self):
         field_names = {f.name for f in dataclasses.fields(SchedulerCallbacks)}
@@ -61,6 +63,7 @@ class TestSchedulerCallbacksDataclass:
             'on_warm_base_resolve',
             'suppress_blocked_write',
             'read_already_landed_tick_view',
+            'read_pending_escalations_by_task',
         }
 
     def test_is_frozen(self):
@@ -73,7 +76,7 @@ class TestSchedulerConstructorCallbacks:
     """(b) Scheduler(config, callbacks=...) construction with/without callbacks."""
 
     def test_constructs_with_callbacks(self):
-        async def on_trip(reason: str) -> None:
+        async def on_trip(reason: str, pause_class: PauseClass) -> None:
             pass
 
         callbacks = SchedulerCallbacks(on_park_stop_trip=on_trip)
@@ -95,6 +98,13 @@ class TestConstructorInjectedHooksFire:
         spy = AsyncMock()
         config = OrchestratorConfig(
             max_per_module=1,
+            # task 4481: pin the trip ON rather than inheriting it.  This test
+            # is about the CALLBACK firing, not about park_stop_enabled's
+            # default; an operator setting park_stop_enabled=false in
+            # dark-factory-orchestrator.yaml disarms the trip and the spy is
+            # never called.  The threshold/window beside it are already pinned
+            # for the same reason.
+            park_stop_enabled=True,
             park_stop_parked_threshold=1,
             park_stop_parked_window_hours=1.0,
         )
@@ -109,7 +119,7 @@ class TestConstructorInjectedHooksFire:
         # Yield to the event loop so the ensure_future'd callback can execute.
         await asyncio.sleep(0)
 
-        spy.assert_called_once()
+        spy.assert_called_once_with(ANY, PauseClass.PARK_STOP)
 
     @pytest.mark.asyncio
     async def test_suppress_blocked_write_consulted(self):
@@ -151,12 +161,12 @@ class TestConstructorInjectedHooksFire:
 
     @pytest.mark.asyncio
     async def test_on_starvation_warn_fires(self):
-        """A constructor-injected on_starvation_warn fires once both gates cross."""
-        t: list[float] = [0.0]
+        """A constructor-injected on_starvation_warn fires once both dual-gate halves cross.
 
-        def fake_clock() -> float:
-            return t[0]
-
+        The eligibility age runs on the WALL clock (task 3821), so that is the
+        clock this test advances.
+        """
+        wall: list[datetime] = [datetime(2026, 10, 1, tzinfo=UTC)]
         spy = AsyncMock()
         config = OrchestratorConfig(
             max_per_module=1,
@@ -169,7 +179,7 @@ class TestConstructorInjectedHooksFire:
         config.fairness.skip_threshold = 9999
         scheduler = Scheduler(
             config,
-            time_source=fake_clock,
+            wall_time_source=lambda: wall[0],
             callbacks=SchedulerCallbacks(on_starvation_warn=spy),
         )
 
@@ -186,14 +196,19 @@ class TestConstructorInjectedHooksFire:
         scheduler.lock_table.try_acquire('seed', ['backend'])
         scheduler._dispatched.add('seed')
         scheduler.get_tasks = AsyncMock(return_value=[task])
+        # The watchdog corroborates a finding with a live status read before
+        # it fires (task 3821).
+        scheduler.get_statuses = AsyncMock(return_value=({'starved': 'pending'}, None))
         scheduler.finish_startup()
 
         # Drive 3 ticks to accumulate skip_count >= skip_threshold (3).
         for _ in range(3):
             await scheduler.acquire_next()
 
-        # Advance clock past idle_secs (100s) and tick once more.
-        t[0] = 150.0
+        spy.assert_not_called()
+        # Advance the wall clock past idle_secs (100s) from the first observed
+        # tick and tick once more.
+        wall[0] += timedelta(seconds=150)
         await scheduler.acquire_next()
 
         spy.assert_called_once()
@@ -314,11 +329,12 @@ class TestWorkflowCancelGraceAndActivelyHeld:
         assert scheduler.workflow_cancel_recent('T1') is True
 
     def test_workflow_cancel_recent_false_after_grace_elapses(self):
-        scheduler = Scheduler(OrchestratorConfig())
-        # Tiny grace window so the test doesn't need to sleep 30s.
-        scheduler._RECONCILE_CANCEL_GRACE_S = 0.01
+        clock = {'t': 1000.0}
+        scheduler = Scheduler(OrchestratorConfig(), time_source=lambda: clock['t'])
         scheduler.note_workflow_cancelled('T1')
-        time.sleep(0.05)
+        clock['t'] = 1029.0
+        assert scheduler.workflow_cancel_recent('T1') is True
+        clock['t'] = 1030.0
         assert scheduler.workflow_cancel_recent('T1') is False
 
     def test_clear_workflow_cancel_makes_it_false_immediately(self):
@@ -403,22 +419,18 @@ class TestMergePhaseGraceTracking:
         assert scheduler.merge_phase_grace_active(0.0) is False
         assert scheduler.merge_phase_grace_active(-5.0) is False
 
-    def test_grace_auto_expires_past_grace_window(self, monkeypatch):
-        scheduler = Scheduler(OrchestratorConfig())
+    def test_grace_auto_expires_past_grace_window(self):
         clock = {'t': 1000.0}
-        # scheduler.py stamps via ``time.monotonic()`` — patch the shared
-        # module attribute so the stamp and the read use the same fake clock.
-        monkeypatch.setattr(time, 'monotonic', lambda: clock['t'])
+        scheduler = Scheduler(OrchestratorConfig(), time_source=lambda: clock['t'])
         scheduler.note_merge_phase_entered('T1')  # stamped at t=1000
         clock['t'] = 1000.0 + 50.0  # 50s elapsed, within a 100s grace
         assert scheduler.merge_phase_grace_active(100.0) is True
         clock['t'] = 1000.0 + 150.0  # 150s elapsed, past a 100s grace
         assert scheduler.merge_phase_grace_active(100.0) is False
 
-    def test_grace_active_if_any_tracked_task_is_fresh(self, monkeypatch):
-        scheduler = Scheduler(OrchestratorConfig())
+    def test_grace_active_if_any_tracked_task_is_fresh(self):
         clock = {'t': 1000.0}
-        monkeypatch.setattr(time, 'monotonic', lambda: clock['t'])
+        scheduler = Scheduler(OrchestratorConfig(), time_source=lambda: clock['t'])
         scheduler.note_merge_phase_entered('OLD')  # stamped at t=1000
         clock['t'] = 1000.0 + 500.0
         scheduler.note_merge_phase_entered('FRESH')  # stamped at t=1500

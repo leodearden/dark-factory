@@ -3,8 +3,8 @@
 PRD task epsilon of plans/module-tagger-retirement-prd.md (decision 3). The
 census enumerates every task record carrying ``metadata.files_tagged_at`` — the
 stamp the retired module tagger left behind — across all six project corpora,
-and classifies each on three axes so DF 3113 P4a and DF 3427 can consume a
-machine-readable candidate set instead of a prose claim.
+and classifies each on three axes so a consumer can join a machine-readable
+candidate set instead of a prose claim.
 
 NO TEST HERE ASSERTS A COUNT OR TASK ID DERIVED FROM THE LIVE DATABASES.
 This norm is inherited verbatim from both sibling suites —
@@ -32,6 +32,7 @@ import sqlite3
 import subprocess
 import sys
 from collections import Counter
+from contextlib import closing
 from pathlib import Path
 
 import pytest
@@ -39,8 +40,6 @@ from _task_db_scan import (
     AUDIT_EXIT_NO_ROOT,
     AUDIT_EXIT_NOTHING_AUDITED,
     AUDIT_EXIT_OK,
-    TaskDbProblem,
-    TaskDbUnreadable,
 )
 from audit_wiped_metadata_files import (
     _EVENT_PLAN_SOURCES,
@@ -81,6 +80,9 @@ from census_tagger_debris import (
     write_artifacts,
 )
 from shared.project_id import project_id_for_root
+from shared.task_store_schema import TASK_STORE_DDL
+from shared.tasks_db_readonly import TaskDbProblem, TaskDbUnreadable
+from tasks_db_schema import columns_outside, introspect, introspect_ddl
 
 from shared import project_layout
 
@@ -141,7 +143,7 @@ def _lock(timestamp: str, modules: tuple[str, ...], event_id: int = 1) -> ScopeE
 def test_classification_vocabulary_constants_have_exact_string_values():
     """(a) The seven labels are the artifact's public vocabulary.
 
-    DF 3113 P4a and DF 3427 will read these strings out of the committed JSON,
+    The artifact's consumers read these strings out of the committed JSON,
     so a rename is a breaking change to a consumer that cannot see this repo's
     constants. Pinning the literals here makes that breakage a failing test
     rather than a silently-unjoinable artifact.
@@ -287,7 +289,7 @@ def test_absent_evidence_is_explicitly_null_not_a_missing_key():
 # straight from metadata.files, which for a never-reconciled tagger-stamped
 # record IS the guess. A post-stamp lock is therefore an ECHO of the guess, not
 # evidence against it, and v1 was reporting the majority of live victims to
-# DF 3113 P4a / DF 3427 as already repaired.
+# the artifact's consumers as already repaired.
 #
 # Every input below is synthetic. The echo test is depth-INVARIANT by
 # construction: files_to_modules truncates each path to `depth` components, so
@@ -299,7 +301,7 @@ def test_absent_evidence_is_explicitly_null_not_a_missing_key():
 
 
 def test_lock_reconciled_is_a_third_axis_2_value_beside_the_two_v1_labels():
-    """(a) The two v1 labels KEEP their spellings — DF 3113 P4a and DF 3427
+    """(a) The two v1 labels KEEP their spellings — the artifact's consumers
     join on these strings out of the committed JSON, so renaming either would
     break a consumer that cannot see this module's constants. The new class is
     additive."""
@@ -590,7 +592,9 @@ def test_evidence_carries_the_deciding_events_fidelity_on_both_axes():
 # only), and the two test directories cannot share imports for the same reason
 # recorded in the header comment above
 # orchestrator/tests/test_deterministic_runner.py::POLLUTED_PREDICATE_OUTPUT.
-# The schemas mirror the live ones so the census exercises real column shapes.
+# The schemas mirror the live ones so the census exercises real column shapes;
+# the subset guard right after ``_make_tasks_db`` checks ``_TASKS_SCHEMA``
+# against ``shared/src/shared/task_store_schema.py::TASK_STORE_DDL``.
 #
 # Two deliberate departures from that sibling:
 #   * ``_make_runs_db`` honours an explicit per-event ``timestamp``, falling
@@ -670,6 +674,11 @@ def _make_tasks_db(dir_path: Path, rows: list[dict]) -> Path:
     finally:
         conn.close()
     return db_path
+
+
+def test_make_tasks_db_declares_only_columns_production_declares(tmp_path):
+    with closing(sqlite3.connect(_make_tasks_db(tmp_path, []))) as fixture_conn:
+        assert columns_outside(introspect(fixture_conn), introspect_ddl(TASK_STORE_DDL)) == ()
 
 
 def _make_runs_db(dir_path: Path, events: list[dict]) -> Path:
@@ -1135,7 +1144,8 @@ def test_census_record_carries_every_field_a_consumer_joins_on(tmp_path):
 
     The merge signature is the audit's own verdict over this task's
     merge_finalized history — a second, independently derived piece of
-    evidence, in the vocabulary DF 3113 P4a and DF 3427 already consume.
+    evidence, in the vocabulary audit_wiped_metadata_files.py and
+    repair_wiped_metadata_files.py already speak.
     """
     root = _make_project(
         tmp_path,
@@ -1197,7 +1207,7 @@ def test_an_unread_event_log_degrades_loudly_not_into_a_clean_project(tmp_path, 
     postdates the stamp" is UNKNOWN, not measured — but every stamped record
     must still be reported, and the coverage block must say the event log was
     unreadable. Reporting the same rows with a silent clean verdict would tell
-    DF 3427 the tagger's guesses were never superseded, which is a claim this
+    a consumer the tagger's guesses were never superseded, which is a claim this
     run did not make. The merge verdict is the audit's EVENT_LOG_UNREAD, never
     NO_MERGE_EVENT, which claims a READ log holds no merge_finalized (INV-13)."""
     root = _make_project(
@@ -1463,7 +1473,7 @@ def test_params_says_how_the_artifact_was_produced(tmp_path):
 
 
 def test_zero_valued_classification_cells_are_present_not_omitted(tmp_path):
-    """(c) A MISSING key must not be readable as a zero. DF 3427 will read the
+    """(c) A MISSING key must not be readable as a zero. A consumer reads the
     live-victim cell straight out of this artifact; if the cell vanished when
     it hit zero, "no victims" and "the schema changed" would look identical."""
     report = build_report([_census(tmp_path, tasks=[_stamped(1, status="pending")])])
@@ -1649,10 +1659,11 @@ def test_the_markdown_says_which_file_is_authoritative(tmp_path):
     """(c) The markdown is CAPPED and the JSON is not, so the markdown must
     say so — otherwise a consumer could read a truncated table as the whole
     population."""
-    markdown = render_markdown(build_report([_census(tmp_path, tasks=[_stamped(1)])]))
+    report = build_report([_census(tmp_path, tasks=[_stamped(1)])])
+    markdown = render_markdown(report)
 
     assert "module-tagger-debris-census.json" in markdown
-    assert "3113" in markdown and "3427" in markdown
+    assert f"Consumers: {', '.join(report['params']['consumers'])}." in markdown
 
 
 def test_the_markdown_names_an_unreadable_event_log_rather_than_omitting_it(tmp_path):
@@ -2072,6 +2083,21 @@ def test_the_artifact_cannot_silently_lag_a_schema_bump(artifact):
     an old shape under a new version number. This is what forces the pair to
     move together."""
     assert artifact["schema_version"] == SCHEMA_VERSION
+
+
+def test_the_committed_artifact_carries_the_builders_static_params(artifact):
+    """A params change made without regenerating leaves consumers reading a
+    stale self-description, which is why the schema-bump test exists too."""
+    expected = build_report([])["params"]
+
+    for key in sorted(expected.keys() - {"project_roots", "regen_command"}):
+        assert artifact["params"][key] == expected[key], key
+
+
+def test_the_committed_markdown_is_the_render_of_the_committed_json(artifact):
+    """A render_markdown edit made without regenerating leaves the twin
+    describing the JSON in words the renderer no longer produces."""
+    assert render_markdown(artifact) == _ARTIFACT_MD.read_text(encoding="utf-8")
 
 
 def test_all_six_corpora_are_present_in_both_halves(artifact):

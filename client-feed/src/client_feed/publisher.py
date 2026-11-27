@@ -19,6 +19,10 @@ from pydantic import BaseModel, ConfigDict
 from client_feed.budget import counted_set
 from client_feed.contract import (
     Branch,
+    CriteriaDeclared,
+    CriteriaResults,
+    Criterion,
+    DefectFiled,
     Degradation,
     EngagementProjection,
     EventHeader,
@@ -28,37 +32,53 @@ from client_feed.contract import (
     Heartbeat,
     NonNegativeInt,
     RevealBudget,
+    RunKind,
     Source,
     TreeFile,
     TreeSnapshot,
 )
+from client_feed.criteria import (
+    CriteriaError,
+    CriteriaRun,
+    declared_event,
+    read_declared,
+    read_staging,
+    results_event,
+    verify_criteria,
+)
 from client_feed.engagement import EngagementUnusable, read_engagement
 from client_feed.envelope import Stamp
 from client_feed.feed_io import Cursor, OutDir
+from client_feed.filer_checks import (
+    deferred_gate_degradation,
+    still_behind_deferred_gates,
+    still_unfiled,
+    unfiled_degradation,
+)
 from client_feed.fold import fold
 from client_feed.inbox import InboxRead, InboxUnusable, read_inbox
 from client_feed.policy import Policy
 from client_feed.redact import redact_paths
 from client_feed.reveals import Answer, RevealOutput, answered_in, reveal_events
 from client_feed.sources.archive import ArchiveReadError
+from client_feed.sources.escalations import QUEUE_RELPATH, OpenEscalations, read_open_escalations
 from client_feed.sources.events import (
     FactoryStatus,
-    OpenEscalations,
     SkippedRow,
     StreamEvent,
     read_events,
     read_factory_status,
-    read_open_escalations,
 )
 from client_feed.sources.git import GitError, main_head, task_branches
 from client_feed.sources.prds import PrdText, read_prds
 from client_feed.sources.store import StoreReadError
-from client_feed.sources.tasks import TasksRead, read_tasks
+from client_feed.sources.tasks import TasksRead, read_defect_carriers, read_tasks
 from client_feed.sources.tree import VisibleTree, visible_tree
 from client_feed.stream_events import Identity, StreamOutput, identity, stream_events
 from client_feed.value_events import (
     branch_event,
     budget_event,
+    defect_filed_events,
     factory_event,
     prd_events,
     task_events,
@@ -76,6 +96,7 @@ _FIXED_SOURCE_ERRORS: Final[Mapping[type[Exception], Source]] = MappingProxyType
         ArchiveReadError: Source.ARCHIVE,
         EngagementUnusable: Source.ENGAGEMENT,
         InboxUnusable: Source.INBOX,
+        CriteriaError: Source.CRITERIA,
     }
 )
 _SOURCE_ERRORS: Final = (StoreReadError, *_FIXED_SOURCE_ERRORS)
@@ -115,14 +136,16 @@ def _guarded(unit: Callable[[], _T], degraded: list[Degradation]) -> _T | None:
         return None
 
 
-def _skipped(source: Source, rows: Iterable[tuple[int, StrEnum]]) -> tuple[Degradation, ...]:
-    """Rows of `source` that could not be projected, counted by reason; none is no degradation."""
+def _skipped(
+    source: Source, rows: Iterable[tuple[int | str, StrEnum]], *, unit: str = 'rows'
+) -> tuple[Degradation, ...]:
+    """Rows of `source` that could not be projected, counted by reason and named by `unit`; none is no degradation."""
     rows = tuple(rows)
     if not rows:
         return ()
     tally = Counter(reason for _, reason in rows)
     counts = ', '.join(f'{reason}={count}' for reason, count in sorted(tally.items()))
-    reason = f'skipped {len(rows)} rows: {counts}'
+    reason = f'skipped {len(rows)} {unit}: {counts}'
     _log.warning('source %s %s (ids %s)', source, reason, ', '.join(str(key) for key, _ in rows))
     return (Degradation(source=source, reason=reason),)
 
@@ -137,9 +160,8 @@ def _engagement_unit(policy: Policy, degraded: list[Degradation]) -> EngagementP
 
 @dataclass(frozen=True)
 class _EventsStore:
-    """runs.db as one pass reads it: the open escalations, every stream row past the cursor, the factory status."""
+    """runs.db as one pass reads it: every stream row past the cursor, and the factory status."""
 
-    escalations: OpenEscalations
     stream: tuple[StreamEvent, ...]
     skipped: tuple[SkippedRow, ...]
     cursor: int
@@ -148,7 +170,6 @@ class _EventsStore:
 
 def _read_events_store(root: Path, *, after_id: int, now: datetime) -> _EventsStore:
     """Every stream row past `after_id`, batch after batch until none is left, with the store's other facts."""
-    escalations = read_open_escalations(root)
     stream: list[StreamEvent] = []
     skipped: list[SkippedRow] = []
     cursor = after_id
@@ -160,7 +181,6 @@ def _read_events_store(root: Path, *, after_id: int, now: datetime) -> _EventsSt
         if not batch.has_more:
             break
     return _EventsStore(
-        escalations=escalations,
         stream=tuple(stream),
         skipped=tuple(skipped),
         cursor=cursor,
@@ -177,12 +197,23 @@ def _events_store_unit(
     return store
 
 
+def _escalations_unit(root: Path, degraded: list[Degradation]) -> OpenEscalations | None:
+    """The escalation queue's open escalations, read apart from runs.db so that either fails alone."""
+    escalations = _guarded(lambda: read_open_escalations(root), degraded)
+    if escalations is not None:
+        skipped = ((record.name, record.reason) for record in escalations.skipped)
+        degraded.extend(
+            _skipped(Source.EVENTS, skipped, unit=f'records in {QUEUE_RELPATH}')
+        )
+    return escalations
+
+
 def _tasks_unit(
-    root: Path, since: str | None, store: _EventsStore | None, degraded: list[Degradation]
+    root: Path, since: str | None, escalations: OpenEscalations | None, degraded: list[Degradation]
 ) -> TasksRead | None:
-    """The task rows; while runs.db is unreadable no escalation is known, so each row's waiting_on follows its status alone."""
-    escalations = _NO_ESCALATIONS if store is None else store.escalations
-    tasks = _guarded(lambda: read_tasks(root, since=since, escalations=escalations), degraded)
+    """The task rows; while the escalation queue is unreadable no escalation is known, so each row's waiting_on follows its status alone."""
+    known = _NO_ESCALATIONS if escalations is None else escalations
+    tasks = _guarded(lambda: read_tasks(root, since=since, escalations=known), degraded)
     if tasks is not None:
         degraded.extend(_skipped(Source.TASKS, ((task.task_id, task.reason) for task in tasks.skipped)))
     return tasks
@@ -273,6 +304,61 @@ def _summaries_unit(
     return _guarded(
         lambda: _read_summaries(root, head, moved=git.tree is not None, view=view), degraded
     )
+
+
+def _declared_unit(
+    root: Path, git: _Git | None, degraded: list[Degradation]
+) -> tuple[Criterion, ...] | None:
+    """The criteria main's head declares; None, so the state's declaration stands, when they cannot be read."""
+    if git is None or git.head is None:
+        return None
+    head = git.head
+    return _guarded(lambda: read_declared(root, head), degraded)
+
+
+def _verify_criteria_unit(
+    root: Path,
+    stream: StreamOutput | None,
+    declared: tuple[Criterion, ...],
+    degraded: list[Degradation],
+) -> CriteriaRun | None:
+    """The criteria the pass's newest tested verify run evidences; None when it has none or nothing is declared."""
+    if stream is None or not stream.reports or not declared:
+        return None
+    newest = stream.reports[-1]
+    return _guarded(
+        lambda: verify_criteria(
+            root,
+            newest.junit_relpaths,
+            declared=declared,
+            commit=newest.run.commit,
+            run_at=newest.run.at,
+        ),
+        degraded,
+    )
+
+
+def _criteria_events(
+    policy: Policy,
+    *,
+    git: _Git | None,
+    stream: StreamOutput | None,
+    view: FeedState,
+    stamp: Stamp,
+    now: datetime,
+    degraded: list[Degradation],
+) -> tuple[CriteriaDeclared | CriteriaResults, ...]:
+    """The declaration read at main's head, then the verify and staging results; each read fails alone."""
+    read = _declared_unit(policy.project_root, git, degraded)
+    declared = tuple(view.criteria_declared.values()) if read is None else read
+    verify = _verify_criteria_unit(policy.project_root, stream, declared, degraded)
+    staging = _guarded(lambda: read_staging(policy.out_dir), degraded)
+    events = (
+        None if read is None else declared_event(read, state=view, stamp=stamp, now=now),
+        None if verify is None else results_event(RunKind.VERIFY, verify, state=view, stamp=stamp),
+        None if staging is None else results_event(RunKind.STAGING, staging, state=view, stamp=stamp),
+    )
+    return tuple(event for event in events if event is not None)
 
 
 def _inbox_unit(policy: Policy, cursor: Cursor, degraded: list[Degradation]) -> InboxRead | None:
@@ -384,6 +470,64 @@ def _tree_snapshot(
     return tree_event(tree, budget=budget, stamp=stamp, now=now)
 
 
+@dataclass(frozen=True)
+class _Acknowledgement:
+    """The defect_filed events of one pass, and where the defect scan of the inbox stands after it."""
+
+    events: tuple[DefectFiled, ...]
+    defect_scan_offset: int
+    pending_reports: dict[str, datetime]
+    deferred_gate_reports: dict[str, datetime]
+
+
+def _acknowledgement_unit(
+    policy: Policy,
+    cursor: Cursor,
+    view: FeedState,
+    stamp: Stamp,
+    now: datetime,
+    degraded: list[Degradation],
+) -> _Acknowledgement:
+    """Each carrier filing the state does not say yet; each report read with no carrier waits, and names `filer` past the grace.
+
+    A filed report whose carrier waits on a deferred gate is held from the pass that first saw it so, and names
+    `filer` past the grace too. The inbox is scanned whatever the engagement, from its own offset; its rejected
+    lines are the reveal tail's to count.
+    """
+    scan = _guarded(lambda: read_inbox(policy.in_dir, offset=cursor.defect_scan_offset), degraded)
+    carriers = _guarded(
+        lambda: read_defect_carriers(policy.project_root, project_id=policy.project_id), degraded
+    )
+    events = defect_filed_events(
+        () if carriers is None else carriers, state=view, stamp=stamp, now=now
+    )
+    pending = still_unfiled(
+        cursor.pending_reports,
+        () if scan is None else scan.lines,
+        project_id=policy.project_id,
+        filed=None if carriers is None else {carrier.ref for carrier in carriers},
+    )
+    held = still_behind_deferred_gates(
+        cursor.deferred_gate_reports,
+        None if carriers is None else {c.ref for c in carriers if c.waits_on_deferred_gate},
+        now=now,
+    )
+    grace = policy.filer_grace_seconds
+    for filer in (
+        unfiled_degradation(pending, now=now, grace_seconds=grace),
+        deferred_gate_degradation(held, now=now, grace_seconds=grace),
+    ):
+        if filer is not None:
+            _log.warning('source %s %s', filer.source, filer.reason)
+            degraded.append(filer)
+    return _Acknowledgement(
+        events=events,
+        defect_scan_offset=cursor.defect_scan_offset if scan is None else scan.offset,
+        pending_reports=pending,
+        deferred_gate_reports=held,
+    )
+
+
 def _advanced(
     cursor: Cursor,
     *,
@@ -392,13 +536,19 @@ def _advanced(
     tree: VisibleTree | None,
     inbox: InboxRead | None,
     reveals: RevealOutput | None,
+    acknowledgement: _Acknowledgement,
 ) -> Cursor:
     """Each source position past what this pass read, where its unit succeeded; head and line counts move with the tree.
 
     The inbox offset, reveals_head and added-line counts move with a reveal unit that ran; an inbox read holding no
-    request moves its offset alone.
+    request moves its offset alone. The defect scan's offset, its pending reports and the reports held behind a
+    deferred gate move as the acknowledgement left them.
     """
-    update: dict[str, object] = {}
+    update: dict[str, object] = {
+        'defect_scan_offset': acknowledgement.defect_scan_offset,
+        'pending_reports': acknowledgement.pending_reports,
+        'deferred_gate_reports': acknowledgement.deferred_gate_reports,
+    }
     if events_id is not None:
         update['events_id'] = events_id
     if tasks is not None:
@@ -419,9 +569,11 @@ def _advanced(
 def run_pass(
     policy: Policy, out: OutDir, *, now: datetime, rescan_tasks: bool = True
 ) -> PassReport:
-    """Read every source, append what is news in the order tasks, stream, factory, branches, reveals, tree, PRDs, heartbeat.
+    """Read every source, append what is news in the order tasks, stream, factory, branches, reveals, tree, PRDs, criteria, defects filed, heartbeat.
 
-    A source that cannot be read is named in the heartbeat's degraded and holds only its own cursor fields.
+    A source that cannot be read is named in the heartbeat's degraded, and holds only its own cursor fields. Units
+    that fail it with the same reason name it once; different reasons, such as two inbox tails at different offsets,
+    each name it.
     """
     root = policy.project_root
     cursor = out.cursor
@@ -429,11 +581,12 @@ def run_pass(
     degraded: list[Degradation] = []
     engagement = _engagement_unit(policy, degraded)
     store = _events_store_unit(root, cursor, now, degraded)
-    tasks = _tasks_unit(root, None if rescan_tasks else cursor.tasks_updated_at, store, degraded)
+    escalations = _escalations_unit(root, degraded)
+    tasks = _tasks_unit(root, None if rescan_tasks else cursor.tasks_updated_at, escalations, degraded)
     upserts = task_events(
         () if tasks is None else tasks.rows,
         state=out.state,
-        escalations=None if store is None else store.escalations,
+        escalations=escalations,
         stamp=stamp,
         now=now,
     )
@@ -468,13 +621,17 @@ def run_pass(
         stamp=stamp,
         now=now,
     )
+    criteria = _criteria_events(
+        policy, git=git, stream=stream, view=view, stamp=stamp, now=now, degraded=degraded
+    )
+    acknowledgement = _acknowledgement_unit(policy, cursor, view, stamp, now, degraded)
     heartbeat = Heartbeat(
         **stamp(now),
         head=None if git is None else git.head,
         as_of=now,
         engagement_version=None if engagement is None else engagement.engagement_version,
         watermark_seq=out.state.watermark_seq,
-        degraded=tuple(degraded),
+        degraded=tuple(dict.fromkeys(degraded)),
     )
     events: list[FeedEvent] = [
         *upserts,
@@ -483,11 +640,19 @@ def run_pass(
         *(() if reveals is None else reveals.events),
         *(() if snapshot is None else (snapshot,)),
         *prds,
+        *criteria,
+        *acknowledgement.events,
         heartbeat,
     ]
     events_id = None if store is None or stream is None else store.cursor
     advanced = _advanced(
-        cursor, events_id=events_id, tasks=tasks, tree=tree, inbox=inbox, reveals=reveals
+        cursor,
+        events_id=events_id,
+        tasks=tasks,
+        tree=tree,
+        inbox=inbox,
+        reveals=reveals,
+        acknowledgement=acknowledgement,
     )
     out.commit(events, advanced)
     return PassReport(

@@ -88,8 +88,19 @@ def make_repo(path: Path) -> Repo:
     return repo
 
 
-def path_with_git_killed_on(bin_dir: Path, subcommand: str) -> str:
-    """A PATH whose `git` dies of SIGKILL running `subcommand` and is the real git for every other."""
+def clone_of_checkout(checkout: Path, destination: Path) -> Repo:
+    """A shared, unchecked-out clone whose main is `checkout`'s HEAD commit, so no live ref or store is read."""
+    commit = Repo(checkout).rev('HEAD^{commit}')
+    Repo(destination.parent).git(
+        'clone', '--quiet', '--shared', '--no-checkout', str(checkout), str(destination)
+    )
+    repo = Repo(destination)
+    repo.git('update-ref', 'refs/heads/main', commit)
+    return repo
+
+
+def path_with_git_replaced_on(bin_dir: Path, subcommand: str, shell: str) -> str:
+    """A PATH whose `git` runs the POSIX-sh snippet `shell` for `subcommand` and is the real git for every other."""
     real_git = shutil.which('git')
     if real_git is None:
         raise RuntimeError('no git on PATH to wrap')
@@ -97,8 +108,24 @@ def path_with_git_killed_on(bin_dir: Path, subcommand: str) -> str:
     wrapper = bin_dir / 'git'
     wrapper.write_text(
         '#!/bin/sh\n'
-        f'[ "$1" = {shlex.quote(subcommand)} ] && kill -KILL $$\n'
+        f'if [ "$1" = {shlex.quote(subcommand)} ]; then\n{shell}\nfi\n'
         f'exec {shlex.quote(real_git)} "$@"\n'
     )
     wrapper.chmod(0o755)
     return f'{bin_dir}{os.pathsep}{os.environ["PATH"]}'
+
+
+def path_with_git_killed_on(bin_dir: Path, subcommand: str) -> str:
+    """A PATH whose `git` dies of SIGKILL running `subcommand` and is the real git for every other."""
+    return path_with_git_replaced_on(bin_dir, subcommand, 'kill -KILL $$')
+
+
+def path_with_git_answering(bin_dir: Path, subcommand: str, stdout: bytes) -> str:
+    """A PATH whose `git` writes exactly `stdout` and exits 0 for `subcommand`, and is the real git for every other."""
+    escaped = ''.join(f'\\{byte:03o}' for byte in stdout)
+    return path_with_git_replaced_on(bin_dir, subcommand, f"printf '{escaped}'\nexit 0")
+
+
+def path_with_git_stalled_on(bin_dir: Path, subcommand: str, *, seconds: int) -> str:
+    """A PATH whose `git` becomes a `sleep` for `subcommand`, so killing it closes its pipes; the real git for every other."""
+    return path_with_git_replaced_on(bin_dir, subcommand, f'exec sleep {seconds}')

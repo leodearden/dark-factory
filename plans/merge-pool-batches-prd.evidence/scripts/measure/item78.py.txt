@@ -1,0 +1,81 @@
+"""Items 7 and 8, per UTC day 11-12..11-19 (11-19 also split a/b at the 8528 deploy)."""
+import sys
+sys.path.insert(0, '/tmp/gate-10069/measure')
+from collections import defaultdict, Counter
+from common import E, by_type, verifies, pct, fmt, ts, T8528
+
+LO = '2026-11-12'
+
+
+def dkey(t):
+    return t[:10] + ('b' if t >= T8528 else ('a' if t[:10] == '2026-11-19' else ''))
+
+
+# --- Item 7a: recorded waiting list on merge_dequeued (from 11-15T~11:00)
+D = by_type('merge_dequeued', LO)
+rec = defaultdict(list)
+rec_in_graph = defaultdict(list)
+for e in D:
+    if 'waiting' in e['d']:
+        rec[dkey(e['ts'])].append(len(e['d']['waiting']))
+        rec_in_graph[dkey(e['ts'])].append(sum(1 for w in e['d']['waiting'] if w.get('in_graph')))
+
+# --- Item 7b: reconstruction (measure.md item 7 rule) replayed from 10-20
+waiting = {}
+recon = defaultdict(list)
+recon_by_id = {}
+for e in E:
+    t = e['type']
+    if t == 'merge_queued':
+        waiting.setdefault(e['task'], e['ts'])
+    elif t == 'merge_dequeued':
+        if e['ts'] >= LO:
+            n = sum(1 for k, q in waiting.items() if k != e['task'] and q < e['ts'])
+            recon[dkey(e['ts'])].append(n)
+            recon_by_id[e['id']] = n
+        waiting.pop(e['task'], None)
+    elif t == 'merge_finalized':
+        waiting.pop(e['task'], None)
+# heartbeat depth, latest within 10 min before each pick
+HB = [(ts(e['ts']), e['d'].get('depth')) for e in by_type('merge_heartbeat', '2026-11-11')]
+hb = defaultdict(list)
+j = 0
+for e in D:
+    t0 = ts(e['ts'])
+    cands = [d for t, d in HB if t0 - 600 <= t <= t0]
+    if cands and cands[-1] is not None:
+        hb[dkey(e['ts'])].append(cands[-1])
+# agreement on overlap
+diffs = [len(e['d']['waiting']) - recon_by_id[e['id']] for e in D if 'waiting' in e['d'] and e['id'] in recon_by_id]
+
+print('## Item 7: waiting set at each pick')
+print('| day | picks | recorded waiting n | p50 | p95 | max | recorded in_graph p50 | reconstruction n | p50 | p95 | heartbeat depth p50 | p95 |')
+for d in sorted(set(recon) | set(rec)):
+    r, c, h, g = rec.get(d, []), recon.get(d, []), hb.get(d, []), rec_in_graph.get(d, [])
+    print(f'| {d} | {len(c)} | {len(r)} | {fmt(pct(r,50),0)} | {fmt(pct(r,95),0)} | {max(r) if r else "-"} | {fmt(pct(g,50),0)} | {len(c)} | {fmt(pct(c,50),0)} | {fmt(pct(c,95),0)} | {fmt(pct(h,50),0)} | {fmt(pct(h,95),0)} |')
+print('recorded minus reconstructed (overlap rows):', len(diffs), 'p5', fmt(pct(diffs, 5), 0), 'p50', fmt(pct(diffs, 50), 0), 'p95', fmt(pct(diffs, 95), 0))
+
+# --- Item 8
+V = verifies('2026-11-11')
+CANC = by_type('merge_verify_cancelled', LO)
+FIN = by_type('merge_finalized', LO)
+land = Counter(dkey(f['ts']) for f in FIN if f['d'].get('state') == 'done')
+land_chain = Counter(dkey(f['ts']) for f in FIN if f['d'].get('state') == 'done' and f['d'].get('landed_via_chain'))
+nv = Counter(); vh = defaultdict(float); nvg = Counter(); nvc = Counter(); ch = defaultdict(float); bld = defaultdict(float)
+for v in V:
+    if v['ts'] < LO:
+        continue
+    k = dkey(v['ts'])
+    nv[k] += 1; vh[k] += v['dur_s'] / 3600; nvg[k] += v['gate']
+EV = {e['id']: e for e in by_type('merge_verify', LO)}
+for v in V:
+    if v['ts'] >= LO:
+        bld[dkey(v['ts'])] += (EV[v['id']]['d'].get('chain_build_ms') or 0) / 3.6e6
+for c in CANC:
+    k = dkey(c['ts'])
+    nvc[k] += 1; ch[k] += (c['d'].get('elapsed_ms') or 0) / 3.6e6
+print('\n## Item 8: verifies per landing, landings per verify-hour')
+print('| day | landings (done) | of which landed_via_chain | completed verifies | of which gate | cancelled | completed verify-h | cancelled verify-h | completed verifies / landing | landings / completed verify-h | landings / (completed+cancelled) verify-h | chain build h |')
+for d in sorted(set(land) | set(nv)):
+    L = land[d]
+    print(f'| {d} | {L} | {land_chain[d]} | {nv[d]} | {nvg[d]} | {nvc[d]} | {vh[d]:.1f} | {ch[d]:.1f} | {fmt(nv[d]/L if L else None,2)} | {fmt(L/vh[d] if vh[d] else None,2)} | {fmt(L/(vh[d]+ch[d]) if vh[d]+ch[d] else None,2)} | {bld[d]:.2f} |')

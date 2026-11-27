@@ -9,6 +9,7 @@ TestLoadPremiseRegistry / TestMatchCandidate — same shape, new module.
 
 from __future__ import annotations
 
+import dataclasses
 import os
 import sys
 from pathlib import Path
@@ -16,6 +17,7 @@ from pathlib import Path
 import pytest
 
 from fused_memory.middleware.curator_types import CandidateTask
+from fused_memory.utils.safe_yaml import YamlListFileError
 
 # ──────────────────────────────────────────────────────────────────────────────
 # step-1 RED: TestLoadOperationalRegistry
@@ -68,84 +70,76 @@ class TestLoadOperationalRegistry:
         warnings = [r for r in caplog.records if r.levelname == "WARNING"]
         assert len(warnings) == 0
 
-    def test_load_missing_path_returns_empty_and_warns(self, tmp_path, caplog):
-        """(b) Missing file returns [] and emits exactly one WARNING."""
+    def test_load_missing_path_raises(self, tmp_path):
+        """(b) A missing file raises YamlListFileError naming the path."""
         from fused_memory.middleware.operational_ask_registry import load_operational_registry
 
         missing = tmp_path / "does_not_exist.yaml"
-        with caplog.at_level("WARNING"):
-            entries = load_operational_registry(missing)
+        with pytest.raises(YamlListFileError) as excinfo:
+            load_operational_registry(missing)
 
-        assert entries == []
-        warnings = [r for r in caplog.records if r.levelname == "WARNING"]
-        assert len(warnings) == 1
+        assert excinfo.value.path == missing
+        assert str(excinfo.value) == f"file not found: {missing}"
 
     @pytest.mark.skipif(
         sys.platform == "win32" or getattr(os, "getuid", lambda: -1)() == 0,
         reason="chmod not reliable on Windows or when running as root",
     )
-    def test_load_unreadable_file_returns_empty_and_warns(self, tmp_path, caplog):
-        """(b) Unreadable file returns [] and emits exactly one WARNING."""
+    def test_load_unreadable_file_raises(self, tmp_path):
+        """(b) An unreadable file raises YamlListFileError naming the path."""
         from fused_memory.middleware.operational_ask_registry import load_operational_registry
 
         locked = tmp_path / "unreadable.yaml"
         locked.write_text("- name: x\n", encoding="utf-8")
         locked.chmod(0o000)
         try:
-            with caplog.at_level("WARNING"):
-                entries = load_operational_registry(locked)
+            with pytest.raises(YamlListFileError) as excinfo:
+                load_operational_registry(locked)
         finally:
             locked.chmod(0o644)
 
-        assert entries == []
-        warnings = [r for r in caplog.records if r.levelname == "WARNING"]
-        assert len(warnings) == 1
+        assert excinfo.value.path == locked
+        assert str(locked) in str(excinfo.value)
 
-    def test_load_malformed_yaml_returns_empty_and_warns(self, tmp_path, caplog):
-        """(b) Malformed YAML returns [] and emits exactly one WARNING."""
+    def test_load_malformed_yaml_raises(self, tmp_path):
+        """(b) Malformed YAML raises YamlListFileError."""
         from fused_memory.middleware.operational_ask_registry import load_operational_registry
 
         bad_yaml = tmp_path / "bad.yaml"
         bad_yaml.write_text("key: [unclosed bracket\n: invalid\n", encoding="utf-8")
 
-        with caplog.at_level("WARNING"):
-            entries = load_operational_registry(bad_yaml)
+        with pytest.raises(YamlListFileError) as excinfo:
+            load_operational_registry(bad_yaml)
 
-        assert entries == []
-        warnings = [r for r in caplog.records if r.levelname == "WARNING"]
-        assert len(warnings) == 1
+        assert excinfo.value.path == bad_yaml
+        assert "YAML parse error" in str(excinfo.value)
 
-    def test_load_undecodable_encoding_returns_empty_and_warns(self, tmp_path, caplog):
-        """(b) File with bytes that are not valid UTF-8 returns [] and emits
-        exactly one WARNING, on this module's own logger.
-        """
+    def test_load_undecodable_encoding_raises(self, tmp_path):
+        """(b) A file whose bytes are not valid UTF-8 raises YamlListFileError."""
         from fused_memory.middleware.operational_ask_registry import load_operational_registry
 
         bad_encoding = tmp_path / "bad_encoding.yaml"
         bad_encoding.write_bytes(b"\xff\xfe- name: x\x00")
 
-        with caplog.at_level("WARNING"):
-            entries = load_operational_registry(bad_encoding)
+        with pytest.raises(YamlListFileError) as excinfo:
+            load_operational_registry(bad_encoding)
 
-        assert entries == []
-        warnings = [r for r in caplog.records if r.levelname == "WARNING"]
-        assert len(warnings) == 1
-        assert str(bad_encoding) in warnings[0].getMessage()
-        assert warnings[0].name == "fused_memory.middleware.operational_ask_registry"
+        assert excinfo.value.path == bad_encoding
+        assert str(bad_encoding) in str(excinfo.value)
+        assert "UTF-8" in str(excinfo.value)
 
-    def test_load_non_list_top_level_returns_empty_and_warns(self, tmp_path, caplog):
-        """(b) A non-list top-level YAML document returns [] and emits one WARNING."""
+    def test_load_non_list_top_level_raises(self, tmp_path):
+        """(b) A non-list top-level YAML document raises YamlListFileError."""
         from fused_memory.middleware.operational_ask_registry import load_operational_registry
 
         p = tmp_path / "not_a_list.yaml"
         p.write_text("just_a_key: just_a_value\n", encoding="utf-8")
 
-        with caplog.at_level("WARNING"):
-            entries = load_operational_registry(p)
+        with pytest.raises(YamlListFileError) as excinfo:
+            load_operational_registry(p)
 
-        assert entries == []
-        warnings = [r for r in caplog.records if r.levelname == "WARNING"]
-        assert len(warnings) == 1
+        assert excinfo.value.path == p
+        assert "expected a YAML list" in str(excinfo.value)
 
     def test_load_entry_missing_required_field_skips_and_warns(self, tmp_path, caplog):
         """(c) Entry missing title_substrings is skipped with WARNING; well-formed entries returned."""
@@ -676,6 +670,88 @@ class TestSeedOperationalAskRegistry:
         )
         assert entry.name == "merge_entities_live_graph"
 
+    _PRUNE_ENTRY = "prune_recon_cycle_summaries_apply"
+    _MERGE_ENTITIES_ENTRY = "merge_entities_live_graph"
+    _PRUNE_DESCRIPTION_ANCHORS_BEFORE_10112 = ["--apply", "cycle-summary", "cycle_summary"]
+    _MERGE_ENTITIES_DESCRIPTION_ANCHORS_BEFORE_10112 = ["FalkorDB", "production graph"]
+
+    def _assert_only_the_description_anchors_protect(
+        self, candidate, entries, entry_name, anchors_before_10112,
+    ):
+        from fused_memory.middleware.operational_ask_registry import match_candidate
+
+        matched = match_candidate(candidate, entries)
+        assert matched is None, f"code task matched {matched.name if matched else None}"
+
+        entry = next(e for e in entries if e.name == entry_name)
+        widened = dataclasses.replace(entry, description_substrings=anchors_before_10112)
+        assert match_candidate(candidate, [widened]) is not None, (
+            f"the candidate must pass {entry_name}'s title gate, so its description "
+            "anchors alone are what protect it"
+        )
+
+    def test_prune_script_docstring_code_task_does_not_match(self):
+        """Task 4281, a code task about the prune script, was routed as an operational ask.
+
+        A token the script's own code or tests carry (a CLI flag, a metadata
+        value, a backend name in a test id) collides with code tasks about that
+        script, so it cannot anchor a live-data ask (task 10112).
+        """
+        candidate = CandidateTask(
+            title=(
+                "prune_recon_cycle_summaries.py docstring advertises a --dry-run flag "
+                "that build_parser() never registers"
+            ),
+            description=(
+                "Noticed while mapping that script's --apply path. The only mode flag "
+                "is --apply; dry-run is simply the default when --apply is absent."
+            ),
+        )
+        self._assert_only_the_description_anchors_protect(
+            candidate, self._load_entries(),
+            self._PRUNE_ENTRY, self._PRUNE_DESCRIPTION_ANCHORS_BEFORE_10112,
+        )
+
+    def test_prune_script_pool_stages_refactor_does_not_match(self):
+        """Task 6198."""
+        candidate = CandidateTask(
+            title=(
+                "Derive prune_recon_cycle_summaries._POOL_STAGES from "
+                "recon_pool_map.CYCLE_SUMMARY_STAGE_TO_RECON_POOL instead of a "
+                "hand-copied tuple"
+            ),
+            description=(
+                "Those strings are exactly the keys of CYCLE_SUMMARY_STAGE_TO_RECON_POOL, "
+                "the single source of truth for which metadata.stage values form the "
+                "two per-cycle kind='cycle_summary' pools."
+            ),
+        )
+        self._assert_only_the_description_anchors_protect(
+            candidate, self._load_entries(),
+            self._PRUNE_ENTRY, self._PRUNE_DESCRIPTION_ANCHORS_BEFORE_10112,
+        )
+
+    def test_merge_entities_flake_debt_task_does_not_match(self):
+        """Task 11326, an offline-lane flake-debt task."""
+        test_id = (
+            "tests/test_merge_entities.py::TestRedirectNodeEdgesLiveFalkorDB::"
+            "test_redirect_repairs_dup_uuids_no_loss_preserves_embeddings"
+        )
+        candidate = CandidateTask(
+            title=(
+                f"Flake debt: {test_id} — cleared on the offline lane "
+                "(qdrant-integration), cycle 1"
+            ),
+            description=(
+                "The test failed in an offline-lane detection run and passed an "
+                f"isolated, serial re-run at the same head. test: {test_id}"
+            ),
+        )
+        self._assert_only_the_description_anchors_protect(
+            candidate, self._load_entries(),
+            self._MERGE_ENTITIES_ENTRY, self._MERGE_ENTITIES_DESCRIPTION_ANCHORS_BEFORE_10112,
+        )
+
     def test_rebuild_entity_summaries_project_wide_matches(self):
         """(b) A project-wide rebuild_entity_summaries ask matches (task 1946)."""
         from fused_memory.middleware.operational_ask_registry import match_candidate
@@ -719,7 +795,7 @@ class TestSeedOperationalAskRegistry:
         candidate = CandidateTask(
             title="Fix null pointer in task_curator batch dedup when candidates list is empty",
             description=(
-                "Add a guard so curate_batch_prepared does not crash on an empty "
+                "Add a guard so curate_prepared does not crash on an empty "
                 "candidates list; add a regression test."
             ),
         )

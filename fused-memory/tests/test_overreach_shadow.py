@@ -8,8 +8,9 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import logging
+import os
 import sqlite3
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -17,19 +18,21 @@ from unittest.mock import MagicMock
 
 import pytest
 import pytest_asyncio
+from _overreach_shadow_fixtures import judged_edge, judged_episode
 from pydantic import ValidationError
+from shared.async_sqlite_base import CheckpointResult
 
 from fused_memory.config.schema import FusedMemoryConfig, OverreachGuardConfig
 from fused_memory.models.enums import MemoryCategory
 from fused_memory.services.overreach_guard import (
     PROMPT_VERSION,
-    EdgeJudgement,
-    JudgeEdge,
     matching_classifiers,
 )
 from fused_memory.services.overreach_shadow import (
     SIDECAR_FILENAME,
+    HandedFlag,
     JudgedEpisode,
+    OverreachFlag,
     OverreachFlagPage,
     OverreachShadow,
     OverreachShadowStore,
@@ -50,22 +53,6 @@ class _Clock:
 
     def __call__(self) -> datetime:
         return self.instants.pop(0) if len(self.instants) > 1 else self.instants[0]
-
-
-def _episode(uuid: str = 'ep1', *, graph: str = 'g', outcome: ShadowOutcome = ShadowOutcome.judged,
-             minted: int = 2, error: str | None = None) -> JudgedEpisode:
-    return JudgedEpisode(
-        graph=graph, episode_uuid=uuid, judge_model='judge-m', prompt_version=PROMPT_VERSION,
-        classifiers=('category_decisions', 'ruling_lexeme_head'), minted_count=minted,
-        outcome=outcome, error=error,
-    )
-
-
-def _judged(edge_uuid: str, label: str, *, fact: str = '') -> tuple[JudgeEdge, EdgeJudgement]:
-    return (
-        JudgeEdge(uuid=edge_uuid, fact=fact or f'fact of {edge_uuid}', source_name='S', target_name='T'),
-        EdgeJudgement(edge_uuid=edge_uuid, label=label, rationale=f'span for {edge_uuid}'),
-    )
 
 
 @pytest_asyncio.fixture
@@ -116,8 +103,8 @@ class TestStore:
 
     @pytest.mark.asyncio
     async def test_judgements_round_trip(self, store) -> None:
-        await store.record(episode=_episode(), judgements=[
-            _judged('e1', 'holding'), _judged('e2', 'overreach'),
+        await store.record(episode=judged_episode(), judgements=[
+            judged_edge('e1', 'holding'), judged_edge('e2', 'overreach'),
         ])
         got = await store.judgements_for([('g', 'e1'), ('g', 'e2'), ('g', 'missing'), ('other', 'e1')])
         assert set(got) == {('g', 'e1'), ('g', 'e2')}
@@ -127,13 +114,13 @@ class TestStore:
 
     @pytest.mark.asyncio
     async def test_an_episode_row_round_trips(self, store) -> None:
-        await store.record(episode=_episode(), judgements=[])
-        assert await store.judged_episode('g', 'ep1') == _episode()
+        await store.record(episode=judged_episode(), judgements=[])
+        assert await store.judged_episode('g', 'ep1') == judged_episode()
         assert await store.judged_episode('g', 'never') is None
 
     @pytest.mark.asyncio
     async def test_a_failed_row_keeps_its_error(self, store) -> None:
-        failed = _episode(outcome=ShadowOutcome.failed, minted=0, error='RuntimeError: down')
+        failed = judged_episode(outcome=ShadowOutcome.failed, minted=0, error='RuntimeError: down')
         await store.record(episode=failed, judgements=[])
         assert await store.judged_episode('g', 'ep1') == failed
 
@@ -142,19 +129,19 @@ class TestStore:
 
     @pytest.mark.asyncio
     async def test_a_rejudged_edge_keeps_its_first_judgement(self, store) -> None:
-        await store.record(episode=_episode('ep1'), judgements=[_judged('e1', 'holding')])
-        await store.record(episode=_episode('ep1'), judgements=[_judged('e1', 'overreach')])
+        await store.record(episode=judged_episode('ep1'), judgements=[judged_edge('e1', 'holding')])
+        await store.record(episode=judged_episode('ep1'), judgements=[judged_edge('e1', 'overreach')])
         assert (await store.judgements_for([('g', 'e1')]))[('g', 'e1')].label == 'holding'
 
 
 async def _seed_flags(tmp_path: Path) -> OverreachShadowStore:
     clock = _Clock(T0, T0 + timedelta(minutes=1), T0 + timedelta(minutes=2))
     opened = await OverreachShadowStore.open(tmp_path / 'flags', clock=clock)
-    await opened.record(episode=_episode('ep-a'), judgements=[
-        _judged('a2', 'overreach'), _judged('a1', 'overreach'), _judged('a3', 'holding'),
+    await opened.record(episode=judged_episode('ep-a'), judgements=[
+        judged_edge('a2', 'overreach'), judged_edge('a1', 'overreach'), judged_edge('a3', 'holding'),
     ])
-    await opened.record(episode=_episode('ep-b'), judgements=[_judged('b1', 'overreach')])
-    await opened.record(episode=_episode('ep-x', graph='other'), judgements=[_judged('x1', 'overreach')])
+    await opened.record(episode=judged_episode('ep-b'), judgements=[judged_edge('b1', 'overreach')])
+    await opened.record(episode=judged_episode('ep-x', graph='other'), judgements=[judged_edge('x1', 'overreach')])
     return opened
 
 
@@ -234,8 +221,8 @@ class TestPendingFlags:
         whole, fraction = T0, T0 + timedelta(microseconds=500_000)
         opened = await OverreachShadowStore.open(tmp_path / 'same-second', clock=_Clock(fraction, whole))
         try:
-            await opened.record(episode=_episode('ep-late'), judgements=[_judged('late', 'overreach')])
-            await opened.record(episode=_episode('ep-whole'), judgements=[_judged('whole', 'overreach')])
+            await opened.record(episode=judged_episode('ep-late'), judgements=[judged_edge('late', 'overreach')])
+            await opened.record(episode=judged_episode('ep-whole'), judgements=[judged_edge('whole', 'overreach')])
             every = await opened.pending_overreach_flags('g', 10)
         finally:
             await opened.close()
@@ -243,25 +230,117 @@ class TestPendingFlags:
         assert [f.judged_at for f in every.flags] == [whole, fraction]
 
 
+H1, H2 = T0 + timedelta(hours=1), T0 + timedelta(hours=3)
+
+
+async def _seed_handoffs(data_dir: Path) -> OverreachShadowStore:
+    """Graph g: a1/a2 overreach and a3 holding handed at H1, b1 handed at H2, b2 never handed; x1 on another graph at H1."""
+    clock = _Clock(T0, T0 + timedelta(minutes=1), T0 + timedelta(minutes=1), T0 + timedelta(minutes=2),
+                   H1, H1, H2)
+    opened = await OverreachShadowStore.open(data_dir, clock=clock)
+    await opened.record(episode=judged_episode('ep-a'), judgements=[
+        judged_edge('a2', 'overreach'), judged_edge('a1', 'overreach'), judged_edge('a3', 'holding'),
+    ])
+    await opened.record(episode=judged_episode('ep-b'), judgements=[judged_edge('b1', 'overreach')])
+    await opened.record(episode=judged_episode('ep-c'), judgements=[judged_edge('b2', 'overreach')])
+    await opened.record(episode=judged_episode('ep-x', graph='other'), judgements=[judged_edge('x1', 'overreach')])
+    await opened.record_handoffs('g', ['a2', 'a1', 'a3'])
+    await opened.record_handoffs('other', ['x1'])
+    await opened.record_handoffs('g', ['b1'])
+    return opened
+
+
+class TestHandedOverreachFlags:
+    @pytest.mark.asyncio
+    async def test_only_this_graphs_handed_overreach_flags_in_the_window(self, tmp_path: Path) -> None:
+        opened = await _seed_handoffs(tmp_path / 'handed')
+        try:
+            handed = await opened.handed_overreach_flags('g', handed_from=H1, handed_until=H2)
+        finally:
+            await opened.close()
+        assert [h.flag.edge_uuid for h in handed] == ['a1', 'a2']
+
+    @pytest.mark.asyncio
+    async def test_a_handed_flag_carries_the_flag_and_its_handoff_instant(self, tmp_path: Path) -> None:
+        opened = await _seed_handoffs(tmp_path / 'handed')
+        try:
+            handed = await opened.handed_overreach_flags('g', handed_from=H1, handed_until=H2)
+        finally:
+            await opened.close()
+        assert isinstance(handed, tuple) and all(isinstance(h, HandedFlag) for h in handed)
+        assert handed[0].flag == OverreachFlag(
+            episode_uuid='ep-a', edge_uuid='a1', fact='fact of a1', rationale='span for a1',
+            judged_at=T0, prompt_version=PROMPT_VERSION,
+        )
+        assert handed[0].handed_at == H1 and handed[0].handed_at.tzinfo is not None
+
+    @pytest.mark.asyncio
+    async def test_the_window_end_is_exclusive_and_its_start_inclusive(self, tmp_path: Path) -> None:
+        opened = await _seed_handoffs(tmp_path / 'handed')
+        try:
+            through_h2 = await opened.handed_overreach_flags(
+                'g', handed_from=H1, handed_until=H2 + timedelta(microseconds=1),
+            )
+            after_h1 = await opened.handed_overreach_flags(
+                'g', handed_from=H1 + timedelta(microseconds=1), handed_until=H2 + timedelta(hours=1),
+            )
+        finally:
+            await opened.close()
+        assert [h.flag.edge_uuid for h in through_h2] == ['a1', 'a2', 'b1']
+        assert [h.flag.edge_uuid for h in after_h1] == ['b1']
+
+    @pytest.mark.asyncio
+    async def test_bounds_in_another_offset_compare_as_instants(self, tmp_path: Path) -> None:
+        plus_two = timezone(timedelta(hours=2))
+        opened = await _seed_handoffs(tmp_path / 'handed')
+        try:
+            handed = await opened.handed_overreach_flags(
+                'g', handed_from=H1.astimezone(plus_two), handed_until=H2.astimezone(plus_two),
+            )
+        finally:
+            await opened.close()
+        assert [h.flag.edge_uuid for h in handed] == ['a1', 'a2']
+
+    @pytest.mark.asyncio
+    async def test_another_graphs_handed_flag_is_its_own(self, tmp_path: Path) -> None:
+        opened = await _seed_handoffs(tmp_path / 'handed')
+        try:
+            handed = await opened.handed_overreach_flags('other', handed_from=T0, handed_until=H2)
+        finally:
+            await opened.close()
+        assert [(h.flag.episode_uuid, h.flag.edge_uuid) for h in handed] == [('ep-x', 'x1')]
+
+    @pytest.mark.asyncio
+    async def test_it_reads_through_the_read_only_view(self, tmp_path: Path) -> None:
+        writer = await _seed_handoffs(tmp_path / 'handed')
+        await writer.close()
+        reader = await OverreachShadowStore.open_read_only(tmp_path / 'handed' / SIDECAR_FILENAME)
+        try:
+            handed = await reader.handed_overreach_flags('g', handed_from=T0, handed_until=H2 + timedelta(hours=1))
+        finally:
+            await reader.close()
+        assert [h.flag.edge_uuid for h in handed] == ['a1', 'a2', 'b1']
+
+
 class TestStoreLifecycle:
     @pytest.mark.asyncio
     async def test_concurrent_records_both_land(self, store) -> None:
         await asyncio.gather(
-            store.record(episode=_episode('ep1'), judgements=[_judged('e1', 'holding')]),
-            store.record(episode=_episode('ep2'), judgements=[_judged('e2', 'overreach')]),
+            store.record(episode=judged_episode('ep1'), judgements=[judged_edge('e1', 'holding')]),
+            store.record(episode=judged_episode('ep2'), judgements=[judged_edge('e2', 'overreach')]),
         )
         assert set(await store.judgements_for([('g', 'e1'), ('g', 'e2')])) == {('g', 'e1'), ('g', 'e2')}
 
     @pytest.mark.asyncio
     async def test_the_read_only_view_reads_and_refuses_writes(self, tmp_path: Path) -> None:
         writer = await OverreachShadowStore.open(tmp_path / 'ro')
-        await writer.record(episode=_episode(), judgements=[_judged('e1', 'overreach')])
+        await writer.record(episode=judged_episode(), judgements=[judged_edge('e1', 'overreach')])
         await writer.close()
         reader = await OverreachShadowStore.open_read_only(tmp_path / 'ro' / SIDECAR_FILENAME)
         try:
             assert set(await reader.judgements_for([('g', 'e1')])) == {('g', 'e1')}
             with pytest.raises(sqlite3.OperationalError):
-                await reader.record(episode=_episode('ep2'), judgements=[])
+                await reader.record(episode=judged_episode('ep2'), judgements=[])
         finally:
             await reader.close()
 
@@ -275,14 +354,84 @@ class TestStoreLifecycle:
     @pytest.mark.asyncio
     async def test_rows_persist_across_reopen_and_close_is_idempotent(self, tmp_path: Path) -> None:
         first = await OverreachShadowStore.open(tmp_path / 'persist')
-        await first.record(episode=_episode(), judgements=[_judged('e1', 'overreach')])
+        await first.record(episode=judged_episode(), judgements=[judged_edge('e1', 'overreach')])
         await first.close()
         await first.close()
         second = await OverreachShadowStore.open(tmp_path / 'persist')
         try:
-            assert await second.judged_episode('g', 'ep1') == _episode()
+            assert await second.judged_episode('g', 'ep1') == judged_episode()
         finally:
             await second.close()
+
+    @pytest.mark.asyncio
+    async def test_checkpoint_truncates_the_wal(self, tmp_path: Path) -> None:
+        opened = await OverreachShadowStore.open(tmp_path / 'ckpt')
+        try:
+            await opened.record(episode=judged_episode(), judgements=[judged_edge('e1', 'overreach')])
+            assert _wal_bytes(tmp_path / 'ckpt') > 0
+            result = await opened.checkpoint()
+            assert result.busy == 0
+            assert _wal_bytes(tmp_path / 'ckpt') == 0
+        finally:
+            await opened.close()
+
+    @pytest.mark.asyncio
+    async def test_a_closed_store_checkpoints_as_unavailable(self, tmp_path: Path) -> None:
+        opened = await OverreachShadowStore.open(tmp_path / 'closed')
+        await opened.close()
+        assert await opened.checkpoint() == CheckpointResult.unavailable()
+
+    @pytest.mark.asyncio
+    async def test_the_shadow_checkpoints_its_store(self, store, tmp_path: Path) -> None:
+        await store.record(episode=judged_episode(), judgements=[judged_edge('e1', 'overreach')])
+        runner = _runner(store)
+        result = await runner.checkpoint()
+        assert result.busy == 0
+        assert _wal_bytes(tmp_path / 'sidecar') == 0
+
+    @pytest.mark.asyncio
+    async def test_a_closed_shadow_checkpoints_as_unavailable(self, store) -> None:
+        runner = _runner(store)
+        await runner.close()
+        assert await runner.checkpoint() == CheckpointResult.unavailable()
+
+    @pytest.mark.skipif(not Path('/proc/self/fd').is_dir(), reason='needs /proc fd links')
+    @pytest.mark.asyncio
+    async def test_a_failed_open_releases_the_sidecar_file(self, tmp_path: Path) -> None:
+        data_dir = tmp_path / 'corrupt'
+        data_dir.mkdir()
+        sidecar = data_dir / SIDECAR_FILENAME
+        sidecar.write_bytes(b'not a database ' * 64)
+        with pytest.raises(sqlite3.DatabaseError) as excinfo:
+            await OverreachShadowStore.open(data_dir)
+        assert 'not a database' in str(excinfo.value)
+        assert str(sidecar.resolve()) not in _open_fd_targets()
+
+    @pytest.mark.asyncio
+    async def test_the_read_only_view_opens_a_path_that_needs_uri_escaping(self, tmp_path: Path) -> None:
+        data_dir = tmp_path / 'odd #1 %41 ?dir'
+        writer = await OverreachShadowStore.open(data_dir)
+        await writer.record(episode=judged_episode(), judgements=[judged_edge('e1', 'overreach')])
+        await writer.close()
+        reader = await OverreachShadowStore.open_read_only(data_dir / SIDECAR_FILENAME)
+        try:
+            assert set(await reader.judgements_for([('g', 'e1')])) == {('g', 'e1')}
+        finally:
+            await reader.close()
+
+
+def _open_fd_targets() -> set[str]:
+    targets: set[str] = set()
+    for fd in os.listdir('/proc/self/fd'):
+        try:
+            targets.add(os.readlink(f'/proc/self/fd/{fd}'))
+        except OSError:
+            continue
+    return targets
+
+
+def _wal_bytes(data_dir: Path) -> int:
+    return (data_dir / f'{SIDECAR_FILENAME}-wal').stat().st_size
 
 
 # --------------------------------------------------------------------------- #
@@ -328,12 +477,17 @@ class _LLM:
         self.calls = 0
         self.entered = asyncio.Event()
         self.release = asyncio.Event()
+        self.cancelled = False
 
     async def generate_response(self, messages, response_model=None, max_tokens=None, **kwargs):
         self.calls += 1
         self.entered.set()
         if self.block:
-            await self.release.wait()
+            try:
+                await self.release.wait()
+            except asyncio.CancelledError:
+                self.cancelled = True
+                raise
         if self.error is not None:
             raise self.error
         if self.reply is not None:
@@ -459,7 +613,8 @@ class TestRunner:
         runner = _runner(owned, llm=llm)
         runner.submit(JOB)
         await llm.entered.wait()
-        await asyncio.wait_for(runner.close(), 0.5)
+        await runner.close()
+        assert llm.cancelled
         with pytest.raises(RuntimeError):
             await owned.judged_episode('g', 'ep1')
         tasks_before = asyncio.all_tasks()

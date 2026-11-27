@@ -51,7 +51,7 @@ test('sketch #9: the recent-merges caption counts only its own window\'s merges,
   for (const win of ['7d', '24h']) {
     const { client, body, block, echo } = await mergeBlock(win);
     const { recentMergesCaption } = client.window.DF_WINDOW_CHIP;
-    const { latencyCaption, recentTotal, projectSpeculative } = client.window.DF_MERGE_QUEUE;
+    const { latencyCaption, recentTotal, projectSpeculative, projectAttempts, attemptCount } = client.window.DF_MERGE_QUEUE;
     const D = client.window.DF_DATA;
     const windowTotal = recentTotal(D, 'dark-factory');
 
@@ -67,17 +67,40 @@ test('sketch #9: the recent-merges caption counts only its own window\'s merges,
     }
     totals[win] = windowTotal.value;
 
-    const attempts = sum(block.outcomes.values);
-    const timed = block.latency.with_duration;
-    assert.equal(latencyCaption(block.latency), `of ${timed} with recorded duration · ${attempts - timed} without`);
+    const read = projectAttempts(D, 'dark-factory');
+    assert.equal(read.state, 'fresh', `${win}: a readable runs.db attempt window is measured`);
+    const attempts = attemptCount(read.value);
+    const timed = read.value.latency.with_duration;
+    assert.equal(latencyCaption(read.value.latency), `of ${timed} with recorded duration · ${attempts - timed} without`);
   }
   assert.ok(totals['24h'] < totals['7d'], `24h holds ${totals['24h']} merges and 7d ${totals['7d']}`);
 });
 
-test('sketch #9: the donut centre, summed inline in tabs.jsx and so asserted here as arithmetic over the served block, counts each attempt once', async () => {
+test('sketch #9: the donut centre, attemptCount over the served attempts Datum, counts each attempt once', async () => {
   for (const win of ['7d', '24h']) {
-    const { block } = await mergeBlock(win);
-    assert.equal(sum(block.outcomes.values), block.latency.with_duration + block.latency.without_duration, win);
-    assert.equal(block.outcomes.values.length, block.outcomes.labels.length, win);
+    const { client } = await mergeBlock(win);
+    const { projectAttempts, attemptCount } = client.window.DF_MERGE_QUEUE;
+    const read = projectAttempts(client.window.DF_DATA, 'dark-factory');
+
+    assert.equal(read.state, 'fresh', win);
+    const { outcomes, latency } = read.value;
+    assert.equal(attemptCount(read.value), latency.with_duration + latency.without_duration, win);
+    assert.equal(attemptCount(read.value), sum(outcomes.values), win);
+    assert.equal(outcomes.values.length, outcomes.labels.length, win);
+  }
+});
+
+// The done merges land 2h, 20h, 30h and 70h before T0: two in the day, four in the week.
+const THROUGHPUT_READING = { '24h': 'now 2/day · mean 2/day', '7d': 'now 2/day · mean 0.57/day' };
+
+test('the throughput panel names the trailing window its served rate was computed over', async () => {
+  for (const win of ['24h', '7d']) {
+    const { client } = await mergeBlock(win);
+    const { projectLandingRate, landingRateCaption, landingRateReading } = client.window.DF_MERGE_QUEUE;
+    const rate = projectLandingRate(client.window.DF_DATA, 'dark-factory').value;
+
+    assert.equal(landingRateCaption(rate), 'landings/day · 1-day trailing', win);
+    const reading = landingRateReading(rate);
+    assert.ok(reading.startsWith(THROUGHPUT_READING[win]), `${win}: ${reading}`);
   }
 });

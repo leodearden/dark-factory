@@ -14,6 +14,7 @@ from __future__ import annotations
 import logging
 
 import pytest
+from _census_helpers import census_lines
 
 from fused_memory.middleware.operational_suggestion_guard import (
     operational_suggestion_finding,
@@ -768,3 +769,38 @@ class TestProvenanceStampRecognizerParityWithRoutingIntentGuard:
             'The two _strip_provenance_stamps copies disagree on this input; '
             'they are deliberate duplicates and must stay equivalent.'
         )
+
+
+_SOURCE = 'operational_suggestion_guard'
+
+
+def _finding_for(metadata):
+    return operational_suggestion_finding(
+        title=None,
+        description='Restart the fused-memory service and confirm it is back up.',
+        details=None,
+        task_kind='normal',
+        metadata=metadata,
+    )
+
+
+class TestUnreadableMetadataIsDiscardedLoudly:
+    """Unreadable metadata reads as empty under the shared wire rule, and is logged."""
+
+    def test_malformed_string_behaves_as_absent_and_logs_one_census_line(self, caplog):
+        with caplog.at_level(logging.WARNING):
+            finding = _finding_for('{not json')
+        assert finding is not None
+        assert finding == _finding_for(None)
+        assert len(census_lines(caplog, _SOURCE)) == 1
+
+    def test_unreadable_value_is_resolved_and_logged_once_per_finding(self, caplog):
+        with caplog.at_level(logging.WARNING):
+            _finding_for('{not json')
+        assert len(census_lines(caplog)) == 1
+
+    @pytest.mark.parametrize('metadata', [None, ''])
+    def test_absent_metadata_logs_no_census_line(self, metadata, caplog):
+        with caplog.at_level(logging.WARNING):
+            _finding_for(metadata)
+        assert census_lines(caplog, _SOURCE) == []

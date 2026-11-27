@@ -12,8 +12,8 @@ Steps covered:
   step-7  RED   — fail-open robustness
   step-8  GREEN — implement fail-open guards
 
-This module reuses the bare-worker git_repo/git_config/git_ops fixtures and
-_setup_repo from test_merge_queue_resource_audit.py (per-file duplication
+This module reuses the bare-worker git_repo/git_config/git_ops fixtures
+from test_merge_queue_resource_audit.py (per-file duplication
 convention — see that module's docstring), along with its
 _mkdir_worktree/_GRACE/_NOW age-test helper pattern. It imports
 orchestrator.merge_lane.worker LOCALLY inside each test so a not-yet-implemented
@@ -33,10 +33,13 @@ from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
+from _git_fixtures import seed_repo
 from _merge_lane_fakes import FakeClock
+from _packaged_defaults import load_packaged_defaults
+from _worktree_registrations import lane_admin_dir, registered_worktree_paths
 
 from orchestrator.config import GitConfig
-from orchestrator.git_ops import PERSISTENT_MERGE_WORKTREE_NAME, GitOps, _run
+from orchestrator.git_ops import PERSISTENT_MERGE_WORKTREE_NAME, GitOps
 
 # ---------------------------------------------------------------------------
 # Fixtures + helpers (per-file duplication convention — see
@@ -44,23 +47,10 @@ from orchestrator.git_ops import PERSISTENT_MERGE_WORKTREE_NAME, GitOps, _run
 # ---------------------------------------------------------------------------
 
 
-async def _setup_repo(repo: Path) -> None:
-    """Initialise a bare git repository with a single commit on main."""
-    await _run(['git', 'init', '-b', 'main'], cwd=repo)
-    await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=repo)
-    await _run(['git', 'config', 'user.name', 'Test'], cwd=repo)
-    (repo / 'README.md').write_text('# Test\n')
-    await _run(['git', 'add', '-A'], cwd=repo)
-    await _run(['git', 'commit', '-m', 'Initial commit'], cwd=repo)
-
-
 @pytest.fixture
 def git_repo(tmp_path: Path) -> Path:
     """Create a temporary git repository with an initial commit."""
-    repo = tmp_path / 'repo'
-    repo.mkdir()
-    asyncio.run(_setup_repo(repo))
-    return repo
+    return seed_repo(tmp_path / 'repo')
 
 
 @pytest.fixture
@@ -122,19 +112,6 @@ async def _create_backdated_merge_worktree(git_ops: GitOps, *, age: float) -> Pa
     return wt
 
 
-async def _registered_worktree_paths(git_ops: GitOps) -> list[str]:
-    """Return the ``git worktree list --porcelain`` registered paths."""
-    rc, out, _ = await _run(
-        ['git', 'worktree', 'list', '--porcelain'], cwd=git_ops.project_root,
-    )
-    assert rc == 0
-    return [
-        line[len('worktree '):].strip()
-        for line in out.splitlines()
-        if line.startswith('worktree ')
-    ]
-
-
 async def _wait_until(predicate, *, what: str, timeout: float = 10.0) -> None:
     """Poll *predicate* until true, or fail after *timeout* REAL seconds.
 
@@ -151,21 +128,6 @@ async def _wait_until(predicate, *, what: str, timeout: float = 10.0) -> None:
             return
         await asyncio.sleep(0.005)
     raise AssertionError(f'timed out after {timeout}s waiting for {what}')
-
-
-def _lane_admin_dir(lane: Path) -> Path:
-    """Parse the ``.git/worktrees/<name>`` admin dir out of a lane's ``.git``
-    pointer file (``gitdir: <repo>/.git/worktrees/<name>``).
-
-    Local per-file duplication (see module docstring / the same helper in
-    test_git_ops.py:_lane_admin_dir) — used to simulate the task-2922 shape-1
-    interrupted-teardown leak by rmtree-ing the admin dir while the on-disk
-    tree survives, so ``git worktree remove --force`` errors.
-    """
-    content = (lane / '.git').read_text().strip()
-    prefix = 'gitdir:'
-    assert content.startswith(prefix), f'unexpected worktree .git pointer: {content!r}'
-    return Path(content[len(prefix):].strip())
 
 
 # ---------------------------------------------------------------------------
@@ -195,8 +157,8 @@ class TestReapOrphanedMergeWorktreesCore:
         report = await worker.reap_orphaned_merge_worktrees(now=_NOW)
 
         assert not wt.exists(), 'aged orphan must be removed from disk'
-        registered = await _registered_worktree_paths(git_ops)
-        assert str(wt) not in registered, (
+        registered = registered_worktree_paths(git_ops.project_root)
+        assert str(wt.resolve()) not in registered, (
             f'aged orphan must be gone from git worktree list: {registered}'
         )
         assert str(wt.resolve()) in report['reaped']
@@ -517,7 +479,7 @@ class TestReapShape1InterruptedTeardown:
         # Simulate shape-1: remove the .git/worktrees/<name> admin dir (located
         # via the lane's <wt>/.git gitdir pointer) so the on-disk tree survives
         # but `git worktree remove` errors — the interrupted-teardown shape.
-        shutil.rmtree(_lane_admin_dir(wt))
+        shutil.rmtree(lane_admin_dir(wt))
 
         # Sanity: the audit flags this shape-1 orphan BEFORE the sweep.
         before = worker.worktree_ledger_violations(now=_NOW)
@@ -601,8 +563,8 @@ class TestPeriodicReapHelper:
         await worker._maybe_reap_orphaned_merge_worktrees(now=_NOW)
 
         assert not orphan.exists(), 'aged orphan must be removed from disk'
-        registered = await _registered_worktree_paths(git_ops)
-        assert str(orphan) not in registered, (
+        registered = registered_worktree_paths(git_ops.project_root)
+        assert str(orphan.resolve()) not in registered, (
             f'aged orphan must be gone from git worktree list: {registered}'
         )
         assert owned_wt.exists(), 'owned/registered worktree must survive the sweep'
@@ -953,9 +915,7 @@ def _shipped_cold_command_timeout_secs() -> float:
     shipped budget is caught by the derivation assertion below instead of
     silently invalidating it.
     """
-    from orchestrator.config import _load_defaults
-
-    value = _load_defaults().get('merge_verify_cold_command_timeout_secs')
+    value = load_packaged_defaults().get('merge_verify_cold_command_timeout_secs')
     assert value is not None, (
         'defaults.yaml no longer ships merge_verify_cold_command_timeout_secs — '
         'the destructive floor below is DERIVED from it, so this test must be '
@@ -1045,8 +1005,8 @@ class TestPeriodicReapDestructiveFloor:
             f'DESTRUCTION floor must survive the sweep — it may still be a live '
             f'verify: {in_band}'
         )
-        registered = await _registered_worktree_paths(git_ops)
-        assert str(in_band) in registered, (
+        registered = registered_worktree_paths(git_ops.project_root)
+        assert str(in_band.resolve()) in registered, (
             f'the surviving worktree must also still be registered with git '
             f'(not half-torn-down): {registered}'
         )
@@ -1106,8 +1066,8 @@ class TestPeriodicReapDestructiveFloor:
             f'reclaimed in-run — raising the floor must not disable the sweep: '
             f'{aged}'
         )
-        registered = await _registered_worktree_paths(git_ops)
-        assert str(aged) not in registered, (
+        registered = registered_worktree_paths(git_ops.project_root)
+        assert str(aged.resolve()) not in registered, (
             f'the reaped worktree must be gone from git worktree list: {registered}'
         )
 

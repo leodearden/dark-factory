@@ -1,6 +1,6 @@
 """Contract tests for ``conftest.py`` correctness.
 
-This module guards six invariants that would silently regress under refactoring
+This module guards eight invariants that would silently regress under refactoring
 and are NOT already covered by other tests:
 
 1. **sys.path ordering / module resolution** — ``conftest.py`` must insert
@@ -40,6 +40,11 @@ and are NOT already covered by other tests:
    one test must not collide.  Its pass-through kwargs and the config /
    collaborator defaults the folded-in factories depended on are pinned here
    too.  See ``TestMakeStewardFixture``.
+
+7. **No real cold pre-provision** — ``_isolate_orch_config`` empties the host-reaching ``verify_cold_preprovision_command``, so no test runs a real ``uv sync``; an explicit kwarg still opts in.
+
+8. **The shared mock-derived stray-dir guard is bound** — see
+   ``TestTheMockDerivedStrayDirGuardIsWired``.
 
 Tests of plain attribute defaults (e.g. ``mock.usage_cap.enabled is False``)
 are deliberately omitted — they would just duplicate literals from
@@ -325,6 +330,30 @@ def test_mock_orch_config_overrides_db_path_default(mock_orch_config, tmp_path):
     assert db_path.suffix == '.db', (
         f'expected overrides_db_path to have .db suffix, got {db_path.name!r}'
     )
+
+
+def test_no_test_inherits_a_cold_preprovision_command(tmp_path, monkeypatch):
+    """A bare config carries no cold pre-provision command, whatever the yaml says.
+
+    The yaml here sets one deliberately, so the assertion does not hang on the
+    operational yaml's current value.
+    """
+    from orchestrator.config import OrchestratorConfig
+
+    yaml_path = tmp_path / 'orch.yaml'
+    yaml_path.write_text('verify_cold_preprovision_command: "uv sync --all-packages"\n')
+    monkeypatch.setenv('ORCH_CONFIG_PATH', str(yaml_path))
+
+    assert OrchestratorConfig().verify_cold_preprovision_command == ''
+
+
+def test_an_explicit_preprovision_command_still_wins():
+    """Feature tests opt into provisioning with an explicit kwarg."""
+    from orchestrator.config import OrchestratorConfig
+
+    config = OrchestratorConfig(verify_cold_preprovision_command='touch x')
+
+    assert config.verify_cold_preprovision_command == 'touch x'
 
 
 class TestMakeStewardFixture:
@@ -747,4 +776,16 @@ class TestMakeStewardFixture:
         assert real_queue.queue_dir == own_dir, (
             f'the fixture must not re-stamp queue_dir on a caller-supplied queue — '
             f'expected {own_dir}, got {real_queue.queue_dir}'
+        )
+
+
+class TestTheMockDerivedStrayDirGuardIsWired:
+    """The shared guard from ``df_pytest_isolation`` is live in this suite (task 5145)."""
+
+    def test_it_is_registered_for_every_test(self, request):
+        assert '_df_no_mock_derived_stray_dirs' in request.fixturenames, (
+            'call arm_test_root_isolation(config) from '
+            'orchestrator/tests/conftest.py\'s pytest_configure, which arms '
+            '_df_no_mock_derived_stray_dirs. Without it an orchestrator run can materialise an '
+            'AsyncMock/ or MagicMock/ tree silently (tasks 3223 and 4592).'
         )

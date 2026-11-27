@@ -17,14 +17,14 @@ from orchestrator.harness import _BY_DESIGN_SESSION_RESUME_REASONS
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'scripts'))
 
 import governed_list_agreement
-import merge_lane_metrics
+import merge_lane_ratchet
 
 MERGE_LANE_RATCHET_BASELINE = governed_exceptions(
     'orchestrator.tests.merge_lane_ratchet_baseline.json',
     'Merge-lane quality measures frozen at their seeded values: each may fall and '
     'none may rise without an authorized raise, and a path or function absent from '
     'the baseline must meet the file-size and new-function complexity ceilings.',
-    [merge_lane_metrics.BASELINE_RELPATH],
+    [merge_lane_ratchet.BASELINE_RELPATH],
     default=Policy('inv12-shrink-only-baselines'),
     default_covers=1,
 )

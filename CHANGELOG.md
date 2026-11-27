@@ -8,7 +8,202 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- `scan_memory_content` now reports records containing a caller-supplied needle. Before, every walked record was re-checked with the tool-call-leak detector, so a custom-needle hunt never reported a match and came back as a clean, complete scan (false absence). Custom needles are now the verdict, as a literal, case-sensitive substring match, and they are honoured with `exhaustive=True`, which now skips only the prefilter. The MCP tool's default `limit` is 1000 (pass `null` for an uncapped walk), and each match's `metadata` omits `data`/`memory`/`content`; `get_memory_by_id` returns the full body. A match's `excerpt` is now a window centred where its earliest matched fragment begins, with `…` on each elided side, not always the first 240 characters. An empty-string needle is rejected with a `ValueError`, since every record contains it. A prefiltered custom-needle scan is complete only while `data` has no text index; `exhaustive=True` does not depend on that. The Mem0 content-key tuple and its text reader have one home, `fused_memory/utils/mem0_content_keys.py` (task 4857).
+- The starvation watchdog's `esc-__starvation_auto_pin_cap__` L1 now reports a CHANGE in the capped cohort, not the standing backlog. It is filed only on a new non-live holder, a new module behind a non-live holder (a live holder's lock turnover is never news), or growth past `max(10, 50%)` of the last announcement. It is refreshed in place while open, and resolved when the cohort drains or every holder is live. It is filed only when some blocker's holder is non-live, or when no waiting task has a recorded blocker while locks are held: a progressing holder, including one just dispatched or finishing, never files it. A tick with no lock held (the first ticks after a restart) leaves an open L1 as it is. A cap alarm parked at L2 for a human counts as open: no L1 is filed beside it, it is never rewritten, and it is resolved with the rest. The watchdog's refusal counts, waiting cohort, per-task announcements and last announcement now survive restarts in `scheduler_eligibility.db`, so a restart no longer re-announces the cohort a day later. A hot-reload that stops the cohort firing, or disabling the watchdog, drains it and resolves the L1. The cap stays 3, and the interim `skip_threshold: 150` stays until task 10578. Amends PRD D9 (Leo, 2026-11-13 and 2026-11-16) (task 9636).
+- `update_task` with none of `prompt`, `metadata`, `title`, `description`, `details`, `priority` or `dependencies` now raises `NoFieldsToUpdateError` (wire `error_type='NoFieldsToUpdateError'`) instead of bumping `updated_at` and returning `updated: True`; `dependencies=[]` and `metadata='{}'` still write (task 4867).
+- fused-memory's primary and recon-report MCP servers now refuse a tool call naming an argument the tool does not declare, instead of silently dropping it: a structured `ToolError` with `code='unknown_argument'`, each unknown name with its `closest_declared` name (a spelling guess, so no ready-to-resubmit call is offered) and the `declared` list. Nothing runs, and the server logs one WARNING per refusal. The declared set is read live from the tool's schema; the guard lets the call through unchecked when there is no usable schema. Fixed the in-repo callers that relied on the drop: the dashboard's Unpin no longer clears the whole override row (it sent `fields`; now one `field` per call), and its pin-queue reorder sends `ordered_task_ids` (task 4867).
+- fused-memory's task-mention scan (`fused_memory/utils/canonical_labels.py::scan_content`) now refuses digits glued to a letter or underscore (`task 8c7e163fcf` and `reify:8c7e163` yield nothing, no longer Task 8 and reify:8), reads every number of a `tasks A, B and C` / `tasks A/B` list after the plural task word (not only the first), and, given a project registry, reads `Reify task N` and `in reify, task N` as `reify:N` instead of the local Task N. Write-time derived referents (`utils/referent_resolution.py::resolve_referents`) change accordingly; without a registry the project-name reading is off (task 10082).
+
 ### Added
+
+#### The filing curator can combine two candidates of one batch (task 8416)
+
+The curator may now combine two candidates the worker drains in one batch,
+lifting batch rule 2: `action='combine'` with `batch_target_index=<B>`,
+`target_id` null, `target_fingerprint` set to B's title and a
+`rewritten_task`. B must itself be created. It is then rewritten through the
+ordinary combine path, under every combine guard.
+
+- A combine whose target sibling was not created (dropped, combined, failed
+  or refused) is created on its own with a reason starting
+  `batch-target-not-create`. It also writes a combine-audit refusal row with
+  `refused_reason: batch-target-not-create`. A combine onto a parked sibling
+  parks with it, as a drop does.
+- A within-batch drop onto a sibling now writes a combine-audit row. That row
+  records the target unchanged: `new` equals `old`, and `items_after` equals
+  `items_before`.
+- Every combine-audit row carries `action` (`combine` or `drop`). A row
+  without the key predates it and was a combine.
+- The parser keeps `batch_target_index` only on a batch edge. A drop or
+  combine that sets both `target_id` and `batch_target_index` degrades to
+  `ambiguous-<action>`.
+- The curator prompt harness is now `curator-v2`. Heuristics artifacts pinned
+  under `curator-v1` stop resolving, and the in-code baseline is used until
+  they are re-pinned.
+
+#### Held follow-ups are promoted (task 8418)
+
+A held follow-up now leaves the hold by promotion: one write drops its holder
+edge and stamps `followup_hold.promoted {by, at, ref}`, and every held task it
+depends on is promoted with it. `pending_since` is left as it is. See
+`docs/task-authoring.md` §3.4.
+
+- Triggers: an edge from a pending, unheld task (`add_dependency`, a
+  born-with dependency, an `update_task` replacement); a landing on `pending`
+  from `deferred` (`commit_planning`, `set_task_status`, the deferral sweep);
+  a citation (`x_finding_key` or `prd_path` written by `update_task`); a
+  combine of a candidate outside the hold rule; a human
+  `remove_dependency(task, holder)` or replacement dropping the holder id; and
+  `release_holder=True`, which promotes every active held follow-up before
+  targeted reconciliation runs, so a cancel-release no longer files one L1
+  per held follow-up.
+- Two new event types: `followup_promoted {task_id, by, ref}` and
+  `followup_promotion_deferred {task_id, by, ref, guard, reason}`.
+- Two new refusals: `followup_holder_edge_strip_refused`, for a machine-role
+  `update_task` replacement that drops the holder edge, and
+  `followup_promotion_deferred`, for a human removal a guard defers.
+- A promotion guard hook, `followup_hold.py::register_promotion_guard`; none
+  is registered by default. A guard that raises counts as a deferral.
+- A promotion that another write set off never fails that write: its error
+  is reported in `post_write_warnings` (`post_create_warnings` on a filing),
+  and the write's event and reconciliation still run. `release_holder=True`
+  on a holder already at the release status releases whatever is still
+  held, so a release that stopped partway can be finished.
+- `update_task` keeps a held task's `followup_hold` record: a write that
+  would drop or rewrite it, a `replace` included, carries the stored record.
+- `TaskInterceptor.hold_emit(project_root)` gives a caller outside the
+  interceptor the journaling `emit` every promotion function takes.
+
+#### New `park_refused` event and `park_refused_emit_interval_secs` (task 6328)
+
+**Old behaviour.** Only the scored scan's top candidate earns skips and fairness
+parks. A candidate below it that was refused its locks by a same-tier (or
+lower-tier) park earned nothing and left no trace: no skip, no park, no event. It
+waited as long as the park's owner did. 6040 waited about 70 h behind 5221's
+critical park, while 5221 waited on 3096's hold of `harness.py`.
+
+**New behaviour.**
+
+- **New `park_refused` event** for a dispatch candidate refused by parks alone, none
+  of which outranks it. Higher-tier fairness parks (fairness working as designed),
+  pin reservations (they report through `pin_blocked`) and any held blocker are out
+  of the class. Payload `{task_id, priority, episode_secs, blockers: [{module, owner,
+  kind}], park_owners: [{owner, source, tier|pin_order, park_age_secs,
+  waiting_on}]}`; `waiting_on` is the owner's own blockers, or `null` when the owner
+  is not in the tick's task list. Dispatch decisions are unchanged.
+- **New config key `park_refused_emit_interval_secs`**, default `1800`, `gt=0`,
+  green tier. The first event comes once the refusal has lasted one interval, then at
+  most once per interval. A dispatch, a refusal by anything else, or the task leaving
+  the dispatch candidates ends the episode; a scoped tick (task 8480) does not.
+- **New read `ModuleLockTable.top_park_rank(owner)`**: the strongest rank among the
+  stack tops the owner holds.
+
+The operator lever is to pin the waiting task: OPERATIONS.md §5, "A task waiting on a
+peer's park". Why visibility rather than an automatic reservation:
+`plans/scheduler-dispatch-scoring-and-lock-layer-prd.md` §7, "Annotation (task 6328)".
+
+#### Low follow-ups are held behind a per-project follow-up holder (task 8417)
+
+`submit_task` now files a low or polish agent follow-up or reviewer suggestion
+already held: it is created with a dependency edge on its project's follow-up
+holder, a never-dispatching deterministic gate minted on first need, so it is
+never ready on its own. Tasks carrying `execution_class`, `prd_path`,
+`x_finding_key` or `human_decomposed` (every planning-mode birth) are not held.
+Promotion, which releases held tasks one at a time, is task 8418. See
+`docs/task-authoring.md` §3.4.
+
+- New config key `followup_hold.backfill_enabled`, default `true`,
+  restart-only. The first fused-memory start after deploy holds the existing
+  pending follow-up stock of every known project before serving, except a
+  follow-up that an active, non-deferred task in any known project waits on,
+  directly or through other stock follow-ups. A second start holds nothing.
+- `set_task_status` gained `release_holder` (strict bool, default `false`).
+  `done`, `cancelled` or `deferred` on a holder is refused with
+  `followup_holder_protected` unless it is the literal `true`, because each of
+  them releases every held follow-up. `update_task` refuses, with the
+  same error, a write that strips the holder's `followup_holder` or
+  `deferred_watch` or sets its `trigger_met`. Until task 8418 lands, a
+  cancel-release also makes targeted reconciliation file one L1 escalation
+  per held follow-up, or block each one when the orchestrator is stopped.
+- A held filing's stored ticket outcome (`result_json`) carries `held_by`, the
+  holder's id. `resolve_ticket` does not return it.
+- A holder's mint journals `task_created` with `source:
+  'followup-holder-mint'`.
+- Three new event types: `followup_held {task_id, holder_id}` per held filing,
+  `followup_hold_backfilled {project_id, count}` once per project per start
+  (count possibly 0), and `followup_holder_protected {holder_id,
+  attempted_status, protection, held_count}` per refusal.
+- `followup_holder` and `followup_hold` are registered metadata submodels in
+  `shared/src/shared/followup_hold_records.py`, written only by fused-memory.
+
+#### Cross-graph leak census (task 6849)
+
+`python -m fused_memory.maintenance.cross_graph_leak_census [--group-id G] [--json]`
+counts, per graph and per label (`Entity`, `Episodic`), the nodes whose `group_id`
+names another graph or no graph at all: task 2115's cross-graph leak. Every
+group-scoped read is blind to such nodes, so this restores the leak signal task 5662
+removed from the task-family census. It is read-only, and it exits non-zero when any
+graph was not read whole, not when leaks are found. The per-node manifest and the
+remedy stay with `fused-memory/scripts/migrate_cross_graph_leak.py`'s dry run.
+
+Both censuses now share one completeness rule, `graph_sweep.sweep_complete`. A sweep
+that read no graph at all, such as an empty listing from a wrong `FALKORDB_URI`, now
+reports `complete=False` and exits 1. This is a change for
+`python -m fused_memory.maintenance.task_family_census`, which used to exit 0 there.
+
+Baseline: the CLI was not run against the live store, because ad-hoc access to
+production FalkorDB is `redis-cli` reads only. This is the architect's measurement,
+taken on 2026-11-17 with read-only `GRAPH.RO_QUERY` via `redis-cli` inside
+`docker-falkordb-1`. Leaked `Entity` nodes: 0 in each of reify, dark_factory,
+know_live, knowlive, market_predictor and pump_web_ui. Foreign `Episodic` residue
+(CGL's EPISODIC_SKIP): dark_factory 78, reify 114, know_live 39.
+
+#### Weekly duplicate-cluster report with a consecutive-run regrowth diff (task 3136)
+
+A new systemd user timer, `scripts/fused-memory-duplicate-audit.timer` (Sun 06:30),
+runs `fused-memory/scripts/duplicate_cluster_report.py`. That script runs the
+detector once per project and category, read-only, with `--no-metrics`. It saves each
+plan, writes `report-<STAMP>.json` and `summary-<STAMP>.txt` under
+`fused-memory/data/duplicate-cluster-reports/<project>/`, and diffs each report against
+that project's previous one. The diff covers cluster lineage by member overlap
+(`new`/`grew`/`shrank`/`split`/dissolved), splits added members into re-emitted and
+pre-existing, and lists per-category `incomparable_reasons`. Regrowth is also totalled
+per category, and the headline leaves out categories the previous report did not
+sweep. Each category's detector stderr is kept beside its plan as
+`plan-<STAMP>-<category>.stderr.log`. A previous report that cannot be read is
+refused before that project's sweep starts. The report is
+`authoritative: false` and files nothing. Gate filing from the report is descoped by
+the 2026-11-17 ruling (esc-10244-1), recorded as `recall_caveat.gate_filing_ruling`.
+`--plan` mode rebuilds a report from saved plans with
+no store access, which seeds the 2026-08-11 T0 baseline. Settings live in
+`fused-memory/config/duplicate-audit.yaml`, including the recall caveat every report
+carries. See OPERATIONS.md §12, "Weekly duplicate-cluster report (Sun 06:30)".
+
+The detector (`fused-memory/scripts/audit_duplicate_memories.py`) changes in three ways:
+
+- **Retention carve-out.** A cluster member carrying a non-empty `metadata.parent_id`
+  (`child_record`) or `metadata.topic` (`topic_stamped`) is never a delete candidate,
+  so `--apply` can no longer delete it. Such members are listed in the group's
+  `retained_members`, and the plan's `retained_carveout` counts them. Before this, a
+  stamped member of a mixed or differing-topic cluster could be deleted.
+- **Report-feed fields.** The stdout plan gains per-group `members` facts (`id`,
+  `created_at`, `topic`, `canonical`, `parent_id`, `kind`), a plan-level `child_counts`
+  over every scanned child record, and `scan_coverage`. Existing keys keep their
+  meaning.
+- **One `created_at` reading.** Survivor ordering and the report's member ages both
+  parse through `fused_memory.utils.created_at.parse_created_at`, which reads a naive
+  timestamp as UTC. The detector used to read one as host-local time.
+
+#### `mem0.persist_history` keeps mem0's change history off the shared DB (task 6100)
+
+New restart-only leaf `Mem0BackendConfig.persist_history`. It defaults to True, and
+under that default the config mem0 receives is byte-identical to before. At False,
+each mem0 instance keeps its history in a private in-memory SQLite DB instead of the
+process-shared `$MEM0_DIR/history.db`. The conftest `mock_config` and
+`fused-memory/scripts/bake_off_storage_shape.py::run_bake_off` now turn it off, and no
+longer patch mem0's private `instance.db.add_history`.
 
 #### `consolidate_memories` teaches the write-time topic guard its topic (task 3135)
 
@@ -525,6 +720,70 @@ entry, bounding but not closing it), and `x_memory_citation_tombstones` on citin
 landed, have since landed under task 3134 (below).
 
 ### Changed
+
+#### The starvation watchdog fires only on a stuck signal, and now acts on what it finds (task 3821, esc-4851-3)
+
+Read `STARVATION_WATCHDOG` series from before and after this change under different
+meanings. Before it, most firings measured backlog depth. The 488/741/915/1171-record
+storms were all `skip_count=0`.
+
+**Old behaviour.**
+- The clock was an in-memory `first_seen`, stamped from the monotonic clock. A restart or
+  a one-tick candidacy gap wiped it, so after every restart the whole backlog was
+  stamped as one cohort.
+- An `idle_only` gate fired on age alone (`idle_only_secs`, 72h), so that cohort, and
+  every low task that later crossed 72h, fired together.
+- A firing filed only a level-0 info escalation. It emitted no event and took no action.
+- Every alarm advanced the EWA breaker's numerator.
+
+**New behaviour.**
+- **Durable eligibility clock.** One wall-clock `eligible_since` anchor per task, stamped
+  at first dispatch candidacy, lives in `data/orchestrator/scheduler_eligibility.db`
+  (`shared.project_layout.scheduler_eligibility_db`). Restarts and transient gaps keep
+  it. Dispatch, leaving `pending`, or going terminal drops it.
+- **Every gate needs the age floor AND an in-candidacy stuck signal.** Age alone never
+  fires. The gate vocabulary is now `dual`, `lock_refused` and `park_blocked`, and
+  `idle_only` is retired:
+  - `dual`: top-candidate skips `>= skip_threshold` and age `>= idle_secs`. Unchanged,
+    except that it now runs on the durable clock.
+  - `lock_refused`: lock refusals `>= skip_threshold` and age `>= idle_only_secs`. A
+    refusal is a scan in which the task was refused its locks while a lower-ranked
+    candidate dispatched. PSI-deferred and no-winner scans count nothing.
+  - `park_blocked`: the task's live park has a module held by another task, and the park
+    is at least `park_blocked_age_secs` old (new, default 4h). It takes precedence over
+    the other gates and names `blocking_holder` and `blocking_module`.
+
+  The thresholds themselves are unchanged. `idle_secs` and `idle_only_secs` stay
+  259200.
+- **Corroboration and dedup.** A finding is delivered only if a live `get_statuses`
+  read still shows `pending`. Open watchdog escalations are reloaded at startup, so a
+  restart neither re-files an alarm nor leaves it unresolved.
+- **`starvation_detected` event.** Every delivered firing emits it. The payload carries
+  `gate`, `eligible_age_secs`, `skip_count`, `lock_refusals`, `blockers`,
+  `auto_pinned`, `pin_order`, `source` and `disposition`. A `park_blocked` firing also
+  carries `blocking_holder`, `blocking_module` and `park_age_secs`.
+- **Bounded, owned auto-pin.** A `dual` or `lock_refused` firing pins the task at the
+  tail of the queue. The pin's override row has `source='starvation_watchdog'` and
+  `ttl_until` = fire time + `auto_pin_ttl_secs` (new, default 24h), and it also files a
+  level-0 info trail. Watchdog pins are bounded:
+  - At most `auto_pin_max_concurrent` (new, default 3) exist at once.
+  - A firing past the cap is recorded as `cap_reached` and files no escalation of its
+    own. Instead, one level-1 escalation under `__starvation_auto_pin_cap__` names the
+    newly capped cohort. A capped task is not marked escalated: it is announced once,
+    then pinned (with its level-0 trail) on the first pass that finds a slot free. The
+    cap escalation is resolved once no capped task still waits on a slot.
+  - An existing operator row is never touched, and that firing is recorded as
+    `operator_override`.
+  - A watchdog pin is released, whichever process created it, when its task dispatches
+    or is seen in any status other than `pending`.
+
+  `park_blocked` takes no pin. It files a level-1 info escalation.
+- **`overrides.source`.** The overrides table gains `source TEXT NOT NULL DEFAULT
+  'operator'`. Both `OverrideStore` and fused-memory's override tools add the column to
+  legacy databases idempotently. Operator writes always take ownership, and
+  `get_pin_queue` reports `source`.
+- **EWA numerator.** `digest.counts_toward_ewa_numerator` excludes the watchdog's role
+  (`orchestrator-starvation-watchdog`). Its alarms still advance the digest gate.
 
 #### Only a pending owner whose dependencies are not known unsatisfied may hold parks (task 6518, esc-6040-7)
 
@@ -1631,6 +1890,39 @@ contain it.)  The renamed event's pre-1230 form (`reservation_installed` +
 `data.reason='reserve_now'`) had zero in-repo consumers.
 
 ### Fixed
+
+#### Fairness parks can no longer deadlock pending owners (task 7799)
+
+Two pending owners could each hold a partial park and need a key the other had parked.
+Each one's acquire was refused by the other's park, and only the score-top ever retried
+its install, so neither moved until someone deferred one of them or the orchestrator
+restarted. solar_challenge hit this four times between 10-27 and 11-01, once for about
+31 h. Park entries now have one order, `scheduler.py::_ParkKey`: rank, then older
+numeric id, then id. A foreign park blocks a requester that owns parks only when its key
+precedes the requester's best key, and install shadows or blocks by the same key. A
+requester that owns no park is still blocked by every park. Every park wait therefore
+points at a strictly smaller key, and no cycle can form. What an operator will see:
+`reservation_shadowed` events now also occur between same-tier owners (the older id
+shadows), and a park owner can pass a lower-key park on a key it has not parked.
+`request_park_eviction` behaves as before. Rationale:
+`plans/scheduler-dispatch-scoring-and-lock-layer-prd.md` §7, Amendment (task 7799).
+
+#### resolve_escalation_shas reports git faults as failed_shas (task 7485)
+
+- **A git fault is never read as "no twin".** `GitOps.resolve_rebased_citation` used to
+  return None, the "already on main, not a commit, or no twin" answer, when git could not
+  answer: a `project_root` that is not a git repository, an unknown main branch, or a
+  failed `diff-tree`, `patch-id` or `log` mid-lookup. It now raises the new
+  `GitQueryFailed` for each of these (`WorktreeMissing` when `project_root` no longer
+  exists). Only empty output stays a fact.
+- **Only tokens that name a commit count against the cap.** One `git cat-file
+  --batch-check` (`GitOps.commits_named`) checks every cited token's object type before
+  `MAX_CITED_SHAS_RESOLVED` is applied. UUID segments, digit runs and hashes are dropped,
+  so they no longer push a real SHA into `skipped_shas`.
+- **New response key `failed_shas: [{cited, error}]`**, in cited order, for each token git
+  could not answer for. Nothing may be concluded about those tokens. Each fault is also
+  logged at WARNING with its traceback. When git cannot check the tokens at all, every
+  token counts against the cap, so the response stays bounded.
 
 #### plan.json writers serialise on a cross-writer mutex (task 5745)
 

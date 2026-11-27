@@ -10,10 +10,17 @@ samples(ts, metric, value, window_mean, window_max, leaf)
     idx_samples_metric_ts_leaf ON samples(metric, ts, leaf) serves every read
     by metric. idx_samples_metric_leaf_ts ON samples(metric, leaf, ts), partial
     on ``leaf IS NOT NULL``, serves the per-leaf trailing window.
+    idx_samples_ts ON samples(ts) serves the retention cutoff. Every index is
+    created if missing whenever a store is built, so an older file gains a new
+    one on its first construction.
 
 meta(key, value)
     Two independent clocks: last_cleanup_ts for the retention gate and
-    last_vacuum_ts for the VACUUM gate.
+    last_vacuum_ts for the VACUUM gate. And one ``GroupRecord`` per collection
+    group, under ``group:<name>:attempted``, ``:state`` and ``:log``: the
+    group's last attempted collection, the state its collector carries to the
+    next one, and its log throttle. Every tick is a process of its own, so
+    whatever a group remembers between ticks lives here.
 
 Migration
 ---------
@@ -30,14 +37,20 @@ default, and lives for one call.
 Writing
 -------
 The unit of writing is the TICK: ``write_tick`` lands a whole tick in one
-transaction, or none of it.
+transaction, or none of it — its rows and its group records together, so a
+collector's state never runs ahead of, or behind, the rows computed from it.
 
 Retention
 ---------
-``cleanup_old`` keeps the rows within ±30 days of now and runs at most once a
-day. ``maybe_vacuum`` runs at most once a day, and only when the reclaimable
-fraction of the file is worth a whole-file rewrite. Both gates treat a stamp in
-the future as due.
+``cleanup_old`` keeps the rows within ±30 days of now. A sweep is due once a
+day, and each tick's call deletes at most ``max_rows`` expired rows. The sweep
+stays due, its clock unstamped, until a call deletes fewer than ``max_rows``,
+which stamps it; so a backlog drains over successive ticks and no tick does
+more than one chunk. Its DELETE (``RETENTION_DELETE_SQL``) is two range
+searches of idx_samples_ts, not a table scan. ``maybe_vacuum`` runs at most once a day,
+and only when the reclaimable fraction of the file is worth a whole-file
+rewrite; it waits out an unfinished sweep, so it judges the whole prune. Both
+gates treat a stamp in the future as due.
 
 Trailing window
 ---------------
@@ -53,7 +66,11 @@ import contextlib
 import logging
 import sqlite3
 import statistics
+from collections.abc import Iterable, Mapping
+from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
+from types import MappingProxyType
 from typing import Protocol
 
 from shared.sqlite_column_migration import add_column_if_missing_sync
@@ -61,7 +78,15 @@ from shared.sqlite_sync_base import apply_full_durability_pragmas_sync
 
 from sampler.metrics import SampleKey, Samples
 
-__all__ = ['SCHEMA', 'Connect', 'LoadSampleStore', 'connect_durably']
+__all__ = [
+    'RETENTION_DELETE_SQL',
+    'SCHEMA',
+    'Connect',
+    'GroupRecord',
+    'LoadSampleStore',
+    'connect_durably',
+    'stamp_is_due',
+]
 
 logger = logging.getLogger(__name__)
 
@@ -87,6 +112,7 @@ _INDEXES_DDL = (
     'CREATE INDEX IF NOT EXISTS idx_samples_metric_ts_leaf ON samples (metric, ts, leaf)',
     'CREATE INDEX IF NOT EXISTS idx_samples_metric_leaf_ts ON samples (metric, leaf, ts)'
     ' WHERE leaf IS NOT NULL',
+    'CREATE INDEX IF NOT EXISTS idx_samples_ts ON samples (ts)',
 )
 
 SCHEMA: str = '\n'.join([_TABLES_DDL, *(f'{ddl};' for ddl in _INDEXES_DDL)]) + '\n'
@@ -102,11 +128,25 @@ _SPLIT_LEGACY_KEYS_SQL = (
 # A VACUUM is worth its whole-file rewrite only past this share of free pages.
 _VACUUM_MIN_RECLAIMABLE_FRACTION = 0.10
 
+# Keeps one tick's share of a retention sweep well inside the tick interval
+# (dashboard/dark-factory-load-sampler.timer::OnUnitActiveSec).
+_RETENTION_ROWS_PER_TICK = 20_000
+
 # Samples a trailing window spans, current value included. One home for it, so
 # ``write_tick`` and ``trailing_window`` cannot disagree about the span.
 _TRAILING_WINDOW_SAMPLES = 60
 
 _SET_META_SQL = 'INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)'
+
+# Bound to (oldest kept ts, newest kept ts, row budget); both arms search
+# idx_samples_ts and the outer delete is by rowid. SQLite as built here
+# rejects DELETE ... LIMIT.
+RETENTION_DELETE_SQL = (
+    'DELETE FROM samples WHERE rowid IN'
+    ' (SELECT rowid FROM samples WHERE ts < ? OR ts > ? LIMIT ?)'
+)
+
+_GET_META_SQL = 'SELECT value FROM meta WHERE key = ?'
 
 _INSERT_SQL = (
     'INSERT INTO samples (ts, metric, leaf, value, window_mean, window_max)'
@@ -123,6 +163,72 @@ _HOST_WINDOW_SQL = (
 _LEAF_WINDOW_SQL = (
     'SELECT value FROM samples WHERE metric = ? AND leaf = ? ORDER BY ts DESC LIMIT ?'
 )
+
+
+def stamp_is_due(stamp: int | None, now: int, interval_seconds: int) -> bool:
+    """The one interval clock: due when *stamp* is absent or ``interval_seconds`` old.
+
+    A stamp in the FUTURE is due too, so a stamp written during a forward
+    clock step cannot hold a clock shut.
+    """
+    return stamp is None or not 0 <= now - stamp < interval_seconds
+
+
+@dataclass(frozen=True)
+class GroupRecord:
+    """What the store keeps for one collection group between ticks.
+
+    ``attempted_at`` is the group's due clock, ``state`` is its collector's
+    opaque carry-over, ``log_throttle`` its failure-log throttle. A field left
+    None in a write leaves the stored value unchanged; a field never written
+    reads back as None.
+    """
+
+    attempted_at: int | None = None
+    state: str | None = None
+    log_throttle: str | None = None
+
+
+class _GroupField(StrEnum):
+    ATTEMPTED = 'attempted'
+    STATE = 'state'
+    LOG = 'log'
+
+
+def _group_meta_key(name: str, field: _GroupField) -> str:
+    return f'group:{name}:{field}'
+
+
+def _stored_fields(record: GroupRecord) -> dict[_GroupField, str | None]:
+    attempted = record.attempted_at
+    return {
+        _GroupField.ATTEMPTED: None if attempted is None else str(attempted),
+        _GroupField.STATE: record.state,
+        _GroupField.LOG: record.log_throttle,
+    }
+
+
+def _record_from(stored: Mapping[_GroupField, str | None]) -> GroupRecord:
+    attempted = stored[_GroupField.ATTEMPTED]
+    return GroupRecord(
+        attempted_at=None if attempted is None else int(attempted),
+        state=stored[_GroupField.STATE],
+        log_throttle=stored[_GroupField.LOG],
+    )
+
+
+def _group_meta_rows(records: Mapping[str, GroupRecord]) -> list[tuple[str, str]]:
+    return [
+        (_group_meta_key(name, field), value)
+        for name, record in records.items()
+        for field, value in _stored_fields(record).items()
+        if value is not None
+    ]
+
+
+def _meta_value(conn: sqlite3.Connection, key: str) -> str | None:
+    row = conn.execute(_GET_META_SQL, (key,)).fetchone()
+    return row[0] if row else None
 
 
 class Connect(Protocol):
@@ -232,6 +338,7 @@ class LoadSampleStore:
         *,
         unwindowed: Samples,
         windowed: Samples,
+        records: Mapping[str, GroupRecord] = MappingProxyType({}),
         window: int = _TRAILING_WINDOW_SAMPLES,
     ) -> None:
         """Write one whole tick on ONE connection inside ONE transaction.
@@ -249,8 +356,12 @@ class LoadSampleStore:
         whole tick or none of it: the corpus never holds half a tick. The
         connection and commit cost is one per tick, whatever the metric count;
         each windowed metric still costs one indexed window read.
+
+        *records* are upserted into meta in the same transaction, keyed by
+        group name, so a group's state commits with its rows or not at all. A
+        tick with records and no rows still writes them.
         """
-        if not unwindowed and not windowed:
+        if not unwindowed and not windowed and not records:
             return
         conn = self._connect()
         try:
@@ -267,6 +378,7 @@ class LoadSampleStore:
                 )
                 rows.append((ts, key.metric, key.leaf, value, window_mean, window_max))
             conn.executemany(_INSERT_SQL, rows)
+            conn.executemany(_SET_META_SQL, _group_meta_rows(records))
             conn.commit()
         finally:
             conn.close()
@@ -317,20 +429,37 @@ class LoadSampleStore:
             conn.close()
 
     # ------------------------------------------------------------------
+    # Group records
+    # ------------------------------------------------------------------
+
+    def read_group_records(self, names: Iterable[str]) -> dict[str, GroupRecord]:
+        """Every named group's record, all read on ONE connection.
+
+        A group never written reads as an empty ``GroupRecord()``.
+        """
+        conn = self._connect()
+        try:
+            return {
+                name: _record_from(
+                    {field: _meta_value(conn, _group_meta_key(name, field)) for field in _GroupField}
+                )
+                for name in names
+            }
+        finally:
+            conn.close()
+
+    # ------------------------------------------------------------------
     # Retention
     # ------------------------------------------------------------------
 
     def _is_due(self, key: str, now: int, interval_seconds: int) -> bool:
-        """Return True when the interval clock at *key* has run out.
+        """Return True when the interval clock at *key* has run out (``stamp_is_due``).
 
         An absent record is due, so a fresh store prunes and compacts on its
-        first tick. A record in the FUTURE is due too, so a stamp written during
-        a forward clock step cannot disable either sweep.
+        first tick.
         """
         last_str = self._get_meta(key)
-        if last_str is None:
-            return True
-        return not 0 <= now - int(last_str) < interval_seconds
+        return stamp_is_due(None if last_str is None else int(last_str), now, interval_seconds)
 
     def should_cleanup(self, now: int, *, interval_seconds: int = 86400) -> bool:
         """Return True when a cleanup is due (no prior record or interval elapsed)."""
@@ -342,30 +471,41 @@ class LoadSampleStore:
         *,
         retain_seconds: int = 30 * 24 * 60 * 60,
         interval_seconds: int = 86400,
-    ) -> None:
-        """Delete rows more than ``retain_seconds`` from ``now``, once per interval.
+        max_rows: int = _RETENTION_ROWS_PER_TICK,
+    ) -> int:
+        """Delete up to ``max_rows`` rows more than ``retain_seconds`` from ``now``.
 
         The cutoff is SYMMETRIC about ``now``: rows that far in the future go
         too, because a forward clock step stamps rows that no past-only cutoff
         would ever reach. Both bounds are exclusive — a row at exactly
         ``now ± retain_seconds`` survives.
 
-        The DELETE is a full table scan, since no index leads with ``ts``,
-        which is why it runs at most once per interval. The interval is stamped
-        only after the DELETE commits, so a failure is retried on the next tick.
+        A sweep is due once per interval. Each call deletes at most
+        ``max_rows`` rows; the sweep stays due, its clock unstamped, until a
+        call deletes fewer than ``max_rows``, which stamps the clock in the
+        same transaction as its DELETE. So a backlog drains over successive
+        calls, and a failure leaves the sweep due for the next tick. The
+        DELETE searches idx_samples_ts from each end, so it costs the rows it
+        removes rather than the table.
+
+        Returns the rows deleted, 0 when no sweep is due. ``max_rows`` below 1
+        raises ValueError, whether or not a sweep is due.
         """
+        if max_rows < 1:
+            raise ValueError(f'cleanup_old: max_rows must be at least 1, got {max_rows}')
         if not self.should_cleanup(now, interval_seconds=interval_seconds):
-            return
+            return 0
         conn = self._connect()
         try:
-            conn.execute(
-                'DELETE FROM samples WHERE ts < ? OR ts > ?',
-                (now - retain_seconds, now + retain_seconds),
-            )
+            deleted = conn.execute(
+                RETENTION_DELETE_SQL, (now - retain_seconds, now + retain_seconds, max_rows)
+            ).rowcount
+            if deleted < max_rows:
+                conn.execute(_SET_META_SQL, ('last_cleanup_ts', str(now)))
             conn.commit()
         finally:
             conn.close()
-        self._set_meta('last_cleanup_ts', str(now))
+        return deleted
 
     # ------------------------------------------------------------------
     # Vacuum gating via meta table
@@ -374,10 +514,9 @@ class LoadSampleStore:
     def _get_meta(self, key: str) -> str | None:
         conn = self._connect()
         try:
-            row = conn.execute('SELECT value FROM meta WHERE key = ?', (key,)).fetchone()
+            return _meta_value(conn, key)
         finally:
             conn.close()
-        return row[0] if row else None
 
     def _set_meta(self, key: str, value: str) -> None:
         conn = self._connect()
@@ -412,12 +551,16 @@ class LoadSampleStore:
         ``reclaimable_fraction`` reaches ``_VACUUM_MIN_RECLAIMABLE_FRACTION``,
         as after a retention change or a bulk prune.
 
+        While a retention sweep is still due (``should_cleanup``) it is not
+        evaluated and its clock is left alone, so a prune spread over several
+        ticks is judged whole, once it finishes.
+
         A skip stamps the clock: finding nothing to reclaim is a successful
         evaluation. A VACUUM stamps it only on success, and a failure, opening
         the connection included, is logged and retried on the next eligible
         tick.
         """
-        if not self.should_vacuum(now):
+        if not self.should_vacuum(now) or self.should_cleanup(now):
             return
         if self.reclaimable_fraction() < _VACUUM_MIN_RECLAIMABLE_FRACTION:
             self._set_meta('last_vacuum_ts', str(now))

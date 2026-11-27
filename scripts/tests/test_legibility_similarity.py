@@ -5,6 +5,7 @@ run builds, its codebook transforms, its report section and its queue CLI
 from __future__ import annotations
 
 import copy
+import dataclasses
 import json
 import math
 
@@ -12,12 +13,16 @@ import pytest
 from legibility import (
     census_findings,
     codebook,
+    codebook_lifecycle,
     config,
     embeddings,
     similarity,
     trickle_state,
     verdict,
 )
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 _MODEL = 'text-embedding-3-small'
 
@@ -110,13 +115,14 @@ class TestItemsOf:
                 _candidate('cand-20260801-3', 'Rejected', disposition='rejected'),
             ],
         )
-        items = similarity.items_of(cb, [_novel('A novel cluster')])
+        items = similarity.items_of(cb, {'cand-20261020-1': _novel('A novel cluster')})
 
         by_kind = {kind: [item for item in items if item.kind is kind] for kind in similarity.Kind}
         assert [item.record_id for item in by_kind[similarity.Kind.ENTRY]] == ['entry-open', 'entry-partially']
         assert [item.record_id for item in by_kind[similarity.Kind.PENDING]] == ['cand-20260801-1']
         [novel] = by_kind[similarity.Kind.NOVEL]
-        assert novel.record_id is None
+        assert novel.record_id == 'cand-20261020-1'
+        assert novel.key == 'cand-20261020-1'
         assert novel.title == 'A novel cluster'
         assert novel.text == 'A novel cluster — novel cause'
         assert novel.sessions == ('s-novel',)
@@ -274,10 +280,10 @@ def _angle(degrees: float) -> list[float]:
 _SETTINGS = config.Adjudication(attach_min_similarity=0.90, cluster_min_similarity=0.85)
 
 
-def _view(tmp_path, cb, novel=(), *, vectors, settings=_SETTINGS, fake=None):
+def _view(tmp_path, cb, novel=None, *, vectors, settings=_SETTINGS, fake=None):
     fake = fake or _KeyedEmbed(vectors)
     view = similarity.build_view(
-        cb, list(novel), embedder=embeddings.Embedder(fake, tmp_path / 'e.sqlite'), settings=settings,
+        cb, dict(novel or {}), embedder=embeddings.Embedder(fake, tmp_path / 'e.sqlite'), settings=settings,
     )
     return view, fake
 
@@ -285,17 +291,18 @@ def _view(tmp_path, cb, novel=(), *, vectors, settings=_SETTINGS, fake=None):
 class TestBuildView:
     def test_a_novel_cluster_near_an_entry_is_screened(self, tmp_path):
         cb = _codebook(entries=[_entry('entry-a', 'Entry A')])
-        near, far = _novel('Near', cause=None), _novel('Far', cause=None)
-        view, _ = _view(tmp_path, cb, [near, far], vectors={
+        novel = {'cand-20261020-1': _novel('Near', cause=None), 'cand-20261020-2': _novel('Far', cause=None)}
+        view, _ = _view(tmp_path, cb, novel, vectors={
             'Entry A': _angle(0), 'Near': _angle(20), 'Far': _angle(40),
         })
 
         [screened] = view.screened
         assert screened.item.title == 'Near'
+        assert screened.item.key == 'cand-20261020-1'
         assert screened.entry_id == 'entry-a'
         assert screened.score == pytest.approx(math.cos(math.radians(20)), abs=1e-4)
-        assert view.screens(near) is True
-        assert view.screens(far) is False
+        assert view.screens('cand-20261020-1') is True
+        assert view.screens('cand-20261020-2') is False
 
     def test_a_pending_candidate_near_an_entry_is_attached_not_queued(self, tmp_path):
         cb = _codebook(
@@ -359,7 +366,7 @@ class TestBuildView:
         vectors = {'Entry A': _angle(0), 'P1': _angle(90), 'Novel': _angle(45)}
         _view(tmp_path, cb, vectors=vectors)
 
-        view, fake = _view(tmp_path, cb, [_novel('Novel', cause=None)], vectors=vectors)
+        view, fake = _view(tmp_path, cb, {'cand-20261020-1': _novel('Novel', cause=None)}, vectors=vectors)
 
         assert view.skipped is None
         assert view.model == 'text-embedding-3-small'
@@ -368,6 +375,17 @@ class TestBuildView:
         assert fake.calls == [['Novel']]
         assert (view.requests, view.embedded, view.cached, view.pruned) == (1, 1, 2, 0)
 
+    def test_a_novel_text_keyed_by_its_candidate_id_stays_out_of_the_vector_cache(self, tmp_path):
+        cb = _codebook(entries=[_entry('entry-a', 'Entry A')])
+        novel = {'cand-20261020-1': _novel('Novel', cause=None)}
+        vectors = {'Entry A': _angle(0), 'Novel': _angle(45)}
+        _view(tmp_path, cb, novel, vectors=vectors)
+
+        view, fake = _view(tmp_path, cb, novel, vectors=vectors)
+
+        assert fake.calls == [['Novel']]
+        assert (view.embedded, view.cached) == (1, 1)
+
     def test_an_embedding_failure_skips_the_whole_stage(self, tmp_path):
         cb = _codebook(
             entries=[_entry('entry-a', 'Entry A')],
@@ -375,12 +393,12 @@ class TestBuildView:
         )
         fake = _KeyedEmbed({'Entry A': _angle(0), 'Near': _angle(1), 'Novel': _angle(2)}, fail_on=1)
 
-        view, _ = _view(tmp_path, cb, [_novel('Novel', cause=None)], vectors={}, fake=fake)
+        view, _ = _view(tmp_path, cb, {'cand-20261020-1': _novel('Novel', cause=None)}, vectors={}, fake=fake)
 
         assert view.skipped is not None and '503' in view.skipped
         assert (view.screened, view.attaches, view.queue, view.depth) == ((), (), (), None)
         assert view.requests == 1
-        assert view.screens(_novel('Novel', cause=None)) is False
+        assert view.screens('cand-20261020-1') is False
         assert len(fake.calls) == 1
 
     def test_an_unreadable_cache_skips_the_whole_stage(self, tmp_path):
@@ -403,6 +421,47 @@ class TestBuildView:
 
         assert view.skipped is not None
         assert len(fake.calls) == 1
+
+
+class TestViewWithout:
+    _VECTORS = {
+        'Entry A': _angle(0), 'Near one': _angle(5), 'Near two': _angle(8), 'Novel near': _angle(12),
+        'Pair older': _angle(90), 'Pair newer': _angle(95), 'Lone': _angle(180),
+    }
+
+    def _built(self, tmp_path):
+        cb = _codebook(
+            entries=[_entry('entry-a', 'Entry A')],
+            candidates=[
+                _candidate('cand-20260801-1', 'Near one', cause=None),
+                _candidate('cand-20260801-2', 'Near two', cause=None),
+                _candidate('cand-20260802-1', 'Pair older', cause=None, first_seen='2026-08-02', sessions=('s-2',)),
+                _candidate('cand-20260803-1', 'Pair newer', cause=None, first_seen='2026-08-03', sessions=('s-3',)),
+                _candidate('cand-20260804-1', 'Lone', cause=None, first_seen='2026-08-04', sessions=('s-4',)),
+            ],
+        )
+        view, _ = _view(tmp_path, cb, {'cand-20261020-1': _novel('Novel near', cause=None)}, vectors=self._VECTORS)
+        assert [attach.item.key for attach in view.attaches] == ['cand-20260801-1', 'cand-20260801-2']
+        assert [[member.key for member in queued.members] for queued in view.queue] == [
+            ['cand-20260802-1', 'cand-20260803-1'], ['cand-20260804-1'],
+        ]
+        return view
+
+    def test_drops_the_attaches_and_the_queue_clusters_touching_the_ids(self, tmp_path):
+        view = self._built(tmp_path)
+
+        narrowed = view.without({'cand-20260801-2', 'cand-20260802-1'})
+
+        assert [attach.item.key for attach in narrowed.attaches] == ['cand-20260801-1']
+        assert [queued.representative.key for queued in narrowed.queue] == ['cand-20260804-1']
+        assert narrowed == dataclasses.replace(view, attaches=narrowed.attaches, queue=narrowed.queue)
+        assert narrowed.screened == view.screened
+
+    def test_ids_the_view_does_not_hold_change_nothing(self, tmp_path):
+        view = self._built(tmp_path)
+
+        assert view.without(()) == view
+        assert view.without({'cand-20261020-1', 'cand-20990101-1'}) == view
 
 
 _RUN = 'census-dark_factory-20261020'
@@ -440,7 +499,10 @@ class TestAttach:
 
     def _views(self, tmp_path):
         cb = self._pre_merge()
-        view, _ = _view(tmp_path, cb, [_novel('Novel near', cause=None, session='s-novel')], vectors=self._VECTORS)
+        view, _ = _view(
+            tmp_path, cb, {'cand-20261020-1': _novel('Novel near', cause=None, session='s-novel')},
+            vectors=self._VECTORS,
+        )
         return cb, view
 
     def test_every_attach_joins_its_entry_by_similarity(self, tmp_path):
@@ -448,7 +510,7 @@ class TestAttach:
         merged = self._post_merge(cb)
         before = copy.deepcopy(merged)
 
-        result, applied, _ = similarity.attach(merged, view, run_id=_RUN)
+        result, applied = similarity.attach(merged, view, run_id=_RUN)
 
         assert merged == before
         assert [(item.candidate_id, item.entry_id, item.novel) for item in applied] == [
@@ -471,7 +533,7 @@ class TestAttach:
     def test_scores_are_the_views(self, tmp_path):
         cb, view = self._views(tmp_path)
 
-        _, applied, _ = similarity.attach(self._post_merge(cb), view, run_id=_RUN)
+        _, applied = similarity.attach(self._post_merge(cb), view, run_id=_RUN)
 
         assert [item.score for item in applied] == [
             view.attaches[0].score, view.screened[0].score,
@@ -485,25 +547,39 @@ class TestAttach:
         with pytest.raises(ValueError, match='cand-20260801-1.*pending'):
             similarity.attach(merged, view, run_id=_RUN)
 
-    def test_a_screened_cluster_with_no_pending_candidate_is_left_unattached(self, tmp_path):
-        cb, view = self._views(tmp_path)
-        pre = copy.deepcopy(cb)
+    def test_screened_novel_candidates_join_by_their_own_ids_whatever_their_titles(self, tmp_path):
+        cb = _codebook(entries=[_keyed(_entry('entry-a', 'Entry A', sessions=('s-entry',)))])
+        novel = {
+            'cand-20261020-1': _novel('Novel near', cause=None, session='s-novel-1'),
+            'cand-20261020-2': _novel('novel NEAR', cause=None, session='s-novel-2'),
+        }
+        view, _ = _view(tmp_path, cb, novel, vectors={
+            'Entry A': _angle(0), 'Novel near': _angle(10), 'novel NEAR': _angle(12),
+        })
+        merged = copy.deepcopy(cb)
+        merged['candidates'] += [
+            _candidate('cand-20261020-1', 'Novel near', cause=None, first_seen='2026-10-20', sessions=('s-novel-1',)),
+            _candidate('cand-20261020-2', 'novel NEAR', cause=None, first_seen='2026-10-20', sessions=('s-novel-2',)),
+        ]
 
-        result, applied, unattached = similarity.attach(pre, view, run_id=_RUN)
+        result, applied = similarity.attach(merged, view, run_id=_RUN)
 
-        assert pre == cb
-        assert [item.candidate_id for item in applied] == ['cand-20260801-1']
-        assert unattached == (view.screened[0],)
-        assert (unattached[0].item.title, unattached[0].entry_id) == ('Novel near', 'entry-a')
+        assert [(item.candidate_id, item.title, item.entry_id, item.novel) for item in applied] == [
+            ('cand-20261020-1', 'Novel near', 'entry-a', True),
+            ('cand-20261020-2', 'novel NEAR', 'entry-a', True),
+        ]
+        for candidate_id in novel:
+            candidate = _by_id(result, candidate_id)
+            assert (candidate['disposition'], candidate['promoted_to']) == ('promoted', 'entry-a')
+        sessions = [sighting['session'] for sighting in _by_id(result, 'entry-a')['sightings']]
+        assert sessions == ['s-entry', 's-novel-1', 's-novel-2']
         assert codebook.validate(result) == []
 
     def test_a_skipped_view_attaches_nothing(self, tmp_path):
         cb = self._pre_merge()
         view = similarity.View.skipped_by('embeddings endpoint answered HTTP 503', 1, _SETTINGS)
 
-        result, applied, unattached = similarity.attach(cb, view, run_id=_RUN)
-
-        assert (result, applied, unattached) == (cb, (), ())
+        assert similarity.attach(cb, view, run_id=_RUN) == (cb, ())
 
 
 class TestAdjudicateMembers:
@@ -598,6 +674,16 @@ class TestAdjudicateMembers:
         with pytest.raises(ValueError, match='cand-20260801-1.*pending'):
             similarity.adjudicate_members(verified, offered)
 
+    def test_a_member_already_rejected_is_refused_by_the_lifecycle_table(self):
+        cb = self._pending()
+        offered = self._offered(cb)
+        rejected = copy.deepcopy(cb)
+        _by_id(rejected, 'cand-20260805-1')['disposition'] = 'rejected'
+        _by_id(rejected, 'cand-20260801-1')['disposition'] = 'rejected'
+
+        with pytest.raises(codebook_lifecycle.IllegalTransition, match=r'^reject: .*cand-20260801-1'):
+            similarity.adjudicate_members(rejected, offered)
+
 
 class TestAdjudicationReport:
     _VECTORS = {
@@ -617,21 +703,21 @@ class TestAdjudicationReport:
             ],
         )
 
-    def _report(self, tmp_path, *, inconclusive=None, merged_novel=True, mass_rejected=False):
+    def _report(self, tmp_path, *, inconclusive=None, mass_rejected=False):
         cb = self._cb()
-        view, _ = _view(tmp_path, cb, [_novel('Novel near', cause=None, session='s-novel')], vectors=self._VECTORS)
+        view, _ = _view(
+            tmp_path, cb, {'cand-20261020-1': _novel('Novel near', cause=None, session='s-novel')},
+            vectors=self._VECTORS,
+        )
         merged = copy.deepcopy(cb)
-        if merged_novel:
-            merged['candidates'].append(_candidate('cand-20261020-1', 'Novel near', cause=None,
-                                                   first_seen='2026-10-20', sessions=('s-novel',)))
-        merged, attached, unattached = similarity.attach(merged, view, run_id=_RUN)
+        merged['candidates'].append(_candidate('cand-20261020-1', 'Novel near', cause=None,
+                                               first_seen='2026-10-20', sessions=('s-novel',)))
+        merged, attached = similarity.attach(merged, view, run_id=_RUN)
         offered = view.select(1)
         if inconclusive is None:
             _by_id(merged, offered[0].representative.key)['disposition'] = 'rejected'
         merged, adjudicated = similarity.adjudicate_members(merged, offered)
-        report = similarity.AdjudicationReport(
-            view, attached, unattached, offered, adjudicated, inconclusive, mass_rejected,
-        )
+        report = similarity.AdjudicationReport(view, attached, offered, adjudicated, inconclusive, mass_rejected)
         return report, view
 
     def test_the_record_is_json_safe_and_complete(self, tmp_path):
@@ -659,24 +745,22 @@ class TestAdjudicationReport:
             (row['candidate_id'], row['title'], row['entry_id'], row['novel']) for row in record['attached']
         ] == [('cand-20260801-1', 'Near', 'entry-a', False), ('cand-20261020-1', 'Novel near', 'entry-a', True)]
         assert all(isinstance(row['score'], float) for row in record['attached'])
-        assert record['unattached'] == []
+        assert 'unattached' not in record
         assert record['inconclusive'] is None
         assert record['mass_rejection'] is None
 
-    def test_a_screened_cluster_the_merge_left_no_candidate_is_reported_unattached(self, tmp_path):
-        report, view = self._report(tmp_path, merged_novel=False)
+    def test_every_screened_cluster_is_reported_attached_and_none_unattached(self, tmp_path):
+        report, view = self._report(tmp_path)
 
         record = report.to_record()
 
-        assert json.loads(json.dumps(record)) == record
-        score = view.screened[0].score
-        assert record['unattached'] == [{'title': 'Novel near', 'entry_id': 'entry-a', 'score': score}]
-        assert isinstance(record['unattached'][0]['score'], float)
-        assert report.counts()['attached'] == 1
-        [line] = [line for line in similarity.report_lines(record) if '"Novel near"' in line]
-        assert 'entry-a' in line
-        assert f'{score:.4f}' in line
-        assert 'no pending candidate' in line
+        assert [row['candidate_id'] for row in record['attached'] if row['novel']] == ['cand-20261020-1']
+        assert 'unattached' not in record
+        lines = similarity.report_lines(record)
+        assert not [line for line in lines if 'not attached' in line]
+        [line] = [line for line in lines if '"Novel near"' in line]
+        assert 'cand-20261020-1' in line
+        assert f'{view.screened[0].score:.4f}' in line
 
     def test_a_mass_rejected_queue_is_recorded_and_stated_first(self, tmp_path):
         report, _ = self._report(tmp_path, mass_rejected=True)
@@ -724,7 +808,7 @@ class TestAdjudicationReport:
 
     def test_a_skipped_record_says_why_and_that_nothing_happened(self):
         view = similarity.View.skipped_by('embeddings endpoint answered HTTP 503', 1, _SETTINGS)
-        record = similarity.AdjudicationReport(view, (), (), (), (), None, False).to_record()
+        record = similarity.AdjudicationReport(view, (), (), (), None, False).to_record()
 
         assert record['skipped'] == 'embeddings endpoint answered HTTP 503'
         assert record['queue_depth'] is None

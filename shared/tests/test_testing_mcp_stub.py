@@ -14,7 +14,8 @@ import httpx
 import pytest
 
 from shared.mcp_post import MCP_POST_HEADERS, decode_mcp_response_body
-from shared.testing_mcp_stub import RecordedRequest, StubAnswer, StubMcpServer
+from shared.mcp_session import McpCallError, McpFailureKind, SyncMcpSession
+from shared.testing_mcp_stub import RecordedRequest, StubAnswer, StubMcpServer, tool_reply_body
 
 PAYLOAD = {"success": True, "id": "7"}
 
@@ -94,6 +95,16 @@ class TestStateful:
         assert resp.status_code == 400
         assert "Missing session ID" in resp.json()["error"]["message"]
 
+    @pytest.mark.parametrize(
+        ("session_id", "status"), [(None, 400), ("never-minted", 404)], ids=["missing", "unknown"],
+    )
+    def test_a_call_outside_a_session_is_recorded_but_not_a_tool_call(self, session_id, status):
+        with StubMcpServer(stateful=True) as server:
+            resp = _post(server, TOOLS_CALL, session_id=session_id)
+            assert resp.status_code == status
+            assert len(server.requests) == 1
+            assert server.tool_call_arguments("update_task") == ()
+
     def test_initialize_mints_the_session_id(self):
         with StubMcpServer(stateful=True) as server:
             resp = _post(server, INITIALIZE)
@@ -167,6 +178,16 @@ class TestEitherMode:
         with pytest.raises(dataclasses.FrozenInstanceError):
             setattr(first, frozen_field, "/elsewhere")
 
+    def test_off_endpoint_paths_names_every_request_not_addressed_to_mcp(self, stateful):
+        with StubMcpServer(stateful=stateful) as server:
+            _post(server, INITIALIZE)
+            httpx.post(
+                f"{server.url}/mcp/", json=INITIALIZE, headers=MCP_POST_HEADERS,
+                follow_redirects=False,
+            )
+            httpx.post(f"{server.url}/elsewhere", json=INITIALIZE, headers=MCP_POST_HEADERS)
+            assert server.off_endpoint_paths == ("/mcp/", "/elsewhere")
+
 
     def test_unavailable_tool_calls_are_503_then_served(self, stateful):
         with StubMcpServer(stateful=stateful, unavailable_tool_calls=1) as server:
@@ -176,6 +197,90 @@ class TestEitherMode:
         assert refused.status_code == 503
         assert served.status_code == 200
         assert decode_mcp_response_body(served)["result"]["structuredContent"]
+
+
+def _tool_call(name: str, arguments: dict) -> dict:
+    return _request("tools/call", {"name": name, "arguments": arguments}, request_id=2)
+
+
+TOOLS_CALL_NOTIFICATION = {"jsonrpc": "2.0", "method": "tools/call", "params": TOOLS_CALL["params"]}
+NO_ACCEPT = {"Content-Type": "application/json"}
+
+
+@pytest.mark.parametrize("stateful", [False, True], ids=["stateless", "stateful"])
+class TestToolCallArguments:
+    """A tool call is a tools/call the tool layer answered, whatever it answered."""
+
+    def test_answered_calls_are_returned_per_tool_in_arrival_order(self, stateful):
+        with StubMcpServer(stateful=stateful) as server:
+            session_id = _open_session(server)
+            _post(server, _tool_call("update_task", {"id": "7"}), session_id=session_id)
+            _post(server, _tool_call("get_task", {"id": "9"}), session_id=session_id)
+            _post(server, _tool_call("update_task", {"id": "8"}), session_id=session_id)
+            assert server.tool_call_arguments("update_task") == ({"id": "7"}, {"id": "8"})
+            assert server.tool_call_arguments("get_task") == ({"id": "9"},)
+            assert server.tool_call_arguments("initialize") == ()
+
+    @pytest.mark.parametrize(
+        ("answer", "path", "body", "headers", "status"),
+        [
+            pytest.param(StubAnswer.OK, "/mcp/", TOOLS_CALL, MCP_POST_HEADERS, 307, id="slash-307"),
+            pytest.param(StubAnswer.OK, "/mcp", TOOLS_CALL, NO_ACCEPT, 406, id="unacceptable-406"),
+            pytest.param(StubAnswer.OK, "/elsewhere", TOOLS_CALL, MCP_POST_HEADERS, 404, id="off-endpoint-404"),
+            pytest.param(StubAnswer.REDIRECT_307, "/mcp", TOOLS_CALL, MCP_POST_HEADERS, 307, id="scripted-307"),
+            pytest.param(
+                StubAnswer.OK, "/mcp", TOOLS_CALL_NOTIFICATION, MCP_POST_HEADERS, 202, id="notification-202",
+            ),
+        ],
+    )
+    def test_a_request_no_tool_answers_is_recorded_but_not_a_tool_call(
+        self, stateful, answer, path, body, headers, status,
+    ):
+        with StubMcpServer(stateful=stateful, answer=answer) as server:
+            session_id = _open_session(server)
+            arrived_before = len(server.requests)
+            headers = dict(headers)
+            if session_id is not None:
+                headers["mcp-session-id"] = session_id
+            resp = httpx.post(f"{server.url}{path}", json=body, headers=headers, follow_redirects=False)
+            assert resp.status_code == status
+            assert len(server.requests) == arrived_before + 1
+            assert server.tool_call_arguments("update_task") == ()
+
+    def test_a_scripted_redirect_followed_to_the_limit_is_never_a_tool_call(self, stateful):
+        with StubMcpServer(stateful=stateful, answer=StubAnswer.REDIRECT_307) as server:
+            session_id = _open_session(server)
+            headers = dict(MCP_POST_HEADERS)
+            if session_id is not None:
+                headers["mcp-session-id"] = session_id
+            with pytest.raises(httpx.TooManyRedirects):
+                httpx.post(f"{server.url}/mcp", json=TOOLS_CALL, headers=headers, follow_redirects=True)
+            assert server.tool_call_arguments("update_task") == ()
+
+    def test_a_gateway_503_is_not_a_tool_call_and_the_answered_retry_is(self, stateful):
+        with StubMcpServer(stateful=stateful, unavailable_tool_calls=1) as server:
+            session_id = _open_session(server)
+            _post(server, _tool_call("update_task", {"id": "refused"}), session_id=session_id)
+            _post(server, _tool_call("update_task", {"id": "answered"}), session_id=session_id)
+            assert server.tool_call_arguments("update_task") == ({"id": "answered"},)
+
+    def test_a_scripted_failure_answer_is_still_a_tool_call(self, stateful):
+        with StubMcpServer(stateful=stateful, answer=StubAnswer.IS_ERROR) as server:
+            session_id = _open_session(server)
+            resp = _post(server, TOOLS_CALL, session_id=session_id)
+            assert decode_mcp_response_body(resp)["result"]["isError"] is True
+            assert server.tool_call_arguments("update_task") == ({"id": "7"},)
+
+    def test_editing_returned_arguments_cannot_rewrite_the_record(self, stateful):
+        arguments = {"id": "7", "metadata": {"files": ["a.py"]}}
+        with StubMcpServer(stateful=stateful) as server:
+            session_id = _open_session(server)
+            _post(server, _tool_call("update_task", arguments), session_id=session_id)
+            [returned] = server.tool_call_arguments("update_task")
+            assert isinstance(returned, dict)
+            returned["id"] = "edited"
+            returned["metadata"]["files"].append("b.py")
+            assert server.tool_call_arguments("update_task") == (arguments,)
 
 
 @pytest.mark.parametrize("stateful", [False, True], ids=["stateless", "stateful"])
@@ -230,3 +335,96 @@ class TestFailureAnswers:
         body = decode_mcp_response_body(resp)
         assert "result" not in body
         assert body["error"]["code"] == -32602
+
+
+class TestToolsHandler:
+    """``tools=`` answers each OK tools/call through a per-tool handler."""
+
+    def test_a_client_gets_exactly_the_handlers_mapping(self):
+        seen = []
+
+        def handler(name, arguments):
+            seen.append((name, dict(arguments)))
+            return {"tasks": [{"id": 1}], "root": arguments["project_root"]}
+
+        with (
+            StubMcpServer(stateful=False, tools=handler) as server,
+            SyncMcpSession(server.url, client_name="stub-fidelity") as session,
+        ):
+            reply = session.call_tool("get_tasks", {"project_root": "/r"})
+
+        assert reply == {"tasks": [{"id": 1}], "root": "/r"}
+        assert seen == [("get_tasks", {"project_root": "/r"})]
+
+    def test_the_stateful_mode_frames_the_handlers_answer_as_sse(self):
+        answer = {"id": "esc-1", "status": "pending"}
+        with StubMcpServer(stateful=True, tools=lambda name, arguments: answer) as server:
+            session_id = _open_session(server)
+            resp = _post(server, TOOLS_CALL, session_id=session_id)
+        assert resp.headers["content-type"].startswith("text/event-stream")
+        result = decode_mcp_response_body(resp)["result"]
+        assert result["structuredContent"] == answer
+        assert json.loads(result["content"][0]["text"]) == answer
+
+    def test_without_a_handler_the_fixed_payload_answers(self):
+        with StubMcpServer(stateful=False, payload=PAYLOAD, tools=None) as server:
+            resp = _post(server, TOOLS_CALL)
+        assert resp.json()["result"]["structuredContent"] == PAYLOAD
+
+    @pytest.mark.parametrize("stateful", [False, True], ids=["stateless", "stateful"])
+    def test_a_raising_handler_answers_a_tool_error(self, stateful):
+        def handler(name, arguments):
+            raise KeyError("no task 7")
+
+        with (
+            StubMcpServer(stateful=stateful, tools=handler) as server,
+            SyncMcpSession(server.url, client_name="stub-fidelity") as session,
+            pytest.raises(McpCallError) as excinfo,
+        ):
+            session.call_tool("get_task", {"id": "7"})
+
+        assert excinfo.value.kind is McpFailureKind.TOOL_ERROR
+        assert "KeyError" in str(excinfo.value)
+
+
+class TestListedTools:
+    """``listed_tools=`` is what tools/list answers, as fused-memory lists its tools."""
+
+    TOOLS_LIST = _request("tools/list", request_id=3)
+
+    @pytest.mark.parametrize("stateful", [False, True], ids=["stateless", "stateful"])
+    def test_each_listed_name_is_a_tool_with_an_input_schema(self, stateful):
+        with StubMcpServer(stateful=stateful, listed_tools=("get_task", "submit_task")) as server:
+            session_id = _open_session(server)
+            result = decode_mcp_response_body(_post(server, self.TOOLS_LIST, session_id=session_id))["result"]
+        assert [tool["name"] for tool in result["tools"]] == ["get_task", "submit_task"]
+        assert all(tool["inputSchema"] == {"type": "object"} for tool in result["tools"])
+
+    def test_by_default_no_tool_is_listed(self):
+        with StubMcpServer(stateful=False) as server:
+            resp = _post(server, self.TOOLS_LIST)
+        assert resp.json()["result"] == {"tools": []}
+
+
+class TestToolReplyBody:
+    """``tool_reply_body`` is the very body the stub serves for an OK tools/call."""
+
+    def test_the_stateless_answer_is_the_body(self):
+        with StubMcpServer(stateful=False, payload=PAYLOAD) as server:
+            resp = _post(server, TOOLS_CALL)
+        assert resp.json() == tool_reply_body(PAYLOAD, request_id=TOOLS_CALL["id"])
+
+    def test_the_stateful_sse_frame_carries_the_body(self):
+        with StubMcpServer(stateful=True, payload=PAYLOAD) as server:
+            session_id = _open_session(server)
+            resp = _post(server, TOOLS_CALL, session_id=session_id)
+        assert decode_mcp_response_body(resp) == tool_reply_body(PAYLOAD, request_id=TOOLS_CALL["id"])
+
+    def test_a_handlers_answer_is_the_body(self):
+        answer = {"tasks": [{"id": 1}]}
+        with StubMcpServer(stateful=False, tools=lambda name, arguments: answer) as server:
+            resp = _post(server, TOOLS_CALL)
+        assert resp.json() == tool_reply_body(answer, request_id=TOOLS_CALL["id"])
+
+    def test_the_request_id_defaults_to_one(self):
+        assert tool_reply_body(PAYLOAD)["id"] == 1

@@ -8,26 +8,34 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
+from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 
 from orchestrator.offline_lane_escalations import (
     LANE_ESCALATION_ROLE,
     OFFLINE_LANE_SENTINEL_PREFIX,
     STUCK_FILING_CATEGORY,
+    TICK_FAILURE_CATEGORY,
     UNLANDED_RED_CATEGORY,
     StuckFiling,
+    TickFailure,
     UnlandedRed,
     amend_stuck_filing,
+    amend_tick_failure,
     escalation_state,
     file_stuck_filing,
+    file_tick_failure,
     file_unlanded_red,
+    release_lane_record,
     resolve_stuck_filing,
+    resolve_tick_failure,
     sentinel_task_id,
 )
 
 COMMAND = 'Nightly Deep'
 FILED_AT = datetime(2026, 10, 1, 13, 21, 4, tzinfo=UTC)
 DUE_SINCE = datetime(2026, 10, 2, 9, 0, 0, tzinfo=UTC)
+FAILING_SINCE = datetime(2026, 10, 3, 6, 30, 0, tzinfo=UTC)
 
 
 @pytest.fixture
@@ -48,6 +56,12 @@ STUCK = StuckFiling(
     nodes=('tests/test_a.py::test_one',),
     due_since=DUE_SINCE,
     reason='planning mode refused: server busy',
+)
+
+FAILURE = TickFailure(
+    command=COMMAND,
+    failing_since=FAILING_SINCE,
+    error='ValueError: a lane fix task needs at least one test, each with a counted pass',
 )
 
 
@@ -172,6 +186,96 @@ def test_resolving_a_stuck_filing_is_read_back_as_resolved_by_the_lane(queue: Es
     assert escalation_state(queue, escalation_id) == 'resolved'
     assert _record(queue, escalation_id).resolved_by == LANE_ESCALATION_ROLE
     assert queue.get_pending() == []
+
+
+def test_tick_failure_is_a_blocking_level_one_infra_record_on_the_sentinel(queue: EscalationQueue):
+    record = _record(queue, file_tick_failure(queue, FAILURE))
+
+    assert record.level == 1
+    assert record.severity == 'blocking'
+    assert record.category == TICK_FAILURE_CATEGORY == 'infra_issue'
+    assert record.agent_role == LANE_ESCALATION_ROLE
+    assert record.task_id == '__offline_lane__nightly-deep'
+    assert COMMAND in record.summary and 'ValueError' in record.summary
+    assert len(record.summary) <= 200
+    for expected in (COMMAND, FAILING_SINCE.isoformat(), FAILURE.error):
+        assert expected in record.detail
+
+
+def test_amending_a_tick_failure_with_a_changed_error_records_it_and_identical_text_is_a_no_op(
+    queue: EscalationQueue,
+):
+    escalation_id = file_tick_failure(queue, FAILURE)
+    changed = replace(FAILURE, error='OSError: [Errno 28] No space left on device')
+
+    amend_tick_failure(queue, escalation_id, changed)
+    record = _record(queue, escalation_id)
+    assert len(record.amendments) == 1
+    assert 'No space left on device' in record.amendments[0]['detail']
+
+    amend_tick_failure(queue, escalation_id, changed)
+    amend_tick_failure(queue, escalation_id, changed)
+    assert len(_record(queue, escalation_id).amendments) == 1
+
+
+def test_resolving_a_tick_failure_is_read_back_as_resolved_by_the_lane(queue: EscalationQueue):
+    escalation_id = file_tick_failure(queue, FAILURE)
+
+    resolve_tick_failure(queue, escalation_id)
+
+    assert escalation_state(queue, escalation_id) == 'resolved'
+    assert _record(queue, escalation_id).resolved_by == LANE_ESCALATION_ROLE
+    assert queue.get_pending() == []
+
+
+def _assert_closed_with_a_class(queue: EscalationQueue, escalation_id: str) -> None:
+    record = _record(queue, escalation_id)
+    assert record.status != 'pending'
+    assert record.resolution_class is not None
+
+
+def test_a_parked_stuck_filing_closes_with_a_resolution_class(queue: EscalationQueue):
+    """A watcher's park promotes the record to level 2, whose close must be classified."""
+    escalation_id = file_stuck_filing(queue, _stuck())
+    queue.park(escalation_id, 'parked for a human')
+
+    resolve_stuck_filing(queue, escalation_id)
+
+    _assert_closed_with_a_class(queue, escalation_id)
+
+
+def test_a_parked_tick_failure_closes_with_a_resolution_class(queue: EscalationQueue):
+    escalation_id = file_tick_failure(queue, FAILURE)
+    queue.park(escalation_id, 'parked for a human')
+
+    resolve_tick_failure(queue, escalation_id)
+
+    _assert_closed_with_a_class(queue, escalation_id)
+
+
+def test_a_released_parked_lane_record_closes_with_a_resolution_class(queue: EscalationQueue):
+    escalation_id = file_unlanded_red(queue, RED)
+    queue.park(escalation_id, 'parked for a human')
+
+    release_lane_record(queue, escalation_id, 'the covering task landed')
+
+    _assert_closed_with_a_class(queue, escalation_id)
+
+
+def test_a_released_records_sole_member_holder_closes_with_a_resolution_class(
+    queue: EscalationQueue,
+):
+    escalation_id = file_unlanded_red(queue, RED)
+    holder = Escalation(
+        id=queue.make_id('7123'), task_id='7123', agent_role='escalation-watcher-auto',
+        severity='blocking', category='infra_issue', summary='holds the lane record',
+        level=2, members=[escalation_id],
+    )
+    queue.submit(holder)
+
+    release_lane_record(queue, escalation_id, 'the covering task landed')
+
+    _assert_closed_with_a_class(queue, holder.id)
 
 
 def test_state_of_an_unknown_escalation_is_none(queue: EscalationQueue):

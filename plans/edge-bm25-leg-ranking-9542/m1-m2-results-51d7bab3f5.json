@@ -1,0 +1,3256 @@
+{
+ "context": {
+  "host": "localhost:6379",
+  "graph": "dark_factory",
+  "head": "51d7bab3f51c4a38753b0c26537225f123c2b288",
+  "start": "2026-11-13T01:04:06Z",
+  "end": "2026-11-13T01:05:25Z"
+ },
+ "m1": {
+  "summary": {
+   "live_edges": 65129,
+   "stride": 325,
+   "sample": 200,
+   "rule": "every 325-th live edge in uuid order, starting at the first, first 200",
+   "self_recall_at_20_A": 0.675,
+   "mean_self_rank_A": 2.4592592592592593,
+   "self_recall_at_20_B": 0.515,
+   "mean_self_rank_B": 5.466019417475728,
+   "self_recall_at_20_C": 0.615,
+   "mean_self_rank_C": 4.032520325203252,
+   "mean_overlap_ab": 0.1035,
+   "mean_overlap_bc": 0.9625,
+   "tier_issued_share": 0.32,
+   "tier_fired_share": 0.22,
+   "max_seconds_c": 0.4864260368049145
+  },
+  "per_fact": [
+   {
+    "uuid": "0000ad66-c85d-4790-bdfe-48120f916af6",
+    "rank": {
+     "A": 1,
+     "B": 4,
+     "C": 4
+    },
+    "overlap_ab": 0.05,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.08191494271159172
+   },
+   {
+    "uuid": "01455884-1fec-44c9-b856-ba0f713a25a8",
+    "rank": {
+     "A": 2,
+     "B": 10,
+     "C": 10
+    },
+    "overlap_ab": 0.05,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.2725892700254917
+   },
+   {
+    "uuid": "027e07bf-09af-4576-aea6-50e802441a3b",
+    "rank": {
+     "A": 1,
+     "B": 6,
+     "C": 6
+    },
+    "overlap_ab": 0.2,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.03165371064096689
+   },
+   {
+    "uuid": "03d02095-c421-4a49-92b7-b0b5d7fd593d",
+    "rank": {
+     "A": 1,
+     "B": 18,
+     "C": 18
+    },
+    "overlap_ab": 0.35,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.04715003911405802
+   },
+   {
+    "uuid": "0538da8f-567d-4289-832b-0978c155d07a",
+    "rank": {
+     "A": 1,
+     "B": 1,
+     "C": 1
+    },
+    "overlap_ab": 0.05,
+    "overlap_bc": 0.8,
+    "tier_rows": 5,
+    "tier_fired": true,
+    "seconds_c": 0.23532838094979525
+   },
+   {
+    "uuid": "067d3dcd-729f-48de-abd7-770f9bc135b5",
+    "rank": {
+     "A": null,
+     "B": 1,
+     "C": 1
+    },
+    "overlap_ab": 0.1,
+    "overlap_bc": 0.95,
+    "tier_rows": 2,
+    "tier_fired": true,
+    "seconds_c": 0.16878914833068848
+   },
+   {
+    "uuid": "07b6fadf-9689-4b9c-9a00-72816e3d4873",
+    "rank": {
+     "A": 1,
+     "B": 2,
+     "C": 2
+    },
+    "overlap_ab": 0.1,
+    "overlap_bc": 1.0,
+    "tier_rows": 21,
+    "tier_fired": false,
+    "seconds_c": 0.09680298622697592
+   },
+   {
+    "uuid": "08e4288a-4dd7-4d9b-9e98-651c57a47602",
+    "rank": {
+     "A": 1,
+     "B": 1,
+     "C": 1
+    },
+    "overlap_ab": 0.15,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.2239200547337532
+   },
+   {
+    "uuid": "0a463f04-fd4d-44e9-adef-e4bb24b989c7",
+    "rank": {
+     "A": 1,
+     "B": 13,
+     "C": 13
+    },
+    "overlap_ab": 0.15,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.10333876591175795
+   },
+   {
+    "uuid": "0b978f75-24ed-4524-9cc6-12865859979d",
+    "rank": {
+     "A": 1,
+     "B": 1,
+     "C": 1
+    },
+    "overlap_ab": 0.2,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.04447977337986231
+   },
+   {
+    "uuid": "0cf7a677-0587-4e74-9412-74498a0fbb26",
+    "rank": {
+     "A": null,
+     "B": null,
+     "C": null
+    },
+    "overlap_ab": 0.05,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.18424114678055048
+   },
+   {
+    "uuid": "0e2ee203-8569-4b98-9cc1-86de8a3bb86d",
+    "rank": {
+     "A": 7,
+     "B": 2,
+     "C": 2
+    },
+    "overlap_ab": 0.45,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.1882985197007656
+   },
+   {
+    "uuid": "0f741ed4-776f-4a1b-9188-2daa744f0fd6",
+    "rank": {
+     "A": 1,
+     "B": null,
+     "C": null
+    },
+    "overlap_ab": 0.25,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.1286146054044366
+   },
+   {
+    "uuid": "10d84e5e-143d-474d-bacc-e070e6dc24dc",
+    "rank": {
+     "A": null,
+     "B": 1,
+     "C": 1
+    },
+    "overlap_ab": 0.4,
+    "overlap_bc": 1.0,
+    "tier_rows": 21,
+    "tier_fired": false,
+    "seconds_c": 0.06260315794497728
+   },
+   {
+    "uuid": "1228b316-4387-426e-880e-d541f0179250",
+    "rank": {
+     "A": 1,
+     "B": 3,
+     "C": 1
+    },
+    "overlap_ab": 0.1,
+    "overlap_bc": 1.0,
+    "tier_rows": 1,
+    "tier_fired": true,
+    "seconds_c": 0.24300371017307043
+   },
+   {
+    "uuid": "136e3251-ae85-44a4-bcbf-5cab5625780b",
+    "rank": {
+     "A": 2,
+     "B": null,
+     "C": null
+    },
+    "overlap_ab": 0.25,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.2727537089958787
+   },
+   {
+    "uuid": "14a90e38-de63-4093-ad19-97170673c018",
+    "rank": {
+     "A": 1,
+     "B": 1,
+     "C": 1
+    },
+    "overlap_ab": 0.2,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.1347019700333476
+   },
+   {
+    "uuid": "15dfaa10-2c1e-41af-a10c-23025246b825",
+    "rank": {
+     "A": 1,
+     "B": null,
+     "C": 1
+    },
+    "overlap_ab": 0.25,
+    "overlap_bc": 0.95,
+    "tier_rows": 1,
+    "tier_fired": true,
+    "seconds_c": 0.14287582505494356
+   },
+   {
+    "uuid": "171358df-d1e5-4e7e-8a33-66f8f23e9bb9",
+    "rank": {
+     "A": null,
+     "B": 2,
+     "C": 2
+    },
+    "overlap_ab": 0.0,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.11727350857108831
+   },
+   {
+    "uuid": "185aae33-da9f-4913-9b0a-740f18c43ab1",
+    "rank": {
+     "A": 2,
+     "B": 20,
+     "C": 1
+    },
+    "overlap_ab": 0.1,
+    "overlap_bc": 0.95,
+    "tier_rows": 2,
+    "tier_fired": true,
+    "seconds_c": 0.23173600248992443
+   },
+   {
+    "uuid": "199216d5-006c-4c9e-87be-7ff8b3733605",
+    "rank": {
+     "A": 1,
+     "B": null,
+     "C": null
+    },
+    "overlap_ab": 0.0,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.052899506874382496
+   },
+   {
+    "uuid": "1ad98c7b-2a5e-4175-be76-b6e1f13f9c59",
+    "rank": {
+     "A": null,
+     "B": null,
+     "C": null
+    },
+    "overlap_ab": 0.0,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.16708137281239033
+   },
+   {
+    "uuid": "1c286a14-a4bb-4d85-a2c1-8dd3a94908f8",
+    "rank": {
+     "A": 1,
+     "B": 1,
+     "C": 1
+    },
+    "overlap_ab": 0.1,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.03192594926804304
+   },
+   {
+    "uuid": "1d65a8fa-3b5f-458c-95f1-801540b8d0cb",
+    "rank": {
+     "A": 1,
+     "B": 1,
+     "C": 1
+    },
+    "overlap_ab": 0.2,
+    "overlap_bc": 0.65,
+    "tier_rows": 8,
+    "tier_fired": true,
+    "seconds_c": 0.14936968591064215
+   },
+   {
+    "uuid": "1ea1ec19-c17a-40af-bff1-9f0762b2225e",
+    "rank": {
+     "A": 1,
+     "B": null,
+     "C": 2
+    },
+    "overlap_ab": 0.15,
+    "overlap_bc": 0.65,
+    "tier_rows": 8,
+    "tier_fired": true,
+    "seconds_c": 0.12562900222837925
+   },
+   {
+    "uuid": "1fd39d5e-2577-4b52-a92e-6e1fa83480c2",
+    "rank": {
+     "A": 1,
+     "B": null,
+     "C": 7
+    },
+    "overlap_ab": 0.15,
+    "overlap_bc": 0.3,
+    "tier_rows": 17,
+    "tier_fired": true,
+    "seconds_c": 0.1332300128415227
+   },
+   {
+    "uuid": "213fbc81-93a1-4bac-8e3c-96f631debc60",
+    "rank": {
+     "A": 7,
+     "B": null,
+     "C": null
+    },
+    "overlap_ab": 0.2,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.12591794971376657
+   },
+   {
+    "uuid": "2290af75-3d1b-4572-ae17-6f3a8afdc8d0",
+    "rank": {
+     "A": 1,
+     "B": null,
+     "C": null
+    },
+    "overlap_ab": 0.0,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.15426802076399326
+   },
+   {
+    "uuid": "23c5ed34-550a-48d1-91c6-2c7afd510323",
+    "rank": {
+     "A": 11,
+     "B": null,
+     "C": null
+    },
+    "overlap_ab": 0.15,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.04585487116128206
+   },
+   {
+    "uuid": "250a4f6f-7146-4cbd-89fc-42b26c61c575",
+    "rank": {
+     "A": null,
+     "B": 7,
+     "C": 7
+    },
+    "overlap_ab": 0.05,
+    "overlap_bc": 1.0,
+    "tier_rows": 21,
+    "tier_fired": false,
+    "seconds_c": 0.12780116312205791
+   },
+   {
+    "uuid": "2660db27-b852-473a-afe7-0308cc823805",
+    "rank": {
+     "A": 2,
+     "B": 1,
+     "C": 1
+    },
+    "overlap_ab": 0.1,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.4864260368049145
+   },
+   {
+    "uuid": "27ad631e-6e71-470b-9d51-d0413bcda202",
+    "rank": {
+     "A": 1,
+     "B": 1,
+     "C": 1
+    },
+    "overlap_ab": 0.05,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.1778273256495595
+   },
+   {
+    "uuid": "28f6f1e4-aa5f-4f34-aca1-9cf1f164a3c8",
+    "rank": {
+     "A": 1,
+     "B": 5,
+     "C": 5
+    },
+    "overlap_ab": 0.05,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.20553205255419016
+   },
+   {
+    "uuid": "2a2bd5f5-67f4-4ed5-903f-ee517c62fc1f",
+    "rank": {
+     "A": 1,
+     "B": 1,
+     "C": 1
+    },
+    "overlap_ab": 0.05,
+    "overlap_bc": 1.0,
+    "tier_rows": 21,
+    "tier_fired": false,
+    "seconds_c": 0.14799512829631567
+   },
+   {
+    "uuid": "2b661d92-a004-4b42-a4c1-7ffccf66120c",
+    "rank": {
+     "A": 1,
+     "B": null,
+     "C": null
+    },
+    "overlap_ab": 0.0,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.19249133113771677
+   },
+   {
+    "uuid": "2cc29f88-4cc5-4430-8680-703367893646",
+    "rank": {
+     "A": 1,
+     "B": 1,
+     "C": 1
+    },
+    "overlap_ab": 0.45,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.08271876443177462
+   },
+   {
+    "uuid": "2e1669bd-4011-48ae-9354-324fc2df9912",
+    "rank": {
+     "A": null,
+     "B": 1,
+     "C": 1
+    },
+    "overlap_ab": 0.0,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.12523385602980852
+   },
+   {
+    "uuid": "2f69fb19-c216-49ff-8ce7-266e8017d5af",
+    "rank": {
+     "A": 1,
+     "B": null,
+     "C": 2
+    },
+    "overlap_ab": 0.05,
+    "overlap_bc": 0.85,
+    "tier_rows": 4,
+    "tier_fired": true,
+    "seconds_c": 0.1266296524554491
+   },
+   {
+    "uuid": "30b385aa-7322-459e-a155-d2187e9666e4",
+    "rank": {
+     "A": null,
+     "B": null,
+     "C": null
+    },
+    "overlap_ab": 0.05,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.05146706011146307
+   },
+   {
+    "uuid": "31f36f86-3a4b-4622-b774-7ff96136147f",
+    "rank": {
+     "A": 1,
+     "B": null,
+     "C": null
+    },
+    "overlap_ab": 0.0,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.11556357517838478
+   },
+   {
+    "uuid": "3349749b-f68d-46db-bbe1-e4c0c6a82c5f",
+    "rank": {
+     "A": null,
+     "B": null,
+     "C": null
+    },
+    "overlap_ab": 0.2,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.0512936320155859
+   },
+   {
+    "uuid": "347e1cb6-7297-45e5-b123-495485104800",
+    "rank": {
+     "A": 8,
+     "B": null,
+     "C": null
+    },
+    "overlap_ab": 0.05,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.1321734432131052
+   },
+   {
+    "uuid": "35cbd11c-e3c5-4077-8a98-5dd28f7f7e1a",
+    "rank": {
+     "A": 1,
+     "B": null,
+     "C": null
+    },
+    "overlap_ab": 0.05,
+    "overlap_bc": 1.0,
+    "tier_rows": 21,
+    "tier_fired": false,
+    "seconds_c": 0.15370327699929476
+   },
+   {
+    "uuid": "37321d92-fed0-421b-aff2-d0f2f83b981a",
+    "rank": {
+     "A": 1,
+     "B": null,
+     "C": null
+    },
+    "overlap_ab": 0.0,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.23226801864802837
+   },
+   {
+    "uuid": "3888b5d2-ca52-47d2-8f35-430b3424032b",
+    "rank": {
+     "A": 1,
+     "B": null,
+     "C": null
+    },
+    "overlap_ab": 0.05,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.11101034563034773
+   },
+   {
+    "uuid": "39d93c9a-6ce4-490e-a531-0e87b750e134",
+    "rank": {
+     "A": null,
+     "B": null,
+     "C": null
+    },
+    "overlap_ab": 0.0,
+    "overlap_bc": 1.0,
+    "tier_rows": 21,
+    "tier_fired": false,
+    "seconds_c": 0.2589373253285885
+   },
+   {
+    "uuid": "3b1f4f1d-104d-4009-8d0f-d927dfdcedde",
+    "rank": {
+     "A": null,
+     "B": null,
+     "C": null
+    },
+    "overlap_ab": 0.35,
+    "overlap_bc": 1.0,
+    "tier_rows": 21,
+    "tier_fired": false,
+    "seconds_c": 0.14463835954666138
+   },
+   {
+    "uuid": "3c5732c8-842b-4cae-a7ca-c54e3625cd49",
+    "rank": {
+     "A": 1,
+     "B": 1,
+     "C": 1
+    },
+    "overlap_ab": 0.05,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.05488003883510828
+   },
+   {
+    "uuid": "3d8d5234-2f1f-44c4-aa46-289601a8b1fc",
+    "rank": {
+     "A": 1,
+     "B": null,
+     "C": null
+    },
+    "overlap_ab": 0.15,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.19704455975443125
+   },
+   {
+    "uuid": "3ed7f086-61f4-4396-8a14-60a478082a25",
+    "rank": {
+     "A": 14,
+     "B": null,
+     "C": null
+    },
+    "overlap_ab": 0.0,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.11586288176476955
+   },
+   {
+    "uuid": "40240569-818d-42fe-bcc1-01ad3e18f10e",
+    "rank": {
+     "A": 8,
+     "B": null,
+     "C": null
+    },
+    "overlap_ab": 0.05,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.29990637116134167
+   },
+   {
+    "uuid": "417c9832-b351-4293-84dd-4cdb93601b74",
+    "rank": {
+     "A": 1,
+     "B": null,
+     "C": null
+    },
+    "overlap_ab": 0.05,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.14727648440748453
+   },
+   {
+    "uuid": "42e94bd9-fb27-403f-8c7d-06cbf9be2a90",
+    "rank": {
+     "A": 1,
+     "B": 1,
+     "C": 1
+    },
+    "overlap_ab": 0.05,
+    "overlap_bc": 0.6,
+    "tier_rows": 9,
+    "tier_fired": true,
+    "seconds_c": 0.23787910677492619
+   },
+   {
+    "uuid": "4432cb52-f097-4223-9458-9426f3dfbd95",
+    "rank": {
+     "A": null,
+     "B": 1,
+     "C": 1
+    },
+    "overlap_ab": 0.2,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.08795664738863707
+   },
+   {
+    "uuid": "457ccd73-3f9d-4d90-b335-e32ffb359c2c",
+    "rank": {
+     "A": 1,
+     "B": 17,
+     "C": 17
+    },
+    "overlap_ab": 0.2,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.23237082827836275
+   },
+   {
+    "uuid": "46d82e29-f45b-49a5-9e22-cb7d2a5b135d",
+    "rank": {
+     "A": 1,
+     "B": null,
+     "C": 2
+    },
+    "overlap_ab": 0.25,
+    "overlap_bc": 0.1,
+    "tier_rows": 18,
+    "tier_fired": true,
+    "seconds_c": 0.2969058295711875
+   },
+   {
+    "uuid": "48222784-14ff-44af-9365-3eb6461802c1",
+    "rank": {
+     "A": 1,
+     "B": null,
+     "C": null
+    },
+    "overlap_ab": 0.25,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.08186268247663975
+   },
+   {
+    "uuid": "4943094c-1ef7-46de-a4f1-fa600f28ba68",
+    "rank": {
+     "A": 15,
+     "B": null,
+     "C": 5
+    },
+    "overlap_ab": 0.05,
+    "overlap_bc": 0.55,
+    "tier_rows": 13,
+    "tier_fired": true,
+    "seconds_c": 0.13291682582348585
+   },
+   {
+    "uuid": "4a94b6cd-27d4-4e38-b9a0-1c99578a3fe4",
+    "rank": {
+     "A": 1,
+     "B": 6,
+     "C": 1
+    },
+    "overlap_ab": 0.4,
+    "overlap_bc": 0.85,
+    "tier_rows": 4,
+    "tier_fired": true,
+    "seconds_c": 0.1643099384382367
+   },
+   {
+    "uuid": "4be6c926-3746-4813-9508-d5249331d84e",
+    "rank": {
+     "A": null,
+     "B": null,
+     "C": null
+    },
+    "overlap_ab": 0.1,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.1683910023421049
+   },
+   {
+    "uuid": "4d3172c5-8e3e-4d50-be93-0d9a6c8da568",
+    "rank": {
+     "A": 1,
+     "B": null,
+     "C": null
+    },
+    "overlap_ab": 0.05,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.20255749113857746
+   },
+   {
+    "uuid": "4e6b459a-ef04-4dff-b5e1-fb7c7fe0934b",
+    "rank": {
+     "A": 1,
+     "B": 19,
+     "C": 19
+    },
+    "overlap_ab": 0.05,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.13100342359393835
+   },
+   {
+    "uuid": "4fb57011-16dd-46b1-9275-e8505f00c293",
+    "rank": {
+     "A": null,
+     "B": null,
+     "C": null
+    },
+    "overlap_ab": 0.05,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.07160131633281708
+   },
+   {
+    "uuid": "50e8f893-e1fa-4798-a51c-df76b311d2f0",
+    "rank": {
+     "A": 3,
+     "B": null,
+     "C": null
+    },
+    "overlap_ab": 0.15,
+    "overlap_bc": 1.0,
+    "tier_rows": 21,
+    "tier_fired": false,
+    "seconds_c": 0.1953415060415864
+   },
+   {
+    "uuid": "524101a4-7b58-4fca-9689-eb144b27a6bd",
+    "rank": {
+     "A": 5,
+     "B": null,
+     "C": 2
+    },
+    "overlap_ab": 0.2,
+    "overlap_bc": 0.45,
+    "tier_rows": 11,
+    "tier_fired": true,
+    "seconds_c": 0.3162455018609762
+   },
+   {
+    "uuid": "538335ef-3139-4cc5-b17e-77e2d9651f36",
+    "rank": {
+     "A": 1,
+     "B": 1,
+     "C": 1
+    },
+    "overlap_ab": 0.05,
+    "overlap_bc": 1.0,
+    "tier_rows": 1,
+    "tier_fired": true,
+    "seconds_c": 0.07834678515791893
+   },
+   {
+    "uuid": "54c0118d-751e-4897-8d3f-721fa02b2bea",
+    "rank": {
+     "A": 1,
+     "B": 16,
+     "C": 16
+    },
+    "overlap_ab": 0.1,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.1555144488811493
+   },
+   {
+    "uuid": "561b4a0f-5f56-43a7-9336-2c3cbae1fa6f",
+    "rank": {
+     "A": null,
+     "B": 1,
+     "C": 1
+    },
+    "overlap_ab": 0.0,
+    "overlap_bc": 0.9,
+    "tier_rows": 2,
+    "tier_fired": true,
+    "seconds_c": 0.0729360543191433
+   },
+   {
+    "uuid": "575da351-3052-4413-a509-4cb19bb22981",
+    "rank": {
+     "A": 5,
+     "B": null,
+     "C": null
+    },
+    "overlap_ab": 0.05,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.05724351666867733
+   },
+   {
+    "uuid": "58bfe4e6-2f63-4489-9a00-8d9834ef7417",
+    "rank": {
+     "A": 1,
+     "B": null,
+     "C": 1
+    },
+    "overlap_ab": 0.25,
+    "overlap_bc": 0.95,
+    "tier_rows": 1,
+    "tier_fired": true,
+    "seconds_c": 0.14700181782245636
+   },
+   {
+    "uuid": "5a1039b3-1fbf-47c7-99b5-2be5313772de",
+    "rank": {
+     "A": 3,
+     "B": null,
+     "C": null
+    },
+    "overlap_ab": 0.0,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.12034647073596716
+   },
+   {
+    "uuid": "5b6dea55-223d-4a21-b764-703ff9a0359c",
+    "rank": {
+     "A": 1,
+     "B": null,
+     "C": 1
+    },
+    "overlap_ab": 0.0,
+    "overlap_bc": 0.95,
+    "tier_rows": 1,
+    "tier_fired": true,
+    "seconds_c": 0.15059095434844494
+   },
+   {
+    "uuid": "5cc0b422-4e1d-44ed-9277-49c306b42051",
+    "rank": {
+     "A": null,
+     "B": 4,
+     "C": 4
+    },
+    "overlap_ab": 0.1,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.08003636915236712
+   },
+   {
+    "uuid": "5e0506a6-be72-4f2f-ae06-8f323a4ec442",
+    "rank": {
+     "A": 1,
+     "B": null,
+     "C": null
+    },
+    "overlap_ab": 0.0,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.09621178172528744
+   },
+   {
+    "uuid": "5f3ecf5b-05a9-49cf-a975-5bcfa397ee21",
+    "rank": {
+     "A": 9,
+     "B": null,
+     "C": null
+    },
+    "overlap_ab": 0.1,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.1660592732951045
+   },
+   {
+    "uuid": "6081da09-df1f-4299-b496-5251f8f69859",
+    "rank": {
+     "A": 6,
+     "B": null,
+     "C": null
+    },
+    "overlap_ab": 0.1,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.13613271713256836
+   },
+   {
+    "uuid": "61a79d09-2630-4f35-b407-a2c7804061a0",
+    "rank": {
+     "A": null,
+     "B": null,
+     "C": null
+    },
+    "overlap_ab": 0.05,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.16676781699061394
+   },
+   {
+    "uuid": "62cf644f-a627-442e-a838-67b6031ed3b7",
+    "rank": {
+     "A": 1,
+     "B": 15,
+     "C": 15
+    },
+    "overlap_ab": 0.15,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.05907059088349342
+   },
+   {
+    "uuid": "64334460-697f-4223-b3c5-c45ea5a0eb53",
+    "rank": {
+     "A": null,
+     "B": 1,
+     "C": 1
+    },
+    "overlap_ab": 0.65,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.1758225243538618
+   },
+   {
+    "uuid": "6575bb72-0628-412b-9ade-23b936f3255c",
+    "rank": {
+     "A": 6,
+     "B": null,
+     "C": 1
+    },
+    "overlap_ab": 0.15,
+    "overlap_bc": 0.95,
+    "tier_rows": 1,
+    "tier_fired": true,
+    "seconds_c": 0.14872299134731293
+   },
+   {
+    "uuid": "66b4a375-1e88-432a-b752-59f1861dc4a7",
+    "rank": {
+     "A": 1,
+     "B": 15,
+     "C": 15
+    },
+    "overlap_ab": 0.1,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.1468348689377308
+   },
+   {
+    "uuid": "67f7ae45-1855-429d-a979-9f69f9418018",
+    "rank": {
+     "A": 1,
+     "B": 1,
+     "C": 1
+    },
+    "overlap_ab": 0.3,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.12042613979429007
+   },
+   {
+    "uuid": "6931db7a-f455-40be-a432-d88793c620a4",
+    "rank": {
+     "A": 1,
+     "B": null,
+     "C": null
+    },
+    "overlap_ab": 0.1,
+    "overlap_bc": 1.0,
+    "tier_rows": 21,
+    "tier_fired": false,
+    "seconds_c": 0.08805226534605026
+   },
+   {
+    "uuid": "6a690fe2-d6f1-492d-b1ce-537d7366423d",
+    "rank": {
+     "A": 1,
+     "B": null,
+     "C": 3
+    },
+    "overlap_ab": 0.15,
+    "overlap_bc": 0.85,
+    "tier_rows": 5,
+    "tier_fired": true,
+    "seconds_c": 0.14519905392080545
+   },
+   {
+    "uuid": "6b8d87b5-8088-4519-8c91-aa8e26ce7bb0",
+    "rank": {
+     "A": 1,
+     "B": 16,
+     "C": 1
+    },
+    "overlap_ab": 0.05,
+    "overlap_bc": 1.0,
+    "tier_rows": 1,
+    "tier_fired": true,
+    "seconds_c": 0.12810944952070713
+   },
+   {
+    "uuid": "6cee9a57-8b96-4dc9-848a-a682c519d988",
+    "rank": {
+     "A": 1,
+     "B": 2,
+     "C": 1
+    },
+    "overlap_ab": 0.1,
+    "overlap_bc": 1.0,
+    "tier_rows": 1,
+    "tier_fired": true,
+    "seconds_c": 0.19680909253656864
+   },
+   {
+    "uuid": "6e32691f-1dc5-4325-b503-7d919ea522f9",
+    "rank": {
+     "A": null,
+     "B": null,
+     "C": null
+    },
+    "overlap_ab": 0.0,
+    "overlap_bc": 1.0,
+    "tier_rows": 21,
+    "tier_fired": false,
+    "seconds_c": 0.19976480584591627
+   },
+   {
+    "uuid": "6f7db4b6-fefc-4a57-9290-38a530b00a4b",
+    "rank": {
+     "A": null,
+     "B": 10,
+     "C": 10
+    },
+    "overlap_ab": 0.15,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.05092462431639433
+   },
+   {
+    "uuid": "70c2d659-e527-4773-9cfa-3b02ee124113",
+    "rank": {
+     "A": null,
+     "B": null,
+     "C": 1
+    },
+    "overlap_ab": 0.05,
+    "overlap_bc": 0.95,
+    "tier_rows": 1,
+    "tier_fired": true,
+    "seconds_c": 0.07098549231886864
+   },
+   {
+    "uuid": "71e9082d-1008-4bcb-a4ce-02b8cf9bcc91",
+    "rank": {
+     "A": null,
+     "B": 6,
+     "C": 6
+    },
+    "overlap_ab": 0.1,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.16226330865174532
+   },
+   {
+    "uuid": "732a8936-aa51-434e-81c1-3ea67ad40cb0",
+    "rank": {
+     "A": 9,
+     "B": null,
+     "C": null
+    },
+    "overlap_ab": 0.0,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.13873264379799366
+   },
+   {
+    "uuid": "745e9a4e-8141-49e2-991f-7e44027b3b9f",
+    "rank": {
+     "A": null,
+     "B": 1,
+     "C": 1
+    },
+    "overlap_ab": 0.0,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.08532600104808807
+   },
+   {
+    "uuid": "75a0d1a4-5ab1-409e-9d10-13d5902e9a8b",
+    "rank": {
+     "A": null,
+     "B": null,
+     "C": null
+    },
+    "overlap_ab": 0.05,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.051783197559416294
+   },
+   {
+    "uuid": "76ec6b12-a576-4d28-8e51-d8d8c5ebc50d",
+    "rank": {
+     "A": 1,
+     "B": 13,
+     "C": 13
+    },
+    "overlap_ab": 0.05,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.03443970624357462
+   },
+   {
+    "uuid": "782185ea-5613-4293-8162-cbd7f4218745",
+    "rank": {
+     "A": 1,
+     "B": 18,
+     "C": 18
+    },
+    "overlap_ab": 0.15,
+    "overlap_bc": 1.0,
+    "tier_rows": 21,
+    "tier_fired": false,
+    "seconds_c": 0.08246625773608685
+   },
+   {
+    "uuid": "7960206b-e82c-4297-9ead-82f16e516144",
+    "rank": {
+     "A": null,
+     "B": null,
+     "C": null
+    },
+    "overlap_ab": 0.0,
+    "overlap_bc": 1.0,
+    "tier_rows": 21,
+    "tier_fired": false,
+    "seconds_c": 0.1525934273377061
+   },
+   {
+    "uuid": "7a9f9530-acc4-4231-bf89-f1ebb60b0f8a",
+    "rank": {
+     "A": 1,
+     "B": null,
+     "C": null
+    },
+    "overlap_ab": 0.05,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.13476481940597296
+   },
+   {
+    "uuid": "7c06e258-175c-464a-b6da-df9aad7adc4e",
+    "rank": {
+     "A": 2,
+     "B": null,
+     "C": 1
+    },
+    "overlap_ab": 0.05,
+    "overlap_bc": 0.95,
+    "tier_rows": 1,
+    "tier_fired": true,
+    "seconds_c": 0.08077806327491999
+   },
+   {
+    "uuid": "7d5dc929-a34f-4dea-83c5-71ca7d6d8174",
+    "rank": {
+     "A": 1,
+     "B": 16,
+     "C": 1
+    },
+    "overlap_ab": 0.1,
+    "overlap_bc": 0.85,
+    "tier_rows": 4,
+    "tier_fired": true,
+    "seconds_c": 0.1963404370471835
+   },
+   {
+    "uuid": "7e96eb62-579a-4905-b03a-5a27f99c6509",
+    "rank": {
+     "A": null,
+     "B": 3,
+     "C": 3
+    },
+    "overlap_ab": 0.05,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.047414347529411316
+   },
+   {
+    "uuid": "7fcfa627-1f59-48ab-bdc7-f50a6ed29ca4",
+    "rank": {
+     "A": 1,
+     "B": 1,
+     "C": 1
+    },
+    "overlap_ab": 0.2,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.11208827700465918
+   },
+   {
+    "uuid": "810d1b8c-0809-47e3-a1ae-79f045f1f8cf",
+    "rank": {
+     "A": 2,
+     "B": null,
+     "C": null
+    },
+    "overlap_ab": 0.05,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.030647500418126583
+   },
+   {
+    "uuid": "8273848f-d663-4248-97cd-bb406e4e71ea",
+    "rank": {
+     "A": 1,
+     "B": 3,
+     "C": 3
+    },
+    "overlap_ab": 0.05,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.04743807762861252
+   },
+   {
+    "uuid": "83984226-7576-47fb-aedd-f1f9d034f3f2",
+    "rank": {
+     "A": 1,
+     "B": null,
+     "C": null
+    },
+    "overlap_ab": 0.05,
+    "overlap_bc": 1.0,
+    "tier_rows": 21,
+    "tier_fired": false,
+    "seconds_c": 0.0752218933776021
+   },
+   {
+    "uuid": "84e8b1cb-cf9d-4630-a11b-03dde635e6d1",
+    "rank": {
+     "A": 1,
+     "B": 1,
+     "C": 1
+    },
+    "overlap_ab": 0.1,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.12461247202008963
+   },
+   {
+    "uuid": "8633dfc6-aad0-4b4e-9d0b-4aa44bf505e9",
+    "rank": {
+     "A": null,
+     "B": 1,
+     "C": 1
+    },
+    "overlap_ab": 0.05,
+    "overlap_bc": 0.8,
+    "tier_rows": 8,
+    "tier_fired": true,
+    "seconds_c": 0.13119940180331469
+   },
+   {
+    "uuid": "8772e3ee-6012-4e51-b336-d731f15e9efc",
+    "rank": {
+     "A": 1,
+     "B": 17,
+     "C": 17
+    },
+    "overlap_ab": 0.3,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.03558892570436001
+   },
+   {
+    "uuid": "88c05209-adc3-4d31-a3cd-83e40c82a83e",
+    "rank": {
+     "A": 1,
+     "B": 14,
+     "C": 1
+    },
+    "overlap_ab": 0.3,
+    "overlap_bc": 1.0,
+    "tier_rows": 1,
+    "tier_fired": true,
+    "seconds_c": 0.0634028110653162
+   },
+   {
+    "uuid": "89ee8d32-8455-46c1-a684-9785d26dcec7",
+    "rank": {
+     "A": 4,
+     "B": null,
+     "C": null
+    },
+    "overlap_ab": 0.0,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.11406456865370274
+   },
+   {
+    "uuid": "8b1f1d64-1f21-48e5-b66a-dade3978fbab",
+    "rank": {
+     "A": 3,
+     "B": 20,
+     "C": 20
+    },
+    "overlap_ab": 0.15,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.03295989893376827
+   },
+   {
+    "uuid": "8c4b9450-8d4d-4ca8-8ad6-3774b7bc67bf",
+    "rank": {
+     "A": null,
+     "B": null,
+     "C": null
+    },
+    "overlap_ab": 0.05,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.17295683082193136
+   },
+   {
+    "uuid": "8d7bceb2-6494-46f0-b704-0591f47de83d",
+    "rank": {
+     "A": null,
+     "B": null,
+     "C": null
+    },
+    "overlap_ab": 0.15,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.12116007413715124
+   },
+   {
+    "uuid": "8ecbcb65-9402-4db2-94ad-0c41bb1bfa3d",
+    "rank": {
+     "A": 1,
+     "B": 1,
+     "C": 1
+    },
+    "overlap_ab": 0.05,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.12272939085960388
+   },
+   {
+    "uuid": "900dcdb6-0efc-412b-b7f6-c4d4335f60e8",
+    "rank": {
+     "A": 7,
+     "B": null,
+     "C": null
+    },
+    "overlap_ab": 0.05,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.05916513968259096
+   },
+   {
+    "uuid": "915c6cf2-3ba2-4b35-8095-d6859b5150fa",
+    "rank": {
+     "A": 19,
+     "B": 3,
+     "C": 3
+    },
+    "overlap_ab": 0.15,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.04624240752309561
+   },
+   {
+    "uuid": "92b608c2-24a1-48e6-ad08-20076077a6b9",
+    "rank": {
+     "A": null,
+     "B": 1,
+     "C": 1
+    },
+    "overlap_ab": 0.0,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.17191370949149132
+   },
+   {
+    "uuid": "94001d7b-a30b-4a7c-a507-b457e1812922",
+    "rank": {
+     "A": 1,
+     "B": 1,
+     "C": 1
+    },
+    "overlap_ab": 0.4,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.03552373591810465
+   },
+   {
+    "uuid": "953f0bd1-618f-4506-8815-7986776e6d1a",
+    "rank": {
+     "A": null,
+     "B": null,
+     "C": null
+    },
+    "overlap_ab": 0.05,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.044393355026841164
+   },
+   {
+    "uuid": "9699dce3-9068-4fa9-b888-a5b9b07e7bca",
+    "rank": {
+     "A": null,
+     "B": null,
+     "C": null
+    },
+    "overlap_ab": 0.05,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.032000668346881866
+   },
+   {
+    "uuid": "97e9664e-be4e-4fef-909a-70358bdb2dca",
+    "rank": {
+     "A": null,
+     "B": 16,
+     "C": 16
+    },
+    "overlap_ab": 0.0,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.11260266229510307
+   },
+   {
+    "uuid": "9934edcc-d7bd-466d-89bc-d74f89330c81",
+    "rank": {
+     "A": 1,
+     "B": 16,
+     "C": 16
+    },
+    "overlap_ab": 0.1,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.1652226923033595
+   },
+   {
+    "uuid": "9a7b09f1-e934-4266-8625-f3721e5caba2",
+    "rank": {
+     "A": 9,
+     "B": null,
+     "C": 1
+    },
+    "overlap_ab": 0.0,
+    "overlap_bc": 0.85,
+    "tier_rows": 3,
+    "tier_fired": true,
+    "seconds_c": 0.041524200700223446
+   },
+   {
+    "uuid": "9be957ec-f132-4c41-bf69-935628664537",
+    "rank": {
+     "A": 1,
+     "B": 1,
+     "C": 1
+    },
+    "overlap_ab": 0.1,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.15315804164856672
+   },
+   {
+    "uuid": "9d392fea-7bcd-4887-a4c9-29c067249894",
+    "rank": {
+     "A": 1,
+     "B": null,
+     "C": null
+    },
+    "overlap_ab": 0.1,
+    "overlap_bc": 1.0,
+    "tier_rows": 21,
+    "tier_fired": false,
+    "seconds_c": 0.06263633724302053
+   },
+   {
+    "uuid": "9e8b94fa-6964-4b3e-a1d4-d643012660c0",
+    "rank": {
+     "A": 2,
+     "B": 1,
+     "C": 1
+    },
+    "overlap_ab": 0.2,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.18326088599860668
+   },
+   {
+    "uuid": "9fc6deeb-008d-4094-9c10-d6858db794db",
+    "rank": {
+     "A": 1,
+     "B": 2,
+     "C": 2
+    },
+    "overlap_ab": 0.15,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.07179850433021784
+   },
+   {
+    "uuid": "a0e80e68-78dc-43e2-aafb-cae7ae48506d",
+    "rank": {
+     "A": 1,
+     "B": 16,
+     "C": 16
+    },
+    "overlap_ab": 0.25,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.05018834210932255
+   },
+   {
+    "uuid": "a2463451-79d0-492f-89f9-81aa89a1703f",
+    "rank": {
+     "A": null,
+     "B": 1,
+     "C": 1
+    },
+    "overlap_ab": 0.0,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.06855717394500971
+   },
+   {
+    "uuid": "a38b379e-a0e1-4931-975f-92b8468a9ca6",
+    "rank": {
+     "A": 2,
+     "B": 7,
+     "C": 1
+    },
+    "overlap_ab": 0.1,
+    "overlap_bc": 1.0,
+    "tier_rows": 1,
+    "tier_fired": true,
+    "seconds_c": 0.16174163296818733
+   },
+   {
+    "uuid": "a4dae2b0-7a87-49ce-82ca-97d9372aac0f",
+    "rank": {
+     "A": null,
+     "B": null,
+     "C": null
+    },
+    "overlap_ab": 0.05,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.05450153257697821
+   },
+   {
+    "uuid": "a60e7346-3620-4b64-8866-4e5e945924d7",
+    "rank": {
+     "A": 1,
+     "B": 1,
+     "C": 1
+    },
+    "overlap_ab": 0.15,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.030245233327150345
+   },
+   {
+    "uuid": "a75b5c92-4c81-4311-a043-eed0fb8ba704",
+    "rank": {
+     "A": 2,
+     "B": 3,
+     "C": 3
+    },
+    "overlap_ab": 0.05,
+    "overlap_bc": 1.0,
+    "tier_rows": 21,
+    "tier_fired": false,
+    "seconds_c": 0.0354603361338377
+   },
+   {
+    "uuid": "a8b834e1-2852-4088-9d43-773bd5b42d0a",
+    "rank": {
+     "A": 2,
+     "B": null,
+     "C": null
+    },
+    "overlap_ab": 0.15,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.10423134826123714
+   },
+   {
+    "uuid": "a9c60a88-6e99-483e-aa98-a8b8d91a4af5",
+    "rank": {
+     "A": null,
+     "B": 18,
+     "C": 18
+    },
+    "overlap_ab": 0.1,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.1558357272297144
+   },
+   {
+    "uuid": "ab14cfb7-cebd-4b8e-a669-0b1a5d50e5ed",
+    "rank": {
+     "A": null,
+     "B": 10,
+     "C": 10
+    },
+    "overlap_ab": 0.05,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.1295317281037569
+   },
+   {
+    "uuid": "ac5b9112-e8ce-46da-a2e7-f49d9694154f",
+    "rank": {
+     "A": null,
+     "B": 3,
+     "C": 3
+    },
+    "overlap_ab": 0.25,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.05067479703575373
+   },
+   {
+    "uuid": "adbff949-0eae-4d3f-be8c-cf7d5aa3bffd",
+    "rank": {
+     "A": 1,
+     "B": 1,
+     "C": 1
+    },
+    "overlap_ab": 0.1,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.08986494038254023
+   },
+   {
+    "uuid": "af2a0303-7af8-44c6-ab44-d0f10ce58f58",
+    "rank": {
+     "A": null,
+     "B": null,
+     "C": null
+    },
+    "overlap_ab": 0.05,
+    "overlap_bc": 1.0,
+    "tier_rows": 21,
+    "tier_fired": false,
+    "seconds_c": 0.1342135639861226
+   },
+   {
+    "uuid": "b067c75c-be24-4429-b022-7d05f2595a95",
+    "rank": {
+     "A": null,
+     "B": null,
+     "C": null
+    },
+    "overlap_ab": 0.1,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.056276025250554085
+   },
+   {
+    "uuid": "b1bfa11a-3e2e-43f8-9d4d-a36aa5a9f6fe",
+    "rank": {
+     "A": 1,
+     "B": 1,
+     "C": 1
+    },
+    "overlap_ab": 0.05,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.06500770710408688
+   },
+   {
+    "uuid": "b30ffd6f-65a1-414e-af98-14ddb4a3cc99",
+    "rank": {
+     "A": null,
+     "B": 2,
+     "C": 2
+    },
+    "overlap_ab": 0.0,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.10679652541875839
+   },
+   {
+    "uuid": "b4797ce9-ab60-4789-a357-bbf16408dace",
+    "rank": {
+     "A": null,
+     "B": null,
+     "C": null
+    },
+    "overlap_ab": 0.0,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.0708250030875206
+   },
+   {
+    "uuid": "b5b71570-8d91-4637-9936-0cb3a98ea432",
+    "rank": {
+     "A": 1,
+     "B": null,
+     "C": null
+    },
+    "overlap_ab": 0.0,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.07678429875522852
+   },
+   {
+    "uuid": "b7050aa4-00e3-4155-9d81-33027aa7df62",
+    "rank": {
+     "A": 1,
+     "B": 1,
+     "C": 1
+    },
+    "overlap_ab": 0.1,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.0473805982619524
+   },
+   {
+    "uuid": "b84cde1b-d352-401d-ae1f-ed6952578fb8",
+    "rank": {
+     "A": null,
+     "B": null,
+     "C": 1
+    },
+    "overlap_ab": 0.05,
+    "overlap_bc": 0.95,
+    "tier_rows": 1,
+    "tier_fired": true,
+    "seconds_c": 0.0351369995623827
+   },
+   {
+    "uuid": "b9949ce8-beb1-4d4d-aed4-d796d526ed7a",
+    "rank": {
+     "A": 1,
+     "B": 1,
+     "C": 1
+    },
+    "overlap_ab": 0.25,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.033804391510784626
+   },
+   {
+    "uuid": "baefa2e5-6f2e-440d-9673-7a6fbc50418a",
+    "rank": {
+     "A": null,
+     "B": null,
+     "C": null
+    },
+    "overlap_ab": 0.0,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.08518608193844557
+   },
+   {
+    "uuid": "bc3379f4-f0e0-436d-a697-c6b4e2df2f93",
+    "rank": {
+     "A": 2,
+     "B": 3,
+     "C": 3
+    },
+    "overlap_ab": 0.05,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.037652695551514626
+   },
+   {
+    "uuid": "bd898c86-2fc0-4758-b694-387f2d3c9f69",
+    "rank": {
+     "A": 1,
+     "B": 8,
+     "C": 1
+    },
+    "overlap_ab": 0.05,
+    "overlap_bc": 0.7,
+    "tier_rows": 6,
+    "tier_fired": true,
+    "seconds_c": 0.20530684478580952
+   },
+   {
+    "uuid": "beebc06c-6c85-4625-9290-3f93d98e5506",
+    "rank": {
+     "A": null,
+     "B": 3,
+     "C": 1
+    },
+    "overlap_ab": 0.1,
+    "overlap_bc": 0.95,
+    "tier_rows": 2,
+    "tier_fired": true,
+    "seconds_c": 0.2387038804590702
+   },
+   {
+    "uuid": "c0439cdb-ec39-4018-b956-1f5197e417bd",
+    "rank": {
+     "A": null,
+     "B": null,
+     "C": null
+    },
+    "overlap_ab": 0.0,
+    "overlap_bc": 1.0,
+    "tier_rows": 21,
+    "tier_fired": false,
+    "seconds_c": 0.04003502428531647
+   },
+   {
+    "uuid": "c1ac298e-be76-416c-a053-cb65e9bafa58",
+    "rank": {
+     "A": 2,
+     "B": null,
+     "C": null
+    },
+    "overlap_ab": 0.0,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.10818994231522083
+   },
+   {
+    "uuid": "c2ef06c5-9291-4b47-ab84-2871203708c3",
+    "rank": {
+     "A": 14,
+     "B": null,
+     "C": null
+    },
+    "overlap_ab": 0.0,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.09592593368142843
+   },
+   {
+    "uuid": "c4199000-3253-4b65-b580-2bb80b2186fb",
+    "rank": {
+     "A": 1,
+     "B": null,
+     "C": 1
+    },
+    "overlap_ab": 0.0,
+    "overlap_bc": 0.85,
+    "tier_rows": 1,
+    "tier_fired": true,
+    "seconds_c": 0.13975158240646124
+   },
+   {
+    "uuid": "c557d885-743c-4bab-bf8c-421bddf9915b",
+    "rank": {
+     "A": 1,
+     "B": null,
+     "C": null
+    },
+    "overlap_ab": 0.05,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.12978524528443813
+   },
+   {
+    "uuid": "c68d796e-57da-4b39-a3bb-4692e801e204",
+    "rank": {
+     "A": 1,
+     "B": null,
+     "C": null
+    },
+    "overlap_ab": 0.2,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.11336637567728758
+   },
+   {
+    "uuid": "c7e2488d-0409-4200-ba32-f741b2a64f59",
+    "rank": {
+     "A": 1,
+     "B": 8,
+     "C": 8
+    },
+    "overlap_ab": 0.05,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.1034850962460041
+   },
+   {
+    "uuid": "c927d7d3-3114-4438-9f77-7580dd6cd915",
+    "rank": {
+     "A": null,
+     "B": null,
+     "C": null
+    },
+    "overlap_ab": 0.1,
+    "overlap_bc": 1.0,
+    "tier_rows": 21,
+    "tier_fired": false,
+    "seconds_c": 0.08533897064626217
+   },
+   {
+    "uuid": "ca65ce86-469b-44a6-a593-ea5443841029",
+    "rank": {
+     "A": 3,
+     "B": null,
+     "C": null
+    },
+    "overlap_ab": 0.05,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.0839094640687108
+   },
+   {
+    "uuid": "cbbc9411-f9a7-4ad6-bd89-f835ecf39468",
+    "rank": {
+     "A": null,
+     "B": null,
+     "C": null
+    },
+    "overlap_ab": 0.2,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.0743034603074193
+   },
+   {
+    "uuid": "cd0b304f-1663-431e-8739-f381b9bd53c7",
+    "rank": {
+     "A": 6,
+     "B": 7,
+     "C": 7
+    },
+    "overlap_ab": 0.35,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.02826845273375511
+   },
+   {
+    "uuid": "ce22593c-3632-4e41-a769-9aa0b0be9349",
+    "rank": {
+     "A": 1,
+     "B": 12,
+     "C": 12
+    },
+    "overlap_ab": 0.1,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.030419631861150265
+   },
+   {
+    "uuid": "cf760f51-cfb0-4385-a3c5-92fb04a9672e",
+    "rank": {
+     "A": null,
+     "B": null,
+     "C": null
+    },
+    "overlap_ab": 0.05,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.13324758410453796
+   },
+   {
+    "uuid": "d0a66e73-ddea-4595-a392-e1068740ab83",
+    "rank": {
+     "A": 1,
+     "B": 1,
+     "C": 1
+    },
+    "overlap_ab": 0.2,
+    "overlap_bc": 0.75,
+    "tier_rows": 5,
+    "tier_fired": true,
+    "seconds_c": 0.13602426834404469
+   },
+   {
+    "uuid": "d1d84841-c3df-4942-bbb6-ddc33494459e",
+    "rank": {
+     "A": null,
+     "B": null,
+     "C": null
+    },
+    "overlap_ab": 0.05,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.1759946933016181
+   },
+   {
+    "uuid": "d30ca38b-59ca-4ff3-8e00-87851a94e34b",
+    "rank": {
+     "A": 2,
+     "B": 2,
+     "C": 2
+    },
+    "overlap_ab": 0.05,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.03943563066422939
+   },
+   {
+    "uuid": "d463f971-8940-40cd-be07-dae019df0d10",
+    "rank": {
+     "A": null,
+     "B": 1,
+     "C": 1
+    },
+    "overlap_ab": 0.05,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.047401187010109425
+   },
+   {
+    "uuid": "d5cb2d62-1ea9-4c99-875d-db1527a58371",
+    "rank": {
+     "A": null,
+     "B": null,
+     "C": null
+    },
+    "overlap_ab": 0.2,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.0632155230268836
+   },
+   {
+    "uuid": "d72772c6-32e4-448e-9bf9-a30ad6296d44",
+    "rank": {
+     "A": 2,
+     "B": 4,
+     "C": 4
+    },
+    "overlap_ab": 0.4,
+    "overlap_bc": 1.0,
+    "tier_rows": 21,
+    "tier_fired": false,
+    "seconds_c": 0.0678649703040719
+   },
+   {
+    "uuid": "d85b7246-6eda-47f9-9510-fd6c6941976a",
+    "rank": {
+     "A": 1,
+     "B": 3,
+     "C": 3
+    },
+    "overlap_ab": 0.15,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.03653802629560232
+   },
+   {
+    "uuid": "d99addcb-c55c-4e00-a43b-c8cb840269c2",
+    "rank": {
+     "A": 1,
+     "B": null,
+     "C": 1
+    },
+    "overlap_ab": 0.0,
+    "overlap_bc": 0.95,
+    "tier_rows": 1,
+    "tier_fired": true,
+    "seconds_c": 0.10194995906203985
+   },
+   {
+    "uuid": "dac64044-c8b0-4d82-b8c7-2eb87196280a",
+    "rank": {
+     "A": null,
+     "B": null,
+     "C": null
+    },
+    "overlap_ab": 0.0,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.06501828599721193
+   },
+   {
+    "uuid": "dc0b068b-2b14-4525-8db8-e65f7e768d95",
+    "rank": {
+     "A": 18,
+     "B": null,
+     "C": 1
+    },
+    "overlap_ab": 0.0,
+    "overlap_bc": 0.95,
+    "tier_rows": 1,
+    "tier_fired": true,
+    "seconds_c": 0.13750097528100014
+   },
+   {
+    "uuid": "dd59c856-6ca9-4d31-b5f6-a352dbd2bd73",
+    "rank": {
+     "A": 1,
+     "B": 7,
+     "C": 7
+    },
+    "overlap_ab": 0.1,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.11760010570287704
+   },
+   {
+    "uuid": "dea1a752-99e3-4aff-8bce-d54ba4e1a0ed",
+    "rank": {
+     "A": null,
+     "B": 1,
+     "C": 1
+    },
+    "overlap_ab": 0.0,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.14783958066254854
+   },
+   {
+    "uuid": "dfda3239-ed5f-4cfe-bc97-8fb58248dd67",
+    "rank": {
+     "A": null,
+     "B": null,
+     "C": null
+    },
+    "overlap_ab": 0.0,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.1789978863671422
+   },
+   {
+    "uuid": "e117b0fe-6371-4b11-9e2d-51d02e456fec",
+    "rank": {
+     "A": 1,
+     "B": 3,
+     "C": 1
+    },
+    "overlap_ab": 0.2,
+    "overlap_bc": 1.0,
+    "tier_rows": 1,
+    "tier_fired": true,
+    "seconds_c": 0.4524328988045454
+   },
+   {
+    "uuid": "e23be50d-ca2b-4a03-9f7a-b5336b7d1378",
+    "rank": {
+     "A": 1,
+     "B": 10,
+     "C": 10
+    },
+    "overlap_ab": 0.1,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.057644124142825603
+   },
+   {
+    "uuid": "e3a573fa-4df5-4ec7-8bc6-a6edfdc5fb3c",
+    "rank": {
+     "A": 1,
+     "B": 1,
+     "C": 1
+    },
+    "overlap_ab": 0.05,
+    "overlap_bc": 1.0,
+    "tier_rows": 1,
+    "tier_fired": true,
+    "seconds_c": 0.13488586898893118
+   },
+   {
+    "uuid": "e4c4aefb-ca1f-454b-bfc9-77bfa3eda35c",
+    "rank": {
+     "A": null,
+     "B": null,
+     "C": null
+    },
+    "overlap_ab": 0.1,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.1606111442670226
+   },
+   {
+    "uuid": "e613c5ce-4b81-4b3c-9afd-0520a9120d49",
+    "rank": {
+     "A": 1,
+     "B": 1,
+     "C": 1
+    },
+    "overlap_ab": 0.05,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.05602158885449171
+   },
+   {
+    "uuid": "e7564f2c-70b2-4c94-b21d-b319ed6147cd",
+    "rank": {
+     "A": null,
+     "B": 4,
+     "C": 1
+    },
+    "overlap_ab": 0.05,
+    "overlap_bc": 0.65,
+    "tier_rows": 14,
+    "tier_fired": true,
+    "seconds_c": 0.06783018168061972
+   },
+   {
+    "uuid": "e894ca47-77c7-493c-9961-2a217ed0d3ca",
+    "rank": {
+     "A": 2,
+     "B": null,
+     "C": null
+    },
+    "overlap_ab": 0.0,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.04135421197861433
+   },
+   {
+    "uuid": "e9f2010c-01d3-4eb9-8b29-cb810a3cdbf1",
+    "rank": {
+     "A": 1,
+     "B": 6,
+     "C": 1
+    },
+    "overlap_ab": 0.05,
+    "overlap_bc": 0.5,
+    "tier_rows": 11,
+    "tier_fired": true,
+    "seconds_c": 0.1540570231154561
+   },
+   {
+    "uuid": "eb32e10c-5263-49a6-adc5-c14a16c53207",
+    "rank": {
+     "A": null,
+     "B": 1,
+     "C": 1
+    },
+    "overlap_ab": 0.05,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.08709280472248793
+   },
+   {
+    "uuid": "ec62a3fe-dff0-4543-8329-88dc8797b4ff",
+    "rank": {
+     "A": null,
+     "B": null,
+     "C": null
+    },
+    "overlap_ab": 0.15,
+    "overlap_bc": 1.0,
+    "tier_rows": 21,
+    "tier_fired": false,
+    "seconds_c": 0.0571215795353055
+   },
+   {
+    "uuid": "edbf9da9-9549-4080-9159-f27aa997ccf8",
+    "rank": {
+     "A": 1,
+     "B": 2,
+     "C": 2
+    },
+    "overlap_ab": 0.2,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.07513819355517626
+   },
+   {
+    "uuid": "ef0fb016-8775-49a9-aa3e-fbca0cff4a01",
+    "rank": {
+     "A": null,
+     "B": null,
+     "C": null
+    },
+    "overlap_ab": 0.0,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.12208780646324158
+   },
+   {
+    "uuid": "f0329f5b-58f7-4cb7-a24c-b0f7b12b2305",
+    "rank": {
+     "A": null,
+     "B": null,
+     "C": null
+    },
+    "overlap_ab": 0.05,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.09823555313050747
+   },
+   {
+    "uuid": "f16e8eb5-b516-4123-867b-3d78ccfc548a",
+    "rank": {
+     "A": null,
+     "B": null,
+     "C": null
+    },
+    "overlap_ab": 0.0,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.15353048872202635
+   },
+   {
+    "uuid": "f2b89bd4-2e3d-4bbb-a23e-514c928f17bf",
+    "rank": {
+     "A": null,
+     "B": null,
+     "C": null
+    },
+    "overlap_ab": 0.0,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.08675932791084051
+   },
+   {
+    "uuid": "f3f9287c-0526-497d-9f78-248762771f6c",
+    "rank": {
+     "A": 5,
+     "B": null,
+     "C": null
+    },
+    "overlap_ab": 0.05,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.060905443504452705
+   },
+   {
+    "uuid": "f54714dd-14a7-4b0b-a8de-e52923fa2827",
+    "rank": {
+     "A": 1,
+     "B": null,
+     "C": 2
+    },
+    "overlap_ab": 0.1,
+    "overlap_bc": 0.7,
+    "tier_rows": 6,
+    "tier_fired": true,
+    "seconds_c": 0.1376286530867219
+   },
+   {
+    "uuid": "f67833ec-f79d-4347-93f7-db34e6653b2f",
+    "rank": {
+     "A": 1,
+     "B": null,
+     "C": 1
+    },
+    "overlap_ab": 0.2,
+    "overlap_bc": 0.9,
+    "tier_rows": 2,
+    "tier_fired": true,
+    "seconds_c": 0.208334157243371
+   },
+   {
+    "uuid": "f7ca537d-7a41-4f87-975c-f607b2c8830f",
+    "rank": {
+     "A": 1,
+     "B": null,
+     "C": null
+    },
+    "overlap_ab": 0.0,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.10396545100957155
+   },
+   {
+    "uuid": "f91f02fa-2c3d-4fe6-afc8-74ff6378cca2",
+    "rank": {
+     "A": null,
+     "B": 1,
+     "C": 1
+    },
+    "overlap_ab": 0.0,
+    "overlap_bc": 1.0,
+    "tier_rows": 1,
+    "tier_fired": true,
+    "seconds_c": 0.058155969716608524
+   },
+   {
+    "uuid": "fa638267-ead4-46ca-8853-af2c8e8b3d7f",
+    "rank": {
+     "A": 3,
+     "B": 10,
+     "C": 1
+    },
+    "overlap_ab": 0.1,
+    "overlap_bc": 1.0,
+    "tier_rows": 1,
+    "tier_fired": true,
+    "seconds_c": 0.11818087100982666
+   },
+   {
+    "uuid": "fbbbc031-63ab-4c9c-b3fc-a92ed80261c3",
+    "rank": {
+     "A": 2,
+     "B": 9,
+     "C": 9
+    },
+    "overlap_ab": 0.15,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.05088626500219107
+   },
+   {
+    "uuid": "fd0dd72e-2ace-408c-b381-dd57e24d96d2",
+    "rank": {
+     "A": 1,
+     "B": 1,
+     "C": 1
+    },
+    "overlap_ab": 0.1,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.037745495326817036
+   },
+   {
+    "uuid": "fe5e8b9e-ae7a-483d-805e-d92489612d11",
+    "rank": {
+     "A": null,
+     "B": 1,
+     "C": 1
+    },
+    "overlap_ab": 0.1,
+    "overlap_bc": 1.0,
+    "tier_rows": null,
+    "tier_fired": false,
+    "seconds_c": 0.04299138858914375
+   }
+  ]
+ },
+ "m2": {
+  "summary": {
+   "queries": 44,
+   "weighted_share_changed_b": 1.0,
+   "weighted_share_changed_c": 1.0
+  },
+  "per_query": [
+   {
+    "query_id": "prod-brief-b187a6e6cb36",
+    "text": "project overview architecture goals",
+    "observed_count": 74702,
+    "overlap_ab": 0.125,
+    "overlap_bc": 1.0,
+    "changed_b": true,
+    "changed_c": true,
+    "tier_rows": null,
+    "promoted_facts": []
+   },
+   {
+    "query_id": "prod-brief-3ca4080f6509",
+    "text": "coding conventions and project norms",
+    "observed_count": 74944,
+    "overlap_ab": 0.125,
+    "overlap_bc": 1.0,
+    "changed_b": true,
+    "changed_c": true,
+    "tier_rows": null,
+    "promoted_facts": []
+   },
+   {
+    "query_id": "prod-brief-33aee7837524",
+    "text": "recent decisions and rationale",
+    "observed_count": 74884,
+    "overlap_ab": 0.0625,
+    "overlap_bc": 1.0,
+    "changed_b": true,
+    "changed_c": true,
+    "tier_rows": null,
+    "promoted_facts": []
+   },
+   {
+    "query_id": "prod-brief-e43e40cb1ad0",
+    "text": "task reify_task_12 context and related decisions",
+    "observed_count": 54097,
+    "overlap_ab": 0.0625,
+    "overlap_bc": 0.875,
+    "changed_b": true,
+    "changed_c": true,
+    "tier_rows": 4,
+    "promoted_facts": [
+     "The plan involves smoke-testing minimax-m25-fp8-new with reify_task_12 to determine if the NULL-byte issue is specific to the reap-139b pod.",
+     "The effect of fable is carried by the reify_task_12 fixture.",
+     "Reify_task_12 carries no 'reference' block, leading to a grading based on plausibility rather than fidelity.",
+     "The nominal advantage of fable over incumbent rides on one fixture, reify_task_12."
+    ]
+   },
+   {
+    "query_id": "prod-tail-bd7e0a851eee",
+    "text": "2026-04-21 mass task reset git branch state recover in-flight work",
+    "observed_count": 33,
+    "overlap_ab": 0.0,
+    "overlap_bc": 1.0,
+    "changed_b": true,
+    "changed_c": true,
+    "tier_rows": 17,
+    "promoted_facts": []
+   },
+   {
+    "query_id": "prod-tail-b1627623a71a",
+    "text": "5295",
+    "observed_count": 1,
+    "overlap_ab": 1.0,
+    "overlap_bc": 1.0,
+    "changed_b": true,
+    "changed_c": true,
+    "tier_rows": 2,
+    "promoted_facts": [
+     "The follow-up agent-followup-5295-remote-task-files-derivation can reuse the apply_spec_to_host_config keyword.",
+     "Follow-up agent-followup-5295-remote-task-files-derivation can reuse the keyword."
+    ]
+   },
+   {
+    "query_id": "prod-tail-6eccc8bfe560",
+    "text": "Graphiti search degraded fused-memory query execution path",
+    "observed_count": 1,
+    "overlap_ab": 0.125,
+    "overlap_bc": 1.0,
+    "changed_b": true,
+    "changed_c": true,
+    "tier_rows": null,
+    "promoted_facts": []
+   },
+   {
+    "query_id": "prod-tail-18b2cac32997",
+    "text": "Human curator gate: consolidate 4 overlapping reify-audit PTODO-detector-from-a-worktree procedural_knowledge Mem0 entries into one canonical entry + gotcha appendix Stage 1 (memory_consolidator, run ",
+    "observed_count": 2,
+    "overlap_ab": 0.0,
+    "overlap_bc": 1.0,
+    "changed_b": true,
+    "changed_c": true,
+    "tier_rows": 0,
+    "promoted_facts": []
+   },
+   {
+    "query_id": "prod-tail-01f8e2bec32c",
+    "text": "TargetedReconciler TaskInterceptor write_lock bypass",
+    "observed_count": 29,
+    "overlap_ab": 0.125,
+    "overlap_bc": 1.0,
+    "changed_b": true,
+    "changed_c": true,
+    "tier_rows": null,
+    "promoted_facts": []
+   },
+   {
+    "query_id": "prod-tail-bbd2f5810314",
+    "text": "Task 1675 phantom done commits e161348f 60b85659 14bb892c db17363e legitimate",
+    "observed_count": 1,
+    "overlap_ab": 0.0625,
+    "overlap_bc": 1.0,
+    "changed_b": true,
+    "changed_c": true,
+    "tier_rows": 0,
+    "promoted_facts": []
+   },
+   {
+    "query_id": "prod-tail-b05761e79538",
+    "text": "TestDryRunZeroSideEffects consolidation",
+    "observed_count": 2,
+    "overlap_ab": 0.25,
+    "overlap_bc": 1.0,
+    "changed_b": true,
+    "changed_c": true,
+    "tier_rows": null,
+    "promoted_facts": []
+   },
+   {
+    "query_id": "prod-tail-673c1801f840",
+    "text": "blockers for: Strengthen LSP bridge test coverage: helpers, assertions, and missing arms In crates/reify-lsp/tests/in_process_bridge.rs: (1) Extract a shared initialized_lsp() async helper to deduplic",
+    "observed_count": 36,
+    "overlap_ab": 0.1875,
+    "overlap_bc": 1.0,
+    "changed_b": true,
+    "changed_c": true,
+    "tier_rows": 17,
+    "promoted_facts": []
+   },
+   {
+    "query_id": "prod-tail-8caf3e2b65fb",
+    "text": "blockers for: ρ1b fused-memory: transition-table log-mode at interceptor + actor threading PRD plans/task-status-authority-prd.md contract C3 / decisions D5,D6 (finding 4.1 — enforce the transition ta",
+    "observed_count": 5,
+    "overlap_ab": 0.0,
+    "overlap_bc": 1.0,
+    "changed_b": true,
+    "changed_c": true,
+    "tier_rows": 0,
+    "promoted_facts": []
+   },
+   {
+    "query_id": "prod-tail-e36c67c39105",
+    "text": "cargo skim output wrapper condensation timeout bypass",
+    "observed_count": 41,
+    "overlap_ab": 0.0,
+    "overlap_bc": 1.0,
+    "changed_b": true,
+    "changed_c": true,
+    "tier_rows": null,
+    "promoted_facts": []
+   },
+   {
+    "query_id": "prod-tail-5ab98c3509e5",
+    "text": "cycle summary run_id stage memory_consolidator",
+    "observed_count": 29,
+    "overlap_ab": 0.125,
+    "overlap_bc": 1.0,
+    "changed_b": true,
+    "changed_c": true,
+    "tier_rows": null,
+    "promoted_facts": []
+   },
+   {
+    "query_id": "prod-tail-095648382582",
+    "text": "de-flake flaky timing wall-clock test merge gate ambush warm-lane preflight semaphore occt cpu-admit load-tolerant infra test robustness",
+    "observed_count": 1,
+    "overlap_ab": 0.0,
+    "overlap_bc": 1.0,
+    "changed_b": true,
+    "changed_c": true,
+    "tier_rows": null,
+    "promoted_facts": []
+   },
+   {
+    "query_id": "prod-tail-a1c3fad46fe9",
+    "text": "engine_purposes.rs merged_purposes merged commit task 4016 ζ boundary tests B1 B8",
+    "observed_count": 1,
+    "overlap_ab": 0.0,
+    "overlap_bc": 1.0,
+    "changed_b": true,
+    "changed_c": true,
+    "tier_rows": 0,
+    "promoted_facts": []
+   },
+   {
+    "query_id": "prod-tail-a1c775469bbe",
+    "text": "flag marker f7998d1d 68093151 28bc288c stage 1 b4242d75",
+    "observed_count": 1,
+    "overlap_ab": 0.0,
+    "overlap_bc": 1.0,
+    "changed_b": true,
+    "changed_c": true,
+    "tier_rows": 0,
+    "promoted_facts": []
+   },
+   {
+    "query_id": "prod-tail-7ae969361dc5",
+    "text": "gate BLOCKED do NOT flip task_metadata.enforce esc-2184-1",
+    "observed_count": 1,
+    "overlap_ab": 0.125,
+    "overlap_bc": 1.0,
+    "changed_b": true,
+    "changed_c": true,
+    "tier_rows": 0,
+    "promoted_facts": []
+   },
+   {
+    "query_id": "prod-tail-9ee325c0ade4",
+    "text": "kernel_registry multi-kernel dispatch lex-min selection capability descriptor",
+    "observed_count": 1,
+    "overlap_ab": 0.3125,
+    "overlap_bc": 1.0,
+    "changed_b": true,
+    "changed_c": true,
+    "tier_rows": null,
+    "promoted_facts": []
+   },
+   {
+    "query_id": "prod-tail-9f67572c3d47",
+    "text": "merge_request coalesce gate dead request_id resubmit",
+    "observed_count": 1,
+    "overlap_ab": 0.0,
+    "overlap_bc": 1.0,
+    "changed_b": true,
+    "changed_c": true,
+    "tier_rows": null,
+    "promoted_facts": []
+   },
+   {
+    "query_id": "prod-tail-fa37aa9d637d",
+    "text": "project overview and current status",
+    "observed_count": 340,
+    "overlap_ab": 0.0,
+    "overlap_bc": 1.0,
+    "changed_b": true,
+    "changed_c": true,
+    "tier_rows": null,
+    "promoted_facts": []
+   },
+   {
+    "query_id": "prod-tail-b0d0230837fb",
+    "text": "project overview current status architecture",
+    "observed_count": 33,
+    "overlap_ab": 0.125,
+    "overlap_bc": 1.0,
+    "changed_b": true,
+    "changed_c": true,
+    "tier_rows": null,
+    "promoted_facts": []
+   },
+   {
+    "query_id": "prod-tail-b22fc044e988",
+    "text": "project overview current status autopilot video",
+    "observed_count": 29,
+    "overlap_ab": 0.0,
+    "overlap_bc": 1.0,
+    "changed_b": true,
+    "changed_c": true,
+    "tier_rows": null,
+    "promoted_facts": []
+   },
+   {
+    "query_id": "prod-tail-be9f0536fc05",
+    "text": "project overview current status recent decisions",
+    "observed_count": 40,
+    "overlap_ab": 0.0,
+    "overlap_bc": 1.0,
+    "changed_b": true,
+    "changed_c": true,
+    "tier_rows": null,
+    "promoted_facts": []
+   },
+   {
+    "query_id": "prod-tail-cc2a6ade44cb",
+    "text": "project overview current status solar challenge",
+    "observed_count": 39,
+    "overlap_ab": 0.125,
+    "overlap_bc": 1.0,
+    "changed_b": true,
+    "changed_c": true,
+    "tier_rows": null,
+    "promoted_facts": []
+   },
+   {
+    "query_id": "prod-tail-a524e77a7cf4",
+    "text": "recent decisions and known issues",
+    "observed_count": 84,
+    "overlap_ab": 0.1875,
+    "overlap_bc": 1.0,
+    "changed_b": true,
+    "changed_c": true,
+    "tier_rows": null,
+    "promoted_facts": []
+   },
+   {
+    "query_id": "prod-tail-70876520d417",
+    "text": "recent decisions and project status",
+    "observed_count": 45,
+    "overlap_ab": 0.0,
+    "overlap_bc": 1.0,
+    "changed_b": true,
+    "changed_c": true,
+    "tier_rows": null,
+    "promoted_facts": []
+   },
+   {
+    "query_id": "prod-tail-f13a68e6b0d7",
+    "text": "recent decisions and session summary",
+    "observed_count": 36,
+    "overlap_ab": 0.0,
+    "overlap_bc": 1.0,
+    "changed_b": true,
+    "changed_c": true,
+    "tier_rows": null,
+    "promoted_facts": []
+   },
+   {
+    "query_id": "prod-tail-db52c23ec966",
+    "text": "recent task completions and status changes",
+    "observed_count": 30,
+    "overlap_ab": 0.0,
+    "overlap_bc": 1.0,
+    "changed_b": true,
+    "changed_c": true,
+    "tier_rows": null,
+    "promoted_facts": []
+   },
+   {
+    "query_id": "prod-tail-5049c1e2d9d1",
+    "text": "stage1_cycle_summary run_id pool cap maintenance",
+    "observed_count": 1,
+    "overlap_ab": 0.0625,
+    "overlap_bc": 1.0,
+    "changed_b": true,
+    "changed_c": true,
+    "tier_rows": 0,
+    "promoted_facts": []
+   },
+   {
+    "query_id": "prod-tail-0a3e2549ef85",
+    "text": "stage1_flag_marker flag_for_stage2",
+    "observed_count": 43,
+    "overlap_ab": 0.75,
+    "overlap_bc": 1.0,
+    "changed_b": true,
+    "changed_c": true,
+    "tier_rows": 0,
+    "promoted_facts": []
+   },
+   {
+    "query_id": "prod-tail-79b71adab3e2",
+    "text": "stage1_flag_suppression",
+    "observed_count": 30,
+    "overlap_ab": 1.0,
+    "overlap_bc": 1.0,
+    "changed_b": true,
+    "changed_c": true,
+    "tier_rows": 10,
+    "promoted_facts": [
+     "The stage1_flag_suppression system implements end-to-end deduplication.",
+     "Task 1185 added the producer that writes stage1_flag_suppression records with round-trip schema validation.",
+     "Task 1185 was completed through commit fbf82da6, which wired up the producer for stage1_flag_suppression records with round-trip schema validation.",
+     "Task 1186 was completed through commit 90eeee33, which enforced stage1_flag_suppression in the flag_dedup.py post-processor as a deterministic gate.",
+     "The stage1_flag_suppression matches the census exactly with 16 records.",
+     "stage1_flag_suppression carries kind plus a sorted-unique plural flag_types, or no flag_types for a blanket record.",
+     "The stage-facing stage1_flag_suppression remedy is retired, not built out.",
+     "Task 4863 rejects kind=stage1_flag_suppression add_memory writes from recon-stage-* agent ids.",
+     "write_suppression_record's operator mirror goes through memory_service.add_memory carrying kind=stage1_flag_suppression with agent_id=None.",
+     "The identifiers include the stage1_flag_suppression call in the test_recon_marker_kind_prompt_guidance.py."
+    ]
+   },
+   {
+    "query_id": "prod-tail-fb558b0a13e3",
+    "text": "stage1_flag_suppression task_id",
+    "observed_count": 29,
+    "overlap_ab": 0.375,
+    "overlap_bc": 1.0,
+    "changed_b": true,
+    "changed_c": true,
+    "tier_rows": 10,
+    "promoted_facts": [
+     "The stage1_flag_suppression system implements end-to-end deduplication.",
+     "Task 1185 added the producer that writes stage1_flag_suppression records with round-trip schema validation.",
+     "Task 1185 was completed through commit fbf82da6, which wired up the producer for stage1_flag_suppression records with round-trip schema validation.",
+     "Task 1186 was completed through commit 90eeee33, which enforced stage1_flag_suppression in the flag_dedup.py post-processor as a deterministic gate.",
+     "The stage1_flag_suppression matches the census exactly with 16 records.",
+     "stage1_flag_suppression carries kind plus a sorted-unique plural flag_types, or no flag_types for a blanket record.",
+     "The stage-facing stage1_flag_suppression remedy is retired, not built out.",
+     "Task 4863 rejects kind=stage1_flag_suppression add_memory writes from recon-stage-* agent ids.",
+     "write_suppression_record's operator mirror goes through memory_service.add_memory carrying kind=stage1_flag_suppression with agent_id=None.",
+     "The identifiers include the stage1_flag_suppression call in the test_recon_marker_kind_prompt_guidance.py."
+    ]
+   },
+   {
+    "query_id": "prod-tail-27486ece8dd5",
+    "text": "stage1_flag_suppression task_id=165",
+    "observed_count": 32,
+    "overlap_ab": 0.375,
+    "overlap_bc": 1.0,
+    "changed_b": true,
+    "changed_c": true,
+    "tier_rows": 0,
+    "promoted_facts": []
+   },
+   {
+    "query_id": "prod-tail-e4918ee31ec6",
+    "text": "stage1_flag_suppression task_id=452",
+    "observed_count": 105,
+    "overlap_ab": 0.375,
+    "overlap_bc": 1.0,
+    "changed_b": true,
+    "changed_c": true,
+    "tier_rows": 0,
+    "promoted_facts": []
+   },
+   {
+    "query_id": "prod-tail-66f71c02b8dd",
+    "text": "sync intrinsics calibration",
+    "observed_count": 1,
+    "overlap_ab": 0.25,
+    "overlap_bc": 1.0,
+    "changed_b": true,
+    "changed_c": true,
+    "tier_rows": null,
+    "promoted_facts": []
+   },
+   {
+    "query_id": "prod-tail-65bdf7bd04e5",
+    "text": "task 19 P2 beta canonical telemetry schema types completed done",
+    "observed_count": 1,
+    "overlap_ab": 0.0,
+    "overlap_bc": 1.0,
+    "changed_b": true,
+    "changed_c": true,
+    "tier_rows": 0,
+    "promoted_facts": []
+   },
+   {
+    "query_id": "prod-tail-d590b99b502e",
+    "text": "task 289 285 276 204 287 completion observation done commit",
+    "observed_count": 1,
+    "overlap_ab": 0.0,
+    "overlap_bc": 1.0,
+    "changed_b": true,
+    "changed_c": true,
+    "tier_rows": 0,
+    "promoted_facts": []
+   },
+   {
+    "query_id": "prod-tail-a38e864205f2",
+    "text": "task 312 review TestHandleDryRun test structure cleanup",
+    "observed_count": 1,
+    "overlap_ab": 0.0,
+    "overlap_bc": 1.0,
+    "changed_b": true,
+    "changed_c": true,
+    "tier_rows": 1,
+    "promoted_facts": [
+     "Manual /compact did not re-mint session_id on CLI 2.1.312."
+    ]
+   },
+   {
+    "query_id": "prod-tail-761661aad4da",
+    "text": "task 552 T-ROMA RoMa dense warp real backend done completion",
+    "observed_count": 1,
+    "overlap_ab": 0.0,
+    "overlap_bc": 1.0,
+    "changed_b": true,
+    "changed_c": true,
+    "tier_rows": 17,
+    "promoted_facts": []
+   },
+   {
+    "query_id": "prod-tail-bf55d0478466",
+    "text": "task count snapshot",
+    "observed_count": 32,
+    "overlap_ab": 0.1875,
+    "overlap_bc": 1.0,
+    "changed_b": true,
+    "changed_c": true,
+    "tier_rows": null,
+    "promoted_facts": []
+   },
+   {
+    "query_id": "prod-tail-279a7f47ee34",
+    "text": "task memory observation mapping e2496a40 tasks 89 100 101 102",
+    "observed_count": 1,
+    "overlap_ab": 0.1875,
+    "overlap_bc": 1.0,
+    "changed_b": true,
+    "changed_c": true,
+    "tier_rows": 0,
+    "promoted_facts": []
+   },
+   {
+    "query_id": "prod-tail-14c93cb10f7b",
+    "text": "verify cold timeout cascade merge_verify_cold_command_timeout_secs defaults.yaml shadows root orchestrator config values",
+    "observed_count": 1,
+    "overlap_ab": 0.375,
+    "overlap_bc": 1.0,
+    "changed_b": true,
+    "changed_c": true,
+    "tier_rows": null,
+    "promoted_facts": []
+   }
+  ],
+  "ticket_877": {
+   "query": "task 877 context and related decisions",
+   "tier_rows": 10,
+   "promoted": [
+    "38241d9e-76f1-4f2d-92c7-7249b3db95a1",
+    "bba24b78-a708-4de0-9481-7a6cb07eab61",
+    "5bf20c42-3abd-411d-8dcd-b887d3c602a2",
+    "4acfcebd-62d8-4d1b-a75c-7fbcb6b840e8",
+    "5d8b1c36-f295-41fe-ab9a-46d15aaaa66b",
+    "1330ec7b-a3b3-4adc-90e0-eb17fc3fb345",
+    "8813cc31-327f-4e3b-ac62-6e5dc6c6d7de",
+    "dbf74612-6e1d-44ea-b14c-0f48ea5fbabc",
+    "f0465663-6398-449f-801b-bab00e424cf8",
+    "4effe5d2-0ff2-420e-858e-e38a2b8c12fc"
+   ],
+   "ranking_c": [
+    {
+     "uuid": "5bf20c42-3abd-411d-8dcd-b887d3c602a2",
+     "fact": "Task 877 adds catch sites for AllAccountsCappedException in fused-memory."
+    },
+    {
+     "uuid": "4acfcebd-62d8-4d1b-a75c-7fbcb6b840e8",
+     "fact": "Task 877 (Add catch sites for AllAccountsCappedException in orchestrator and fused-memory) was moved from blocked to pending on 2026-04-22T02:07:49Z; it had been incorrectly blocked with no recorded reason. Its prerequisite Task 881 (Replace UsageGate.raise_if_all_capped pattern) was completed on 2026-04-21."
+    },
+    {
+     "uuid": "1330ec7b-a3b3-4adc-90e0-eb17fc3fb345",
+     "fact": "Task 877 was previously blocked but is now actionable since prerequisite Task 881 was already complete."
+    },
+    {
+     "uuid": "5d8b1c36-f295-41fe-ab9a-46d15aaaa66b",
+     "fact": "Only Task 877 addresses the missing catch sites for AllAccountsCappedException."
+    },
+    {
+     "uuid": "bba24b78-a708-4de0-9481-7a6cb07eab61",
+     "fact": "AllAccountsCappedException catch sites added in fused-memory via task 877 (commit 371d476388d7c4f10de53bace256566ef97078c4, 2026-04-22). Previously had no catch sites as of 2026-04-21."
+    },
+    {
+     "uuid": "38241d9e-76f1-4f2d-92c7-7249b3db95a1",
+     "fact": "AllAccountsCappedException catch sites added in production orchestrator via task 877 (commit 371d476388d7c4f10de53bace256566ef97078c4, 2026-04-22). Previously had no catch sites as of 2026-04-21."
+    },
+    {
+     "uuid": "4effe5d2-0ff2-420e-858e-e38a2b8c12fc",
+     "fact": "production_query_sample.jsonl is part of the M2 blast-radius census plus the 877 check."
+    },
+    {
+     "uuid": "dbf74612-6e1d-44ea-b14c-0f48ea5fbabc",
+     "fact": "The FIRST id is chosen from drifted id 877 based on the replacement rule."
+    },
+    {
+     "uuid": "f0465663-6398-449f-801b-bab00e424cf8",
+     "fact": "The 877 ranking observation was filed by the architect as tkt_0RVJFNZTMNA6N1HE3CR9VPZ2M9."
+    },
+    {
+     "uuid": "8813cc31-327f-4e3b-ac62-6e5dc6c6d7de",
+     "fact": "In the decision to unblock workflow, the user chose option 2 of 3 regarding task 877."
+    },
+    {
+     "uuid": "408c786a-3357-4e34-b1b7-e40e60445755",
+     "fact": "Per-context instance labels reused across contexts are considered homonyms, not one referent."
+    },
+    {
+     "uuid": "27f6edcd-45a3-46c0-bc47-7677476ae3ec",
+     "fact": "The clean-worktree Phase 1 is an open decision related to uv run."
+    },
+    {
+     "uuid": "45d58b1f-7c74-41da-b6f8-80992ac76640",
+     "fact": "The vllm-eval subsystem decisions include parking devstral."
+    },
+    {
+     "uuid": "e06fa4e7-0b8b-4c0c-9b12-6c0b145e6cdc",
+     "fact": "Leo participated in a discussion session regarding WarmLanePool hardening decisions on 2026-07-23."
+    },
+    {
+     "uuid": "e74b0221-4105-4162-97ef-2b2bf244862c",
+     "fact": "CGL-ι Phase-2 human-review data decisions were made regarding consolidate_namespace_families.py."
+    },
+    {
+     "uuid": "831b1352-01cd-4bed-9317-af84f3a80427",
+     "fact": "The phrase 'recent decisions and changes' in memory.md is identified as a rewording that needs fixing."
+    }
+   ],
+   "ranks_a": {
+    "f0465663": null,
+    "dbf74612": null,
+    "38241d9e": null,
+    "bba24b78": null
+   },
+   "ranks_b": {
+    "f0465663": null,
+    "dbf74612": null,
+    "38241d9e": null,
+    "bba24b78": null
+   },
+   "ranks_c": {
+    "f0465663": 9,
+    "dbf74612": 8,
+    "38241d9e": 6,
+    "bba24b78": 5
+   },
+   "gate_top4_are_the_877_edges": false
+  }
+ }
+}

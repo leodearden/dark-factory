@@ -1,7 +1,9 @@
-# Rater brief v2.1: what a reader of the record would miss
+# Rater brief v2.2: what a reader of the record would miss
+
+v2.2 (2026-10-29): the LOSS question is rewritten as one test with a list of what does not count, and anchors 5 to 8 are added; HOME, CONFLICT, SCOPE, action_changing, the output format and the procedure are unchanged from v2.1.
 
 This brief replaces the seven-word attach scale (`write_triage_rater_brief.md`,
-kept unchanged as the record of v1) for every rating under rubric v2.1. It asks
+kept unchanged as the record of v1) for every rating under rubric v2.2. It asks
 three questions about a pair of records, and follow-ups for two of them. The
 answers are not verdicts about where a write belongs. They are facts about the
 two texts, and the scorer turns them into correctness mechanically.
@@ -55,12 +57,51 @@ When CONFLICT is YES, also give:
   that CHILD shows false, outdated or replaced, and the CHILD sentence that
   shows it, each copied verbatim from the text shown.
 
-**LOSS** (only when HOME is YES and CONFLICT is NO). Would someone acting on
-PARENT's claim go wrong, or lack something they need, without CHILD?
-Provenance (who, when, which branch) does not count, and neither does bare
-recurrence (the same thing seen again). When LOSS is YES, give `loss_spans`:
-verbatim quotes from CHILD of exactly what is needed, one entry per separate
-piece.
+**LOSS** (only when HOME is YES and CONFLICT is NO). Does CHILD add something
+that a reader relying on PARENT would need? Take each thing CHILD says that
+PARENT does not already say or make obvious, and put it to one test: *a reader
+who does exactly what PARENT says, or acts on what PARENT states, in the
+situation PARENT describes, knowing nothing of CHILD: would they act wrongly,
+or be unable to finish, without this?* LOSS is YES when at least one thing
+passes the test, and NO otherwise. Three kinds of thing pass it:
+
+- a case, condition or exception in which PARENT's claim or instruction does
+  not hold as stated, or needs a further step: the caveat that CONFLICT leaves
+  to LOSS;
+- a consequence of PARENT's claim that its reader would not otherwise expect
+  and would act on wrongly;
+- a step, value, command, format or location that PARENT's instruction depends
+  on and does not give, so that the instruction cannot be carried out from
+  PARENT alone; or a remedy or workaround for a hazard PARENT names but gives
+  no remedy for.
+
+These never pass it on their own, and a CHILD that adds only them is LOSS NO:
+
+1. Another route to an end PARENT already gives a route to: a different
+   command, check, filter, detection or remedy, or PARENT's mechanism in
+   other or more exact words.
+   PARENT's own route is taken to work; a CHILD that shows it fails is
+   CONFLICT, not LOSS.
+2. PARENT's rule applied to one more case, stated for more cases, or shown by
+   more examples, when PARENT's rule as given already tells its reader what
+   to do.
+3. The same thing seen again: a further sighting, measurement, count, date or
+   size, or evidence that PARENT's claim holds in more places.
+4. Provenance and backing for CHILD's own claim or for the change it records:
+   who, when, which branch, task, commit or ticket; CHILD's reasons and
+   premises, its plans, line anchors, the commands CHILD ran to check itself,
+   and the pre-change state that a completion record describes. A command or
+   step PARENT's instruction needs is the third kind that passes, and a
+   consequence that makes some other statement false is the second, not
+   backing.
+5. A fact about something else that stands next to PARENT's subject: a tip, a
+   related gotcha, a sibling task.
+6. Confirmation that a change PARENT already describes has landed, or that
+   PARENT still holds.
+
+When LOSS is YES, give `loss_spans`: verbatim quotes from CHILD of exactly
+what passes the test, one entry per separate piece, and nothing from the list
+above.
 
 Answer HOME, CONFLICT, LOSS and action_changing with YES or NO, and SCOPE with
 CENTRAL or SECONDARY. UNCLEAR is allowed only when a truncation falls at the
@@ -87,7 +128,8 @@ In short, an outcome is correct when:
 
 ## Anchors
 
-Paraphrased from hard cases in the 2026-10-19 soak.
+Anchors 1 to 4 are paraphrased from hard cases in the 2026-10-19 soak. Anchors
+5 to 8 are synthetic: each describes a shape, not a pair.
 
 1. **Measurement update.** PARENT records a verify run's duration and advises an
    explicit foreground timeout. CHILD, from a later run, records a shorter
@@ -116,6 +158,35 @@ Paraphrased from hard cases in the 2026-10-19 soak.
    task's change: PARENT the dedup protocol, CHILD the feedback of task
    outcomes. The template and the subject area are shared, but the claims are
    not, so HOME is NO.
+5. **Another route.** PARENT says to confirm that a service has finished
+   starting by polling its health endpoint, and only then to send it work.
+   CHILD says to watch the service's log for its ready line instead, and then
+   to send it work. HOME is YES and CONFLICT is NO. LOSS is NO: PARENT's
+   reader reaches the same point, and the same action, by PARENT's own check.
+   Had CHILD shown that the health endpoint answers before the service is
+   ready, that would be CONFLICT.
+6. **A wider statement.** PARENT says a config loader accepts a duration only
+   as a bare number of seconds, and tells its reader to write seconds. CHILD
+   adds that `30m` and `2h` are rejected as well, with the same advice. HOME
+   is YES and CONFLICT is NO. LOSS is NO: PARENT's advice already keeps its
+   reader right in every case CHILD lists. Had PARENT said only that `30m` is
+   rejected, without the bare-seconds rule, CHILD's statement that every unit
+   suffix is rejected would pass the test: PARENT's reader writing `2h` would
+   act wrongly.
+7. **A completion record under a record of the landed state.** PARENT
+   describes how a mechanism works now and names the task that changed it.
+   CHILD is that task's completion record: the defect as it was, the premises
+   verified, the plan, the key decisions and the modules touched. HOME is
+   YES. CONFLICT is NO, since PARENT does not state the defect as current.
+   LOSS is NO unless the record also states a case, condition or consequence
+   that passes the test: the defect as it was, the premises, the plan, the
+   rationale and the fact of landing do not.
+8. **A missing step.** PARENT says a release note is generated from commit
+   trailers and must never be edited by hand. CHILD says the same and gives
+   the trailer's required form and the command that regenerates the note.
+   HOME is YES and CONFLICT is NO. LOSS is YES: without the form and the
+   command, PARENT's reader cannot carry out PARENT's instruction.
+   `loss_spans` quotes both.
 
 ## Procedure
 

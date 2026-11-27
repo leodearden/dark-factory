@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import logging
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -26,6 +27,7 @@ from orchestrator.deterministic_runner import (  # type: ignore[import-not-found
 )
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome  # type: ignore[import-not-found]
 from pydantic import ValidationError
+from shared.followup_items import FOLLOWUP_ITEMS_METADATA_KEY, observed_item
 from shared.task_metadata import (
     MemoryHints,
     RetryLedger,
@@ -33,9 +35,12 @@ from shared.task_metadata import (
     apply_migrations,
     parse_metadata,
 )
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend
 from fused_memory.config.schema import TaskmasterConfig
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 
 @pytest_asyncio.fixture
@@ -136,6 +141,7 @@ def test_legacy_blob_roundtrip_preserves_unknown_keys_and_upgrades_memory_hints(
         ('found_on_main', {'commit': 'abc123', 'note': 'found it'}),
         ('deterministic-deploy', {'pid': 4242, 'unit': 'fused-memory.service'}),
         ('deterministic-deploy-scheduled', {'unit': 'fused-memory.service'}),
+        ('deterministic-deploy-unverified', {}),
     ],
 )
 async def test_orchestrator_done_provenance_all_kinds_accepted_by_backend(
@@ -481,15 +487,13 @@ async def test_census_code_token_and_vocabulary_reconciliation_end_to_end(
     """Capstone regression guard for the near-empty enforcement census (task 2330).
 
     Drives the REAL write-boundary validator (``_validate_metadata_on_write``
-    — the exact seam ``add_task``/``update_task`` call internally) with three
+    — the exact seam ``add_task``/``update_task`` call internally) with two
     blobs, confirming the task's user-observable signal end-to-end:
 
-    (a) a blob with legacy TOP-LEVEL infra-resume counters emits ZERO
-        ``task_metadata.schema_warning`` census lines — the v1->v2
-        migration lifts them into ``retry_ledger`` at parse-time;
-    (b) a blob of Tier-A blessed conventional keys emits ZERO census lines
-        — the ``_BLESSED_METADATA_KEYS`` allowlist suppresses them;
-    (c) a blob with a genuine unknown key still emits exactly one census
+    (a) a blob of Tier-A blessed conventional keys emits ZERO
+        ``task_metadata.schema_warning`` census lines — the
+        ``_BLESSED_METADATA_KEYS`` allowlist suppresses them;
+    (b) a blob with a genuine unknown key still emits exactly one census
         line, and that line now carries the ``code=unknown_key`` token —
         WORK ITEM 1's discriminator flowing through the real backend, with
         genuine drift still surfacing.
@@ -503,23 +507,7 @@ async def test_census_code_token_and_vocabulary_reconciliation_end_to_end(
     dto = await backend.add_task(project_root=root, title='t')
     tid = int(dto['id'])
 
-    # (a) legacy top-level infra-resume counters -- suppressed by the
-    # v1->v2 migration at parse-time.
-    legacy_counters = json.dumps({
-        'consecutive_infra_resume_failures': 3,
-        'last_infra_resume_iteration_count': 7,
-    })
-    with caplog.at_level(logging.WARNING, logger='fused_memory.backends.sqlite_task_backend'):
-        caplog.clear()
-        await backend._validate_metadata_on_write(
-            legacy_counters, project_root=root, tag='master', task_id=tid,
-        )
-    assert _schema_warning_messages(caplog) == [], (
-        'Expected zero census lines for legacy top-level infra-resume counters '
-        '(the v1->v2 migration should lift them into retry_ledger at parse-time)'
-    )
-
-    # (b) a representative spread of Tier-A blessed conventional keys --
+    # (a) a representative spread of Tier-A blessed conventional keys --
     # suppressed by the _BLESSED_METADATA_KEYS allowlist.
     blessed_blob = json.dumps({
         'source': 'x',
@@ -537,7 +525,7 @@ async def test_census_code_token_and_vocabulary_reconciliation_end_to_end(
         'Expected zero census lines for a Tier-A blessed conventional-key blob'
     )
 
-    # (c) a genuine unknown key -- still surfaces, and now carries the new
+    # (b) a genuine unknown key -- still surfaces, and now carries the new
     # code=unknown_key discriminator token.
     unknown_blob = json.dumps({'mystery_zzz': 'control'})
     with caplog.at_level(logging.WARNING, logger='fused_memory.backends.sqlite_task_backend'):
@@ -1060,3 +1048,245 @@ class TestSliceCardinalityAtWriteBoundary:
         assert _schema_warning_messages(caplog) == []
         task = await enforce_backend.get_task(task_id, project_root=project_root)
         assert task['metadata']['files'] == ['orchestrator/src/orchestrator/thing.py']
+
+
+class TestLegacyMalformedSliceStaysWritable:
+    """An untouched malformed legacy slice must not make its row unwritable (task 5281).
+
+    The shape is reify 5050 and its 215 terminal siblings: a JSON-bool
+    ``milestone`` that predates the enforce gate (esc-4528-2,
+    plans/metadata-modules-migration-run.md §5). A write is responsible only for
+    the keys it changes, so echoing the stored bad slice back verbatim, which
+    every read-modify-write caller does, is not a write of bad data. A change
+    of JSON type is a change, so 86400 -> 86400.0 or 1 -> true is enforced.
+    """
+
+    _LEGACY = {'milestone': True, 'files': []}
+    _FILES = ['src/a.py']
+
+    async def _land_legacy_row(self, make_backend, project_root: str) -> str:
+        warn_backend = await make_backend(enforce=False)
+        dto = await warn_backend.add_task(
+            project_root=project_root, title='t', metadata=json.dumps(self._LEGACY),
+        )
+        landed = await warn_backend.get_task(dto['id'], project_root=project_root)
+        assert landed['metadata'] == {**self._LEGACY, 'pending_since': landed['updatedAt']}
+        return dto['id']
+
+    @pytest.mark.asyncio
+    async def test_replace_mode_echo_of_the_untouched_slice_succeeds(
+        self, make_backend, tmp_path,
+    ):
+        """(a) the task-4528 migration shape: read, transform, replace."""
+        project_root = str(tmp_path / 'legacy')
+        task_id = await self._land_legacy_row(make_backend, project_root)
+        backend = await make_backend(enforce=True)
+
+        metadata = (await backend.get_task(task_id, project_root=project_root))['metadata']
+        metadata['files'] = self._FILES
+        await backend.update_task(
+            task_id, project_root=project_root,
+            metadata=json.dumps(metadata), metadata_mode='replace',
+        )
+
+        task = await backend.get_task(task_id, project_root=project_root)
+        assert task['metadata']['files'] == self._FILES
+        assert task['metadata']['milestone'] is True
+
+    @pytest.mark.asyncio
+    async def test_merge_mode_full_blob_echo_succeeds(self, make_backend, tmp_path):
+        """(b) the orchestrator's read-modify-write shape (_stamp_merge_phase_entered)."""
+        project_root = str(tmp_path / 'legacy')
+        task_id = await self._land_legacy_row(make_backend, project_root)
+        backend = await make_backend(enforce=True)
+
+        metadata = (await backend.get_task(task_id, project_root=project_root))['metadata']
+        stamp = {'entered_at': '2026-11-15T00:00:00+00:00'}
+        metadata['merge_phase_liveness'] = stamp
+        await backend.update_task(
+            task_id, project_root=project_root,
+            metadata=json.dumps(metadata), metadata_mode='merge',
+        )
+
+        task = await backend.get_task(task_id, project_root=project_root)
+        assert task['metadata']['merge_phase_liveness'] == stamp
+        assert task['metadata']['milestone'] is True
+
+    @pytest.mark.asyncio
+    async def test_minimal_merge_delta_succeeds(self, make_backend, tmp_path):
+        """(c) characterization: a delta that omits the bad slice was always fine."""
+        project_root = str(tmp_path / 'legacy')
+        task_id = await self._land_legacy_row(make_backend, project_root)
+        backend = await make_backend(enforce=True)
+
+        await backend.update_task(
+            task_id, project_root=project_root,
+            metadata=json.dumps({'files': self._FILES}), metadata_mode='merge',
+        )
+
+        task = await backend.get_task(task_id, project_root=project_root)
+        assert task['metadata']['files'] == self._FILES
+
+    @pytest.mark.asyncio
+    async def test_malformed_value_in_the_delta_is_still_rejected(
+        self, make_backend, tmp_path,
+    ):
+        """(d) changing a slice to a bad value stays fatal, legacy row or not."""
+        project_root = str(tmp_path / 'legacy')
+        task_id = await self._land_legacy_row(make_backend, project_root)
+        backend = await make_backend(enforce=True)
+
+        with pytest.raises(TypeError):
+            await backend.update_task(
+                task_id, project_root=project_root,
+                metadata=json.dumps({'milestone': 'yes'}), metadata_mode='merge',
+            )
+
+        good_milestone = {'mode': 'delayed', 'after_secs': 604800}
+        dto = await backend.add_task(
+            project_root=project_root, title='good',
+            metadata=json.dumps({'milestone': good_milestone}),
+        )
+        with pytest.raises(TypeError):
+            await backend.update_task(
+                dto['id'], project_root=project_root,
+                metadata=json.dumps({'milestone': True}), metadata_mode='merge',
+            )
+        task = await backend.get_task(dto['id'], project_root=project_root)
+        assert task['metadata']['milestone'] == good_milestone
+
+    @pytest.mark.asyncio
+    async def test_replace_omitting_the_slice_repairs_the_row(
+        self, make_backend, tmp_path, caplog,
+    ):
+        """(e) the sanctioned repair leaves a clean row, not a tolerated one."""
+        project_root = str(tmp_path / 'legacy')
+        task_id = await self._land_legacy_row(make_backend, project_root)
+        backend = await make_backend(enforce=True)
+
+        metadata = (await backend.get_task(task_id, project_root=project_root))['metadata']
+        del metadata['milestone']
+        await backend.update_task(
+            task_id, project_root=project_root,
+            metadata=json.dumps(metadata), metadata_mode='replace',
+        )
+
+        with caplog.at_level(
+            logging.WARNING, logger='fused_memory.backends.sqlite_task_backend'
+        ):
+            caplog.clear()
+            await backend.update_task(
+                task_id, project_root=project_root,
+                metadata=json.dumps({'files': self._FILES}), metadata_mode='merge',
+            )
+
+        assert _schema_warning_messages(caplog) == []
+        task = await backend.get_task(task_id, project_root=project_root)
+        assert 'milestone' not in task['metadata']
+        assert task['metadata']['files'] == self._FILES
+
+    @pytest.mark.parametrize(
+        ('seed_secs', 'retyped_secs', 'mode'),
+        [
+            pytest.param(86400, 86400.0, 'merge', id='merge-int-to-float'),
+            pytest.param(1, True, 'merge', id='merge-int-to-bool'),
+            pytest.param(86400, 86400.0, 'replace', id='replace-int-to-float'),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_a_json_type_change_in_the_delta_is_still_rejected(
+        self, make_backend, tmp_path, seed_secs, retyped_secs, mode,
+    ):
+        """(f) Python == calls 86400 and 86400.0 equal; the strict field does not."""
+        project_root = str(tmp_path / 'retype')
+        backend = await make_backend(enforce=True)
+        dto = await backend.add_task(
+            project_root=project_root, title='t',
+            metadata=json.dumps(
+                {'recurrence': {'key': 'daily', 'interval_secs': seed_secs}}
+            ),
+        )
+        retyped = {'key': 'daily', 'interval_secs': retyped_secs}
+        if mode == 'replace':
+            stored = (await backend.get_task(dto['id'], project_root=project_root))['metadata']
+            payload = {**stored, 'recurrence': {**stored['recurrence'], **retyped}}
+        else:
+            payload = {'recurrence': retyped}
+
+        with pytest.raises(ValidationError):
+            await backend.update_task(
+                dto['id'], project_root=project_root,
+                metadata=json.dumps(payload), metadata_mode=mode,
+            )
+
+        task = await backend.get_task(dto['id'], project_root=project_root)
+        interval_secs = task['metadata']['recurrence']['interval_secs']
+        assert interval_secs == seed_secs
+        assert type(interval_secs) is int
+
+
+class TestFollowupItemsAtWriteBoundary:
+    """``followup_items`` reaches the backend's enforce-mode write gate as a registered list slice.
+
+    The shared rows in ``shared/tests/test_followup_items.py`` prove ``parse_metadata``
+    validates the slice; these prove the fused-memory write boundary routes a malformed
+    one to a raise with no row behind it, and lets a well-formed one land without a
+    census line (``plans/follow-up-filing-shape-prd.md`` §4.1).
+    """
+
+    @staticmethod
+    def _items_blob() -> dict[str, list[dict[str, Any]]]:
+        items = [
+            observed_item(summary='one', files=['pkg/a.py'], origin_task='8414'),
+            observed_item(summary='two', files=['pkg/a.py', 'pkg/b.py'], origin_task='8414'),
+        ]
+        return {FOLLOWUP_ITEMS_METADATA_KEY: [item.model_dump(mode='json') for item in items]}
+
+    @pytest.mark.asyncio
+    async def test_a_dict_shaped_slice_is_rejected_with_no_row(self, make_backend, tmp_path):
+        backend = await make_backend(enforce=True)
+        project_root = str(tmp_path / 'enforce')
+        element = self._items_blob()[FOLLOWUP_ITEMS_METADATA_KEY][0]
+
+        with pytest.raises(TypeError):
+            await backend.add_task(
+                project_root=project_root, title='t',
+                metadata=json.dumps({FOLLOWUP_ITEMS_METADATA_KEY: element}),
+            )
+
+        assert (await backend.get_tasks(project_root=project_root))['tasks'] == []
+
+    @pytest.mark.asyncio
+    async def test_an_element_without_files_is_rejected(self, make_backend, tmp_path):
+        backend = await make_backend(enforce=True)
+        project_root = str(tmp_path / 'enforce')
+        element = dict(self._items_blob()[FOLLOWUP_ITEMS_METADATA_KEY][0])
+        element.pop('files')
+
+        with pytest.raises(ValidationError):
+            await backend.add_task(
+                project_root=project_root, title='t',
+                metadata=json.dumps({FOLLOWUP_ITEMS_METADATA_KEY: [element]}),
+            )
+
+        assert (await backend.get_tasks(project_root=project_root))['tasks'] == []
+
+    @pytest.mark.asyncio
+    async def test_a_well_formed_list_writes_clean_and_round_trips(
+        self, make_backend, tmp_path, caplog,
+    ):
+        backend = await make_backend(enforce=True)
+        project_root = str(tmp_path / 'enforce')
+        blob = self._items_blob()
+
+        with caplog.at_level(
+            logging.WARNING, logger='fused_memory.backends.sqlite_task_backend'
+        ):
+            caplog.clear()
+            dto = await backend.add_task(
+                project_root=project_root, title='t', metadata=json.dumps(blob),
+            )
+
+        assert _schema_warning_messages(caplog) == []
+        task = await backend.get_task(dto['id'], project_root=project_root)
+        assert task['metadata'][FOLLOWUP_ITEMS_METADATA_KEY] == blob[FOLLOWUP_ITEMS_METADATA_KEY]

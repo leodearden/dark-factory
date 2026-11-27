@@ -18,8 +18,9 @@ disposition lives; and how one run schedules the next.
 A finding is a claim that a specific part of the code raises the cost or
 risk of the next change, in the sense of `docs/code-quality.md`, located
 precisely enough that another agent can re-verify it at a later commit.
-Everything else a run learns (counts, trends, caveats, method notes) is
-report prose, not a finding.
+A live correctness defect (§6) is recorded as a finding too. Everything
+else a run learns (counts, trends, caveats, method notes) is report
+prose, not a finding.
 
 Every finding carries these fields, in the instrument's committed artefact:
 
@@ -141,6 +142,16 @@ Two routes, chosen by the finding's class, recorded on the finding:
   deliberation with the human, then a program doc, then `/prd`, which files
   tasks under `planning_mode` and stamps the finding keys (§8) on them.
 
+A live correctness defect (wrong behaviour in landed code today) never
+waits for deliberation, whatever the class of the finding that exposed
+it: the instrument records the defect as its own mechanical finding (its
+anchor, the behaviour, the fix that stops it) and files it by the
+mechanical route. Any structural finding behind it still goes to
+deliberation, citing the defect's key in its `statement`. `/prd` stamps
+only the structural finding's key on the tasks it files, never the
+defect's, so a §8 key lookup on the defect finds only the defect's own
+task.
+
 A finding whose proposal is "split this file" or "reduce this number" is
 structural by definition; heuristic 14's measurement protocol in
 `docs/code-quality.md` applies before any split is proposed.
@@ -175,7 +186,23 @@ metadata.x_finding_run   = "<run_id>"         # the run that filed it
 metadata.x_supersedes_task = <task id>        # only when §8 step 1c applies
 metadata.x_acceptance_reason = "<text>"       # only on an accepting task (§7), set when it is cancelled
 metadata.source          = "<instrument>"     # existing convention
+metadata.finding_set_hold = {ruling: "<who, when, which finding>"}
+                                              # only on a cleanup set a ruling says is not
+                                              # scheduled individually; holds it
 ```
+
+`finding_set_hold` is not Tier-C: it is a registered submodel
+(`shared/src/shared/followup_hold_records.py::FindingSetHold`), validated at
+the write boundary. Stamped on every member of a low cleanup set, it holds
+the set behind its project's follow-up holder on either filing path, the
+ticket path or `planning_mode` (`plans/follow-up-filing-shape-prd.md` §3
+decision 9). The instrument confirms the hold on every member it files. A
+`planning_mode` answer carries `held_by` when the member was held. On the
+ticket path `resolve_ticket` does not return it, so read the task's
+`metadata.followup_hold` with `get_task`. The ruling is not enforced on a
+member left unheld. The fused-memory log carries a WARNING naming the task
+and why, for example a priority above `low`. The report records the member
+as unheld rather than assuming it was held.
 
 Before filing, in this order, and the report records the step that
 decided each finding:
@@ -184,7 +211,15 @@ decided each finding:
    value=<key>)` (fused-memory MCP), which matches a list-valued
    `x_finding_key` by membership.
    a. A task in `pending`, `in-progress`, `blocked`, `deferred` or
-      `merge-deferred` → disposition `filed:<id>`; do not file.
+      `merge-deferred` → disposition `filed:<id>`; do not file. If that
+      task is held (it depends on its project's follow-up holder,
+      `docs/task-authoring.md` §3.4), append the finding key to its
+      `x_finding_key` with `update_task(metadata_mode='additive')`. That
+      promotes it with `by=citation` (`ref` = the key), so it dispatches.
+      A held task carrying `finding_set_hold` is not appended to: it stays
+      held as a set, and an append would not promote it anyway (the
+      citation is deferred, `plans/follow-up-filing-shape-prd.md` §3
+      decision 14).
    b. A `cancelled` task carrying `x_acceptance_reason` → `accepted:<id>`;
       do not file. A `cancelled` task without it was abandoned, not
       accepted: treat as absent and continue to step 2.
@@ -193,12 +228,22 @@ decided each finding:
 2. **Semantic lookup.** `search_tasks` with a paraphrase of the statement at
    `score_threshold ≥ 0.6`; its corpus excludes `deferred` tasks, which is
    why step 1 runs first. A plausible match is read with `get_task` before
-   deciding.
+   deciding. A plausible match on a held task gets the same append as in
+   step 1a, with the same exception for a task carrying `finding_set_hold`,
+   and is recorded as `filed:<id>`.
 3. **Curator.** The ticket path's own `candidate_key` dedup is the last net,
    never the first.
 
 A run that cannot perform step 1 (store unreachable) files nothing and
-says so in its report.
+says so in its report. A `search_tasks` reply carrying `degraded: true`
+reports an embedder or Qdrant outage, which also blinds the curator's own
+semantic dedup and leaves only its `candidate_key` net, so it holds the
+finding: it is not filed this run, the report records the hold against it,
+and the next run retries it. Any other `search_tasks` reply carrying `error` (a transport
+failure, or a refusal of that one query) means step 2 was not performed,
+never "no match": the finding goes on to step 3, since holding on a
+deterministic refusal would strand it on every run, and the report records
+against that finding that step 2 did not run.
 
 ## 9. Consumption between instruments
 

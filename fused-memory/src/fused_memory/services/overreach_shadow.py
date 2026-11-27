@@ -23,6 +23,7 @@ from typing import Any, Protocol
 
 from shared.async_sqlite_base import (
     AtomicConnection,
+    CheckpointResult,
     apply_full_durability_pragmas,
     connect_daemon,
 )
@@ -128,6 +129,14 @@ class OverreachFlag:
 
 
 @dataclass(frozen=True)
+class HandedFlag:
+    """A flag recon has disposed of, and when: shown to Stage 1, or dropped as already gone or retired."""
+
+    flag: OverreachFlag
+    handed_at: datetime
+
+
+@dataclass(frozen=True)
 class OverreachFlagPage:
     """One cycle's slice of *graph*'s flags not yet handed over.
 
@@ -174,6 +183,15 @@ ORDER BY j.judged_at, j.edge_uuid
 LIMIT ?
 """
 
+_HANDED_FLAGS_SQL = """
+SELECT j.episode_uuid, j.edge_uuid, j.fact, j.rationale, j.judged_at, e.prompt_version, h.handed_at
+FROM edge_judgements j
+JOIN judged_episodes e ON e.graph = j.graph AND e.episode_uuid = j.episode_uuid
+JOIN flag_handoffs h ON h.graph = j.graph AND h.edge_uuid = j.edge_uuid
+WHERE j.graph = ? AND j.label = ? AND h.handed_at >= ? AND h.handed_at < ?
+ORDER BY j.edge_uuid
+"""
+
 _JUDGEMENTS_SQL = """
 SELECT j.edge_uuid, j.episode_uuid, j.label, j.rationale, e.judge_model, e.prompt_version,
        j.judged_at
@@ -201,11 +219,15 @@ class OverreachShadowStore:
         directory = Path(data_dir)
         await asyncio.to_thread(directory.mkdir, parents=True, exist_ok=True)
         conn = await connect_daemon(str(directory / SIDECAR_FILENAME))
-        await apply_full_durability_pragmas(conn, busy_timeout_ms=5000)
-        access = AtomicConnection(conn)
-        async with access.write() as db:
-            for statement in _DDL:
-                await db.execute(statement)
+        try:
+            await apply_full_durability_pragmas(conn, busy_timeout_ms=5000)
+            access = AtomicConnection(conn)
+            async with access.write() as db:
+                for statement in _DDL:
+                    await db.execute(statement)
+        except BaseException:
+            await conn.close()
+            raise
         return cls(access, clock=clock)
 
     @classmethod
@@ -214,7 +236,7 @@ class OverreachShadowStore:
         path = Path(db_path)
         if not await asyncio.to_thread(path.is_file):
             raise FileNotFoundError(f'no overreach shadow sidecar at {path}')
-        conn = await connect_daemon(f'file:{path}?mode=ro', uri=True)
+        conn = await connect_daemon(f'{path.resolve().as_uri()}?mode=ro', uri=True)
         return cls(AtomicConnection(conn))
 
     def _require_access(self) -> AtomicConnection:
@@ -226,6 +248,9 @@ class OverreachShadowStore:
         if self._access is not None:
             access, self._access = self._access, None
             await access.close()
+
+    async def checkpoint(self) -> CheckpointResult:
+        return await AtomicConnection.checkpoint_or_unavailable(self._access)
 
     async def record(
         self, *, episode: JudgedEpisode, judgements: Sequence[tuple[JudgeEdge, EdgeJudgement]],
@@ -291,6 +316,25 @@ class OverreachShadowStore:
         )
         total = rows[0][-1] if rows else 0
         return OverreachFlagPage(graph=graph, flags=flags, omitted=total - len(flags))
+
+    async def handed_overreach_flags(
+        self, graph: str, *, handed_from: datetime, handed_until: datetime,
+    ) -> tuple[HandedFlag, ...]:
+        """*graph*'s overreach flags first handed over in ``[handed_from, handed_until)``, by edge uuid."""
+        rows = await self._require_access().read_all(
+            _HANDED_FLAGS_SQL,
+            (graph, OVERREACH, _to_stored_instant(handed_from), _to_stored_instant(handed_until)),
+        )
+        return tuple(
+            HandedFlag(
+                flag=OverreachFlag(
+                    episode_uuid=episode_uuid, edge_uuid=edge_uuid, fact=fact, rationale=rationale,
+                    judged_at=_from_stored_instant(judged_at), prompt_version=prompt_version,
+                ),
+                handed_at=_from_stored_instant(handed_at),
+            )
+            for episode_uuid, edge_uuid, fact, rationale, judged_at, prompt_version, handed_at in rows
+        )
 
     async def record_handoffs(self, graph: str, edge_uuids: Sequence[str]) -> None:
         """Take *edge_uuids* out of *graph*'s pending flags; the first handoff of an edge is kept."""
@@ -404,6 +448,10 @@ class OverreachShadow:
     async def acknowledge(self, page: OverreachFlagPage) -> None:
         """No later page offers what *page* handed over."""
         await self._store.record_handoffs(page.graph, page.handed_over())
+
+    async def checkpoint(self) -> CheckpointResult:
+        """The periodic WAL checkpoint of the sidecar this shadow owns."""
+        return await self._store.checkpoint()
 
     async def close(self) -> None:
         """Cancel in-flight judgements, then close the store; a second call is a no-op.

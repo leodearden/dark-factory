@@ -14,6 +14,7 @@ import pytest
 import pytest_asyncio
 from escalation.queue import EscalationQueue
 from shared.project_layout import escalation_queue_dir
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.config.schema import CuratorConfig, FusedMemoryConfig, TicketJanitorConfig
 from fused_memory.middleware.curation_deferral import DeferReason
@@ -25,13 +26,17 @@ from fused_memory.middleware.curator_types import (
 from fused_memory.middleware.task_curator import TaskCurator
 from fused_memory.middleware.task_interceptor import TaskInterceptor
 from fused_memory.middleware.ticket_janitor import curation_backlog_anchor
-from fused_memory.middleware.ticket_store import AWAITING_CURATION, TicketStore
+from fused_memory.middleware.ticket_store import TicketStatus, TicketStore
 from fused_memory.reconciliation.event_buffer import EventBuffer
 from fused_memory.server.main import _build_ticket_janitor
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 PROJECT_ROOT = '/project'
 PROJECT_ID = 'project'
 DEADLINE_SECONDS = 5.0
+# timedelta keeps whole microseconds, so a ticket parked with this backoff is due the instant it is parked.
+SUB_MICROSECOND_BACKOFF_SECONDS = 1e-9
 
 
 class _DeferThenHoldCurator:
@@ -47,7 +52,7 @@ class _DeferThenHoldCurator:
     ) -> PreparedCandidate:
         return PreparedCandidate(candidate=candidate, pool=[], pool_sizes={}, prompt_tokens=0)
 
-    async def curate_batch_prepared(
+    async def curate_prepared(
         self, prepared: list[PreparedCandidate], project_id: str, project_root: str,
     ) -> list[CuratorDecision]:
         if self._defer_next:
@@ -61,17 +66,12 @@ class _DeferThenHoldCurator:
         return None
 
 
-@pytest.fixture(autouse=True)
-def _combine_audit_in_tmp(monkeypatch, tmp_path):
-    monkeypatch.setenv('DARK_FACTORY_DATA_DIR', str(tmp_path / 'data'))
-
-
 @pytest.fixture
 def config() -> FusedMemoryConfig:
     cfg = FusedMemoryConfig()
     cfg.curator = CuratorConfig(
-        deferral_backoff_base_seconds=0.001,
-        deferral_backoff_max_seconds=0.001,
+        deferral_backoff_base_seconds=SUB_MICROSECOND_BACKOFF_SECONDS,
+        deferral_backoff_max_seconds=SUB_MICROSECOND_BACKOFF_SECONDS,
         janitor=TicketJanitorConfig(curation_backlog_escalation_min_attempts=1),
     )
     return cfg
@@ -112,8 +112,21 @@ async def _park_through(interceptor: TaskInterceptor) -> str:
         interceptor.resolve_ticket(ticket_id, PROJECT_ROOT, timeout_seconds=DEADLINE_SECONDS),
         timeout=DEADLINE_SECONDS + 1,
     )
-    assert answer['status'] == AWAITING_CURATION
+    assert answer['status'] == TicketStatus.AWAITING_CURATION
     return ticket_id
+
+
+async def _await_curation(curator: _DeferThenHoldCurator, store: TicketStore, ticket_id: str) -> None:
+    try:
+        # noqa: wall-clock-deadline — bounds a wait that used to hang to the pytest timeout  # debt: ticket tkt_0RXE77AQ50Z12K8SJ91XQDEB9E
+        await asyncio.wait_for(curator.reached.wait(), timeout=DEADLINE_SECONDS)
+    except TimeoutError:
+        row = await store.get(ticket_id) or {}
+        pytest.fail(
+            f'the janitor did not hand ticket {ticket_id} to the curator within {DEADLINE_SECONDS}s: '
+            f'status={row.get("status")!r} attempts={row.get("attempts")!r} '
+            f'next_attempt_at={row.get("next_attempt_at")!r}'
+        )
 
 
 @pytest.mark.asyncio
@@ -127,7 +140,7 @@ async def test_built_janitor_drains_through_the_interceptor(config, store, make_
     assert janitor is not None
     await janitor.tick()
 
-    await curator.reached.wait()
+    await _await_curation(curator, store, ticket_id)
     row = await store.get(ticket_id)
     assert row is not None
     assert (row['status'], row['attempts']) == ('pending', 1)

@@ -57,8 +57,8 @@ loudly if it ever arises.
 WHY ``sys.executable``, AND WHY ``timeout=60`` INSTEAD OF A WALL-CLOCK ASSERT.
 Two separate hazards. (1) ``verify._target_subprocess_env`` — cited by SYMBOL,
 since its line has already moved once (3473 -> 3609) between this plan's two
-revisions — strips ``_VENV_ISOLATION_KEYS`` including ``VIRTUAL_ENV`` and calls
-``_strip_venv_bin_from_path`` so a target resolves its own ``.venv``. A test that
+revisions — builds on ``shared.python_env.without_python_env_selection``, which
+drops ``VIRTUAL_ENV`` and the venv's ``bin`` from PATH, so a target resolves its own ``.venv``. A test that
 shelled out to a bare ``python`` off PATH could therefore hit a system
 interpreter with no uvicorn installed and go FALSELY red under verify;
 ``sys.executable`` is the interpreter already running pytest, correct in the main
@@ -93,6 +93,9 @@ import tomllib
 
 import pytest
 import verify_command_invariants as vci
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 
@@ -117,26 +120,6 @@ _PYTHON_ARGV0 = ("python", "python3")
 _QUERY_TIMEOUT_SECS = 60
 
 
-def _marked_command(markdown_text, marker, bullet_label):
-    """The command on the *bullet_label* bullet between *marker*'s begin/end comments.
-
-    ``verify_command_invariants.marked_span`` owns the loud marker checks. This
-    guard supplies only the pattern, keyed on the bullet's label rather than on
-    backticks so that inline code in the begin comment is never extracted.
-    """
-    bullet = re.compile(r"- \*\*" + re.escape(bullet_label) + r"\*\*: `([^`]+)`")
-    return vci.marked_span(
-        markdown_text,
-        begin=f"{marker}:begin",
-        end=f"{marker}:end",
-        pattern=bullet,
-        what=f"`- **{bullet_label}**: <command>` bullet",
-        source="CLAUDE.md",
-        label=f"the {bullet_label!r} command",
-        task="3959",
-    ).strip()
-
-
 # Hand-written fixtures. The marker literals are spelled out IN FULL rather than
 # interpolated from the constants above, per the precedent's stated reason: "a
 # rename must not be able to silently keep a broken parser agreeing with its own
@@ -157,24 +140,6 @@ Never `find /` for an installed package.
 
 _HAPPY_COMMAND = "python -c 'import alpha, os; print(os.path.dirname(alpha.__file__))'"
 
-_NO_MARKER_DOC = """\
-- **Third-party package source**: `python -c 'import alpha, os; print(os.path.dirname(alpha.__file__))'`
-
-Somewhere else entirely, an unmarked mention of `site-packages`.
-"""
-
-_DUPLICATE_MARKER_DOC = """\
-<!-- package-source-lookup:begin -->
-- **Third-party package source**: `python -c 'import alpha; print(alpha.__file__)'`
-<!-- package-source-lookup:end -->
-
-## Some later section
-
-<!-- package-source-lookup:begin -->
-- **Third-party package source**: `python -c 'import beta; print(beta.__file__)'`
-<!-- package-source-lookup:end -->
-"""
-
 _DECOY_DOC = """\
 Do not run `find / -path '*/alpha/config.py'` — it hits the Bash timeout.
 
@@ -190,47 +155,35 @@ Afterwards, `grep -rn 'timeout_keep_alive' <that dir>/config.py`.
 """
 
 
-def test_marked_command_extracts_the_marked_span():
-    """(a) Only the marked bullet's command is returned, backticks stripped."""
+def test_package_source_bullet_extracts_the_marked_span():
+    """Only the marked bullet's command is returned, backticks stripped."""
     assert (
-        _marked_command(_HAPPY_DOC, PACKAGE_SOURCE_MARKER, PACKAGE_SOURCE_LABEL)
+        vci.marked_bullet_command(
+            _HAPPY_DOC,
+            slug=PACKAGE_SOURCE_MARKER,
+            bullet_label=PACKAGE_SOURCE_LABEL,
+            source="CLAUDE.md",
+            task="3959",
+        )
         == _HAPPY_COMMAND
     )
 
 
-@pytest.mark.parametrize(
-    ("markdown_text", "case"),
-    [
-        (_NO_MARKER_DOC, "missing"),
-        (_DUPLICATE_MARKER_DOC, "duplicated"),
-    ],
-)
-def test_marked_command_fails_loudly_on_a_broken_marker(markdown_text, case):
-    """(b, c) A missing or duplicated marker RAISES — never '' or None.
-
-    Missing is the vacuity hazard: an extractor that silently returns nothing
-    turns every downstream assertion green while executing nothing at all.
-    Duplicated is the same failure one level down: silently taking the first
-    leaves the second copy unexecuted and free to rot. The message must tell a
-    human what to restore and where.
-    """
-    with pytest.raises(AssertionError) as excinfo:
-        _marked_command(markdown_text, PACKAGE_SOURCE_MARKER, PACKAGE_SOURCE_LABEL)
-
-    message = str(excinfo.value)
-    assert PACKAGE_SOURCE_MARKER in message, case
-    assert "CLAUDE.md" in message, case
-
-
-def test_marked_command_is_immune_to_inline_code_in_the_begin_comment():
-    """(d) Prose inline code inside the marked slice is never extracted.
+def test_package_source_bullet_is_immune_to_inline_code_in_the_begin_comment():
+    """Prose inline code inside the marked slice is never extracted.
 
     An extractor keyed on "the first backtick span after the begin marker" would
     return ``site-packages`` here — a plausible-looking string, so the mistake
     would survive review and then be executed as a command.
     """
     assert (
-        _marked_command(_DECOY_DOC, PACKAGE_SOURCE_MARKER, PACKAGE_SOURCE_LABEL)
+        vci.marked_bullet_command(
+            _DECOY_DOC,
+            slug=PACKAGE_SOURCE_MARKER,
+            bullet_label=PACKAGE_SOURCE_LABEL,
+            source="CLAUDE.md",
+            task="3959",
+        )
         == _HAPPY_COMMAND
     )
 
@@ -311,10 +264,12 @@ def test_documented_package_source_lookup_resolves_a_third_party_package():
     it. MEASURED at task 3959: resolves ``<venv>/lib/python3.13/site-packages/
     uvicorn`` in 0.396s, against a ``find /`` that returned nothing in 120s.
     """
-    command = _marked_command(
+    command = vci.marked_bullet_command(
         CLAUDE_MD_PATH.read_text(encoding="utf-8"),
-        PACKAGE_SOURCE_MARKER,
-        PACKAGE_SOURCE_LABEL,
+        slug=PACKAGE_SOURCE_MARKER,
+        bullet_label=PACKAGE_SOURCE_LABEL,
+        source="CLAUDE.md",
+        task="3959",
     )
     body = _interpreter_query_body(command, PACKAGE_SOURCE_MARKER)
     resolved = _run_documented_query(body, PACKAGE_SOURCE_MARKER)
@@ -389,10 +344,12 @@ def test_documented_import_provenance_check_resolves_to_a_checkout_source_tree()
     resolves to the main checkout. Both are valid, and pinning either would go
     red in the other environment.
     """
-    command = _marked_command(
+    command = vci.marked_bullet_command(
         CLAUDE_MD_PATH.read_text(encoding="utf-8"),
-        IMPORT_PROVENANCE_MARKER,
-        IMPORT_PROVENANCE_LABEL,
+        slug=IMPORT_PROVENANCE_MARKER,
+        bullet_label=IMPORT_PROVENANCE_LABEL,
+        source="CLAUDE.md",
+        task="3959",
     )
     body = _interpreter_query_body(command, IMPORT_PROVENANCE_MARKER)
 

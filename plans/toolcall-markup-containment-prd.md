@@ -367,6 +367,16 @@ what would let specimens land permanently in fleet `plan.json` files."* The mech
 model/harness-side over-consumption past a mis-closed tag, where parameter N's value swallows parameter N+1's entire
 serialization and N+1 is silently dropped — and is not fixable at the fleet layer.
 
+**Recurrence log continued (2026-11-21) — one unrepairable specimen at the gated fused-memory boundary, `reify`.**
+`esc-markup-residue-11` (reify queue, 2026-11-21T23:16:01Z): an `update_task.metadata` call whose payload was a
+verbatim copy of reify task 3787's own metadata (`dry_run_proposals`, `done_provenance`, `retry_ledger`, …) carried
+envelope markup inside a dry-run proposal's text; the residue was not parseable, so the guard refused the call and
+preserved the raw payload on the record. Same blindness as above: the owner reads `l2-escalation-watcher` but
+`agent_id` was None. **Nothing was lost** — 3787 reached `done` (`found_on_main` `3fd685c47f`) by another write at
+23:19Z, and the refused value duplicated content already on the task; `markup_residue.spooled_files` and
+`preservation_failures` were both 0. Closed by the reify L2 watcher on Leo's ruling of 2026-11-22. The gate held;
+this is a floor-count datum for the gated boundary, not landed damage.
+
 ### 2.6 The corruption is deterministically repairable
 
 Replaying all 334 specimens through a schema-validated repairer: **308 repair cleanly (92.2%), recovering 194 dropped parameters**; 26 (7.8%) are ambiguous (doubly-corrupted calls) and must escalate. Recovered parameters are exactly the silently-lost ones: `add_memory.category` ×70, `add_memory.project_id` ×32, `add_design_decision.rationale` ×25, `add_memory.agent_id` ×18, `escalate_info.suggested_action` ×13, `submit_review_verdict.issues` ×10, `submit_task.priority` ×5.
@@ -505,7 +515,7 @@ Every rewrite is **atomic**: repair into a temp file in the same directory, veri
 
   **UNIFORM over every registered tool of both servers** (16 + 4), not narrowed to the prose-bearing ones: the guard scans every string argument of every tool, so any tool on these servers can be the one that bounces a caller.
 
-  **A decorator rather than twenty signature edits.** `accepts_markup_override` (`shared/src/shared/mcp_markup_middleware.py`) appends the keyword-only parameter to the wrapped tool's `__signature__`. Twenty copies of a declaration no tool body reads is the lock-step duplication INV-5 exists to end, and it would leave twenty places for a future tool to be born without it. It also gives `strip_markup_override` ONE load-bearing call site: the decorator consumes the map, so no tool body can persist the flag — "never written" is structural, not a promise repeated at each registration site — and a caller's non-flag residue is reported there as a warning naming the leftover KEYS only.
+  **A decorator rather than twenty signature edits.** `accepts_markup_override` (`shared/src/shared/markup_override_param.py`, moved out of the middleware module by task 5055) appends the keyword-only parameter to the wrapped tool's `__signature__`. Twenty copies of a declaration no tool body reads is the lock-step duplication INV-5 exists to end, and it would leave twenty places for a future tool to be born without it. It also gives `strip_markup_override` ONE load-bearing call site: the decorator consumes the map, so no tool body can persist the flag — "never written" is structural, not a promise repeated at each registration site — and a caller's non-flag residue is reported there as a warning naming the leftover KEYS only.
 
   **Substrate, measured (fastmcp 3.2.2 / CPython 3.13.9), because §6 has been wrong about this library before:** FastMCP builds `inputSchema` from `__signature__`, so a `tools/list` round-trip advertises `"metadata": {"anyOf": [{"additionalProperties": true, "type": "object"}, {"type": "null"}], "default": null}` with the tool's own `required` and its `additionalProperties: false` both preserved; calls with and without the argument both succeed; and an `async def` tool needs the async wrapper branch or FastMCP receives an un-awaited coroutine.
 
@@ -514,6 +524,18 @@ Every rewrite is **atomic**: repair into a temp file in the same directory, veri
   **The parameter DESCRIBES ITSELF, because declaring it closed one diagnostic.** *(Amended after review.)* An undescribed `metadata: object|null` on twenty agent-facing tools invites the wrong call — on `create_plan` or a verdict tool it reads as somewhere to attach metadata to what the tool writes — and a caller who believes that has its map dropped by `_consume_override` with the only report going to a server log it cannot read. Before the declaration, pydantic bounced that caller: a bad response, but a response. So the declaration carries a pydantic `Field(description=...)`, spelled from `MARKUP_OVERRIDE_KEY` so the schema and `_OVERRIDE_SENTENCE` cannot name different flags, stating both what the map is for and that nothing in it is persisted. Measured (fastmcp 3.2.2): an `Annotated[..., Field(description=...)]` annotation survives the `__signature__` route and lands as that property's `description`. Handing the leftover key NAMES back to the caller was considered and rejected: raising re-creates exactly the bounce this decision removed below, and widening a tool's RESULT to carry a guard diagnostic would rewrite the structured-content contract of all twenty. The mistake is forestalled in the contract instead of reported after the fact.
 
   **A pre-existing sharp edge is REMOVED:** the flag sent alongside any other metadata key used to yield a raw pydantic `Unexpected keyword argument` on these twenty tools. Checked that nothing depended on that shape before relying on it. The escalation surface (`escalate_info`, `escalate_blocker`) still declares no `metadata` and keeps the DROP branch, so `_OVERRIDE_SENTENCE`'s promise stays true there.
+
+- **D13 — A residue record names its caller uniformly, states what its custody proves, and reports a swallowed override.** *(task 5055.)* Four gaps, each measured in the code before this decision.
+
+  **Host attribution fills only the axes the arguments left `None`.** The middleware reads its caller off the call's own arguments, and no plan-tools or verdict-tools tool, nor `stamp_triage` or `resolve_issue`, declares one, so their records named nobody. `shared/src/shared/mcp_markup_middleware.py::HostAttribution` is an optional provider each host injects with what it knows: plan-tools its new `--caller-role` launch flag, verdict-tools its verdict role, the escalation server the connection's `X-Escalation-Identity` header (attribution only, never a gate). The arguments always win, and a provider that raises falls back to argument-only attribution without changing the call's outcome. fused-memory wires none, because its memory tools declare `agent_id` themselves. The flag is optional because an orchestrator still running an older launcher spawns the new server without it.
+
+  **One rendering of the caller.** `residue_header_lines` renders the caller keys `subject_task_id`, `subject_agent_role`, `agent_id` and `project` (`RESIDUE_CALLER_KEYS`), then `override_swallowed`, the one header key that describes the leak rather than the caller, as `key=repr` lines, an absent key as `None`. Every residue kind carries `override_swallowed` as a bool. The orchestrator sink, the escalation server and `markup_tripwire` all call it. Three hand-spelled renderings are how plan-tools records came to omit the role.
+
+  **The custody claim is the caveat, not "the only surviving copy".** All three filers told the reader that the residue was the only surviving copy, while the refusal told the caller to resend from its own copy. In the field, 3 of 3 checked genuine-leak residues had been resent within about a minute, and the content of esc-plan-tools-markup-residue-10 was already in plan.json. So a refused record now states `MARKUP_REFUSAL_CUSTODY_CAVEAT`: the call wrote nothing and its caller was told to resend; whether it did is not known; look at the destination for a later write before recovering, because recovering a resent payload writes a duplicate. The unrecovered-parameter kind states `MARKUP_UNRECOVERED_PARAM_CUSTODY_CAVEAT` instead, through the same constant at every sink that files it: nothing bounced that caller, the drop was reported only in the forwarded result's metadata, and no resend is coming, so the record is the only copy the boundary holds. Residue is still never deduped, for the real reason: each record holds a different caller's payload.
+
+  **A swallowed override is reported, never honoured.** The leak swallows every parameter after the leaking one, so a `metadata` override sent after it arrives inside the leaked value. `shared/src/shared/toolcall_markup.py::swallowed_markup_override` finds it there. It is evidence of a real leak, because a genuine quotation never makes the harness over-consume, so it is not honoured. Nor does it come back to be honoured later: the swallowed `metadata` is restored WITHOUT the flag, on both tiers, so a bounce's `repaired_call` resubmitted verbatim, as its hint prescribes, is guarded like any other call. The strip applies to any recovered `metadata`, because `repair()` recovers only names the caller did not supply (B9), so it never depends on `swallowed_markup_override`'s non-validating scan, and on a repaired call `override_swallowed` reports either source: that scan, or the validated recovery. The refusal and reject payloads and the residue record carry `override_swallowed`, and the hint gives the one structural escape: send `metadata` as the first argument, ahead of the string that carries the markup. The override sentence and the parameter's own schema description say the same.
+
+  **Not decided here.** Moving plan-tools or fused-memory to FORWARD_REPAIR would change D3's tiers. The fused-memory tier is `plans/uuid-prefix-resolution-prd.md` open question 3, reserved to a separate operator decision.
 
 - **D7 — The upstream defect is not fixable here.** The originating error is model-side (wrong closing-tag dialect); the *amplification* — silently over-consuming and dropping parameters instead of raising a parse error — is the harness parser's. Neither is in this repo. Everything in this PRD is containment, recovery and repair.
 
@@ -555,6 +577,7 @@ Every rewrite is **atomic**: repair into a temp file in the same directory, veri
 | `docs/prds/memory-write-path-convergence.md` §8 row "XML-leak cure" | re-point | row currently reads "DF 3083 (pending)"; 3083 is `done` | **this PRD** | ι files the paired edit |
 | DF 3083 (done, `7899eef17b`) | consumes | `toolcall_xml_leak` detector, `scan_memory_content` | 3083 (terminal) — this PRD re-exports its literals from `shared` | C1 |
 | DF 3141 (done, `da94baf14a`) | consumes | `markup_tripwire`, `MarkupStormCounter` | 3141 (terminal) — generalised here | C2 |
+| `plans/uuid-prefix-resolution-prd.md` leaf γ (DF 4643) | generalises | the fused-memory shim (`install_markup_guard`, retired by `8ccffde1b3`) became one guard chain, `fused-memory/src/fused_memory/server/boundary_guards.py::boundary_guard_chain`, able to consume `RepairPolicy.FORWARD_REPAIR`. The markup member is now `fused-memory/src/fused_memory/server/markup_guard.py::build_markup_guard`. Its tier (REJECT_WITH_REPAIR) and its outermost place in the chain are unchanged. Whether that tier should change is that PRD's open question 3, deliberately out of scope | **`plans/uuid-prefix-resolution-prd.md`** (leaf γ, DF 4643) | DF 4643 (done, `28787ba3bc`) |
 | `docs/legibility/design-invariants.md` | consumes | INV-1/2/3/4/5/7 gate this batch | that doc (normative) | G7 walk in §9 |
 
 No reciprocal-ownership ambiguity: 3083 and 3141 are both terminal, so this PRD takes the territory uncontested. ι makes that explicit in the owning PRD rather than leaving it inferred.
@@ -691,7 +714,9 @@ Implements C1. Extracts the real specimens from the archived transcripts into a 
 > `tkt_0RTT9N7HAZ2WP6DF3YNXAKHSX4`); negative control
 > `test_a_sibling_opener_with_NO_closing_tag_is_NOT_refused_TODAY` pins the residue,
 > so 5639 landing fails loudly here instead of silently contradicting this
-> paragraph. (2) The widened rule leaves `_parse_body`'s depth-1 probe short-circuit
+> paragraph. Closed by task 5639: that pin is replaced by
+> `test_the_opener_verdict_does_not_depend_on_a_closing_tag`; see below.
+> (2) The widened rule leaves `_parse_body`'s depth-1 probe short-circuit
 > unreachable by construction (instrumented: 1 execution before, 0 after). It is
 > documented in place and kept, because deleting it removes a recursion bound 4502
 > landed deliberately. **Task 5640** (filed as `tkt_0RTT9N05CHRSHN2MSCHNXX4A8D`).
@@ -720,6 +745,29 @@ Implements C1. Extracts the real specimens from the archived transcripts into a 
 > record changing outcome; both `esc-3514` specimen pins stay green (escalation markup
 > suites 74 passed), as do the shared markup suites (539 passed, 1 skipped), the sweep
 > suite and the plan-tools markup suites (244 passed).
+>
+> *Made uniform 2026-10-09 (task 5639) — the opener rule is an accept-time condition,
+> and it no longer depends on a closer.* 5620's opener clause sat inside the per-item
+> B5 function, behind `_parse_body`'s closing-tag prefilter, so its verdict flipped on
+> whether an UNRELATED quoted closer was present: on 5620's code every row of
+> `test_the_opener_verdict_does_not_depend_on_a_closing_tag` (which replaces the
+> residual (1) pin) got opposite answers in its two closer cells. The rule now lives
+> in `repair()` beside B8, as B8's value-side mirror, and applies to every recovered
+> value whether or not it carries a closer. The canonical opener stays categorical;
+> the name-echoing opener now blocks only when it names a schema parameter. That
+> narrowing is measured: applying 5620's broad both-dialect rule uniformly moved 3
+> committed-corpus records repaired → unrepairable, all placeholder false positives
+> (`\x3cname>` in `toolu_011GM1rYsnpdmE26YX3sjPpg`, `\x3cunknown>` in
+> `toolu_01JMhsqu24iuKFH9RuYxSTd2`, `\x3ctitle>` in `toolu_01QrpSawmZ3qASDFFoEH6SQK`),
+> while the shipped variant moves none. A non-schema echo tag names nothing B8 would
+> let `repair()` recover. The prefilter line is untouched, so its clean-path contract
+> is unchanged. The per-item function reasons only about inner closers again and is
+> renamed back to `_inner_closer_blocks`. In the sweep, the unterminated-inner-opener
+> nested leak now refuses in round one; a recovered value that QUOTES a closer is the
+> shape that still reaches round two. *Blast radius, re-measured at 5639:* the corpus
+> stays **444/60** with no record changing outcome; the shared markup suites (535
+> passed), both `esc-3514` specimen pins with the registration specimens (74 passed),
+> the sweep suite (94 passed) and the plan-tools markup suites (244 passed) are green.
 >
 > *The invariant that did NOT move.* `clean_value` stays envelope-free, stated against
 > `detect_for`. That is C1's post-condition on the value the repairer **rewrote**, and

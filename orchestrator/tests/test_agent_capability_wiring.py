@@ -36,6 +36,7 @@ from orchestrator.agents.roles import (
     reviewers_for,
 )
 from orchestrator.agents.write_set import compute_write_set
+from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.scheduler import TaskAssignment
@@ -55,9 +56,9 @@ class TestAgentRoleCapabilityFields:
 class TestImportTimeCapabilityAssertion:
     """__post_init__ enforces: tool-in-allowed_tools ⟹ matching family declared.
 
-    One-way only — declaring a family with no matching tool is allowed
-    (the judge shape: it needs 'orchestrator' wired for jcodemunch even
-    though it has no fused-memory/escalation tool in allowed_tools).
+    One-way only: mcp_families is a lower bound on the families
+    allowed_tools needs, so declaring a family with no matching tool is
+    allowed.
     """
 
     def test_plan_tools_tool_without_plan_tools_family_raises(self):
@@ -107,13 +108,13 @@ class TestImportTimeCapabilityAssertion:
         assert role.mcp_families == frozenset({'orchestrator'})
 
     def test_declaring_family_with_no_matching_tool_is_allowed(self):
-        """judge shape: mcp_families={'orchestrator'} but no fm/esc tool in
-        allowed_tools — the assertion is a lower bound, never the reverse."""
+        """mcp_families is a lower bound on the families allowed_tools needs,
+        so a declared family need not have a matching tool."""
 
         role = AgentRole(
-            name='judge_like',
+            name='family_only',
             system_prompt='x',
-            allowed_tools=['mcp__jcodemunch__*'],
+            allowed_tools=['Read'],
             mcp_families=frozenset({'orchestrator'}),
         )
 
@@ -165,7 +166,7 @@ class TestShippedRoleCapabilityDeclarations:
         'implementer': (frozenset({'orchestrator', 'plan_tools'}), True),
         'debugger': (frozenset({'orchestrator', 'plan_tools'}), True),
         'merger': (frozenset({'orchestrator', 'verdict_tools'}), False),
-        'judge': (frozenset({'orchestrator', 'verdict_tools'}), False),
+        'judge': (frozenset({'verdict_tools'}), False),
         'simple_task': (frozenset({'orchestrator', 'plan_tools'}), True),
         'reviewer_comprehensive': (frozenset({'verdict_tools'}), False),
         'steward': (frozenset({'orchestrator'}), False),
@@ -185,6 +186,12 @@ class TestShippedRoleCapabilityDeclarations:
             f'{role_name}: expected sandboxed={expected_sandboxed!r}, '
             f'got {role.sandboxed!r}'
         )
+
+    def test_judge_mcp_surface_is_its_verdict_server(self):
+        """The judge declares only verdict_tools and has no other MCP grant,
+        so it runs strictly scoped to its verdict server."""
+
+        assert ROLES['judge'].strict_mcp_scope is True
 
     def test_simple_task_has_both_families(self):
         """Explicit regression guard for reify esc-4943-54: simple_task's
@@ -258,6 +265,27 @@ class TestInverseCapabilityInvariant:
                     f"'verdict_tools' in mcp_families (reify esc-4943-54 class)"
                 )
 
+    def test_a_grant_no_declared_family_serves_is_reported(self):
+        role = AgentRole(
+            name='probe_ambient', system_prompt='x',
+            allowed_tools=['Read', 'mcp__verdict-tools__*', 'mcp__ambient-probe__*'],
+            mcp_families=frozenset({'verdict_tools'}),
+        )
+
+        assert role.mcp_grants_outside_families == ('mcp__ambient-probe__*',)
+
+    @pytest.mark.parametrize('role_name', sorted(ROLES))
+    def test_every_mcp_grant_is_served_by_a_declared_family(self, role_name):
+        """The converse: a role's every mcp__ grant falls under a prefix of a
+        family it declares, so no grant names a server _invoke never wires."""
+
+        role = ROLES[role_name]
+        assert role.mcp_grants_outside_families == (), (
+            f'{role_name!r} grants {list(role.mcp_grants_outside_families)!r}, '
+            f'which no family in its mcp_families={sorted(role.mcp_families)!r} '
+            'serves.'
+        )
+
 
 # ---------------------------------------------------------------------------
 # TestInvokeDerivesGatingFromRole fixtures — mirrors
@@ -325,7 +353,7 @@ async def _invoke_probe(role, config, git_ops, task_assignment, mcp=None):
     Returns (call_kwargs, workflow, cwd) — the kwargs invoke_with_cap_retry
     was awaited with, the workflow instance (so callers can assert against
     workflow.modules), and the worktree path (a real linked worktree, so the
-    write-set wiring tests can recompute compute_write_set(cwd).writable_paths()).
+    write-set wiring tests can recompute compute_write_set(cwd, task_id=...).writable_paths()).
     ``mcp`` defaults to a bare ``FakeMcp()`` (empty mcpServers); callers may
     pass a fake that pre-populates a server (e.g. ``_FakeMcpWithFusedMemory``)
     to distinguish "server added alongside an existing one" from "server is
@@ -395,7 +423,7 @@ class TestInvokeDerivesGatingFromRole:
         sandbox_modules=[] (the empty-list value is the sandbox-on gate — no
         per-module dirs) and delivers the full contract write set (worktree
         root + carve-outs) via
-        sandbox_extras == compute_write_set(cwd).writable_paths(). Still gated
+        sandbox_extras == compute_write_set(cwd, task_id=...).writable_paths(). Still gated
         off role.sandboxed, not role.name.
         """
 
@@ -410,9 +438,13 @@ class TestInvokeDerivesGatingFromRole:
             f"got {call_kwargs.get('sandbox_modules')!r}. _invoke must gate "
             'sandboxing off role.sandboxed, not role.name.'
         )
-        expected_extras = [str(p) for p in compute_write_set(cwd).writable_paths()]
+        expected_extras = [
+            str(p) for p in compute_write_set(cwd, task_id=task_assignment.task_id).writable_paths()
+        ]
+        task_root = TaskArtifacts.task_root_for(cwd.parent, task_assignment.task_id).resolve()
+        assert str(task_root) in call_kwargs.get('sandbox_extras', [])
         assert call_kwargs.get('sandbox_extras') == expected_extras, (
-            'Expected sandbox_extras == compute_write_set(cwd).writable_paths() '
+            'Expected sandbox_extras == compute_write_set(cwd, task_id=...).writable_paths() '
             f"(the full contract set), but got {call_kwargs.get('sandbox_extras')!r}."
         )
 
@@ -423,7 +455,7 @@ class TestInvokeDerivesGatingFromRole:
         """Each shipped sandboxed role (implementer/debugger/simple_task) drives
         _invoke's sandbox block to the whole-worktree wiring: sandbox_modules=[]
         (the sandbox-on gate) and sandbox_extras == the FULL contract write set
-        (worktree root + carve-outs) from compute_write_set(cwd) — the single
+        (worktree root + carve-outs) from compute_write_set(cwd, task_id=...) — the single
         source of truth (INV-5). This is the α3 SIGNAL: a live wrap_command for
         these roles now carries the full contract set."""
 
@@ -434,7 +466,11 @@ class TestInvokeDerivesGatingFromRole:
             f'{role_name}: expected sandbox_modules == [] (whole-worktree gate), '
             f"got {call_kwargs.get('sandbox_modules')!r}."
         )
-        expected_extras = [str(p) for p in compute_write_set(cwd).writable_paths()]
+        expected_extras = [
+            str(p) for p in compute_write_set(cwd, task_id=task_assignment.task_id).writable_paths()
+        ]
+        task_root = TaskArtifacts.task_root_for(cwd.parent, task_assignment.task_id).resolve()
+        assert str(task_root) in call_kwargs.get('sandbox_extras', [])
         assert call_kwargs.get('sandbox_extras') == expected_extras, (
             f'{role_name}: expected sandbox_extras == the full compute_write_set '
             f"contract list, got {call_kwargs.get('sandbox_extras')!r}."
@@ -459,6 +495,26 @@ class TestInvokeDerivesGatingFromRole:
             f"(role.mcp_families={{'plan_tools'}}) but got {mcp_config!r}. _invoke "
             "must gate the plan-tools injection off 'plan_tools' in "
             'role.mcp_families, not role.name in _PLAN_TOOLS_ROLES.'
+        )
+
+    @pytest.mark.parametrize(
+        ('family', 'server'), [('plan_tools', 'plan-tools'), ('verdict_tools', 'verdict-tools')],
+    )
+    async def test_agent_side_server_gets_the_task_root(
+        self, family, server, config, git_ops, task_assignment,
+    ):
+        """Task 3155: the agent-side server is launched on the same task root
+        the workflow reads, or the agent writes plan/verdicts where nobody looks."""
+        role = AgentRole(
+            name=f'probe_{family}', system_prompt='x', allowed_tools=[],
+            mcp_families=frozenset({family}),
+        )
+        call_kwargs, _workflow, cwd = await _invoke_probe(role, config, git_ops, task_assignment)
+
+        args = call_kwargs['mcp_config']['mcpServers'][server]['args']
+        idx = args.index('--task-root')
+        assert args[idx + 1] == str(
+            TaskArtifacts.task_root_for(cwd.parent, task_assignment.task_id)
         )
 
     async def test_orchestrator_family_wires_mcp_config_regardless_of_name(
@@ -557,7 +613,7 @@ class TestInvokeDerivesGatingFromRole:
     async def test_merger_gets_verdict_server_alongside_orchestrator(
         self, config, git_ops, task_assignment,
     ):
-        """MERGER already declares 'orchestrator' (for jcodemunch); the
+        """MERGER already declares 'orchestrator' (for its escalation tools); the
         verdict-tools gate must ADD its server alongside the
         orchestrator-assembled ones, not replace them (PRD task β, task 2482)."""
 
@@ -683,15 +739,15 @@ class TestInvokeScopesSelfContainedRolesStrictly:
         self, config, git_ops, task_assignment,
     ):
         role = AgentRole(
-            name='probe_verdict_jcm', system_prompt='x',
-            allowed_tools=['mcp__verdict-tools__*', 'mcp__jcodemunch__*'],
+            name='probe_verdict_ambient', system_prompt='x',
+            allowed_tools=['mcp__verdict-tools__*', 'mcp__ambient-probe__*'],
             mcp_families=frozenset({'verdict_tools'}),
         )
         call_kwargs, _workflow, _cwd = await _invoke_probe(role, config, git_ops, task_assignment)
 
         assert call_kwargs['strict_mcp_config'] is False, (
-            'The role grants mcp__jcodemunch__*, which only the orchestrator-'
-            'assembled or the ambient config serves; strict scoping would silently '
+            'The role grants mcp__ambient-probe__*, which only the ambient config '
+            'serves; strict scoping would silently '
             'strip a granted tool. Got '
             f"strict_mcp_config={call_kwargs['strict_mcp_config']!r}."
         )

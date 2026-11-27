@@ -35,7 +35,7 @@ dev = [
     "pytest>=9.0.2",
     "pytest-asyncio>=1.3.0",
     "pytest-timeout>=2.4.0",
-    "pytest-xdist>=3.5.0",
+    "pytest-xdist>=3.6.0",
     "ruff>=0.4.0",
     # Needed by TestMergeRequestDedup / TestGetMergeQueue in tests/test_server.py
     # (added by task 1604), which lazily import orchestrator.merge_lane.worker and
@@ -50,6 +50,11 @@ dark-factory-shared = { workspace = true }
 orchestrator = { workspace = true }
 
 [tool.pytest.ini_options]
+markers = [
+    "defect(ref): this test reproduces the declared defect <ref>; the binding is read statically by shared/src/shared/defect_enumerator.py (plans/defect-tests-prd.md decision 8). Not deselected by default.",
+    "criterion(id): this test evidences acceptance criterion <id> (plans/client-feed-prd.md §7.7). Not deselected by default.",
+    "timing(reason): a deadline, grace period or timeout is the behaviour under test, named by reason=; the timing-dependence lint (fused-memory/scripts/_timing_dependence.py) accepts a real sleep, an elapsed-vs-literal assert or a literal wait deadline only under it. Not deselected by default.",
+]
 # Default per-test timeout. Catches deadlocked lock implementations and
 # accidental hangs; slow tests opt out with @pytest.mark.timeout(N).
 # See shared/pyproject.toml for the full rationale, including why this is large
@@ -99,7 +104,8 @@ addopts = "-n auto --dist loadgroup"
 include = ["src", "tests"]
 # ".." LAST (mirrors tests/conftest.py's sys.path.append): resolves the repo-root
 # df_pytest_isolation module without letting project dirs shadow their own src/.
-extraPaths = ["src", "tests", "../shared/src", ".."]
+# "../scripts" resolves the `legibility` package for tests/test_legibility_census_escalation_e2e.py.
+extraPaths = ["src", "tests", "../shared/src", "..", "../scripts"]
 pythonVersion = "3.11"
 typeCheckingMode = "basic"
 # Task 3367 / esc-3359-1: pins pyright's interpreter to THIS worktree's own

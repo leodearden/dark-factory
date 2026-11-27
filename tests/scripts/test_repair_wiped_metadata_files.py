@@ -35,10 +35,10 @@ from pathlib import Path
 import pytest
 
 # All three modules live in <repo>/scripts, which tests/scripts/conftest.py puts
-# on sys.path at collection time. As of task 3456, scripts/ and
-# scripts/legibility/ are ALSO listed in [tool.pyright] extraPaths in the root
-# pyproject.toml — a precondition for the `scripts` module's own declared type
-# gate — so these imports resolve statically too and need no ignore. This comment
+# on sys.path at collection time. As of task 3456, scripts/ is ALSO listed in
+# [tool.pyright] extraPaths in the root pyproject.toml — a precondition for the
+# `scripts` module's own declared type gate — so these imports resolve
+# statically too and need no ignore. This comment
 # previously asserted the opposite ("deliberately absent from extraPaths"); 3456
 # falsified it. Same correction in
 # tests/scripts/test_migrate_metadata_modules_to_files.py.
@@ -52,8 +52,6 @@ from _task_db_scan import (
     AUDIT_EXIT_NO_ROOT,
     AUDIT_EXIT_NOTHING_AUDITED,
     AUDIT_EXIT_OK,
-    TaskDbProblem,
-    TaskDbUnreadable,
 )
 from audit_wiped_metadata_files import (
     CLEAN_MERGE_SHA,
@@ -63,6 +61,8 @@ from audit_wiped_metadata_files import (
     FIDELITY_LOCK_LEVEL,
     NO_MERGE_EVENT,
     NO_SUCCESSFUL_MERGE_SHA,
+    PLAN_EVENT_TYPES,
+    PLAN_EVENTS_SQL,
     AuditCoverage,
     WipeCandidate,
 )
@@ -102,6 +102,20 @@ from repair_wiped_metadata_files import (
     select_repairable_candidates,
     writable_plan_files,
 )
+from shared.task_store_schema import TASK_STORE_DDL
+from shared.tasks_db_readonly import TaskDbProblem, TaskDbUnreadable
+from shared.testing_sqlite_spill import (
+    SPILL_PAD,
+    SPILL_ROWS,
+    require_sort_to_spill,
+    run_unable_to_write_files,
+)
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+from tasks_db_schema import columns_outside, introspect, introspect_ddl
+
+from shared import project_layout
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 # ---------------------------------------------------------------------------
 # Synthetic candidate builder.
@@ -1139,7 +1153,9 @@ def _make_tasks_db(dir_path: Path, rows: list[dict]) -> Path:
     """Copied from scripts/tests/test_audit_wiped_metadata_files.py — the two
     test directories cannot share imports (same note as
     orchestrator/tests/test_deterministic_runner.py:31-32). Schemas mirror the
-    live ones so the audit exercises real column shapes."""
+    live ones so the audit exercises real column shapes; the subset guard below
+    checks ``_TASKS_SCHEMA`` against
+    ``shared/src/shared/task_store_schema.py::TASK_STORE_DDL``."""
     db_path = dir_path / "tasks.db"
     conn = sqlite3.connect(db_path)
     try:
@@ -1169,6 +1185,11 @@ def _make_tasks_db(dir_path: Path, rows: list[dict]) -> Path:
     finally:
         conn.close()
     return db_path
+
+
+def test_make_tasks_db_declares_only_columns_production_declares(tmp_path):
+    with contextlib.closing(sqlite3.connect(_make_tasks_db(tmp_path, []))) as fixture_conn:
+        assert columns_outside(introspect(fixture_conn), introspect_ddl(TASK_STORE_DDL)) == ()
 
 
 def _make_runs_db(dir_path: Path, events: list[dict]) -> Path:
@@ -1614,6 +1635,33 @@ def test_main_dry_run_summary_states_no_write_was_attempted(tmp_path):
     result = _run_cli("--project-root", str(root))
 
     assert "NO WRITE WAS ATTEMPTED" in result.stdout
+
+
+def test_main_dry_run_audits_an_event_log_whose_sort_spills_when_no_file_can_be_written(tmp_path):
+    """A sandboxed run with no writable temp dir must audit a healthy event log,
+    not skip it as an unreadable project and exit 3 (task 7251)."""
+    root = _make_project(
+        tmp_path,
+        tasks=[{"id": 1, "status": "done", "metadata": {"files": []}}],
+        events=[
+            {"event_type": "phase_skipped", "task_id": i, "data": {"plan_files": ["a.py"], "pad": SPILL_PAD}}
+            for i in range(SPILL_ROWS)
+        ],
+    )
+    runs_db = project_layout.runs_db(root)
+    # The live store carries this index (orchestrator/src/orchestrator/event_store.py); it makes the IN ... ORDER BY id query sort.
+    with contextlib.closing(sqlite3.connect(runs_db)) as c:
+        c.execute("CREATE INDEX idx_events_type ON events(event_type)")
+        c.commit()
+    require_sort_to_spill(runs_db, PLAN_EVENTS_SQL, PLAN_EVENT_TYPES)
+
+    result = run_unable_to_write_files([sys.executable, _SCRIPT, "--project-root", str(root), "--json"])
+
+    assert result.returncode == 0, result.stderr
+    assert "unreadable" not in result.stderr
+    project = json.loads(result.stdout)["projects"][0]
+    assert project["applied"] is False
+    assert [(o["task_id"], o["disposition"]) for o in project["outcomes"]] == [(1, REPAIR)]
 
 
 def test_main_json_emits_an_object_with_both_outcomes_and_coverage(tmp_path):

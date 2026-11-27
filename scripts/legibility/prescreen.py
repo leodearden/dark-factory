@@ -157,71 +157,70 @@ class Surfaced:
 
 @dataclass(frozen=True)
 class Screen:
-    to_verify: tuple[dict, ...]
+    """One pre-screened batch: *records* routed for the merge, refs into them
+    for the payloads still to verify, the subset of those no catalogued record
+    matches, and the payloads screened or surfaced on the way."""
+
+    records: tuple[dict, ...]
+    to_verify: tuple[codebook.PayloadRef, ...]
+    uncatalogued: tuple[codebook.PayloadRef, ...]
     screened: tuple[Screened, ...]
     surfaced: tuple[Surfaced, ...]
-
-    @property
-    def uncatalogued(self) -> tuple[dict, ...]:
-        """The clusters to verify that no catalogued record matches by title or
-        session; a surfaced cluster re-observes a fixed entry and is not among them."""
-        surfaced = {item.title for item in self.surfaced}
-        return tuple(cluster for cluster in self.to_verify if cluster["title"] not in surfaced)
-
-
-def screen(clusters: Sequence[dict], catalogue: Catalogue) -> Screen:
-    """Split novel *clusters* into those still to verify, in order, and those
-    the title rule or the session rule screens."""
-    to_verify: list[dict] = []
-    screened: list[Screened] = []
-    surfaced: list[Surfaced] = []
-    for cluster in clusters:
-        title = cluster["title"]
-        sessions = codebook.sessions_of(cluster)
-        session = sessions[0] if sessions else None
-        if (attach := catalogue.attachable(title)) is not None:
-            screened.append(Screened(Rule.TITLE, title, session, attach.matched))
-        elif (match := catalogue.title_match(title)) is not None:
-            surfaced.append(Surfaced(Rule.TITLE, title, match.fixed_entry_ids))
-            to_verify.append(cluster)
-        elif sighted := catalogue.sighted(sessions):
-            screened.append(Screened(Rule.SESSION, title, session, sighted))
-        else:
-            to_verify.append(cluster)
-    return Screen(tuple(to_verify), tuple(screened), tuple(surfaced))
 
 
 _MATCH_FIELDS = ("origin_phase", "manifested_phase", "evidence_quote")
 
 
-def routed_records(records: Sequence[dict], catalogue: Catalogue, *, run_id: str) -> list[dict]:
-    """New copies of *records* in which every title-screened candidate payload
-    attaches through the merger's existing routing: renamed to the matched
-    candidate's exact title, or turned into a ``matches`` op on the one entry
-    carrying the title. Each carries ``attached_by``; no other payload changes."""
-    routed = []
-    for record in records:
+def screen(records: Sequence[dict], catalogue: Catalogue, *, run_id: str) -> Screen:
+    """Screen each candidate payload of *records* once, in mining order.
+
+    A payload the title rule attaches is routed through the merger's existing
+    routing: renamed to the matched candidate's exact title, or turned into a
+    ``matches`` op on the one entry carrying the title, carrying
+    ``attached_by``. Every other payload is left as mined: a surfaced one is
+    verified, a session-screened one is not, and the rest are verified and
+    uncatalogued. A titleless payload is merged and nothing else."""
+    routed: list[dict] = []
+    to_verify: list[codebook.PayloadRef] = []
+    uncatalogued: list[codebook.PayloadRef] = []
+    screened: list[Screened] = []
+    surfaced: list[Surfaced] = []
+    for record_index, record in enumerate(records):
         record = copy.deepcopy(record)
+        session = record.get("session") if isinstance(record.get("session"), str) else None
         candidates, matches = [], list(record.get("matches") or [])
         for payload in record.get("candidates") or []:
             title = payload.get("title") if isinstance(payload, dict) else None
-            attach = catalogue.attachable(title) if isinstance(title, str) and title else None
-            if attach is None:
+            if not (isinstance(title, str) and title):
                 candidates.append(payload)
-            elif attach.entry_id is None:
-                candidates.append({**payload, "title": attach.title, "attached_by": _attached_by(Rule.TITLE, run_id)})
+                continue
+            if (attach := catalogue.attachable(title)) is not None:
+                screened.append(Screened(Rule.TITLE, title, session, attach.matched))
+                if attach.entry_id is None:
+                    candidates.append({**payload, "title": attach.title, "attached_by": _attached_by(Rule.TITLE, run_id)})
+                else:
+                    matches.append({
+                        "entry_id": attach.entry_id,
+                        **{field: payload[field] for field in _MATCH_FIELDS if field in payload},
+                        "attached_by": _attached_by(Rule.TITLE, run_id),
+                    })
+                continue
+            ref = codebook.PayloadRef(record=record_index, candidate=len(candidates))
+            candidates.append(payload)
+            if (match := catalogue.title_match(title)) is not None:
+                surfaced.append(Surfaced(Rule.TITLE, title, match.fixed_entry_ids))
+                to_verify.append(ref)
+            elif session is not None and (sighted := catalogue.sighted([session])):
+                screened.append(Screened(Rule.SESSION, title, session, sighted))
             else:
-                matches.append({
-                    "entry_id": attach.entry_id,
-                    **{field: payload[field] for field in _MATCH_FIELDS if field in payload},
-                    "attached_by": _attached_by(Rule.TITLE, run_id),
-                })
+                to_verify.append(ref)
+                uncatalogued.append(ref)
         if "candidates" in record:
             record["candidates"] = candidates
         if "matches" in record or matches:
             record["matches"] = matches
         routed.append(record)
-    return routed
+    return Screen(tuple(routed), tuple(to_verify), tuple(uncatalogued), tuple(screened), tuple(surfaced))
 
 
 def _entries_at(
@@ -264,20 +263,13 @@ class KeyAttach:
         return None if standing == offered else (standing, offered)
 
 
-def _record_by_id(records: Iterable[dict], record_id: str, *, kind: str) -> dict:
-    for record in records:
-        if record.get("id") == record_id:
-            return record
-    raise ValueError(f"attach_by_key: no {kind} {record_id!r}")
-
-
 def attach_by_key(
     cb: dict, candidate_id: str, entry_id: str, found: verdict.Verdict, *, run_id: str,
 ) -> tuple[dict, KeyAttach]:
     """A new codebook in which pending *candidate_id* joins keyed entry
     *entry_id* (``entry_join.py::join_entry``), and the attach it made. The
     sightings it appends carry the attach and the verifier's tags."""
-    target = _record_by_id(cb.get("entries") or [], entry_id, kind="entry")
+    target = codebook.record_by_id(cb.get("entries") or [], entry_id, kind="entry")
     identity = census_findings.FindingIdentity.from_record(target)
     if identity is None:
         raise ValueError(f"attach_by_key: entry {entry_id!r} carries no finding identity")
@@ -288,7 +280,7 @@ def attach_by_key(
         sighting_fields={"attached_by": attached_by, "verifier_tags": list(found.tags)},
     )
     return result, KeyAttach(
-        title=_record_by_id(result["candidates"], candidate_id, kind="candidate").get("title") or "",
+        title=codebook.record_by_id(result["candidates"], candidate_id, kind="candidate").get("title") or "",
         candidate_id=candidate_id,
         entry_id=entry_id,
         identity=identity,

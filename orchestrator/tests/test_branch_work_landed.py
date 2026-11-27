@@ -8,46 +8,46 @@ merely thorough: the producer under test is defined by what ``git cherry``,
 sync-merged and no-op-merged histories, and a mock would only re-assert this
 file's own assumptions about them.
 
-Fixture scaffolding is MODULE-LOCAL and modelled verbatim on
-``test_git_ops.py``'s ``git_repo`` / ``git_config`` / ``git_ops`` triple and
-its ``_commit_all`` helper.  Both isolation guards from ``_orch_helpers`` are
-applied to every synthetic repo (esc-3072-3): ``assert_isolated_git_repo``
-runs BEFORE any subprocess so a rejected call writes nothing anywhere, and
-``git_env_with_ceiling`` caps git's upward repo discovery at the fixture root
-so escape is impossible at the git level even if the pre-flight is ever
-refactored away.  Without both, a pytest basetemp living inside a live task
-worktree would send ``git commit`` into the enclosing dark-factory checkout.
-
-The boundary rows the scenario builders below exist to construct:
-
-* **B1** non-decay — a landed branch followed by N unrelated commits that
-  TOUCH THE SAME PATHS (:func:`advance_main_touching_same_paths`).
-* **B2** sync-merge tip — a branch whose tip is a conflict-resolution merge
-  whose ``parents[1]`` is main (:func:`build_sync_merge_branch`).
-* **B3** rebase landing — the branch's work on main with REWRITTEN shas, no
-  merge commit and no citation (:func:`build_rebased_landing`).
-* **B4** no-op landing — a merge commit on main whose net branch diff is
-  empty (:func:`build_no_op_landing`).
-* **B5** genuinely unlanded — a branch whose commits are absent from main
-  (:func:`build_unlanded_branch`).
-* **B6** degenerate branch — a tip equal to the recorded ``branch_base_sha``
-  (:func:`build_degenerate_branch`).
+The ``git_repo`` / ``git_config`` / ``git_ops`` fixtures are MODULE-LOCAL and
+modelled on ``test_git_ops.py``'s triple.  The guarded repository wrapper and
+the one-builder-per-boundary-row scenarios (B1--B6) live in
+``_landing_git_scenarios``, shared with the consumer suites that rebuild the
+same shapes one layer up; its docstring names each row and the isolation
+guards (esc-3072-3) every repository is built under.
 """
 
 from __future__ import annotations
 
 import inspect
-import subprocess
-from dataclasses import dataclass, field
+import os
+import shlex
+import shutil
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import pytest
-from _orch_helpers import (
-    NonIsolatedGitRepoError,
-    assert_isolated_git_repo,
-    git_env_with_ceiling,
+from _landing_git_scenarios import (
+    BRANCH,
+    TASK_ID,
+    WORK_PATH,
+    Scenario,
+    advance_main_touching_same_paths,
+    build_degenerate_branch,
+    build_landing_then_main_merged_back,
+    build_main_merged_only_branch,
+    build_merged_landing,
+    build_no_op_landing,
+    build_rebased_landing,
+    build_reseeded_ancestor_tip,
+    build_sync_merge_branch,
+    build_unlanded_branch,
+    numbered_lines,
+    revert_landing,
+    rewind_landing,
+    seed_branch,
 )
+from _landing_git_scenarios import LandingRepo as _Repo
+from _orch_helpers import NonIsolatedGitRepoError
 
 from orchestrator.config import GitConfig, RecoveryEmissionConfig
 from orchestrator.git_ops import GitOps
@@ -66,125 +66,6 @@ from orchestrator.merge_lane.landing_evidence import (
 
 if TYPE_CHECKING:
     from escalation.queue import EscalationQueue
-
-TASK_ID = '4647'
-BRANCH = f'task/{TASK_ID}'
-
-#: The two paths every scenario's task work touches.  Shared by construction so
-#: B1 can rewrite exactly the lines the task added.
-WORK_PATH = 'pkg/feature.py'
-OTHER_PATH = 'pkg/helper.py'
-
-
-def _numbered(prefix: str, count: int, *, start: int = 0) -> str:
-    """Return *count* unique, non-blank lines.
-
-    Uniqueness is load-bearing rather than cosmetic (the same reasoning as
-    ``test_git_ops.py``'s helper of the same name): patch-ids and line-survival
-    are both computed over line CONTENT, so duplicated or short common lines
-    can be "present" by pure coincidence and a fixture built from them would
-    measure coincidence instead of containment.
-    """
-    return ''.join(f'{prefix}_{i:04d} = {i * 7919}\n' for i in range(start, start + count))
-
-
-class _Repo:
-    """A synthetic git repository with the isolation guards always applied.
-
-    Every git invocation goes through :meth:`git`, so there is exactly one
-    place where ``cwd`` and the ceiling environment are established and no
-    scenario builder can accidentally shell out unguarded.
-    """
-
-    def __init__(self, root: Path) -> None:
-        # FIRST, before any subprocess: a rejected root must write nothing.
-        assert_isolated_git_repo(root)
-        self.root = root
-        self.env = git_env_with_ceiling(root)
-
-    @classmethod
-    def init(cls, root: Path) -> _Repo:
-        """``git init`` *root* and return the guarded wrapper for it.
-
-        The pre-flight cannot run before ``git init`` — it refuses any
-        directory that is not ALREADY a repo root, which is precisely what
-        this call creates.  The ceiling environment is therefore applied to
-        the bootstrap invocation on its own, and ``git init`` only ever
-        writes into its own ``cwd``, so no upward escape is possible even in
-        the one call the pre-flight cannot cover.
-        """
-        proc = subprocess.run(
-            ['git', 'init', '-b', 'main'], cwd=str(root), capture_output=True,
-            env=git_env_with_ceiling(root), text=True, check=False,
-        )
-        assert proc.returncode == 0, f'git init failed: {proc.stderr.strip()}'
-        return cls(root)
-
-    def git(self, *args: str, check: bool = True) -> str:
-        proc = subprocess.run(
-            ['git', *args], cwd=str(self.root), capture_output=True,
-            env=self.env, text=True, check=False,
-        )
-        if check:
-            assert proc.returncode == 0, (
-                f'git {" ".join(args)} failed (rc={proc.returncode}): '
-                f'{proc.stderr.strip()}'
-            )
-        return proc.stdout.strip()
-
-    def git_rc(self, *args: str) -> tuple[int, str]:
-        proc = subprocess.run(
-            ['git', *args], cwd=str(self.root), capture_output=True,
-            env=self.env, text=True, check=False,
-        )
-        return proc.returncode, proc.stdout.strip()
-
-    def write(self, rel: str, content: str) -> None:
-        target = self.root / rel
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(content)
-
-    def commit(self, message: str, files: dict[str, str] | None = None) -> str:
-        """Write *files*, stage everything and commit; return the new sha."""
-        for rel, content in (files or {}).items():
-            self.write(rel, content)
-        self.git('add', '-A')
-        self.git('commit', '-m', message)
-        return self.sha('HEAD')
-
-    def commit_empty(self, message: str) -> str:
-        self.git('commit', '--allow-empty', '-m', message)
-        return self.sha('HEAD')
-
-    def sha(self, ref: str) -> str:
-        return self.git('rev-parse', ref)
-
-    def parents(self, ref: str) -> list[str]:
-        return self.git('rev-list', '--parents', '-n', '1', ref).split()[1:]
-
-    def subjects(self, ref: str) -> list[str]:
-        out = self.git('log', '--format=%s', ref)
-        return out.splitlines() if out else []
-
-
-@dataclass
-class Scenario:
-    """What a scenario builder hands the test: refs plus the task metadata."""
-
-    repo: _Repo
-    branch: str = BRANCH
-    branch_tip_sha: str = ''
-    branch_base_sha: str = ''
-    main_sha: str = ''
-    #: The commit on main that carries this task's work, when one exists.
-    landed_sha: str | None = None
-    #: The paths the task's work touched, for B1's same-path churn.
-    work_paths: tuple[str, ...] = (WORK_PATH, OTHER_PATH)
-    metadata: dict[str, object] = field(default_factory=dict)
-
-    def refresh(self) -> None:
-        self.branch_tip_sha = self.repo.sha(self.branch)
-        self.main_sha = self.repo.sha('main')
 
 
 @pytest.fixture
@@ -221,260 +102,17 @@ def repo(git_repo: Path) -> _Repo:
     return _Repo(git_repo)
 
 
-# --------------------------------------------------------------------------
-# Scenario builders — one per boundary row.
-# --------------------------------------------------------------------------
+async def _landed_under_default_pattern(
+    git_ops: GitOps, task_id: str, branch: str, **kwargs: Any,
+) -> LandingVerdict:
+    """``branch_work_landed`` under the default citation pattern.
 
-
-def _seed_branch(repo: _Repo, *, branch: str = BRANCH) -> tuple[str, str]:
-    """Create *branch* off main with two content-bearing commits.
-
-    Returns ``(branch_base_sha, branch_tip_sha)``.
+    The producer requires ``pattern_template`` by keyword; every test outside
+    ``TestCitationPatternIsHonoured`` means ``None``, the default pattern.
     """
-    base = repo.sha('main')
-    repo.git('checkout', '-b', branch)
-    repo.commit(
-        f'feat({TASK_ID}): add the feature module',
-        {WORK_PATH: _numbered('feature', 40)},
+    return await branch_work_landed(
+        git_ops, task_id, branch, pattern_template=None, **kwargs,
     )
-    repo.commit(
-        f'test({TASK_ID}): cover the feature module',
-        {OTHER_PATH: _numbered('helper', 30)},
-    )
-    tip = repo.sha('HEAD')
-    repo.git('checkout', 'main')
-    return base, tip
-
-
-def build_merged_landing(repo: _Repo, *, branch: str = BRANCH) -> Scenario:
-    """(a) A task branch merged to main by a no-ff merge carrying a citation."""
-    base, tip = _seed_branch(repo, branch=branch)
-    repo.git('merge', '--no-ff', branch, '-m', f'Merge {branch} into main')
-    merge_sha = repo.sha('main')
-    sc = Scenario(
-        repo=repo, branch=branch, branch_base_sha=base, landed_sha=merge_sha,
-        metadata={'branch_base_sha': base},
-    )
-    sc.refresh()
-    assert sc.branch_tip_sha == tip
-    return sc
-
-
-def build_rebased_landing(repo: _Repo, *, branch: str = BRANCH) -> Scenario:
-    """(b) B3 — the same work REBASED onto main: rewritten shas, no merge, no citation.
-
-    Main is advanced first so the replay genuinely rewrites the shas, and the
-    replayed commits are re-worded to strip every task citation, so a
-    citation-based detector has nothing to find and only patch-id equivalence
-    can attribute the landing.
-    """
-    base, tip = _seed_branch(repo, branch=branch)
-    repo.commit('chore: unrelated main advance', {'CHANGELOG.md': _numbered('log', 5)})
-
-    # Replay the branch's content onto main with fresh shas and no citation.
-    # ONE REPLAYED COMMIT PER SOURCE COMMIT, deliberately: ``git cherry``
-    # compares PER-COMMIT patch-ids, so squashing the branch's two commits
-    # into one replay commit produces a patch-id that matches NEITHER source
-    # and the fixture would build an "unlanded" shape while claiming to build
-    # a rebase landing.  Re-wording each replay does not perturb its patch-id
-    # (patch-id is computed over the diff alone), which is what lets this
-    # scenario be simultaneously patch-id-contained and citation-free.
-    commits = repo.git('rev-list', '--reverse', f'{base}..{tip}').splitlines()
-    repo.git('checkout', '-b', '_replay', 'main')
-    for i, sha in enumerate(commits):
-        repo.git('cherry-pick', sha)
-        repo.git('commit', '--amend', '-m', f'chore: unattributed replay {i}')
-    repo.git('checkout', 'main')
-    repo.git('merge', '--ff-only', '_replay')
-    repo.git('branch', '-D', '_replay')
-
-    landed = repo.sha('main')
-    sc = Scenario(
-        repo=repo, branch=branch, branch_base_sha=base, landed_sha=landed,
-        metadata={'branch_base_sha': base},
-    )
-    sc.refresh()
-    assert sc.branch_tip_sha == tip
-    return sc
-
-
-def build_sync_merge_branch(repo: _Repo, *, branch: str = BRANCH) -> Scenario:
-    """(c) B2 — a branch tip that is a conflict-resolution merge with parents[1] == main.
-
-    The branch and main both edit ``WORK_PATH``, so merging main INTO the
-    branch conflicts and must be resolved; the resulting tip is a real merge
-    commit whose second parent is main's tip.  The branch's own work is then
-    landed on main by a no-ff merge.
-    """
-    base, _tip = _seed_branch(repo, branch=branch)
-    main_edit = repo.commit(
-        'chore: main edits the same file',
-        {WORK_PATH: _numbered('feature', 40) + _numbered('mainside', 6)},
-    )
-    repo.git('checkout', branch)
-    rc, _ = repo.git_rc('merge', '--no-ff', 'main', '-m', f'Merge main into {branch}')
-    assert rc != 0, 'the sync merge was expected to conflict'
-    repo.write(WORK_PATH, _numbered('feature', 40) + _numbered('mainside', 6))
-    repo.git('add', '-A')
-    repo.git('commit', '--no-edit')
-    tip = repo.sha('HEAD')
-    assert repo.parents(tip)[1] == main_edit, 'parents[1] must be main'
-    repo.git('checkout', 'main')
-    repo.git('merge', '--no-ff', branch, '-m', f'Merge {branch} into main')
-
-    sc = Scenario(
-        repo=repo, branch=branch, branch_base_sha=base,
-        landed_sha=repo.sha('main'), metadata={'branch_base_sha': base},
-    )
-    sc.refresh()
-    assert sc.branch_tip_sha == tip
-    return sc
-
-
-def build_no_op_landing(repo: _Repo, *, branch: str = BRANCH) -> Scenario:
-    """(d) B4 — a merge commit on main whose NET branch diff is empty (task-1175 shape).
-
-    The branch adds the feature and then removes it again, so every commit is
-    real work but ``merge-base(main, tip)..tip`` is empty: the merge marker on
-    main is genuine while the task delivered nothing.
-    """
-    base = repo.sha('main')
-    repo.git('checkout', '-b', branch)
-    repo.commit(
-        f'feat({TASK_ID}): add the feature module',
-        {WORK_PATH: _numbered('feature', 40)},
-    )
-    repo.git('rm', '-q', WORK_PATH)
-    repo.git('commit', '-m', f'fix({TASK_ID}): back the feature out again')
-    tip = repo.sha('HEAD')
-    repo.git('checkout', 'main')
-    repo.git('merge', '--no-ff', branch, '-m', f'Merge {branch} into main')
-
-    sc = Scenario(
-        repo=repo, branch=branch, branch_base_sha=base,
-        landed_sha=repo.sha('main'), metadata={'branch_base_sha': base},
-    )
-    sc.refresh()
-    assert sc.branch_tip_sha == tip
-    return sc
-
-
-def build_degenerate_branch(repo: _Repo, *, branch: str = BRANCH) -> Scenario:
-    """(e) B6 — a branch whose tip equals its recorded ``branch_base_sha``.
-
-    Zero commits were ever pushed beyond the creation point (#1226).  Main is
-    then advanced so the branch is parked at an OLD main commit, which is the
-    shape that reads as a confident landing to any containment-only check.
-    """
-    base = repo.sha('main')
-    repo.git('branch', branch, base)
-    repo.commit('chore: main advances past the parked branch', {WORK_PATH: _numbered('foreign', 20)})
-
-    sc = Scenario(
-        repo=repo, branch=branch, branch_base_sha=base, landed_sha=None,
-        metadata={'branch_base_sha': base},
-    )
-    sc.refresh()
-    assert sc.branch_tip_sha == base
-    return sc
-
-
-def build_unlanded_branch(repo: _Repo, *, branch: str = BRANCH) -> Scenario:
-    """B5 — a branch with real commits that are genuinely absent from main."""
-    base, tip = _seed_branch(repo, branch=branch)
-    repo.commit('chore: main moves on without the branch', {'CHANGELOG.md': _numbered('log', 5)})
-
-    sc = Scenario(
-        repo=repo, branch=branch, branch_base_sha=base, landed_sha=None,
-        metadata={'branch_base_sha': base},
-    )
-    sc.refresh()
-    assert sc.branch_tip_sha == tip
-    return sc
-
-
-def advance_main_touching_same_paths(
-    sc: Scenario, count: int, *, rewrite: bool = False, start: int = 0,
-) -> list[str]:
-    """(f) B1 — *count* unrelated commits on main that TOUCH THE SAME PATHS.
-
-    With ``rewrite=True`` the final commit REPLACES most of the lines the task
-    added, which is the shape that trips the 0.98 aggregate / 0.90 per-file
-    line-survival thresholds a decaying effect-present predicate applies.  The
-    task's work is not removed — it is churned — so a non-decaying producer
-    must still report it landed.
-
-    *start* offsets the churn counter so a caller advancing main ONE commit at
-    a time (to re-run the producer after each) still writes distinct content
-    every time.  Without it a repeated ``count=1`` call rewrites byte-identical
-    content and ``git commit`` fails with "nothing to commit" — the fixture
-    would silently stop advancing main and the non-decay pin would measure
-    nothing.
-    """
-    repo = sc.repo
-    repo.git('checkout', 'main')
-    shas: list[str] = []
-    for n in range(count):
-        i = start + n
-        last = rewrite and n == count - 1
-        body = (
-            _numbered('rewritten', 40, start=1000) if last
-            else _numbered('feature', 40) + _numbered('churn', 4, start=100 * (i + 1))
-        )
-        shas.append(repo.commit(
-            f'chore: unrelated main churn {i}',
-            {WORK_PATH: body, OTHER_PATH: _numbered('helper', 30) + _numbered('extra', 2, start=i)},
-        ))
-    sc.refresh()
-    return shas
-
-
-def revert_landing(sc: Scenario) -> str:
-    """Apply a POST-HOC REVERT of the landing on main.
-
-    Measured against real git (both the merged and the rebased landing shape):
-    a ``git revert`` does **not** make the task's patch-ids absent from main.
-    ``git cherry`` answers "is an equivalent patch anywhere in upstream's
-    history", and a revert ADDS an inverse commit rather than removing the
-    original — so containment still holds afterwards.  See
-    :func:`rewind_landing` for the construction that genuinely removes it.
-
-    This builder therefore exists to PIN that accepted residual, not to flip a
-    verdict.  It is the tradeoff D1 already prices in (2 genuine post-hoc
-    reverts across both repos in 5.4 months) and is the direct cost of the
-    non-decay property B1 demands: a predicate that could see this revert is
-    exactly a predicate that decays under ordinary same-path churn.
-    """
-    repo = sc.repo
-    repo.git('checkout', 'main')
-    assert sc.landed_sha is not None, 'nothing to revert — this scenario never landed'
-    if len(repo.parents(sc.landed_sha)) >= 2:
-        repo.git('revert', '--no-edit', '-m', '1', sc.landed_sha)
-    else:
-        repo.git('revert', '--no-edit', sc.landed_sha)
-    sc.refresh()
-    return repo.sha('main')
-
-
-def rewind_landing(sc: Scenario) -> str:
-    """B1's paired NEGATIVE — genuinely REMOVE the task's work from main.
-
-    Rewinds main to the commit preceding the landing and advances it with
-    unrelated work, so the task's commits are no longer in main's history at
-    all and their patch-ids are genuinely absent.  This is the only removal
-    shape patch-id containment can observe (see :func:`revert_landing`), and
-    it is what keeps B1's non-decay pin from being vacuous: the invariant is
-    "must not decay unless the work is genuinely removed", not "always True".
-    """
-    repo = sc.repo
-    repo.git('checkout', 'main')
-    assert sc.landed_sha is not None, 'nothing to rewind — this scenario never landed'
-    repo.git('reset', '--hard', f'{sc.landed_sha}^1')
-    repo.commit('chore: main moves on without the reverted work',
-                {'CHANGELOG.md': _numbered('log', 5)})
-    sc.landed_sha = None
-    sc.refresh()
-    return repo.sha('main')
 
 
 # --------------------------------------------------------------------------
@@ -543,7 +181,7 @@ class TestBoundaryFixtures:
         # ...but most of the lines the task added are gone from main HEAD,
         # which is exactly what makes a survival-threshold predicate decay.
         head_body = (repo.root / WORK_PATH).read_text()
-        added = _numbered('feature', 40).splitlines()
+        added = numbered_lines('feature', 40).splitlines()
         survivors = sum(1 for line in added if line in head_body.splitlines())
         assert survivors / len(added) < 0.90
 
@@ -573,15 +211,15 @@ class TestBoundaryFixtures:
         in the producer, and this test is what would notice if that ever
         changed under us.
         """
-        base, _tip = _seed_branch(repo)
+        base, _tip = seed_branch(repo)
         main_edit = repo.commit(
             'chore: main edits the same file',
-            {WORK_PATH: _numbered('feature', 40) + _numbered('mainside', 6)},
+            {WORK_PATH: numbered_lines('feature', 40) + numbered_lines('mainside', 6)},
         )
         repo.git('checkout', BRANCH)
         rc, _ = repo.git_rc('merge', '--no-ff', 'main', '-m', f'Merge main into {BRANCH}')
         assert rc != 0
-        repo.write(WORK_PATH, _numbered('feature', 40) + _numbered('mainside', 6))
+        repo.write(WORK_PATH, numbered_lines('feature', 40) + numbered_lines('mainside', 6))
         repo.git('add', '-A')
         repo.git('commit', '--no-edit')
         tip = repo.sha('HEAD')
@@ -658,7 +296,7 @@ class TestB3RebaseLanding:
         self, git_ops: GitOps, repo: _Repo,
     ) -> None:
         sc = build_rebased_landing(repo)
-        verdict = await branch_work_landed(
+        verdict = await _landed_under_default_pattern(
             git_ops, TASK_ID, sc.branch, branch_tip_sha=sc.branch_tip_sha,
         )
         assert isinstance(verdict, LandingVerdict)
@@ -679,10 +317,10 @@ class TestB3RebaseLanding:
         """
         sc = build_rebased_landing(repo)
         repo.git('checkout', 'main')
-        repo.commit('chore: an unrelated follow-up', {'CHANGELOG.md': _numbered('log', 7)})
+        repo.commit('chore: an unrelated follow-up', {'CHANGELOG.md': numbered_lines('log', 7)})
         sc.refresh()
 
-        verdict = await branch_work_landed(
+        verdict = await _landed_under_default_pattern(
             git_ops, TASK_ID, sc.branch, branch_tip_sha=sc.branch_tip_sha,
         )
         evidence = verdict.evidence_sha
@@ -711,7 +349,7 @@ class TestB3RebaseLanding:
         a property of the CALL, not of the outcome.
         """
         sc = build_rebased_landing(repo)
-        verdict = await branch_work_landed(
+        verdict = await _landed_under_default_pattern(
             git_ops, TASK_ID, sc.branch, branch_tip_sha=sc.branch_tip_sha,
         )
         assert verdict.probe, 'the probe must never be empty'
@@ -725,7 +363,7 @@ class TestB3RebaseLanding:
         self, git_ops: GitOps, repo: _Repo,
     ) -> None:
         sc = build_rebased_landing(repo)
-        verdict = await branch_work_landed(
+        verdict = await _landed_under_default_pattern(
             git_ops, TASK_ID, sc.branch, branch_tip_sha=None,
         )
         assert verdict.accepted is True
@@ -745,7 +383,7 @@ class TestB5GenuinelyUnlanded:
         self, git_ops: GitOps, repo: _Repo,
     ) -> None:
         sc = build_unlanded_branch(repo)
-        verdict = await branch_work_landed(
+        verdict = await _landed_under_default_pattern(
             git_ops, TASK_ID, sc.branch, branch_tip_sha=sc.branch_tip_sha,
         )
         assert verdict.accepted is False
@@ -758,7 +396,7 @@ class TestB5GenuinelyUnlanded:
         self, git_ops: GitOps, repo: _Repo,
     ) -> None:
         sc = build_unlanded_branch(repo)
-        verdict = await branch_work_landed(
+        verdict = await _landed_under_default_pattern(
             git_ops, TASK_ID, sc.branch, branch_tip_sha=sc.branch_tip_sha,
         )
         assert verdict.probe
@@ -777,7 +415,7 @@ class TestB5GenuinelyUnlanded:
         to improve.
         """
         sc = build_unlanded_branch(repo)
-        verdict = await branch_work_landed(
+        verdict = await _landed_under_default_pattern(
             git_ops, TASK_ID, sc.branch, branch_tip_sha=sc.branch_tip_sha,
         )
         summary, detail = format_unattributed_landing_detail(
@@ -826,7 +464,7 @@ class TestB4NoOpLanding:
         self, git_ops: GitOps, repo: _Repo,
     ) -> None:
         sc = build_no_op_landing(repo)
-        verdict = await branch_work_landed(
+        verdict = await _landed_under_default_pattern(
             git_ops, TASK_ID, sc.branch,
             branch_tip_sha=sc.branch_tip_sha, metadata=sc.metadata,
         )
@@ -847,7 +485,7 @@ class TestB4NoOpLanding:
         sc = build_no_op_landing(repo)
         assert f'Merge {sc.branch} into main' in repo.subjects('main')
         assert await git_ops.find_task_citation_commit(TASK_ID) is not None
-        verdict = await branch_work_landed(
+        verdict = await _landed_under_default_pattern(
             git_ops, TASK_ID, sc.branch,
             branch_tip_sha=sc.branch_tip_sha, metadata=sc.metadata,
         )
@@ -857,7 +495,7 @@ class TestB4NoOpLanding:
         self, git_ops: GitOps, repo: _Repo,
     ) -> None:
         sc = build_no_op_landing(repo)
-        verdict = await branch_work_landed(
+        verdict = await _landed_under_default_pattern(
             git_ops, TASK_ID, sc.branch,
             branch_tip_sha=sc.branch_tip_sha, metadata=sc.metadata,
         )
@@ -896,7 +534,7 @@ class TestOrderingRule:
         # Precondition 2: ...and the branch's net contribution is empty.
         assert await git_ops.net_diff_is_empty('main', sc.branch_tip_sha) is True
 
-        verdict = await branch_work_landed(
+        verdict = await _landed_under_default_pattern(
             git_ops, TASK_ID, sc.branch,
             branch_tip_sha=sc.branch_tip_sha, metadata=sc.metadata,
         )
@@ -920,7 +558,7 @@ class TestOrderingRule:
         # of anything but degenerate_branch would be the later arm's answer.
         assert await patch_content_contained(sc.branch_tip_sha, 'main', git_ops) is True
 
-        verdict = await branch_work_landed(
+        verdict = await _landed_under_default_pattern(
             git_ops, TASK_ID, sc.branch,
             branch_tip_sha=sc.branch_tip_sha, metadata=sc.metadata,
         )
@@ -937,7 +575,7 @@ class TestB6DegenerateBranch:
     ) -> None:
         sc = build_degenerate_branch(repo)
         assert sc.branch_tip_sha == sc.branch_base_sha
-        verdict = await branch_work_landed(
+        verdict = await _landed_under_default_pattern(
             git_ops, TASK_ID, sc.branch,
             branch_tip_sha=sc.branch_tip_sha, metadata=sc.metadata,
         )
@@ -958,7 +596,7 @@ class TestB6DegenerateBranch:
         self, git_ops: GitOps, repo: _Repo,
     ) -> None:
         sc = build_degenerate_branch(repo)
-        verdict = await branch_work_landed(
+        verdict = await _landed_under_default_pattern(
             git_ops, TASK_ID, sc.branch,
             branch_tip_sha=sc.branch_tip_sha, metadata=sc.metadata,
         )
@@ -982,7 +620,7 @@ class TestDegenerateArmBackwardCompatibility:
         self, git_ops: GitOps, repo: _Repo,
     ) -> None:
         sc = build_unlanded_branch(repo)
-        verdict = await branch_work_landed(
+        verdict = await _landed_under_default_pattern(
             git_ops, TASK_ID, sc.branch,
             branch_tip_sha=sc.branch_tip_sha, metadata=None,
         )
@@ -993,7 +631,7 @@ class TestDegenerateArmBackwardCompatibility:
     ) -> None:
         sc = build_unlanded_branch(repo)
         for bogus in ('', 'not-a-sha', 'ABCDEF' * 6 + 'abcd', 123, None):
-            verdict = await branch_work_landed(
+            verdict = await _landed_under_default_pattern(
                 git_ops, TASK_ID, sc.branch,
                 branch_tip_sha=sc.branch_tip_sha,
                 metadata={'branch_base_sha': bogus},
@@ -1051,7 +689,7 @@ class TestDegenerateArmBackwardCompatibility:
         posture is backward compatibility rather than a supported mode.
         """
         sc = build_degenerate_branch(repo)
-        verdict = await branch_work_landed(
+        verdict = await _landed_under_default_pattern(
             git_ops, TASK_ID, sc.branch,
             branch_tip_sha=sc.branch_tip_sha, metadata=None,
         )
@@ -1097,7 +735,7 @@ class TestB1NonDecay:
         property you can only see by sampling the whole sequence.
         """
         sc = build_merged_landing(repo)
-        first = await branch_work_landed(
+        first = await _landed_under_default_pattern(
             git_ops, TASK_ID, sc.branch,
             branch_tip_sha=sc.branch_tip_sha, metadata=sc.metadata,
         )
@@ -1108,7 +746,7 @@ class TestB1NonDecay:
             # The LAST commit rewrites the lines the task added, which is the
             # shape that trips the survival thresholds.
             advance_main_touching_same_paths(sc, 1, rewrite=(i == 4), start=i)
-            verdict = await branch_work_landed(
+            verdict = await _landed_under_default_pattern(
                 git_ops, TASK_ID, sc.branch,
                 branch_tip_sha=sc.branch_tip_sha, metadata=sc.metadata,
             )
@@ -1133,13 +771,13 @@ class TestB1NonDecay:
 
         sc = build_merged_landing(repo)
         advance_main_touching_same_paths(sc, 5, rewrite=True)
-        added = _numbered('feature', 40).splitlines()
+        added = numbered_lines('feature', 40).splitlines()
         head_lines = set((repo.root / WORK_PATH).read_text().splitlines())
         survival = sum(1 for line in added if line in head_lines) / len(added)
         assert survival < _EFFECT_SURVIVAL_PER_FILE_THRESHOLD
         assert survival < _EFFECT_SURVIVAL_AGGREGATE_THRESHOLD
 
-        verdict = await branch_work_landed(
+        verdict = await _landed_under_default_pattern(
             git_ops, TASK_ID, sc.branch,
             branch_tip_sha=sc.branch_tip_sha, metadata=sc.metadata,
         )
@@ -1151,7 +789,7 @@ class TestB1NonDecay:
         """Non-decay is a property of the POLICY, not of one landing shape."""
         sc = build_rebased_landing(repo)
         advance_main_touching_same_paths(sc, 5, rewrite=True)
-        verdict = await branch_work_landed(
+        verdict = await _landed_under_default_pattern(
             git_ops, TASK_ID, sc.branch,
             branch_tip_sha=sc.branch_tip_sha, metadata=sc.metadata,
         )
@@ -1176,13 +814,13 @@ class TestB1NonDecay:
         revert residual is pinned separately below as a priced tradeoff.
         """
         sc = build_merged_landing(repo)
-        assert (await branch_work_landed(
+        assert (await _landed_under_default_pattern(
             git_ops, TASK_ID, sc.branch,
             branch_tip_sha=sc.branch_tip_sha, metadata=sc.metadata,
         )).accepted is True
 
         rewind_landing(sc)
-        verdict = await branch_work_landed(
+        verdict = await _landed_under_default_pattern(
             git_ops, TASK_ID, sc.branch,
             branch_tip_sha=sc.branch_tip_sha, metadata=sc.metadata,
         )
@@ -1205,7 +843,7 @@ class TestB1NonDecay:
         """
         sc = build_merged_landing(repo)
         revert_landing(sc)
-        verdict = await branch_work_landed(
+        verdict = await _landed_under_default_pattern(
             git_ops, TASK_ID, sc.branch,
             branch_tip_sha=sc.branch_tip_sha, metadata=sc.metadata,
         )
@@ -1230,7 +868,7 @@ class TestB2SyncMergeTip:
     ) -> None:
         sc = build_sync_merge_branch(repo)
         assert len(repo.parents(sc.branch_tip_sha)) == 2, 'the tip must be a merge'
-        verdict = await branch_work_landed(
+        verdict = await _landed_under_default_pattern(
             git_ops, TASK_ID, sc.branch,
             branch_tip_sha=sc.branch_tip_sha, metadata=sc.metadata,
         )
@@ -1249,14 +887,15 @@ class TestB2SyncMergeTip:
         a guard that fired on the wrong question.
         """
         sc = build_sync_merge_branch(repo)
-        verdict = await branch_work_landed(
+        verdict = await _landed_under_default_pattern(
             git_ops, TASK_ID, sc.branch,
             branch_tip_sha=sc.branch_tip_sha, metadata=sc.metadata,
         )
         assert verdict.reason is not LandingReason.no_op_landing, verdict.probe
-        assert verdict.probe.get('patch_id_contained') is True, (
+        assert verdict.probe.get('patch_id_containment') == 'vacuous', (
             'the patch-id arm must actually have run and answered'
         )
+        assert verdict.probe.get('containment_by_ancestry') is True
 
     async def test_an_unmerged_sync_merge_branch_is_still_not_landed(
         self, git_ops: GitOps, repo: _Repo,
@@ -1269,22 +908,22 @@ class TestB2SyncMergeTip:
         merge commit is invisible to ``git cherry``: its real work commits are
         still absent from main.
         """
-        base, _tip = _seed_branch(repo)
+        base, _tip = seed_branch(repo)
         main_edit = repo.commit(
             'chore: main edits the same file',
-            {WORK_PATH: _numbered('feature', 40) + _numbered('mainside', 6)},
+            {WORK_PATH: numbered_lines('feature', 40) + numbered_lines('mainside', 6)},
         )
         repo.git('checkout', BRANCH)
         rc, _ = repo.git_rc('merge', '--no-ff', 'main', '-m', f'Merge main into {BRANCH}')
         assert rc != 0
-        repo.write(WORK_PATH, _numbered('feature', 40) + _numbered('mainside', 6))
+        repo.write(WORK_PATH, numbered_lines('feature', 40) + numbered_lines('mainside', 6))
         repo.git('add', '-A')
         repo.git('commit', '--no-edit')
         tip = repo.sha('HEAD')
         assert repo.parents(tip)[1] == main_edit
         repo.git('checkout', 'main')
 
-        verdict = await branch_work_landed(
+        verdict = await _landed_under_default_pattern(
             git_ops, TASK_ID, BRANCH,
             branch_tip_sha=tip, metadata={'branch_base_sha': base},
         )
@@ -1302,7 +941,7 @@ class TestB2SyncMergeTip:
         having to re-derive it from the shape of the repo.
         """
         landed = build_merged_landing(repo)
-        verdict = await branch_work_landed(
+        verdict = await _landed_under_default_pattern(
             git_ops, TASK_ID, landed.branch,
             branch_tip_sha=landed.branch_tip_sha, metadata=landed.metadata,
         )
@@ -1323,7 +962,7 @@ class TestB2SyncMergeTip:
         has none.
         """
         sc = build_merged_landing(repo)
-        real = await branch_work_landed(
+        real = await _landed_under_default_pattern(
             git_ops, TASK_ID, sc.branch, branch_tip_sha=sc.branch_tip_sha, metadata=None,
         )
         assert real.probe['no_op_baseline'] == 'landing_merge'
@@ -1340,7 +979,7 @@ class TestB2SyncMergeTip:
         that never delivered — strictly worse here than any false negative.
         """
         sc = build_no_op_landing(repo)
-        verdict = await branch_work_landed(
+        verdict = await _landed_under_default_pattern(
             git_ops, TASK_ID, sc.branch, branch_tip_sha=sc.branch_tip_sha, metadata=None,
         )
         assert verdict.probe['no_op_baseline'] == 'landing_merge'
@@ -1356,6 +995,7 @@ class TestB2SyncMergeTip:
             build_no_op_landing,
             build_unlanded_branch,
             build_degenerate_branch,
+            build_main_merged_only_branch,
         ],
     )
     async def test_neither_decaying_predicate_is_ever_awaited(
@@ -1380,7 +1020,7 @@ class TestB2SyncMergeTip:
         describe_effect = _spy_on_method(monkeypatch, git_ops, 'describe_commit_effect_in_main')
 
         sc = build(repo)
-        await branch_work_landed(
+        await _landed_under_default_pattern(
             git_ops, TASK_ID, sc.branch,
             branch_tip_sha=sc.branch_tip_sha, metadata=sc.metadata,
         )
@@ -1389,10 +1029,219 @@ class TestB2SyncMergeTip:
         assert describe_effect == [], 'describe_commit_effect_in_main must never be reached'
 
 
+@pytest.mark.asyncio
+class TestEmptyContainmentIsRefused:
+    """Empty ``git cherry`` output carries no content proof, so it is not a landing.
+
+    The rule is ``skills/_shared/deriving-landed-sha.md`` check (c)'s: a branch
+    with no non-merge commit beyond main has nothing whose containment could
+    be proven, however its merge history reads.
+    """
+
+    async def test_a_branch_holding_only_a_merge_of_main_is_not_landed(
+        self, git_ops: GitOps, repo: _Repo,
+    ) -> None:
+        sc = build_main_merged_only_branch(repo)
+        verdict = await _landed_under_default_pattern(
+            git_ops, TASK_ID, sc.branch,
+            branch_tip_sha=sc.branch_tip_sha, metadata=sc.metadata,
+        )
+        assert verdict.accepted is False, verdict.probe
+        assert verdict.reason is LandingReason.not_landed
+        assert verdict.evidence_sha is None
+        assert verdict.probe['patch_id_containment'] == 'vacuous'
+        assert verdict.probe['containment_by_ancestry'] is False
+
+    async def test_without_a_recorded_base_the_no_op_guard_still_answers_first(
+        self, git_ops: GitOps, repo: _Repo,
+    ) -> None:
+        sc = build_main_merged_only_branch(repo)
+        verdict = await _landed_under_default_pattern(
+            git_ops, TASK_ID, sc.branch,
+            branch_tip_sha=sc.branch_tip_sha, metadata=None,
+        )
+        assert verdict.reason is LandingReason.no_op_landing, verdict.probe
+
+    async def test_a_landing_whose_branch_then_merged_main_back_is_not_landed(
+        self, git_ops: GitOps, repo: _Repo,
+    ) -> None:
+        """Fail-closed by choice: an off-main tip with nothing to prove is refused, earlier landing or not."""
+        sc = build_landing_then_main_merged_back(repo)
+        verdict = await _landed_under_default_pattern(
+            git_ops, TASK_ID, sc.branch,
+            branch_tip_sha=sc.branch_tip_sha, metadata=sc.metadata,
+        )
+        assert verdict.reason is LandingReason.not_landed, verdict.probe
+        assert verdict.probe['patch_id_containment'] == 'vacuous'
+        assert verdict.probe['containment_by_ancestry'] is False
+
+    async def test_a_tip_already_on_main_prints_nothing_and_is_contained_by_ancestry(
+        self, git_ops: GitOps, repo: _Repo,
+    ) -> None:
+        """Check (c)'s rule applies only off the ancestor arm.
+
+        ``git cherry main <tip>`` lists nothing for any tip main already
+        contains, so a genuine merged landing prints the same empty output.
+        """
+        sc = build_merged_landing(repo)
+        assert repo.git('cherry', 'main', sc.branch_tip_sha) == ''
+        verdict = await _landed_under_default_pattern(
+            git_ops, TASK_ID, sc.branch,
+            branch_tip_sha=sc.branch_tip_sha, metadata=sc.metadata,
+        )
+        assert verdict.accepted is True, verdict.probe
+        assert verdict.probe['patch_id_containment'] == 'vacuous'
+        assert verdict.probe['containment_by_ancestry'] is True
+
+    async def test_an_unreadable_ancestry_answer_is_a_git_error(
+        self, git_ops: GitOps, repo: _Repo, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        sc = build_merged_landing(repo)
+        real = git_ops.is_ancestor_checked
+
+        async def _unreadable_against_main(ancestor: str, descendant: str) -> bool | None:
+            if (ancestor, descendant) == (sc.branch_tip_sha, 'main'):
+                return None
+            return await real(ancestor, descendant)
+
+        monkeypatch.setattr(git_ops, 'is_ancestor_checked', _unreadable_against_main)
+        verdict = await _landed_under_default_pattern(
+            git_ops, TASK_ID, sc.branch,
+            branch_tip_sha=sc.branch_tip_sha, metadata=sc.metadata,
+        )
+        assert verdict.reason is LandingReason.git_error, verdict.probe
+        assert verdict.probe['git_error_stage'] == 'patch_id_containment'
+        assert verdict.probe['containment_by_ancestry'] is None
+
+    @pytest.mark.parametrize(
+        ('build', 'containment'),
+        [(build_rebased_landing, 'contained'), (build_unlanded_branch, 'not_contained')],
+    )
+    async def test_containment_is_recorded_as_a_structured_fact(
+        self, git_ops: GitOps, repo: _Repo, build, containment: str,
+    ) -> None:
+        sc = build(repo)
+        verdict = await _landed_under_default_pattern(
+            git_ops, TASK_ID, sc.branch,
+            branch_tip_sha=sc.branch_tip_sha, metadata=sc.metadata,
+        )
+        assert verdict.probe['patch_id_containment'] == containment
+
+
+@pytest.mark.asyncio
+class TestReseededAncestorTipIsNotAttributedBySubject:
+    """Attribution anchors only on a citation or the tip's patch-id twin (esc-4648-5).
+
+    On a reseeded ancestor tip containment is vacuous, so attribution is the
+    only guard left; a later main commit that merely repeats the tip's
+    subject carries none of the tip's diff and must not be stamped.
+    """
+
+    async def test_a_later_same_subject_commit_is_not_the_landing(
+        self, git_ops: GitOps, repo: _Repo,
+    ) -> None:
+        sc = build_reseeded_ancestor_tip(repo)
+        verdict = await _landed_under_default_pattern(
+            git_ops, TASK_ID, sc.branch,
+            branch_tip_sha=sc.branch_tip_sha, metadata=sc.metadata,
+        )
+        assert verdict.accepted is False, verdict.probe
+        assert verdict.reason is LandingReason.no_attribution
+        assert verdict.evidence_sha is None
+        assert verdict.probe['evidence_source'] == 'no_equivalent_on_main'
+
+
+@pytest.mark.asyncio
+class TestCitationPatternIsHonoured:
+    """The citation tier uses the project's ``git.commit_citation_pattern``.
+
+    Every test starts from B3's uncited rebase landing, whose evidence is the
+    tip's patch-id twin on main, then adds commits on main whose subjects the
+    default pattern and an override read differently.
+    """
+
+    SQUASH_SUBJECT = f'Fix an unrelated thing (#{TASK_ID})'
+    OVERRIDE = r'^\[{tid}\]'
+
+    async def _verdict(
+        self, git_ops: GitOps, sc: Scenario, *, pattern_template: str | None,
+    ) -> LandingVerdict:
+        return await branch_work_landed(
+            git_ops, TASK_ID, sc.branch,
+            branch_tip_sha=sc.branch_tip_sha, metadata=sc.metadata,
+            pattern_template=pattern_template,
+        )
+
+    async def test_a_caller_must_state_the_pattern(self, git_ops: GitOps) -> None:
+        """No default, so a caller that forgot the project's pattern fails loudly."""
+        forgot_the_pattern: dict[str, Any] = {'branch_tip_sha': None}
+        with pytest.raises(TypeError, match='pattern_template'):
+            await branch_work_landed(git_ops, TASK_ID, BRANCH, **forgot_the_pattern)
+
+    async def test_the_default_pattern_reads_a_squash_subject_as_a_citation(
+        self, git_ops: GitOps, repo: _Repo,
+    ) -> None:
+        sc = build_rebased_landing(repo)
+        squash = repo.commit(self.SQUASH_SUBJECT, {'pkg/squash.py': numbered_lines('squash', 6)})
+        verdict = await self._verdict(git_ops, sc, pattern_template=None)
+        assert verdict.evidence_sha == squash, verdict.probe
+
+    async def test_an_opted_out_project_attributes_by_patch_id_twin(
+        self, git_ops: GitOps, repo: _Repo,
+    ) -> None:
+        sc = build_rebased_landing(repo)
+        twin = sc.landed_sha
+        repo.commit(self.SQUASH_SUBJECT, {'pkg/squash.py': numbered_lines('squash', 6)})
+        verdict = await self._verdict(git_ops, sc, pattern_template='')
+        assert verdict.accepted is True, verdict.probe
+        assert verdict.evidence_sha == twin
+        assert verdict.probe['citation'] is None
+        assert verdict.probe['evidence_source'] == 'patch_id_equivalent'
+
+    async def test_an_override_that_does_not_match_falls_to_the_twin(
+        self, git_ops: GitOps, repo: _Repo,
+    ) -> None:
+        sc = build_rebased_landing(repo)
+        twin = sc.landed_sha
+        repo.commit(self.SQUASH_SUBJECT, {'pkg/squash.py': numbered_lines('squash', 6)})
+        verdict = await self._verdict(git_ops, sc, pattern_template=self.OVERRIDE)
+        assert verdict.evidence_sha == twin, verdict.probe
+
+    async def test_an_override_that_matches_names_its_commit(
+        self, git_ops: GitOps, repo: _Repo,
+    ) -> None:
+        sc = build_rebased_landing(repo)
+        cited = repo.commit(f'[{TASK_ID}] release note', {'pkg/note.py': numbered_lines('note', 6)})
+        verdict = await self._verdict(git_ops, sc, pattern_template=self.OVERRIDE)
+        assert verdict.evidence_sha == cited, verdict.probe
+        assert verdict.probe['evidence_source'] == 'citation'
+
+
 # --------------------------------------------------------------------------
 # Contract invariant 4 — fail-closed, and git_error is never not_landed
 # (step-11).
 # --------------------------------------------------------------------------
+
+
+def _fail_git_subcommand(
+    monkeypatch: pytest.MonkeyPatch, where: Path, subcommand: str,
+) -> None:
+    """Put a ``git`` shim first on PATH that exits 128 for *subcommand* only.
+
+    Every other git call reaches the real binary, so the repo stays healthy
+    and only the one answer fails.
+    """
+    real_git = shutil.which('git')
+    assert real_git is not None
+    where.mkdir(parents=True)
+    shim = where / 'git'
+    shim.write_text(
+        '#!/bin/sh\n'
+        f'case " $* " in *" {subcommand} "*) exit 128;; esac\n'
+        f'exec {shlex.quote(real_git)} "$@"\n'
+    )
+    shim.chmod(0o755)
+    monkeypatch.setenv('PATH', f'{where}{os.pathsep}{os.environ["PATH"]}')
 
 
 @pytest.fixture
@@ -1438,7 +1287,7 @@ class TestGitErrorIsNeverNotLanded:
         self, git_ops: GitOps, repo: _Repo,
     ) -> None:
         build_unlanded_branch(repo)
-        verdict = await branch_work_landed(
+        verdict = await _landed_under_default_pattern(
             git_ops, TASK_ID, 'task/does-not-exist', branch_tip_sha=None,
         )
         assert verdict.accepted is False
@@ -1450,7 +1299,7 @@ class TestGitErrorIsNeverNotLanded:
     ) -> None:
         """A caller-supplied tip that is not in this repo at all."""
         sc = build_unlanded_branch(repo)
-        verdict = await branch_work_landed(
+        verdict = await _landed_under_default_pattern(
             git_ops, TASK_ID, sc.branch,
             branch_tip_sha='0' * 39 + '1', metadata=sc.metadata,
         )
@@ -1466,11 +1315,10 @@ class TestGitErrorIsNeverNotLanded:
         Without metadata the baseline ladder resolves against main and fails
         early.  WITH metadata the ladder answers from the recorded base
         without touching main at all, so the first thing to see the broken ref
-        is ``git cherry`` — whose fail-OPEN ``False`` is exactly the
-        misclassification this class exists to prevent.
+        is ``git cherry``, whose failure must read as ``git_error``.
         """
         sc = build_unlanded_branch(repo)
-        verdict = await branch_work_landed(
+        verdict = await _landed_under_default_pattern(
             broken_main_git_ops, TASK_ID, sc.branch,
             branch_tip_sha=sc.branch_tip_sha,
             metadata=sc.metadata if with_metadata else None,
@@ -1484,55 +1332,76 @@ class TestGitErrorIsNeverNotLanded:
     ) -> None:
         """The direction that matters most: a REAL landing must not silently reject.
 
-        This branch genuinely landed.  With main unresolvable the containment
-        helper returns its fail-open ``False``, and reading that as
-        ``not_landed`` would re-dispatch a task whose work is already on main
+        This branch genuinely landed.  With main unresolvable ``git cherry``
+        fails, and reading that as ``not_landed`` would re-dispatch a task
+        whose work is already on main
         — the exact stranding this PRD exists to fix, re-created by the
         recovery path itself.
         """
         sc = build_merged_landing(repo)
-        verdict = await branch_work_landed(
+        verdict = await _landed_under_default_pattern(
             broken_main_git_ops, TASK_ID, sc.branch,
             branch_tip_sha=sc.branch_tip_sha, metadata=sc.metadata,
         )
         assert verdict.reason is LandingReason.git_error, verdict.probe
         assert verdict.reason is not LandingReason.not_landed
 
-    async def test_the_fail_open_containment_answer_is_disambiguated(
-        self, broken_main_git_ops: GitOps, repo: _Repo,
+    async def test_a_failed_cherry_is_a_git_error_while_both_endpoints_resolve(
+        self, git_ops: GitOps, repo: _Repo, monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
     ) -> None:
-        """THE fail-open disambiguation, and the probe must SHOW which branch was taken.
+        """``git cherry`` failing is git's own answer: the detector could not look.
 
-        ``merge_queue.patch_content_contained`` is documented fail-OPEN and
-        returns ``False`` on ``rc != 0`` — correct for ITS caller, which falls
-        through to a full merge attempt, and exactly backwards here, where
-        ``False`` means "not landed".  The producer therefore re-probes ref
-        health on a ``False`` and records the outcome, so a reader can tell a
-        genuine negative from an unreadable repo without re-running git.
+        Both endpoints still resolve, so a ref-health re-probe would call the
+        repo healthy and the failure a negative, rejecting a REAL landing as
+        ``not_landed``.
         """
         sc = build_merged_landing(repo)
-        verdict = await branch_work_landed(
-            broken_main_git_ops, TASK_ID, sc.branch,
+        _fail_git_subcommand(monkeypatch, tmp_path / 'shim', 'cherry')
+        verdict = await _landed_under_default_pattern(
+            git_ops, TASK_ID, sc.branch,
             branch_tip_sha=sc.branch_tip_sha, metadata=sc.metadata,
         )
-        assert verdict.reason is LandingReason.git_error
-        assert verdict.probe['containment_recheck'] == 'unhealthy'
-        assert verdict.probe['containment_unresolvable'], (
-            'the endpoints that failed to re-resolve must be recorded'
+        assert verdict.reason is LandingReason.git_error, verdict.probe
+        assert verdict.probe['patch_id_containment'] == 'unreadable'
+        assert verdict.probe['git_error_stage'] == 'patch_id_containment'
+        assert 'containment_recheck' not in verdict.probe
+
+    async def test_a_not_contained_answer_is_re_probed_before_it_is_believed(
+        self, git_ops: GitOps, repo: _Repo, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The probe must SHOW the re-probe found an endpoint that stopped resolving."""
+        sc = build_unlanded_branch(repo)
+        real = git_ops.is_ancestor
+
+        async def _main_stopped_resolving(ancestor: str, descendant: str) -> bool:
+            if ancestor == descendant == 'main':
+                return False
+            return await real(ancestor, descendant)
+
+        monkeypatch.setattr(git_ops, 'is_ancestor', _main_stopped_resolving)
+        verdict = await _landed_under_default_pattern(
+            git_ops, TASK_ID, sc.branch,
+            branch_tip_sha=sc.branch_tip_sha, metadata=sc.metadata,
         )
+        assert verdict.reason is LandingReason.git_error, verdict.probe
+        assert verdict.probe['patch_id_containment'] == 'not_contained'
+        assert verdict.probe['containment_recheck'] == 'unhealthy'
+        assert verdict.probe['containment_unresolvable'] == ['main']
+        assert verdict.probe['git_error_stage'] == 'patch_id_containment'
 
     async def test_the_contrasting_positive_control_on_a_healthy_repo(
         self, git_ops: GitOps, repo: _Repo,
     ) -> None:
-        """The disambiguation must not have relabelled every rejection.
+        """The re-probe must not have relabelled every rejection.
 
-        Same producer, same ``False`` from the containment helper — but a
-        healthy repo, so the answer is trustworthy and the verdict stays the
-        ordinary ``not_landed``.  Without this control, "always say git_error
-        on False" would pass every other case in this class.
+        Same producer, same ``not_contained`` answer, but a healthy repo, so
+        the answer is trustworthy and the verdict stays the ordinary
+        ``not_landed``.  Without this control, "always say git_error on
+        not_contained" would pass every other case in this class.
         """
         sc = build_unlanded_branch(repo)
-        verdict = await branch_work_landed(
+        verdict = await _landed_under_default_pattern(
             git_ops, TASK_ID, sc.branch,
             branch_tip_sha=sc.branch_tip_sha, metadata=sc.metadata,
         )
@@ -1557,7 +1426,7 @@ class TestGitErrorIsNeverNotLanded:
             return None
 
         monkeypatch.setattr(git_ops, 'net_diff_is_empty', _indeterminate)
-        verdict = await branch_work_landed(
+        verdict = await _landed_under_default_pattern(
             git_ops, TASK_ID, sc.branch,
             branch_tip_sha=sc.branch_tip_sha, metadata=sc.metadata,
         )
@@ -1574,7 +1443,7 @@ class TestGitErrorIsNeverNotLanded:
             return None
 
         monkeypatch.setattr(git_ops, 'merge_base_with_main', _no_merge_base)
-        verdict = await branch_work_landed(
+        verdict = await _landed_under_default_pattern(
             git_ops, TASK_ID, sc.branch, branch_tip_sha=sc.branch_tip_sha, metadata=None,
         )
         assert verdict.reason is LandingReason.git_error
@@ -1613,7 +1482,7 @@ class TestBranchWorkLandedNeverRaises:
             raise RuntimeError(f'simulated {method} failure')
 
         monkeypatch.setattr(git_ops, method, _boom)
-        verdict = await branch_work_landed(
+        verdict = await _landed_under_default_pattern(
             git_ops, TASK_ID, sc.branch,
             branch_tip_sha=None if method == 'resolve_branch_sha' else sc.branch_tip_sha,
             metadata=sc.metadata,
@@ -1641,7 +1510,7 @@ class TestBranchWorkLandedNeverRaises:
 
         monkeypatch.setattr(git_ops, 'merge_base_with_main', _boom)
         with caplog.at_level('WARNING', logger='orchestrator.merge_lane'):
-            verdict = await branch_work_landed(
+            verdict = await _landed_under_default_pattern(
                 git_ops, TASK_ID, sc.branch,
                 branch_tip_sha=sc.branch_tip_sha, metadata=None,
             )
@@ -1654,7 +1523,7 @@ class TestBranchWorkLandedNeverRaises:
         self, broken_main_git_ops: GitOps, repo: _Repo,
     ) -> None:
         sc = build_merged_landing(repo)
-        verdict = await branch_work_landed(
+        verdict = await _landed_under_default_pattern(
             broken_main_git_ops, TASK_ID, sc.branch,
             branch_tip_sha=sc.branch_tip_sha, metadata=sc.metadata,
         )
@@ -1766,7 +1635,7 @@ async def _drive_git_errors(
     """
     verdicts: list[LandingVerdict] = []
     for _ in range(count):
-        verdict = await branch_work_landed(
+        verdict = await _landed_under_default_pattern(
             git_ops, TASK_ID, 'task/does-not-exist', branch_tip_sha=None,
             escalation_queue=_as_queue(queue), recovery_emission=recovery_emission,
         )
@@ -1903,7 +1772,7 @@ class TestTallyIsChargedByEveryVerdict:
         self, git_ops: GitOps, repo: _Repo, tally: LandingTally,
     ) -> None:
         scenario = build_rebased_landing(repo)
-        accepted = await branch_work_landed(
+        accepted = await _landed_under_default_pattern(
             git_ops, TASK_ID, scenario.branch,
             branch_tip_sha=scenario.branch_tip_sha, metadata=scenario.metadata,
         )
@@ -1919,7 +1788,7 @@ class TestTallyIsChargedByEveryVerdict:
         self, git_ops: GitOps, repo: _Repo, tally: LandingTally,
     ) -> None:
         scenario = build_unlanded_branch(repo)
-        await branch_work_landed(
+        await _landed_under_default_pattern(
             git_ops, TASK_ID, scenario.branch,
             branch_tip_sha=scenario.branch_tip_sha, metadata=scenario.metadata,
         )
@@ -1936,7 +1805,7 @@ class TestTallyIsChargedByEveryVerdict:
         """
         scenario = build_rebased_landing(repo)
         with caplog.at_level('INFO', logger='orchestrator.merge_lane'):
-            await branch_work_landed(
+            await _landed_under_default_pattern(
                 git_ops, TASK_ID, scenario.branch,
                 branch_tip_sha=scenario.branch_tip_sha, metadata=scenario.metadata,
             )
@@ -1999,7 +1868,7 @@ class TestGitErrorStormEscape:
         scenario = build_unlanded_branch(repo)
         queue = _FakeEscalationQueue()
         for _ in range(6):
-            verdict = await branch_work_landed(
+            verdict = await _landed_under_default_pattern(
                 git_ops, TASK_ID, scenario.branch,
                 branch_tip_sha=scenario.branch_tip_sha, metadata=scenario.metadata,
                 escalation_queue=_as_queue(queue), recovery_emission=_storm_config(rate=1),

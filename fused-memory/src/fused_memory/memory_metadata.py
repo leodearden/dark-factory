@@ -17,6 +17,9 @@ Contents
   module without a cycle — validates through the identical rule.  See
   that module's docstring for the measured ``ImportError`` behind the
   split.
+* ``is_canonical`` — the one strict reading of the ``canonical`` marker,
+  defined in ``canonical_marker.py::is_canonical`` and re-exported here as
+  the same object.
 * ``normalize_supersedes`` — PRD D2's scalar/list/None normalizer.
 * ``render_metadata_vocabulary_guidance`` — the writer-facing statement of
   this vocabulary that the writing reconciliation stage prompts interpolate.
@@ -24,7 +27,8 @@ Contents
 ``kind`` is deliberately **NOT** slug-validated: 321 of the 329 live
 ``kind`` values are snake_case, so applying this regex to ``kind`` would
 reject essentially the entire live population.  ``kind`` is
-registry-membership-validated instead, exactly as V1 specifies.
+registry-membership-CENSUSED instead, and never rejected (PRD §10 open
+question 1, option (b)).
 
 Layering note
 -------------
@@ -59,9 +63,16 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+from types import MappingProxyType
 from typing import Any
 
+from shared.memory_supersession import SUPERSEDED_BY_METADATA_KEY
+from shared.task_statuses import TaskStatus
+
 from fused_memory.backends.mem0_client import MEM0_MANAGED_METADATA_KEYS
+
+# Re-exported as the same object, like the topic_slug names below.
+from fused_memory.canonical_marker import is_canonical
 
 # Re-exported, NOT redefined (task 3198, leaf ε).  These are bound to the
 # *same objects* the leaf module defines, so this registry remains the
@@ -96,14 +107,22 @@ __all__ = [
     'PARENT_ID_DEAD_CODE',
     'PARENT_ID_UNAVAILABLE_CODE',
     'ParentHasChildrenError',
+    'RECONCILIATION_COMPLETION_ECHO_MARKER',
+    'RECONCILIATION_VERDICT_KEY',
     'RESERVED_VOCABULARY_KEYS',
     'SERVER_STAMPED_KEYS',
+    'SUPERSEDED_BY_METADATA_KEY',
+    'TARGETED_RECONCILIATION_SOURCE',
     'TOPIC_SLUG_MAX_LEN',
     'TOPIC_SLUG_RE',
     'TRIAGE_CONTESTED_METADATA_KEY',
     'check_canonical_routing',
     'classify_unknown_keys',
+    'is_canonical',
+    'is_completion_record',
     'is_orchestrator_completion_record',
+    'is_reconciliation_completion_echo',
+    'is_reconciliation_verdict_note',
     'is_valid_topic_slug',
     'normalize_supersedes',
     'parent_liveness_violation',
@@ -145,8 +164,12 @@ def normalize_supersedes(value: Any) -> list[Any]:
     tolerance for the legacy scalar stays.  The readers are
     ``reconciliation.targeted._is_authoritative_resolution`` (truthiness
     discriminator, which tests ``any()`` of the normalized members — see
-    ITS docstring for why member-level and not container truthiness) and
-    leaf 3112's closure predicate.  Both go through this helper — INV-5:
+    ITS docstring for why member-level and not container truthiness),
+    leaf 3112's closure predicate,
+    ``server/write_triage.py::declares_supersession`` (a declaration
+    force-stores the write instead of triaging it) and
+    ``services/supersession_mark.py::mark_superseded`` (which marks each
+    declared record superseded).  All go through this helper — INV-5:
     never a second ``supersedes`` parser.
 
     Accepts ``None`` (→ ``[]``), a scalar (→ single-element list), or any
@@ -178,10 +201,10 @@ def normalize_supersedes(value: Any) -> list[Any]:
 CHILD_KINDS: frozenset[str] = frozenset({'amendment', 'sighting'})
 
 
-#: The normative closed registry of Mem0 ``metadata.kind`` values
-#: (PRD D3).  Membership is checked by :func:`validate_memory_metadata`
-#: and enforced only when ``memory_metadata.enforce_kind_registry`` is
-#: on — see the module docstring for why that flag defaults to False.
+#: The registry of Mem0 ``metadata.kind`` values (PRD D3), FROZEN BY
+#: DECISION (task 5266, PRD §10 open question 1, option (b)).  It is the
+#: drift BASELINE, not a gate: :func:`validate_memory_metadata` censuses a
+#: non-member as ``unknown_kind`` and never rejects it.
 #:
 #: Generated mechanically from the census artifact, NOT read at import
 #: time: a registry that mutates when an artifact is regenerated is not
@@ -193,13 +216,18 @@ CHILD_KINDS: frozenset[str] = frozenset({'amendment', 'sighting'})
 #: rationale, and for why re-deriving needs leaf β review rather than a
 #: fixture refresh).
 #:
-#: KNOWN STALE against the live corpus as of 2026-08-16: 4006's first live
-#: census measured 385 distinct ``kind`` values vs the 329 below (+70 new,
-#: −14 disappeared).  Harmless under the shipped defaults —
-#: ``enforce_kind_registry`` is False and deliberately stays off (see the
-#: WARNING below) — so nothing is rejected; re-derivation is queued as
-#: reviewed leaf-β work, including a policy for values that LEAVE the
-#: corpus, which this registry does not currently have.
+#: REMOVAL POLICY — this is its one home.  APPEND-ONLY: a value is never
+#: removed.  Absence from one census is no evidence its writer is dead —
+#: most writers are agents and prompts a source grep cannot see, which is
+#: the rule BLOCK 2's retention already follows — and a shrinking baseline
+#: would hide exactly the departures the drift report exists to show.
+#:
+#: NO CENSUS TOP-UP: re-seeding from a census would zero the drift signal.
+#: A new normative kind enters only by a PRD decision, as CHILD_KINDS did.
+#:
+#: Live drift is the nightly ``kind_registry_drift`` block of
+#: ``plans/memory-metadata-census-report.{json,md}``, not a test: a
+#: tripwire that goes red every night trains its readers to ignore it.
 KIND_REGISTRY: frozenset[str] = frozenset({
     # ---------------------------------------------------------------
     # BLOCK 1 — CENSUS-MEASURED (329 values)
@@ -214,10 +242,8 @@ KIND_REGISTRY: frozenset[str] = frozenset({
     # WARNING (PRD §10 open question 1): 242 of these 329 values are
     # SINGLETONS.  The population is agent-invented free text and open
     # in practice, which measured D3's "kind writers are in-repo code +
-    # prompts" premise FALSE.  That is precisely why
-    # `enforce_kind_registry` ships defaulted off: a day-one
-    # strict-reject would turn every newly invented kind into a hard
-    # memory-write failure on the live fleet.
+    # prompts" premise FALSE — the reason that question was ruled
+    # option (b): `kind` membership never rejects.
     # ---------------------------------------------------------------
     'admin_cleanup_task_filed',
     'architectural_failure_mode',
@@ -555,15 +581,14 @@ KIND_REGISTRY: frozenset[str] = frozenset({
     # but measure ZERO live records (esc-3194-1, re-verified against
     # main @ 2814b01202).  They are retained anyway: grandfathering
     # means "what is WRITTEN", not only what survives an aging sweep.
-    # Dropping them would reject in-repo code the moment
-    # `enforce_kind_registry` flips.
+    # Retained under the append-only policy above.
     # ---------------------------------------------------------------
     'consolidated_scope_correction',  # reconciliation/scope_freshness.py:97 (declared), written :251, :495
     # ReconciliationHarness._reconcile_status_correction (same dict as `supersedes`)
     'project_status_correction',
     'count_snapshot_cleanup_audit',   # scripts/cleanup_count_snapshots.py:210
-    # No live Mem0 writer found — retained per esc-3194-1 pending the
-    # PRD §10 open questions.  `entity_standing_decision` is a SQLite
+    # No live Mem0 writer found — retained per esc-3194-1 and the
+    # append-only policy above.  `entity_standing_decision` is a SQLite
     # recon_ledger record kind (reconciliation/standing_decision_writer.py,
     # list_entity_standing_decisions), i.e. a DIFFERENT store's vocabulary;
     # `stage1_flag_marker`'s Mem0 mirror write was RETIRED by task 2406
@@ -676,6 +701,48 @@ ORCHESTRATOR_COMPLETION_SOURCE = 'orchestrator_completion'
 
 def is_orchestrator_completion_record(meta: Mapping[str, Any]) -> bool:
     return meta.get('source') == ORCHESTRATOR_COMPLETION_SOURCE
+
+
+#: The ``source`` reconciliation/targeted.py::TargetedReconciler stamps on its
+#: notes: the completion echo and the verification-verdict note. Both are
+#: records about their metadata.task_id, which :func:`is_completion_record` accepts.
+TARGETED_RECONCILIATION_SOURCE = 'targeted_reconciliation'
+
+#: The metadata that marks reconciliation's completion echo, as against its
+#: verification-verdict note. TargetedReconciler._on_task_done's fast path
+#: stamps it and TargetedReconciler._delete_stale_completion_echoes filters on
+#: it, so that sweep never deletes a verdict note.
+RECONCILIATION_COMPLETION_ECHO_MARKER: Mapping[str, str] = MappingProxyType({
+    'source': TARGETED_RECONCILIATION_SOURCE,
+    'transition': TaskStatus.DONE.value,
+})
+
+
+def is_reconciliation_completion_echo(meta: Mapping[str, Any]) -> bool:
+    return all(meta.get(key) == value for key, value in RECONCILIATION_COMPLETION_ECHO_MARKER.items())
+
+
+#: The key under which TargetedReconciler._on_task_done's verification-verdict
+#: note records the verifier's verdict on its metadata.task_id's completion.
+RECONCILIATION_VERDICT_KEY = 'verification_verdict'
+
+
+def is_reconciliation_verdict_note(meta: Mapping[str, Any]) -> bool:
+    verdict = meta.get(RECONCILIATION_VERDICT_KEY)
+    return meta.get('source') == TARGETED_RECONCILIATION_SOURCE and isinstance(verdict, str) and bool(verdict)
+
+
+def is_completion_record(meta: Mapping[str, Any]) -> bool:
+    """Is this a record ABOUT its metadata.task_id, as opposed to one merely written by that task?
+
+    Being about the task is not saying it completed: a verification-verdict note
+    whose verdict is 'contradicted' counts too.
+    """
+    return (
+        is_orchestrator_completion_record(meta)
+        or is_reconciliation_completion_echo(meta)
+        or is_reconciliation_verdict_note(meta)
+    )
 
 
 #: Union of every known layer, precomputed for the unknown-key scan.
@@ -951,9 +1018,7 @@ def parent_liveness_violation(parent_id: Any, *, code: str) -> MetadataViolation
     )
 
 
-def validate_memory_metadata(
-    meta: dict[str, Any], *, enforce_kind_registry: bool
-) -> list[MetadataViolation]:
+def validate_memory_metadata(meta: dict[str, Any]) -> list[MetadataViolation]:
     """Shape-check the reserved Mem0 metadata vocabulary (PRD V1, leaf β).
 
     Returns **every** violation found — it never short-circuits at the first
@@ -1003,16 +1068,6 @@ def validate_memory_metadata(
     2. shape-check each reserved key that is PRESENT — absence is never a
        violation, since none of V1's five keys is required;
     3. classify unknown top-level keys (census-only, never fatal).
-
-    :param enforce_kind_registry: whether an unknown ``kind`` is fatal.  The
-        violation is emitted either way — this flag only decides whether it
-        can reject.  It exists because leaf α measured PRD D3's stated
-        premise ("kind writers are in-repo code + prompts, enumerated and
-        grandfathered") FALSE: 242 of the 329 live ``kind`` values are
-        singletons, i.e. the population is agent-invented free text and open
-        in practice.  Day-one strict rejection would convert every newly
-        invented kind into a hard memory-write failure on the live fleet.
-        See PRD §10 open question 1.
     """
     violations: list[MetadataViolation] = []
 
@@ -1094,15 +1149,14 @@ def validate_memory_metadata(
                 f'truthiness, so 1/0 do not pass as True/False',
                 fatal=True,
             ))
-        # `is True`, not truthiness — for the reason 2b already documents
-        # above (`1 == True`), and so a non-bool value reports only the TYPE
-        # defect rather than being double-counted here.
+        # Read through is_canonical, so a non-bool value reports only the
+        # TYPE defect above rather than being double-counted here.
         #
         # Only the `topic` KEY's presence is tested: when it is present but
         # malformed, 2a's invalid_topic_slug already describes that defect,
         # and emitting both would report one defect twice while implying the
         # writer forgot a key they did supply.
-        elif canonical is True and 'topic' not in meta:
+        elif is_canonical(meta) and 'topic' not in meta:
             violations.append(_violation(
                 'canonical',
                 'canonical_without_topic',
@@ -1127,12 +1181,13 @@ def validate_memory_metadata(
                 fatal=True,
             ))
         elif kind not in KIND_REGISTRY:
+            # Census-only by PRD §10 OQ1 option (b); the registry is the drift baseline.
             violations.append(_violation(
                 'kind',
                 'unknown_kind',
                 f'kind {kind!r} is not in KIND_REGISTRY '
                 f'({len(KIND_REGISTRY)} grandfathered values)',
-                fatal=enforce_kind_registry,
+                fatal=False,
             ))
 
     # 2d. parent_id — SHAPE only.
@@ -1217,9 +1272,8 @@ def check_canonical_routing(
     * ``entity_types``, the only route to ``EntityNode.attributes``, is
       never supplied by any caller, so attributes are always ``{}``.
 
-    So the marker is never stored — hence never readable by its only live
-    reader (``pick_survivor`` in ``scripts/audit_duplicate_memories.py``,
-    which reads ``metadata.get('canonical')`` off Mem0 scroll results) and
+    So the marker is never stored — hence never readable by any reader,
+    all of which read Mem0 payloads — and
     never countable by the <=1-per-``(project, topic)`` probe, whose two
     round-trips are Qdrant payload filters.  Admitting such a write would
     silently destroy a caller's assertion, which is the fail-soft the house
@@ -1277,11 +1331,10 @@ def check_canonical_routing(
         default would let a future write path skip the check silently,
         which is the exact silence this rule removes.
     """
-    # `is True`, not truthiness — the same discipline rule 2b documents
-    # above (`1 == True`).  The int form is `invalid_canonical_type`'s
+    # Read through is_canonical: the int form is `invalid_canonical_type`'s
     # defect and is reported there; catching it here too would render one
     # mistake as two.
-    if meta.get('canonical') is not True or reaches_mem0:
+    if not is_canonical(meta) or reaches_mem0:
         return []
 
     return [_violation(

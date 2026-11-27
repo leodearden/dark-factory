@@ -9,10 +9,9 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 import yaml
+from _task_units import rows_in_root_order, units_by_label
 from shared.task_runtime_state import TaskRuntimeEntry, TaskRuntimeSnapshot
 
-import dashboard.data.active_tasks as active_tasks
-import dashboard.data.task_snapshot as task_snapshot
 from dashboard.config import DashboardConfig
 from dashboard.data import escalation_corpus, redux_api
 from dashboard.data.active_tasks import (
@@ -22,26 +21,16 @@ from dashboard.data.active_tasks import (
 )
 from dashboard.data.datum import Datum, DatumState
 from dashboard.data.escalation_corpus import QueueKind, corpus_queues
+from dashboard.data.merge_queue import MergeAttempts
 from dashboard.data.root_invariants import RootInvariants, ScanStatus
-from dashboard.data.scheduler import collect_scheduler_state
-from dashboard.data.task_snapshot import (
-    FRESHNESS_BOUND_SECONDS,
-    SnapshotFailure,
-    unmeasured_snapshot,
-)
+from dashboard.data.scheduler import clear_scheduler_state, collect_scheduler_state
+from dashboard.data.task_snapshot import FRESHNESS_BOUND_SECONDS
 from dashboard.project_labels import ProjectLabels
+
+pytestmark = pytest.mark.usefixtures('fresh_task_snapshot_state')
 
 A_LABEL = 'a/proj'
 B_LABEL = 'b/proj'
-
-
-@pytest.fixture(autouse=True)
-def _fresh_collector_state():
-    active_tasks._reset_root_rotation()
-    task_snapshot._snapshot_cache_clear()
-    yield
-    active_tasks._reset_root_rotation()
-    task_snapshot._snapshot_cache_clear()
 
 
 @pytest.fixture
@@ -102,21 +91,24 @@ class TestTasksCollector:
         _runtime_for_b_only(monkeypatch)
 
     async def test_each_root_contributes_its_own_row_once(self, config, dummy_client):
-        rows, _snapshots = await collect_tasks_with_counts(dummy_client, config)
+        snapshots = await collect_tasks_with_counts(dummy_client, config)
 
-        assert sorted((row['id'], row['project'], row['title']) for row in rows) == [
-            ('a/proj/T-1', A_LABEL, 'from-a'),
-            ('b/proj/T-1', B_LABEL, 'from-b'),
-        ]
+        assert {
+            label: [(row['id'], row['project'], row['title']) for row in unit.rows.value or []]
+            for label, unit in snapshots.items()
+        } == {
+            A_LABEL: [('a/proj/T-1', A_LABEL, 'from-a')],
+            B_LABEL: [('b/proj/T-1', B_LABEL, 'from-b')],
+        }
 
     async def test_each_root_keeps_its_own_snapshot(self, config, dummy_client):
-        _rows, snapshots = await collect_tasks_with_counts(dummy_client, config)
+        snapshots = await collect_tasks_with_counts(dummy_client, config)
 
         assert set(snapshots) == {A_LABEL, B_LABEL}
 
     async def test_a_roots_runtime_reaches_only_that_roots_rows(self, config, dummy_client):
-        rows, _snapshots = await collect_tasks_with_counts(dummy_client, config)
-        by_project = {row['project']: row for row in rows}
+        snapshots = await collect_tasks_with_counts(dummy_client, config)
+        by_project = {row['project']: row for row in rows_in_root_order(snapshots)}
 
         assert by_project[B_LABEL]['lane'] == 'lane-b'
         assert by_project[B_LABEL]['runtime_status'] == 'ok'
@@ -150,7 +142,7 @@ def test_the_terminal_window_reads_the_root_its_label_names(client, roots):
     ))
     with patch(
         'dashboard.api.tasks.collect_tasks_with_counts',
-        new=AsyncMock(return_value=([], {})),
+        new=AsyncMock(return_value={}),
     ), patch('dashboard.api.tasks.acquire_terminal_window', new=window):
         resp = client.get('/api/v2/dashboard/tasks?terminal=b%2Fproj')
 
@@ -218,11 +210,12 @@ class TestSchedulerCollector:
         )
 
     @staticmethod
-    async def _collect(client, roots, substrate, active, snapshots=None):
+    async def _collect(client, roots, substrate, active, *, offline=()):
         config = DashboardConfig(project_root=roots[0], known_project_roots=list(roots[1:]))
+        clear_scheduler_state()
         with patch('dashboard.data.scheduler.mcp_tool_call', new=substrate), patch(
             'dashboard.data.scheduler.collect_tasks_with_counts',
-            new=AsyncMock(return_value=(active, snapshots or {})),
+            new=AsyncMock(return_value=units_by_label(active, offline=offline)),
         ):
             return await collect_scheduler_state(client, config, now=_NOW)
 
@@ -282,14 +275,11 @@ class TestSchedulerCollector:
     async def test_an_offline_root_skips_only_itself(
         self, dummy_client, scheduler_roots, substrate,
     ):
-        x, y = scheduler_roots
-        offline_x = unmeasured_snapshot(
-            x, now=_NOW, reason='test', failure=SnapshotFailure.UNREACHABLE,
-        )
+        _x, y = scheduler_roots
         rows, _modules, _pins, _events, offline_projects, _paused, recovery_events, _degraded = (
             await self._collect(
                 dummy_client, scheduler_roots, substrate,
-                [_active_row('y/proj', 7)], {'x/proj': offline_x},
+                [_active_row('y/proj', 7)], offline=['x/proj'],
             )
         )
 
@@ -375,13 +365,20 @@ _TEAM_LABELS = ProjectLabels.of_roots([_TEAM_A, _TEAM_B])
 def _measured_merge_queue(depth: int) -> dict:
     """One project's merge-queue aggregate, with the fields the route always resolves."""
     return {
-        'depth_timeseries': {'labels': [0], 'values': [depth]},
-        'outcomes': {'labels': [], 'values': []},
-        'latency': {},
+        'depth_timeseries': Datum(
+            {'labels': [0], 'values': [depth]}, _NOW, DatumState.FRESH, None, 30,
+        ),
+        'attempts': Datum(MergeAttempts(), _NOW, DatumState.FRESH, None, 30),
+        'train_throughput': Datum({}, _NOW, DatumState.FRESH, None, 30),
+        'landing_rate': Datum(
+            {'labels': [], 'values': [], 'trailing_minutes': 1440, 'window_mean_per_day': 0.0},
+            _NOW, DatumState.FRESH, None, 30,
+        ),
         'recent': [],
         'active': [],
         'in_queue': Datum(0, _NOW, DatumState.FRESH, None, 30),
         'live_probe_configured': True,
+        'runs_db_present': True,
         'speculative': Datum(
             {'hit_count': 0, 'discard_count': 0, 'total': 0, 'hit_rate': None},
             _NOW, DatumState.FRESH, None, 30,
@@ -427,7 +424,7 @@ class TestReduxShapers:
         )['MERGE_QUEUE']
 
         assert {
-            label: (block['depth']['values'], block['halt']['halted'])
+            label: (block['depth']['value']['values'], block['halt']['halted'])
             for label, block in mq.items()
         } == {'team-a/app': ([3], True), 'team-b/app': ([5], False)}
 

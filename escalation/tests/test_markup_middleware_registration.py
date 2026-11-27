@@ -45,14 +45,34 @@ from __future__ import annotations
 
 import contextlib
 import json
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import pytest
+from _escalation_http import escalation_http_call
 from fastmcp import Client
 from fastmcp.exceptions import ToolError
-from shared.mcp_markup_middleware import MarkupGuardMiddleware, RepairPolicy
-from shared.toolcall_markup import INVOKE_CLOSER, closer_for, detect
+from shared.markup_residue_custody import (
+    MARKUP_REFUSAL_CUSTODY_CAVEAT,
+    MARKUP_UNRECOVERED_PARAM_CUSTODY_CAVEAT,
+    MARKUP_UNRECOVERED_PARAM_OUTCOME_CAVEAT,
+)
+from shared.mcp_markup_middleware import (
+    MARKUP_RECURRENCE_ROUTING,
+    MARKUP_UNRECOVERED_PARAM_ERROR_TYPE,
+    MARKUP_UNREPAIRABLE_ERROR_TYPE,
+    MarkupGuardMiddleware,
+    RepairPolicy,
+    residue_header_lines,
+)
+from shared.toolcall_markup import (
+    CANONICAL_OPENER_PREFIX,
+    INVOKE_CLOSER,
+    closer_for,
+    detect,
+)
 
 from escalation.models import BORN_AT_L2_SEVERITIES, Escalation
 from escalation.queue import EscalationQueue
@@ -480,6 +500,17 @@ class TestUnrepairableResidueIsPreserved:
         return residues[0]
 
     @pytest.mark.asyncio
+    async def test_the_residue_routes_the_recurrence_through_the_shared_sentence(
+        self, tmp_path: Path
+    ):
+        queue, _ = await self._refuse(tmp_path)
+
+        assert MARKUP_RECURRENCE_ROUTING in self._residue(queue).detail, (
+            'the routing sentence has one home, '
+            'shared/src/shared/mcp_markup_middleware.py::MARKUP_RECURRENCE_ROUTING'
+        )
+
+    @pytest.mark.asyncio
     async def test_the_call_is_refused(self, tmp_path: Path):
         """(a) The boundary is a guess, so nothing is forwarded."""
         _, payload = await self._refuse(tmp_path)
@@ -725,9 +756,11 @@ STORM_THRESHOLD = 3
 class TestStormBurstAlarm:
     """The burst path against the REAL server (INV-4).
 
-    ``_file_markup_storm`` is the half of the escalation server's sink that
-    nothing exercised: the residue path was covered from step 9, the burst path
-    by nothing at all. Everything it decides — the dedup predicate, the
+    ``escalation/src/escalation/server.py::_MARKUP_STORM_ALARM``, filed via
+    ``escalation/src/escalation/guard_storm_alarm.py::file_storm_once``, is the
+    half of the escalation server's sink that nothing exercised: the residue
+    path was covered from step 9, the burst path by nothing at all. Everything
+    it decides — the dedup predicate, the
     read-failure fall-through, ``level=1``/``severity='blocking'``, and the
     summary it builds — was therefore unverified.
 
@@ -768,6 +801,19 @@ class TestStormBurstAlarm:
         return sorted(
             (esc for esc in queue.get_pending() if esc.category == STORM_CATEGORY),
             key=lambda esc: esc.id,
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_alarm_routes_the_recurrence_through_the_shared_sentence(
+        self, tmp_path: Path
+    ):
+        queue, server = build(tmp_path)
+        await self._burst(server)
+
+        [alarm] = self._alarms(queue)
+        assert MARKUP_RECURRENCE_ROUTING in alarm.suggested_action, (
+            'the routing sentence has one home, '
+            'shared/src/shared/mcp_markup_middleware.py::MARKUP_RECURRENCE_ROUTING'
         )
 
     @pytest.mark.asyncio
@@ -928,7 +974,7 @@ class TestTheResidueNamesWhoseCallLeaked:
     On THIS server the middleware's ``agent_id``/``project`` axes usually stay
     ``None``: ``MarkupGuardMiddleware._identity`` resolves them from arguments
     named ``agent_id`` / ``project_root`` / ``project_id``; no escalation tool
-    declares ``agent_id`` or ``project_id``, and the five tools that accept an
+    declares ``agent_id`` or ``project_id``, and the tools that accept an
     OPTIONAL ``project_root`` see it omitted by fleet callers. The record's
     own ``task_id`` is the synthetic ``mcp-markup-residue`` anchor — correctly
     so, since a live task id at level 2 would halt the very task that leaked.
@@ -993,10 +1039,11 @@ class TestTheResidueProseMatchesItsKind:
 
     The sink receives ``mcp_markup_unrepairable`` (refused: nothing written,
     the caller was told, a retry may be coming) and
-    ``mcp_markup_unrecovered_param`` (FORWARDED: the call landed incomplete and
-    nobody was told, so no retry is coming and the stored record is already
-    wrong). This server is the only registration site that produces the second
-    kind, because ``_preserve_unrecovered`` is FORWARD_REPAIR-only.
+    ``mcp_markup_unrecovered_param`` (FORWARDED without the parameter and
+    nobody was bounced, so no retry is coming). The second kind's record is filed
+    before the forwarded call runs, so whether that call then succeeded is not
+    known to the sink. This server is the only registration site that produces
+    the second kind, because ``_preserve_unrecovered`` is FORWARD_REPAIR-only.
 
     One hardcoded "the call was refused" sentence made the forwarded record
     contradict its own summary three lines above it, and the false half is the
@@ -1050,7 +1097,7 @@ class TestTheResidueProseMatchesItsKind:
         )
         assert 'THE CALL WAS FORWARDED WITHOUT THIS PARAMETER' in residue.detail
         # And the half a reader acts on: nobody is coming back for this.
-        assert 'was NOT told' in residue.detail
+        assert MARKUP_UNRECOVERED_PARAM_CUSTODY_CAVEAT in residue.detail
         # The record does not contradict its own summary any more.
         assert 'forwarded WITHOUT it' in residue.summary
 
@@ -1077,7 +1124,7 @@ class TestTheResidueProseMatchesItsKind:
     async def test_the_forwarded_record_still_carries_the_dropped_value(
         self, tmp_path: Path
     ):
-        """It is the only surviving copy — the caller was never told to resend."""
+        """It is the only copy this boundary holds — nothing bounced the caller to resend."""
         residues = await self._residues(
             tmp_path,
             detail=_leak('Ill-formed.', 'evidence', UNTYPABLE_EVIDENCE),
@@ -1087,6 +1134,43 @@ class TestTheResidueProseMatchesItsKind:
         assert UNTYPABLE_EVIDENCE in detail
         assert "field='evidence'" in detail
         assert f"subject_task_id={REQUIRED['task_id']!r}" in detail
+
+    @pytest.mark.asyncio
+    async def test_a_forwarded_call_the_tool_rejects_is_not_claimed_as_landed(
+        self, tmp_path: Path
+    ):
+        """The slice is filed before the call is forwarded.
+
+        So the sink cannot know whether the call then succeeds; here it does
+        not.
+        """
+        queue, server = build(tmp_path)
+        async with Client(server) as client:
+            result = await client.call_tool('escalate_info', {
+                **REQUIRED,
+                'category': 'not_a_registered_category',
+                'detail': _leak('Ill-formed.', 'evidence', UNTYPABLE_EVIDENCE),
+            })
+
+        assert 'error' in result.data, 'the forwarded call must fail in the tool'
+        assert queue.get_by_task(REQUIRED['task_id']) == [], (
+            'the rejected call must write nothing under the caller'
+        )
+        residues = [
+            esc for esc in queue.get_pending() if esc.category == RESIDUE_CATEGORY
+        ]
+        assert len(residues) == 1, (
+            f'the dropped slice must be preserved anyway, found {len(residues)}'
+        )
+        assert MARKUP_UNRECOVERED_PARAM_OUTCOME_CAVEAT in residues[0].detail, (
+            'the residue must state its outcome through '
+            'shared/src/shared/mcp_markup_middleware.py::'
+            'MARKUP_UNRECOVERED_PARAM_OUTCOME_CAVEAT'
+        )
+        assert 'landed' not in residues[0].detail.lower(), (
+            'the residue claims a landing it cannot see: it is filed before '
+            'the forwarded call runs'
+        )
 
 
 class TestAnUnknownResidueKindIsFiledVisibly:
@@ -1133,6 +1217,356 @@ class TestAnUnknownResidueKindIsFiledVisibly:
         assert 'Recover it.' in residue.detail
         assert 'the payload' in residue.detail
         assert "UNRECOGNISED RESIDUE KIND 'mcp_markup_something_new'" in residue.detail
+        # The custody hedge is this sink's, so it must not read as a tail of
+        # the middleware's own suggested action.
+        assert "suggested_action: 'Recover it.'" in residue.detail.splitlines()
         assert any(
             'unrecognised residue kind' in r.getMessage() for r in caplog.records
         ), 'an unknown kind must be visible in the log, not merely in the queue'
+
+
+# ---------------------------------------------------------------------------
+# Task 10396 — a quoted HTML block is not a leak.
+# ---------------------------------------------------------------------------
+
+
+def _html_element(name: str, body: str) -> str:
+    return '\x3c' + name + '>' + body + closer_for(name)
+
+
+#: A collapsible HTML block as escalation prose quotes it. ``details`` is an
+#: envelope closer name, but no escalation tool declares a ``details``
+#: parameter, so its closer here terminates no envelope boundary.
+HTML_DETAILS_BLOCK = (
+    '\x3cdetails>' + _html_element('summary', 'Measured')
+    + _html_element('pre', 'rc=0') + closer_for('details')
+)
+
+#: The same block without its ``summary`` child, for ``escalate_info``: that
+#: tool declares a ``summary`` parameter, so the child's closer is a parameter
+#: closer of a name that is not HTML-colliding, a needle the guard still
+#: refuses in ANY of its arguments (see the last test below).
+HTML_DETAILS_BLOCK_UNLABELLED = (
+    '\x3cdetails>' + _html_element('pre', 'rc=0') + closer_for('details')
+)
+
+
+class TestAQuotedHtmlBlockIsFiledVerbatim:
+    """The real server files and resolves prose quoting an HTML block unchanged."""
+
+    SUMMARY = 'The report renders ' + HTML_DETAILS_BLOCK_UNLABELLED + ' for each finding.'
+    DETAIL = 'Evidence:\n' + HTML_DETAILS_BLOCK_UNLABELLED + '\nEnd of evidence.'
+    RESOLUTION = 'Resolved; the page now shows\n' + HTML_DETAILS_BLOCK
+
+    async def _file(self, client) -> str:
+        result = await client.call_tool(
+            'escalate_info', {**REQUIRED, 'summary': self.SUMMARY, 'detail': self.DETAIL},
+        )
+        assert result.data['status'] == 'queued'
+        return result.data['id']
+
+    @pytest.mark.asyncio
+    async def test_escalate_info_stores_the_text_verbatim(self, tmp_path: Path):
+        queue, server = build(tmp_path)
+
+        async with Client(server) as client:
+            esc_id = await self._file(client)
+
+        esc = queue.get(esc_id)
+        assert esc is not None
+        assert esc.summary == self.SUMMARY
+        assert esc.detail == self.DETAIL
+
+    @pytest.mark.asyncio
+    async def test_resolve_issue_stores_the_resolution_verbatim(self, tmp_path: Path):
+        queue, server = build(tmp_path)
+
+        async with Client(server) as client:
+            esc_id = await self._file(client)
+            await client.call_tool(
+                'resolve_issue', {'escalation_id': esc_id, 'resolution': self.RESOLUTION},
+            )
+
+        esc = queue.get(esc_id)
+        assert esc is not None
+        assert esc.resolution == self.RESOLUTION
+
+    @pytest.mark.asyncio
+    async def test_an_invoke_closer_beside_the_block_is_still_refused(self, tmp_path: Path):
+        _, server = build(tmp_path)
+
+        async with Client(server) as client:
+            with pytest.raises(ToolError) as excinfo:
+                await client.call_tool(
+                    'escalate_info',
+                    {**REQUIRED, 'detail': HTML_DETAILS_BLOCK + INVOKE_CLOSER + 'junk'},
+                )
+
+        payload = error_payload(excinfo)
+        assert payload['error_type'] == 'mcp_markup_unrepairable'
+        assert payload['field'] == 'detail'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('field', ['summary', 'detail'])
+    async def test_a_summary_element_is_still_refused_where_summary_is_a_parameter(
+        self, tmp_path: Path, field: str,
+    ):
+        """Pins the known false positive task 10551 exists to remove; expected to flip when it lands."""
+        _, server = build(tmp_path)
+
+        async with Client(server) as client:
+            with pytest.raises(ToolError) as excinfo:
+                await client.call_tool(
+                    'escalate_info',
+                    {**REQUIRED, field: 'Renders ' + HTML_DETAILS_BLOCK + ' per finding.'},
+                )
+
+        payload = error_payload(excinfo)
+        assert payload['error_type'] == 'mcp_markup_unrepairable'
+        assert payload['field'] == field
+        assert payload['matched_pattern'] == closer_for('summary')
+
+
+# ---------------------------------------------------------------------------
+# Task 5055: one caller rendering, the connection's identity, a truthful custody
+# claim.
+# ---------------------------------------------------------------------------
+
+
+def _unrepairable(field: str) -> str:
+    """*field* mis-closed, then a pseudo-parameter no tool declares (boundary row B8)."""
+    return (
+        'The note the caller meant to send.' + closer_for(field) + '\n'
+        + CANONICAL_OPENER_PREFIX + '"not_a_declared_parameter">' + 'stray'
+    )
+
+
+def _residues_of(queue: EscalationQueue) -> list[Escalation]:
+    return queue.get_by_task('mcp-markup-residue', status='pending')
+
+
+class TestTheResidueNamesTheConnectionsIdentity:
+    """``stamp_triage`` declares no ``agent_id``, so only the connection can name its caller.
+
+    The L2 watcher made the measured ``stamp_triage`` and ``resolve_issue``
+    leaks, and it connects with an ``X-Escalation-Identity`` header. That
+    header resolves only under a real ASGI request, so these rows run over HTTP.
+    """
+
+    WATCHER = 'l2-escalation-watcher'
+
+    @pytest.fixture
+    def served(self, tmp_path: Path, serve_escalation_mcp) -> tuple[str, EscalationQueue, str]:
+        """A running server, its queue, and one pending record to annotate.
+
+        Sync, because the fixture's readiness handshake runs its own event loop.
+        """
+        base_url, _port, queue = serve_escalation_mcp(tmp_path / 'esc')
+        seeded = Escalation(
+            id=queue.make_id('3441'), task_id='3441', agent_role='implementer',
+            level=0, severity='blocking', category='scope_violation',
+            summary='A pending record for the watcher to annotate.',
+        )
+        queue.submit(seeded)
+        return base_url, queue, seeded.id
+
+    @staticmethod
+    async def _refuse_over_http(served, identity: str | None) -> list[str]:
+        base_url, queue, escalation_id = served
+        with pytest.raises(ToolError):
+            await escalation_http_call(
+                base_url, 'stamp_triage', identity=identity,
+                escalation_id=escalation_id, triage_note=_unrepairable('triage_note'),
+            )
+        [residue] = _residues_of(queue)
+        return residue.detail.splitlines()
+
+    @pytest.mark.asyncio
+    async def test_the_identity_header_names_the_caller(self, served):
+        lines = await self._refuse_over_http(served, self.WATCHER)
+
+        assert f'agent_id={self.WATCHER!r}' in lines
+
+    @pytest.mark.asyncio
+    async def test_an_unlabelled_connection_is_never_guessed(self, served):
+        lines = await self._refuse_over_http(served, None)
+
+        assert 'agent_id=None' in lines
+
+
+class TestTheResidueRendersTheSharedCallerLines:
+    """The escalation server renders its caller lines the way every residue filer does."""
+
+    async def _residue_detail(self, tmp_path: Path) -> str:
+        record = specimen(UNREPAIRABLE)
+        queue, server = build(tmp_path)
+        async with Client(server) as client:
+            with pytest.raises(ToolError):
+                await client.call_tool(
+                    'escalate_info', {**REQUIRED, record['param']: record['value']},
+                )
+        [residue] = _residues_of(queue)
+        return residue.detail
+
+    @pytest.mark.asyncio
+    async def test_every_caller_line_is_rendered(self, tmp_path: Path):
+        detail = await self._residue_detail(tmp_path)
+
+        caller = {
+            'subject_task_id': REQUIRED['task_id'],
+            'subject_agent_role': REQUIRED['agent_role'],
+            'agent_id': None,
+            'project': None,
+            'override_swallowed': False,
+        }
+        missing = set(residue_header_lines(caller)) - set(detail.splitlines())
+        assert not missing, f'the residue detail lacks caller lines {sorted(missing)}'
+
+    @pytest.mark.asyncio
+    async def test_the_custody_claim_is_the_shared_caveat(self, tmp_path: Path):
+        detail = await self._residue_detail(tmp_path)
+
+        assert MARKUP_REFUSAL_CUSTODY_CAVEAT in detail
+        assert 'only surviving copy' not in detail
+
+
+class TestAResolutionLeakIsForwardedClean:
+    """Characterization: FORWARD_REPAIR lands a repairable ``resolve_issue.resolution`` leak."""
+
+    RESOLUTION = 'Fixed by folding the duplicates into one entry.'
+
+    @pytest.mark.asyncio
+    async def test_the_stored_resolution_is_the_clean_value(self, tmp_path: Path):
+        queue, server = build(tmp_path)
+        leaked = (
+            self.RESOLUTION + closer_for('resolution') + '\n'
+            + '\x3cresolved_by>' + 'steward' + closer_for('resolved_by') + INVOKE_CLOSER
+        )
+
+        async with Client(server) as client:
+            filed = await client.call_tool('escalate_info', REQUIRED)
+            await client.call_tool(
+                'resolve_issue', {'escalation_id': filed.data['id'], 'resolution': leaked},
+            )
+
+        resolved = queue.get(filed.data['id'])
+        assert resolved is not None
+        assert resolved.resolution == self.RESOLUTION
+        assert resolved.resolved_by == 'steward'
+
+
+# ---------------------------------------------------------------------------
+# A residue the queue cannot take still survives, whole, in the log.
+# ---------------------------------------------------------------------------
+
+
+class _ResidueRefusingQueue(EscalationQueue):
+    """A queue whose disk is full for residue records only."""
+
+    def submit(self, escalation: Escalation) -> str:
+        if escalation.category == RESIDUE_CATEGORY:
+            raise OSError(28, 'No space left on device')
+        return super().submit(escalation)
+
+
+class _ResidueIdlessQueue(EscalationQueue):
+    """A queue that cannot mint an id under the residue anchor."""
+
+    def make_id(self, key: str) -> str:
+        if key == 'mcp-markup-residue':
+            raise OSError(28, 'No space left on device')
+        return super().make_id(key)
+
+
+@dataclass(frozen=True)
+class _LeakingCall:
+    """One leaked ``escalate_info`` call, and what its caller is told and gets."""
+
+    error_type: str
+    arguments: dict[str, Any]
+    raw: str
+    reported_residue_id: Callable[[Client, dict[str, Any]], Awaitable[str | None]]
+    caller_records_filed: int
+
+
+async def _refusal_residue_id(client: Client, arguments: dict[str, Any]) -> str | None:
+    """A refused call names its residue's home on the ToolError."""
+    with pytest.raises(ToolError) as excinfo:
+        await client.call_tool('escalate_info', arguments)
+    return error_payload(excinfo)['escalation_id']
+
+
+async def _forwarded_residue_id(client: Client, arguments: dict[str, Any]) -> str | None:
+    """A forwarded call names its dropped slice's home on the result meta."""
+    result = await client.call_tool('escalate_info', arguments)
+    assert result.meta is not None
+    return result.meta['markup_repair']['unrecovered_residue_id']
+
+
+def _refused_call() -> _LeakingCall:
+    record = specimen(UNREPAIRABLE)
+    return _LeakingCall(
+        error_type=MARKUP_UNREPAIRABLE_ERROR_TYPE,
+        arguments={**REQUIRED, record['param']: record['value']},
+        raw=record['value'],
+        reported_residue_id=_refusal_residue_id,
+        caller_records_filed=0,
+    )
+
+
+def _dropped_slice_call() -> _LeakingCall:
+    return _LeakingCall(
+        error_type=MARKUP_UNRECOVERED_PARAM_ERROR_TYPE,
+        arguments={**REQUIRED, 'detail': _leak('Ill-formed.', 'evidence', UNTYPABLE_EVIDENCE)},
+        raw=UNTYPABLE_EVIDENCE,
+        reported_residue_id=_forwarded_residue_id,
+        caller_records_filed=1,
+    )
+
+
+class TestAResidueTheQueueCannotTakeSurvivesInTheLog:
+    """The queue is the residue's first home, never its only chance.
+
+    A residue the queue refuses is written whole to one ERROR line, as text
+    and as data, so the payload is recoverable from the service's journal.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'failing_queue',
+        [
+            pytest.param(_ResidueRefusingQueue, id='submit-raises'),
+            pytest.param(_ResidueIdlessQueue, id='make-id-raises'),
+        ],
+    )
+    @pytest.mark.parametrize(
+        'leaking_call',
+        [
+            pytest.param(_refused_call, id='refused'),
+            pytest.param(_dropped_slice_call, id='dropped-slice'),
+        ],
+    )
+    async def test_the_whole_record_is_logged(
+        self,
+        tmp_path: Path,
+        caplog,
+        failing_queue: type[EscalationQueue],
+        leaking_call: Callable[[], _LeakingCall],
+    ):
+        call = leaking_call()
+        queue = failing_queue(tmp_path / 'esc')
+        server = create_server(queue, startup_sweep=False)
+
+        with caplog.at_level('ERROR', logger='escalation.server'):
+            async with Client(server) as client:
+                preserved_in = await call.reported_residue_id(client, call.arguments)
+
+        assert preserved_in is None
+        [line] = [r for r in caplog.records if 'residue_record' in r.__dict__]
+        residue_record = line.__dict__['residue_record']
+        assert residue_record['raw_value'] == call.raw
+        assert residue_record['error_type'] == call.error_type
+        assert repr(call.raw) in line.getMessage()
+        assert line.exc_info is not None
+        assert line.exc_info[0] is OSError
+        assert len(queue.get_by_task(REQUIRED['task_id'])) == call.caller_records_filed

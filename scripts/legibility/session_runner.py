@@ -21,12 +21,10 @@ for an invocation that produced no usable reply, and its subclass
 ``NoHeadroom`` for one that no pool account could take.
 
 THE PACKAGE SPELLING, ``from legibility import session_runner``, is the only
-way consumers reach this module, and that is what makes the exception classes
-unique. scripts/legibility/ sits on sys.path beside scripts/, so census's bare
-``import coder`` and nightly's ``from legibility import coder`` build two coder
-module objects. Defined here rather than in coder, the classes exist once
-however coder itself was imported, so ``coder.code_digest`` catches exactly
-what the invoker raises (task 6042).
+way consumers reach this module, as it is for every sibling, so its exception
+classes exist once and ``coder.code_digest`` catches exactly what the invoker
+raises (task 6042). scripts/tests/test_legibility_import_spelling.py enforces
+the one spelling.
 """
 from __future__ import annotations
 
@@ -48,6 +46,7 @@ if str(_SHARED_SRC) not in sys.path:
     sys.path.insert(0, str(_SHARED_SRC))
 
 from legibility import account_pool  # noqa: E402
+from shared.account_reserve import WorkClass, WorkKind  # noqa: E402  # debt: task 6760
 from shared.cli_invoke import (  # noqa: E402
     AgentResult,
     AllAccountsCappedException,
@@ -66,6 +65,8 @@ from shared.usage_gate import PoolFrozen  # noqa: E402
 logger = logging.getLogger("legibility.session_runner")
 
 _CONFIG_DIR_TASK_PREFIX = "legibility-session-"
+
+_LEGIBILITY_WORK_CLASS = WorkClass(kind=WorkKind.BACKGROUND, role="legibility")
 
 _ERROR_STREAM_TAIL_CHARS = 2000
 """How much of EACH output stream an ``InvocationFailed`` carries. One bound
@@ -227,6 +228,7 @@ class SessionRunner:
                 config_dir=self._config_dir,
                 max_cap_retries=self._gate.account_count,
                 park_on_frozen_pool=False,
+                work_class=_LEGIBILITY_WORK_CLASS,
                 prompt=prompt,
                 model=model,
                 cwd=cwd,
@@ -293,16 +295,17 @@ def _exhaustion_error(gate, label: str, *, frozen: PoolFrozen | None = None) -> 
     """The exception for a pool with no account left — typed as well as
     worded, because each exhaustion needs a different operator response.
 
-    ====================================  ================  =======================
+    ====================================  ================  ===========================
     pool state                            raised            clears on its own?
-    ====================================  ================  =======================
+    ====================================  ================  ===========================
     no accounts resolved                  NoHeadroom        no — config fault
+    refused the reserve                   NoHeadroom        yes — the reserve's release
     a model scope exhausted everywhere    NoHeadroom        yes — the scope's reset
     retries spent, an account still live  NoHeadroom        no — not a cap at all
     every account auth-failed             InvocationFailed  no — operator action
     some auth-failed, rest capped         NoHeadroom        only the capped ones
     all capped                            NoHeadroom        yes — weekly reset
-    ====================================  ================  =======================
+    ====================================  ================  ===========================
 
     The all-auth-failed pool must NOT be a ``NoHeadroom``:
     ``coder.is_cap_deferral`` would turn a majority of those into an exit-0
@@ -324,6 +327,10 @@ def _exhaustion_error(gate, label: str, *, frozen: PoolFrozen | None = None) -> 
             "config/usage-accounts.yaml",
         )
     if frozen is not None:
+        if frozen.reserved_account is not None:
+            return _pool_exhausted(
+                label, f"{frozen} — background work waits for the reserve until its release",
+            )
         if frozen.scope is not None:
             return _scope_exhausted_error(label, frozen)
         return _unavailable_pool_error(

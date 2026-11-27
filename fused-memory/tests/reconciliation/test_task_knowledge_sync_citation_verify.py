@@ -47,20 +47,17 @@ from fused_memory.reconciliation.stages.task_knowledge_sync import (
 # returns exactly as tests/test_stages.py already does.
 _STAGE2_POST_RUN_HELPERS = (
     'write_cycle_summary',
-    '_write_task_count_snapshot',
-    '_verify_task_count_snapshot_written',
     '_gc_recon_markers',
     '_sweep_stale_persistence_markers',
     '_sweep_stale_mem0_flag_markers',
     '_sweep_stale_mem0_flag_for_stage2_markers',
 )
 
-# The Stage-3 finding-side filters. Each is a pass-through for the
-# 'test_project' scope used here, but they are patched to the identity so a
-# future policy change to one of them cannot silently turn these tests green
-# by dropping the finding under test instead of verifying its citations.
+# The Stage-3 finding-side filters, patched to the identity so a change to
+# one of them cannot silently turn these tests green by dropping the finding
+# under test instead of verifying its citations.
 _STAGE3_FINDING_FILTERS = (
-    'filter_blocked_snapshot_findings',
+    'filter_task_count_snapshot_findings',
     'filter_contamination_ceiling_findings',
 )
 

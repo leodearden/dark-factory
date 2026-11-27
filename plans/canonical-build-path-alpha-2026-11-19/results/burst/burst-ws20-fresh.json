@@ -1,0 +1,151 @@
+{
+ "host": "workstation",
+ "label": "ws20-fresh",
+ "started": 20,
+ "answered": 18,
+ "readonly_by_log": 14,
+ "wrote_entry": 0,
+ "no_write": 18,
+ "rows": [
+  {
+   "i": 1,
+   "readonly_log": true,
+   "writes": 0,
+   "write_errors": 0,
+   "err_tail": "   written: 13"
+  },
+  {
+   "i": 2,
+   "readonly_log": true,
+   "writes": 0,
+   "write_errors": 0,
+   "err_tail": "   written: 13"
+  },
+  {
+   "i": 3,
+   "readonly_log": true,
+   "writes": 0,
+   "write_errors": 0,
+   "err_tail": "   written: 13"
+  },
+  {
+   "i": 4,
+   "readonly_log": true,
+   "writes": 0,
+   "write_errors": 0,
+   "err_tail": "   written: 13"
+  },
+  {
+   "i": 5,
+   "readonly_log": true,
+   "writes": 0,
+   "write_errors": 0,
+   "err_tail": "   written: 13"
+  },
+  {
+   "i": 6,
+   "readonly_log": false,
+   "writes": null,
+   "write_errors": null,
+   "err_tail": "   error decoding response body: error reading a body from connection: end of file before message length reached"
+  },
+  {
+   "i": 7,
+   "readonly_log": true,
+   "writes": 0,
+   "write_errors": 0,
+   "err_tail": "   written: 13"
+  },
+  {
+   "i": 8,
+   "readonly_log": true,
+   "writes": 0,
+   "write_errors": 0,
+   "err_tail": "   written: 13"
+  },
+  {
+   "i": 9,
+   "readonly_log": true,
+   "writes": 0,
+   "write_errors": 0,
+   "err_tail": "   written: 13"
+  },
+  {
+   "i": 10,
+   "readonly_log": true,
+   "writes": 0,
+   "write_errors": 0,
+   "err_tail": "   written: 13"
+  },
+  {
+   "i": 11,
+   "readonly_log": false,
+   "writes": 0,
+   "write_errors": 0,
+   "err_tail": ""
+  },
+  {
+   "i": 12,
+   "readonly_log": true,
+   "writes": 0,
+   "write_errors": 0,
+   "err_tail": "   written: 13"
+  },
+  {
+   "i": 13,
+   "readonly_log": false,
+   "writes": 0,
+   "write_errors": 0,
+   "err_tail": ""
+  },
+  {
+   "i": 14,
+   "readonly_log": true,
+   "writes": 0,
+   "write_errors": 0,
+   "err_tail": "   written: 13"
+  },
+  {
+   "i": 15,
+   "readonly_log": true,
+   "writes": 0,
+   "write_errors": 0,
+   "err_tail": "   written: 13"
+  },
+  {
+   "i": 16,
+   "readonly_log": true,
+   "writes": 0,
+   "write_errors": 0,
+   "err_tail": "   written: 13"
+  },
+  {
+   "i": 17,
+   "readonly_log": false,
+   "writes": 0,
+   "write_errors": 0,
+   "err_tail": ""
+  },
+  {
+   "i": 18,
+   "readonly_log": false,
+   "writes": 0,
+   "write_errors": 0,
+   "err_tail": ""
+  },
+  {
+   "i": 19,
+   "readonly_log": true,
+   "writes": 0,
+   "write_errors": 0,
+   "err_tail": "   written: 13"
+  },
+  {
+   "i": 20,
+   "readonly_log": false,
+   "writes": null,
+   "write_errors": null,
+   "err_tail": "   error decoding response body: error reading a body from connection: end of file before message length reached"
+  }
+ ]
+}

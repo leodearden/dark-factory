@@ -91,8 +91,18 @@ class TestWorkflowVerifyProducerEmit:
         assert rows[0]['data'] == {
             'passed': True,
             'tip_sha': 'cafef00d',
+            'tip_sha_unresolved': False,
+            'tip_sha_unresolved_reason': None,
             'base_sha': 'deadbeef',
             'branch': f'{wf.config.git.branch_prefix}{wf.task_id}',
+            # task 5651: this workflow holds no VerifyResult, so every verdict fact is None.
+            'site': 'implement',
+            'runner': 'local',
+            'duration_ms': None,
+            'slot_wait_secs': None,
+            'plan_hash': None,
+            'cache_mode': None,
+            'units': None,
         }
 
     def test_verify_checkpoint_hit_suppresses_workflow_verify_emit(self, tmp_path: Path):
@@ -243,7 +253,7 @@ class TestSubmitToMergeQueueIntegrationSkewRouting:
 
         workflow.merge_queue = asyncio.Queue()
         with patch(
-            'orchestrator.merge_lane.worker.enqueue_merge_request', _fake_enqueue,
+            'orchestrator.merge_lane.intake.enqueue_merge_request', _fake_enqueue,
         ):
             result = asyncio.run(
                 workflow._submit_to_merge_queue('task/42', pre_rebased=False, merge_phase=True)
@@ -300,7 +310,7 @@ class TestSubmitToMergeQueueIntegrationSkewRouting:
 
         workflow.merge_queue = asyncio.Queue()
         with patch(
-            'orchestrator.merge_lane.worker.enqueue_merge_request', _fake_enqueue,
+            'orchestrator.merge_lane.intake.enqueue_merge_request', _fake_enqueue,
         ):
             result = asyncio.run(
                 workflow._submit_to_merge_queue('task/42', pre_rebased=False, merge_phase=False)

@@ -40,6 +40,10 @@ from pathlib import Path
 
 import pytest
 
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 ROOT_PYPROJECT = REPO_ROOT / 'pyproject.toml'
 TARGET_MODULE = REPO_ROOT / 'shared' / 'tests' / 'test_cli_invoke_integration.py'
@@ -149,10 +153,6 @@ def default_collect() -> str:
     return _collect()
 
 
-# shared/pyproject.toml caps tests at 60s (signal method). A warm collect is
-# ~2s, but this pays a cold root-conftest import that reaches across all seven
-# subprojects, so take generous headroom rather than flake on a cold cache.
-@pytest.mark.timeout(180)
 class TestRootConfigIntegrationDeselection:
     """The root config must gate `integration` -- without over-gating.
 

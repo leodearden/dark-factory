@@ -9,6 +9,7 @@ suite that exercises full ticks end-to-end.
 
 import dataclasses
 import inspect
+import logging
 from datetime import UTC, datetime, timedelta
 from typing import cast
 from unittest.mock import AsyncMock
@@ -19,7 +20,8 @@ from shared.psi import PsiSample
 
 from orchestrator.config import OrchestratorConfig, PsiAdmissionConfig, apply_reload
 from orchestrator.event_store import EventStore
-from orchestrator.overrides import OverrideRow, OverrideStore
+from orchestrator.overrides import OverrideRow, OverrideSource, OverrideStore
+from orchestrator.pause_policy import PauseClass
 from orchestrator.scheduler import _CONTINUE, PsiHold, Scheduler, TickContext, TickOutcome
 
 
@@ -123,7 +125,7 @@ class TestHygienePhases:
         # A non-delivered streak for the same dependent — must STILL be GC'd.
         scheduler._streak_local_backfill.counts[('10', '9')] = 2
         # '10' is tracked (pending-age anchor) but drops out of the fetch.
-        scheduler._pending_anchor['10'] = 10
+        scheduler.age_anchors.observe([{'id': '10', 'status': 'pending'}], max_id=10)
 
         ctx = TickContext(
             tasks=[],
@@ -140,7 +142,7 @@ class TestHygienePhases:
         assert scheduler._streak_local_backfill.value(('10', '9')) == 0
         # Bookkeeping cleanup preserved — '10' is still stale-swept.
         assert '10' in ctx.stale_ids
-        assert '10' not in scheduler._pending_anchor
+        assert '10' not in scheduler.age_anchors.tracked_ids()
 
     @pytest.mark.asyncio
     async def test_phase_stale_sweep_still_gcs_delivered_streaks_on_terminal_status(
@@ -150,7 +152,7 @@ class TestHygienePhases:
         GC'd — the protection is narrowed to non-terminal transient absence,
         not a blanket exemption (task 2743)."""
         scheduler._streak_delivered_fail.counts[('11', '21')] = 2
-        scheduler._pending_anchor['11'] = 11
+        scheduler.age_anchors.observe([{'id': '11', 'status': 'pending'}], max_id=11)
 
         ctx = TickContext(
             tasks=[],
@@ -163,7 +165,7 @@ class TestHygienePhases:
         # Terminal → still cleaned up (no leak on genuine completion).
         assert scheduler._streak_delivered_fail.value(('11', '21')) == 0
         assert '11' in ctx.stale_ids
-        assert '11' not in scheduler._pending_anchor
+        assert '11' not in scheduler.age_anchors.tracked_ids()
 
     @pytest.mark.asyncio
     async def test_phase_stale_sweep_protects_external_streaks_on_transient_absence(
@@ -185,7 +187,7 @@ class TestHygienePhases:
         scheduler._streak_hold.counts['10'] = 2
         scheduler._streak_local_backfill.counts[('10', '9')] = 2
         # '10' is tracked (pending-age anchor) but drops out of the fetch.
-        scheduler._pending_anchor['10'] = 10
+        scheduler.age_anchors.observe([{'id': '10', 'status': 'pending'}], max_id=10)
 
         ctx = TickContext(
             tasks=[],
@@ -203,7 +205,7 @@ class TestHygienePhases:
         assert scheduler._streak_local_backfill.value(('10', '9')) == 0
         # Bookkeeping cleanup preserved — '10' is still stale-swept.
         assert '10' in ctx.stale_ids
-        assert '10' not in scheduler._pending_anchor
+        assert '10' not in scheduler.age_anchors.tracked_ids()
 
     @pytest.mark.asyncio
     async def test_phase_stale_sweep_still_gcs_external_streaks_on_terminal_status(
@@ -215,7 +217,7 @@ class TestHygienePhases:
         (task 2746)."""
         scheduler._streak_external_unresolved.counts[('11', 'dark_factory:5')] = 2
         scheduler._streak_resolver_degraded.counts['11'] = 2
-        scheduler._pending_anchor['11'] = 11
+        scheduler.age_anchors.observe([{'id': '11', 'status': 'pending'}], max_id=11)
 
         ctx = TickContext(
             tasks=[],
@@ -229,7 +231,7 @@ class TestHygienePhases:
         assert scheduler._streak_external_unresolved.value(('11', 'dark_factory:5')) == 0
         assert scheduler._streak_resolver_degraded.value('11') == 0
         assert '11' in ctx.stale_ids
-        assert '11' not in scheduler._pending_anchor
+        assert '11' not in scheduler.age_anchors.tracked_ids()
 
     @pytest.mark.asyncio
     async def test_phase_cooldown_gc_drops_expired(self, scheduler: Scheduler):
@@ -344,8 +346,22 @@ class TestPolicySelectionPrepPhases:
         assert any(str(t.get('id')) == 'A' for t in ctx.candidates)
         assert 'A' in ctx.candidate_signals
 
+    @staticmethod
+    def _starvation_ctx(**overrides) -> TickContext:
+        task = {'id': 'A', 'status': 'pending', 'dependencies': []}
+        fields = {
+            'tasks': [task],
+            'status_map': {'A': 'pending'},
+            'tasks_by_id': {'A': task},
+            'candidates': [task],
+            'tasks_read_at': datetime(2026, 11, 25, tzinfo=UTC),
+        }
+        return TickContext(**(fields | overrides))
+
     @pytest.mark.asyncio
-    async def test_phase_starvation_scans_candidates(self, scheduler: Scheduler):
+    async def test_phase_starvation_scans_candidates(
+        self, scheduler: Scheduler, caplog: pytest.LogCaptureFixture
+    ):
         calls: list[str] = []
 
         async def _spy(task_id, **kwargs):
@@ -354,17 +370,35 @@ class TestPolicySelectionPrepPhases:
         scheduler._callbacks = dataclasses.replace(
             scheduler._callbacks, on_starvation_warn=_spy
         )
-        task = {'id': 'A', 'status': 'pending', 'dependencies': []}
-        ctx = TickContext(
-            tasks=[task],
-            status_map={'A': 'pending'},
-            tasks_by_id={'A': task},
-            candidates=[task],
-        )
 
-        result = await scheduler._phase_starvation(ctx)
+        with caplog.at_level(logging.WARNING, logger='orchestrator.scheduler'):
+            result = await scheduler._phase_starvation(self._starvation_ctx())
 
         assert result is _CONTINUE
+        assert not [
+            r for r in caplog.records
+            if 'Starvation watchdog pass raised' in r.getMessage()
+        ]
+
+    @pytest.mark.asyncio
+    async def test_phase_starvation_without_tasks_read_at_logs_the_invariant(
+        self, scheduler: Scheduler, caplog: pytest.LogCaptureFixture
+    ):
+        with caplog.at_level(logging.WARNING, logger='orchestrator.scheduler'):
+            result = await scheduler._phase_starvation(
+                self._starvation_ctx(tasks_read_at=None)
+            )
+
+        assert result is _CONTINUE
+        raised = [
+            r for r in caplog.records
+            if 'Starvation watchdog pass raised' in r.getMessage()
+        ]
+        assert len(raised) == 1
+        exc_info = raised[0].exc_info
+        assert exc_info is not None
+        assert isinstance(exc_info[1], ValueError)
+        assert 'tasks_read_at is unset' in str(exc_info[1])
 
     @pytest.mark.asyncio
     async def test_phase_reserve_now_installs_parks_and_clears_flag(self, tmp_path):
@@ -381,7 +415,7 @@ class TestPolicySelectionPrepPhases:
         }
         reserve_row = OverrideRow(
             boost_tier=None, pinned=False, pin_order=None, reserve_now=True,
-            ttl_until=None,
+            ttl_until=None, source=OverrideSource.OPERATOR,
         )
         ctx = TickContext(
             tasks=[task],
@@ -414,7 +448,7 @@ class TestPolicySelectionPrepPhases:
 
         row = OverrideRow(
             boost_tier='high', pinned=False, pin_order=None, reserve_now=False,
-            ttl_until=None,
+            ttl_until=None, source=OverrideSource.OPERATOR,
         )
         ctx = TickContext(
             tasks=[], status_map={}, tasks_by_id={},
@@ -444,7 +478,7 @@ class TestPolicySelectionPrepPhases:
 
         row = OverrideRow(
             boost_tier='high', pinned=False, pin_order=None, reserve_now=False,
-            ttl_until=None,
+            ttl_until=None, source=OverrideSource.OPERATOR,
         )
         ctx = TickContext(
             tasks=[], status_map={}, tasks_by_id={},
@@ -617,7 +651,7 @@ class TestSelectionPhases:
         }
         pinned_row = OverrideRow(
             boost_tier=None, pinned=True, pin_order=0, reserve_now=False,
-            ttl_until=None,
+            ttl_until=None, source=OverrideSource.OPERATOR,
         )
         ctx = TickContext(
             tasks=[task],
@@ -649,7 +683,7 @@ class TestSelectionPhases:
         }
         unpinned_row = OverrideRow(
             boost_tier=None, pinned=False, pin_order=None, reserve_now=False,
-            ttl_until=None,
+            ttl_until=None, source=OverrideSource.OPERATOR,
         )
         ctx = TickContext(
             tasks=[task],
@@ -695,7 +729,7 @@ class TestSelectionPhases:
         }
         pinned_row = OverrideRow(
             boost_tier=None, pinned=True, pin_order=0, reserve_now=False,
-            ttl_until=None,
+            ttl_until=None, source=OverrideSource.OPERATOR,
         )
         ctx = TickContext(
             tasks=[pinned_task, scored_task],
@@ -1040,7 +1074,7 @@ class TestTickTelemetry:
         """
         event_store = _RecordingEventStore()
         scheduler.event_store = event_store  # type: ignore[assignment]
-        scheduler.pause('test-pause')
+        scheduler.pause('test-pause', PauseClass.OPERATOR)
         scheduler.get_tasks = AsyncMock(return_value=[])
 
         result = await scheduler.acquire_next()

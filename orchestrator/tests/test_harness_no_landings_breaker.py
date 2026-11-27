@@ -20,6 +20,7 @@ from orchestrator.config import OrchestratorConfig
 from orchestrator.event_store import EventStore
 from orchestrator.harness import Harness
 from orchestrator.merge_lane.worker import NoLandingsCircuitBreaker
+from orchestrator.pause_policy import PauseClass
 from orchestrator.run_store import RunStore
 
 # Role tag used by the breaker escalation (must match implementation)
@@ -96,7 +97,7 @@ class TestHarnessNoLandingsFire:
         floor=10_000_000 > disk values (180k–200k) so disk-pressure gate
         (last_free < floor) is satisfied and the trip fires.
         """
-        harness, _rs, _escalations = _make_harness(
+        harness, run_store, _escalations = _make_harness(
             tmp_path, window=3, floor=10_000_000,
         )
         _stub_merge_worker(harness, landings_total=5)  # landings stay flat
@@ -110,6 +111,12 @@ class TestHarnessNoLandingsFire:
 
         assert harness.scheduler.is_paused, (
             'scheduler should be paused after trip window'
+        )
+        assert harness.scheduler.pause_class is PauseClass.NO_LANDINGS
+        run_store.save_scheduler_pause.assert_called_once()
+        assert (
+            run_store.save_scheduler_pause.call_args.kwargs['pause_class']
+            is PauseClass.NO_LANDINGS
         )
 
     @pytest.mark.asyncio
@@ -316,6 +323,30 @@ class TestHarnessNoLandingsResume:
         assert not after, (
             f'expected 0 pending breaker INFO escalations after resume, got {len(after)}'
         )
+
+    @pytest.mark.asyncio
+    async def test_resume_classifies_a_parked_info_escalation(self, tmp_path: Path) -> None:
+        """A watcher's park promotes the record to level 2, whose close must be classified."""
+        harness, _rs, escalations = _make_harness(
+            tmp_path, window=3, floor=10_000_000,
+        )
+        await self._drive_to_trip(harness)
+        (filed,) = [
+            e
+            for e in escalations.get_by_task(_BREAKER_SENTINEL, status='pending')
+            if e.agent_role == _BREAKER_ROLE
+        ]
+        escalations.park(filed.id, 'parked for a human')
+
+        _stub_merge_worker(harness, landings_total=6)
+        with patch('shutil.disk_usage') as mock_du:
+            mock_du.return_value = MagicMock(free=150_000)
+            await harness._run_no_landings_breaker_pass()
+
+        closed = escalations.get(filed.id)
+        assert closed is not None
+        assert closed.status != 'pending'
+        assert closed.resolution_class is not None
 
     @pytest.mark.asyncio
     async def test_disk_recovery_resumes(self, tmp_path: Path) -> None:

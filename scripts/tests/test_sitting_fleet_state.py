@@ -11,12 +11,15 @@ from pathlib import Path
 import pytest
 from escalation.models import Escalation
 from escalation.shadow_ruling import ShadowRuling, agreement_report
-from orchestrator.session_registry import DecisionRecord, normalize_escalations_dir
+from orchestrator.decision_registry import DecisionRecord, normalize_escalations_dir
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 from sitting import fleet_state as mod
 from sitting import inventory, payloads
 from sitting.payloads import AgreedMarker, PreparedMarker
 
 from orchestrator import digest
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 NOW = datetime(2026, 9, 26, 5, 30, tzinfo=UTC)
 WINDOW = mod.Window(NOW - timedelta(days=1), NOW)
@@ -444,9 +447,12 @@ class TestStandingPolicyRulings:
     def test_folds_the_per_queue_agreement_reports(self, tmp_path):
         first, second = tmp_path / 'a' / 'data' / 'escalations', tmp_path / 'b' / 'data' / 'escalations'
         cls = 'infra_issue_transient_self_cleared'
-        _resolved(first, 'esc-1-1', triage_note=_shadow(cls, 'close_only'), resolution_action='close_only')
-        _resolved(first, 'esc-1-2', triage_note=_shadow(cls, 'close_only'), resolution_action='resume')
-        _resolved(second, 'esc-2-1', triage_note=_shadow(cls, 'close_only'), resolution_action='close_only')
+        _resolved(first, 'esc-1-1', triage_note=_shadow(cls, 'close_only'), resolution_action='close_only',
+                  ruled_by_human=True)
+        _resolved(first, 'esc-1-2', triage_note=_shadow(cls, 'close_only'), resolution_action='resume',
+                  ruled_by_human=True)
+        _resolved(second, 'esc-2-1', triage_note=_shadow(cls, 'close_only'), resolution_action='close_only',
+                  ruled_by_human=True)
         _write_escalation(second, id='esc-2-2', triage_note=_shadow(cls, 'resume'))
 
         measurement = mod.standing_policy_rulings([str(first), str(second)], WINDOW, now=NOW)

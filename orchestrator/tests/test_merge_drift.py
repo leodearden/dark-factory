@@ -31,12 +31,21 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from _merge_lane_fakes import FakeVerifier, hangs_until
+from _drift_lanes import registered_drift_lanes
+from _lane_test_helpers import get_head
+from _merge_lane_fakes import FakeVerifier, delegates_to, hangs_until
 from _orch_helpers import wait_responsive
+from _seed_script_stubs import (
+    CURRENT_LOCKING_SEED_SCRIPT,
+    commit_seed_script,
+    make_seed_test_repo,
+    seed_default_warm_base,
+    warm_pool_git_config,
+)
 
 from orchestrator.config import GitConfig, OrchestratorConfig, VerifyRunnerConfig
 from orchestrator.event_store import EventStore, EventType
-from orchestrator.git_ops import GitOps, _run
+from orchestrator.git_ops import GitOps, WorktreeKind, _run
 from orchestrator.merge_lane.drift import (
     DriftCheckState,
     _load_drift_check_state,
@@ -66,6 +75,15 @@ from orchestrator.verify_runner import HostAllocator
 # "no probes" out loud keeps them hermetic on purpose and by construction — the
 # guard order in check_env makes an empty list return before it touches a host.
 _LEVER_C_OFF: list = []
+
+
+def _no_pool_git_ops(throwaway: Path) -> MagicMock:
+    """A GitOps double on a host with no warm-lane pool, minting *throwaway* cold."""
+    git_ops = MagicMock()
+    git_ops.pool_in_use = MagicMock(return_value=False)
+    git_ops.create_ephemeral_verify_worktree = AsyncMock(return_value=throwaway)
+    git_ops.cleanup_merge_worktree = AsyncMock()
+    return git_ops
 
 
 def test_merge_drift_exports_moved_public_symbols() -> None:
@@ -369,11 +387,7 @@ class TestDriftCheckFullGateSpecNoDerivation:
         from orchestrator.merge_lane.drift import _run_drift_check
         from orchestrator.verify_runner import HostAllocator
 
-        git_ops = MagicMock()
-        git_ops.create_ephemeral_verify_worktree = AsyncMock(
-            return_value=Path('/repo/_throwaway')
-        )
-        git_ops.cleanup_merge_worktree = AsyncMock()
+        git_ops = _no_pool_git_ops(Path('/repo/_throwaway'))
 
         req = MagicMock()
         req.task_id = 'task-drift-fullgate'
@@ -424,7 +438,7 @@ class TestDriftCheckFullGateSpecNoDerivation:
             ),
             # A full-gate drift spec must NOT derive/scope task_files at all.
             patch(
-                'orchestrator.merge_lane.worker._derive_task_files_from_git',
+                'orchestrator.merge_lane.post_merge_verify._derive_task_files_from_git',
                 derive_spy,
             ),
             patch(
@@ -433,7 +447,7 @@ class TestDriftCheckFullGateSpecNoDerivation:
             ),
         ):
             await _run_drift_check(
-                git_ops, req, 'commit-sha', None, event_store, set(),
+                git_ops, req, 'commit-sha', None, event_store, set().add,
                 allocator=allocator,
                 verifier=PRODUCTION_VERIFIER,
             )
@@ -579,11 +593,7 @@ class TestDriftCheckEnvDivergenceWiring:
         from orchestrator.merge_lane.drift import _run_drift_check
         from orchestrator.verify_runner import HostAllocator
 
-        git_ops = MagicMock()
-        git_ops.create_ephemeral_verify_worktree = AsyncMock(
-            return_value=Path('/repo/_throwaway')
-        )
-        git_ops.cleanup_merge_worktree = AsyncMock()
+        git_ops = _no_pool_git_ops(Path('/repo/_throwaway'))
 
         req = MagicMock()
         req.task_id = 'task-env-drift'
@@ -601,7 +611,7 @@ class TestDriftCheckEnvDivergenceWiring:
         fake_remote.name = 'laptop'
         fake_remote.is_local = False
         fake_remote.run_merge_verify = AsyncMock(return_value=pass_result)
-        fake_remote.env_probe_run = MagicMock(return_value=remote_seam)
+        fake_remote.env_probe_run = AsyncMock(return_value=remote_seam)
         allocator = HostAllocator([fake_remote], quarantine=set())
 
         local_seam = _make_env_probe_seam(_LOCAL_PROBE_OUTPUT)
@@ -625,7 +635,7 @@ class TestDriftCheckEnvDivergenceWiring:
             ),
         ):
             await _run_drift_check(
-                git_ops, req, 'commit-sha', escalation_queue, event_store, set(),
+                git_ops, req, 'commit-sha', escalation_queue, event_store, set().add,
                 allocator=allocator, verifier=PRODUCTION_VERIFIER,
             )
         return event_store, escalation_queue, local_seam, remote_seam
@@ -702,11 +712,7 @@ class TestDriftCheckEnvDivergenceWiring:
         from orchestrator.merge_lane.drift import _run_drift_check
         from orchestrator.verify_runner import HostAllocator
 
-        git_ops = MagicMock()
-        git_ops.create_ephemeral_verify_worktree = AsyncMock(
-            return_value=Path('/repo/_throwaway')
-        )
-        git_ops.cleanup_merge_worktree = AsyncMock()
+        git_ops = _no_pool_git_ops(Path('/repo/_throwaway'))
         req = MagicMock()
         req.task_id = 'task-env-drift-noquarantine'
         req.task_files = None
@@ -722,7 +728,7 @@ class TestDriftCheckEnvDivergenceWiring:
         fake_remote.name = 'laptop'
         fake_remote.is_local = False
         fake_remote.run_merge_verify = AsyncMock(return_value=pass_result)
-        fake_remote.env_probe_run = MagicMock(
+        fake_remote.env_probe_run = AsyncMock(
             return_value=_make_env_probe_seam(_REMOTE_PROBE_OUTPUT_SKEWED)
         )
         allocator = HostAllocator([fake_remote], quarantine=set())
@@ -743,7 +749,7 @@ class TestDriftCheckEnvDivergenceWiring:
         ):
             await _run_drift_check(
                 git_ops, req, 'commit-sha', _RecordingEscalationQueue(),
-                event_store, quarantine_set, allocator=allocator, verifier=PRODUCTION_VERIFIER,
+                event_store, quarantine_set.add, allocator=allocator, verifier=PRODUCTION_VERIFIER,
             )
         from orchestrator.event_store import EventType
         assert quarantine_set == set()
@@ -809,11 +815,7 @@ class TestDriftCheckEnvDivergenceWiring:
         from orchestrator.merge_lane.drift import _run_drift_check
         from orchestrator.verify_runner import HostAllocator
 
-        git_ops = MagicMock()
-        git_ops.create_ephemeral_verify_worktree = AsyncMock(
-            return_value=Path('/repo/_throwaway')
-        )
-        git_ops.cleanup_merge_worktree = AsyncMock()
+        git_ops = _no_pool_git_ops(Path('/repo/_throwaway'))
 
         req = MagicMock()
         req.task_id = 'task-env-drift-no-local-spawn'
@@ -852,7 +854,7 @@ class TestDriftCheckEnvDivergenceWiring:
         ):
             await _run_drift_check(
                 git_ops, req, 'commit-sha', _RecordingEscalationQueue(), event_store,
-                set(), allocator=allocator, verifier=PRODUCTION_VERIFIER,
+                set().add, allocator=allocator, verifier=PRODUCTION_VERIFIER,
             )
 
         assert local_seam.issued == [], (
@@ -890,11 +892,7 @@ class TestEnvCheckCannotBreakVerdictDriftCheck:
         from orchestrator.merge_lane.drift import _run_drift_check
         from orchestrator.verify_runner import DriftDetector, HostAllocator
 
-        git_ops = MagicMock()
-        git_ops.create_ephemeral_verify_worktree = AsyncMock(
-            return_value=Path('/repo/_throwaway')
-        )
-        git_ops.cleanup_merge_worktree = AsyncMock()
+        git_ops = _no_pool_git_ops(Path('/repo/_throwaway'))
 
         req = MagicMock()
         req.task_id = 'task-env-check-blast-radius'
@@ -912,7 +910,7 @@ class TestEnvCheckCannotBreakVerdictDriftCheck:
         fake_remote.name = 'laptop'
         fake_remote.is_local = False
         fake_remote.run_merge_verify = AsyncMock(return_value=pass_result)
-        fake_remote.env_probe_run = MagicMock(
+        fake_remote.env_probe_run = AsyncMock(
             return_value=_make_env_probe_seam(_REMOTE_PROBE_OUTPUT_MATCHING)
         )
         allocator = HostAllocator([fake_remote], quarantine=set())
@@ -931,7 +929,7 @@ class TestEnvCheckCannotBreakVerdictDriftCheck:
         ):
             await _run_drift_check(
                 git_ops, req, 'commit-sha', _RecordingEscalationQueue(),
-                event_store, set(), allocator=allocator, verifier=PRODUCTION_VERIFIER,
+                event_store, set().add, allocator=allocator, verifier=PRODUCTION_VERIFIER,
             )
 
         assert EventType.verdict_parity_ok in event_store.types(), (
@@ -948,11 +946,7 @@ class TestEnvCheckCannotBreakVerdictDriftCheck:
         from orchestrator.merge_lane.drift import _run_drift_check
         from orchestrator.verify_runner import DriftDetector, HostAllocator
 
-        git_ops = MagicMock()
-        git_ops.create_ephemeral_verify_worktree = AsyncMock(
-            return_value=Path('/repo/_throwaway')
-        )
-        git_ops.cleanup_merge_worktree = AsyncMock()
+        git_ops = _no_pool_git_ops(Path('/repo/_throwaway'))
 
         req = MagicMock()
         req.task_id = 'task-env-check-logged'
@@ -970,7 +964,7 @@ class TestEnvCheckCannotBreakVerdictDriftCheck:
         fake_remote.name = 'laptop'
         fake_remote.is_local = False
         fake_remote.run_merge_verify = AsyncMock(return_value=pass_result)
-        fake_remote.env_probe_run = MagicMock(
+        fake_remote.env_probe_run = AsyncMock(
             return_value=_make_env_probe_seam(_REMOTE_PROBE_OUTPUT_MATCHING)
         )
         allocator = HostAllocator([fake_remote], quarantine=set())
@@ -988,7 +982,7 @@ class TestEnvCheckCannotBreakVerdictDriftCheck:
         ):
             await _run_drift_check(
                 git_ops, req, 'commit-sha', _RecordingEscalationQueue(),
-                _RecordingEventStore(), set(), allocator=allocator, verifier=PRODUCTION_VERIFIER,
+                _RecordingEventStore(), set().add, allocator=allocator, verifier=PRODUCTION_VERIFIER,
             )
 
         env_warnings = [
@@ -1040,12 +1034,6 @@ async def _setup_drift_repo(repo: Path) -> None:
     (repo / 'README.md').write_text('# Test\n')
     await _run(['git', 'add', '-A'], cwd=repo)
     await _run(['git', 'commit', '-m', 'Initial commit'], cwd=repo)
-
-
-async def _drift_head_sha(repo: Path) -> str:
-    rc, out, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=repo)
-    assert rc == 0
-    return out.strip()
 
 
 @pytest.fixture
@@ -1112,7 +1100,7 @@ class TestDriftCheckHoldsLaneLease:
         from orchestrator.merge_lane.drift import _run_drift_check
         from orchestrator.verify_runner import HostAllocator
 
-        head = await _drift_head_sha(drift_git_ops.project_root)
+        head = await get_head(drift_git_ops.project_root)
         recorded: list[tuple[str, bool, Path]] = []
 
         pass_result = VerifyResult(
@@ -1147,7 +1135,7 @@ class TestDriftCheckHoldsLaneLease:
             'orchestrator.merge_lane.worker.run_scoped_verification', _reaping_scoped,
         ):
             await _run_drift_check(
-                drift_git_ops, req, head, None, None, set(), allocator=allocator,
+                drift_git_ops, req, head, None, None, set().add, allocator=allocator,
                 verifier=PRODUCTION_VERIFIER,
             )
 
@@ -1207,9 +1195,7 @@ class _DriftScene:
     def build(
         cls, tmp_path: Path, *, remote_verify: AsyncMock | None = None, **config: Any,
     ) -> _DriftScene:
-        git_ops = MagicMock()
-        git_ops.create_ephemeral_verify_worktree = AsyncMock(return_value=tmp_path / '_throwaway')
-        git_ops.cleanup_merge_worktree = AsyncMock()
+        git_ops = _no_pool_git_ops(tmp_path / '_throwaway')
         req = MagicMock()
         req.task_id = 'task-6648-drift'
         req.module_configs = []
@@ -1233,7 +1219,7 @@ class _DriftScene:
 
     def run(self, verifier: FakeVerifier, **options: Any) -> Coroutine[Any, Any, None]:
         return _run_drift_check(
-            self.git_ops, self.req, 'drift-sha', None, self.event_store, set(),
+            self.git_ops, self.req, 'drift-sha', None, self.event_store, set().add,
             verifier=verifier, allocator=self.allocator, **options,
         )
 
@@ -1349,6 +1335,8 @@ class TestDriftCheckDefersWhenAHostSlotIsBusy:
         assert verifier.entered_count == 0
         (deferral,) = _deferrals(scene)
         assert deferral['merge_sha'] == 'drift-sha'
+        assert deferral['cause'] == 'host_slots_busy'
+        assert deferral['detail'] is None
         assert deferral['consecutive_deferrals'] == 1
         assert deferral['hosts'] == scene.allocator.host_states()
         assert {h['name']: h['slot_state'] for h in deferral['hosts']}['laptop'] == 'busy'
@@ -1474,6 +1462,148 @@ class TestDriftCheckDefersWhenAHostSlotIsBusy:
             'after 2 deferred' in message
             for message in _deferral_logs(caplog, logging.INFO)
         )
+
+
+# ---------------------------------------------------------------------------
+# task 11479: the local leg runs warm wherever a pool is configured
+#
+# Real git plus the reify seed-script stubs, a real HostAllocator with a
+# 'laptop' double, and the local leg observed through the injected VerifyPort.
+# ---------------------------------------------------------------------------
+
+
+@dataclasses.dataclass
+class _WarmDriftScene:
+    """``_run_drift_check`` over a REAL GitOps with a spec warm-lane pool configured."""
+
+    git_ops: GitOps
+    repo: Path
+    head: str
+    req: MagicMock
+    remote: MagicMock
+    allocator: HostAllocator
+    event_store: _RecordingEventStore
+    state_path: Path
+
+    @classmethod
+    async def build(cls, tmp_path: Path, *, warm_base: bool) -> _WarmDriftScene:
+        repo = make_seed_test_repo(tmp_path, warm_base=warm_base)
+        await commit_seed_script(repo, CURRENT_LOCKING_SEED_SCRIPT)
+        req = MagicMock()
+        req.task_id = 'task-11479-drift'
+        req.module_configs = []
+        req.config = OrchestratorConfig(
+            project_root=repo,
+            verify_runners=[
+                VerifyRunnerConfig(
+                    name='laptop', ssh_host='laptop.local', git_remote='origin',
+                    df_checkout_path='/df',
+                ),
+            ],
+            verify_env_probes=_LEVER_C_OFF,
+        )
+        remote = MagicMock()
+        remote.name = 'laptop'
+        remote.is_local = False
+        remote.run_merge_verify = AsyncMock(return_value=_PASS)
+        return cls(
+            GitOps(warm_pool_git_config(), repo, merge_spec_warm_lane_pool_size=1),
+            repo, await get_head(repo), req, remote,
+            HostAllocator([remote], quarantine=set()), _RecordingEventStore(),
+            tmp_path / 'drift_check_state.json',
+        )
+
+    async def run(self) -> tuple[FakeVerifier, list[tuple[Path, bool]]]:
+        """One drift check; returns its verifier and (worktree, seeded) per local leg."""
+        legs: list[tuple[Path, bool]] = []
+
+        async def _record_leg(worktree: Path, *_args: Any, **_options: Any) -> VerifyResult:
+            legs.append((worktree, (worktree / 'target' / 'seeded.bin').exists()))
+            return _PASS
+
+        verifier = FakeVerifier(default=delegates_to(_record_leg))
+        await _run_drift_check(
+            self.git_ops, self.req, self.head, None, self.event_store, set().add,
+            verifier=verifier, allocator=self.allocator,
+            state_path=self.state_path, host_settle_secs=0,
+        )
+        return verifier, legs
+
+    def slots(self) -> set[str]:
+        return {h['slot_state'] for h in self.allocator.host_states()}
+
+
+@pytest.mark.asyncio
+class TestDriftCheckLocalLegRunsWarm:
+    """With a pool configured the local leg verifies in a CoW-seeded
+    ``_driftcheck-<hex>`` tree, or the check defers; it never builds cold."""
+
+    async def test_seedable_local_leg_verifies_in_a_seeded_drift_lane(
+        self, tmp_path: Path,
+    ) -> None:
+        scene = await _WarmDriftScene.build(tmp_path, warm_base=True)
+
+        _verifier, legs = await scene.run()
+
+        ((wt, seeded),) = legs
+        assert wt.name.startswith(WorktreeKind.DRIFT_CHECK.value)
+        assert seeded, 'the local leg must verify a CoW-seeded target/'
+        assert scene.event_store.types().count(EventType.verdict_parity_ok) == 1
+        assert scene.event_store.data_for(EventType.drift_check_deferred) == []
+        assert _load_drift_check_state(scene.state_path).consecutive_deferrals == 0
+        assert scene.slots() == {'free'}
+        assert not wt.exists()
+
+    async def test_unseedable_lane_defers_without_running_or_building_anything(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        scene = await _WarmDriftScene.build(tmp_path, warm_base=False)
+
+        with caplog.at_level(logging.INFO, logger='orchestrator.merge_lane'):
+            verifier, _legs = await scene.run()
+
+        assert verifier.entered_count == 0, 'no local leg may run, warm or cold'
+        scene.remote.run_merge_verify.assert_not_awaited()
+        (deferral,) = scene.event_store.data_for(EventType.drift_check_deferred)
+        assert deferral['cause'] == 'no_warm_lane'
+        assert 'warm base not resolvable' in deferral['detail']
+        assert deferral['consecutive_deferrals'] == 1
+        assert deferral['merge_sha'] == scene.head
+        assert {h['slot_state'] for h in deferral['hosts']} == {'free'}, (
+            'the deferral must be reported after the check released its own slots'
+        )
+        (logged,) = _deferral_logs(caplog, logging.INFO)
+        assert deferral['detail'] in logged, 'the INFO line must say why no lane was seeded'
+        assert _load_drift_check_state(scene.state_path).consecutive_deferrals == 1
+        assert scene.slots() == {'free'}
+        assert registered_drift_lanes(scene.repo) == [], 'no residue left'
+
+    async def test_back_to_back_no_warm_lane_deferrals_count_up(
+        self, tmp_path: Path,
+    ) -> None:
+        """A check that never got its lane never started, so it must not clear the count."""
+        scene = await _WarmDriftScene.build(tmp_path, warm_base=False)
+
+        await scene.run()
+        await scene.run()
+
+        deferrals = scene.event_store.data_for(EventType.drift_check_deferred)
+        assert [d['consecutive_deferrals'] for d in deferrals] == [1, 2]
+        assert _load_drift_check_state(scene.state_path).consecutive_deferrals == 2
+
+    async def test_a_no_warm_lane_deferral_re_arms_once_a_seed_is_available(
+        self, tmp_path: Path,
+    ) -> None:
+        scene = await _WarmDriftScene.build(tmp_path, warm_base=False)
+        await scene.run()
+        assert _load_drift_check_state(scene.state_path).consecutive_deferrals == 1
+
+        seed_default_warm_base(scene.repo)
+        _verifier, legs = await scene.run()
+
+        ((_wt, seeded),) = legs
+        assert seeded
+        assert _load_drift_check_state(scene.state_path).consecutive_deferrals == 0
 
 
 # ---------------------------------------------------------------------------

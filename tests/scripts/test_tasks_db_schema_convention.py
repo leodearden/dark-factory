@@ -29,13 +29,17 @@ expectation is derived rather than remembered.
 :data:`RECIPE_DOCS`: it is the generic multi-repo template and names no
 dark-factory command to execute.
 
+It also certifies CLAUDE.md's ticket-store recipe (task 7438), which hands out
+a host-absolute ``--db`` path to the one shared reconciliation ``tickets.db``;
+the guard checks that path's tail, which rules out the known decoy, then swaps
+it for a store it builds, so it never reads production state.
+
 PLACEMENT IS LOAD-BEARING. ``tests/scripts/`` carries its own module config, so
 this guard runs under FULL_SUITE and merge-role ``merge_verify_breadth: full``.
 """
 from __future__ import annotations
 
 import pathlib
-import re
 import shlex
 import sqlite3
 import subprocess
@@ -43,6 +47,9 @@ import sys
 
 import pytest
 import verify_command_invariants as vci
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 
@@ -55,6 +62,9 @@ RECIPE_DOCS = (
 
 SHAPE_LOOKUP_MARKER = "tasks-db-schema-lookup"
 SHAPE_LOOKUP_LABEL = "Task store shape"
+
+TICKETS_LOOKUP_MARKER = "tickets-db-schema-lookup"
+TICKETS_LOOKUP_LABEL = "Ticket store shape"
 
 _TOOL_RELATIVE_PATH = "scripts/tasks_db_schema.py"
 
@@ -69,26 +79,16 @@ _FIXTURE_TABLE = "tasks"
 _FIXTURE_COLUMNS = ("id", "status")
 _FIXTURE_DDL = "CREATE TABLE tasks (id INTEGER NOT NULL PRIMARY KEY, status TEXT NOT NULL)"
 
+# Likewise ARBITRARY for the ticket store: not a copy of ticket_store.py's DDL.
+_TICKETS_FIXTURE_TABLE = "tickets"
+_TICKETS_FIXTURE_COLUMNS = ("ticket_id", "status")
+_TICKETS_FIXTURE_DDL = "CREATE TABLE tickets (ticket_id TEXT PRIMARY KEY, status TEXT NOT NULL)"
 
-def _marked_command(markdown_text, marker, bullet_label, doc_name):
-    """The command on the *bullet_label* bullet between *marker*'s begin/end comments.
-
-    ``verify_command_invariants.marked_span`` owns the loud marker checks, and
-    every failure names *doc_name*. This guard supplies only the pattern, keyed
-    on the bullet's label rather than on backticks so that inline code in the
-    begin comment is never extracted.
-    """
-    bullet = re.compile(r"- \*\*" + re.escape(bullet_label) + r"\*\*: `([^`]+)`")
-    return vci.marked_span(
-        markdown_text,
-        begin=f"{marker}:begin",
-        end=f"{marker}:end",
-        pattern=bullet,
-        what=f"`- **{bullet_label}**: <command>` bullet",
-        source=doc_name,
-        label=f"the {bullet_label!r} command",
-        task="5330",
-    ).strip()
+# The live ticket store's path tail: the reconciliation data dir's default in
+# fused-memory/config/config.yaml, plus the file name
+# fused-memory/src/fused_memory/server/main.py::_build_ticket_store gives it.
+# Checked as a tail, never by parsing that config's syntax.
+_LIVE_TICKET_STORE_TAIL = ("data", "reconciliation", "tickets.db")
 
 
 _HAPPY_DOC = """\
@@ -108,24 +108,6 @@ _HAPPY_COMMAND = "python scripts/tasks_db_schema.py"
 
 _SELF_TEST_DOC_NAME = "self-test-doc.md"
 
-_NO_MARKER_DOC = """\
-- **Task store shape**: `python scripts/tasks_db_schema.py`
-
-Somewhere else entirely, an unmarked mention of `.taskmaster/tasks/tasks.db`.
-"""
-
-_DUPLICATE_MARKER_DOC = """\
-<!-- tasks-db-schema-lookup:begin -->
-- **Task store shape**: `python scripts/tasks_db_schema.py`
-<!-- tasks-db-schema-lookup:end -->
-
-## Some later section
-
-<!-- tasks-db-schema-lookup:begin -->
-- **Task store shape**: `python scripts/tasks_db_schema.py --db /elsewhere.db`
-<!-- tasks-db-schema-lookup:end -->
-"""
-
 _DECOY_DOC = """\
 The store is at `.taskmaster/tasks/tasks.db`, never inside your worktree.
 
@@ -141,42 +123,21 @@ Afterwards, `SELECT` against the columns it printed.
 """
 
 
-def test_marked_command_extracts_the_marked_span():
+def test_tasks_db_schema_bullet_extracts_the_marked_span():
     """Only the marked bullet's command is returned, backticks stripped."""
     assert (
-        _marked_command(
-            _HAPPY_DOC, SHAPE_LOOKUP_MARKER, SHAPE_LOOKUP_LABEL, _SELF_TEST_DOC_NAME
+        vci.marked_bullet_command(
+            _HAPPY_DOC,
+            slug=SHAPE_LOOKUP_MARKER,
+            bullet_label=SHAPE_LOOKUP_LABEL,
+            source=_SELF_TEST_DOC_NAME,
+            task="5330",
         )
         == _HAPPY_COMMAND
     )
 
 
-@pytest.mark.parametrize(
-    ("markdown_text", "case"),
-    [
-        (_NO_MARKER_DOC, "missing"),
-        (_DUPLICATE_MARKER_DOC, "duplicated"),
-    ],
-)
-def test_marked_command_fails_loudly_on_a_broken_marker(markdown_text, case):
-    """A missing or duplicated marker RAISES — never '' or None.
-
-    Missing is the vacuity hazard: an extractor that silently returns nothing
-    turns every downstream assertion green while executing nothing at all.
-    Duplicated is the same failure one level down — silently taking the first
-    leaves the second copy unexecuted and free to rot.
-    """
-    with pytest.raises(AssertionError) as excinfo:
-        _marked_command(
-            markdown_text, SHAPE_LOOKUP_MARKER, SHAPE_LOOKUP_LABEL, _SELF_TEST_DOC_NAME
-        )
-
-    message = str(excinfo.value)
-    assert SHAPE_LOOKUP_MARKER in message, case
-    assert _SELF_TEST_DOC_NAME in message, case
-
-
-def test_marked_command_is_immune_to_inline_code_in_the_begin_comment():
+def test_tasks_db_schema_bullet_is_immune_to_inline_code_in_the_begin_comment():
     """Prose inline code inside the marked slice is never extracted.
 
     An extractor keyed on "the first backtick span after the begin marker"
@@ -184,19 +145,44 @@ def test_marked_command_is_immune_to_inline_code_in_the_begin_comment():
     so the mistake would survive review and then be executed as a command.
     """
     assert (
-        _marked_command(
-            _DECOY_DOC, SHAPE_LOOKUP_MARKER, SHAPE_LOOKUP_LABEL, _SELF_TEST_DOC_NAME
+        vci.marked_bullet_command(
+            _DECOY_DOC,
+            slug=SHAPE_LOOKUP_MARKER,
+            bullet_label=SHAPE_LOOKUP_LABEL,
+            source=_SELF_TEST_DOC_NAME,
+            task="5330",
         )
         == _HAPPY_COMMAND
     )
 
 
-def _documented_tool_argv(command, doc_name):
-    """*command* re-pointed at this interpreter and this checkout's copy of the tool.
+def _bare_tool_run_argv(command, *, operand_shape, marker, doc_name, task):
+    """*command* tokenised, after checking it runs the shape tool with *operand_shape* after it.
 
     The SHAPE assertion is load-bearing: a recipe degraded into a raw
     ``sqlite3 ... 'SELECT ...'`` one-liner, or into a python ``-c`` that
     hardcodes a column list, fails here rather than being executed.
+    *operand_shape* only sets how many tokens follow the script and how the
+    failure message describes them; each caller checks its own operands.
+    """
+    argv = shlex.split(command)
+    expected = ", ".join(("python|python3", repr(_TOOL_RELATIVE_PATH), *operand_shape))
+    assert (
+        len(argv) == 2 + len(operand_shape)
+        and argv[0] in _PYTHON_ARGV0
+        and argv[1] == _TOOL_RELATIVE_PATH
+    ), (
+        f"the command inside the {marker!r} marker in {doc_name} is not a bare "
+        f"run of the shape tool (task {task}): {command!r} tokenises to "
+        f"{argv!r}, expected exactly [{expected}]. The convention is that an "
+        f"agent asks the store and reads the answer — a hand-written sqlite "
+        f"query in its place is the confusion this closes."
+    )
+    return argv
+
+
+def _documented_tool_argv(command, doc_name):
+    """*command* re-pointed at this interpreter and this checkout's copy of the tool.
 
     ``sys.executable`` rather than a bare ``python`` off PATH, because
     ``verify._target_subprocess_env`` strips ``VIRTUAL_ENV`` and the venv's bin
@@ -205,17 +191,8 @@ def _documented_tool_argv(command, doc_name):
     cwd set to a temp project root — which is the whole point, since the recipe
     resolves the store from the checkout it is standing in.
     """
-    argv = shlex.split(command)
-    assert len(argv) == 2 and argv[0] in _PYTHON_ARGV0, (
-        f"the command inside the {SHAPE_LOOKUP_MARKER!r} marker in {doc_name} is "
-        f"not a bare run of the shape tool (task 5330): {command!r} tokenises to "
-        f"{argv!r}, expected exactly [python|python3, {_TOOL_RELATIVE_PATH!r}]. "
-        f"The convention is that an agent asks the store and reads the answer — "
-        f"a hand-written sqlite query in its place is the confusion this closes."
-    )
-    assert argv[1] == _TOOL_RELATIVE_PATH, (
-        f"the {SHAPE_LOOKUP_MARKER!r} command in {doc_name} runs {argv[1]!r}, "
-        f"expected {_TOOL_RELATIVE_PATH!r} (task 5330)"
+    argv = _bare_tool_run_argv(
+        command, operand_shape=(), marker=SHAPE_LOOKUP_MARKER, doc_name=doc_name, task="5330"
     )
     return [sys.executable, str(REPO_ROOT / argv[1])]
 
@@ -259,19 +236,122 @@ def test_documented_store_shape_lookup_reports_the_stores_real_shape(doc_path, t
     the claim the doc is making to every agent that reads it.
     """
     doc_name = doc_path.relative_to(REPO_ROOT).as_posix()
-    command = _marked_command(
+    command = vci.marked_bullet_command(
         doc_path.read_text(encoding="utf-8"),
-        SHAPE_LOOKUP_MARKER,
-        SHAPE_LOOKUP_LABEL,
-        doc_name,
+        slug=SHAPE_LOOKUP_MARKER,
+        bullet_label=SHAPE_LOOKUP_LABEL,
+        source=doc_name,
+        task="5330",
     )
     argv = _documented_tool_argv(command, doc_name)
     root = _seeded_project_root(tmp_path)
 
+    out = _recipe_stdout(
+        argv, cwd=root, marker=SHAPE_LOOKUP_MARKER, doc_name=doc_name, task="5330"
+    )
+    _assert_reports_shape(
+        out,
+        marker=SHAPE_LOOKUP_MARKER,
+        store=root,
+        table=_FIXTURE_TABLE,
+        columns=_FIXTURE_COLUMNS,
+        task="5330",
+    )
+
+
+def _documented_ticket_store_argv(command, doc_name, store):
+    """*command* re-pointed at this checkout's tool and at *store* in place of the live one.
+
+    The documented operand must be ABSOLUTE: the ticket store is one per-host
+    file under the fused-memory server's checkout, and a task worktree has no
+    ``data/``, so a relative operand fails from every lane. It must also end in
+    :data:`_LIVE_TICKET_STORE_TAIL`, which rules out the 0-byte
+    ``fused-memory/data/tickets.db`` decoy. It is then swapped for *store*, so
+    this guard never reads production state.
+    """
+    argv = _bare_tool_run_argv(
+        command,
+        operand_shape=("'--db'", f"<absolute .../{'/'.join(_LIVE_TICKET_STORE_TAIL)}>"),
+        marker=TICKETS_LOOKUP_MARKER,
+        doc_name=doc_name,
+        task="7438",
+    )
+    assert argv[2] == "--db", (
+        f"the {TICKETS_LOOKUP_MARKER!r} command in {doc_name} passes {argv[2]!r} "
+        f"where '--db' belongs (task 7438): {argv!r}"
+    )
+    documented_store = pathlib.PurePosixPath(argv[3])
+    assert documented_store.is_absolute(), (
+        f"the {TICKETS_LOOKUP_MARKER!r} command in {doc_name} names the store as "
+        f"{argv[3]!r}, which is relative (task 7438): it resolves against the "
+        f"caller's cwd, and a task worktree has no data/. Name the one shared "
+        f"store by its absolute path."
+    )
+    assert documented_store.parts[-len(_LIVE_TICKET_STORE_TAIL):] == _LIVE_TICKET_STORE_TAIL, (
+        f"the {TICKETS_LOOKUP_MARKER!r} command in {doc_name} points --db at "
+        f"{argv[3]!r}, which does not end in {'/'.join(_LIVE_TICKET_STORE_TAIL)} "
+        f"(task 7438). The live store is in the fused-memory server's "
+        f"reconciliation data dir "
+        f"(fused-memory/src/fused_memory/server/main.py::resolve_data_dir); "
+        f"fused-memory/data/tickets.db is a 0-byte decoy."
+    )
+    return [sys.executable, str(REPO_ROOT / argv[1]), "--db", str(store)]
+
+
+def _seeded_ticket_store(tmp_path):
+    """A store holding :data:`_TICKETS_FIXTURE_DDL`; ``--db`` is explicit, so its path is arbitrary."""
+    db_path = tmp_path / "store.db"
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(_TICKETS_FIXTURE_DDL)
+        conn.commit()
+    finally:
+        conn.close()
+    return db_path
+
+
+def test_documented_ticket_store_shape_lookup_reports_the_stores_real_shape(tmp_path):
+    """CLAUDE.md's ticket-store recipe must print the shape of the store it is given.
+
+    Executed with the documented store swapped for one this test builds, so
+    the guard certifies the recipe works without reading production state.
+    """
+    doc_name = CLAUDE_MD_PATH.relative_to(REPO_ROOT).as_posix()
+    command = vci.marked_bullet_command(
+        CLAUDE_MD_PATH.read_text(encoding="utf-8"),
+        slug=TICKETS_LOOKUP_MARKER,
+        bullet_label=TICKETS_LOOKUP_LABEL,
+        source=doc_name,
+        task="7438",
+    )
+    store = _seeded_ticket_store(tmp_path)
+    argv = _documented_ticket_store_argv(command, doc_name, store)
+
+    out = _recipe_stdout(
+        argv, cwd=tmp_path, marker=TICKETS_LOOKUP_MARKER, doc_name=doc_name, task="7438"
+    )
+    first_line = out.splitlines()[0] if out else ""
+    assert first_line == str(store.resolve()), (
+        f"the {TICKETS_LOOKUP_MARKER!r} command's first line is {first_line!r}, "
+        f"expected the store it was handed, {str(store.resolve())!r} (task 7438). "
+        f"Full output: {out!r}"
+    )
+    _assert_reports_shape(
+        out,
+        marker=TICKETS_LOOKUP_MARKER,
+        store=store,
+        table=_TICKETS_FIXTURE_TABLE,
+        columns=_TICKETS_FIXTURE_COLUMNS,
+        task="7438",
+    )
+
+
+def _recipe_stdout(argv, *, cwd, marker, doc_name, task):
+    """Stdout of the *marker* recipe from *doc_name*, run as *argv* in *cwd*; it must exit 0."""
     try:
         completed = subprocess.run(
             argv,
-            cwd=str(root),
+            cwd=str(cwd),
             capture_output=True,
             text=True,
             timeout=_RUN_TIMEOUT_SECS,
@@ -279,28 +359,36 @@ def test_documented_store_shape_lookup_reports_the_stores_real_shape(doc_path, t
         )
     except subprocess.TimeoutExpired:
         pytest.fail(
-            f"the {SHAPE_LOOKUP_MARKER!r} command documented in {doc_name} did not "
-            f"finish within {_RUN_TIMEOUT_SECS}s (task 5330); argv: {argv!r}"
+            f"the {marker!r} command documented in {doc_name} did not "
+            f"finish within {_RUN_TIMEOUT_SECS}s (task {task}); argv: {argv!r}"
         )
 
     assert completed.returncode == 0, (
-        f"the {SHAPE_LOOKUP_MARKER!r} command documented in {doc_name} exited "
-        f"{completed.returncode} (task 5330) — agents are being handed a recipe "
+        f"the {marker!r} command documented in {doc_name} exited "
+        f"{completed.returncode} (task {task}) — agents are being handed a recipe "
         f"that does not work.\n"
-        f" argv: {argv!r}\n cwd: {root}\n"
+        f" argv: {argv!r}\n cwd: {cwd}\n"
         f" stdout: {completed.stdout.strip()!r}\n"
         f" stderr: {completed.stderr.strip()!r}"
     )
+    return completed.stdout
 
-    out = completed.stdout
-    assert _FIXTURE_TABLE in out, (
-        f"the {SHAPE_LOOKUP_MARKER!r} command exited 0 without naming the "
-        f"{_FIXTURE_TABLE!r} table of the store at {root} (task 5330): {out!r}"
+
+def _assert_reports_shape(out, *, marker, store, table, columns, task):
+    """*out* has *table*'s header line and every one of *columns* of the store this test built.
+
+    The header line, not a bare substring: the first line of *out* is the
+    store's path, which can itself contain the table name.
+    """
+    header = f"{table} — "
+    assert any(line.startswith(header) for line in out.splitlines()), (
+        f"the {marker!r} command exited 0 without a {header!r}... header line "
+        f"for the {table!r} table of the store at {store} (task {task}): {out!r}"
     )
-    missing = [column for column in _FIXTURE_COLUMNS if column not in out]
+    missing = [column for column in columns if column not in out]
     assert not missing, (
-        f"the {SHAPE_LOOKUP_MARKER!r} command did not report {missing!r} for the "
-        f"store this test built (task 5330) — it is meant to answer 'what "
+        f"the {marker!r} command did not report {missing!r} for the "
+        f"store this test built (task {task}) — it is meant to answer 'what "
         f"columns does this store have', so a report missing them would leave an "
         f"agent guessing exactly as before. Full output: {out!r}"
     )

@@ -20,23 +20,35 @@ from shared.project_layout import (
     ESCALATION_QUEUE_RELPATH,
     KNOWN_PROJECT_ROOTS_ENV,
     CheckoutRootError,
+    agent_transcripts_dir,
     default_project_root,
     escalation_queue_dir,
     known_project_roots,
     main_checkout_of,
+    offline_lane_dir,
     orchestrator_data_dir,
     park_eviction_requests_db,
+    reconciliation_tickets_db,
     runs_db,
+    scheduler_eligibility_db,
     scheduler_overrides_db,
     scheduler_state_json,
+    startup_failures_json,
     tasks_db,
+    verify_logs_dir,
 )
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 _ORCHESTRATOR_STORES = (
     (runs_db, 'runs.db'),
     (scheduler_state_json, 'scheduler_state.json'),
     (scheduler_overrides_db, 'scheduler_overrides.db'),
     (park_eviction_requests_db, 'park_eviction_requests.db'),
+    (scheduler_eligibility_db, 'scheduler_eligibility.db'),
+    (startup_failures_json, 'startup_failures.json'),
+    (offline_lane_dir, 'offline-lane'),
 )
 
 
@@ -55,9 +67,24 @@ class TestStoreLocators:
     def test_orchestrator_data_dir(self, root: str | Path) -> None:
         assert orchestrator_data_dir(root) == Path(root) / 'data' / 'orchestrator'
 
+    def test_agent_transcripts_dir(self, root: str | Path) -> None:
+        assert agent_transcripts_dir(root) == Path(root) / 'data' / 'orchestrator' / 'agent-transcripts'
+
+    def test_verify_logs_dir(self, root: str | Path) -> None:
+        assert verify_logs_dir(root) == Path(root) / 'data' / 'verify-logs'
+
     @pytest.mark.parametrize(('locator', 'name'), _ORCHESTRATOR_STORES)
     def test_orchestrator_store(self, root: str | Path, locator, name: str) -> None:
         assert locator(root) == Path(root) / 'data' / 'orchestrator' / name
+
+    def test_scheduler_eligibility_db_is_exported(self) -> None:
+        assert 'scheduler_eligibility_db' in shared.project_layout.__all__
+
+    def test_reconciliation_tickets_db(self, root: str | Path) -> None:
+        assert reconciliation_tickets_db(root) == Path(root) / 'data' / 'reconciliation' / 'tickets.db'
+
+    def test_reconciliation_tickets_db_is_exported(self) -> None:
+        assert 'reconciliation_tickets_db' in shared.project_layout.__all__
 
     def test_tasks_db_is_the_real_store_not_the_decoy(self, root: str | Path) -> None:
         assert tasks_db(root) == Path(root) / '.taskmaster' / 'tasks' / 'tasks.db'
@@ -68,7 +95,9 @@ class TestStoreLocators:
             escalation_queue_dir,
             orchestrator_data_dir,
             *(locator for locator, _ in _ORCHESTRATOR_STORES),
+            reconciliation_tickets_db,
             tasks_db,
+            verify_logs_dir,
         ],
     )
     def test_returns_a_path(self, root: str | Path, locator) -> None:
@@ -88,7 +117,9 @@ class TestLocatorsArePure:
             escalation_queue_dir,
             orchestrator_data_dir,
             *(locator for locator, _ in _ORCHESTRATOR_STORES),
+            reconciliation_tickets_db,
             tasks_db,
+            verify_logs_dir,
         ],
     )
     def test_no_io_on_a_missing_root(self, tmp_path: Path, locator) -> None:
@@ -101,6 +132,7 @@ class TestLocatorsArePure:
         assert runs_db('proj') == Path('proj/data/orchestrator/runs.db')
         assert tasks_db('proj') == Path('proj/.taskmaster/tasks/tasks.db')
         assert escalation_queue_dir('proj') == Path('proj/data/escalations')
+        assert reconciliation_tickets_db('proj') == Path('proj/data/reconciliation/tickets.db')
 
 
 class TestKnownProjectRoots:
@@ -231,8 +263,66 @@ class TestMainCheckoutOf:
         assert not any((ancestor / '.git').exists() for ancestor in src.parents), (
             f'fixture premise: no ancestor of {src} may hold .git'
         )
-        with pytest.raises(CheckoutRootError, match=re.escape(str(src))):
+        with pytest.raises(CheckoutRootError, match=re.escape(str(src))) as refused:
             main_checkout_of(src)
+        assert refused.value.checkout is None
+
+    def test_nul_byte_path_is_refused(self, base: Path) -> None:
+        with pytest.raises(CheckoutRootError) as refused:
+            main_checkout_of(f'{base}/a\x00b/src')
+        assert isinstance(refused.value.__cause__, ValueError)
+        assert refused.value.checkout is None
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason='root searches a mode-000 directory')
+    def test_unsearchable_directory_is_walked_past_to_the_enclosing_checkout(
+        self, main_repo: Path
+    ) -> None:
+        locked = main_repo / 'locked'
+        (locked / 'sub').mkdir(parents=True)
+        locked.chmod(0)
+        try:
+            answer = main_checkout_of(locked / 'sub')
+        finally:
+            locked.chmod(0o755)
+        assert answer == main_repo
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason='root searches a mode-000 directory')
+    def test_unsearchable_directory_with_no_checkout_above_is_refused(self, base: Path) -> None:
+        locked = base / 'locked'
+        (locked / 'sub').mkdir(parents=True)
+        assert not any((ancestor / '.git').exists() for ancestor in locked.parents), (
+            f'fixture premise: no ancestor of {locked} may hold .git'
+        )
+        locked.chmod(0)
+        try:
+            with pytest.raises(CheckoutRootError) as refused:
+                main_checkout_of(locked / 'sub')
+        finally:
+            locked.chmod(0o755)
+        assert refused.value.checkout is None
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason='root searches a mode-000 directory')
+    def test_gitdir_under_an_unsearchable_directory_is_refused_naming_the_checkout(
+        self, base: Path
+    ) -> None:
+        worktree = base / 'wt'
+        worktree.mkdir()
+        locked = base / 'locked'
+        (locked / 'gd').mkdir(parents=True)
+        (worktree / '.git').write_text(f'gitdir: {locked}/gd\n')
+        locked.chmod(0)
+        try:
+            with pytest.raises(CheckoutRootError) as refused:
+                main_checkout_of(worktree)
+        finally:
+            locked.chmod(0o755)
+        assert refused.value.checkout == worktree
+
+    def test_symlink_loop_is_refused(self, base: Path) -> None:
+        loop = base / 'loop'
+        loop.symlink_to(loop)
+        with pytest.raises(CheckoutRootError):
+            main_checkout_of(loop / 'x')
 
     def test_missing_gitdir_is_refused_rather_than_answering_the_worktree(
         self, base: Path, main_repo: Path
@@ -240,19 +330,30 @@ class TestMainCheckoutOf:
         worktree = _add_worktree(main_repo, main_repo / '.worktrees' / 'wt', 'wt')
         nowhere = base / 'nowhere'
         (worktree / '.git').write_text(f'gitdir: {nowhere}\n')
-        with pytest.raises(CheckoutRootError, match=re.escape(str(nowhere))):
+        with pytest.raises(CheckoutRootError, match=re.escape(str(nowhere))) as refused:
             main_checkout_of(_src_of(worktree))
+        assert refused.value.checkout == worktree
+
+    def test_garbled_gitfile_is_refused_naming_it(self, main_repo: Path) -> None:
+        worktree = _add_worktree(main_repo, main_repo / '.worktrees' / 'wt', 'wt')
+        dot_git = worktree / '.git'
+        dot_git.write_text('not a gitfile\n')
+        with pytest.raises(CheckoutRootError, match=re.escape(str(dot_git))) as refused:
+            main_checkout_of(_src_of(worktree))
+        assert refused.value.checkout == worktree
 
     def test_bare_backed_worktree_is_refused(self, base: Path, main_repo: Path) -> None:
         bare = base / 'bare.git'
         subprocess.run(
             ['git', 'clone', '-q', '--bare', str(main_repo), str(bare)], check=True, capture_output=True
         )
-        src = _src_of(_add_worktree(bare, base / 'bare-wt', 'bwt'))
+        worktree = _add_worktree(bare, base / 'bare-wt', 'bwt')
+        src = _src_of(worktree)
         common_dir = _git(src, 'rev-parse', '--path-format=absolute', '--git-common-dir').strip()
         assert Path(common_dir) == bare, 'fixture premise: the bare repo is the common git dir'
-        with pytest.raises(CheckoutRootError, match=re.escape(str(bare))):
+        with pytest.raises(CheckoutRootError, match=re.escape(str(bare))) as refused:
             main_checkout_of(src)
+        assert refused.value.checkout == worktree
 
     @pytest.mark.parametrize('pointer', ['gitfile', 'commondir'])
     def test_undecodable_pointer_file_is_refused_naming_it(
@@ -266,6 +367,7 @@ class TestMainCheckoutOf:
             main_checkout_of(_src_of(worktree))
         assert str(target) in str(refused.value)
         assert isinstance(refused.value.__cause__, UnicodeDecodeError)
+        assert refused.value.checkout == worktree
 
     @pytest.mark.skipif(os.geteuid() == 0, reason='root reads a mode-000 file')
     def test_unreadable_gitfile_is_refused_naming_it(self, main_repo: Path) -> None:

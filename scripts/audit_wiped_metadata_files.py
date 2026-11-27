@@ -3,13 +3,13 @@
 
 READ-ONLY / REPORT-ONLY: this module and its CLI never mutate a task record,
 an event record, or a plan artifact. Every database connection it opens is
-read-only: the task store goes through ``_task_db_scan.py::connect_ro``, and the
-runs.db event log through a read-only SQLite URI
-(``sqlite3.connect(f"file:{path}?mode=ro", uri=True)``), so the sweep is
-structurally incapable of writing to the live 128MB WAL databases the running
-orchestrator holds open. Plan files on disk are only
-ever read. REMEDIATION IS A SEPARATE, REVIEWED FOLLOW-UP — backfilling
-``metadata.files`` from this report is never done by this script.
+read-only: the task store goes through
+``shared/src/shared/tasks_db_readonly.py::connect_ro``, and the runs.db event
+log through ``shared/src/shared/sqlite_readonly.py::connect_readonly``, so the
+sweep is structurally incapable of writing to the live 128MB WAL databases the
+running orchestrator holds open. Plan files on disk are only ever read.
+REMEDIATION IS A SEPARATE, REVIEWED FOLLOW-UP — backfilling ``metadata.files``
+from this report is never done by this script.
 
 Background (task 3146): ``TaskWorkflow._reconcile_metadata_files_for_done``
 (orchestrator/src/orchestrator/workflow.py:2001-2021) contains an
@@ -28,7 +28,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import sqlite3
 import sys
 from pathlib import Path
 from typing import NamedTuple
@@ -50,7 +49,6 @@ from typing import NamedTuple
 # discover_project_roots is unused BY THIS MODULE — it is re-exported because
 # scripts/tests/test_audit_wiped_metadata_files.py imports it from here.
 from _task_db_scan import (
-    connect_ro,
     discover_project_roots,  # noqa: F401  (re-exported for this script's tests)
     format_coverage_block,
     format_kv_line,
@@ -58,6 +56,8 @@ from _task_db_scan import (
     runs_db_path,
     tasks_db_path,
 )
+from shared.sqlite_readonly import connect_readonly
+from shared.tasks_db_readonly import connect_ro
 
 # The canonical meta-root directory name, per config.py:1343 TASK_META_DIRNAME
 # and artifacts.py:287 meta_root_for. It is a SIBLING of the worktrees inside
@@ -156,6 +156,12 @@ _EVENT_PLAN_SOURCES = {
     "phase_skipped": ("plan_files", "phase_skipped_event", FIDELITY_FILE_LEVEL),
     "set_to_plan": ("files", "set_to_plan_event", FIDELITY_LOCK_LEVEL),
 }
+
+PLAN_EVENT_TYPES = tuple(_EVENT_PLAN_SOURCES)
+PLAN_EVENTS_SQL = (
+    "SELECT id, task_id, event_type, data FROM events "
+    f"WHERE event_type IN ({', '.join('?' for _ in PLAN_EVENT_TYPES)}) ORDER BY id"
+)
 
 # Higher rank wins. Compared before recency, so a file-level record beats a
 # lock-level one regardless of which event row is newer.
@@ -283,7 +289,7 @@ def load_merge_signatures(runs_db_path: str) -> dict[str, list[dict]]:
     malformed/NULL/non-dict payload are skipped.
     """
     signatures: dict[str, list[dict]] = {}
-    conn = sqlite3.connect(f"file:{runs_db_path}?mode=ro", uri=True)
+    conn = connect_readonly(runs_db_path)
     try:
         cursor = conn.execute(
             "SELECT id, task_id, data FROM events "
@@ -460,14 +466,9 @@ def load_plan_files_from_events(runs_db_path: str) -> dict[str, PlanFilesRecord]
     which are TEXT in the live schema.
     """
     records: dict[str, PlanFilesRecord] = {}
-    placeholders = ", ".join("?" for _ in _EVENT_PLAN_SOURCES)
-    conn = sqlite3.connect(f"file:{runs_db_path}?mode=ro", uri=True)
+    conn = connect_readonly(runs_db_path)
     try:
-        cursor = conn.execute(
-            "SELECT id, task_id, event_type, data FROM events "
-            f"WHERE event_type IN ({placeholders}) ORDER BY id",
-            tuple(_EVENT_PLAN_SOURCES),
-        )
+        cursor = conn.execute(PLAN_EVENTS_SQL, PLAN_EVENT_TYPES)
         for _event_id, task_id, event_type, data in cursor:
             if not task_id:
                 continue
@@ -495,8 +496,8 @@ def load_task_records(tasks_db_path: str) -> dict[tuple[str, int], TaskRecord]:
     ``master`` tag, but the schema permits the same numeric id under two tags
     and collapsing them would silently merge two distinct tasks.
 
-    Opens through ``_task_db_scan.py::connect_ro`` (read-only; see there for
-    refusals).
+    Opens through ``shared/src/shared/tasks_db_readonly.py::connect_ro``
+    (read-only; see there for refusals).
     """
     records: dict[tuple[str, int], TaskRecord] = {}
     conn = connect_ro(tasks_db_path)

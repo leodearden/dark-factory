@@ -63,9 +63,10 @@ from typing import (
 from shared.git_async import run_git
 
 from orchestrator import flake_ledger, verify
-from orchestrator.config import EnvProbeConfig, ModuleConfig, VerifyHostPolicy
+from orchestrator.config import EnvProbeConfig, ModuleConfig, VerifyCacheConfig, VerifyHostPolicy
 from orchestrator.deployed_sha import DeployedSha, resolve_code_checkout
 from orchestrator.event_store import EventType
+from orchestrator.merge_verify_facts import MergeVerifyDispatchFacts, RunnerReason
 from orchestrator.remote_gate import (
     ENSURE_CLIENT_TIMEOUT_SECS,
     SHIM_REMEDY,
@@ -79,13 +80,36 @@ from orchestrator.remote_gate import (
     parse_ensure_report,
     reap_script_text,
     shim_suspected,
+    wire_fields,
 )
-from orchestrator.task_verify_spec import TaskVerifySpec, task_spec_to_json
+from orchestrator.task_verify_spec import (
+    TaskVerifySpec,
+    collapsed_module_overrides,
+    task_spec_to_json,
+)
 from orchestrator.verify import (
     VerifyResult,
-    _archive_merge_verify_logs,
     _target_subprocess_env,
+    archive_verify_logs,
 )
+from orchestrator.verify_cache.modes import VerifyRole
+from orchestrator.verify_cache.recorder import (
+    CacheRecord,
+    ConsumeOutcome,
+    VerifyEvidenceRef,
+    cache_report_from_wire,
+    consume_replayed,
+    record_greens,
+)
+from orchestrator.verify_cache.registry import Registry
+from orchestrator.verify_cache.remote_view import (
+    RemoteCache,
+    ShippedView,
+    never_cache_unit_ids,
+    planned_unit_ids,
+)
+from orchestrator.verify_cache.replay import CacheAccess
+from orchestrator.verify_cache.runner_report import with_cache_report
 from orchestrator.verify_cancel import (
     HEARTBEAT_INTERVAL_SECS,
     SSH_SERVER_ALIVE_COUNT_MAX,
@@ -93,6 +117,7 @@ from orchestrator.verify_cancel import (
     start_stdin_heartbeat,
 )
 from orchestrator.verify_categories import FailureCategory, _assert_sentinels_disjoint
+from orchestrator.verify_evidence import verify_event_fields
 from orchestrator.verify_spec_shared import (
     VerifyCommand,
     apply_spec_to_host_config,
@@ -121,6 +146,10 @@ __all__ = [
     "RemoteRunner",
     "RemoteVerifySubcommand",
     "REMOTE_VERIFY_PROCESS_PATTERN",
+    "remote_verify_process_pattern",
+    "CANCEL_PROBE_ATTEMPTS",
+    "CANCEL_PROBE_INTERVAL_SECS",
+    "poll_until_clean",
     "RunnerUnavailable",
     "RunnerUnavailableKind",
     "ConcurrentDispatchError",
@@ -174,7 +203,7 @@ __all__ = [
 ]
 
 # Sentinel category constants — encode an unscoped-gate failure inside a
-# VerifyResult so _run_post_merge_verify can branch byte-identically.
+# VerifyResult so merge_lane/post_merge_verify.py::run_post_merge_verify can branch byte-identically.
 UNSCOPED_TYPECHECK_FAILED_CATEGORY = 'unscoped_typecheck_failed'
 UNSCOPED_TYPECHECK_TIMEOUT_CATEGORY = 'unscoped_typecheck_timeout'
 
@@ -284,6 +313,11 @@ class UnscopedTypecheckSpec:
 class MergeVerifySpec:
     """Full pre-advance merge-verify bundle — PRD §A contract.
 
+    Which OrchestratorConfig names the merge path reads, and whether each rides
+    this spec, is classified and census-guarded in
+    ``orchestrator/tests/test_merge_verify_config_fidelity.py::MERGE_PATH_CONFIG_READS``;
+    adding a merge-path config read or a spec field means updating that table.
+
     Fields
     ------
     verify_commands     : one VerifyCommand per module, scoped to task_files
@@ -312,12 +346,12 @@ class MergeVerifySpec:
                           home (INV-9), and the file to read before assuming what a
                           key here means.
                           The failed-only retry env from
-                          orchestrator/src/orchestrator/merge_lane/worker.py::_build_retry_verify_env
+                          orchestrator/src/orchestrator/merge_lane/retry_verify_env.py::_build_retry_verify_env
                           has path-valued keys that cannot resolve remotely:
                           its nextest filter files are UNTRACKED files in the
                           dispatching host's merge_wt, which the git-pushed merge
                           SHA does not carry. That env is therefore never shipped:
-                          merge_lane/worker.py::_run_post_merge_verify builds it
+                          merge_lane/post_merge_verify.py::run_post_merge_verify builds it
                           only for a LOCAL dispatch (runner is None), so a REMOTE
                           retry runs FULL and is charged to the legacy (full)
                           retry budget, not the narrowed one. Pinned by
@@ -347,6 +381,18 @@ class MergeVerifySpec:
                           TaskVerifySpec's rule: non-empty replaces the host's
                           value, '' keeps the host's own. '' is also what a
                           pre-6127 dispatcher's spec decodes to.
+    scope_cargo         : the cargo-scoping switch that gates
+                          verify.py::_apply_cargo_scope, including the
+                          zero-module __cargo_scoped__ route (task 7465). None
+                          (a pre-7465 spec) keeps the host's own value; a
+                          carried value replaces it.
+    merge_config_only_full_gate_globs : task 2838's manifest-drift backstop,
+                          read by verify.py::_merge_config_only_diff_forces_full_gate
+                          (task 7465). None (a pre-7465 spec) keeps the host's
+                          own globs; a carried value, () included, replaces them.
+    verify_cache        : the dispatcher's registry view (A5), merge-deciding like
+                          the task-2822 profile; set only by
+                          RemoteRunner.run_merge_verify. None runs every unit.
 
     Note
     ----
@@ -365,8 +411,10 @@ class MergeVerifySpec:
     is_merge_verify: bool = True
     # Fix (a), task 2822 — the merge-gate PROFILE rides the spec so the remote
     # host runs the identical scope/profile as the dispatching merge gate.
-    # Narrow defaults match the pre-fix behaviour and the OrchestratorConfig
-    # field defaults (merge_verify_workspace=False, merge_verify_breadth='scoped').
+    # The narrow defaults are the wire back-compat value for a spec that does
+    # not carry the profile (a pre-task-2822 dispatcher), not the project
+    # policy: every live dispatcher sets both fields from config in
+    # build_merge_verify_spec.
     merge_verify_workspace: bool = False
     merge_verify_breadth: str = "scoped"
     # INV-1, task 2883 — the global full-gate commands for a zero-module-config
@@ -375,6 +423,11 @@ class MergeVerifySpec:
     global_verify_command: VerifyCommand | None = None
     # Task 6127 — the dispatcher's pre-provision command; '' keeps the host's.
     verify_cold_preprovision_command: str = ''
+    # Task 7465 — None: not carried (a pre-7465 spec); the host keeps its own.
+    scope_cargo: bool | None = None
+    # Task 7465 — None: not carried (a pre-7465 spec); the host keeps its own.
+    merge_config_only_full_gate_globs: tuple[str, ...] | None = None
+    verify_cache: ShippedView | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -392,6 +445,13 @@ class MergeVerifySpec:
                 else None
             ),
             "verify_cold_preprovision_command": self.verify_cold_preprovision_command,
+            "scope_cargo": self.scope_cargo,
+            "merge_config_only_full_gate_globs": (
+                list(self.merge_config_only_full_gate_globs)
+                if self.merge_config_only_full_gate_globs is not None
+                else None
+            ),
+            "verify_cache": self.verify_cache.to_wire() if self.verify_cache is not None else None,
         }
 
     @classmethod
@@ -400,6 +460,8 @@ class MergeVerifySpec:
         # Back-compat: a legacy spec dict (pre-task-2883) lacks this key, so
         # default to None — same d.get idiom as merge_verify_workspace/breadth.
         _gvc = d.get("global_verify_command")
+        _globs = d.get("merge_config_only_full_gate_globs")
+        _view = d.get("verify_cache")
         return cls(
             verify_commands=tuple(VerifyCommand.from_dict(vc) for vc in d["verify_commands"]),
             unscoped_typecheck=UnscopedTypecheckSpec.from_dict(d["unscoped_typecheck"]),
@@ -415,6 +477,9 @@ class MergeVerifySpec:
                 VerifyCommand.from_dict(_gvc) if _gvc is not None else None
             ),
             verify_cold_preprovision_command=d.get("verify_cold_preprovision_command", ""),
+            scope_cargo=d.get("scope_cargo"),
+            merge_config_only_full_gate_globs=tuple(_globs) if _globs is not None else None,
+            verify_cache=ShippedView.from_wire(_view) if _view is not None else None,
         )
 
 
@@ -432,8 +497,17 @@ def result_to_dict(vr: VerifyResult) -> dict:
     dict here, and ``json.dumps`` flattens its ``StrEnum`` members to their values and
     its tuple to an array — so this direction still needs no special handling.  The
     asymmetry is entirely on the READ side; see :func:`result_from_dict`.
+
+    Off-wire fields (``remote_gate.wire_fields``) are left out, never walked: a
+    runner's ``cache_record`` stays on its host, and what it reports to the
+    dispatcher's recorder is the wire field ``cache_report`` (task 9123).
     """
-    return dataclasses.asdict(vr)
+    shipped = {f.name for f in wire_fields(VerifyResult)}
+    off_wire = [f.name for f in dataclasses.fields(vr) if f.name not in shipped]
+    wire = dataclasses.asdict(dataclasses.replace(vr, **dict.fromkeys(off_wire)))
+    for name in off_wire:
+        del wire[name]
+    return wire
 
 
 def result_from_dict(d: dict) -> VerifyResult:
@@ -470,6 +544,9 @@ def result_from_dict(d: dict) -> VerifyResult:
         if raw is not None:
             # Shallow COPY — never mutate the caller's dict, which it may still inspect.
             d = {**d, 'flake_suppression': flake_ledger.flake_suppression_from_wire(raw)}
+        raw_report = d.get('cache_report')
+        if raw_report is not None:
+            d = {**d, 'cache_report': cache_report_from_wire(raw_report)}
     return VerifyResult(**d)
 
 
@@ -521,7 +598,20 @@ def build_merge_verify_spec(
         merge_verify_breadth=config.merge_verify_breadth,
         global_verify_command=global_verify_command_for(config, verify_commands),
         verify_cold_preprovision_command=config.verify_cold_preprovision_command,
+        scope_cargo=_carried_scope_cargo(config, module_configs),
+        merge_config_only_full_gate_globs=tuple(config.git.merge_config_only_full_gate_globs),
     )
+
+
+def _carried_scope_cargo(config: OrchestratorConfig, module_configs: list[ModuleConfig]) -> bool:
+    """The scope_cargo the spec ships: False when a per-module override cannot ride it.
+
+    module_config_from_command drops a per-module scope_cargo, and on the remote
+    a spec-level False can only widen cargo scope (verify.py::_apply_cargo_scope);
+    η (task 9135) makes per-module carriage lossless.
+    """
+    collapsed = collapsed_module_overrides(module_configs)
+    return config.scope_cargo and not any(c.field == 'scope_cargo' for c in collapsed)
 
 
 # ---------------------------------------------------------------------------
@@ -533,7 +623,8 @@ def _module_config_from_command(vc: VerifyCommand, spec: MergeVerifySpec) -> Mod
     """Reconstruct a ModuleConfig from a VerifyCommand + shared MergeVerifySpec fields.
 
     This is the exact inverse of build_merge_verify_spec's projection:
-    - prefix + three command fields come from the VerifyCommand
+    - prefix + three command fields come from the VerifyCommand, and so does the
+      module's verify_cache, so a never-cache module stays never-cache here
     - verify_env and cold_timeout_secs are shared spec-level fields threaded into
       each ModuleConfig's verify_env and verify_cold_command_timeout_secs
 
@@ -550,6 +641,9 @@ def _module_config_from_command(vc: VerifyCommand, spec: MergeVerifySpec) -> Mod
     cascade (module→top-level→warm) exactly as a real local merge run does, instead of
     returning 0.0 and triggering an immediate asyncio.wait_for(..., timeout=0.0)
     TimeoutError.  Positive cold timeouts map verbatim.
+
+    A per-module scope_cargo is not carried; build_merge_verify_spec collapses it
+    into the spec-level value (see _carried_scope_cargo).
     """
     return module_config_from_command(
         vc,
@@ -618,16 +712,15 @@ async def run_merge_verify_on_worktree(
 
     # Fix (a), task 2822 — the merge-deciding profile rides the spec, so the
     # host's own --config can no longer narrow it; task 6127 — nor skip the
-    # dispatcher's cold-venv pre-provision.
+    # dispatcher's cold-venv pre-provision; task 7465 — nor decide cargo scope
+    # or the config-only full-gate backstop.
     config = apply_spec_to_host_config(
         config,
         verify_env=spec.verify_env,
         global_verify_command=spec.global_verify_command,
         module_configs=module_configs,
-        field_overrides={
-            'merge_verify_workspace': spec.merge_verify_workspace,
-            'merge_verify_breadth': spec.merge_verify_breadth,
-        },
+        field_overrides=_spec_field_overrides(spec, config),
+        git_field_overrides=_spec_git_field_overrides(spec),
         verify_cold_preprovision_command=spec.verify_cold_preprovision_command,
     )
 
@@ -639,8 +732,32 @@ async def run_merge_verify_on_worktree(
         run_scoped=run_scoped,
         run_unscoped=run_unscoped,
         task_id=task_id,
+        # A runner reaches no registry: it decides against the view its
+        # dispatcher shipped, and reports its units for the dispatcher to record (A5).
+        verify_cache=await CacheAccess.on_runner(spec.verify_cache),
     )
-    return await runner.run_merge_verify(merge_sha, spec)
+    return with_cache_report(await runner.run_merge_verify(merge_sha, spec))
+
+
+def _spec_field_overrides(spec: MergeVerifySpec, config: OrchestratorConfig) -> dict[str, Any]:
+    """The top-level OrchestratorConfig fields the spec decides; a None scope_cargo is not
+    carried, and a shipped view pins the merge role's cache mode in place of the host's."""
+    overrides: dict[str, Any] = {
+        'merge_verify_workspace': spec.merge_verify_workspace,
+        'merge_verify_breadth': spec.merge_verify_breadth,
+    }
+    if spec.scope_cargo is not None:
+        overrides['scope_cargo'] = spec.scope_cargo
+    if spec.verify_cache is not None:
+        overrides['verify_cache'] = config.verify_cache.with_mode('merge', spec.verify_cache.mode)
+    return overrides
+
+
+def _spec_git_field_overrides(spec: MergeVerifySpec) -> dict[str, Any]:
+    """The GitConfig leaves the spec decides, as fresh lists (strict validation rejects a tuple)."""
+    if spec.merge_config_only_full_gate_globs is None:
+        return {}
+    return {'merge_config_only_full_gate_globs': list(spec.merge_config_only_full_gate_globs)}
 
 
 # ---------------------------------------------------------------------------
@@ -659,7 +776,9 @@ class RunnerUnavailable(Exception):
     (stdout is not JSON), ``wire_shape`` (a gate identity or a verdict of the
     wrong shape — a contract skew between the two hosts), or ``no_verdict`` —
     the ONE parseable outcome that raises: a result whose summary records no
-    verdict (``verify.is_no_verdict_summary``).  Every other parseable
+    verdict (``verify.is_no_verdict_summary``), whose output (stderr, streams,
+    summary and a no-verdict record) is archived before the raise when the
+    caller gave an archive root.  Every other parseable
     VerifyResult is returned — even passed=False or timed_out=True (PRD §A
     Invariant 5).
 
@@ -757,6 +876,7 @@ class LocalRunner:
         task_id: str | None = None,
         archive_root: Path | None = None,
         event_store: EventStore | None = None,
+        verify_cache: CacheAccess | None = None,
     ) -> None:
         """Initialise LocalRunner.
 
@@ -781,6 +901,9 @@ class LocalRunner:
         runs where the WORKTREE is and cannot reach the dispatching host's queue,
         so accepting one here only ever invited re-wiring a side-effect onto the
         host that cannot perform it.
+
+        *verify_cache* joins the scoped verify to the verify-result cache
+        (``run_scoped_verification``'s parameter); None leaves it outside.
         """
         self._merge_wt = merge_wt
         self._config = config
@@ -791,6 +914,7 @@ class LocalRunner:
         self._task_id = task_id
         self._archive_root = archive_root
         self._event_store = event_store
+        self._verify_cache = verify_cache
 
     async def health(self) -> bool:
         return True
@@ -832,6 +956,7 @@ class LocalRunner:
             # event_store), which cannot reach the dispatching host's store —
             # None-safe by construction, mirroring merge-flake suppression.
             event_store=self._event_store,
+            verify_cache=self._verify_cache,
         )
         if not scoped.passed:
             # PRD task α: single flake-retry gate. Re-run the named failing tests
@@ -864,6 +989,7 @@ class LocalRunner:
             self._module_configs,
             block_on_timeout=True,
             task_id=self._task_id,
+            executed=scoped,
         )
         if gate.broken:
             failing = gate.failing_subprojects
@@ -891,6 +1017,11 @@ class LocalRunner:
                 # likely to occur under load — and would REGRESS an emission that
                 # happened inline before the recorder was split out.
                 flake_suppression=getattr(scoped, 'flake_suppression', None),
+                # The scoped plan did run; the unscoped gate is not one of its units.
+                plan=scoped.plan,
+                units=scoped.units,
+                cache_record=scoped.cache_record,
+                cache_mode=scoped.cache_mode,
             )
 
         return scoped
@@ -922,6 +1053,23 @@ _SSH_BASE_OPTS = [
     '-o', f'ServerAliveInterval={SSH_SERVER_ALIVE_INTERVAL}',
     '-o', f'ServerAliveCountMax={SSH_SERVER_ALIVE_COUNT_MAX}',
 ]
+
+# Linux MAX_ARG_STRLEN less its NUL: the remote shell is handed the whole verify
+# command as one -c argument, so a shipped cache view is trimmed to fit it (task 9123).
+_MAX_REMOTE_COMMAND_BYTES = 131_072 - 1
+
+# Env probes only: the dispatch sites keep _SSH_BASE_OPTS, because the
+# verify-merge ssh child must own its connection for the heartbeat protocol.
+# The socket lives in the dispatching user's home, which always exists and is
+# not world-writable; %C makes it per host, port and user.  ssh reaps it: the
+# master exits 30s after its last session and unlinks it, and the next
+# ControlMaster=auto client replaces a stale socket a killed master left.
+_SSH_PROBE_OPTS = (
+    *_SSH_BASE_OPTS,
+    '-o', 'ControlMaster=auto',
+    '-o', 'ControlPersist=30',
+    '-o', 'ControlPath=~/.df-env-probe-%C',
+)
 
 # The same options for git's own ssh transport, as a `git -c` global option, so
 # a RemoteRunner push to a sleeping host fails as fast and as batch-safely as
@@ -1067,9 +1215,9 @@ async def env_probe_local_run(
 #: writer's only blocking operation is a ``threading.Event.wait`` that ``stop()``
 #: ends within one GIL switch, and its write end is non-blocking so ``os.write``
 #: can never park on a full pipe — so 5.0s is ~6x the ~0.85s worst single-gap
-#: additive scheduling delay measured at loadavg 113-178 (recorded in
-#: ``test_laptop_warm_verify_boundary.py``'s ``HeartbeatWriter`` comment) and is
-#: never reached in practice.
+#: additive scheduling delay measured at loadavg 113-178 (recorded in the
+#: ROW_WATCHDOG banner of ``orchestrator/tests/_verify_boundary_ceilings.py``)
+#: and is never reached in practice.
 #:
 #: WHO PAYS THE WAIT: not the event loop.  ``Thread.join`` is synchronous, and
 #: the coroutine that tears the writer down runs on the orchestrator's single
@@ -1087,6 +1235,9 @@ async def env_probe_local_run(
 #: whenever it does finish, so that fd can never be closed out from under a
 #: reused descriptor.
 HEARTBEAT_STOP_JOIN_SECS: float = 5.0
+
+#: Pause before ``RemoteRunner.publish_sha``'s one retry of a refused publish.
+_PUBLISH_RETRY_DELAY_SECS: float = 1.0
 
 
 async def _default_ssh_heartbeat_run(
@@ -1220,11 +1371,87 @@ RemoteVerifySubcommand = Literal['verify-merge', 'verify-task']
 REMOTE_VERIFY_PROCESS_PATTERN: str = '|'.join(get_args(RemoteVerifySubcommand))
 
 
+def remote_verify_process_pattern(request_id: str) -> str:
+    """The pgrep pattern of request *request_id*'s remote verify, of either subcommand.
+
+    The subcommand alternation keeps a ``cancel-verify --request-id <id>`` from
+    matching, and the ``)`` after it keeps the probing command line from matching
+    itself.  The id must end at a space or the line's end, so no id matches a
+    longer one it prefixes.  A dispatch puts ``--request-id`` ahead of the
+    unbounded ``--spec`` JSON, so the id lies inside the first 4096 bytes of the
+    command line that procps 3.3's ``pgrep -f`` reads.
+    """
+    return f'({REMOTE_VERIFY_PROCESS_PATTERN}) .*--request-id {request_id}( |$)'
+
+
+CANCEL_PROBE_ATTEMPTS = 10
+CANCEL_PROBE_INTERVAL_SECS = 1.0
+
+
+async def poll_until_clean(
+    probe: Callable[[], Awaitable[bool]],
+    *,
+    attempts: int = CANCEL_PROBE_ATTEMPTS,
+    interval: float = CANCEL_PROBE_INTERVAL_SECS,
+    sleep: Callable[[float], Awaitable[object]] = asyncio.sleep,
+) -> bool:
+    """Await *probe* up to *attempts* times, *interval* apart, until it reads clean.
+
+    The one cancel-probe policy, for a failed cancel's merge PARK and its task
+    bench alike.  No sleep follows the last probe.
+    """
+    for attempt in range(attempts):
+        if await probe():
+            return True
+        if attempt < attempts - 1:
+            await sleep(interval)
+    return False
+
+
 @dataclass(frozen=True)
 class _DispatchOutcome:
     result: VerifyResult
     ssh_stderr: str
     duration_ms: int
+
+
+@dataclass(frozen=True)
+class _RemoteArchiveTarget:
+    """Where one remote verify's artefacts go: ``<root>/<task_id>/attempt-<attempt_id>.remote-<name>...``."""
+
+    root: Path
+    task_id: str
+    attempt_id: int
+    role: Literal['merge', 'task']
+
+
+def _no_verdict_record_payload(
+    runner_name: str,
+    ssh_host: str,
+    sha: str,
+    archive: _RemoteArchiveTarget,
+    outcome: _DispatchOutcome,
+) -> dict[str, Any]:
+    """A remote NO-VERDICT's audit record: the host, the verified sha and what the wire said.
+
+    It carries no ``passed`` key, so it cannot be read as a red.
+    """
+    result = outcome.result
+    return {
+        'sha': sha,
+        'runner': runner_name,
+        'ssh_host': ssh_host,
+        'task_id': archive.task_id,
+        'attempt_id': archive.attempt_id,
+        'role': archive.role,
+        'summary': result.summary,
+        'category': result.category,
+        'cause_hint': result.cause_hint,
+        'timed_out': result.timed_out,
+        'duration_ms': outcome.duration_ms,
+        'failing_test_ids': result.failing_test_ids,
+        'skipped_test_ids': result.skipped_test_ids,
+    }
 
 
 def _merge_pass_summary_payload(
@@ -1431,12 +1658,26 @@ class RemoteRunner:
         the gates are cloned from whatever this runner's project remote is, and
         it delivers a sha origin has never seen.  Near-free when the remote
         already holds the objects.
+
+        ensure-gate.sh deletes ``refs/gate/<sha>`` after every ensure, so two
+        roles publishing one sha collide on ``cannot lock ref`` (classed gate).
+        A non-transport failure is retried once: the retry finds the ref present
+        or absent, and a real refusal fails twice.
         """
         sha = self.deployed_sha.sha
-        await self._push(
-            f'{self._ssh_host}:{self._df_remote_checkout}', f'{sha}:refs/gate/{sha}',
-            cwd=self._code_checkout,
-        )
+        target = f'{self._ssh_host}:{self._df_remote_checkout}'
+        refspec = f'{sha}:refs/gate/{sha}'
+        try:
+            await self._push(target, refspec, cwd=self._code_checkout)
+        except RunnerUnavailable as exc:
+            if exc.kind == 'transport':
+                raise
+            logger.info(
+                'RemoteRunner %r: publish of gate sha %s refused, retrying once: %s',
+                self.name, sha, exc,
+            )
+            await asyncio.sleep(_PUBLISH_RETRY_DELAY_SECS)
+            await self._push(target, refspec, cwd=self._code_checkout)
 
     async def reap_idle_gates(self) -> None:
         """Launch ``remote_gate/reap-gates.sh`` detached on the remote; never raises.
@@ -1460,23 +1701,25 @@ class RemoteRunner:
                 'RemoteRunner %r: gate reaper launch exited %d: %s', self.name, rc, stderr,
             )
 
-    async def _push(self, target: str, refspec: str, *, cwd: str | Path) -> None:
-        """``git push <target> <refspec>`` over the bounded ssh transport, or raise RunnerUnavailable.
+    async def _push(self, target: str, *push_args: str, cwd: str | Path) -> None:
+        """``git push <target> <push_args...>`` over the bounded ssh transport, or raise RunnerUnavailable.
 
-        A failure is classed on the push channel.  The ssh options make an
-        unreachable or lost host fail within about a minute with an ssh client
-        line ('transport'), so a push still running after
-        ``ENSURE_CLIENT_TIMEOUT_SECS`` has a live session to a host whose
-        receive-pack or hook hung: 'gate', as for ensure-gate's own timeout.
+        Every RemoteRunner push goes through here.  A failure is classed on the
+        push channel.  The ssh options make an unreachable or lost host fail
+        within about a minute with an ssh client line ('transport'), so a push
+        still running after ``ENSURE_CLIENT_TIMEOUT_SECS`` has a live session to
+        a host whose receive-pack or hook hung: 'gate', as for ensure-gate's own
+        timeout.
         """
-        argv = ['git', *GIT_PUSH_SSH_CONFIG, 'push', target, refspec]
+        argv = ['git', *GIT_PUSH_SSH_CONFIG, 'push', target, *push_args]
+        pushed = ' '.join(push_args)
         try:
             async with asyncio.timeout(ENSURE_CLIENT_TIMEOUT_SECS):
                 rc, _, stderr = await self._run(argv, cwd=cwd)
         except TimeoutError as exc:
             # BEFORE the OSError clause: TimeoutError subclasses OSError.
             raise RunnerUnavailable(
-                f'git push {target} {refspec} exceeded {ENSURE_CLIENT_TIMEOUT_SECS}s '
+                f'git push {target} {pushed} exceeded {ENSURE_CLIENT_TIMEOUT_SECS}s '
                 'on a reached host',
                 kind='gate',
             ) from exc
@@ -1486,7 +1729,7 @@ class RemoteRunner:
             ) from exc
         if rc != 0:
             raise RunnerUnavailable(
-                f'git push {target} {refspec} failed (rc={rc}): {stderr}',
+                f'git push {target} {pushed} failed (rc={rc}): {stderr}',
                 kind=classify_remote_exit(rc, stderr, channel='git_push'),
             )
 
@@ -1562,6 +1805,72 @@ class RemoteRunner:
     def _config_args(self) -> list[str]:
         return ['--config', self._config_path] if self._config_path else []
 
+    def _verify_command(
+        self, subcommand: RemoteVerifySubcommand, sha: str, request_id: str, spec_json: str,
+    ) -> str:
+        """The remote command running verify *subcommand* of *sha* under *request_id* with *spec_json*."""
+        return self._gate_command([
+            subcommand, '--sha', sha, '--request-id', request_id, '--spec', spec_json, *self._config_args(),
+        ])
+
+    async def _shipped_view(
+        self,
+        cache: RemoteCache | None,
+        role: VerifyRole,
+        commands: Sequence[VerifyCommand | None],
+        command_carrying: Callable[[ShippedView], str],
+    ) -> ShippedView | None:
+        """The view of *cache* a *role* verify of *commands* ships, as deep as the remote
+        command *command_carrying* it builds still fits one argument; None outside the cache."""
+        if cache is None:
+            return None
+        return await cache.ship(
+            role, planned_unit_ids(command for command in commands if command is not None),
+            fits=lambda view: len(command_carrying(view).encode()) <= _MAX_REMOTE_COMMAND_BYTES,
+        )
+
+    async def _settled(
+        self,
+        cache: RemoteCache | None,
+        view: ShippedView | None,
+        role: VerifyRole,
+        commands: Sequence[VerifyCommand | None],
+        result: VerifyResult,
+        *,
+        landing_sha: str | None,
+    ) -> VerifyResult:
+        """*result* once *cache* has backed each replay it claims against the live registry,
+        consuming them for *landing_sha* before the verdict returns (I6), carrying the record
+        the dispatcher records its greens from (I8), with the never-cache modules of the
+        dispatcher's own *commands* refused again. Unchanged outside the cache."""
+        if cache is None:
+            return result
+        settlement = await cache.settle(
+            view, role, result.units, result.cache_report,
+            never_cache=never_cache_unit_ids(command for command in commands if command is not None),
+            landing_sha=landing_sha,
+        )
+        if not settlement.outcome.backs_every_hit:
+            result = self._unbacked(result, role, settlement.outcome)
+        return dataclasses.replace(result, cache_record=settlement.record)
+
+    def _unbacked(self, result: VerifyResult, role: VerifyRole, outcome: ConsumeOutcome) -> VerifyResult:
+        """*result*, whose replays *outcome* could not back. Only a green rests on its replays:
+        a red keeps its verdict. A registry error is the dispatcher's own fault, so the green
+        becomes the local no-verdict; a replay of a green no live entry backs is no verdict
+        from this host."""
+        if not result.passed:
+            logger.warning(
+                'RemoteRunner %r: red %s verify keeps its verdict; its replays were not backed: %s',
+                self.name, role, outcome.reason,
+            )
+            return result
+        if outcome.error is not None:
+            return verify.unconsumed_replay_result(result, outcome.reason)
+        raise RunnerUnavailable(
+            f'{self.name!r} replayed greens its dispatcher cannot back: {outcome.reason}', kind='no_verdict',
+        )
+
     async def run_merge_verify(
         self,
         merge_sha: str,
@@ -1570,6 +1879,7 @@ class RemoteRunner:
         task_id: str | None = None,
         archive_root: Path | None = None,
         event_store: Any = None,
+        verify_cache: RemoteCache | None = None,
     ) -> VerifyResult:
         """Run the combined merge-verify bundle on the remote host.
 
@@ -1590,31 +1900,46 @@ class RemoteRunner:
         (task 2822 fix c) so a remote GREEN is auditable.  Any archival error is
         swallowed so the VerifyResult is always returned unchanged (PRD §A Invariant 5).
 
-        Raises RunnerUnavailable when the host produced no usable verdict.
+        Raises RunnerUnavailable when the host produced no usable verdict.  A
+        ``no_verdict`` first archives, given both *task_id* and *archive_root*,
+        its stderr, streams and summary exactly as a red does, plus an
+        ``attempt-1.remote-<name>.no-verdict-<utc_ts>.json`` record.
         Returns any other VerifyResult unchanged — even passed=False or
-        timed_out=True (PRD §A Invariant 5).
+        timed_out=True (PRD §A Invariant 5) — but for the verify-result cache:
+        with *verify_cache* the spec ships a view of the dispatcher's registry,
+        and the verdict is settled against it (:meth:`_settled`).
         """
         request_id = self._id_factory()
+        archive = (
+            _RemoteArchiveTarget(archive_root, task_id, _MERGE_ARCHIVE_ATTEMPT_ID, 'merge')
+            if archive_root is not None and task_id is not None else None
+        )
+        commands = (*spec.verify_commands, spec.global_verify_command)
+        view = await self._shipped_view(
+            verify_cache, 'merge', commands,
+            lambda shipped: self._verify_command(
+                'verify-merge', merge_sha, request_id, spec_to_json(dataclasses.replace(spec, verify_cache=shipped)),
+            ),
+        )
+        spec = dataclasses.replace(spec, verify_cache=view)
         await self._push_main_mirror(task_id=task_id, event_store=event_store)
         outcome = await self._dispatch(
             merge_sha, 'verify-merge', spec_to_json(spec), request_id=request_id,
-            event_store=event_store, task_id=task_id,
+            archive=archive, event_store=event_store, task_id=task_id,
         )
         result = outcome.result
-        if archive_root is not None and task_id is not None:
+        if archive is not None:
             if not result.passed:
-                self._archive_remote_red(
-                    archive_root, task_id, _MERGE_ARCHIVE_ATTEMPT_ID, outcome, role='merge',
-                )
+                self._archive_remote_output(archive, outcome)
             else:
                 # task-2822 fix (c): a remote GREEN is auditable beside the red archives.
-                self._archive_pass_summary(
-                    archive_root, task_id, _MERGE_ARCHIVE_ATTEMPT_ID,
+                self._archive_record(
+                    archive, 'pass-summary',
                     _merge_pass_summary_payload(
                         self.name, spec, result, merge_sha, outcome.duration_ms,
                     ),
                 )
-        return result
+        return await self._settled(verify_cache, view, 'merge', commands, result, landing_sha=merge_sha)
 
     async def run_task_verify(
         self,
@@ -1623,6 +1948,7 @@ class RemoteRunner:
         task_id: str,
         archive_root: Path | None,
         event_store: Any = None,
+        verify_cache: RemoteCache | None = None,
     ) -> VerifyResult:
         """Run a task-role verify of ``spec.tip_sha`` on the remote host (PRD §5.2).
 
@@ -1633,120 +1959,113 @@ class RemoteRunner:
         one ``.pass-summary-<stamp>.json``.  The result's archive_log_paths name
         exactly those workstation files and worktree_log_paths is emptied, since
         laptop paths mean nothing here.  *task_id* must equal ``spec.task_id``.
+
+        Raises RunnerUnavailable when the host produced no usable verdict.  A
+        ``no_verdict`` first archives, with *archive_root*, what a red would
+        plus a ``.no-verdict-<stamp>.json`` record.  With *verify_cache* the
+        spec ships a view of the dispatcher's registry and the verdict is
+        settled against it, consuming nothing (:meth:`_settled`).
         """
         if task_id != spec.task_id:
             raise ValueError(
                 f'run_task_verify task_id {task_id!r} disagrees with spec.task_id '
                 f'{spec.task_id!r}'
             )
+        archive = (
+            _RemoteArchiveTarget(archive_root, task_id, spec.attempt_id, 'task')
+            if archive_root is not None else None
+        )
+        request_id = self._id_factory()
+        commands = (*spec.verify_commands, spec.global_verify_command)
+        view = await self._shipped_view(
+            verify_cache, 'task', commands,
+            lambda shipped: self._verify_command(
+                'verify-task', spec.tip_sha, request_id,
+                task_spec_to_json(dataclasses.replace(spec, verify_cache=shipped)),
+            ),
+        )
+        spec = dataclasses.replace(spec, verify_cache=view)
         outcome = await self._dispatch(
             spec.tip_sha, 'verify-task', task_spec_to_json(spec),
-            request_id=self._id_factory(), event_store=event_store, task_id=task_id,
+            request_id=request_id, archive=archive,
+            event_store=event_store, task_id=task_id,
         )
         archived: list[Path] = []
-        if archive_root is not None:
+        if archive is not None:
             if not outcome.result.passed:
-                archived = self._archive_remote_red(
-                    archive_root, task_id, spec.attempt_id, outcome, role='task',
-                )
+                archived = self._archive_remote_output(archive, outcome)
             else:
-                pass_summary = self._archive_pass_summary(
-                    archive_root, task_id, spec.attempt_id,
+                pass_summary = self._archive_record(
+                    archive, 'pass-summary',
                     _task_pass_summary_payload(
                         self.name, spec, outcome.result, outcome.duration_ms,
                     ),
                 )
                 archived = [pass_summary] if pass_summary is not None else []
-        return dataclasses.replace(
+        result = dataclasses.replace(
             outcome.result,
             worktree_log_paths=[],
             archive_log_paths=[str(path) for path in archived],
         )
+        return await self._settled(verify_cache, view, 'task', commands, result, landing_sha=None)
 
     async def _push_main_mirror(self, *, task_id: str | None, event_store: Any) -> None:
         """Step 0 (best-effort): push main FIRST so the remote has a fresh view of it.
 
-        A non-zero rc or OSError is logged at WARNING and swallowed — a
-        non-fast-forward must not abort the verify.
+        Every failure is logged at WARNING and swallowed — a non-fast-forward
+        must not abort the verify.  Both pushes go through :meth:`_push`, so they
+        share its bounded ssh transport and deadline.
 
         β dedup: resolve the local main tip via `git rev-parse` (network-free).
         When the resolved sha matches _last_pushed_main_sha the push is skipped —
         the remote already has this main sha, so the push is redundant.
-        """
-        if self._main_branch:
-            # Resolve local main tip (network-free)
-            resolved_main_sha: str | None = None
-            try:
-                rev_rc, rev_stdout, _ = await self._run(
-                    ['git', 'rev-parse', self._main_branch],
-                    cwd=self._cwd,
-                )
-                if rev_rc == 0:
-                    resolved_main_sha = rev_stdout.strip() or None
-            except OSError:
-                pass  # rev-parse failed; push unconditionally below
 
-            # Skip push when sha is unchanged (dedup)
-            if resolved_main_sha is None or resolved_main_sha != self._last_pushed_main_sha:
-                try:
-                    main_rc, _, main_stderr = await self._run(
-                        ['git', 'push', self._git_remote,
-                         f'{self._main_branch}:refs/heads/{self._main_branch}'],
-                        cwd=self._cwd,
-                    )
-                    if main_rc == 0:
-                        if resolved_main_sha is not None:
-                            self._last_pushed_main_sha = resolved_main_sha
-                    else:
-                        # INV-2 mirror-semantics (task 2884, PRD §3.1): the FF
-                        # main push was rejected (typically non-fast-forward —
-                        # the remote PROJECT main diverged, e.g. the laptop
-                        # reify main since 07-20).  Retry ONCE with a force
-                        # refspec to restore mirror semantics.  The FF fast
-                        # path above is preserved — a force is attempted ONLY
-                        # on FF failure, so a healthy remote never sees one and
-                        # the divergence signal is not silently dropped.
-                        force_rc, _, force_stderr = await self._run(
-                            ['git', 'push', self._git_remote,
-                             f'+{self._main_branch}:refs/heads/{self._main_branch}'],
-                            cwd=self._cwd,
-                        )
-                        if force_rc == 0:
-                            prior_main_sha = self._last_pushed_main_sha
-                            if resolved_main_sha is not None:
-                                self._last_pushed_main_sha = resolved_main_sha
-                            if event_store is not None:
-                                from orchestrator.event_store import EventType
-                                event_store.emit(
-                                    EventType.runner_synced,
-                                    task_id=task_id,
-                                    data={
-                                        'runner': self.name,
-                                        'kind': 'project_main_mirror',
-                                        'from_head': prior_main_sha,
-                                        'to_head': resolved_main_sha,
-                                        'forced': True,
-                                    },
-                                )
-                        else:
-                            # Force ALSO failed — keep today's best-effort
-                            # WARNING+swallow (the merge-sha push stays the
-                            # load-bearing transport; a non-fatal main push
-                            # must never abort the verify).
-                            import logging as _logging
-                            _logging.getLogger(__name__).warning(
-                                'RemoteRunner %r: best-effort main push of %r to %r failed '
-                                '(FF rc=%d: %s; force rc=%d: %s) — continuing with merge-sha push',
-                                self.name, self._main_branch, self._git_remote,
-                                main_rc, main_stderr, force_rc, force_stderr,
-                            )
-                except OSError as exc:
-                    import logging as _logging
-                    _logging.getLogger(__name__).warning(
-                        'RemoteRunner %r: best-effort main push failed with OSError: %s'
-                        ' — continuing',
-                        self.name, exc,
-                    )
+        INV-2 mirror semantics (task 2884, PRD §3.1): a rejected fast-forward
+        (typically the remote PROJECT main diverged) is retried ONCE with a force
+        refspec, and a forced success emits runner_synced(kind='project_main_mirror').
+        A healthy remote never sees a force, so the divergence signal is not
+        silently dropped.
+        """
+        main_branch = self._main_branch
+        if not main_branch:
+            return
+        resolved_main_sha = await self._local_branch_sha(main_branch)
+        if resolved_main_sha is not None and resolved_main_sha == self._last_pushed_main_sha:
+            return
+        refspec = f'{main_branch}:refs/heads/{main_branch}'
+        try:
+            await self._push(self._git_remote, refspec, cwd=self._cwd)
+            forced = False
+        except RunnerUnavailable as ff_failure:
+            try:
+                await self._push(self._git_remote, f'+{refspec}', cwd=self._cwd)
+            except RunnerUnavailable as force_failure:
+                logger.warning(
+                    'RemoteRunner %r: best-effort main push of %r to %r failed '
+                    '(FF: %s; force: %s) — continuing with merge-sha push',
+                    self.name, main_branch, self._git_remote, ff_failure, force_failure,
+                )
+                return
+            forced = True
+        prior_main_sha = self._last_pushed_main_sha
+        if resolved_main_sha is not None:
+            self._last_pushed_main_sha = resolved_main_sha
+        if forced and event_store is not None:
+            event_store.emit(EventType.runner_synced, task_id=task_id, data={
+                'runner': self.name,
+                'kind': 'project_main_mirror',
+                'from_head': prior_main_sha,
+                'to_head': resolved_main_sha,
+                'forced': True,
+            })
+
+    async def _local_branch_sha(self, branch: str) -> str | None:
+        """*branch*'s local tip by a network-free ``git rev-parse``, or None when unreadable."""
+        try:
+            rc, stdout, _ = await self._run(['git', 'rev-parse', branch], cwd=self._cwd)
+        except OSError:
+            return None
+        return (stdout.strip() or None) if rc == 0 else None
 
     async def _dispatch(
         self,
@@ -1755,6 +2074,7 @@ class RemoteRunner:
         spec_json: str,
         *,
         request_id: str,
+        archive: _RemoteArchiveTarget | None,
         event_store: Any = None,
         task_id: str | None = None,
     ) -> _DispatchOutcome:
@@ -1771,7 +2091,8 @@ class RemoteRunner:
         ('transport') instead of starting the verify.
 
         Raises RunnerUnavailable, whose ``kind`` says why, whenever the host
-        produced no usable verdict — a parseable no-verdict result included.
+        produced no usable verdict — a parseable no-verdict result included,
+        whose output is first archived best-effort to *archive* (when given).
         """
         if self._inflight_request_id is not None:
             raise ConcurrentDispatchError(
@@ -1784,14 +2105,14 @@ class RemoteRunner:
             await self.ensure_gate(event_store=event_store, task_id=task_id)
             await self._push(self._git_remote, f'{sha}:{ref}', cwd=self._cwd)
             try:
-                return await self._run_gate_verify(sha, subcommand, spec_json, request_id)
+                outcome = await self._run_gate_verify(sha, subcommand, spec_json, request_id)
+                if verify.is_no_verdict_summary(outcome.result.summary):
+                    raise self._no_verdict_unavailable(outcome, sha, archive)
+                return outcome
             finally:
                 # Best-effort ref cleanup — never alters returned result nor masks exceptions
                 with contextlib.suppress(Exception):
-                    await self._run(
-                        ['git', 'push', self._git_remote, '--delete', ref],
-                        cwd=self._cwd,
-                    )
+                    await self._push(self._git_remote, '--delete', ref, cwd=self._cwd)
         finally:
             self._inflight_request_id = None
             self._verify_started_request_id = None
@@ -1799,11 +2120,7 @@ class RemoteRunner:
     async def _run_gate_verify(
         self, sha: str, subcommand: RemoteVerifySubcommand, spec_json: str, request_id: str,
     ) -> _DispatchOutcome:
-        # --request-id is APPENDED, after the optional --config.
-        remote_cmd = self._gate_command([
-            subcommand, '--sha', sha, '--spec', spec_json, *self._config_args(),
-            '--request-id', request_id,
-        ])
+        remote_cmd = self._verify_command(subcommand, sha, request_id, spec_json)
         if request_id == self._cancelled_request_id:
             raise RunnerUnavailable(
                 f'request {request_id!r} was cancelled before its verify ssh to '
@@ -1824,7 +2141,7 @@ class RemoteRunner:
         if ssh_rc != 0:
             raise self._verify_exit_unavailable(ssh_rc, ssh_stderr, request_id)
         return _DispatchOutcome(
-            result=self._parse_verdict(ssh_stdout),
+            result=self._parse_wire_result(ssh_stdout),
             ssh_stderr=ssh_stderr,
             duration_ms=duration_ms,
         )
@@ -1850,7 +2167,7 @@ class RemoteRunner:
             f'ssh {self._ssh_host} exited {rc}: {stderr}', kind=classify_remote_exit(rc),
         )
 
-    def _parse_verdict(self, stdout: str) -> VerifyResult:
+    def _parse_wire_result(self, stdout: str) -> VerifyResult:
         try:
             result = result_from_json(stdout)
         except ValueError as exc:  # json.JSONDecodeError included
@@ -1869,117 +2186,113 @@ class RemoteRunner:
                 f'summary {result.summary!r} is not a string',
                 kind='wire_shape',
             )
-        if verify.is_no_verdict_summary(result.summary):
-            raise RunnerUnavailable(
-                f'{self.name!r} returned no verdict: {result.summary}',
-                kind='no_verdict',
-            )
         return result
 
-    def _archive_remote_red(
-        self,
-        archive_root: Path,
-        task_id: str,
-        attempt_id: int,
-        outcome: _DispatchOutcome,
-        *,
-        role: Literal['merge', 'task'],
+    def _no_verdict_unavailable(
+        self, outcome: _DispatchOutcome, sha: str, archive: _RemoteArchiveTarget | None,
+    ) -> RunnerUnavailable:
+        """The RunnerUnavailable('no_verdict') for *outcome*, archived to *archive* first.
+
+        Its one-line message names every archived path: it becomes the bench
+        entry's reason, so the hosts block, the verify_host_skew event and the
+        L1 all lead to the output.
+        """
+        archived = self._archive_no_verdict(archive, outcome, sha) if archive is not None else []
+        message = f'{self.name!r} returned no verdict: {outcome.result.summary}'
+        if archived:
+            message += '; output archived at ' + ', '.join(str(path) for path in archived)
+        return RunnerUnavailable(message, kind='no_verdict')
+
+    def _archive_no_verdict(
+        self, archive: _RemoteArchiveTarget, outcome: _DispatchOutcome, sha: str,
     ) -> list[Path]:
-        """Archive a remote red: its ssh stderr (task 1920), then its captured streams (task 1921)."""
+        """Archive a remote no-verdict: its no-verdict record, then what a red would archive."""
+        record = self._archive_record(
+            archive, 'no-verdict',
+            _no_verdict_record_payload(self.name, self._ssh_host, sha, archive, outcome),
+        )
+        archived = [record] if record is not None else []
+        return archived + self._archive_remote_output(archive, outcome)
+
+    def _archive_remote_output(
+        self, archive: _RemoteArchiveTarget, outcome: _DispatchOutcome,
+    ) -> list[Path]:
+        """Archive a remote run's output: its ssh stderr (task 1920), then its captured streams (task 1921)."""
         archived: list[Path] = []
         if outcome.ssh_stderr.strip():
-            stderr_path = self._archive_failure_stderr(
-                archive_root, task_id, attempt_id, outcome.ssh_stderr,
-            )
+            stderr_path = self._archive_failure_stderr(archive, outcome.ssh_stderr)
             if stderr_path is not None:
                 archived.append(stderr_path)
-        archived += self._archive_failure_streams(
-            archive_root, task_id, attempt_id, outcome.result, role=role,
-        )
+        archived += self._archive_failure_streams(archive, outcome.result)
         return archived
 
-    def _archive_failure_stderr(
+    def _archive_file(
         self,
-        archive_root: Path,
-        task_id: str,
-        attempt_id: int,
-        stderr_text: str,
+        archive: _RemoteArchiveTarget,
+        what: str,
+        name_tail: Callable[[str], str],
+        render: Callable[[], str],
     ) -> Path | None:
-        """Write *stderr_text* to a timestamped .stderr.log file under archive_root/task_id/.
+        """Write ``render()`` to ``<root>/<task_id>/attempt-<attempt_id>.remote-<safe_name><name_tail(stamp)>``.
 
-        Filename: ``attempt-<attempt_id>.remote-<safe_name>-<utc_ts>.stderr.log``
+        The one home of the remote archive file naming that this runner owns:
+        the directory, the ``attempt-<attempt_id>.remote-<safe_name>`` stem
+        (_sanitize_runner_name) and the microsecond UTC stamp
+        (_STDERR_ARCHIVE_TS_FMT), co-located with local verify archives for
+        side-by-side triage.  The I/O is synchronous, matching the local-archive
+        convention; payloads are bounded by the ssh output buffer.
 
-        Co-located with local verify archives for side-by-side operator triage (task 1920,
-        sibling of 1768).  Timestamp format and name sanitization mirror _archive_merge_verify_logs
-        via _STDERR_ARCHIVE_TS_FMT and _sanitize_runner_name.
-
-        Filesystem I/O is synchronous (mkdir + write_text), matching the local-archive convention.
-        Remote stderr payloads are bounded by the ssh process output buffer; the event-loop
-        blocking window is negligible at current sizes.
-
-        Best-effort: any exception is swallowed with a WARNING (returning None) so the
-        caller's VerifyResult is always returned unchanged (PRD §A Invariant 5).
+        Best-effort: any exception, *render*'s included, is swallowed with a
+        WARNING naming *what*, returning None, so the caller's VerifyResult or
+        raise is unchanged (PRD §A Invariant 5).
         """
-        import logging as _logging
         try:
-            target_dir = Path(archive_root) / task_id
+            target_dir = archive.root / archive.task_id
             target_dir.mkdir(parents=True, exist_ok=True)
-            utc_ts = datetime.now(UTC).strftime(_STDERR_ARCHIVE_TS_FMT)
-            safe = _sanitize_runner_name(self.name)
-            path = target_dir / f'attempt-{attempt_id}.remote-{safe}-{utc_ts}.stderr.log'
-            path.write_text(stderr_text, encoding='utf-8')
+            stamp = datetime.now(UTC).strftime(_STDERR_ARCHIVE_TS_FMT)
+            stem = f'attempt-{archive.attempt_id}.remote-{_sanitize_runner_name(self.name)}'
+            path = target_dir / f'{stem}{name_tail(stamp)}'
+            path.write_text(render(), encoding='utf-8')
             return path
         except Exception as exc:
-            _logging.getLogger(__name__).warning(
-                'RemoteRunner %r: best-effort stderr archival failed: %s', self.name, exc,
+            logger.warning(
+                'RemoteRunner %r: best-effort %s archival failed: %s', self.name, what, exc,
             )
             return None
 
-    def _archive_pass_summary(
+    def _archive_failure_stderr(
+        self, archive: _RemoteArchiveTarget, stderr_text: str,
+    ) -> Path | None:
+        """Archive the remote ssh stderr as ``attempt-<attempt_id>.remote-<safe_name>-<stamp>.stderr.log`` (task 1920)."""
+        return self._archive_file(
+            archive, 'stderr', lambda stamp: f'-{stamp}.stderr.log', lambda: stderr_text,
+        )
+
+    def _archive_record(
         self,
-        archive_root: Path,
-        task_id: str,
-        attempt_id: int,
+        archive: _RemoteArchiveTarget,
+        label: Literal['pass-summary', 'no-verdict'],
         payload: dict[str, Any],
     ) -> Path | None:
-        """Archive a PASSING remote verify's *payload* as a best-effort JSON pass-summary.
+        """Archive *payload* as ``attempt-<attempt_id>.remote-<safe_name>.<label>-<stamp>.json``.
 
-        Filename: ``attempt-<attempt_id>.remote-<safe_name>.pass-summary-<utc_ts>.json``
-
-        Mirrors _archive_failure_stderr's best-effort shape (mkdir(parents,exist_ok),
-        microsecond-UTC timestamp via _STDERR_ARCHIVE_TS_FMT, _sanitize_runner_name,
-        swallow-with-WARNING returning None) so a remote GREEN is auditable
-        side-by-side with the failure archives (task 2822 fix c).
+        'pass-summary' makes a remote GREEN auditable side-by-side with the
+        failure archives (task 2822 fix c); 'no-verdict' records which host and
+        sha a no-verdict ran on.
         """
-        import logging as _logging
-        try:
-            target_dir = Path(archive_root) / task_id
-            target_dir.mkdir(parents=True, exist_ok=True)
-            utc_ts = datetime.now(UTC).strftime(_STDERR_ARCHIVE_TS_FMT)
-            safe = _sanitize_runner_name(self.name)
-            path = target_dir / f'attempt-{attempt_id}.remote-{safe}.pass-summary-{utc_ts}.json'
-            path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding='utf-8')
-            return path
-        except Exception as exc:
-            _logging.getLogger(__name__).warning(
-                'RemoteRunner %r: best-effort pass-summary archival failed: %s', self.name, exc,
-            )
-            return None
+        return self._archive_file(
+            archive, label, lambda stamp: f'.{label}-{stamp}.json',
+            lambda: json.dumps(payload, indent=2, sort_keys=True),
+        )
 
     def _archive_failure_streams(
-        self,
-        archive_root: Path,
-        task_id: str,
-        attempt_id: int,
-        result: VerifyResult,
-        *,
-        role: Literal['merge', 'task'],
+        self, archive: _RemoteArchiveTarget, result: VerifyResult,
     ) -> list[Path]:
-        """Archive captured test/lint/type output streams to archive_root/task_id/ on failure.
+        """Archive *result*'s captured test/lint/type output streams under *archive*.
 
-        Mirrors verify._archive_merge_verify_logs by projecting the three VerifyResult
+        Mirrors verify.archive_verify_logs by projecting the three VerifyResult
         output fields into synthetic per-stream run dicts, one per NON-EMPTY stream.
-        Delegates to _archive_merge_verify_logs so filenames, the microsecond UTC timestamp,
+        Delegates to archive_verify_logs so filenames, the microsecond UTC timestamp,
         and the summary.json shape are byte-identical to local merge-verify archives.
 
         Filename convention (task 1921):
@@ -2001,10 +2314,9 @@ class RemoteRunner:
 
         Best-effort: any exception is swallowed with a WARNING (returning ``[]``) so
         the caller's VerifyResult is always returned unchanged (PRD §A Invariant 5).
-        _archive_merge_verify_logs already swallows OSError internally; this outer
+        archive_verify_logs already swallows OSError internally; this outer
         guard additionally swallows non-OSError failures as a backstop (task 1921 step-4).
         """
-        import logging as _logging
         try:
             runs = [
                 {
@@ -2031,18 +2343,18 @@ class RemoteRunner:
             # result.timed_out=True when a timeout occurred.  Distinguishability in the
             # emitted summary.json depends on the remote host honouring this contract;
             # this method threads the fields through verbatim but cannot enforce them.
-            return _archive_merge_verify_logs(
+            return archive_verify_logs(
                 runs,
-                Path(archive_root),
-                task_id,
-                attempt_id,
+                archive.root,
+                archive.task_id,
+                archive.attempt_id,
                 result.category,
                 result.cause_hint,
                 module_prefix=f'remote-{self.name}',
-                role=role,
+                role=archive.role,
             )
         except Exception as exc:
-            _logging.getLogger(__name__).warning(
+            logger.warning(
                 'RemoteRunner %r: best-effort stream archival failed: %s', self.name, exc,
             )
             return []
@@ -2091,115 +2403,110 @@ class RemoteRunner:
             return 1  # non-zero → caller treats as cancel failure
 
     async def probe_clean(self) -> bool:
-        """Probe whether any remote verify (any RemoteVerifySubcommand) is still running.
+        """Probe whether the request this runner last cancelled still runs on its host.
 
-        Issues: ssh <_SSH_BASE_OPTS> <host> pgrep -f 'verify-merge|verify-task'
-        (REMOTE_VERIFY_PROCESS_PATTERN, quoted: '|' is a remote-shell metacharacter)
-
-        Returns:
-            True  — rc == 1 (pgrep found no match; host is clean)
-            False — rc == 0 (process still running) or rc >= 2 (error / ssh failure)
-                    Conservative: any non-1 rc keeps the slot PARKED.
+        Only that request is probed (``remote_verify_process_pattern``), so a
+        PARKED merge slot clears while a sibling task verify or another
+        project's verify runs there; with nothing cancelled there is nothing to
+        probe and no ssh is issued. Clean only when pgrep finds no match (rc 1):
+        any other rc, or an ssh failure, keeps the slot PARKED.
         """
+        request_id = self._cancelled_request_id
+        if request_id is None:
+            return True
+        pattern = remote_verify_process_pattern(request_id)
         try:
             rc, _, _ = await self._run(
-                [
-                    'ssh', *_SSH_BASE_OPTS, self._ssh_host,
-                    f'pgrep -f {shlex.quote(REMOTE_VERIFY_PROCESS_PATTERN)}',
-                ]
+                ['ssh', *_SSH_BASE_OPTS, self._ssh_host, f'pgrep -f {shlex.quote(pattern)}'],
             )
             return rc == 1
         except Exception:
             return False  # fail-safe: stay PARKED on any transport error
 
-    def env_probe_run(self) -> Callable[..., Awaitable[tuple[int, str, str]]]:
-        """Return a :func:`capture_env_fingerprint`-compatible run adapter.
+    async def env_probe_run(self) -> Callable[..., Awaitable[tuple[int, str, str]]]:
+        """Open (or reuse) the probe ssh master, then return a run adapter for it.
 
-        The returned async callable has capture's ``(argv, *, cwd=None) ->
-        (rc, stdout, stderr)`` shape, and dispatches each probe as::
+        The adapter has :func:`capture_env_fingerprint`'s ``(argv, *, cwd=None)
+        -> (rc, stdout, stderr)`` shape and dispatches each probe as::
 
-            ssh <_SSH_BASE_OPTS> <host> <REMOTE_TOOL_PATH_PRELUDE> <shlex-joined argv>
+            ssh <_SSH_PROBE_OPTS> <host> <REMOTE_TOOL_PATH_PRELUDE> <shlex-joined argv>
 
-        so a remote fingerprint can be captured through exactly the same
-        function that captures the local one.  The rc/stdout/stderr triple is
-        returned unchanged.  The prelude (task 7097) puts ``~/.local/bin`` on
-        the non-login shell's PATH, as for RemoteRunner's own remote ``uv
-        sync``; without it a host with uv installed reports rc=127.
+        so a remote fingerprint is captured through exactly the same function
+        that captures the local one, and every probe of a check rides one
+        multiplexed connection instead of paying a full handshake each.  The
+        prelude (task 7097) puts ``~/.local/bin`` on the non-login shell's PATH,
+        as for RemoteRunner's own remote ``uv sync``.
+
+        THE OPEN IS ITS OWN AWAITED STEP.  ``ssh ... true`` establishes the
+        master under its own ``_SSH_PROBE_TIMEOUT_SECS`` bound before any probe
+        runs.  Folded into the first adapter call, open plus probe could exceed
+        that bound and race the longer ``_PROBE_TIMEOUT_SECS`` that
+        :func:`_probe_run_safe` wraps around each call: a slow handshake would
+        then be recorded as ``'<unavailable rc=124>'`` against a real local
+        version, which is a false env-divergence alarm.  A failed open raises
+        RunnerUnavailable here, which ``DriftDetector.check_env`` reads as
+        INCONCLUSIVE.
 
         Routed through ``self._run`` (the plain seam shared with health /
         cancel_verify / probe_clean) rather than ``self._ssh_run``: probes are
-        short read-only commands, not the load-bearing long build that needs
-        the stdin heartbeat.  Using ``self._run`` also means every existing
-        test that injects only ``run`` gets the probe path for free.
+        short read-only commands, not the long build that needs the stdin
+        heartbeat.
 
-        A binary absent on the REMOTE host makes the remote shell exit 127,
-        which capture records as ``'<unavailable rc=127>'`` — the same value
-        the local ENOENT normalisation in :func:`_probe_run_safe` produces, so
-        a tool missing on both hosts compares equal rather than as drift.
-
-        TRANSPORT FAILURE IS RAISED, NOT RECORDED
-        -----------------------------------------
-        ``self._run`` defaults to :func:`_default_subprocess_run`, which
-        RETURNS ``(rc, stdout, stderr)`` for every outcome and never raises —
-        so an unreachable host arrives here as ssh's own rc=255, not as an
-        exception.  Recorded verbatim that would render EVERY probe
-        ``'<unavailable rc=255>'`` against real local versions, i.e. a
-        sleeping laptop would read as total env skew.  This adapter therefore
-        converts ssh-level failure into RunnerUnavailable, which is what
-        ``DriftDetector.check_env`` already catches to return INCONCLUSIVE
-        (Invariant 5: transport failure is not divergence) — the same
-        conversion ``run_merge_verify`` performs for the dispatch itself.
-
-        Each probe is additionally bounded by ``_SSH_PROBE_TIMEOUT_SECS``.
-        ``ConnectTimeout=10`` in ``_SSH_BASE_OPTS`` bounds only the HANDSHAKE;
-        a connection that establishes and then hangs would otherwise hold the
-        merge-verify lease and both host slots indefinitely.  A hang converts
-        to RunnerUnavailable for the same reason rc=255 does — transport
-        failure is not divergence.
-
-        Scoped to ``_SSH_TRANSPORT_ERROR_RC`` and OSError specifically, NOT to
-        rc != 0: a reached host that simply lacks the tool exits 127, and that
-        is a genuine reportable difference between the two hosts — the most
-        likely real finding this detector exists to produce.  Broadening the
-        guard would silently disarm it.
+        Transport failure is RAISED, never recorded; see :meth:`_probe_ssh`.  A
+        binary absent on a REACHED host exits 127 through the remote shell and
+        is returned unchanged: capture records it as ``'<unavailable rc=127>'``,
+        the value the local ENOENT normalisation produces, so a tool missing on
+        both hosts compares equal while a tool missing on one side is the real
+        finding this detector exists to produce.
         """
-        async def _run_probe(
-            argv: list[str],
-            *,
-            cwd: str | Path | None = None,
-        ) -> tuple[int, str, str]:
-            remote_cmd = ' '.join(shlex.quote(a) for a in argv)
-            try:
-                async with asyncio.timeout(_SSH_PROBE_TIMEOUT_SECS):
-                    rc, stdout, stderr = await self._run([
-                        'ssh', *_SSH_BASE_OPTS, self._ssh_host,
-                        f'{REMOTE_TOOL_PATH_PRELUDE} {remote_cmd}',
-                    ])
-            except TimeoutError as exc:
-                # BEFORE the OSError clause: TimeoutError subclasses OSError.
-                # A reached-then-wedged connection is a transport failure, not
-                # a finding about the remote's tooling — recording it as
-                # rc=124 would compare a sentinel against real local versions
-                # and file a false divergence L1 over a slow link.
-                raise RunnerUnavailable(
-                    f'ssh {self._ssh_host} probe {remote_cmd!r} exceeded '
-                    f'{_SSH_PROBE_TIMEOUT_SECS}s'
-                ) from exc
-            except OSError as exc:
-                # Spawning the LOCAL ssh binary failed.  Must not fall through
-                # to _probe_run_safe's OSError→rc=127 normalisation: that rule
-                # exists to make an absent binary compare EQUAL across hosts,
-                # and here it would mark every remote probe unavailable while
-                # the local side reports real versions.
-                raise RunnerUnavailable(f'ssh spawn failed: {exc}') from exc
-            if rc == _SSH_TRANSPORT_ERROR_RC:
-                raise RunnerUnavailable(
-                    f'ssh {self._ssh_host} exited {rc} probing '
-                    f'{remote_cmd!r}: {stderr}'
-                )
-            return (rc, stdout, stderr)
+        await self._probe_ssh('true')
+        return self._run_env_probe
 
-        return _run_probe
+    async def _run_env_probe(
+        self,
+        argv: list[str],
+        *,
+        cwd: str | Path | None = None,
+    ) -> tuple[int, str, str]:
+        remote_cmd = ' '.join(shlex.quote(a) for a in argv)
+        return await self._probe_ssh(f'{REMOTE_TOOL_PATH_PRELUDE} {remote_cmd}')
+
+    async def _probe_ssh(self, remote_cmd: str) -> tuple[int, str, str]:
+        """One bounded probe-option ssh; every transport failure is RunnerUnavailable.
+
+        ``self._run`` defaults to :func:`_default_subprocess_run`, which RETURNS
+        ssh's own rc=255 for an unreachable host rather than raising.  Recorded
+        verbatim, a sleeping laptop would read as total env skew, so rc=255, a
+        spawn OSError and a hang past ``_SSH_PROBE_TIMEOUT_SECS`` (ConnectTimeout
+        bounds only the handshake) all raise instead (Invariant 5: transport
+        failure is not divergence).  Any other rc is the remote command's own and
+        is returned unchanged: broadening this to rc != 0 would swallow a real
+        missing-tool finding.
+        """
+        try:
+            async with asyncio.timeout(_SSH_PROBE_TIMEOUT_SECS):
+                rc, stdout, stderr = await self._run(
+                    ['ssh', *_SSH_PROBE_OPTS, self._ssh_host, remote_cmd]
+                )
+        except TimeoutError as exc:
+            # BEFORE the OSError clause: TimeoutError subclasses OSError.
+            raise RunnerUnavailable(
+                f'ssh {self._ssh_host} probe {remote_cmd!r} exceeded '
+                f'{_SSH_PROBE_TIMEOUT_SECS}s'
+            ) from exc
+        except OSError as exc:
+            # Spawning the LOCAL ssh binary failed.  _probe_run_safe's
+            # OSError->rc=127 rule must not see it: that rule makes an absent
+            # binary compare EQUAL across hosts, and here it would mark every
+            # remote probe unavailable against real local versions.
+            raise RunnerUnavailable(
+                f'ssh {self._ssh_host} probe {remote_cmd!r}: spawn failed: {exc}'
+            ) from exc
+        if rc == _SSH_TRANSPORT_ERROR_RC:
+            raise RunnerUnavailable(
+                f'ssh {self._ssh_host} exited {rc} probing {remote_cmd!r}: {stderr}'
+            )
+        return (rc, stdout, stderr)
 
     @property
     def dispatch_in_flight(self) -> bool:
@@ -2342,6 +2649,14 @@ class VerifyRunnerPool:
     *on_unavailable* is where a remote this pool could not use is reported —
     the merge worker's bench, which classes it by kind (design D6) — so a
     fallback never swallows one.  None reports nowhere.
+
+    *verify_cache_registry* is the dispatcher's verify-result cache, and the
+    pool its only writer (I8): any verdict's admitted greens are recorded
+    citing its ``merge_verify`` row.  A verdict that replayed greens has them
+    consumed for its merge sha before that row is written (I6): here for a
+    local verdict, inside RemoteRunner for a remote one, which ships a view of
+    the registry under *verify_cache_modes* (A5).  A None registry keeps the
+    pool outside the cache; None modes keep a remote outside it.
     """
 
     def __init__(
@@ -2352,6 +2667,8 @@ class VerifyRunnerPool:
         task_id: str | None = None,
         archive_root: Path | None = None,
         on_unavailable: RunnerUnavailableSink | None = None,
+        verify_cache_registry: Registry | None = None,
+        verify_cache_modes: VerifyCacheConfig | None = None,
     ) -> None:
         if not runners:
             raise ValueError('VerifyRunnerPool requires at least one runner')
@@ -2372,6 +2689,10 @@ class VerifyRunnerPool:
         # Local (is_local) is the trust anchor and is never quarantined.
         self._quarantined: set[str] = set()
         self._on_unavailable = on_unavailable
+        self._verify_cache_registry = verify_cache_registry
+        self._remote_cache = (
+            None if verify_cache_modes is None else RemoteCache.of(verify_cache_registry, verify_cache_modes)
+        )
 
     # ------------------------------------------------------------------
     # ι: quarantine API
@@ -2431,6 +2752,7 @@ class VerifyRunnerPool:
         speculative: bool | None = None,
         chain_items: int = 1,
         chain_build_ms: int | None = None,
+        dispatch_facts: MergeVerifyDispatchFacts | None = None,
     ) -> VerifyResult:
         """Run the verify bundle and emit a merge_verify event.
 
@@ -2485,6 +2807,12 @@ class VerifyRunnerPool:
         ``merge_verify`` doc-comment in ``event_store.py`` for the full field
         note.
 
+        ``dispatch_facts`` (task 8523) supplies ``runner_reason`` and
+        ``base_relation``; both keys are always present, None when the caller
+        reported no allocation decision.  A RunnerUnavailable fallback to
+        local reports ``remote_quarantined``.  Vocabulary:
+        ``orchestrator/merge_verify_facts.py``.
+
         Fail-safe (PRD §A Invariant 2 / D5): if the selected runner raises
         RunnerUnavailable, dispatch reports it to the pool's *on_unavailable*
         sink and falls back to the local runner (if distinct), logging exactly
@@ -2513,6 +2841,7 @@ class VerifyRunnerPool:
                     task_id=self._task_id,
                     archive_root=self._archive_root,
                     event_store=self._event_store,
+                    verify_cache=self._remote_cache,
                 )
             else:
                 result = await selected.run_merge_verify(merge_sha, spec)
@@ -2531,6 +2860,10 @@ class VerifyRunnerPool:
                 # RunnerUnavailable→local fallback: always 2-arg (local never archives remote stderr)
                 result = await self._local.run_merge_verify(merge_sha, spec)
                 actual_runner = self._local
+                dispatch_facts = dataclasses.replace(
+                    dispatch_facts or MergeVerifyDispatchFacts(),
+                    runner_reason=RunnerReason.REMOTE_QUARANTINED,
+                )
             else:
                 raise
         duration_ms = round((time.monotonic() - t0) * 1000)
@@ -2572,14 +2905,16 @@ class VerifyRunnerPool:
                 ),
             )
 
-        if self._event_store is not None:
-            self._event_store.emit(
+        def _emit(verdict: VerifyResult) -> int | None:
+            if self._event_store is None:
+                return None
+            return self._event_store.emit(
                 EventType.merge_verify,
                 task_id=self._task_id,
                 data={
                     'runner': actual_runner.name,
                     'merge_sha': merge_sha,
-                    'passed': result.passed,
+                    'passed': verdict.passed,
                     'duration_ms': duration_ms,
                     'attempt': attempt,
                     'depth': depth,
@@ -2589,16 +2924,61 @@ class VerifyRunnerPool:
                     # dispatch()'s docstring for why the default is 1.
                     'chain_items': chain_items,
                     'chain_build_ms': chain_build_ms,
+                    **(dispatch_facts or MergeVerifyDispatchFacts()).event_fields(),
                     # task 2837 (PRD verify-retry-failed-only D5): retry_scope +
                     # retry_subset_sizes — always-present (None for a full/legacy
                     # verify), derived from the D2 failed-only contract carried in
                     # spec.verify_env, so a narrowed retry is never miscounted as
                     # a full green gate.
                     **retry_scope_event_fields(spec.verify_env),
+                    **verify_event_fields(verdict),
                 },
             )
 
+        return await self._emit_through_cache(result, actual_runner, merge_sha, _emit)
+
+    async def _emit_through_cache(
+        self,
+        result: VerifyResult,
+        runner: VerifyRunner,
+        merge_sha: str,
+        emit: Callable[[VerifyResult], int | None],
+    ) -> VerifyResult:
+        """Emit *result*'s row through *emit*: for a verdict in the cache, after its
+        replays are consumed (I6), and before recording its greens citing that row (I8).
+        A remote verdict's replays were consumed before RemoteRunner returned it."""
+        registry = self._verify_cache_registry
+        record = getattr(result, 'cache_record', None)
+        if registry is None or not isinstance(record, CacheRecord):
+            emit(result)
+            return result
+        if runner.is_local:
+            result = await _consumed_locally(registry, record, result, merge_sha)
+        event_id = emit(result)
+        if isinstance(event_id, int):
+            await record_greens(
+                registry, record, flake_suppressed=result.flake_suppression is not None,
+                evidence=VerifyEvidenceRef(event_id, self._event_store.run_id, merge_sha, result.passed),
+            )
         return result
+
+
+async def _consumed_locally(
+    registry: Registry, record: CacheRecord, result: VerifyResult, merge_sha: str,
+) -> VerifyResult:
+    """*result* once the greens its local verify replayed are consumed for *merge_sha*.
+
+    Only a green rests on its replays, so only a green whose replays could not be
+    consumed becomes a no-verdict; a red keeps its own verdict."""
+    consumed = await consume_replayed(registry, record, landing_sha=merge_sha)
+    if consumed.backs_every_hit:
+        return result
+    if result.passed:
+        return verify.unconsumed_replay_result(result, consumed.reason)
+    logger.warning(
+        'red merge verify of %s keeps its verdict; its replays were not consumed: %s', merge_sha, consumed.reason,
+    )
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -2845,7 +3225,8 @@ _PROBE_TIMEOUT_SECS = 30.0
 # which would read as env divergence and file a false L1 against a slow link.
 # ssh's own ConnectTimeout=10 in _SSH_BASE_OPTS bounds only the HANDSHAKE; a
 # connection that establishes and then hangs is bounded by this and nothing
-# else.
+# else.  RemoteRunner.env_probe_run's master open gets its own bound of this
+# size, separate from every probe's, so no single adapter call can exceed it.
 _SSH_PROBE_TIMEOUT_SECS = 20.0
 
 
@@ -2922,10 +3303,8 @@ async def capture_env_fingerprint(
         correct only when the caller will not COMPARE those fields — see
         :meth:`DriftDetector.check_env`, which derives this from its
         ``dimensions``.  The saving is not cosmetic: on the remote side each
-        probe is a separate ssh invocation (``_SSH_BASE_OPTS`` sets up no
-        ControlMaster), so skipping three of them turns a 4-probe check from
-        seven full TCP+auth handshakes into four, serially, over a possibly-WAN
-        link — plus three fewer local subprocess spawns.
+        probe is a separate ssh round trip over the probe master, serially, over
+        a possibly-WAN link — plus three fewer local subprocess spawns.
 
     Absent binaries
     ---------------
@@ -3225,6 +3604,14 @@ class EnvDriftCheckResult:
     remote_probes:    The remote host's extra_probes mapping ({} when unprobed).
     escalated:        True when a NEW env-divergence escalation was submitted
                       (False when deduped against an already-open L1).
+    unavailable_reason: str() of the RunnerUnavailable that made the check
+                      INCONCLUSIVE — for a remote, ssh's own stderr via
+                      ``RemoteRunner._probe_ssh`` — so a dispatcher-side fault
+                      such as an unbindable ControlPath can be told from an
+                      unreachable host.  None on every other result, including
+                      the INCONCLUSIVE guards for a check that was not taken.
+                      Construction rejects a reason on anything but a faithful
+                      INCONCLUSIVE, because check_env_safely logs it as one.
     """
     verdict: DriftVerdict
     is_faithful: bool
@@ -3232,6 +3619,18 @@ class EnvDriftCheckResult:
     local_probes: Mapping[str, str] = dataclasses.field(default_factory=dict)
     remote_probes: Mapping[str, str] = dataclasses.field(default_factory=dict)
     escalated: bool = False
+    unavailable_reason: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.unavailable_reason is None:
+            return
+        if self.verdict is not DriftVerdict.INCONCLUSIVE or not self.is_faithful:
+            raise ValueError(
+                'EnvDriftCheckResult: unavailable_reason is set only on a faithful '
+                f'INCONCLUSIVE; got verdict={self.verdict}, '
+                f'is_faithful={self.is_faithful}, '
+                f'unavailable_reason={self.unavailable_reason!r}'
+            )
 
 
 class DriftDetector:
@@ -3459,7 +3858,7 @@ class DriftDetector:
 
         Captures an EnvFingerprint on each host through the SAME
         :func:`capture_env_fingerprint` (local via *local_run* /
-        :func:`env_probe_local_run`, remote via ``remote.env_probe_run()``),
+        :func:`env_probe_local_run`, remote via ``await remote.env_probe_run()``),
         then compares them under :func:`compare_env_fingerprints` scoped to
         *dimensions*.
 
@@ -3493,7 +3892,10 @@ class DriftDetector:
         ------------
         AGREE → emit ``verify_env_parity_ok`` (None-safe).
         DIVERGE → emit ``verify_env_divergence`` + one deduped L1 escalation.
-        INCONCLUSIVE → nothing at all: no event, no escalation, no probe.
+        INCONCLUSIVE → no event, no escalation.  When a runner raised
+        RunnerUnavailable its message is kept on ``unavailable_reason``, which
+        :meth:`check_env_safely` logs once at INFO; every other INCONCLUSIVE
+        carries None.
         INCONCLUSIVE covers every reason the check could not be TAKEN — no
         probes declared, no local runner, no eligible remote (including one
         the verdict path just quarantined), a remote that is not a
@@ -3582,7 +3984,7 @@ class DriftDetector:
         )
         try:
             remote_fp = await capture_env_fingerprint(
-                probe_run(),
+                await probe_run(),
                 extra_probe_specs=probe_specs,
                 include_toolchain=include_toolchain,
             )
@@ -3595,7 +3997,7 @@ class DriftDetector:
                 extra_probe_specs=probe_specs,
                 include_toolchain=include_toolchain,
             )
-        except RunnerUnavailable:
+        except RunnerUnavailable as exc:
             # Invariant 5: transport failure is not divergence.  A closed or
             # flaky laptop must never raise a false env-skew alarm — the same
             # reasoning check() applies to a failed verify dispatch.
@@ -3605,7 +4007,11 @@ class DriftDetector:
             # spawn failure) into RunnerUnavailable precisely so an unreachable
             # host lands here instead of comparing '<unavailable rc=255>'
             # against real local versions and alarming on every declared tool.
-            return inconclusive
+            return EnvDriftCheckResult(
+                verdict=DriftVerdict.INCONCLUSIVE,
+                is_faithful=True,
+                unavailable_reason=str(exc),
+            )
 
         parity = compare_env_fingerprints(local_fp, remote_fp, dimensions=dimensions)
 
@@ -3728,18 +4134,27 @@ class DriftDetector:
         here — an ssh probe hanging up, a malformed argv, a bug in
         ``check_env``, its ValueError for a bad selection — is logged at
         WARNING with the traceback and swallowed rather than allowed to skip
-        ``check``.
+        ``check``.  An INCONCLUSIVE caused by RunnerUnavailable is logged once
+        at INFO with its ``unavailable_reason``.
         """
-        import logging
-
         try:
-            await self.check_env([(probe.key, list(probe.argv)) for probe in probes])
+            result = await self.check_env(
+                [(probe.key, list(probe.argv)) for probe in probes]
+            )
         except Exception:
-            logging.getLogger(__name__).warning(
+            logger.warning(
                 'Env drift check failed for task %s; ignoring (detective control)',
                 self._task_id,
                 exc_info=True,
             )
+        else:
+            if result.unavailable_reason is not None:
+                logger.info(
+                    'Env drift check inconclusive for task %s '
+                    '(runner unavailable, not an alarm): %s',
+                    self._task_id,
+                    result.unavailable_reason,
+                )
 
 
 def render_parity_report(report: VerdictParityReport) -> str:
@@ -4025,11 +4440,18 @@ class HostLease:
     name      : host name (matches RemoteRunner.name, or 'local' for the local slot)
     runner    : the VerifyRunner instance assigned to this slot
     is_local  : True when name == 'local' (LocalRunner)
+    reason    : why :meth:`HostAllocator.acquire` granted this host; None for a
+                lease taken by ``acquire_local``/``acquire_remote`` directly
     """
 
     name: str
     runner: Any
     is_local: bool
+    reason: RunnerReason | None = None
+
+
+def _with_reason(lease: HostLease | None, reason: RunnerReason) -> HostLease | None:
+    return None if lease is None else dataclasses.replace(lease, reason=reason)
 
 
 class HostAllocator:
@@ -4080,7 +4502,8 @@ class HostAllocator:
     -----------------
     The quarantine set is passed by reference so HostAllocator-driven
     (RunnerUnavailable) and DriftDetector-driven quarantines share one
-    source of truth with the worker's _runner_quarantine set.
+    source of truth with the lane's quarantine set
+    (``merge_lane/host_quarantine.py::HostQuarantine``).
     ``clear_quarantine(name)`` discards from this same set; because it is
     shared by reference the host immediately becomes acquire_remote()-eligible
     again without an orchestrator restart.  This is the re-engagement
@@ -4152,18 +4575,32 @@ class HostAllocator:
         Eligibility is NOT re-checked here: acquire_remote() already demands a
         FREE, non-quarantined, non-PARKED slot, so a busy, quarantined or
         PARKED remote falls through to local on its own.
+
+        The returned lease's ``reason`` records the decision as a
+        :class:`~orchestrator.merge_verify_facts.RunnerReason`.
         """
         match policy:
             case 'prefer_local':
                 local = self.acquire_local(local_factory)
-                return local if local is not None else self.acquire_remote()
+                if local is not None:
+                    return _with_reason(local, RunnerReason.PREFER_LOCAL_FREE)
+                return _with_reason(self.acquire_remote(), RunnerReason.LOCAL_BUSY)
             case 'prefer_remote':
                 remote = self.acquire_remote()
                 if remote is not None:
-                    return remote
-                return self.acquire_local(local_factory)
+                    return _with_reason(remote, RunnerReason.PREFER_REMOTE_FREE)
+                fallback_reason = self._local_fallback_reason()
+                return _with_reason(self.acquire_local(local_factory), fallback_reason)
             case _:
                 assert_never(policy)
+
+    def _local_fallback_reason(self) -> RunnerReason:
+        """Why no remote was taken; read before local is, so slot state is current."""
+        if not self._remote_runners:
+            return RunnerReason.LOCAL_ONLY_RULE
+        if any(self._slots[name] == _SLOT_BUSY for name in self._remote_runners):
+            return RunnerReason.REMOTE_BUSY
+        return RunnerReason.REMOTE_QUARANTINED
 
     async def release(self, lease: HostLease) -> None:
         """Release a held slot back to FREE.  Idempotent."""
@@ -4191,8 +4628,8 @@ class HostAllocator:
         """Remove a host from the shared quarantine set (idempotent).
 
         Mirrors :meth:`VerifyRunnerPool.clear_quarantine`.  Because the
-        quarantine set is shared by reference with the worker's
-        ``_runner_quarantine``, discarding *name* here immediately makes the
+        quarantine set is shared by reference with
+        ``merge_lane/host_quarantine.py::HostQuarantine``, discarding *name* here immediately makes the
         host eligible for :meth:`acquire_remote` again — no restart required.
 
         Clearing a name that is not in the quarantine (including names that
@@ -4250,8 +4687,8 @@ class HostAllocator:
         """Return True if host *name* is currently quarantined.
 
         Mirrors :meth:`VerifyRunnerPool.is_quarantined`.  Because the
-        quarantine set is shared **by reference** with the worker's
-        ``_runner_quarantine``, this reflects every writer of that set — not
+        quarantine set is shared **by reference** with
+        ``merge_lane/host_quarantine.py::HostQuarantine``, this reflects every writer of that set — not
         just :meth:`quarantine_and_release`, but also the DriftDetector-driven
         verdict-divergence quarantines and the land-time per-land cross-check,
         which add names to the worker's set directly without going through the
@@ -4262,7 +4699,7 @@ class HostAllocator:
         a slot lookup, so it answers for unmanaged names too (False for one
         that was never quarantined).  That is precisely why it exists
         alongside :meth:`host_states`: its production caller is
-        ``SpeculativeMergeWorker._host_states_block``'s **orphan** arm (task
+        ``merge_lane/host_quarantine.py::HostQuarantine.host_states``'s **orphan** arm (task
         3275), which classifies RU-tracked hosts that have no slot in this
         allocator.  :meth:`host_states` structurally cannot answer for those —
         it enumerates ``_slots`` — so the two are complementary, not redundant.
@@ -4420,8 +4857,8 @@ class HostAllocator:
         is quarantined.
 
         Used by the auto-reprobe path (task 1795) to identify candidates for
-        health probing: only RU-quarantined hosts (those also in the worker's
-        ``_runner_unavailable`` tracker) are ultimately probed and cleared.
+        health probing: only RU-quarantined hosts (those also in
+        ``merge_lane/host_quarantine.py::HostQuarantine``'s RunnerUnavailable tracker) are ultimately probed and cleared.
         """
         return [
             (name, runner)
@@ -4434,7 +4871,7 @@ class HostAllocator:
         lease: HostLease | None,
         *,
         sleep: Any | None = None,
-        max_attempts: int = 10,
+        max_attempts: int = CANCEL_PROBE_ATTEMPTS,
     ) -> bool:
         """Cancel an in-flight verify and release the slot.
 
@@ -4516,16 +4953,12 @@ class HostAllocator:
         # Cancel failed: PARK the slot and poll until the host is clean,
         # for as long as this park episode is still the current one.
         episode = self._park(lease.name, rc)
-        for attempt in range(max_attempts):
-            if self.park_epoch(lease.name) != episode:
-                return False
-            if await lease.runner.probe_clean():
-                self._unpark(lease.name, expect_epoch=episode, source='inline_probe')
-                return False
-            if attempt < max_attempts - 1:
-                await sleep(1.0)
 
-        # max_attempts exhausted — slot remains PARKED (non-acquirable)
+        async def clean_or_superseded() -> bool:
+            return self.park_epoch(lease.name) != episode or await lease.runner.probe_clean()
+
+        if await poll_until_clean(clean_or_superseded, attempts=max_attempts, sleep=sleep):
+            self._unpark(lease.name, expect_epoch=episode, source='inline_probe')
         return False
 
     async def reprobe_parked_slots(

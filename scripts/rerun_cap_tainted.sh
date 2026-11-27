@@ -101,7 +101,7 @@ for pair in \
             echo "[$(date +%H:%M:%S)] START $cfg × $task (config=$ORCH_CONFIG)"
             cd /home/leo/src/dark-factory
             USAGE_ACCOUNTS_FILE="$EVAL_ACCOUNTS_FILE" \
-            uv run --project orchestrator orchestrator eval \
+            uv run --no-sync --project orchestrator orchestrator eval \
                 --task "$TASK_PATH" \
                 --config-name "$cfg" \
                 --force \

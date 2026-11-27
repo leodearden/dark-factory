@@ -19,6 +19,14 @@ Rust-shaped plan still resolves opus, via the new `large-plan-steps` rule);
 see test_routing_theta_plan_shape.py for theta's own language-agnostic
 model-upgrade coverage.
 
+Experiment 1 of plans/routing-experiment-substrate-prd.md (task 8375) puts a
+split on the shipped table: the >=3-module lift now holds on arm 0 of salt
+routing-exp-1 and arm 1 needs >=4 modules. So the task id moves a decision
+for an implementer or debugger with a >=3-module, under-12-step plan and
+nowhere else: the outcome for exactly 3 modules, and only the attributed
+rule id for 4 or more (TestExperimentOneRuleTable,
+TestExperimentOneResolution, TestTaskIdMovesOnlyTheSplitRules).
+
 Fixtures are kept MODULE-LOCAL (not conftest.py) -- mirrors test_routing.py's
 documented rationale (a conftest.py edit forces verify.py's has_conftest to
 widen the merge-time scoped-test selection to the whole owning package).
@@ -27,9 +35,12 @@ widen the merge-time scoped-test selection to the whole owning package).
 from __future__ import annotations
 
 import pytest
+from _routing_arms import task_id_in_rule_arm
 
-from orchestrator.config import OrchestratorConfig
+from orchestrator.config import OrchestratorConfig, RoutingRule, SplitMatch
 from orchestrator.routing import PlanShape, RoleDefaults, RouteInputs, resolve_route
+
+pytestmark = pytest.mark.usefixtures("code_default_config")
 
 # Every role _invoke can dispatch today (task epsilon boundary test 3) -- the
 # 11 full-name config-addressable roles (task alpha) plus one representative
@@ -60,16 +71,6 @@ _SENTINEL_ROLE_DEFAULTS = RoleDefaults(
 )
 
 
-@pytest.fixture(autouse=True)
-def _isolated_config_env(monkeypatch, tmp_path):
-    """Every OrchestratorConfig() built in this module reads ONLY the
-    package's shipped defaults.yaml -- no stray project config.yaml, no
-    ambient ORCH_CONFIG_PATH. Mirrors test_routing.py's per-test convention.
-    """
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv('ORCH_CONFIG_PATH', '')
-
-
 def _config_key(role_name: str) -> str:
     """Reviewer* collapse, reconstructed independently of
     ``orchestrator.routing._config_key`` -- see this module's docstring:
@@ -93,10 +94,12 @@ def _expected_from_config(cfg: OrchestratorConfig, role_name: str) -> tuple[str,
     )
 
 
-def _inputs_for(role_name: str, *, plan_shape: PlanShape | None = None) -> RouteInputs:
+def _inputs_for(
+    role_name: str, *, plan_shape: PlanShape | None = None, task_id: str = '1',
+) -> RouteInputs:
     return RouteInputs(
         role_name=role_name,
-        task_id='1',
+        task_id=task_id,
         task_metadata={},
         plan_shape=plan_shape,
         routing_tier=0,
@@ -165,3 +168,137 @@ class TestRustHeuristicRuleParity:
 
         assert decision.model == cfg.models.architect
         assert decision.source_layer != 'policy_rule'
+
+
+def _rule(cfg: OrchestratorConfig, rule_id: str) -> RoutingRule:
+    return next(r for r in cfg.routing.rules if r.id == rule_id)
+
+
+_THREE_MODULE_PLAN = PlanShape(5, ('a', 'b', 'c'))
+_FOUR_MODULE_PLAN = PlanShape(5, ('a', 'b', 'c', 'd'))
+_TWELVE_STEP_PLAN = PlanShape(12, ('a',))
+
+
+class TestExperimentOneRuleTable:
+    """The shipped table carries experiment 1 of
+    plans/routing-experiment-substrate-prd.md: large-plan-modules-4 (>=4
+    modules) on arm 1 of split salt routing-exp-1 and today's >=3-module
+    rule on arm 0, both after the unsplit large-plan-steps."""
+
+    def test_rule_ids_in_order(self):
+        cfg = OrchestratorConfig()
+
+        assert [r.id for r in cfg.routing.rules] == [
+            'large-plan-steps', 'large-plan-modules-4', 'large-plan-modules',
+            'simple-saturated-full-path', 'retry-tier-up',
+        ]
+
+    def test_arm_one_rule_raises_the_module_threshold_to_four(self):
+        rule = _rule(OrchestratorConfig(), 'large-plan-modules-4')
+
+        assert rule.match.role == ['implementer', 'debugger']
+        assert rule.match.plan_min_modules == 4
+        assert rule.match.split == SplitMatch(salt='routing-exp-1', buckets=2, bucket=1)
+        assert (rule.set.model, rule.set.max_turns) == ('opus', 120)
+
+    def test_arm_zero_rule_keeps_the_three_module_threshold(self):
+        rule = _rule(OrchestratorConfig(), 'large-plan-modules')
+
+        assert rule.match.role == ['implementer', 'debugger']
+        assert rule.match.plan_min_modules == 3
+        assert rule.match.split == SplitMatch(salt='routing-exp-1', buckets=2, bucket=0)
+        assert (rule.set.model, rule.set.max_turns) == ('opus', 120)
+
+    def test_large_plan_steps_is_not_split(self):
+        assert _rule(OrchestratorConfig(), 'large-plan-steps').match.split is None
+
+
+@pytest.mark.parametrize('role_name', ['implementer', 'debugger'])
+class TestExperimentOneResolution:
+    """How the shipped table resolves each arm's task ids."""
+
+    def _resolve(self, role_name: str, plan_shape: PlanShape, arm_rule_id: str):
+        cfg = OrchestratorConfig()
+        task_id = task_id_in_rule_arm(cfg, arm_rule_id)
+        return cfg, resolve_route(
+            _inputs_for(role_name, plan_shape=plan_shape, task_id=task_id), cfg,
+        )
+
+    def test_three_modules_on_arm_zero_lifts_to_opus(self, role_name):
+        _, decision = self._resolve(role_name, _THREE_MODULE_PLAN, 'large-plan-modules')
+
+        assert decision.rule_id == 'large-plan-modules'
+        assert (decision.model, decision.max_turns) == ('opus', 120)
+        assert decision.source_layer == 'policy_rule'
+
+    def test_three_modules_on_arm_one_falls_through_to_config(self, role_name):
+        cfg, decision = self._resolve(role_name, _THREE_MODULE_PLAN, 'large-plan-modules-4')
+
+        assert decision.rule_id is None
+        assert decision.source_layer == 'config'
+        assert decision.model == getattr(cfg.models, role_name)
+        assert decision.max_turns == getattr(cfg.max_turns, role_name)
+
+    def test_four_modules_on_arm_one_lifts_via_the_four_module_rule(self, role_name):
+        _, decision = self._resolve(role_name, _FOUR_MODULE_PLAN, 'large-plan-modules-4')
+
+        assert decision.rule_id == 'large-plan-modules-4'
+        assert (decision.model, decision.max_turns) == ('opus', 120)
+
+    def test_four_modules_on_arm_zero_lifts_via_the_three_module_rule(self, role_name):
+        _, decision = self._resolve(role_name, _FOUR_MODULE_PLAN, 'large-plan-modules')
+
+        assert decision.rule_id == 'large-plan-modules'
+        assert (decision.model, decision.max_turns) == ('opus', 120)
+
+    @pytest.mark.parametrize('arm_rule_id', ['large-plan-modules', 'large-plan-modules-4'])
+    def test_twelve_steps_lifts_via_large_plan_steps_in_both_arms(self, role_name, arm_rule_id):
+        _, decision = self._resolve(role_name, _TWELVE_STEP_PLAN, arm_rule_id)
+
+        assert decision.rule_id == 'large-plan-steps'
+
+
+_TASK_IDS = [str(i) for i in range(1, 201)]
+
+
+def _decisions_over_task_ids(role_name: str, plan_shape: PlanShape | None):
+    cfg = OrchestratorConfig()
+    return [
+        resolve_route(_inputs_for(role_name, plan_shape=plan_shape, task_id=task_id), cfg)
+        for task_id in _TASK_IDS
+    ]
+
+
+class TestTaskIdMovesOnlyTheSplitRules:
+    """Invariant 3, extended: the task id changes a decision only where an
+    experiment-1 split rule can match -- an implementer or debugger with a
+    plan of >=3 modules and under 12 steps. With exactly 3 modules it picks
+    one of the two arm outcomes; with 4 or more only the attributed rule id
+    differs."""
+
+    @pytest.mark.parametrize(
+        'plan_shape',
+        [None, PlanShape(5, ('a',)), _THREE_MODULE_PLAN, _TWELVE_STEP_PLAN],
+    )
+    def test_architect_decision_is_the_same_for_every_task_id(self, plan_shape):
+        assert len(set(_decisions_over_task_ids('architect', plan_shape))) == 1
+
+    @pytest.mark.parametrize('role_name', ['implementer', 'debugger'])
+    @pytest.mark.parametrize('plan_shape', [None, PlanShape(5, ('a',)), _TWELVE_STEP_PLAN])
+    def test_executor_decision_is_the_same_for_every_task_id_outside_the_split(
+        self, role_name, plan_shape,
+    ):
+        assert len(set(_decisions_over_task_ids(role_name, plan_shape))) == 1
+
+    @pytest.mark.parametrize('role_name', ['implementer', 'debugger'])
+    def test_three_module_executor_takes_exactly_the_two_arm_outcomes(self, role_name):
+        rule_ids = {d.rule_id for d in _decisions_over_task_ids(role_name, _THREE_MODULE_PLAN)}
+
+        assert rule_ids == {'large-plan-modules', None}
+
+    @pytest.mark.parametrize('role_name', ['implementer', 'debugger'])
+    def test_four_module_executor_differs_by_arm_only_in_rule_id(self, role_name):
+        decisions = _decisions_over_task_ids(role_name, _FOUR_MODULE_PLAN)
+
+        assert {d.rule_id for d in decisions} == {'large-plan-modules-4', 'large-plan-modules'}
+        assert len({(d.model, d.max_turns) for d in decisions}) == 1

@@ -173,9 +173,8 @@ RestartMaxDelaySec=60), changing nothing else — followed by `systemctl
     RestartMaxDelayUSec=1min (previously RestartSteps=0).
   - `systemd-analyze --user verify` no longer prints the "Service has
     RestartMaxDelaySec= but no RestartSteps= setting. Ignoring." line for
-    either dark-factory unit (the remaining jcodemunch-serve.service "No
-    such file or directory" line is Reify-owned, out of scope — see the
-    plan analysis).
+    either dark-factory unit (the remaining Reify-owned unit's "No such
+    file or directory" line is out of scope — see the plan analysis).
   - dark-factory-dashboard.service remained `active` throughout; no restart
     was performed.
   - Both tests in this module pass under `-m integration`; run together
@@ -211,6 +210,7 @@ import pathlib
 import shutil
 
 import pytest
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 from systemd_unit_invariants import (
     INSTALLED_UNIT_DIR,
     SYSTEMCTL_SKIP_REASON,
@@ -219,6 +219,8 @@ from systemd_unit_invariants import (
     restart_directive,
     systemctl_user_show,
 )
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 UNIT_BASENAME = "dark-factory-dashboard.service"
 INSTALLED_UNIT_PATH = INSTALLED_UNIT_DIR / UNIT_BASENAME
@@ -300,8 +302,7 @@ def test_installed_unit_file_restart_backoff_effective() -> None:
     correct here because a <unit>.d/ drop-in merges by appending.
 
     The shared helper's own failure message is written for the COMMITTED
-    fleet and points at scripts/jcodemunch-watcher.service.template as the
-    worked example — accurate, but it never mentions re-installing THIS unit
+    fleet — accurate, but it never mentions re-installing THIS unit
     or running daemon-reload, which is the only thing that fixes a drifted
     HOST copy. Since this is the layer an operator hits first, the assertion
     is re-raised with _REMEDIATION appended rather than delegating the

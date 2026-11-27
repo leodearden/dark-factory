@@ -52,10 +52,13 @@ from unittest.mock import AsyncMock
 import pytest
 from orchestrator.agents.roles import ROLES
 from orchestrator.review_checkpoint import render_reflection_instructions
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.server.entities_gate import entities_gate
 from fused_memory.server.tools import create_mcp_server
 from fused_memory.utils.referent_resolution import render_referent_declaration_guidance
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 #: The keyword the extractor scans documents for. Pinned below to the LIVE
 #: signature of both write tools, so a parameter rename goes red here instead
@@ -215,6 +218,10 @@ _GUARDED_DOCS = (
     '.claude/commands/memory.md',
     'skills/reflect/SKILL.md',
     'skills/orchestrate/SKILL.md',
+    'skills/review/SKILL.md',
+    'skills/review/references/phase3-triage.md',
+    'skills/hotspot-survey/SKILL.md',
+    'skills/review-briefing/SKILL.md',
 )
 
 _GUARDED_SITES = (

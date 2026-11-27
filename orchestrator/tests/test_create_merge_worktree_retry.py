@@ -49,7 +49,7 @@ from _orch_helpers import assert_isolated_git_repo, git_env_with_ceiling
 from _worktree_add_fakes import make_fake_run
 
 import orchestrator.git_ops as git_ops_mod
-import orchestrator.merge_lane.worker as worker_mod
+import orchestrator.merge_lane.verify_failure_outcome as verify_failure_outcome_mod
 import orchestrator.verify_classify as verify_classify_mod
 from orchestrator.config import GitConfig
 from orchestrator.git_ops import GitOps
@@ -156,7 +156,7 @@ class TestWorktreeAddRetryPredicate:
         so an "inline it" refactor turns this red rather than forking a copy
         that can drift."""
         assert git_ops_mod.reports_disk_full is verify_classify_mod.reports_disk_full
-        assert worker_mod.reports_disk_full is verify_classify_mod.reports_disk_full
+        assert verify_failure_outcome_mod.reports_disk_full is verify_classify_mod.reports_disk_full
 
 
 # ---------------------------------------------------------------------------

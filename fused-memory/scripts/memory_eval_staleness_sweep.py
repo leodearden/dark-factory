@@ -76,6 +76,11 @@ can never be misread as health.
 """
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
+
 import argparse
 import asyncio
 import contextlib
@@ -83,11 +88,9 @@ import hashlib
 import logging
 import os
 import re
-import sys
 import tempfile
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger('memory_eval_staleness_sweep')
@@ -181,15 +184,16 @@ def by_design_reaper(metadata: Any) -> str | None:
 
     Read off the CITING record's metadata and never parsed from its content:
     the "CANONICAL (consolidates ...)" prose is LLM-authored. ``canonical`` is
-    tested with ``is True``, the vocabulary validator's own idiom, so a ``1``
-    or ``'true'`` never attributes. Status correction is checked first, so a
+    read through ``canonical_marker.py::is_canonical``, so a ``1`` or
+    ``'true'`` never attributes. Status correction is checked first, so a
     record carrying both signatures gets the more specific writer.
 
     One residual (PRD D11): a reaper-written edge whose target vanished for an
     unrelated reason is indistinguishable from a reaped one, and is treated as
     by-design because that target was going to be deleted anyway.
     """
-    from fused_memory.reconciliation.harness import (  # noqa: PLC0415
+    from fused_memory.canonical_marker import is_canonical
+    from fused_memory.reconciliation.harness import (
         PROJECT_STATUS_CORRECTION_KIND,
     )
 
@@ -197,7 +201,7 @@ def by_design_reaper(metadata: Any) -> str | None:
         return None
     if metadata.get('kind') == PROJECT_STATUS_CORRECTION_KIND:
         return REAPER_STATUS_CORRECTION
-    if metadata.get('canonical') is True or metadata.get('agent_id') == CONSOLIDATOR_AGENT_ID:
+    if is_canonical(metadata) or metadata.get('agent_id') == CONSOLIDATOR_AGENT_ID:
         return REAPER_CONSOLIDATION
     return None
 
@@ -320,7 +324,7 @@ def pointer_targets(record: dict) -> list[PointerRef]:
     Malformed members are RETAINED, matching the helper's no-drop contract;
     :func:`malformed_pointer_refs` is how they are surfaced.
     """
-    from fused_memory.memory_metadata import normalize_supersedes  # noqa: PLC0415
+    from fused_memory.memory_metadata import normalize_supersedes
 
     metadata = record.get('metadata') or {}
     source_id = str(record.get('id') or '')
@@ -528,7 +532,8 @@ def unkeyable_successor_refs(refs: list[PointerRef]) -> list[PointerRef]:
     """The ``supersedes`` refs whose source carries no content to key on.
 
     ``fetch_pointer_records`` normalises ``content`` to ``''`` when none of
-    ``_CONTENT_KEYS`` yields a string, and :func:`content_key` of an empty
+    ``fused_memory/utils/mem0_content_keys.py::MEM0_CONTENT_KEYS`` yields a
+    string, and :func:`content_key` of an empty
     string is a CONSTANT. Every content-less source therefore hashes to the
     same value, so two DIFFERENT sources citing one target would share an
     item_key — which :func:`successor_pointer_items` would then fold with
@@ -599,7 +604,7 @@ def successor_pointer_items(refs: list[PointerRef], resolution: dict[str, bool])
     diverged status-correction record would mint a new failing item, and so a
     new alarm, on every run a reaper acted (PRD D11).
     """
-    from shared.memory_eval_metrics import TripwireItem  # noqa: PLC0415
+    from shared.memory_eval_metrics import TripwireItem
 
     by_key: dict[str, bool] = {}
     for ref in refs:
@@ -933,7 +938,7 @@ def referenced_task_ids(record: dict) -> set[str]:
     live records carrying ``task_id`` — and is normalised to ``str`` because
     it is written as both an int and a string.
     """
-    from fused_memory.reconciliation.task_filter import TASK_REF_RE  # noqa: PLC0415
+    from fused_memory.reconciliation.task_filter import TASK_REF_RE
 
     ids = set(TASK_REF_RE.findall(record.get('content') or ''))
     raw = (record.get('metadata') or {}).get('task_id')
@@ -983,7 +988,7 @@ def terminal_staleness(records: list[dict], terminal_task_ids) -> StalenessObser
     only. ``deferred`` is NOT terminal, and an entry asserting live state for
     a deferred task is not making a false claim.
     """
-    from fused_memory.reconciliation import task_filter  # noqa: PLC0415
+    from fused_memory.reconciliation import task_filter
 
     statuses = terminal_task_ids if isinstance(terminal_task_ids, dict) else {}
     terminal = set(terminal_task_ids)
@@ -1052,7 +1057,7 @@ def _count(metric_id: str, value: int, exposure: int, *, details_path: str | Non
     more superseded entries outranking their successors and more stale
     liveness claims are each unambiguously the regression direction.
     """
-    from shared.memory_eval_metrics import Metric  # noqa: PLC0415
+    from shared.memory_eval_metrics import Metric
 
     if exposure <= 0:
         return None
@@ -1073,7 +1078,7 @@ def _scalar(metric_id: str, value: int, exposure: int, *, details_path: str | No
     ``direction``: the shared validator rejects one on a scalar, which has no
     alarm rule for a direction to steer.
     """
-    from shared.memory_eval_metrics import Metric  # noqa: PLC0415
+    from shared.memory_eval_metrics import Metric
 
     if exposure <= 0:
         return None
@@ -1243,7 +1248,7 @@ def build_series(
     "rejected at emit time, not read time" guarantee applied to the producer's
     own arithmetic.
     """
-    from shared.memory_eval_metrics import (  # noqa: PLC0415
+    from shared.memory_eval_metrics import (
         SCHEMA_VERSION,
         Corpus,
         Metric,
@@ -1366,17 +1371,6 @@ and that the Graphiti-primary ones were not — rather than leaving a near-zero
 count to be misread as an empty graph.
 """
 
-_CONTENT_KEYS: tuple[str, ...] = ('data', 'memory', 'content')
-"""Payload keys tried in order for a scrolled record's text.
-
-``data`` is the canonical scroll-payload key and is tried first; ``memory``
-is a search-layer key that can appear stale on a scroll payload; ``content``
-is a defensive third. Same order and same reasoning as δ's ``fetch_memories``
-— the two runners read the same payloads and must agree about which string is
-the memory.
-"""
-
-
 STORE_READ_CONCURRENCY = 8
 """How many store reads either fetch band keeps in flight at once.
 
@@ -1460,7 +1454,8 @@ async def fetch_pointer_records(
             empty corpus — the same no-silent-fail posture the primitive
             itself adopted.
     """
-    from fused_memory.models.scope import Scope  # noqa: PLC0415
+    from fused_memory.models.scope import Scope
+    from fused_memory.utils.mem0_content_keys import mem0_payload_text
 
     scope = Scope(project_id=project_id)
     records: list[dict[str, Any]] = []
@@ -1482,15 +1477,9 @@ async def fetch_pointer_records(
         }
         for raw in raw_records:
             payload = raw.get('metadata') or {}
-            content = ''
-            for key in _CONTENT_KEYS:
-                value = payload.get(key)
-                if isinstance(value, str) and value:
-                    content = value
-                    break
             records.append({
                 'id': str(raw.get('id') or ''),
-                'content': content,
+                'content': mem0_payload_text(payload),
                 'metadata': payload,
             })
     return records, scan_stats
@@ -1718,7 +1707,7 @@ async def fetch_terminal_task_ids(config: Any) -> TerminalTaskJoin:
     families are still measurable without the task tree. It does not degrade
     to a silent empty set — see :class:`TerminalTaskJoin`.
     """
-    from shared.task_statuses import TERMINAL  # noqa: PLC0415
+    from shared.task_statuses import TERMINAL
 
     taskmaster = getattr(config, 'taskmaster', None)
     if taskmaster is None:
@@ -1731,7 +1720,7 @@ async def fetch_terminal_task_ids(config: Any) -> TerminalTaskJoin:
             ),
         )
 
-    from fused_memory.backends.sqlite_task_backend import (  # noqa: PLC0415
+    from fused_memory.backends.sqlite_task_backend import (
         SqliteTaskBackend,
     )
 
@@ -1843,7 +1832,7 @@ def sweep_report_sections(
     unresolved and malformed disclosures follow: a bare total tells an
     operator something was narrowed but not which record to go and look at.
     """
-    from shared.memory_eval_metrics import render_report  # noqa: PLC0415
+    from shared.memory_eval_metrics import render_report
 
     # The categories this run ACTUALLY scrolled, not the module default: a
     # caller may narrow them, and a scope line that named the default would be
@@ -2102,7 +2091,10 @@ def write_report_text(path: str | Path, text: str) -> None:
 # The read-only run band
 #
 # D8's runner pattern minus every mutation: CONFIG_PATH from --config,
-# FusedMemoryConfig(), MemoryService(), initialize(), try/finally close().
+# FusedMemoryConfig(), then
+# fused_memory/maintenance/_utils.py::maintenance_service(open_as=READS), which
+# opens and always closes the service. The full opening starts the durable
+# write queue and runs Graphiti startup maintenance, which repairs edges.
 #
 # There is no --apply band and no write call anywhere below. The guarantee is
 # asserted as BEHAVIOUR: the tests drive this band against a service double
@@ -2170,7 +2162,7 @@ async def run_sweep(
     CLI's single-valued ``--project-id`` only guards the CLI — this function is
     called directly by the scheduled runner (leaf ε) too.
     """
-    from shared.memory_eval_metrics import run_stamp, write_metric_series  # noqa: PLC0415
+    from shared.memory_eval_metrics import run_stamp, write_metric_series
 
     distinct_projects = tuple(dict.fromkeys(project_ids))
     if len(distinct_projects) != 1:
@@ -2322,16 +2314,15 @@ async def _run(args: argparse.Namespace) -> int:
     if args.config:
         os.environ['CONFIG_PATH'] = str(args.config)
 
-    # Imported as MODULE ATTRIBUTES, function-locally (D8): that indirection
-    # is the seam the read-only double patches, so the guarantee is testable
-    # end to end without a test-only hook in this script.
-    import fused_memory.config.schema as _schema  # noqa: PLC0415
-    import fused_memory.services.memory_service as _service  # noqa: PLC0415
+    # Imported function-locally (D8): the config is read as a MODULE ATTRIBUTE
+    # and the service comes from maintenance_service, the seams the read-only
+    # double patches, so the guarantee is testable end to end without a
+    # test-only hook in this script.
+    import fused_memory.config.schema as _schema
+    from fused_memory.maintenance._utils import ServiceOpen, maintenance_service
 
     config = _schema.FusedMemoryConfig()
-    memory = _service.MemoryService(config)
-    await memory.initialize()
-    try:
+    async with maintenance_service(config=config, open_as=ServiceOpen.READS) as (_, memory):
         outcome = await run_sweep(
             memory,
             project_ids=(args.project_id,),
@@ -2341,8 +2332,6 @@ async def _run(args: argparse.Namespace) -> int:
             eval_id=args.eval_id,
             write_metrics=not args.no_metrics,
         )
-    finally:
-        await memory.close()
 
     print(outcome.report, end='')
     if outcome.metrics_path is not None:

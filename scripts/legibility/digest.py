@@ -42,15 +42,17 @@ from legibility.detectors import (  # noqa: E402  # debt: task 6760
     RecordHits,
     SignalClass,
     classify_agent_class,
+    dialogue_turn_text,
     error_hits,
-    is_non_dialogue_carrier,
     message_content,
     record_hits,
-    user_turn_text,
 )
-from legibility.inventory import (  # noqa: E402
+from legibility.inventory import (
     UNREADABLE_FILE_ERRORS,
     as_unreadable_file_error,
+    encode_cwd,
+    first_transcript_identity,
+    transcript_encoded_dir,
 )
 
 logger = logging.getLogger('legibility.digest')
@@ -490,48 +492,24 @@ def score_signals(counts: Mapping[str, int], n_user_turns: int) -> float:
 
 
 def iter_user_turns(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Return genuine non-sidechain, non-meta human user turns.
+    """Return the human user turns, each with its record index: the records
+    :func:`detectors.dialogue_turn_text` keeps. That one rule, which the
+    classifier's INTERACTIVE also asks, is the whole filter; it already drops
+    client-rendered turns (:func:`detectors.is_client_rendered_turn`).
 
-    Excludes: non-'user' records, isSidechain=True (subagent) turns,
-    isMeta=True (system-injected) turns, user records whose content is
-    entirely tool_result blocks, a record whose harness provenance names a
-    non-human producer (:func:`reingestion.has_non_human_origin` -- a background-task
-    notification, an auto-continuation, a coordinator or peer message), and
-    re-ingested machine content (:func:`reingestion.is_reingested_content`): a pasted
-    coder judgment, and every harness-injected briefing/prompt/report/
-    context-block turn -- the orchestrator briefing, the trickle-coder and
-    resume prompts, the reconciliation judge's run-review prompt and a lone
-    memory-context block alike (see :func:`reingestion.is_harness_injected_turn`). Every
-    one of those injected shapes lands in the transcript as ordinary
-    user-role text (isMeta unset), so isMeta alone cannot exclude any of
-    them. The gold bucket asks the SAME predicate every scalar detector asks
-    (:func:`detectors.is_non_dialogue_carrier`) rather than holding a private copy of
-    the rule: task 5685's ruling that the fix belongs at the
-    content-classification layer, not per bucket.
-
-    This function is the SINGLE source for both the gold user_corrections
-    section and render_digest's n_user_turns score component, so this one
-    filter excludes such a turn from the body AND the score together --
+    This function is the SINGLE source for both the gold user_turns
+    section and render_digest's n_user_turns score component, so a turn
+    this filter drops leaves the body AND the score together --
     which is exactly what confusion-census-2026-07-31 §3.1 asks for, its
     clusters 1.1(b) and 1.2 being one event observed from two surfaces.
-    User corrections are gold (PRD Sec 5) -- this is the highest-priority
+    User turns are gold (PRD Sec 5) -- this is the highest-priority
     digest section.
     """
-    turns = []
-    for index, record in enumerate(records):
-        if record.get('type') != 'user':
-            continue
-        if record.get('isSidechain'):
-            continue
-        if record.get('isMeta'):
-            continue
-        text = user_turn_text(record)
-        if text is None:
-            continue
-        if is_non_dialogue_carrier(record, text):
-            continue
-        turns.append({'index': index, 'text': text})
-    return turns
+    return [
+        {'index': index, 'text': text}
+        for index, record in enumerate(records)
+        if (text := dialogue_turn_text(record)) is not None
+    ]
 
 
 def _yaml_dquote(value: Any) -> str:
@@ -548,7 +526,7 @@ def _yaml_dquote(value: Any) -> str:
     return f'"{escaped}"'
 
 
-DIGEST_INSTRUMENT_VERSION: int = 7
+DIGEST_INSTRUMENT_VERSION: int = 10
 """Which generation of this instrument produced a given digest.
 
 BUMP POLICY: increment whenever a signal detector or the gold-turn
@@ -579,6 +557,16 @@ keys do NOT bump it.
   7 -- the prior-round adjudicator, escalation-watcher rotation and retired
        pre-5356 replan prompt markers (reingestion.HARNESS_PROMPT_MARKERS,
        task 7441), consulted by the gold-turn filter and every dialogue carrier.
+  8 -- the headless-SDK prompt record rule (reingestion.is_headless_sdk_prompt,
+       task 6953), consulted with the non-human-origin rule by the gold-turn
+       filter and every dialogue carrier.
+  9 -- the periodic-census verifier and synthesis prompt markers
+       (reingestion.HARNESS_PROMPT_MARKERS, task 6847), consulted by the
+       gold-turn filter and every dialogue carrier.
+  10 -- the client-rendered turn rule (detectors.is_client_rendered_turn,
+       task 7442), inside detectors.dialogue_turn_text since task 11556,
+       consulted by the gold-turn filter and the classifier's interactive
+       fallback, never by a dialogue carrier.
 
 This answers ``plans/confusion-census-2026-07-31.md:151`` (Sec 6): the
 next census must be able to tell a pre-fix trace from a live regression.
@@ -586,7 +574,7 @@ next census must be able to tell a pre-fix trace from a live regression.
 
 FRONTMATTER_KEYS: tuple[str, ...] = (
     'session', 'cwd', 'encoded_dir', 'agent_class', 'date', 'size_bytes', 'score',
-    'n_user_turns', 'truncated_items', 'instrument_version',
+    'n_user_turns', 'truncated_items', 'parent_session', 'instrument_version',
 )
 """Top-level frontmatter keys in the exact PRD Sec 7.2 order (everything
 before ``signal_counts``, which is rendered as its own nested block).
@@ -613,6 +601,10 @@ rendered body for :data:`ITEM_TRUNCATION_MARKER`, which item content can
 quote on its own), maintained over the POST-trim sections (see
 :func:`_truncate_sections`), so it describes the body that actually
 ships.
+
+``parent_session`` names the parent's ``sessionId`` for a sub-agent
+transcript, whose ``session`` is its
+:class:`~legibility.inventory.TranscriptIdentity` key, and is '' otherwise.
 
 ``instrument_version`` (task 3610) stays LAST of the top-level keys, and
 that position is pinned by its own test: a generation marker belongs after
@@ -680,7 +672,15 @@ def _first_present(records: list[dict[str, Any]], key: str) -> Any:
 
 
 def _derive_session(records: list[dict[str, Any]]) -> str:
-    return _first_present(records, 'sessionId') or 'unknown'
+    identity = first_transcript_identity(records)
+    return identity.key if identity is not None else 'unknown'
+
+
+def _derive_parent_session(records: list[dict[str, Any]]) -> str:
+    identity = first_transcript_identity(records)
+    if identity is None or identity.parent_session is None:
+        return ''
+    return identity.parent_session
 
 
 def _derive_cwd(records: list[dict[str, Any]]) -> str:
@@ -695,39 +695,23 @@ def _derive_date(records: list[dict[str, Any]]) -> str:
     return timestamp.split('T', 1)[0]
 
 
-def _encode_cwd(cwd: str) -> str:
-    """Mirror Claude Code's own ``~/.claude/projects/<enc>`` encoding.
-
-    '/', '.' AND '_' all map to '-', and case is preserved — same rule as
-    orchestrator.session_registry.encode_cwd, the canonical implementation,
-    which carries the authoritative statement of the rule and the record of
-    the 738 real (encoded-dir, decoded-cwd) pairs it was validated against.
-    Reused here as the fallback when the real transcript path isn't
-    available to read the ground-truth encoded dir name off disk.
-
-    Agreement with the canonical is not left to goodwill: it is asserted
-    row-for-row against real on-disk dir names by
-    ``scripts/tests/test_legibility_inventory.py``'s ``TestEncoderLockstep``
-    (task 3272, which found this copy and three others all missing '_').
-    """
-    return cwd.replace('/', '-').replace('.', '-').replace('_', '-')
-
-
 def _derive_encoded_dir(records: list[dict[str, Any]], cwd: str, path: Any) -> str:
-    """Prefer the real transcript file's parent dir name (ground truth);
-    fall back to mirror-encoding the derived *cwd* when no *path* is given
-    or *cwd* itself could not be derived."""
+    """Prefer the encoded dir the real transcript file is filed under
+    (ground truth, :func:`inventory.transcript_encoded_dir`); fall back to
+    ``inventory.encode_cwd`` of the derived *cwd* when no *path* is given or
+    that dir name is empty, or to 'unknown' when *cwd* itself could not be
+    derived."""
     if path is not None:
-        parent_name = Path(path).parent.name
-        if parent_name:
-            return parent_name
+        encoded_dir = transcript_encoded_dir(Path(path))
+        if encoded_dir:
+            return encoded_dir
     if cwd == 'unknown':
         return 'unknown'
-    return _encode_cwd(cwd)
+    return encode_cwd(cwd)
 
 
 SECTION_HEADINGS: dict[str, str] = {
-    'user_corrections': 'User Corrections',
+    'user_turns': 'User Turns',
     'error_neighborhoods': 'Error Neighborhoods',
     'self_corrections': 'Self-Corrections',
     'retry_loops': 'Retry Loops',
@@ -745,12 +729,12 @@ Sec 11 alpha observable: "frontmatter + the four signal-class sections")."""
 SECTION_PRIORITY: tuple[str, ...] = (
     'designed_outcomes',
     'retry_loops', 'not_found', 'error_neighborhoods', 'df_guard', 'interrupt',
-    'self_corrections', 'user_corrections',
+    'self_corrections', 'user_turns',
 )
 """Section keys in ASCENDING signal priority -- index 0 is dropped/trimmed
-FIRST under the 15KB soft cap, the last entry ('user_corrections', gold)
+FIRST under the 15KB soft cap, the last entry ('user_turns', gold)
 is trimmed LAST (PRD Sec 7.2: "truncate lowest-signal sections last"; PRD
-Sec 5: user corrections are gold). Digest bodies render in the REVERSE of
+Sec 5: user turns are gold). Digest bodies render in the REVERSE of
 this order (gold first). Ranking mirrors SIGNAL_WEIGHTS magnitude
 (self_correct 3.0 > df_guard/interrupt 2.0 > tool_error/not_found 1.0),
 with retry_loops below those since it carries no SIGNAL_WEIGHTS entry at
@@ -772,8 +756,17 @@ carrying their own designed-outcome count and the rules that fired (see
 priority order and no re-prioritisation is needed."""
 
 
-def _render_user_corrections(items: list[dict[str, Any]]) -> list[str]:
-    return [f"- (turn {item['index']}) {item['text']}" for item in items]
+def _record_label(index: int) -> str:
+    """Render an item's '(record N)' label. N is the item's 0-based
+    position among the transcript's parsed records, whatever their type,
+    so it is not a user-turn ordinal; frontmatter ``n_user_turns`` counts
+    those.
+    Pinned by scripts/tests/test_legibility_digest.py::TestItemRecordLabels."""
+    return f'(record {index})'
+
+
+def _render_user_turns(items: list[dict[str, Any]]) -> list[str]:
+    return [f"- {_record_label(item['index'])} {item['text']}" for item in items]
 
 
 def _exit_marker(exit_code: int | None) -> str:
@@ -791,7 +784,7 @@ def _render_error_neighborhoods(items: list[dict[str, Any]]) -> list[str]:
         summary = item['attempt_input_summary'] or ''
         marker = _exit_marker(item['exit_code'])
         lines.append(
-            f"- (turn {item['index']}) {tool}({summary}) -> "
+            f"- {_record_label(item['index'])} {tool}({summary}) -> "
             f"{marker}{item['error_content']}"
         )
     return lines
@@ -807,7 +800,7 @@ def _render_designed_outcomes(items: list[dict[str, Any]]) -> list[str]:
         summary = item['attempt_input_summary'] or ''
         marker = _exit_marker(item['exit_code'])
         lines.append(
-            f"- (turn {item['index']}) {tool}({summary}) -> "
+            f"- {_record_label(item['index'])} {tool}({summary}) -> "
             f"{marker}[{item['designed_outcome']}] {item['error_content']}"
         )
     return lines
@@ -815,7 +808,7 @@ def _render_designed_outcomes(items: list[dict[str, Any]]) -> list[str]:
 
 def _render_self_corrections(items: list[dict[str, Any]]) -> list[str]:
     return [
-        f"- (turn {item['index']}) [{item['pattern']}] {item['context']}"
+        f"- {_record_label(item['index'])} [{item['pattern']}] {item['context']}"
         for item in items
     ]
 
@@ -866,7 +859,7 @@ def _render_retry_loops(items: list[dict[str, Any]]) -> list[str]:
 
 
 def _render_scalar_signal(items: list[dict[str, Any]]) -> list[str]:
-    return [f"- (turn {item['index']}) {item['pattern']}" for item in items]
+    return [f"- {_record_label(item['index'])} {item['pattern']}" for item in items]
 
 
 @dataclass(frozen=True)
@@ -887,8 +880,8 @@ _SectionDetector = Callable[[_DigestScan], list[dict[str, Any]]]
 _ItemRenderer = Callable[[list[dict[str, Any]]], list[str]]
 
 _SECTION_RENDERERS: dict[str, tuple[_SectionDetector, _ItemRenderer]] = {
-    'user_corrections': (
-        lambda scan: iter_user_turns(scan.records), _render_user_corrections,
+    'user_turns': (
+        lambda scan: iter_user_turns(scan.records), _render_user_turns,
     ),
     'error_neighborhoods': (
         lambda scan: iter_genuine_errors(neighborhoods=scan.neighborhoods),
@@ -943,6 +936,14 @@ merely reads or greps those files renders items containing the marker
 without having been capped. ``truncated_items`` is therefore tracked from
 what :func:`_cap_item` actually did (see :func:`_build_sections`), never
 re-derived by scanning the rendered body."""
+
+DEFAULT_MAX_BYTES = 15360
+"""The PRD §7.2 per-digest soft cap, in UTF-8 bytes.
+
+SOFT because :func:`_truncate_sections` stops trimming once every section is
+empty: a soft cap cannot shrink the frontmatter itself, so a digest whose
+frontmatter alone exceeds *max_bytes* (a pathological ``cwd``/``session``
+value, or a very small injected cap) renders LARGER than the cap."""
 
 MAX_ITEM_BYTES = 2048
 """Hard ceiling on a single rendered item's UTF-8 byte length, regardless
@@ -1042,7 +1043,7 @@ def _cap_item(line: str, cap: int) -> str:
 def _build_sections(
     records: list[dict[str, Any]],
     *,
-    item_max_bytes: int = _item_byte_cap(15360),
+    item_max_bytes: int,
     hits: Sequence[RecordHits] | None = None,
 ) -> tuple[dict[str, list[str]], set[tuple[str, int]]]:
     """Run every detector once and render its hits to markdown bullet
@@ -1086,7 +1087,7 @@ def _build_sections(
 
 
 def _render_body(sections: dict[str, list[str]]) -> str:
-    """Render non-empty sections, gold (user_corrections) first, retry_loops
+    """Render non-empty sections, gold (user_turns) first, retry_loops
     last -- the REVERSE of the ascending-priority SECTION_PRIORITY order."""
     blocks = []
     for key in reversed(SECTION_PRIORITY):
@@ -1225,7 +1226,7 @@ def render_digest(
     *,
     agent_class: str,
     path: Any = None,
-    max_bytes: int = 15360,
+    max_bytes: int = DEFAULT_MAX_BYTES,
 ) -> str:
     """Render the full markdown digest: frontmatter + one section per
     non-empty signal class (PRD Sec 7.2), soft-capped at *max_bytes*.
@@ -1233,11 +1234,12 @@ def render_digest(
     *agent_class* is the caller's already-resolved class (typically
     :func:`detectors.classify_agent_class`'s result) -- render_digest never
     classifies on its own. *path*, when given, sources ``encoded_dir``
-    from the transcript file's real parent dir name; otherwise it falls
+    from the encoded dir the transcript file is filed under
+    (:func:`inventory.transcript_encoded_dir`); otherwise it falls
     back to mirror-encoding the derived ``cwd`` (see
     :func:`_derive_encoded_dir`). When the unrestricted render exceeds
     *max_bytes*, :func:`_truncate_sections` trims lowest-signal sections
-    first (gold user-corrections last); a digest already under the cap is
+    first (gold user turns last); a digest already under the cap is
     returned unmodified (zero trim iterations).
     """
     cwd = _derive_cwd(records)
@@ -1259,6 +1261,7 @@ def render_digest(
         # the key; _truncate_sections resolves the real value against the
         # POST-trim sections it is about to render.
         'truncated_items': 0,
+        'parent_session': _derive_parent_session(records),
         'instrument_version': DIGEST_INSTRUMENT_VERSION,
         'signal_counts': counts,
     }
@@ -1274,7 +1277,8 @@ def render_digest(
 
 
 def build_digest(
-    path: Any, *, agent_class_override: str | None = None, max_bytes: int = 15360,
+    path: Any, *, agent_class_override: str | None = None,
+    max_bytes: int = DEFAULT_MAX_BYTES,
 ) -> str:
     """Orchestrate the full pipeline for a single transcript file: parse,
     classify, render. This is the headline entry point (PRD Sec 8.1
@@ -1315,7 +1319,7 @@ def main(argv: Sequence[str]) -> int:
         help='Render this agent_class instead of classifying the transcript',
     )
     parser.add_argument(
-        '--max-bytes', type=int, default=15360,
+        '--max-bytes', type=int, default=DEFAULT_MAX_BYTES,
         help='Soft byte cap for the rendered digest (default: %(default)s)',
     )
     parser.add_argument(

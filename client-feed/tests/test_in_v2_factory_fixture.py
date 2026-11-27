@@ -10,7 +10,7 @@ from typing import Any
 import pytest
 from _git_repo import make_repo
 from _in_dir import write_engagement
-from _stores import RunsDb, TasksDb
+from _stores import EscalationQueueDir, RunsDb, TasksDb
 
 from client_feed.contract import (
     INBOX_FILENAME,
@@ -21,6 +21,7 @@ from client_feed.contract import (
     Restated,
     RevealRefused,
     RevealRequested,
+    Source,
     parse_inbox_line,
     split_jsonl,
 )
@@ -150,6 +151,7 @@ def policy(tmp_path: Path, in_dir: Path) -> Policy:
     repo.commit('c1', when=T0)
     TasksDb.create(repo.root)
     RunsDb.create(repo.root)
+    EscalationQueueDir.create(repo.root)
     write_engagement(in_dir, project_id=PROJECT)
     out_dir = tmp_path / 'out'
     out_dir.mkdir()
@@ -170,7 +172,7 @@ def test_a_publisher_pass_answers_both_requests_and_counts_nothing_under_inbox(
 ) -> None:
     report = run_pass(policy, OutDir.open(policy.out_dir, project_id=PROJECT), now=NOW)
 
-    assert report.degraded == ()
+    assert [degradation.source for degradation in report.degraded] == [Source.FILER]
     answers = [
         (line.type, line.path)
         for line in read_feed_lines(policy.out_dir)
@@ -191,7 +193,7 @@ def test_a_pass_over_an_inbox_of_only_defect_reports_moves_the_offset_past_them(
 
     report = run_pass(policy, OutDir.open(policy.out_dir, project_id=PROJECT), now=NOW)
 
-    assert report.degraded == ()
+    assert [degradation.source for degradation in report.degraded] == [Source.FILER]
     assert not any(
         isinstance(line, FileRevealed | RevealRefused) for line in read_feed_lines(policy.out_dir)
     )

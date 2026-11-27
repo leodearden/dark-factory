@@ -95,6 +95,16 @@ if [ -d "$DATA_DIR" ]; then
 fi
 
 # ---------------------------------------------------------------------------
+# 2b. Restore recovery archives
+# The FalkorDB pre-state dumps in scripts/recovery_archive.py::RECOVERY_ARCHIVES
+# (docs/falkordb-recovery-dumps.md), back to their repo paths before any live data.
+# ---------------------------------------------------------------------------
+info "Restoring recovery archives"
+python3 "$REPO_ROOT/scripts/recovery_archive.py" copy "$EXPORT_DIR/recovery-archive" "$REPO_ROOT" \
+  || fail "Recovery archives: the export's recovery-archive/ is missing or a pinned dump in it is altered (listed above). No live data was restored. Re-transfer <export>/recovery-archive/ from the source host, then re-run this import"
+ok "Recovery archives restored to their repo paths"
+
+# ---------------------------------------------------------------------------
 # 3. Restore FalkorDB data
 # ---------------------------------------------------------------------------
 info "Restoring FalkorDB data"
@@ -102,6 +112,17 @@ info "Restoring FalkorDB data"
 FALKOR_EXPORT="$EXPORT_DIR/fused-memory-data/falkordb"
 FALKOR_DEST="$REPO_ROOT/fused-memory/data/falkordb"
 if [ -d "$FALKOR_EXPORT" ]; then
+  # A new falkordb container boots with appendonly yes and loads ONLY the AOF,
+  # ignoring dump.rdb (task 6330), so with no AOF manifest, or one older than
+  # dump.rdb, the server would come up stale or empty. export-data.sh rewrites
+  # the AOF after its BGSAVE, so a current export's manifest is never older
+  # than its dump.rdb. Judged on the EXPORT before copying: the overlay copy
+  # below keeps any newer manifest the destination already has.
+  FALKOR_EXPORT_MANIFEST="$FALKOR_EXPORT/appendonlydir/appendonly.aof.manifest"
+  if [ -f "$FALKOR_EXPORT/dump.rdb" ] \
+    && { [ ! -f "$FALKOR_EXPORT_MANIFEST" ] || [ "$FALKOR_EXPORT_MANIFEST" -ot "$FALKOR_EXPORT/dump.rdb" ]; }; then
+    fail "FalkorDB: the export's dump.rdb has no AOF manifest at least as new, so a started server would load a stale or empty AOF. NOT importing FalkorDB data (the import stops here). Follow OPERATIONS.md \"Deciding which FalkorDB copy is newest\" with the export's files."
+  fi
   mkdir -p "$FALKOR_DEST"
   cp -a "$FALKOR_EXPORT/." "$FALKOR_DEST/"
   ok "FalkorDB: $(du -sh "$FALKOR_DEST" | cut -f1)"

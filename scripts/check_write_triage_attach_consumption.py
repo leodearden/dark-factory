@@ -242,7 +242,7 @@ def _attach_id_for(module: Any, candidate: Any) -> Any:
     if callable(hoist):
         try:
             resolved = hoist(candidate)
-        except Exception:  # noqa: BLE001 - a changed shape is not fatal
+        except Exception:  # a changed shape is not fatal
             resolved = None
         if isinstance(resolved, str) and resolved:
             return resolved
@@ -369,7 +369,7 @@ def _drive(module: Any, judge: _FakeJudge) -> _Run:
                 'awaitable — nothing here executed the write path',
             )
         decision = asyncio.run(_await(pending))
-    except Exception as exc:  # noqa: BLE001 - attributed to this run, not global
+    except Exception as exc:  # attributed to this run, not global
         return failed(f'triage_write raised: {exc!r}')
     shape_error = _decision_shape_error(decision)
     if shape_error is not None:
@@ -408,7 +408,7 @@ def _make_counter(module: Any) -> tuple[Any, Callable[[], int]]:
             reader = counter.live_count
             if isinstance(reader(), int):
                 return counter, reader
-        except Exception:  # noqa: BLE001 - a changed shape is not fatal
+        except Exception:  # a changed shape is not fatal
             pass
     # Outside the branch above, so an ABSENT class warns too: the fallback
     # changes what was measured, and that has to be said.
@@ -582,7 +582,7 @@ def _judge_decision(module: Any, canonical_id: str) -> Any:
     if cls is not None:
         try:
             return cls(outcome, canonical_id, _CHILD_SCORE, _T_HIGH, _T_LOW)
-        except Exception:  # noqa: BLE001 - a changed shape is not fatal
+        except Exception:  # a changed shape is not fatal
             pass
     return SimpleNamespace(
         outcome=outcome,
