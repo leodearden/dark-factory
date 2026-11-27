@@ -19234,6 +19234,7 @@ class Harness:
                 await asyncio.to_thread(
                     digest_mod.landings_in_window,
                     events_db_path, Path(self.config.project_root), window_start, window_end,
+                    main_ref=self.config.git.main_branch,
                 )
                 if events_db_path is not None
                 else None

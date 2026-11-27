@@ -87,6 +87,19 @@ class TestLandingsInWindow:
         assert digest.landings_in_window(
             scene.runs_db, scene.repo.root, WINDOW_START, WINDOW_END) == 3
 
+    def test_landings_are_read_off_the_named_main_branch(self, tmp_path: Path) -> None:
+        trunk = landing_repo(tmp_path / 'repo', branch='trunk')
+        runs_db = create_runs_db(tmp_path / 'runs.db')
+        conn = sqlite3.connect(runs_db)
+        try:
+            record_merge_done(conn, 'on-trunk', trunk.fast_forward('on trunk'), IN_WINDOW)
+            conn.commit()
+        finally:
+            conn.close()
+        assert digest.landings_in_window(
+            runs_db, trunk.root, WINDOW_START, WINDOW_END, main_ref='trunk') == 1
+        assert digest.landings_in_window(runs_db, trunk.root, WINDOW_START, WINDOW_END) is None
+
     def test_path_form_is_none_for_a_root_that_is_not_a_repository(
         self, scene: Scene, tmp_path: Path,
     ) -> None:

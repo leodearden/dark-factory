@@ -390,17 +390,19 @@ def query_landings_in_window(
     repo: str | os.PathLike[str],
     window_start_iso: str,
     window_end_iso: str,
+    *,
+    main_ref: str = 'main',
 ) -> int:
-    """Count landings on main whose landed_at lies in the inclusive window.
+    """Count landings on *main_ref* whose landed_at lies in the inclusive window.
 
     The landing datum is shared.quality_series.landings.landings (plans/quality-dashboard-prd.md):
-    each train member counts, and a fast-forward counts like a merge commit. *conn* is neither
-    opened nor closed here. sqlite3.Error and landings()'s typed errors propagate;
+    each train member counts, and a fast-forward counts like a merge commit. *main_ref* is the
+    project's configured main branch. *conn* is neither opened nor closed here. sqlite3.Error and landings()'s typed errors propagate;
     landings_in_window is the fail-open form. The call runs a blocking ``git rev-list``, so a
     coroutine calls the path form through ``asyncio.to_thread``.
     """
     start, end = parse_utc(window_start_iso), parse_utc(window_end_iso)
-    batch = landings(conn, repo, since_cursor=None)
+    batch = landings(conn, repo, since_cursor=None, main_ref=main_ref)
     return sum(1 for landing in batch.landings if start <= landing.landed_at <= end)
 
 
@@ -409,11 +411,14 @@ def landings_in_window(
     repo: str | os.PathLike[str],
     window_start_iso: str,
     window_end_iso: str,
+    *,
+    main_ref: str = 'main',
 ) -> int | None:
     """The fail-open form of query_landings_in_window: None, never 0, when it cannot be read."""
     return _query_events_ro(
         events_db, 'landings_in_window', None,
-        lambda conn: query_landings_in_window(conn, repo, window_start_iso, window_end_iso),
+        lambda conn: query_landings_in_window(
+            conn, repo, window_start_iso, window_end_iso, main_ref=main_ref),
     )
 
 

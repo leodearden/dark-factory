@@ -19,7 +19,7 @@ from shared.testing_landing_history import LandingRepo, record_merge_done, recor
 from test_harness_park_stop import _make_harness_with_mocks
 
 import orchestrator.digest as digest
-from orchestrator.config import OrchestratorConfig
+from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore
 from orchestrator.harness import Harness
 
@@ -48,10 +48,13 @@ def _seed(event_store: EventStore | None, repo: LandingRepo | None) -> None:
         conn.close()
 
 
-async def _harness(tmp_path: Path, project_root: Path, cost_store_factory) -> Harness:
+async def _harness(
+    tmp_path: Path, project_root: Path, cost_store_factory, *, main_branch: str = 'main',
+) -> Harness:
     harness, _, _ = _make_harness_with_mocks(tmp_path)
     harness.config = OrchestratorConfig(
         project_root=project_root,
+        git=GitConfig(main_branch=main_branch),
         digest_dir=str(tmp_path / 'digests'),
         digest_every_n_escalations=1,
         digest_ewa_alpha=ALPHA,
@@ -94,6 +97,18 @@ class TestHarnessDigestLandings:
         )
         assert harness._ewa_value == pytest.approx(
             digest.update_ewa(prev, SUBMISSIONS, 1, ALPHA))
+
+    @pytest.mark.asyncio
+    async def test_landings_are_read_off_the_configured_main_branch(
+        self, tmp_path: Path, _cost_store_factory,
+    ) -> None:
+        repo = landing_repo(tmp_path / 'repo', branch='trunk')
+        harness = await _harness(tmp_path, repo.root, _cost_store_factory, main_branch='trunk')
+        _seed(harness.event_store, repo)
+
+        await harness._maybe_write_digest()
+
+        assert _section(_written_digest(tmp_path), '## Landings in window').splitlines()[0] == '3'
 
     @pytest.mark.asyncio
     async def test_landings_are_read_off_the_event_loop_thread(
