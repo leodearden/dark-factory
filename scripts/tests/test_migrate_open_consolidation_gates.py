@@ -563,6 +563,7 @@ class TestExecuteWrites:
         assert resume['arguments']['escalation_id'] == escalation_id
         assert resume['arguments']['action'] == 'resume'
         assert payload['run_id'] in resume['arguments']['resolution']
+        assert 'acknowledge_declared_pins' not in resume['arguments']
 
     def test_tag_only_stamps_the_observed_members_and_leaves_the_canonical(
         self, root, fake, seed_tasks, capsys,
@@ -601,7 +602,7 @@ class TestExecuteWrites:
             auto_predicate_version='1',
             category=CATEGORY,
         )])
-        seed_gate_escalation(root, 83)
+        escalation_id = seed_gate_escalation(root, 83)
 
         code, payload = drive(root, fake, capsys, '--execute', '--claim', f'{TOPIC}={CLAIM}')
 
@@ -614,6 +615,7 @@ class TestExecuteWrites:
         assert stamp['project_root'] == str(root)
         assert set(stamp['metadata']) == {'human_curator_adjudicated_at'}
         assert stamp['metadata_mode'] == 'merge'
+        assert gate['next'][1]['arguments']['acknowledge_declared_pins'] == [escalation_id]
 
     def test_a_closed_gate_with_no_pending_escalation_says_so(
         self, root, fake, seed_tasks, capsys,
