@@ -14,7 +14,7 @@ import time
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Protocol, TypeGuard
 
 from escalation.queue import EscalationQueue
 from shared.project_layout import escalation_queue_dir
@@ -32,6 +32,7 @@ from orchestrator.offline_lane_filing import EvidenceNote
 from orchestrator.offline_lane_records import (
     LEGACY_INFRA_COMMAND,
     LEGACY_NUMERIC_COMMAND,
+    EndedBy,
     LanePass,
     Leg,
     Phase,
@@ -99,6 +100,22 @@ class LaneLeg:
         return self.command if self.lane_command is not None else self.leg.value
 
 
+def never_stopping() -> bool:
+    return False
+
+
+def _killed_by_the_stop(record: RunRecord | None, stopping: Callable[[], bool]) -> TypeGuard[RunRecord]:
+    return record is not None and record.ended_by == EndedBy.SIGNAL and stopping()
+
+
+def _log_killed_by_the_stop(target: LaneLeg, lane_pass: LanePass, record: RunRecord) -> None:
+    logger.info(
+        'offline-lane: %s pass %s: its %s sub-run was ended by a signal (rc %s) while the lane is stopping;'
+        ' the pass has no effect',
+        target.label, lane_pass.pass_id, record.phase, record.returncode,
+    )
+
+
 def _log_sub_run(target: LaneLeg, head: str, returncode: int, duration: float) -> None:
     logger.info(
         'offline-lane: %s sub-run head=%s status=%s ended_by=%s duration=%.1fs',
@@ -153,19 +170,25 @@ async def run_pass(
     engine: PassObserver,
     hooks: Sequence[PassOutcomeHook],
     probe_runner: ProbeSeam = run_probe,
+    stopping: Callable[[], bool] = never_stopping,
 ) -> bool:
     """Run one pass of *target* at *head*; true when its detection was green.
 
     A red detection of a command that declares ``outage_probe`` runs the probe first;
     an outage answer skips the confirm and the hooks.  A red detection that left no run
     record (an injected seam) is handed to *confirm* with no record, which the lane's
-    confirm answers ``Unconfirmable(NO_DETECT_RECORD)``.
+    confirm answers ``Unconfirmable(NO_DETECT_RECORD)``.  A detect or confirm ended by a
+    signal while *stopping* holds is the lane's own stop killing it (PRD
+    ``plans/offline-lane-red-path-prd.md`` D4, section 14 item 25), so the pass has no effect.
     """
     lane_pass = await asyncio.to_thread(store.allocate_pass, target.command, target.leg, head)
     started = time.monotonic()
     returncode, _tail = await detect()
     _log_sub_run(target, head, returncode, time.monotonic() - started)
     detect_record = store.last_record(target.command, Phase.DETECT)
+    if _killed_by_the_stop(detect_record, stopping):
+        _log_killed_by_the_stop(target, lane_pass, detect_record)
+        return False
     outcome: PassOutcome | None = None
     probe: ProbeResult | None = None
     notes: tuple[EvidenceNote, ...] = ()
@@ -177,6 +200,10 @@ async def run_pass(
         else:
             confirm_target = ConfirmTarget(target.leg, worktree, target.lane_command)
             confirmed = await confirm(confirm_target, detect_record, confirm_runner(store, lane_pass))
+            confirm_record = store.last_record(target.command, Phase.CONFIRM)
+            if _killed_by_the_stop(confirm_record, stopping):
+                _log_killed_by_the_stop(target, lane_pass, confirm_record)
+                return False
             notes = await _hook_notes(hooks, target.command, head, confirmed, _run_records(store, target.command))
             outcome = confirmed
     effect = await engine.observe(PassObservation(
