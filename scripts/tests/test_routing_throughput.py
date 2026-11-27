@@ -14,6 +14,7 @@ import routing_throughput
 from routing_throughput import (
     Arm,
     ArmTotals,
+    IntervalSide,
     ThroughputOptions,
     ThroughputUnavailable,
     Unavailable,
@@ -29,6 +30,7 @@ from throughput_cohort_fixtures import (
     Dispatch,
     arm_task_ids,
     build_cohort_root,
+    planted_cohort,
 )
 
 SALT = 'effort-exp-test'
@@ -302,3 +304,94 @@ def test_options_refuse_an_out_of_range_value_naming_it(tmp_path, overrides, nam
 def test_options_refuse_fewer_than_two_buckets(tmp_path):
     with pytest.raises(ValueError, match='buckets'):
         _options(tmp_path, buckets=1, treated_bucket=0)
+
+
+PLANTED_CUT = 0.6
+PLANTED_LOSS = 1 / 0.6
+IDENTICAL_ARMS = 1.0
+
+
+@pytest.fixture
+def planted_root(tmp_path, make_seeding_runs_db):
+    """Factory: a root holding planted_cohort(n_per_arm=40) at *factor*."""
+    def _build(factor: float) -> Path:
+        root = tmp_path / f'df-{factor:.4f}'
+        build_cohort_root(
+            root, make_seeding_runs_db,
+            planted_cohort(SALT, SINCE, n_per_arm=40, treated_cost_factor=factor), git=False,
+        )
+        return root
+
+    return _build
+
+
+def _planted_report(root: Path, **overrides):
+    return throughput_report(_options(root, resamples=2000, seed=20261117, **overrides), SINCE)
+
+
+def test_a_planted_cost_cut_is_an_interval_wholly_above_1(planted_root):
+    report = _planted_report(planted_root(PLANTED_CUT))
+
+    assert report.ratio == pytest.approx(1 / PLANTED_CUT)
+    assert report.interval is not None
+    assert report.interval[0] > 1
+    assert report.interval_side is IntervalSide.ABOVE_1
+
+
+def test_a_planted_cost_rise_is_an_interval_wholly_below_1(planted_root):
+    report = _planted_report(planted_root(PLANTED_LOSS))
+
+    assert report.interval is not None
+    assert report.interval[1] < 1
+    assert report.interval_side is IntervalSide.BELOW_1
+
+
+def test_identical_arms_give_a_ratio_of_exactly_1_inside_an_interval_including_1(planted_root):
+    report = _planted_report(planted_root(IDENTICAL_ARMS))
+
+    assert report.ratio == 1.0
+    assert report.interval is not None
+    low, high = report.interval
+    assert low < 1 < high
+    assert report.interval_side is IntervalSide.INCLUDES_1
+
+
+def test_a_wider_level_gives_a_strictly_wider_interval_containing_the_narrower(planted_root):
+    root = planted_root(IDENTICAL_ARMS)
+
+    narrow = _planted_report(root, interval_level=0.80).interval
+    wide = _planted_report(root, interval_level=0.97).interval
+
+    assert narrow is not None and wide is not None
+    assert wide[0] < narrow[0] < narrow[1] < wide[1]
+
+
+def test_the_a_a_null_is_two_ordered_magnitudes_of_the_ratio(planted_root):
+    report = _planted_report(planted_root(PLANTED_CUT))
+
+    assert report.null is not None
+    p95, p99 = report.null
+    assert 1.0 <= p95 <= p99
+
+
+def test_the_same_options_give_an_identical_report(planted_root):
+    root = planted_root(PLANTED_CUT)
+
+    assert _planted_report(root) == _planted_report(root)
+
+
+def test_an_undefined_ratio_has_no_interval_and_an_undefined_side(tmp_path, make_seeding_runs_db):
+    root = tmp_path / 'df'
+    (treated,), (control,) = arm_task_ids(SALT, 2, 1, 1)
+    build_cohort_root(root, make_seeding_runs_db, [
+        CohortTask(task_id=treated, dispatches=(_treated(_hours(1)),),
+                   invocations=(('implementer', 1.0, _hours(1)),), landed_at=_hours(5)),
+        CohortTask(task_id=control, dispatches=(_control(_hours(1)),),
+                   invocations=(('implementer', 1.0, _hours(1)),)),
+    ], git=False)
+
+    report = throughput_report(_options(root), SINCE)
+
+    assert report.ratio is None
+    assert report.interval is None
+    assert report.interval_side is IntervalSide.UNDEFINED
