@@ -196,6 +196,7 @@ from orchestrator.merge_lane.speculation_controller import (
     SpeculationController,
     fresh_dequeue_offer,
 )
+from orchestrator.merge_lane.tested_tree import TestedTree
 from orchestrator.merge_lane.tip_relation import (
     TipRelation,
     classify_tip_relation,
@@ -6235,6 +6236,7 @@ class SpeculativeMergeWorker:
                 verify_base_divergence=lambda item, main: (
                     self._verify_base_divergence_at_dispatch(item, main)
                 ),
+                live_trees=lambda: self._live_tested_trees(),
             ),
             chain_planning=ChainPlanning(
                 probe_placement=lambda item: self._probe_verify_placement(item),
@@ -15470,6 +15472,10 @@ class SpeculativeMergeWorker:
         rebased_heads = {e.gate.rebased_sha for e in frozen if e.gate is not None}
         rebased_heads |= rebased_head_commits(frozen)
         return stacked_on, rebased_heads
+
+    def _live_tested_trees(self) -> tuple[TestedTree, ...]:
+        """The published tested trees of the frozen prefix, a dispatch's possible bases."""
+        return tuple(e.tree for e in self._frozen_inflight_entries() if e.tree is not None)
 
     async def dispatch_parked_rebased_head(
         self,
