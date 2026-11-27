@@ -39,8 +39,9 @@ from shared.cgroup_stats import (
 from shared.proc_group import unified_cgroup_path
 from shared.verify_scope_tag import parse_verify_scope_unit, scope_tag_for
 
+from orchestrator.config import FusedMemoryConfig, ModuleConfig, OrchestratorConfig
 from orchestrator.scope_launch_handshake import ScopeLaunchHandshake
-from orchestrator.verify import _run_cmd
+from orchestrator.verify import _run_cmd, run_verification
 from orchestrator.verify_command_resources import (
     Capture,
     CommandCapture,
@@ -861,3 +862,48 @@ class TestRunCmdDefaultSpawn:
         _handshake, newline, command = spawn[-1].partition('\n')
         assert newline
         assert command == cmd
+
+
+ALLOCATE_50_MIB = (
+    "python3 -c \"x = b'x' * (50 * 1024 * 1024); print('allocated', len(x))\"; exec true"
+)
+
+
+@pytest.mark.usefixtures('real_user_scopes', 'code_default_config')
+class TestRunVerificationRecordsTheRealScope:
+    """The task's observable signal in miniature: a real scoped verify's written summary."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(60)
+    async def test_the_summary_records_cpu_and_peak_captured_at_exit(
+        self, tmp_path, real_project_slice: RealProjectSlice
+    ):
+        worktree = tmp_path / 'wt'
+        (worktree / '.task').mkdir(parents=True)
+        config = OrchestratorConfig(
+            project_root=worktree,
+            verify_use_cgroup_scope=True,
+            verify_admission_enabled=False,
+            fused_memory=FusedMemoryConfig(project_id=real_project_slice.project_id),
+        )
+        module = ModuleConfig(
+            prefix='pkg',
+            test_command=ALLOCATE_50_MIB,
+            lint_command=None,
+            type_check_command=None,
+        )
+
+        result = await run_verification(
+            worktree, config, module, attempt_id=1, task_id='6355', max_retries=0, role='task'
+        )
+
+        assert result.passed, result.summary
+        summary = json.loads(
+            (worktree / '.task' / 'verify' / 'attempt-1.pkg.summary.json').read_text()
+        )
+        (test,) = [entry for entry in summary['commands'] if entry['label'] == 'test']
+        resources = test['resources']
+        assert resources['capture'] == 'exit', resources['capture_reason']
+        assert resources['cpu_usec'] > 0
+        assert resources['memory_peak_bytes'] >= 50 * MIB
+        assert resources['project'] == real_project_slice.project_id
