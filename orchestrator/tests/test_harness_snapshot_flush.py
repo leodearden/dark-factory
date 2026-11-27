@@ -101,7 +101,9 @@ class TestPauseAndResumeFlush:
         assert view.pause_disagreement is False
 
     @pytest.mark.asyncio
-    async def test_pause_and_resume_record_their_events_before_they_flush(self, tmp_path: Path) -> None:
+    async def test_pause_and_resume_record_their_events_before_they_flush(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
         harness = _harness(_config(tmp_path))
         order: list[str] = []
         event_store = harness.event_store
@@ -117,8 +119,8 @@ class TestPauseAndResumeFlush:
             order.append('flush')
             await flush()
 
-        event_store.emit = recording_emit  # type: ignore[method-assign]
-        harness.scheduler.flush_state_snapshot = recording_flush  # type: ignore[method-assign]
+        monkeypatch.setattr(event_store, 'emit', recording_emit)
+        monkeypatch.setattr(harness.scheduler, 'flush_state_snapshot', recording_flush)
 
         await harness.pause_scheduler(_COST_REASON, PauseClass.COST_CEILING, file_escalation=False)
         await harness.resume_scheduler()
@@ -173,7 +175,7 @@ class TestRestoreFlush:
 class TestRunFlushOrder:
     @pytest.mark.asyncio
     async def test_run_flushes_after_the_restore_and_at_shutdown(
-        self, tmp_path: Path, mock_orch_config: MagicMock,
+        self, tmp_path: Path, mock_orch_config: MagicMock, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         mock_orch_config.fused_memory.project_id = 'test'
         _seed_pause(tmp_path, 'test')
@@ -191,16 +193,18 @@ class TestRunFlushOrder:
         h.git_ops.has_dirty_working_tree = AsyncMock(return_value=None)
         h.git_ops.worktree_base = tmp_path / '.worktrees'
 
-        h._start_escalation_server = AsyncMock()  # type: ignore[method-assign]
-        h._start_merge_worker = AsyncMock()  # type: ignore[method-assign]
-        h._dismiss_stale_escalations = AsyncMock()  # type: ignore[method-assign]
-        h._start_orphan_l0_reaper = MagicMock()  # type: ignore[method-assign]
-        h._start_terminal_status_watcher = MagicMock()  # type: ignore[method-assign]
-        h._tag_task_modules = AsyncMock()  # type: ignore[method-assign]
-        h._recover_crashed_tasks = AsyncMock()  # type: ignore[method-assign]
-        h._reconcile_lane_checkouts = AsyncMock()  # type: ignore[method-assign]
-        h._reconcile_stranded_in_progress = AsyncMock()  # type: ignore[method-assign]
-        h._tag_prd_metadata = AsyncMock()  # type: ignore[method-assign]
+        stubs: tuple[tuple[str, object], ...] = (
+            ('_start_escalation_server', AsyncMock()),
+            ('_start_merge_worker', AsyncMock()),
+            ('_dismiss_stale_escalations', AsyncMock()),
+            ('_tag_task_modules', AsyncMock()),
+            ('_recover_crashed_tasks', AsyncMock()),
+            ('_reconcile_lane_checkouts', AsyncMock()),
+            ('_reconcile_stranded_in_progress', AsyncMock()),
+            ('_tag_prd_metadata', AsyncMock()),
+        )
+        for name, stub in stubs:
+            monkeypatch.setattr(h, name, stub)
 
         h.scheduler = MagicMock()
         h.scheduler.get_tasks = AsyncMock(return_value=[])
