@@ -108,7 +108,6 @@ from orchestrator.config import (  # noqa: E402
     SandboxConfig,
 )
 from orchestrator.merge_lane import worker  # noqa: E402
-from orchestrator.verify_host_roster_file import ROSTER_FILE_ENV  # noqa: E402
 
 # Belt-and-braces direct assignment: defeats any import-order race where
 # orchestrator.merge_lane.worker was imported (by another conftest/plugin) before
@@ -339,7 +338,7 @@ def briefing(tmp_path: Path) -> BriefingAssembler:
     return BriefingAssembler(config)
 
 
-#: Guaranteed-absent roster path; fixed for the same reason as _ABSENT_WARM_LANE_SCRIPT_DIR below.
+#: Guaranteed-absent ORCH_VERIFY_HOSTS_FILE (orchestrator/src/orchestrator/verify_host_roster_file.py::ROSTER_FILE_ENV); fixed like _ABSENT_WARM_LANE_SCRIPT_DIR below.
 _ABSENT_VERIFY_HOSTS_FILE = "/nonexistent/df-verify-hosts.yaml"
 
 
@@ -381,7 +380,7 @@ def _isolate_orch_config(monkeypatch, tmp_path):
     monkeypatch.setenv("ORCH_CONFIG_PATH", str(REPO_ROOT / "dark-factory-orchestrator.yaml"))
     monkeypatch.setenv("ORCH_PROJECT_ROOT", str(tmp_path))
     monkeypatch.setenv("ORCH_VERIFY_RUNNERS", "[]")
-    monkeypatch.setenv(ROSTER_FILE_ENV, _ABSENT_VERIFY_HOSTS_FILE)
+    monkeypatch.setenv("ORCH_VERIFY_HOSTS_FILE", _ABSENT_VERIFY_HOSTS_FILE)
     monkeypatch.setenv("ORCH_VERIFY_HOST_POLICY", "prefer_local")
     monkeypatch.setenv("ORCH_VERIFY_USE_CGROUP_SCOPE", "false")
     monkeypatch.setenv("ORCH_VERIFY_COLD_PREPROVISION_COMMAND", "")
