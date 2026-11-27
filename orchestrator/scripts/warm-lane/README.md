@@ -19,6 +19,11 @@ order:
 3. Neither → a WARNING naming **both** tried paths, and the wrapper's
    existing fail-soft sentinel.
 
+A name listed in `git.warm_lane_df_preferred_scripts` swaps steps 1 and 2, so
+dark-factory's copy is tried first; the both-paths WARNING still names both,
+in that order. See
+`orchestrator/src/orchestrator/config.py::GitConfig.warm_lane_df_preferred_scripts`.
+
 Project-first is PRD decision D3: a project that has invested in its own
 warm-lane tooling keeps it, and dark-factory's copy is the floor rather than
 the ceiling. Resolution is repo-relative (`Path(__file__).resolve().parents[2]

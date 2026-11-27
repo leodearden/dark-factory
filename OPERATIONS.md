@@ -2584,6 +2584,39 @@ adding to it.
 
 ---
 
+## 5b. Warm-lane script resolution
+
+Each warm-lane wrapper in `GitOps` runs the project's `scripts/<name>` if it
+exists, else dark-factory's `orchestrator/scripts/warm-lane/<name>`. The
+order, and the WARNING when neither exists, are described in
+`orchestrator/scripts/warm-lane/README.md` "Resolution order"; the design is
+PRD `plans/warm-lane-infra-repatriation-prd.md` D3.
+
+`git.warm_lane_df_preferred_scripts` reverses the order per script, so a
+project can run dark-factory's copy without deleting its own. It accepts
+`warm-lane-disk-guard.sh` (both the hard and the soft guard),
+`warm-lane-audit.sh`, `warm-lane-gc.sh`, `warm-lane-degenerate-ref-check.sh`
+and `thin-warm-lane.sh`; any other name fails config load. Default `[]`.
+
+```yaml
+git:
+  warm_lane_df_preferred_scripts: [warm-lane-gc.sh]
+```
+
+- **Confirm it.** Every invocation logs the resolved copy at INFO. Grep the
+  orchestrator journal for `resolved warm-lane-gc.sh -> ... (dark-factory)`.
+  If dark-factory's copy is absent, the project copy runs and the line reads
+  `(project)`.
+- **Revert it.** Delete the line and call `mcp__escalation__reload_config`.
+  The knob is green tier: check that `applied` names
+  `git.warm_lane_df_preferred_scripts`. The next wrapper invocation resolves
+  project-first again; a script already running is unaffected.
+- **The systemd sweep is not governed by this knob.** Repointing reify's
+  `reify-warm-lane-gc.service` at dark-factory's sweep (PRD leaf η) also needs
+  `REIFY_WARM_LANE_GC_SEED_SCRIPT` in the unit's environment.
+
+---
+
 ## 6. Config reload vs restart
 
 `mcp__escalation__reload_config` hot-applies an edited
@@ -2644,6 +2677,9 @@ takes no arguments: it always re-reads that process's own
 - `git.merge_park_lock_grace_seconds` (the `advance_main` index-lock
   stand-off budget — re-read per advance, see
   [§"Merge-halt semantics"](#merge-halt-semantics-wip_conflict--unmerged_state))
+- `git.warm_lane_df_preferred_scripts` (warm-lane scripts that resolve
+  dark-factory's copy first — read per wrapper invocation, see
+  [§5b](#5b-warm-lane-script-resolution))
 - The `git.offline_lane_*` leaf tunables
 - `config_key_census.*` (the unknown-key census escape hatch — see
   [§6a](#6a-unknown-config-key-census); green-tier on purpose, so a
