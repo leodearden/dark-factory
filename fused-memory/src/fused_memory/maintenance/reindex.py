@@ -5,10 +5,10 @@ import asyncio
 import logging
 from dataclasses import dataclass
 
-from graphiti_core.embedder import OpenAIEmbedder
 from graphiti_core.embedder.openai import OpenAIEmbedderConfig
 
 from fused_memory.backends.sdk_client_lifecycle import close_wrapped_sdk_clients
+from fused_memory.backends.sdk_request_timeout import bounded_openai_embedder
 from fused_memory.config.env_precedence import warn_if_ambient_base_url_is_overridden
 from fused_memory.maintenance._utils import maintenance_service
 
@@ -155,8 +155,9 @@ async def run_reindex(
     1. Loads FusedMemoryConfig (honouring CONFIG_PATH env var or config_path arg).
     2. Creates and initialises a MemoryService (which owns GraphitiBackend +
        DurableWriteQueue).
-    3. Builds an OpenAIEmbedder with the dimension AND the endpoint
-       (embedder.providers.openai.api_url) from config.
+    3. Builds an OpenAIEmbedder with the dimension, the endpoint
+       (embedder.providers.openai.api_url) and the bounded request attempts
+       (embedder.request_attempts) from config.
     4. Creates a ReindexManager and runs reindex_and_replay().
     5. Closes the embedder and the service in finally blocks.
 
@@ -198,7 +199,7 @@ async def run_reindex(
             # behaviour when no provider block is configured.
             base_url=openai_base_url,
         )
-        embedder = OpenAIEmbedder(config=embedder_config)
+        embedder = bounded_openai_embedder(embedder_config, config.embedder.request_attempts)
         try:
             manager = ReindexManager(
                 backend=service.graphiti,

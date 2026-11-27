@@ -921,16 +921,20 @@ class TaskCurator:
             if cfg.provider == 'openai' and cfg.providers.openai:
                 api_key = cfg.providers.openai.api_key
                 if api_key:
-                    from graphiti_core.embedder import OpenAIEmbedder
                     from graphiti_core.embedder.openai import OpenAIEmbedderConfig
 
-                    self._embedder = OpenAIEmbedder(
-                        config=OpenAIEmbedderConfig(
+                    from fused_memory.backends.sdk_request_timeout import (
+                        bounded_openai_embedder,
+                    )
+
+                    self._embedder = bounded_openai_embedder(
+                        OpenAIEmbedderConfig(
                             api_key=api_key,
                             embedding_model=cfg.model,
                             base_url=cfg.providers.openai.api_url,
                             embedding_dim=cfg.dimensions,
                         ),
+                        cfg.request_attempts,
                     )
             if self._embedder is None:
                 raise RuntimeError(
