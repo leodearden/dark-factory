@@ -4,19 +4,29 @@ PRD ``plans/per-consumer-resource-recording-prd.md`` C4 and leaf 4. The pure
 surface (record, invariants, the reading map, the capture decision) is tested
 over hand-filled capture directories holding kernel-format fixture files.
 The in-scope script (``CommandCapture.wrap``) is run for real, unscoped, against
-a fake cgroup root that mirrors this process's own unified cgroup path.
+a fake cgroup root that mirrors this process's own unified cgroup path. The PRD
+section 7 boundary rows run ``verify.py::_run_cmd`` under real
+``systemd-run --user --scope``, and skip on a host without it.
 """
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import json
+import shutil
 import socket
 import subprocess
 import tempfile
+import uuid
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
+from _fake_systemd_run import fake_systemd_run as fake_systemd_run
+from _fake_systemd_run import recorded_scope_spawns
+from _real_project_slice import RealProjectSlice
+from _real_project_slice import real_project_slice as real_project_slice
 from shared.cgroup_stats import (
     CPU_STAT,
     MEMORY_EVENTS,
@@ -27,8 +37,10 @@ from shared.cgroup_stats import (
     read_cgroup,
 )
 from shared.proc_group import unified_cgroup_path
+from shared.verify_scope_tag import parse_verify_scope_unit, scope_tag_for
 
 from orchestrator.scope_launch_handshake import ScopeLaunchHandshake
+from orchestrator.verify import _run_cmd
 from orchestrator.verify_command_resources import (
     Capture,
     CommandCapture,
@@ -652,3 +664,200 @@ class TestWrapScriptText:
         assert 'line 2:' in bare.stderr
         assert wrapped.stderr == bare.stderr
         assert wrapped.returncode == bare.returncode == 127
+
+
+MIB = 1024 * 1024
+
+
+@pytest.fixture(scope='module')
+def real_user_scopes() -> None:
+    try:
+        probe = subprocess.run(
+            ['systemd-run', '--user', '--scope', '--quiet', '--collect', '/bin/true'],
+            capture_output=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        pytest.skip(f'no working systemd-run --user --scope: {exc}')
+    if probe.returncode != 0:
+        pytest.skip(f'systemd-run --user --scope refused: {probe.stderr!r}')
+
+
+@pytest.fixture
+def inner_unit() -> Iterator[str]:
+    """A unique unit name for a scope the command moves itself into; stopped at teardown."""
+    unit = f'df6355reloc{uuid.uuid4().hex[:10]}.scope'
+    yield unit
+    with contextlib.suppress(Exception):
+        subprocess.run(['systemctl', '--user', 'stop', unit], capture_output=True, timeout=15)
+
+
+async def _scoped(
+    cmd: str,
+    tmp_path: Path,
+    slice_name: str,
+    *,
+    timeout: float = 60,
+    capture: CommandCapture | None = None,
+) -> tuple[int, str, bool]:
+    return await _run_cmd(
+        cmd,
+        tmp_path,
+        timeout=timeout,
+        use_cgroup_scope=True,
+        scope_tag=scope_tag_for(tmp_path),
+        slice_name=slice_name,
+        capture=capture,
+    )
+
+
+def _relocating(unit: str, seconds: int) -> str:
+    return f'systemd-run --user --scope --quiet --collect --unit={unit} sleep {seconds}; true'
+
+
+ALLOCATE_200_MIB = (
+    "python3 -c \"x = b'x' * (200 * 1024 * 1024); print('allocated', len(x))\"; exec true"
+)
+
+
+@pytest.mark.usefixtures('real_user_scopes')
+class TestRunCmdCapturesInItsRealScope:
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(60)
+    async def test_capture_at_exit(self, tmp_path, real_project_slice: RealProjectSlice):
+        with allocate_command_capture() as capture:
+            captured = await _scoped(
+                ALLOCATE_200_MIB, tmp_path, real_project_slice.slice_name, capture=capture
+            )
+            record = capture.record(**IDENTITY)
+        bare = await _scoped(ALLOCATE_200_MIB, tmp_path, real_project_slice.slice_name)
+
+        assert captured == bare
+        assert captured[0] == 0
+        assert record.capture is Capture.EXIT, record.capture_reason
+        assert record.memory_peak_bytes is not None
+        assert record.memory_peak_bytes >= 200 * MIB
+        assert record.cpu_usec is not None
+        assert record.cpu_usec > 0
+        assert record.scope_unit is not None
+        assert parse_verify_scope_unit(record.scope_unit) is not None
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(60)
+    async def test_capture_at_exit_keeps_a_failing_rc(
+        self, tmp_path, real_project_slice: RealProjectSlice
+    ):
+        with allocate_command_capture() as capture:
+            rc, _output, timed_out = await _scoped(
+                'echo failing; exit 3', tmp_path, real_project_slice.slice_name, capture=capture
+            )
+            record = capture.record(**IDENTITY)
+
+        assert (rc, timed_out) == (3, False)
+        assert record.capture is Capture.EXIT, record.capture_reason
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(60)
+    async def test_capture_on_timeout_is_read_before_the_kill(
+        self, tmp_path, real_project_slice: RealProjectSlice
+    ):
+        with allocate_command_capture() as capture:
+            _rc, _output, timed_out = await _scoped(
+                'sleep 30', tmp_path, real_project_slice.slice_name, timeout=1, capture=capture
+            )
+            record = capture.record(**IDENTITY)
+
+        assert timed_out is True
+        assert record.capture is Capture.BEFORE_KILL, record.capture_reason
+        assert record.cpu_usec is not None
+        assert record.memory_peak_bytes is not None
+        assert record.memory_peak_bytes > 0
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(60)
+    async def test_a_relocating_command_that_exits_reads_relocated(
+        self, tmp_path, inner_unit, real_project_slice: RealProjectSlice
+    ):
+        with allocate_command_capture() as capture:
+            rc, _output, _ = await _scoped(
+                _relocating(inner_unit, 4),
+                tmp_path,
+                real_project_slice.slice_name,
+                capture=capture,
+            )
+            record = capture.record(**IDENTITY)
+
+        assert rc == 0
+        assert record.capture is Capture.RELOCATED, record.capture_reason
+        assert inner_unit in record.relocated_scopes
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(60)
+    async def test_a_relocating_command_that_is_killed_reads_relocated(
+        self, tmp_path, inner_unit, real_project_slice: RealProjectSlice
+    ):
+        with allocate_command_capture() as capture:
+            _rc, _output, timed_out = await _scoped(
+                _relocating(inner_unit, 30),
+                tmp_path,
+                real_project_slice.slice_name,
+                timeout=3,
+                capture=capture,
+            )
+            record = capture.record(**IDENTITY)
+
+        assert timed_out is True
+        assert record.capture is Capture.RELOCATED, record.capture_reason
+        assert inner_unit in record.relocated_scopes
+
+
+class TestRunCmdWithoutAScope:
+    @pytest.mark.asyncio
+    async def test_scope_off_runs_unchanged_and_reads_unavailable(self, tmp_path):
+        cmd = 'echo out; echo err >&2; exit 4'
+        with allocate_command_capture() as capture:
+            captured = await _run_cmd(cmd, tmp_path, timeout=30, capture=capture)
+            record = capture.record(**IDENTITY)
+        bare = await _run_cmd(cmd, tmp_path, timeout=30)
+
+        assert captured == bare
+        assert record.capture is Capture.UNAVAILABLE
+        assert 'no cgroup scope' in record.capture_reason
+
+    @pytest.mark.asyncio
+    async def test_no_systemd_run_runs_unchanged_and_reads_unavailable(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(shutil, 'which', lambda _name: None)
+        cmd = 'echo out; exit 2'
+        with allocate_command_capture() as capture:
+            captured = await _run_cmd(
+                cmd,
+                tmp_path,
+                timeout=30,
+                use_cgroup_scope=True,
+                scope_tag=scope_tag_for(tmp_path),
+                capture=capture,
+            )
+            record = capture.record(**IDENTITY)
+        bare = await _run_cmd(cmd, tmp_path, timeout=30)
+
+        assert captured == bare
+        assert record.capture is Capture.UNAVAILABLE
+        assert 'no cgroup scope' in record.capture_reason
+
+
+class TestRunCmdDefaultSpawn:
+    @pytest.mark.asyncio
+    async def test_no_capture_spawns_the_bare_payload(self, tmp_path, fake_systemd_run):
+        cmd = 'echo hello; exit 0'
+
+        rc, output, _ = await _run_cmd(
+            cmd, tmp_path, timeout=30, use_cgroup_scope=True, scope_tag=scope_tag_for(tmp_path)
+        )
+
+        assert (rc, output) == (0, 'hello\n')
+        (spawn,) = recorded_scope_spawns(fake_systemd_run)
+        _handshake, newline, command = spawn[-1].partition('\n')
+        assert newline
+        assert command == cmd
