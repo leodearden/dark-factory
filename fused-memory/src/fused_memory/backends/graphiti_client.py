@@ -241,7 +241,7 @@ def build_llm_client(
     """
     llm_client = _construct_llm_client(cfg, http_client=http_client)
     if llm_client is not None:
-        llm_client.token_tracker = AttributingTokenUsageTracker()
+        llm_client.token_tracker = AttributingTokenUsageTracker(model=cfg.llm.model)
     return llm_client
 
 

@@ -2715,6 +2715,7 @@ class MemoryService:
                     error=f'{type(e).__name__}: {e}',
                     duration_ms=_elapsed_ms_since(started),
                     llm_tokens=measurement.usage,
+                    llm_tokens_by_model=measurement.by_model,
                 )
             raise
         duration_ms = _elapsed_ms_since(started)
@@ -2731,6 +2732,7 @@ class MemoryService:
                 success=True,
                 duration_ms=duration_ms,
                 llm_tokens=measurement.usage,
+                llm_tokens_by_model=measurement.by_model,
             )
         return result
 
