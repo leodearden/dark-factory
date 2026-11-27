@@ -2082,6 +2082,103 @@ class TestHumanCuratorGateAdjudicationGuard:
         )
 
 
+async def _headerless_resolve(queue: EscalationQueue, escalation_id: str, **kwargs) -> dict:
+    """Close *escalation_id* through the real ``resolve_issue`` tool, header-less."""
+    from escalation.server import create_server
+    from fastmcp.tools.function_tool import FunctionTool
+
+    tool = await create_server(queue, startup_sweep=False).get_tool('resolve_issue')
+    assert isinstance(tool, FunctionTool)
+    return tool.fn(escalation_id=escalation_id, resolution_class='actionable', **kwargs)
+
+
+async def _file_first_gate(queue: EscalationQueue, task: dict) -> Escalation:
+    from orchestrator.deterministic_runner import DeterministicRunner
+
+    runner = DeterministicRunner(scheduler=_mock_scheduler(task), escalation_queue=queue)
+    await runner.run(_make_assignment(task))
+    (filed,) = queue.get_by_task(str(task['id']), status='pending')
+    return filed
+
+
+_WATCHER_RESUME = {
+    'action': 'resume',
+    'resolved_by': 'escalation-watcher',
+    'resolution': (
+        'Answered the fact question. RECOMMENDED REMEDIATION (curator action, '
+        'deliberately NOT executed here).'
+    ),
+}
+
+
+@pytest.mark.asyncio
+class TestCuratorGateEscalationIsPinned:
+    """Task 3346: a curator gate's escalation is filed with a declared pin.
+
+    Replays esc-3181-1, which a header-less ``escalation-watcher`` resume
+    closed although its own text said the curator content work was not done.
+    """
+
+    async def test_watcher_resume_of_an_unadjudicated_curator_gate_is_refused(
+        self, tmp_path: Path,
+    ):
+        queue = EscalationQueue(tmp_path)
+        filed = await _file_first_gate(queue, _curator_gate_task(task_id='3181'))
+
+        result = await _headerless_resolve(queue, filed.id, **_WATCHER_RESUME)
+
+        assert result['code'] == 'declared_pin_refused'
+        (pin,) = result['declared_pins']
+        assert pin['escalation_id'] == filed.id
+        assert pin['declared_by'] == ['task-3181-human-curator-gate']
+        assert [e.id for e in queue.get_by_task('3181', status='pending')] == [filed.id]
+
+    async def test_a_named_acknowledgement_closes_the_curator_gate(self, tmp_path: Path):
+        queue = EscalationQueue(tmp_path)
+        filed = await _file_first_gate(queue, _curator_gate_task(task_id='3181'))
+
+        result = await _headerless_resolve(
+            queue, filed.id, acknowledge_declared_pins=[filed.id], **_WATCHER_RESUME,
+        )
+
+        assert 'error' not in result, result
+        assert queue.get_by_task('3181', status='pending') == []
+
+    async def test_plain_pure_gate_is_not_pinned_and_resumes_unacknowledged(
+        self, tmp_path: Path,
+    ):
+        queue = EscalationQueue(tmp_path)
+        filed = await _file_first_gate(queue, _gate_task(task_id='99'))
+        assert filed.pin_declared_by == []
+        assert filed.pin_declared_reason == ''
+
+        result = await _headerless_resolve(queue, filed.id, **_WATCHER_RESUME)
+
+        assert 'error' not in result, result
+        assert queue.get_by_task('99', status='pending') == []
+
+    async def test_curator_adjudication_missing_reask_is_pinned_and_refuses_a_resume(
+        self, tmp_path: Path,
+    ):
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        task = _curator_gate_task(
+            task_id='3181', gate_escalated_at='2026-07-30T16:30:28.993178+00:00',
+        )
+        queue = EscalationQueue(tmp_path)
+        _seed_resolved_gate(queue, '3181')
+        runner = DeterministicRunner(scheduler=_mock_scheduler(task), escalation_queue=queue)
+        await runner.run(_make_assignment(task))
+        (reask,) = queue.get_by_task('3181', status='pending')
+        assert reask.category == 'curator_adjudication_missing'
+        assert reask.pin_declared_by == ['task-3181-human-curator-gate']
+
+        result = await _headerless_resolve(queue, reask.id, **_WATCHER_RESUME)
+
+        assert result['code'] == 'declared_pin_refused'
+        assert [e.id for e in queue.get_by_task('3181', status='pending')] == [reask.id]
+
+
 # ---------------------------------------------------------------------------
 # Step-1: cross-unit deploy success (B6)
 # (RED until step-2 adds the before_done execution path)
