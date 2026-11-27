@@ -39,7 +39,7 @@ from orchestrator.agents.invoke import AgentResult
 from orchestrator.agents.roles import ARCHITECT, IMPLEMENTER, AgentRole
 from orchestrator.config import OrchestratorConfig, PriceEntry, RoutingRule, RuleMatch, RuleSet
 from orchestrator.event_store import EventStore, EventType
-from orchestrator.routing import PlanShape, RoutingDecision
+from orchestrator.routing import DispatchedRoute, PlanShape, RoutingDecision
 from orchestrator.workflow import TaskWorkflow
 from orchestrator.workflow_types import WorkflowState
 
@@ -66,7 +66,7 @@ _RUST_RULE = RoutingRule(
 
 def _make_workflow(
     *,
-    event_store: _RecordingEventStore | EventStore,
+    event_store: _RecordingEventStore | EventStore | None,
     cost_store: MagicMock | None = None,
 ) -> TaskWorkflow:
     """Minimal TaskWorkflow instance for ``_invoke`` routing-decision tests.
@@ -166,19 +166,22 @@ def _routing_decision_entries(rec: _RecordingEventStore) -> list[dict]:
 
 async def _invoke_role(
     wf: TaskWorkflow, role: AgentRole, cwd: Path, *, prompt: str = 'x',
+    result: AgentResult | None = None,
 ) -> None:
     with (
         patch(
             'orchestrator.workflow.invoke_with_cap_retry',
-            new=AsyncMock(return_value=_stub_agent_result()),
+            new=AsyncMock(return_value=result or _stub_agent_result()),
         ),
         patch.object(wf, '_build_agent_env', return_value=None),
     ):
         await wf._invoke(role, build_prompt=fixed_prompt(prompt), cwd=cwd)
 
 
-async def _invoke_implementer(wf: TaskWorkflow, cwd: Path, *, prompt: str = 'x') -> None:
-    await _invoke_role(wf, IMPLEMENTER, cwd, prompt=prompt)
+async def _invoke_implementer(
+    wf: TaskWorkflow, cwd: Path, *, prompt: str = 'x', result: AgentResult | None = None,
+) -> None:
+    await _invoke_role(wf, IMPLEMENTER, cwd, prompt=prompt, result=result)
 
 
 @pytest.mark.asyncio
@@ -219,6 +222,65 @@ class TestInvokeRecordsRoutingDecisionEvent:
         assert data['model'] == 'opus'
         assert data['source_layer'] == 'policy_rule'
         assert data['rule_id'] == 'rust-large-plan-implementer'
+
+
+def _served_result(model_id: str | None) -> AgentResult:
+    return AgentResult(
+        success=True, output='ok', turns=3, cost_usd=1.0, duration_ms=1_000, model_id=model_id,
+    )
+
+
+@pytest.mark.asyncio
+class TestInvokeRecordsDispatchedRoute:
+    """``_invoke`` records each returned invocation's route on WorkflowMetrics,
+    with no event store (eval cells run without one, task 8499)."""
+
+    async def test_config_route_and_served_model_are_recorded(self, tmp_path: Path) -> None:
+        wf = _make_workflow(event_store=None)
+
+        await _invoke_implementer(wf, tmp_path, result=_served_result('claude-sonnet-5-5'))
+
+        [route] = wf.metrics.dispatched_routes
+        assert isinstance(route, DispatchedRoute)
+        assert route.role_name == 'implementer'
+        assert route.decision.model == 'sonnet'
+        assert route.decision.source_layer == 'config'
+        assert route.decision.rule_id is None
+        assert route.served_model_id == 'claude-sonnet-5-5'
+
+    async def test_record_carries_the_policy_rule_decision_dispatched(
+        self, tmp_path: Path,
+    ) -> None:
+        wf = _make_workflow(event_store=None)
+        wf.modules = ['crates/a', 'crates/b', 'crates/c']
+        wf.plan = {'steps': [{}] * 12}
+
+        await _invoke_implementer(wf, tmp_path, result=_served_result('claude-opus-5-5'))
+
+        [route] = wf.metrics.dispatched_routes
+        assert route.decision.model == 'opus'
+        assert route.decision.source_layer == 'policy_rule'
+        assert route.decision.rule_id == 'rust-large-plan-implementer'
+
+    async def test_invocations_append_in_call_order(self, tmp_path: Path) -> None:
+        wf = _make_workflow(event_store=None)
+
+        await _invoke_implementer(wf, tmp_path, result=_served_result('claude-sonnet-5-5'))
+        await _invoke_role(wf, ARCHITECT, tmp_path, result=_served_result('claude-opus-5-5'))
+
+        assert [(r.role_name, r.decision.model, r.served_model_id)
+                for r in wf.metrics.dispatched_routes] == [
+            ('implementer', 'sonnet', 'claude-sonnet-5-5'),
+            ('architect', 'opus', 'claude-opus-5-5'),
+        ]
+
+    async def test_unreported_served_model_records_none(self, tmp_path: Path) -> None:
+        wf = _make_workflow(event_store=None)
+
+        await _invoke_implementer(wf, tmp_path, result=_served_result(None))
+
+        [route] = wf.metrics.dispatched_routes
+        assert route.served_model_id is None
 
 
 @pytest.mark.asyncio
