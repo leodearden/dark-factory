@@ -5469,11 +5469,20 @@ class VerifyResult:
         self.cache_mode = CacheMode(self.cache_mode)
         if self.narrow_gate is not None:
             self.narrow_gate = MergeGateResolution(self.narrow_gate)
+            if not self.narrow_gate.is_narrow:
+                raise ValueError(
+                    f'VerifyResult.narrow_gate must be None or a narrow resolution, got {self.narrow_gate.value!r}',
+                )
+
+    @property
+    def ran_narrow_gate(self) -> bool:
+        """Whether this verdict ran only a narrow gate's command set (docs/narrow-merge-gate.md)."""
+        return self.narrow_gate is not None and self.narrow_gate.is_narrow
 
     @property
     def is_whole_tree_evidence(self) -> bool:
         """Whether this verdict ran a gate over the whole tree: not a trivial pass, nor a narrow gate's."""
-        return not self.trivial and self.narrow_gate is None
+        return not self.trivial and not self.ran_narrow_gate
 
     @property
     def plan_hash(self) -> str | None:
@@ -9881,9 +9890,7 @@ async def _run_narrow_gate(
     plan_dict = decision.plan.to_dict()
     persist(plan_dict)
     result = await execute(decision.plan, scoped)
-    result.plan = plan_dict
-    result.narrow_gate = decision.resolution
-    return result
+    return replace(result, plan=plan_dict, narrow_gate=decision.resolution)
 
 
 async def run_scoped_verification(

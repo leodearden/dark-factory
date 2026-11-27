@@ -990,7 +990,7 @@ class LocalRunner:
             )
             if not scoped.passed:
                 return scoped
-        if scoped.narrow_gate is not None:
+        if scoped.ran_narrow_gate:
             return scoped
 
         gate = await self._run_unscoped(
