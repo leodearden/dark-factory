@@ -296,6 +296,10 @@ def _measured(
     )
 
 
+def _runs_nothing(cmd: str) -> bool:
+    return all(not line.strip() or line.lstrip().startswith('#') for line in cmd.splitlines())
+
+
 def _read_directory(directory: Path) -> CgroupReading | _Gap:
     """Read the C4 files of *directory*: the capture copy and the live scope alike.
 
@@ -346,9 +350,11 @@ class CommandCapture:
         copy. *cmd* starts on the script's first line, so bash's error messages
         for it keep their line numbers. The script starts nothing but ``cat``. Its own
         shell writes nothing to the output, not even a report of *cmd*'s death
-        by a signal, while *cmd* keeps its own stderr.
+        by a signal, while *cmd* keeps its own stderr. A *cmd* with nothing to
+        run, only blank or comment lines, is returned unchanged: bash refuses
+        an empty subshell, and there is nothing to measure.
         """
-        if self.directory is None:
+        if self.directory is None or _runs_nothing(cmd):
             return cmd
         directory = shlex.quote(str(self.directory))
         source = shlex.quote(str(self._cgroup_root)) + '"${__df_cg#0::}/$__df_f"'

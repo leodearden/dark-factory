@@ -743,6 +743,24 @@ class TestWrapRunsTheCommandUnchanged:
         assert _outcome(wrapped) == _outcome(bare)
         assert launcher_exited_before_exec is False
 
+    @pytest.mark.parametrize('cmd', ['', '   ', '# only a comment', '# one\n\n  # two\n'])
+    def test_a_command_with_nothing_to_run_runs_as_bare(self, tmp_path, cmd):
+        capture = _FakeScope(tmp_path).capture(tmp_path)
+
+        wrapped, _ = _run_payload(capture.wrap(cmd))
+        bare, _ = _run_payload(cmd)
+
+        assert _outcome(wrapped) == _outcome(bare) == (0, '', '')
+        assert capture.record(**IDENTITY).capture is Capture.UNAVAILABLE
+
+    def test_a_comment_after_a_command_is_still_wrapped(self, tmp_path):
+        capture = _FakeScope(tmp_path).capture(tmp_path)
+
+        wrapped, _ = _run_payload(capture.wrap('# setup\necho hi  # greet'))
+
+        assert _outcome(wrapped) == (0, 'hi\n', '')
+        assert capture.record(**IDENTITY).capture is Capture.EXIT
+
     @pytest.mark.parametrize(
         ('cmd', 'signal_number'),
         [
