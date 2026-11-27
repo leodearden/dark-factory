@@ -163,13 +163,15 @@ def test_gates_per_landing_is_unmeasured_without_a_landing():
     assert canary.gates_per_landing([ev(5, 'a', reverify=True)], ()) is None
 
 
-def test_voids_per_landing_splits_dispatch_from_adoption_voids():
-    voided = [ev(1, 'a', point='dispatch'), ev(2, 'b', point='dispatch'), ev(3, 'c', point='adoption')]
+def test_voids_per_landing_counts_only_voids_after_a_host_was_acquired():
+    voided = [
+        ev(1, 'a', point='dispatch'), ev(2, 'b', point='dispatch'), ev(3, 'c', point='adoption'), ev(4, 'd'),
+    ]
 
     tally = canary.voids_per_landing(voided, two_landings())
 
-    assert (tally.total, tally.before_host, tally.at_adoption) == (3, 2, 1)
-    assert tally.per_landing == 1.5
+    assert (tally.total, tally.before_host, tally.at_adoption, tally.after_host) == (4, 2, 1, 2)
+    assert tally.per_landing == 1.0
 
 
 def test_voids_per_landing_is_unmeasured_without_a_landing():
@@ -287,6 +289,37 @@ def test_host_verify_hours_is_the_clipped_union_of_one_hosts_intervals():
 def test_union_busy_hours_counts_two_hosts_verifying_at_once_once():
     verify = [completed(120, 'local', 60), completed(150, 'laptop', 60)]
     assert canary.union_busy_hours(verify, at(0), at(600)) == pytest.approx(1.5)
+
+
+def test_verify_hours_per_landing_sums_every_hosts_completed_and_cancelled_time():
+    verify = [
+        completed(120, 'local', 60),    # [60, 120]
+        completed(150, 'laptop', 60),   # [90, 150], overlaps: a union would be 1.5 h
+    ]
+    cancelled = [cancelled_verify(200, 'laptop', 30)]
+
+    result = canary.verify_hours_per_landing(verify, cancelled, two_landings())
+
+    assert result.completed == pytest.approx(2.0)
+    assert result.cancelled == pytest.approx(0.5)
+    assert result.total == pytest.approx(2.5)
+    assert result.n_missing == 0
+    assert result.per_landing == pytest.approx(1.25)
+
+
+def test_a_verify_row_without_a_duration_is_counted_and_leaves_hours_per_landing_unmeasured():
+    verify = [completed(120, 'local', 60), ev(160, 'x', runner='local')]
+    cancelled = [cancelled_verify(200, 'laptop', 30), ev(210, 'c', host='laptop', cause='void')]
+
+    result = canary.verify_hours_per_landing(verify, cancelled, two_landings())
+
+    assert (result.completed, result.cancelled) == (pytest.approx(1.0), pytest.approx(0.5))
+    assert result.n_missing == 2
+    assert result.per_landing is None
+
+
+def test_verify_hours_per_landing_is_unmeasured_without_a_landing():
+    assert canary.verify_hours_per_landing([completed(120, 'local', 60)], [], ()).per_landing is None
 
 
 def test_queue_to_land_is_the_median_of_done_landings_in_hours():
@@ -640,7 +673,7 @@ def test_chain_attributed_episodes_need_a_chain_landing_in_the_candidate_range()
 D12_KEYS = (
     'gates_per_landing', 'voids_per_landing', 'p_gate_after_gate', 'laptop_finished_share',
     'frozen_tip_violations', 'speculation_accounting_violations', 'chain_attributed_red_main',
-    'queue_to_land_p50_hours', 'local_verify_hours_per_week', 'deep_chain_p90_secs',
+    'queue_to_land_p50_hours', 'verify_hours_per_landing', 'deep_chain_p90_secs',
 )
 
 
@@ -649,7 +682,7 @@ def healthy_figures(**overrides: Any) -> canary.CanaryFigures:
         'gates_per_landing': 0.2, 'voids_per_landing': 0.05, 'p_gate_after_gate': 0.1,
         'laptop_finished_share': 0.05, 'frozen_tip_violations': 0,
         'speculation_accounting_violations': 0, 'chain_attributed_red_main': 0,
-        'queue_to_land_p50_hours': 0.5, 'local_verify_hours_per_week': 40.0,
+        'queue_to_land_p50_hours': 0.5, 'verify_hours_per_landing': 0.5,
         'deep_chain_p90_secs': 10800.0,
     }
     return canary.CanaryFigures(**{**values, **overrides})
@@ -659,7 +692,7 @@ def test_evaluate_returns_the_ten_d12_rows_in_order_with_their_values():
     rows = canary.evaluate(healthy_figures())
 
     assert tuple(row.key for row in rows) == D12_KEYS
-    assert [row.value for row in rows] == [0.2, 0.05, 0.1, 0.05, 0, 0, 0, 0.5, 40.0, 10800.0]
+    assert [row.value for row in rows] == [0.2, 0.05, 0.1, 0.05, 0, 0, 0, 0.5, 0.5, 10800.0]
     assert all(row.holds for row in rows)
     assert all(row.rule and row.label for row in rows)
 
@@ -670,14 +703,14 @@ def test_evaluate_carries_each_limit_comparison_and_baseline():
 
     assert {key: (row.limit, row.comparison, row.baseline) for key, row in by_key.items()} == {
         'gates_per_landing': (0.3, lt, '0.84'),
-        'voids_per_landing': (0.1, lt, '0.78'),
+        'voids_per_landing': (0.1, lt, '0.78 (all voids)'),
         'p_gate_after_gate': (0.3, lt, '0.79'),
         'laptop_finished_share': (0.1, lt, '33%'),
         'frozen_tip_violations': (0, eq0, '—'),
         'speculation_accounting_violations': (0, eq0, '—'),
         'chain_attributed_red_main': (0, eq0, '—'),
         'queue_to_land_p50_hours': (1.0, lt, '5.4 h'),
-        'local_verify_hours_per_week': (60.0, lt, '~100 h'),
+        'verify_hours_per_landing': (0.75, lt, '0.83–1.24 h (weekly, 10-22..11-12)'),
         'deep_chain_p90_secs': (10800.0, le, '—'),
     }
 

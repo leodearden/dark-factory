@@ -182,6 +182,12 @@ def test_the_readout_values_follow_the_fixture(project, tmp_path):
     text = out.read_text(encoding='utf-8')
 
     assert '| gates per landing | 1 | < 0.3 | FALSE |' in text
+    assert '| voids per landing | 0 | < 0.1 | holds |' in text
+    assert 'discarded before a host (point dispatch, not counted): 1' in text
+    assert '| merge-verify hours per landing | 0.6667 | < 0.75 | holds |' in text
+    assert ('- merge-verify host-hours, all hosts: 0.5 h completed + 0.1667 h cancelled = 0.6667 h; '
+            'per landing: 0.6667 h (a sum over hosts, not a union; rows without a duration: 0)') in text
+    assert not any(line.startswith('| local merge-verify hours / week |') for line in text.splitlines())
     assert '| chain-attributed red-main episodes | 1 | = 0 | FALSE |' in text
     assert '| speculation accounting violations | 0 | = 0 | holds |' in text
     assert f'first red {shas["f2"][:12]}' in text

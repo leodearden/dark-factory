@@ -328,6 +328,7 @@ class Readout:
     voids: canary.VoidTally
     conditionals: canary.GateConditionals
     local_hours: canary.HostHours
+    summed_verify_hours: canary.SummedVerifyHours
     union_busy_hours: float
     queue: canary.QueueToLand
     chain_items: dict[int, int]
@@ -364,10 +365,12 @@ def compute(
     accounting = canary.accounting_violations(journal.audits)
     conditionals = canary.gate_conditionals(ledger, events.gates, events.queued_lookback)
     local_hours = canary.host_verify_hours(events.verify_lookback, events.cancelled, lo, hi, host=hosts.local)
+    summed_verify_hours = canary.verify_hours_per_landing(events.verify, events.cancelled, ledger)
     queue = canary.queue_to_land(events.finalized)
+    voids = canary.voids_per_landing(events.voided, ledger)
     figures = canary.CanaryFigures(
         gates_per_landing=canary.gates_per_landing(events.gates, ledger),
-        voids_per_landing=canary.voids_per_landing(events.voided, ledger).per_landing,
+        voids_per_landing=voids.per_landing,
         p_gate_after_gate=conditionals.p_gate_after_gate,
         laptop_finished_share=canary.host_finished_share(events.heartbeats, hi, host=hosts.laptop),
         frozen_tip_violations=len(frozen.violations),
@@ -377,13 +380,13 @@ def compute(
             [row.merge_sha for row in lookback_ledger if row.via_chain and row.merge_sha is not None],
         ),
         queue_to_land_p50_hours=queue.p50_hours,
-        local_verify_hours_per_week=local_hours.per_week,
+        verify_hours_per_landing=summed_verify_hours.per_landing,
         deep_chain_p90_secs=canary.deep_chain_p90_secs(events.verify),
     )
     return Readout(
         lo=lo, hi=hi, sources=sources, ledger=ledger, predicates=canary.evaluate(figures),
-        voids=canary.voids_per_landing(events.voided, ledger), conditionals=conditionals,
-        local_hours=local_hours, union_busy_hours=canary.union_busy_hours(events.verify_lookback, lo, hi),
+        voids=voids, conditionals=conditionals, local_hours=local_hours, summed_verify_hours=summed_verify_hours,
+        union_busy_hours=canary.union_busy_hours(events.verify_lookback, lo, hi),
         queue=queue, chain_items=canary.chain_items_distribution(events.verify),
         depth_reasons=canary.depth_reason_tally(events.verify), starved=canary.depth_starved(events.verify),
         solos=canary.post_red_chain_solos(events.verify_lookback, events.finalized_lookback, lo, hi),
@@ -430,13 +433,18 @@ def _predicate_table(rows: Sequence[canary.Predicate]) -> list[str]:
 
 
 def _landings_section(r: Readout) -> list[str]:
+    v = r.summed_verify_hours
     return [
         '## Landings and lane hours', '',
         f'- landings: {len(r.ledger)} (merge_finalized done ∪ train_merged members); '
         f'landed via a chain: {sum(row.via_chain for row in r.ledger)}',
+        f'- merge-verify host-hours, all hosts: {_num(v.completed)} h completed + {_num(v.cancelled)} h '
+        f'cancelled = {_num(v.total)} h; per landing: {_num(v.per_landing)} h (a sum over hosts, not a union; '
+        f'rows without a duration: {v.n_missing})',
         f'- local merge-verify hours: {_num(r.local_hours.hours)} h in the window, '
-        f'{_num(r.local_hours.per_week)} h/week (union of completed and cancelled intervals)',
-        f'- union-busy hours, all hosts: {_num(r.union_busy_hours)} h (union of completed merge-verify intervals)',
+        f'{_num(r.local_hours.per_week)} h/week (union of completed and cancelled intervals) (information only)',
+        f'- union-busy hours, all hosts: {_num(r.union_busy_hours)} h (union of completed merge-verify '
+        'intervals) (information only)',
         f'- median queue-to-land: {_num(r.queue.p50_hours)} h over {r.queue.n} landings '
         f'({r.queue.n_missing} without queue_to_land_secs)',
     ]
@@ -446,8 +454,9 @@ def _voids_section(r: Readout) -> list[str]:
     c = r.conditionals
     return [
         '## Voids', '',
-        f'- verdict_voided rows: {r.voids.total}; before a host (point dispatch): {r.voids.before_host}; '
-        f'at adoption: {r.voids.at_adoption}; per landing: {_num(r.voids.per_landing)}',
+        f'- verdict_voided rows: {r.voids.total}; discarded before a host (point dispatch, not counted): '
+        f'{r.voids.before_host}; after a host was acquired: {r.voids.after_host} '
+        f'(at adoption: {r.voids.at_adoption}); per landing, after a host only: {_num(r.voids.per_landing)}',
         f'- gated landings: {sum(c.gated)} of {len(c.gated)}; P(gate after a gated landing): '
         f'{_num(c.p_gate_after_gate)}; P(gate after an ungated landing): {_num(c.p_gate_after_ungated)}',
     ]

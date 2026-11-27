@@ -229,17 +229,24 @@ class VoidTally:
     total: int
     before_host: int
     at_adoption: int
+    after_host: int
     per_landing: float | None
 
 
 def voids_per_landing(voided: Sequence[Event], ledger: Sequence[Landing]) -> VoidTally:
-    """``verdict_voided`` rows per landing; point dispatch voids were discarded before a host."""
+    """``verdict_voided`` rows not discarded at point dispatch (after a verify host was acquired) per landing.
+
+    ``total`` and the dispatch count ``before_host`` are kept as information.
+    """
     points = [_data(e).get('point') for e in voided]
+    before_host = points.count('dispatch')
+    after_host = len(points) - before_host
     return VoidTally(
         total=len(points),
-        before_host=points.count('dispatch'),
+        before_host=before_host,
         at_adoption=points.count('adoption'),
-        per_landing=_share(len(points), len(ledger)),
+        after_host=after_host,
+        per_landing=_share(after_host, len(ledger)),
     )
 
 
@@ -372,6 +379,44 @@ def host_verify_hours(
 def union_busy_hours(verify: Sequence[Event], lo: datetime, hi: datetime) -> float:
     """Hours in ``[lo, hi)`` during which any host ran a completed merge verify."""
     return _union_hours(_intervals(verify, 'duration_ms'), lo, hi)
+
+
+@dataclass(frozen=True)
+class SummedVerifyHours:
+    """Merge-verify host-hours summed over every host, so two hosts verifying at once count twice."""
+
+    completed: float
+    cancelled: float
+    n_missing: int
+    per_landing: float | None
+
+    @property
+    def total(self) -> float:
+        return self.completed + self.cancelled
+
+
+def _summed_hours(events: Sequence[Event], duration_key: str) -> tuple[float, int]:
+    """Hours summed over *events*' ``duration_key``, and how many events lack one."""
+    durations = [millis for e in events if (millis := _number(_data(e).get(duration_key))) is not None]
+    return sum(durations) / 3_600_000.0, len(events) - len(durations)
+
+
+def verify_hours_per_landing(
+    verify: Sequence[Event], cancelled: Sequence[Event], ledger: Sequence[Landing],
+) -> SummedVerifyHours:
+    """Host-hours of every completed and cancelled merge verify passed in, per landing.
+
+    A sum (cost), not a union (occupancy); the caller passes the window's rows. A row without
+    a duration would lower the sum toward passing, so any such row leaves the figure unmeasured.
+    """
+    (completed, completed_missing), (aborted, aborted_missing) = (
+        _summed_hours(verify, 'duration_ms'), _summed_hours(cancelled, 'elapsed_ms'),
+    )
+    n_missing = completed_missing + aborted_missing
+    return SummedVerifyHours(
+        completed=completed, cancelled=aborted, n_missing=n_missing,
+        per_landing=None if n_missing else _share(completed + aborted, len(ledger)),
+    )
 
 
 @dataclass(frozen=True)
@@ -951,7 +996,8 @@ def chain_attributed_episodes(
 
 # ---------------------------------------------------------------------------
 # evaluate: the D12 table. Each limit, rule and baseline is written once, in
-# D12_ROWS; the baselines are the merge-throughput report's 2026-11-04 figures.
+# D12_ROWS; the baselines are the merge-throughput report's 2026-11-04 figures,
+# except merge-verify hours per landing's weekly series (2026-11-26 ruling).
 # ---------------------------------------------------------------------------
 
 
@@ -967,7 +1013,7 @@ class CanaryFigures:
     speculation_accounting_violations: int | None
     chain_attributed_red_main: int | None
     queue_to_land_p50_hours: float | None
-    local_verify_hours_per_week: float | None
+    verify_hours_per_landing: float | None
     deep_chain_p90_secs: float | None
 
 
@@ -990,7 +1036,8 @@ D12_ROWS: tuple[D12Row, ...] = (
     ),
     D12Row(
         'voids_per_landing', 'voids per landing', 0.1, Comparison.LT,
-        'verdict_voided rows / landings', '0.78',
+        'verdict_voided rows not discarded at point dispatch (after a verify host was acquired) / landings',
+        '0.78 (all voids)',
     ),
     D12Row(
         'p_gate_after_gate', 'P(gate after a gated landing)', 0.3, Comparison.LT,
@@ -1026,9 +1073,11 @@ D12_ROWS: tuple[D12Row, ...] = (
         'p50 of merge_finalized done queue_to_land_secs', '5.4 h',
     ),
     D12Row(
-        'local_verify_hours_per_week', 'local merge-verify hours / week', 60.0, Comparison.LT,
-        'union of local completed (runner) and cancelled (host) merge-verify intervals, x 168 / window hours',
-        '~100 h',
+        'verify_hours_per_landing', 'merge-verify hours per landing', 0.75, Comparison.LT,
+        'host-hours of completed (merge_verify duration_ms) plus cancelled (merge_verify_cancelled '
+        'elapsed_ms) merge verifies stamped in the window, all hosts summed (not a union) / landings '
+        '(merge_finalized done ∪ train_merged members)',
+        '0.83–1.24 h (weekly, 10-22..11-12)',
     ),
     D12Row(
         'deep_chain_p90_secs', 'deep-chain verify p90 (s)', 10800.0, Comparison.LE,
