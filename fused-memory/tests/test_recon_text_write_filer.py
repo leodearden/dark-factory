@@ -105,7 +105,7 @@ class TestBuildTextWriteUnconfirmedFiler:
     async def test_drops_with_a_warning_when_no_run_is_active(self, caplog):
         state = _make_state()
 
-        with caplog.at_level(logging.WARNING, logger='fused_memory.server.recon_text_write_filer'):
+        with caplog.at_level(logging.WARNING):
             await _filer(state)(_finding())
 
         (record,) = caplog.records

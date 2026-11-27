@@ -8,11 +8,13 @@ it via a mock). This module tests the REAL adapter against a REAL
 ``ReconReportState``: it must resolve the currently in-progress Stage-2
 (``task_knowledge_sync``) run for the finding's project via the new
 ``active_run_for_stage`` accessor, then land a ``task_lifecycle_reset_detected``
-finding through ``add_finding`` — or silently no-op when no such run is
-active, since filing must never raise on the write path.
+finding through ``add_finding`` — or drop it with a warning when no such run
+is active.
 """
 
 from __future__ import annotations
+
+import logging
 
 import pytest
 
@@ -118,16 +120,19 @@ class TestBuildLifecycleResetFiler:
         assert row['actionable'] is True
 
     @pytest.mark.asyncio
-    async def test_no_op_when_no_active_run(self):
+    async def test_drops_with_a_warning_when_no_run_is_active(self, caplog):
         from fused_memory.server.recon_lifecycle_filer import build_lifecycle_reset_filer
 
         state = _make_state()
-        filer = build_lifecycle_reset_filer(state)
 
-        # Must not raise even though no Stage-2 run is active for this project.
-        await filer(_finding())
+        with caplog.at_level(logging.WARNING):
+            await build_lifecycle_reset_filer(state)(_finding())
 
-        assert state._state == {}
+        (record,) = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert LIFECYCLE_RESET_FLAG_TYPE in record.getMessage()
+        assert '42' in record.getMessage()
+        state.start_report(run_id='run-1', stage=STAGE, project_id=PROJECT_ID)
+        assert state.get_findings_for_run('run-1') == []
 
     @pytest.mark.asyncio
     async def test_no_op_when_active_run_is_for_a_different_project(self):
