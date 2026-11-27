@@ -8545,7 +8545,7 @@ class Scheduler:
                 row = judged_row(picture_row, status_map, rows or {})
                 if predecessor not in dependency_ids(row):
                     continue
-                reason = self._early_start_refusal_of(row, tid, predecessor, picture, status_map)
+                reason = self._early_start_qualification_refusal(row, tid, predecessor, picture, status_map)
                 if reason is not None:
                     refusals.append(EarlyStartRefusal(reason, dependent=tid, predecessor=predecessor))
                     continue
@@ -8615,7 +8615,7 @@ class Scheduler:
             pair = reads.pairs.get(dependent)
             if pair is None or pair.predecessor != predecessor or not self.lock_table.is_held(predecessor):
                 continue
-            refusal = self._early_start_pair_refusal(candidate, pair, picture, statuses, competitors)
+            refusal = self._early_start_reads_refusal(candidate, pair, picture, statuses, competitors)
             if refusal is not None:
                 refusals.append(refusal)
                 continue
@@ -8668,7 +8668,7 @@ class Scheduler:
             ))
         return tuple(competitors)
 
-    def _early_start_pair_refusal(
+    def _early_start_reads_refusal(
         self,
         candidate: EarlyStartCandidate,
         pair: PairReads,
@@ -8676,7 +8676,7 @@ class Scheduler:
         statuses: Mapping[str, str],
         competitors: tuple[Competitor, ...],
     ) -> EarlyStartRefusal | None:
-        """Why step (b)'s reads, the started set or a higher tier refuse *candidate*; None when it may be claimed."""
+        """Step (c)'s check of a qualified candidate: why step (b)'s reads, the started set or a higher tier refuse it; None when it may be claimed."""
         dependent, predecessor = candidate.dependent, candidate.predecessor
         reason = check_refusal(pair.predecessor_checks)
         if reason is None and not branch_admits(pair.dependent_row.task, predecessor, pair.dependent_branch):
@@ -8733,7 +8733,7 @@ class Scheduler:
         self.release(claim.dependent)
         return True
 
-    def _early_start_refusal_of(
+    def _early_start_qualification_refusal(
         self,
         row: dict,
         tid: str,
@@ -8741,7 +8741,7 @@ class Scheduler:
         picture: TaskPicture,
         status_map: dict[str, str],
     ) -> EarlyStartRefusalReason | None:
-        """Why *row* may not start early on *predecessor*'s branch, in the PRD's check order; None when it may."""
+        """Step (a)'s qualification: why *row* may not start early on *predecessor*'s branch, in the PRD's check order; None when it may."""
         if self.lock_table.successor_relation(predecessor) is not None:
             return EarlyStartRefusalReason.PREDECESSOR_HAS_DEPENDENT
         if self.is_deterministic(row):
