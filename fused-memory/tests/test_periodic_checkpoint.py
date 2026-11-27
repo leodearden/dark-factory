@@ -23,6 +23,7 @@ import logging
 from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 from _overreach_shadow_fixtures import judged_edge, judged_episode, non_judging_shadow
@@ -228,8 +229,8 @@ async def test_collect_targets_omits_recon_ledger_when_none_or_no_checkpoint():
     assert 'recon_ledger' not in {name for name, _ in targets_no_checkpoint}
 
 
-def _collect_targets(**overrides) -> list[tuple[str, object]]:
-    stores: dict[str, object] = {
+def _collect_targets(**overrides: Any) -> list[tuple[str, object]]:
+    stores: dict[str, Any] = {
         'taskmaster': None,
         'recon_journal': None,
         'event_buffer': None,
