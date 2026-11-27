@@ -422,13 +422,20 @@ class TestVerifyLegInjectionEndToEnd:
 
         assert result.passed, result.test_output
         session = json.loads(recorded.read_text(encoding='utf-8'))
-        assert session['xdist_workerid'].startswith('gw'), (
-            'the recorder ran outside any xdist worker, so the leg had no xdist '
-            'controller, which is what resolves a basetemp and arms the exit-time '
-            'sweep: the assertion below would pass vacuously '
-            f"(worker id {session['xdist_workerid']!r})"
+        worker_id = session['xdist_workerid']
+        assert worker_id.startswith('gw'), (
+            'the recorder ran outside any xdist worker, so the leg was not the xdist '
+            "leg this test is about, and `.parent` below would name the session "
+            "basetemp's parent, not an xdist controller's basetemp "
+            f'(worker id {worker_id!r})'
         )
-        controller_basetemp = Path(session['basetemp']).parent
+        worker_basetemp = Path(session['basetemp'])
+        assert worker_basetemp.name == f'popen-{worker_id}', (
+            "xdist no longer lays out a worker's basetemp as "
+            '<controller basetemp>/popen-<worker id>, so `.parent` below no longer '
+            f"names the controller's basetemp\nworker basetemp: {worker_basetemp}"
+        )
+        controller_basetemp = worker_basetemp.parent
         assert controller_basetemp.is_relative_to(worktree.resolve()), (
             'a nested xdist verify leg must resolve its basetemp inside the fixture '
             'project: a basetemp under PYTEST_DEBUG_TEMPROOT makes a numbered dir '
