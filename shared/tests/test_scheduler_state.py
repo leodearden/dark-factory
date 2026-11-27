@@ -417,7 +417,9 @@ class TestFromBytes:
         assert parsed == SchedulerStateSnapshot.from_json(wire)
 
     @pytest.mark.parametrize(
-        'raw', [b'', b'{not json', b'\xff\xfe', b'[]', b'{"lock_depth": true}'],
+        'raw',
+        [b'', b'{not json', b'\xff\xfe', b'[]', b'{"lock_depth": true}', b'[' * 100_000],
+        ids=['empty', 'not-json', 'not-utf8', 'not-an-object', 'wrong-type', 'too-deep'],
     )
     def test_bytes_that_are_not_a_snapshot_raise_malformed(self, raw: bytes) -> None:
         with pytest.raises(MalformedSnapshotError):
@@ -545,7 +547,7 @@ class TestCheckedReaderRow:
 
 
 class TestCheckedReaderMalformedSnapshot:
-    @pytest.mark.parametrize('body', ['{not json', '[]'])
+    @pytest.mark.parametrize('body', ['{not json', '[]', '[' * 100_000])
     def test_a_malformed_body_reads_as_unreadable_and_warns(
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture, body: str,
     ) -> None:

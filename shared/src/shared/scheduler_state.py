@@ -180,7 +180,7 @@ class SchedulerStateSnapshot(BaseModel):
         """
         try:
             data = json.loads(raw)
-        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        except (json.JSONDecodeError, UnicodeDecodeError, RecursionError) as exc:
             raise MalformedSnapshotError(str(exc)) from exc
         return cls.from_json(data)
 
