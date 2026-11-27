@@ -16,12 +16,11 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
-from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 import pytest
-from _merge_lane_fakes import FakeRemoteRunner, FakeVerifier, fails, passes
+from _merge_lane_fakes import TreeKeyedRemote, TreeKeyedVerifier, fails, no_tree, passes
 from _orch_helpers import MERGE_GATE_BARRIER_TIMEOUT, wait_responsive
 from test_merge_queue_deep_reservation import (
     _deep,
@@ -37,7 +36,6 @@ from test_merge_queue_deep_reservation import (
 )
 
 from orchestrator.event_store import EventType
-from orchestrator.git_ops import _run
 from orchestrator.merge_lane import MergeLane, MergeOutcome, MergeRequest
 from orchestrator.verify import VerifyResult
 
@@ -46,7 +44,6 @@ pytestmark = pytest.mark.asyncio
 _RED_FILES = frozenset({'S.txt', 'F1.txt'})
 """S and F1 are genuinely red: any tree holding either fails its verify."""
 
-TreeTest = Callable[[frozenset[str]], bool]
 Chains = list[tuple[str, list[str]]]
 
 
@@ -56,69 +53,9 @@ def _verdict(files: frozenset[str]) -> VerifyResult:
     return passes().result
 
 
-def _never(_files: frozenset[str]) -> bool:
-    return False
-
-
 def _chains(lane: MergeLane) -> Chains:
     """The live chain reservations, as ``(owner, links)``."""
     return [(r['owner_task_id'], r['link_task_ids']) for r in _reservations(lane)]
-
-
-class _TreeKeyedVerifier(FakeVerifier):
-    """The local host: red iff the worktree holds a red file.
-
-    *raising* selects the trees whose verify raises instead; a test may swap
-    it between rounds. Each call records its task, its tree and, once a test
-    sets ``lane``, the chains reserved while it ran.
-    """
-
-    def __init__(self, *, raising: TreeTest = _never) -> None:
-        super().__init__()
-        self.raising = raising
-        self.lane: MergeLane | None = None
-        self.calls: list[tuple[str | None, frozenset[str], Chains]] = []
-
-    async def run_scoped(
-        self, worktree: Path, config: Any, module_configs: list[Any],
-        task_files: list[str] | None = None, **options: Any,
-    ) -> VerifyResult:
-        task_id = options.get('task_id')
-        self._note_entry(task_id)
-        files = frozenset(p.name for p in Path(worktree).glob('*.txt'))
-        self.calls.append((task_id, files, [] if self.lane is None else _chains(self.lane)))
-        if self.raising(files):
-            raise RuntimeError(f'verify infra exploded on {sorted(files)}')
-        return _verdict(files)
-
-
-class _TreeKeyedRemote(FakeRemoteRunner):
-    """A remote host: red iff the merge commit's tree holds a red file.
-
-    A verify whose tree *hold* selects waits for *release* first.
-    """
-
-    def __init__(
-        self, name: str, repo: Path, *, hold: TreeTest, release: asyncio.Event,
-        entered: asyncio.Event,
-    ) -> None:
-        super().__init__(name, release=release, entered=entered)
-        self.repo = repo
-        self.hold = hold
-
-    async def run_merge_verify(self, merge_sha: str, spec: Any) -> VerifyResult:
-        self.calls.append(merge_sha)
-        _, listing, _ = await _run(['git', 'ls-tree', '--name-only', merge_sha], cwd=self.repo)
-        files = frozenset(name for name in listing.split() if name.endswith('.txt'))
-        if self.hold(files) and self.release is not None:
-            self.live = True
-            try:
-                if self.entered is not None:
-                    self.entered.set()
-                await self.release.wait()
-            finally:
-                self.live = False
-        return _verdict(files)
 
 
 async def _high(scene: _Scene, name: str) -> MergeRequest:
@@ -174,12 +111,12 @@ class TestAVoidedVerifyKeepsTheMark:
             **await _requests(scene, 'F2', 'F3', 'G1', 'G2', 'G3'),
         }
         f1_entered, release_f1 = asyncio.Event(), asyncio.Event()
-        remote = _TreeKeyedRemote(
-            'ahead-host', scene.git_ops.project_root,
+        remote = TreeKeyedRemote(
+            'ahead-host', scene.git_ops.project_root, verdict=_verdict,
             hold=_f1_alone, release=release_f1, entered=f1_entered,
         )
         async with _running(
-            scene, verifier=_TreeKeyedVerifier(), remotes=[remote], speculation_depth=2,
+            scene, verifier=TreeKeyedVerifier(_verdict), remotes=[remote], speculation_depth=2,
         ) as run:
             run.put(*(reqs[name] for name in ('S', 'F1', 'F2', 'F3')))
             await wait_responsive(
@@ -224,11 +161,11 @@ class TestAVoidedVerifyKeepsTheMark:
         )
 
 
-class _SecondSVerifyHangs(_TreeKeyedVerifier):
+class _SecondSVerifyHangs(TreeKeyedVerifier):
     """S's second verify hangs until it is cancelled; every other call is tree-keyed."""
 
     def __init__(self) -> None:
-        super().__init__()
+        super().__init__(_verdict)
         self.hanging, self.torn_down = asyncio.Event(), asyncio.Event()
         self._s_calls = 0
 
@@ -260,7 +197,7 @@ class TestADroppedRequestTakesItsMarkWithIt:
         reqs = await _requests(scene, 'S', 'B1')
         verifier = _SecondSVerifyHangs()
         async with _running(scene, verifier=verifier, remotes=[], speculation_depth=1) as run:
-            verifier.lane = run.lane
+            verifier.observe = lambda: _chains(run.lane)
             run.put(reqs['S'], reqs['B1'])
             await wait_responsive(verifier.hanging.wait(), label="S's un-chained verify hanging")
             reqs['S'].result.cancel()
@@ -290,9 +227,9 @@ class TestBAChainArmErrorStillTerminates:
         The applied block clears the mark, so a resubmission chains H1."""
         scene = _scene(tmp_path, monkeypatch, merge_deep=_deep())
         reqs = await _requests(scene, 'S', 'B1')
-        verifier = _TreeKeyedVerifier(raising=lambda files: 'S.txt' in files)
+        verifier = TreeKeyedVerifier(_verdict, raising=lambda files: 'S.txt' in files)
         async with _running(scene, verifier=verifier, remotes=[], speculation_depth=2) as run:
-            verifier.lane = run.lane
+            verifier.observe = lambda: _chains(run.lane)
             run.put(reqs['S'], reqs['B1'])
             outcome = await _outcome(reqs['S'], 'S')
             assert outcome.status == 'blocked', outcome
@@ -305,7 +242,7 @@ class TestBAChainArmErrorStillTerminates:
             )
 
             again, h1 = _resubmission(scene, reqs['S']), await _request(scene, 'H1')
-            verifier.raising = _never
+            verifier.raising = no_tree
             run.put(again, h1)
             assert (await _outcome(again, 'resubmitted S')).status == 'blocked'
         s_chains = [chains for task_id, _files, chains in verifier.calls if task_id == 'S']

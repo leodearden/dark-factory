@@ -27,6 +27,11 @@ nothing is draining. ``main_health_probe_spawned`` reads off a red
 ``lane_scene_config`` builds a scene's ``OrchestratorConfig`` with that probe
 off. ``branch_merge_request`` commits one root-level file on a fresh task
 branch and returns the ``MergeRequest`` that merges it.
+``TreeKeyedVerifier`` and ``TreeKeyedRemote`` answer a verify by the
+verified tree's content -- the ``*.txt`` names at its root, read by
+``worktree_tree`` and ``commit_tree`` -- through an injected ``TreeVerdict``,
+so a red is caused by a file and not by a call's position; ``TreeTest``
+selects trees (``no_tree`` selects none).
 
 Since task 5037 every merge-lane module, and ``suffix_graph``, logs under
 exactly ``'orchestrator.merge_lane'``; filter caplog by that name. A
@@ -499,6 +504,97 @@ class FakeRemoteRunner:
             )
         finally:
             self.live = False
+
+
+#: Selects verified trees by their ``*.txt`` names.
+TreeTest = Callable[[frozenset[str]], bool]
+#: The verdict for a verified tree, by its ``*.txt`` names.
+TreeVerdict = Callable[[frozenset[str]], VerifyResult]
+
+
+def no_tree(files: frozenset[str]) -> bool:
+    """The ``TreeTest`` that selects no tree."""
+    return False
+
+
+def worktree_tree(worktree: Path) -> frozenset[str]:
+    """The ``*.txt`` names at *worktree*'s root."""
+    return frozenset(p.name for p in Path(worktree).glob('*.txt'))
+
+
+async def commit_tree(repo: Path, rev: str) -> frozenset[str]:
+    """The ``*.txt`` names at the root of *rev*'s tree in *repo*."""
+    proc = await asyncio.create_subprocess_exec(
+        'git', 'ls-tree', '--name-only', rev, cwd=repo,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+    )
+    out, err = await proc.communicate()
+    if proc.returncode != 0:
+        raise RuntimeError(f'git ls-tree {rev} failed: {err.decode().strip()}')
+    return frozenset(name for name in out.decode().split() if name.endswith('.txt'))
+
+
+class TreeKeyedVerifier(FakeVerifier):
+    """The local host, answering each verify with *verdict* of the worktree's tree.
+
+    *raising* selects the trees whose verify raises instead; a test may swap
+    it between rounds. Each call records ``(task_id, tree, observe())`` in
+    ``calls``; a test sets ``observe`` to read lane state while the verify runs.
+    """
+
+    def __init__(
+        self,
+        verdict: TreeVerdict,
+        *,
+        raising: TreeTest = no_tree,
+        observe: Callable[[], object] = lambda: None,
+    ) -> None:
+        super().__init__()
+        self.verdict = verdict
+        self.raising = raising
+        self.observe = observe
+        self.calls: list[tuple[str | None, frozenset[str], object]] = []
+
+    async def run_scoped(
+        self, worktree: Path, config: Any, module_configs: list[Any],
+        task_files: list[str] | None = None, **options: Any,
+    ) -> VerifyResult:
+        task_id = options.get('task_id')
+        self._note_entry(task_id)
+        files = worktree_tree(worktree)
+        self.calls.append((task_id, files, self.observe()))
+        if self.raising(files):
+            raise RuntimeError(f'verify infra exploded on {sorted(files)}')
+        return self.verdict(files)
+
+
+class TreeKeyedRemote(FakeRemoteRunner):
+    """A remote host, answering each verify with *verdict* of the merge commit's tree.
+
+    A verify whose tree *hold* selects waits for *release* first.
+    """
+
+    def __init__(
+        self, name: str, repo: Path, *, verdict: TreeVerdict, hold: TreeTest,
+        release: asyncio.Event, entered: asyncio.Event,
+    ) -> None:
+        super().__init__(name, release=release, entered=entered)
+        self.repo = repo
+        self.verdict = verdict
+        self.hold = hold
+
+    async def run_merge_verify(self, merge_sha: str, spec: Any) -> VerifyResult:
+        self.calls.append(merge_sha)
+        files = await commit_tree(self.repo, merge_sha)
+        if self.hold(files) and self.release is not None:
+            self.live = True
+            try:
+                if self.entered is not None:
+                    self.entered.set()
+                await self.release.wait()
+            finally:
+                self.live = False
+        return self.verdict(files)
 
 
 class FakeClock:

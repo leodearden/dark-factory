@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from _merge_lane_fakes import healthy_verify_clock, make_lane
+from _merge_lane_fakes import TreeKeyedVerifier, healthy_verify_clock, make_lane
 from _orch_helpers import MERGE_RESULT_TIMEOUT
 from test_merge_queue_deep_reservation import (
     _deep,
@@ -38,7 +38,7 @@ from test_merge_queue_deep_unchained_mark import (
     _high,
     _outcome,
     _resubmission,
-    _TreeKeyedVerifier,
+    _verdict,
 )
 
 from orchestrator.merge_lane import MergeLane, MergeRequest
@@ -64,11 +64,11 @@ async def _stopped(lane: MergeLane, run: asyncio.Task[None]) -> None:
     await asyncio.wait_for(run, MERGE_RESULT_TIMEOUT)
 
 
-class _SoloVerifiesHang(_TreeKeyedVerifier):
+class _SoloVerifiesHang(TreeKeyedVerifier):
     """A red tip verifies; a verify of one member alone never returns."""
 
     def __init__(self) -> None:
-        super().__init__()
+        super().__init__(_verdict)
         self.solo_entered = asyncio.Event()
 
     async def run_scoped(
@@ -150,7 +150,7 @@ async def _first_process_ends_while_verifying_alone(
 async def _run_process(scene: _Scene, requests: dict[str, MergeRequest]) -> None:
     """Put *requests* in order on a fresh lane over *scene*; wait until each resolves."""
     async with _running(
-        scene, verifier=_TreeKeyedVerifier(), remotes=[], speculation_depth=2,
+        scene, verifier=TreeKeyedVerifier(_verdict), remotes=[], speculation_depth=2,
     ) as run:
         run.put(*requests.values())
         for name, request in requests.items():
