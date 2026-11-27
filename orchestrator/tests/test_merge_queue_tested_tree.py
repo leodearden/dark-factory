@@ -115,6 +115,8 @@ async def test_each_in_flight_entry_shows_the_tree_it_verifies(tmp_path: Path) -
         h_tree = _tree(lane, reqs['H'])
         s_tree = _tree(lane, reqs['S'])
         x_tree = _tree(lane, reqs['X'])
+        link_ids = {reqs['F1'].request_id, reqs['F2'].request_id}
+        link_entries = [e for e in lane.snapshot()['entries'] if e['request_id'] in link_ids]
 
         for host in (head_host, s_host, spare):
             host.release.set()
@@ -148,5 +150,8 @@ async def test_each_in_flight_entry_shows_the_tree_it_verifies(tmp_path: Path) -
     assert [m['own'] for m in x_members] == [False, False, False, False, True]
     assert x_members[:4] == [{**m, 'own': False} for m in s_members]
     assert x_members[-1]['merge_commit'] == spare.runner.calls[0]
+
+    assert len(link_entries) == 2
+    assert [e['tree'] for e in link_entries] == [None, None]
 
     assert {n: o.status for n, o in outcomes.items()} == dict.fromkeys(_NAMES, 'done')

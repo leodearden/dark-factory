@@ -14,6 +14,7 @@ import asyncio
 import contextlib
 import dataclasses
 import importlib
+import logging
 from pathlib import Path
 from typing import Any, cast
 
@@ -50,6 +51,7 @@ from orchestrator.merge_lane.dispatch_ports import (
     VerifyFrontier,
     VerifyRetryBudgets,
 )
+from orchestrator.merge_lane.git_read import GitReadFailed
 from orchestrator.merge_lane.halt import HaltState
 from orchestrator.merge_lane.intake import MERGE_LANES
 from orchestrator.merge_lane.main_health_probe import MainHealthProbeHandles
@@ -101,6 +103,7 @@ class _Ports:
         self.remerged: Any = None
         self.placement_error: BaseException | None = None
         self.live_trees: tuple[tested_tree.TestedTree, ...] = ()
+        self.live_trees_error: BaseException | None = None
         self._streak = 0
         self._cap_outs = 0
 
@@ -146,6 +149,11 @@ class _Ports:
             raise self.placement_error
         return NO_DEEP_PLACEMENT
 
+    def _live_trees(self) -> tuple[tested_tree.TestedTree, ...]:
+        if self.live_trees_error is not None:
+            raise self.live_trees_error
+        return self.live_trees
+
     def custody(self) -> DispatchCustody:
         return DispatchCustody(
             request_abandoned=lambda req: self.abandoned,
@@ -174,7 +182,7 @@ class _Ports:
             frontier_depth=lambda: 0,
             frontier_base_commits=lambda: (set(), set()),
             verify_base_divergence=lambda item, main: None,
-            live_trees=lambda: self.live_trees,
+            live_trees=self._live_trees,
         )
 
     def chain_planning(self) -> ChainPlanning:
@@ -945,6 +953,46 @@ class TestTheTestedTree:
 
         with pytest.raises(tested_tree.TestedTreeViolation):
             InflightEntrySlot(entry=entry).publish_tree(entry.tree)
+
+    async def test_a_tree_that_cannot_be_recorded_leaves_none_and_the_verify_still_runs(
+        self, scene: _Scene, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        verifier = FakeVerifier(passes())
+        dispatcher = scene.dispatcher(verifier)
+        item = await scene.merged_item()
+        scene.ports.main = item.base_sha
+        scene.ports.live_trees_error = RuntimeError('frontier unreadable')
+
+        with caplog.at_level(logging.ERROR, logger='orchestrator.merge_lane'):
+            entry = await _launched(await dispatcher.dispatch(item))
+
+        assert entry.tree is None
+        assert entry.verify_task is not None
+        assert entry.verify_task.result().outcome is None
+        assert verifier.verified == ['vd-1']
+        [record] = [r for r in caplog.records if 'tested tree not recorded' in r.getMessage()]
+        assert record.exc_info is not None
+        assert str(record.exc_info[1]) == 'frontier unreadable'
+
+    async def test_a_failed_main_containment_read_is_logged_and_leaves_no_root(
+        self, scene: _Scene, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        dispatcher = scene.dispatcher(FakeVerifier(passes()))
+        unknown = 'e' * 40
+        item = dataclasses.replace(await scene.merged_item(), base_sha=unknown, speculative=True)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
+            tree = await _tree_of(dispatcher, item)
+
+        assert tree.base_commit == unknown
+        assert tree.root_commit is None
+        assert tree.members == (_owner_of(item, None),)
+        [record] = [r for r in caplog.records if 'main containment' in r.getMessage()]
+        assert record.levelno == logging.WARNING
+        assert unknown in record.getMessage()
+        assert record.exc_info is not None
+        assert isinstance(record.exc_info[1], GitReadFailed)
+        assert record.exc_info[1].stderr
 
 
 _HOMES = {

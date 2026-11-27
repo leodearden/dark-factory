@@ -36,6 +36,7 @@ from orchestrator.merge_lane.dispatch_ports import (
     SpeculationPermits,
     VerifyFrontier,
 )
+from orchestrator.merge_lane.git_read import is_ancestor_or_raise
 from orchestrator.merge_lane.halt import HaltState
 from orchestrator.merge_lane.inflight_verify import (
     InflightVerifyCall,
@@ -592,7 +593,7 @@ class VerifyDispatcher:
         build is released by the builder, before any chain reaches this frame.
         """
         divergence, guard_main = await self._observe_verify_base(item)
-        base_on_main = await self._base_on_main(item.base_sha, guard_main)
+        base_on_main = await self._base_on_main(item, guard_main)
         stacked_on, rebased_heads = self._frontier.frontier_base_commits()
         facts = MergeVerifyDispatchFacts(
             runner_reason=lease.reason,
@@ -613,19 +614,27 @@ class VerifyDispatcher:
             base_on_main=base_on_main,
         )
 
-    async def _base_on_main(self, base_sha: str, guard_main: str | None) -> bool:
-        """Whether main contains *base_sha*; any git error reads as not on main.
+    async def _base_on_main(self, item: RealMergeItem, guard_main: str | None) -> bool:
+        """Whether main contains *item*'s base; a failed read is logged and reads as not on main.
 
         Read before the chain build: an await after it would leak the chain's
         lane on an external cancel (see :meth:`_place`).
         """
+        base_sha = item.base_sha
         if not base_sha or not guard_main:
             return False
         if base_sha == guard_main:
             return True
-        with contextlib.suppress(Exception):
-            return await self._git_ops().is_ancestor_checked(base_sha, guard_main) is True
-        return False
+        try:
+            return await is_ancestor_or_raise(
+                self._git_ops(), ancestor=base_sha, descendant=guard_main,
+            )
+        except Exception:
+            logger.warning(
+                'Task %s: main containment of base %s unknown; tree root unresolved',
+                item.request.task_id, base_sha, exc_info=True,
+            )
+            return False
 
     async def _observe_verify_base(
         self, item: RealMergeItem,

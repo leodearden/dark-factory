@@ -1125,6 +1125,21 @@ class TestBuildChainClean:
             assert tip == await _rev_parse(git_repo, f'{merge_commit}^2')
         await release_chain_build_lane(git_ops, res.lane, warm=res.lane_warm)
 
+    async def test_a_link_tip_read_of_a_commit_with_no_second_parent_keeps_gits_reason(
+        self, git_repo: Path,
+    ):
+        """The tip read raises GitReadFailed, which build_chain's lane-releasing except takes."""
+        from orchestrator.merge_lane.git_read import GitReadFailed, second_parents
+
+        git_ops = _make_git_ops(git_repo)
+        not_a_merge = await _rev_parse(git_repo)
+
+        with pytest.raises(GitReadFailed) as caught:
+            await second_parents(git_ops, (not_a_merge,))
+
+        assert f'{not_a_merge}^2' in caught.value.command
+        assert caught.value.stderr.strip()
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # step-15: RED — build_chain truncation semantics + purity (decision #4)
