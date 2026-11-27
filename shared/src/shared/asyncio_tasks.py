@@ -187,20 +187,28 @@ async def gather_unwound(*aws: Awaitable[_Gathered]) -> list[_Gathered]:
     the call that gathered it. Here, as in a ``TaskGroup``, the other children are cancelled
     and then awaited, and cancelling the caller again meanwhile does not cut
     that wait short. The exception raised is the one the gather raised, unless
-    the caller was cancelled during the wait: that cancel is raised instead, so
-    it is never swallowed. A child already asked to cancel (a cancelled gather
-    asks every child) is not asked again, which would interrupt the kill it is
-    awaiting.
+    the caller was cancelled: that cancel is raised instead, so it is never
+    swallowed. Cancelling the caller, once or repeatedly, asks each child to
+    cancel at most once, and never a child already cancelling: asking again
+    would interrupt the kill it is awaiting.
     """
     children = [asyncio.ensure_future(aw) for aw in aws]
+    gathered = asyncio.gather(*children)
+    gathered.add_done_callback(_consume_outcome)
     try:
-        return await asyncio.gather(*children)
+        return await asyncio.shield(gathered)
     except BaseException:
         for child in children:
             if not (isinstance(child, asyncio.Task) and child.cancelling()):
                 child.cancel()
         await _await_all_through_cancels(children)
         raise
+
+
+def _consume_outcome(gathered: asyncio.Future) -> None:
+    """Retrieve *gathered*'s exception, which a shield cancelled by its caller leaves unretrieved."""
+    if not gathered.cancelled():
+        gathered.exception()
 
 
 async def _await_all_through_cancels(children: Sequence[asyncio.Future]) -> None:
