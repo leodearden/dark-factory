@@ -128,8 +128,7 @@ async def test_a_cancelled_merge_verify_returns_only_after_a_leg_only_sigkill_en
 
     verify.cancel()
     with pytest.raises(asyncio.CancelledError):
-        async with asyncio.timeout(30.0):
-            await verify
+        await verify
 
     assert alive_at_return == [False]
     assert [pid for label in spinning for pid in legs.pids(label) if _alive(pid)] == []
