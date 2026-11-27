@@ -513,7 +513,12 @@ class TestExecuteGating:
 
 
 def seed_gate_escalation(
-    root: Path, task_id: int, *, category: str = 'milestone_gate', timestamp: str | None = None,
+    root: Path,
+    task_id: int,
+    *,
+    category: str = 'milestone_gate',
+    timestamp: str | None = None,
+    pin_declared_by: Sequence[str] = (),
 ) -> str:
     queue = EscalationQueue(escalation_queue_dir(root))
     escalation_id = queue.make_id(str(task_id))
@@ -525,6 +530,7 @@ def seed_gate_escalation(
         category=category,
         summary='gate',
         level=2,
+        pin_declared_by=list(pin_declared_by),
     )
     if timestamp is not None:
         escalation = dataclasses.replace(escalation, timestamp=timestamp)
@@ -563,6 +569,7 @@ class TestExecuteWrites:
         assert resume['arguments']['escalation_id'] == escalation_id
         assert resume['arguments']['action'] == 'resume'
         assert payload['run_id'] in resume['arguments']['resolution']
+        assert resume['arguments']['resolution_class'] == 'actionable'
         assert 'acknowledge_declared_pins' not in resume['arguments']
 
     def test_tag_only_stamps_the_observed_members_and_leaves_the_canonical(
@@ -602,7 +609,9 @@ class TestExecuteWrites:
             auto_predicate_version='1',
             category=CATEGORY,
         )])
-        escalation_id = seed_gate_escalation(root, 83)
+        escalation_id = seed_gate_escalation(
+            root, 83, pin_declared_by=['task-83-human-curator-gate'],
+        )
 
         code, payload = drive(root, fake, capsys, '--execute', '--claim', f'{TOPIC}={CLAIM}')
 
@@ -616,6 +625,28 @@ class TestExecuteWrites:
         assert set(stamp['metadata']) == {'human_curator_adjudicated_at'}
         assert stamp['metadata_mode'] == 'merge'
         assert gate['next'][1]['arguments']['acknowledge_declared_pins'] == [escalation_id]
+        assert gate['note'] is None
+
+    def test_a_curator_gate_pinned_by_another_declarer_is_not_acknowledged(
+        self, root, fake, seed_tasks, capsys,
+    ):
+        row = gate_row(87, TOPIC, observed=fake.seed_many(3))
+        row['metadata']['human_curator_gate'] = True
+        seed_tasks([row])
+        escalation_id = seed_gate_escalation(
+            root, 87,
+            pin_declared_by=['task-87-human-curator-gate', 'task-3546-second-deviation-notice'],
+        )
+
+        code, payload = drive(root, fake, capsys, '--execute', '--claim', f'{TOPIC}={CLAIM}')
+
+        assert code == 0
+        gate = gate_of(payload, 87)
+        assert tools_of(gate) == ['update_task', 'resolve_issue']
+        resume = gate['next'][1]['arguments']
+        assert resume['escalation_id'] == escalation_id
+        assert 'acknowledge_declared_pins' not in resume
+        assert 'task-3546-second-deviation-notice' in gate['note']
 
     def test_a_string_marked_curator_gate_is_stamped_as_its_runner_reads_it(
         self, root, fake, seed_tasks, capsys,
