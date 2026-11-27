@@ -133,7 +133,7 @@ async def test_a_commit_git_cannot_resolve_fails(repo: _Repo) -> None:
 
 async def test_a_check_that_outruns_its_timeout_fails(repo: _Repo) -> None:
     async def _hung_runner(argv, **_kwargs) -> tuple[int, str, str]:
-        await asyncio.sleep(30)
+        await asyncio.Event().wait()
         return (0, '', '')
 
     metadata = {'delivered_checks': [_grep(_TOKEN)]}
