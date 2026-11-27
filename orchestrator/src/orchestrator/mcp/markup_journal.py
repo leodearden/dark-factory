@@ -39,7 +39,10 @@ fact and outcome are
 ``orchestrator/src/orchestrator/mcp/markup_sink.py::MARKUP_RECORD_LOST_FACT``
 and ``::MARKUP_RECORD_LOST_OUTCOME``: one line for each record the queue could
 not take, naming why and the payload's size. They are
-payload-free like every other line, so the rule above is unchanged.
+payload-free like every other line, so the rule above is unchanged. So are
+plan-tools' stored-markup facts, fact
+``orchestrator/src/orchestrator/mcp/stored_markup_journal.py::STORED_MARKUP_FACT``:
+damage already in ``plan.json`` that a read found, journalled as disclosed.
 
 Shape inherited from ``markup_sink.make_escalation_sink``: never raises, does
 its blocking work under ``asyncio.to_thread``, memoizes successes only, returns
@@ -109,7 +112,9 @@ MARKUP_JOURNAL_MAX_LINE_BYTES = 8192
 
 #: The identity a line must carry even at the floor — who leaked, from which
 #: tool, into which parameter, when, and with what outcome. Exactly the question
-#: the storm escalation asks a human to answer and gives them no way to.
+#: the storm escalation asks a human to answer and gives them no way to. On a
+#: plan-tools stored-markup line, ``tool`` is the plan field's writer and ``ts``
+#: is when a read found the damage, not when it leaked.
 MARKUP_JOURNAL_FLOOR_KEYS = ('ts', 'server', 'subject_task_id', 'tool', 'param', 'outcome')
 
 #: The two disclosure keys, NAMESPACED under ``journal_`` because everything

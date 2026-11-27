@@ -69,6 +69,10 @@ from orchestrator.mcp import (
 )
 from orchestrator.mcp.branch_probes import Reachability
 from orchestrator.mcp.plan_markup_repair import PlanField
+from orchestrator.mcp.stored_markup_journal import (
+    STORED_MARKUP_FACT,
+    StoredMarkupJournalMiddleware,
+)
 from orchestrator.scope_drift import InvalidScopeRequest, ScopeRequest, pending_scope_paths
 
 logger = logging.getLogger(__name__)
@@ -370,7 +374,7 @@ def _with_markup_repairs(
     contractual and must not be "aligned" by anything passing through here.
     """
     if facts:
-        response['markup_repairs'] = facts
+        response[plan_markup_repair.MARKUP_REPAIRS_KEY] = facts
     return response
 
 
@@ -1366,7 +1370,12 @@ MARKUP_SINK_SPEC = markup_sink.MarkupSinkSpec(
         f'to {markup_journal.MARKUP_JOURNAL_DIRNAME}/plan-tools.jsonl under '
         'the main checkout — each line carries subject_task_id, tool, param, '
         'outcome and a UTC timestamp, so the leaking task is nameable from '
-        "the burst window's own lines (jq or grep '\"subject_task_id\"')"
+        "the burst window's own lines (jq or grep '\"subject_task_id\"'). "
+        f'Lines whose fact is "{STORED_MARKUP_FACT}" name no leak: they are '
+        'damage already in a plan.json that an accepted call read, so their '
+        'tool is the plan field\'s writer, their ts is the read time, and their '
+        "outcome matches an inbound line's. Exclude them before attributing: "
+        f"jq 'select(.fact != \"{STORED_MARKUP_FACT}\")'"
     ),
 )
 
@@ -1598,6 +1607,8 @@ def _server_with_every_tool(
     #   orchestrator/src/orchestrator/mcp/markup_sink.py::make_escalation_sink.
     # * The caller role, named by the launch because no tool here declares
     #   one: shared/src/shared/mcp_markup_middleware.py::HostAttribution.
+    # * The stored-markup facts a response discloses, journalled through the
+    #   same journal: orchestrator/src/orchestrator/mcp/stored_markup_journal.py.
     journal = _markup_fact_journal(artifacts)
     mcp.add_middleware(
         MarkupGuardMiddleware(
@@ -1612,6 +1623,7 @@ def _server_with_every_tool(
         )
     )
     mcp.add_middleware(MissingArgumentMiddleware())
+    mcp.add_middleware(StoredMarkupJournalMiddleware(journal, reader_role=caller_role))
 
     @tool
     @accepts_markup_override

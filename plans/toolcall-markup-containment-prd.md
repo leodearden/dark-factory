@@ -100,6 +100,7 @@ no longer exist. Neither sweep lane reaches those: δ globs `.worktrees-orphaned
 orphaned lane exists. Accepted as a transient irrelevance by operator decision — dead lanes are not read. (2) Live
 plans carry **19 hard-damage strings across 16 tasks**; three of those tasks (3382, 4081 pending; 3133 blocked) are
 plans an implementer will read *next*, and ε repairs them only on the next plan-tools read.
+3382's read happened on 2026-11-26, and left no journal line: see §2.5, "Recurrence log continued (2026-11-27)".
 
 **Re-measured 2026-08-25 over `.worktrees/.task-meta/*/plan.json` (task 4696), and the corpus had GROWN.** Predicate: a closing tag whose name is a plan-tools parameter, or an invoke closer, or a parameter-open token, over `design_decisions` / `reuse` / `steps` / `prerequisites`.
 
@@ -376,6 +377,34 @@ preserved the raw payload on the record. Same blindness as above: the owner read
 23:19Z, and the refused value duplicated content already on the task; `markup_residue.spooled_files` and
 `preservation_failures` were both 0. Closed by the reify L2 watcher on Leo's ruling of 2026-11-22. The gate held;
 this is a floor-count datum for the gated boundary, not landed damage.
+
+**Recurrence log continued (2026-11-27) — `esc-markup-residue-12`, task 3382: NOT a boundary recurrence, but two
+journal gaps (task 11978).** The specimen is 3382's `design_decisions[1].decision`: a decision that absorbed its own
+`rationale`, an invoke closer and the opening of a NEXT `add_design_decision` call, so the tail re-declares `decision`.
+- **Origin is pre-guard.** It was written 2026-08-01T03:13:29Z by 3382's architect (session
+  `0872e952-1e46-4bd9-91a8-58662c354bde`) through `add_design_decision.decision`, and the server answered ok — 19 days
+  before the γ2 guard was registered (`37eed69c97`, task 4457). §2.4 and D8 already counted it among the live plans
+  with hard damage.
+- **Today's boundary holds.** Replayed in-process through today's plan-tools, the call is refused
+  `mcp_markup_unrepairable` and journalled as one `markup_detected` line. The replay rules out an uncovered tool, an
+  uncovered parameter and a pattern variant. The pre-guard origin above is what makes the fourth candidate, another
+  server instance, moot: no instance had a guard on 2026-08-01.
+- **Gap 1, closed here for unsandboxed roles: the read-time path had no journal channel.** On
+  2026-11-26T15:27:19Z the re-dispatched implementer's first `mark_step_done` ran ε's read-time repair, which repaired
+  two trailing `\x3c/rationale>` mis-closes and classified the decision unrepairable (its recovered set collides with
+  the supplied set). That verdict reached only that response's `markup_repairs` key and a stdio subprocess's stderr.
+  Task 11978 journals every disclosed stored fact to `plan-tools.jsonl` as a `stored_markup_detected` line
+  (`orchestrator/src/orchestrator/mcp/stored_markup_journal.py`). That holds only where the host can reach the
+  journal: 3382's own read came from a landlocked implementer, so the same read today still leaves no line until
+  Gap 2 closes.
+- **Gap 2, open: sandboxed roles cannot reach the journal.** That session was a landlocked implementer, and the write
+  set grants nothing under the main checkout's `data/` (EACCES on append, probed 2026-11-27). Nine
+  `record_step_deviation` refusals from 2026-10-31 to 2026-11-26 are in their plans' `_markup_rejections` stamps but
+  not in the journal, so **the journal's silence since 2026-09-22 is not evidence of zero leaks**. Open as
+  `tkt_0RXFFAY29XAEX8SSSW0A49T2SB`; it needs a ruling against the os-sandbox PRD's ratified read-only main-tree row.
+- **Downstream, the gate held.** On merge, the completion-memory builder forwarded the decision raw, and fused-memory's
+  own guard refused it — that refusal is `esc-markup-residue-12`. The raw forwarding is filed as
+  `tkt_0RXFFB0B4ATJ3DXQXX1FFSQ71T`.
 
 ### 2.6 The corruption is deterministically repairable
 
