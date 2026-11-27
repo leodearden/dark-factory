@@ -96,13 +96,6 @@ OPAQUE_COMMAND = LaneCommand(name='lane-opaque', command='lane-suite tests', cwd
 PROBED_COMMAND = LANE_COMMAND.model_copy(update={'outage_probe': 'lane-probe'})
 
 
-def probed_command(timeout_secs: int | None = None) -> LaneCommand:
-    """``PROBED_COMMAND``, its probe bounded at *timeout_secs* where given."""
-    if timeout_secs is None:
-        return PROBED_COMMAND
-    return PROBED_COMMAND.model_copy(update={'outage_probe_timeout_secs': timeout_secs})
-
-
 #: The junit resolver maps a report's classnames to node ids only through module files that exist under the cwd.
 LANE_SEED = RepoSeed(
     files=(

@@ -40,7 +40,6 @@ from _offline_lane_red_path_fixtures import (
     lane_test_timeout,
     merge_gate_suppression,
     offered,
-    probed_command,
     promote_to_level_2,
     reload_git,
     sync_storm_window,
@@ -67,6 +66,7 @@ from orchestrator.offline_lane_escalations import (
     sentinel_task_id,
 )
 from orchestrator.offline_lane_ledger import NUMERIC_UNNAMED_CLEAR
+from orchestrator.offline_lane_records import PassRecord, ProbeKind, ProbeResult
 
 pytestmark = [pytest.mark.usefixtures('code_default_config')]
 
@@ -679,34 +679,64 @@ async def test_scenario_37_a_hand_resolved_outage_record_is_replaced_by_the_next
 
 
 BROKEN_PROBES = {
-    'killed': (ProbeAnswer(signal=signal.SIGKILL), None),
-    'another exit code': (ProbeAnswer(exit=3), None),
-    'the outage exit printing nothing': (ProbeAnswer(exit=OUTAGE_EXIT_STATUS, stdout=''), None),
-    'past its timeout': (ProbeAnswer(sleep_secs=5), 1),
+    'killed': ProbeAnswer(signal=signal.SIGKILL),
+    'another exit code': ProbeAnswer(exit=3),
+    'the outage exit printing nothing': ProbeAnswer(exit=OUTAGE_EXIT_STATUS, stdout=''),
 }
+PROBE_TIMEOUT_SECS = 1
+PROBE_STARTS = {'starting at once': '', 'starting after its timeout': f'sleep {PROBE_TIMEOUT_SECS + 1}; '}
+#: A probe that never answers on its own, so the lane's timeout ends it whenever its child first gets a CPU.
+HANGING_PROBE = 'exec sleep 30'
 
 
-@pytest.mark.asyncio
-@pytest.mark.timeout(lane_test_timeout(drives=1))
-@pytest.mark.parametrize(('answer', 'timeout_secs'), BROKEN_PROBES.values(), ids=list(BROKEN_PROBES))
-async def test_scenario_38_a_broken_probe_is_confirmed_as_if_none_were_declared_under_one_record(
-    tmp_path, monkeypatch, answer, timeout_secs,
-):
-    lane = await RedPathLane.open(tmp_path, monkeypatch, command=probed_command(timeout_secs))
-    lane.stub.probe(answer)
-
-    record = await lane.advance(RED_A, RED_A)
-
+def assert_confirmed_as_if_no_probe_under_one_broken_record(lane: RedPathLane, record: PassRecord) -> ProbeResult:
     assert record.outcome == {
         'arm': 'confirmed', 'mode': 'narrowed', 'reproduced': [A], 'cleared': [], 'inconclusive': [],
     }
+    assert record.detect is not None
+    assert record.detect.probe is not None
+    assert record.detect.probe.result == ProbeKind.BROKEN
     assert len(lane.stub.invocations()) == 2
-    assert len(lane.stub.probe_invocations()) == 1
     episode = lane.episode(A)
     assert episode is not None
     assert episode.counted_passes == (record.pass_id,)
     [broken] = lane.pending(PROBE_BROKEN_CATEGORY)
     assert broken.level == 1
+    return record.detect.probe
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(lane_test_timeout(drives=1))
+@pytest.mark.parametrize('answer', BROKEN_PROBES.values(), ids=list(BROKEN_PROBES))
+async def test_scenario_38_a_broken_probe_is_confirmed_as_if_none_were_declared_under_one_record(
+    tmp_path, monkeypatch, answer,
+):
+    lane = await RedPathLane.open(tmp_path, monkeypatch, command=PROBED_COMMAND)
+    lane.stub.probe(answer)
+
+    record = await lane.advance(RED_A, RED_A)
+
+    assert_confirmed_as_if_no_probe_under_one_broken_record(lane, record)
+    assert len(lane.stub.probe_invocations()) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(lane_test_timeout(drives=1))
+@pytest.mark.timing(reason='the outage probe timeout is the behaviour under test')
+@pytest.mark.parametrize('start', PROBE_STARTS.values(), ids=list(PROBE_STARTS))
+async def test_scenario_38_a_probe_past_its_timeout_is_confirmed_as_if_none_were_declared_under_one_record(
+    tmp_path, monkeypatch, start,
+):
+    command = PROBED_COMMAND.model_copy(
+        update={'outage_probe': f'{start}{HANGING_PROBE}', 'outage_probe_timeout_secs': PROBE_TIMEOUT_SECS},
+    )
+    lane = await RedPathLane.open(tmp_path, monkeypatch, command=command)
+
+    record = await lane.advance(RED_A, RED_A)
+
+    probe = assert_confirmed_as_if_no_probe_under_one_broken_record(lane, record)
+    assert (probe.result, probe.returncode) == (ProbeKind.BROKEN, None)
+    assert probe.duration >= PROBE_TIMEOUT_SECS
 
 
 @pytest.mark.asyncio
