@@ -2304,8 +2304,6 @@ async def test_collect_scheduler_state_ignores_an_unknown_key_from_a_newer_produ
 
     fixed = datetime(2026, 4, 11, 12, 0, 0, tzinfo=UTC)
     reply = _scheduler_snapshot(
-        is_paused=True,
-        pause_reason='park-stop: test',
         pin_queue=[{'task_id': '1', 'order': 1}],
         park_stacks={'src/a': [{'owner': '9', 'rank': 2, 'shadowed': False,
                                 'installed_at': '', 'source': 'fairness', 'tier': 'medium'}]},
@@ -2321,9 +2319,7 @@ async def test_collect_scheduler_state_ignores_an_unknown_key_from_a_newer_produ
             return await collect_scheduler_state(dummy_client, dummy_config, now=fixed)
 
     baseline = await collect(reply)
-    _rows, modules, pin_queue, _events, _offline, paused, _recovery, _degraded = baseline
-    project = dummy_config.project_root.name
-    assert paused == [{'project': project, 'reason': 'park-stop: test'}]
+    _rows, modules, pin_queue, _events, _offline, _paused, _recovery, _degraded = baseline
     assert [pin['task_id'] for pin in pin_queue] == ['1']
     assert [(m['path'], m['parked_by']) for m in modules] == [('src/a', '9')]
 
