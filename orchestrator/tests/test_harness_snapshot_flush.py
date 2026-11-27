@@ -104,7 +104,9 @@ class TestPauseAndResumeFlush:
     async def test_pause_and_resume_record_their_events_before_they_flush(self, tmp_path: Path) -> None:
         harness = _harness(_config(tmp_path))
         order: list[str] = []
-        emit = harness.event_store.emit
+        event_store = harness.event_store
+        assert event_store is not None
+        emit = event_store.emit
         flush = harness.scheduler.flush_state_snapshot
 
         def recording_emit(event_type: Any, *args: Any, **kwargs: Any) -> Any:
@@ -115,7 +117,7 @@ class TestPauseAndResumeFlush:
             order.append('flush')
             await flush()
 
-        harness.event_store.emit = recording_emit  # type: ignore[method-assign]
+        event_store.emit = recording_emit  # type: ignore[method-assign]
         harness.scheduler.flush_state_snapshot = recording_flush  # type: ignore[method-assign]
 
         await harness.pause_scheduler(_COST_REASON, PauseClass.COST_CEILING, file_escalation=False)
