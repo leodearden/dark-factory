@@ -54,10 +54,12 @@ from orchestrator.offline_lane_records import (
     Leg,
     PassRecord,
     Phase,
+    ProbeKind,
+    ProbeResult,
     RunRecord,
     RunRecordStore,
 )
-from orchestrator.offline_lane_runs import ConfirmRunner
+from orchestrator.offline_lane_runs import ConfirmRunner, ProbeSeam, run_probe
 from orchestrator.verify_cache import keys, registry
 from orchestrator.verify_cache.audit_hook import AUDIT_ESCALATION_SENTINEL, VerifyCacheAuditHook
 from orchestrator.verify_cache.audit_run import AUDIT_COMMAND, AuditNode
@@ -71,6 +73,8 @@ EFFECT = PassEffect(
     threshold_reached=(), stale_heads=(), no_decision=(), tasks_filed=(), escalations_raised=(),
 )
 SIGTERM_ENDED = Unconfirmable(UnconfirmableReason.CONFIRM_SIGNAL_ENDED, '-15')
+PROBED = LaneLeg.generic(LANE_COMMAND.model_copy(update={'outage_probe': 'python probe.py'}))
+SIGTERMED_PROBE = ProbeResult(ProbeKind.BROKEN, -15, None, '', 0.5)
 
 
 def _exited(record: RunRecord) -> RunRecord:
@@ -152,6 +156,14 @@ def _detect(
     return detect
 
 
+def _probe(log: list[str], answer: ProbeResult) -> ProbeSeam:
+    async def probe(command: LaneCommand, worktree: Path) -> ProbeResult:
+        log.append('probe')
+        return answer
+
+    return probe
+
+
 def _injected(returncode: int) -> DetectSeam:
     async def detect() -> tuple[int, str]:
         return returncode, ''
@@ -177,6 +189,7 @@ class Pass:
         confirm: ConfirmSeam | None = None,
         hooks: Sequence[PassOutcomeHook] = (),
         engine: PassObserver | None = None,
+        probe_runner: ProbeSeam = run_probe,
         stopping: Callable[[], bool] = never_stopping,
     ) -> bool:
         return await run_pass(
@@ -188,6 +201,7 @@ class Pass:
             store=self.store,
             engine=engine or self.engine,
             hooks=hooks,
+            probe_runner=probe_runner,
             stopping=stopping,
         )
 
@@ -361,6 +375,43 @@ async def test_a_confirm_the_lanes_own_stop_killed_leaves_its_pass_with_no_effec
     assert (hook.calls, lane.engine.observations) == ([], [])
     assert lane.stored().confirm == killed
     assert lane.pass_blocks() == (None, None)
+
+
+@pytest.mark.asyncio
+async def test_an_outage_probe_the_lanes_own_stop_killed_leaves_its_pass_with_no_effect(tmp_path, caplog):
+    lane = Pass(tmp_path)
+    confirm_seam = FakeConfirm(lane.store, lane.log)
+    hook = RecordingHook(lane.log)
+
+    with caplog.at_level(logging.INFO, logger='orchestrator.offline_lane_pass'):
+        green = await lane.run(
+            _detect(lane.store, failing=(A,)), target=PROBED, confirm=confirm_seam, hooks=(hook,),
+            probe_runner=_probe(lane.log, SIGTERMED_PROBE), stopping=lambda: True,
+        )
+
+    detect = lane.stored().detect
+    assert green is False
+    assert lane.log == ['probe']
+    assert (confirm_seam.calls, hook.calls, lane.engine.observations) == ([], [], [])
+    assert detect is not None and detect.probe == SIGTERMED_PROBE
+    assert lane.stored().confirm is None
+    assert lane.pass_blocks() == (None, None)
+    assert any('its outage probe' in r.getMessage() for r in caplog.records), caplog.text
+
+
+@pytest.mark.asyncio
+async def test_a_signal_ended_outage_probe_outside_a_stop_is_still_broken(tmp_path):
+    lane = Pass(tmp_path)
+    hook = RecordingHook(lane.log)
+
+    await lane.run(
+        _detect(lane.store, failing=(A,)), target=PROBED, hooks=(hook,),
+        probe_runner=_probe(lane.log, SIGTERMED_PROBE), stopping=lambda: False,
+    )
+
+    assert lane.log == ['probe', 'confirm', 'hook', 'observe']
+    assert lane.observed().probe == SIGTERMED_PROBE
+    assert lane.pass_blocks() == (outcome_to_json(REPRODUCED), EFFECT.to_json())
 
 
 @pytest.mark.asyncio

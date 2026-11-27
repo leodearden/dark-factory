@@ -1,9 +1,10 @@
 """One pass of one offline-lane command: detect, probe and confirm a red, ask the outcome hooks, then the engine.
 
 PRD ``plans/offline-lane-red-path-prd.md`` D4, D7, D13 and sections 5.7 and 5.10.  The engine's
-:meth:`~orchestrator.offline_lane_episodes.LaneEngine.observe` sees every pass, green
-included, and is the only point at which a pass has an effect; the pass record then
-keeps the outcome and that effect.
+:meth:`~orchestrator.offline_lane_episodes.LaneEngine.observe` sees every pass that
+reaches an outcome or a green detection, and is the only point at which a pass has an
+effect; the pass record then keeps the outcome and that effect.  A pass whose sub-run
+the lane's own stop killed is never observed (see :func:`run_pass`).
 """
 
 from __future__ import annotations
@@ -104,15 +105,26 @@ def never_stopping() -> bool:
     return False
 
 
+def _ended_by_the_stop(ended_by: str, stopping: Callable[[], bool]) -> bool:
+    return ended_by == EndedBy.SIGNAL and stopping()
+
+
 def _killed_by_the_stop(record: RunRecord | None, stopping: Callable[[], bool]) -> TypeGuard[RunRecord]:
-    return record is not None and record.ended_by == EndedBy.SIGNAL and stopping()
+    return record is not None and _ended_by_the_stop(record.ended_by, stopping)
 
 
-def _log_killed_by_the_stop(target: LaneLeg, lane_pass: LanePass, record: RunRecord) -> None:
+def _probe_killed_by_the_stop(probe: ProbeResult | None, stopping: Callable[[], bool]) -> TypeGuard[ProbeResult]:
+    """Classifies the probe's exit as a run record's ``ended_by`` is; a probe that never exited was not killed."""
+    if probe is None or probe.returncode is None:
+        return False
+    return _ended_by_the_stop(classify_exit(probe.returncode), stopping)
+
+
+def _log_killed_by_the_stop(target: LaneLeg, lane_pass: LanePass, sub_run: str, returncode: int | None) -> None:
     logger.info(
-        'offline-lane: %s pass %s: its %s sub-run was ended by a signal (rc %s) while the lane is stopping;'
+        'offline-lane: %s pass %s: its %s was ended by a signal (rc %s) while the lane is stopping;'
         ' the pass has no effect',
-        target.label, lane_pass.pass_id, record.phase, record.returncode,
+        target.label, lane_pass.pass_id, sub_run, returncode,
     )
 
 
@@ -177,8 +189,8 @@ async def run_pass(
     A red detection of a command that declares ``outage_probe`` runs the probe first;
     an outage answer skips the confirm and the hooks.  A red detection that left no run
     record (an injected seam) is handed to *confirm* with no record, which the lane's
-    confirm answers ``Unconfirmable(NO_DETECT_RECORD)``.  A detect or confirm ended by a
-    signal while *stopping* holds is the lane's own stop killing it (PRD
+    confirm answers ``Unconfirmable(NO_DETECT_RECORD)``.  A detect, outage probe or confirm
+    ended by a signal while *stopping* holds is the lane's own stop killing it (PRD
     ``plans/offline-lane-red-path-prd.md`` D4, section 14 item 25), so the pass has no effect.
     """
     lane_pass = await asyncio.to_thread(store.allocate_pass, target.command, target.leg, head)
@@ -187,13 +199,16 @@ async def run_pass(
     _log_sub_run(target, head, returncode, time.monotonic() - started)
     detect_record = store.last_record(target.command, Phase.DETECT)
     if _killed_by_the_stop(detect_record, stopping):
-        _log_killed_by_the_stop(target, lane_pass, detect_record)
+        _log_killed_by_the_stop(target, lane_pass, 'detect sub-run', detect_record.returncode)
         return False
     outcome: PassOutcome | None = None
     probe: ProbeResult | None = None
     notes: tuple[EvidenceNote, ...] = ()
     if returncode != 0:
         probe = await _probed(target, worktree, store, lane_pass, probe_runner)
+        if _probe_killed_by_the_stop(probe, stopping):
+            _log_killed_by_the_stop(target, lane_pass, 'outage probe', probe.returncode)
+            return False
         detect_record = store.last_record(target.command, Phase.DETECT)
         if probe is not None and probe.result == ProbeKind.OUTAGE:
             outcome = Outage(probe)
@@ -202,7 +217,7 @@ async def run_pass(
             confirmed = await confirm(confirm_target, detect_record, confirm_runner(store, lane_pass))
             confirm_record = store.last_record(target.command, Phase.CONFIRM)
             if _killed_by_the_stop(confirm_record, stopping):
-                _log_killed_by_the_stop(target, lane_pass, confirm_record)
+                _log_killed_by_the_stop(target, lane_pass, 'confirm sub-run', confirm_record.returncode)
                 return False
             notes = await _hook_notes(hooks, target.command, head, confirmed, _run_records(store, target.command))
             outcome = confirmed
