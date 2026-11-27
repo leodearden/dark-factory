@@ -8,7 +8,7 @@ import logging
 import re
 import threading
 import time
-from collections.abc import Awaitable, Callable, Iterable
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -74,13 +74,16 @@ from .hermeticity import (
     writers_held_by,
 )
 from .metrics import (
+    DispatchRecord,
     EndpointKind,
     EvalMetrics,
     RoleUnderTest,
     compute_composite,
+    dispatched_models,
     is_false_green,
     is_null_work,
     is_proxied_endpoint,
+    off_pin_roles,
     resolve_cost_usd,
 )
 from .profile import apply_eval_profile
@@ -863,6 +866,7 @@ async def collect_metrics(
         cli_cost_usd=wf_metrics.total_cost_usd,
         cli_cost_untrusted=cli_cost_untrusted,
     )
+    dispatched = dispatched_models(wf_metrics.dispatched_routes)
 
     m = EvalMetrics(
         tests_pass=verification.passed if verification else False,
@@ -893,7 +897,9 @@ async def collect_metrics(
         replay_frame=replay_frame,
         sandbox_backend=sandbox_backend,
         endpoint_kind=endpoint_kind,
+        dispatched_models=dispatched,
     )
+    _warn_off_pin_dispatch(task.get('id', '?'), dispatched)
     # False-green guard — catches the 404-bug signature so the same class of
     # silent failure doesn't need manual quarantine in future runs.
     enforced_cap = execute_iteration_cap(
@@ -950,6 +956,25 @@ async def collect_metrics(
         )
 
     return m
+
+
+def _warn_off_pin_dispatch(task_id: str, dispatched: Mapping[str, list[DispatchRecord]]) -> None:
+    """One WARNING naming every role whose dispatches left its cell's pinned model."""
+    roles = off_pin_roles(dispatched)
+    if not roles:
+        return
+    logger.warning(
+        'Eval cell %s did not run the models its config pins: %s',
+        task_id,
+        '; '.join(
+            f'{role}: ' + ', '.join(
+                f"{r['model']} (source_layer={r['source_layer']}, rule_id={r['rule_id']}, "
+                f"served_model_id={r['served_model_id']})"
+                for r in dispatched[role]
+            )
+            for role in roles
+        ),
+    )
 
 
 async def _git_diff_stats(worktree: Path, base_commit: str) -> tuple[int, int]:
