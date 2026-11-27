@@ -346,16 +346,8 @@ def scheduler_pause(runs_db: Path | str, *, now: datetime) -> Measurement[str | 
 def new_escalations(queue_dirs: Iterable[str], window: Window, *, now: datetime) -> Measurement[int]:
     """Records filed (by ``timestamp``) in *window*, root tier and archive, at any level and status."""
     def measure(queues: Sequence[str]) -> tuple[int, tuple[Shortfall, ...]]:
-        filed = 0
-        shortfalls: list[Shortfall] = []
-        for queue in queues:
-            for path in iter_all_escalation_paths(Path(queue)):
-                esc, problem = inventory.read_escalation(path)
-                if problem is not None:
-                    shortfalls.append(problem)
-                if esc is not None and window.holds(inventory.parse_stamp(esc.timestamp)):
-                    filed += 1
-        return filed, tuple(shortfalls)
+        filed, shortfalls = _records(queues, lambda esc: window.holds(inventory.parse_stamp(esc.timestamp)))
+        return len(filed), shortfalls
 
     return _over_queues(queue_dirs, 0, measure, now)
 
@@ -684,17 +676,26 @@ def _fold_reports(reports: Sequence[AgreementReport], window: Window) -> Agreeme
     )
 
 
-def _resolved_in_window(queues: Sequence[str], window: Window) -> tuple[list[Escalation], tuple[Shortfall, ...]]:
-    resolved: list[Escalation] = []
+def _records(
+    queues: Sequence[str], keep: Callable[[Escalation], bool],
+) -> tuple[list[Escalation], tuple[Shortfall, ...]]:
+    """The records *keep* accepts across *queues*' root tiers and archives, and every record that could not be read."""
+    kept: list[Escalation] = []
     shortfalls: list[Shortfall] = []
     for queue in queues:
         for path in iter_all_escalation_paths(Path(queue)):
             esc, problem = inventory.read_escalation(path)
             if problem is not None:
                 shortfalls.append(problem)
-            if esc is not None and esc.status != 'pending' and window.holds(inventory.parse_stamp(esc.resolved_at)):
-                resolved.append(esc)
-    return resolved, tuple(shortfalls)
+            if esc is not None and keep(esc):
+                kept.append(esc)
+    return kept, tuple(shortfalls)
+
+
+def _resolved_in_window(queues: Sequence[str], window: Window) -> tuple[list[Escalation], tuple[Shortfall, ...]]:
+    return _records(
+        queues, lambda esc: esc.status != 'pending' and window.holds(inventory.parse_stamp(esc.resolved_at)),
+    )
 
 
 def _trial(resolved: Iterable[Escalation]) -> PreparerTrial:

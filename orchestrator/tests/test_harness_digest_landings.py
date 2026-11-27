@@ -144,3 +144,16 @@ class TestHarnessDigestLandings:
 
         section = _section(_written_digest(tmp_path), '## Landings in window')
         assert section.startswith('_unavailable')
+
+    @pytest.mark.asyncio
+    async def test_a_harness_without_an_event_store_renders_landings_unavailable(
+        self, tmp_path: Path, _cost_store_factory,
+    ) -> None:
+        repo = landing_repo(tmp_path / 'repo')
+        harness = await _harness(tmp_path, repo.root, _cost_store_factory)
+        harness.event_store = None
+
+        await harness._maybe_write_digest()
+
+        section = _section(_written_digest(tmp_path), '## Landings in window')
+        assert section.startswith('_unavailable')

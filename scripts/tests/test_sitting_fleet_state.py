@@ -246,6 +246,26 @@ class TestLanded:
         assert gap.path == str(plain)
         assert 'GitUnavailable' in gap.reason
 
+    def test_a_train_event_with_neither_payload_is_unreadable(self, df):
+        runs_db = mod.runs_db_path(df)
+        conn = sqlite3.connect(runs_db)
+        try:
+            conn.execute(
+                'INSERT INTO events (timestamp, run_id, task_id, event_type, data) '
+                "VALUES (?, 'r1', '7', 'train_merged', '{}')",
+                (IN_WINDOW,),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        measurement = mod.landed(runs_db, WINDOW, now=NOW, repo=df)
+
+        assert (measurement.value, measurement.status) == (0, 'unreadable')
+        (gap,) = measurement.shortfalls
+        assert gap.path == str(df)
+        assert 'UnrecognisedTrainEvent' in gap.reason
+
     def test_a_missing_runs_db_is_a_flagged_zero(self, df, tmp_path):
         runs_db = tmp_path / 'absent' / 'runs.db'
 
