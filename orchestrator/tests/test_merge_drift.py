@@ -32,6 +32,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from _drift_lanes import registered_drift_lanes
+from _git_fixtures import seed_repo
 from _lane_test_helpers import get_head
 from _merge_lane_fakes import FakeVerifier, delegates_to, hangs_until
 from _orch_helpers import wait_responsive
@@ -45,7 +46,7 @@ from _seed_script_stubs import (
 
 from orchestrator.config import GitConfig, OrchestratorConfig, VerifyRunnerConfig
 from orchestrator.event_store import EventStore, EventType
-from orchestrator.git_ops import GitOps, WorktreeKind, _run
+from orchestrator.git_ops import GitOps, WorktreeKind
 from orchestrator.merge_lane.drift import (
     DriftCheckState,
     _load_drift_check_state,
@@ -1027,21 +1028,9 @@ class TestEnvCheckCannotBreakVerdictDriftCheck:
 # ---------------------------------------------------------------------------
 
 
-async def _setup_drift_repo(repo: Path) -> None:
-    await _run(['git', 'init', '-b', 'main'], cwd=repo)
-    await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=repo)
-    await _run(['git', 'config', 'user.name', 'Test'], cwd=repo)
-    (repo / 'README.md').write_text('# Test\n')
-    await _run(['git', 'add', '-A'], cwd=repo)
-    await _run(['git', 'commit', '-m', 'Initial commit'], cwd=repo)
-
-
 @pytest.fixture
 def drift_git_repo(tmp_path: Path) -> Path:
-    repo = tmp_path / 'repo'
-    repo.mkdir()
-    asyncio.run(_setup_drift_repo(repo))
-    return repo
+    return seed_repo(tmp_path / 'repo')
 
 
 @pytest.fixture

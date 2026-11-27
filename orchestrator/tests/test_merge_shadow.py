@@ -15,11 +15,11 @@ mirroring task β's test_merge_gates.py:
 
 from __future__ import annotations
 
-import asyncio
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _git_fixtures import seed_repo
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
@@ -1308,15 +1308,6 @@ def test_build_warm_shadow_results_empty_parse_returned_unchanged() -> None:
 # ---------------------------------------------------------------------------
 
 
-async def _setup_shadow_repo(repo: Path) -> None:
-    await _run(['git', 'init', '-b', 'main'], cwd=repo)
-    await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=repo)
-    await _run(['git', 'config', 'user.name', 'Test'], cwd=repo)
-    (repo / 'README.md').write_text('# Test\n')
-    await _run(['git', 'add', '-A'], cwd=repo)
-    await _run(['git', 'commit', '-m', 'Initial commit'], cwd=repo)
-
-
 async def _shadow_head_sha(repo: Path) -> str:
     rc, out, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=repo)
     assert rc == 0
@@ -1325,10 +1316,7 @@ async def _shadow_head_sha(repo: Path) -> str:
 
 @pytest.fixture
 def shadow_git_repo(tmp_path: Path) -> Path:
-    repo = tmp_path / 'repo'
-    repo.mkdir()
-    asyncio.run(_setup_shadow_repo(repo))
-    return repo
+    return seed_repo(tmp_path / 'repo')
 
 
 @pytest.fixture
