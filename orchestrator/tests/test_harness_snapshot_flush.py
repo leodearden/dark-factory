@@ -15,18 +15,18 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-
-from orchestrator.config import OrchestratorConfig
-from orchestrator.event_store import EventStore
-from orchestrator.harness import Harness
-from orchestrator.pause_policy import PauseClass
-from orchestrator.run_store import RunStore
 from shared.project_layout import runs_db, scheduler_state_json
 from shared.scheduler_state import (
     CheckedSchedulerState,
     SchedulerStateSnapshot,
     read_scheduler_state_checked,
 )
+
+from orchestrator.config import OrchestratorConfig
+from orchestrator.event_store import EventStore
+from orchestrator.harness import Harness
+from orchestrator.pause_policy import PauseClass
+from orchestrator.run_store import RunStore
 
 _COST_REASON = 'cost_ceiling_orch_exceeded'
 _PRIOR_PAUSE_AT = '2026-11-20T03:11:09+00:00'
