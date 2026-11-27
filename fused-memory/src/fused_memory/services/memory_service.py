@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import dataclasses
+import functools
 import hashlib
 import json
 import logging
@@ -16,7 +17,6 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar, assert_never, cast
 
-import httpx
 from graphiti_core.errors import EdgeNotFoundError
 from graphiti_core.nodes import EpisodeType
 from shared.streak import KeyedStreaks
@@ -2481,21 +2481,16 @@ class MemoryService:
             parked_items=parked_items, escalation_id=self._plan_cap_alarm.escalation_id(),
         )
 
-    def _graphiti_plan_route_client(self) -> httpx.AsyncClient | None:
-        provider = self.config.llm.providers.openai
-        if self.config.llm.provider != 'openai' or provider is None or not provider.api_url:
-            return None
-        return self.plan_route.http_client_for(provider.api_url, site=PlanRouteSite.GRAPHITI)
-
     async def initialize(self) -> None:
         """Initialize backends and the durable write queue."""
-        plan_client = self._graphiti_plan_route_client()
-        if plan_client is None:
-            await self.graphiti.initialize()
-        else:
-            await self.graphiti.initialize(
-                llm_client=build_llm_client(self.config, http_client=plan_client),
-            )
+        await self.graphiti.initialize(
+            llm_client=build_llm_client(
+                self.config,
+                gated_http_client_for=functools.partial(
+                    self.plan_route.http_client_for, site=PlanRouteSite.GRAPHITI,
+                ),
+            ),
+        )
 
         qcfg = self.config.queue
 
