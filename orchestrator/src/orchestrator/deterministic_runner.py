@@ -700,6 +700,35 @@ def file_deterministic_escalation(
 
 
 @dataclass(frozen=True)
+class GatePin:
+    """The declared pin a gate's escalation is filed with; empty means unpinned."""
+
+    declared_by: tuple[str, ...] = ()
+    reason: str = ''
+
+
+def curator_gate_pin(task_id: str, metadata: dict) -> GatePin:
+    """The declared pin for a human-curator gate's escalation, or an empty ``GatePin``.
+
+    Why the record carries it: docs/deterministic-runner.md
+    "Human-curator gate contract".
+    """
+    if not _is_human_curator_gate(metadata):
+        return GatePin()
+    return GatePin(
+        declared_by=(f'task-{task_id}-human-curator-gate',),
+        reason=(
+            f'Task {task_id} carries `metadata.{HUMAN_CURATOR_GATE_KEY}`: it closes '
+            'only on human CONTENT adjudication of every entry it names. '
+            'Acknowledge this pin only after that review is done and '
+            f'`metadata.{HUMAN_CURATOR_ADJUDICATED_AT_KEY}` is stamped, or when '
+            "cancelling the gate with action='abandon'. A factual finding that "
+            'does not complete the review belongs in amend_escalation, not in a close.'
+        ),
+    )
+
+
+@dataclass(frozen=True)
 class GateEscalationFields:
     """The fields of a pure gate's born-at-L2 escalation that depend on the task."""
 
@@ -708,6 +737,7 @@ class GateEscalationFields:
     detail: str
     options: tuple[str, ...]
     review_due: ReviewDueState | None
+    pin: GatePin = GatePin()
 
 
 def gate_escalation_category(metadata: dict) -> str:
@@ -736,6 +766,7 @@ def build_gate_escalation_fields(
     The operational-LLM token prefix applies to either.
     """
     task = task or {}
+    task_id = str(task.get('id'))
     dep_ids = dependency_ids(task)
     detail_parts = [task.get('description', '')]
     if dep_ids:
@@ -747,7 +778,7 @@ def build_gate_escalation_fields(
         detail_parts.append(human_gate.detail_line())
     elif human_gate is not None:
         due = build_review_due(
-            human_gate, human_gate_task_id=str(task.get('id')),
+            human_gate, human_gate_task_id=task_id,
             escalation_id=escalation_id, fired_at=fired_at,
         )
         category = REVIEW_DUE_CATEGORY
@@ -770,6 +801,7 @@ def build_gate_escalation_fields(
         detail=detail,
         options=tuple(metadata.get('gate_options') or ()),
         review_due=payload,
+        pin=curator_gate_pin(task_id, metadata),
     )
 
 
