@@ -7,12 +7,13 @@ from dataclasses import asdict, dataclass, fields
 from datetime import UTC, datetime
 from enum import StrEnum
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, TypedDict
 
 # The per-token cost formula and its primitives have a SINGLE home in
 # agents.token_pricing, a leaf module that invoke._estimate_cost prices through
 # too, so runtime and eval figures cannot drift apart.
 from orchestrator.agents.token_pricing import FALLBACK_PRICE, TokenUsage, price_tokens
+from orchestrator.routing import CONFIG_SOURCE_LAYER
 from orchestrator.shadow_types import ReferenceKind
 
 from .cell_sandbox import CellSandbox
@@ -20,13 +21,14 @@ from .measurement import UnmeasuredRecord
 from .plan_predicates import is_scorable_plan
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Iterable, Mapping
 
     # TYPE_CHECKING only, deliberately: this module must not gain a RUNTIME
     # import of orchestrator.artifacts. read_decline_artifacts below reaches
     # the readers by getattr, so it needs the NAME for the signature and
     # nothing at import time.
     from orchestrator.artifacts import TaskArtifacts
+    from orchestrator.routing import DispatchedRoute
 
 logger = logging.getLogger(__name__)
 
@@ -89,6 +91,15 @@ class EndpointKind(StrEnum):
 CANDIDATE_ROLES: frozenset[RoleUnderTest] = frozenset({
     RoleUnderTest.IMPLEMENTER, RoleUnderTest.ARCHITECT, RoleUnderTest.JUDGE,
 })
+
+
+class DispatchRecord(TypedDict):
+    """The persisted, JSON-safe form of one distinct route a role ran on."""
+
+    model: str
+    served_model_id: str | None
+    source_layer: str
+    rule_id: str | None
 
 
 @dataclass
@@ -317,6 +328,10 @@ class EvalMetrics:
     # (evals/fixture_agent_env.py).
     sandbox_backend: CellSandbox | None = None
 
+    # Per role, the distinct routes its invocations ran on. None means not
+    # recorded (a cell before task 8499, or collection failed); off_pin_roles reads it.
+    dispatched_models: dict[str, list[DispatchRecord]] | None = None
+
     # Live shadow eval (plans/live-shadow-eval-prd.md C1/C4): the shadow_cells row
     # is the record's home and this is its pointer. None on every non-shadow cell
     # and on every result persisted before these fields existed.
@@ -363,6 +378,37 @@ def terminal_kind_of(metrics: dict[str, Any]) -> str | None:
     Pure: no I/O, no mutation.
     """
     return metrics.get('terminal_kind')
+
+
+def dispatched_models(routes: Iterable[DispatchedRoute]) -> dict[str, list[DispatchRecord]]:
+    """Per role, the distinct :class:`DispatchRecord` of *routes*, in first-dispatch order."""
+    by_role: dict[str, list[DispatchRecord]] = {}
+    for route in routes:
+        record = DispatchRecord(
+            model=route.decision.model,
+            served_model_id=route.served_model_id,
+            source_layer=route.decision.source_layer,
+            rule_id=route.decision.rule_id,
+        )
+        records = by_role.setdefault(route.role_name, [])
+        if record not in records:
+            records.append(record)
+    return by_role
+
+
+def off_pin_roles(dispatched: Mapping[str, list[DispatchRecord]] | None) -> list[str] | None:
+    """THE consumer accessor for :attr:`EvalMetrics.dispatched_models`.
+
+    The sorted roles that ran a model their cell's config did not pin: any record
+    whose model came from a layer other than ``routing.CONFIG_SOURCE_LAYER``.
+    ``None`` when the dispatches were not recorded.
+    """
+    if dispatched is None:
+        return None
+    return sorted(
+        role for role, records in dispatched.items()
+        if any(record['source_layer'] != CONFIG_SOURCE_LAYER for record in records)
+    )
 
 
 def _parse_terminal_stamp(value: object) -> datetime | None:
