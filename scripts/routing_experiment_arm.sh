@@ -5,11 +5,13 @@
 # and every reachable unit reloaded; non-zero = the caller escalates born-at-L2.
 #
 # 1. Confirms main carries the experiment's rule ids (gamma landed), so a reload
-#    cannot silently arm an older table.
+#    cannot silently arm an older table. Main's copy is read once and each id is
+#    tested against it.
 # 2. Runs scripts/routing_experiment_readout.py --aa (leaf beta) over the trailing
-#    window with the experiment salt: the A/A check that seat N showed is required
-#    before any split is read (task-id parity skew, drift). Non-zero there stops here.
-# 3. Calls reload_config on every unit listed in UNITS through the shared transport
+#    window with the experiment salt, reading only the experiment units' roots: the
+#    A/A check that seat N showed is required before any split is read (task-id
+#    parity skew, drift). Non-zero there stops here.
+# 3. Calls reload_config on every experiment unit through the shared transport
 #    (scripts/_config_reload_gate.py). A unit whose MCP is not listening is SKIPPED
 #    with a warning, never a failure: defaults.yaml is re-read at its next start, so
 #    a halted or idle unit arms itself when it comes back. A unit that answers with
@@ -18,7 +20,8 @@
 #    the salt, rule ids, flip time and per-unit dispositions: the readout gate's
 #    anchor for "when did arm 1 start".
 #
-# Usage: routing_experiment_arm.sh <salt> <rule_id_csv> [days]
+# Usage: [ROUTING_EXPERIMENT_UNITS='<project_root>:<port> ...'] \
+#          routing_experiment_arm.sh <salt> <rule_id_csv> [days]
 #   e.g. routing_experiment_arm.sh routing-exp-1 large-plan-modules-4,large-plan-modules 30
 set -euo pipefail
 
@@ -30,8 +33,10 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
 PY="$ROOT/.venv/bin/python3"; [ -x "$PY" ] || PY=python3
 
-# Fleet units: <project_root>:<escalation_port>. Idle or halted units are skipped
-# when their MCP does not answer (see header). Override with ROUTING_EXPERIMENT_UNITS.
+# The experiment's units, <project_root>:<escalation_port> with an absolute
+# project_root, whitespace-separated.
+# Step 2's A/A reads exactly their roots and step 3 reloads exactly them. The
+# default is the whole fleet; ROUTING_EXPERIMENT_UNITS names a subset.
 UNITS="${ROUTING_EXPERIMENT_UNITS:-\
 /home/leo/src/dark-factory:8102 \
 /home/leo/src/reify:8100 \
@@ -43,23 +48,39 @@ UNITS="${ROUTING_EXPERIMENT_UNITS:-\
 /home/leo/src/know-live:8105 \
 /home/leo/src/autopilot-video:8101}"
 
+IFS=$' \t\n' read -r -d '' -a UNIT_LIST <<< "$UNITS" || true
+[ "${#UNIT_LIST[@]}" -gt 0 ] \
+  || die "ROUTING_EXPERIMENT_UNITS names no unit; an experiment needs at least one <project_root>:<port>"
+ROOTS=(); ROOT_PORT_PAIRS=()
+for unit in "${UNIT_LIST[@]}"; do
+  [[ "$unit" =~ ^(/[^,]+):([0-9]+)$ ]] \
+    || die "unit '${unit}' is not <project_root>:<port> with an absolute, comma-free project_root"
+  ROOTS+=("${BASH_REMATCH[1]}")
+  ROOT_PORT_PAIRS+=("${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}")
+done
+ROOTS_CSV="$(IFS=,; printf '%s' "${ROOTS[*]}")"
+
 # 1. The rule ids must be on main's defaults.yaml (the editable install every unit reads).
+RULES_FILE=orchestrator/src/orchestrator/defaults.yaml
+RULES_TEXT="$(git -C "$ROOT" show "main:${RULES_FILE}")" \
+  || die "cannot read ${RULES_FILE} from main (git's message is above)"
 IFS=',' read -r -a RULE_IDS <<< "$RULES"
 for rid in "${RULE_IDS[@]}"; do
-  git -C "$ROOT" show main:orchestrator/src/orchestrator/defaults.yaml | grep -q "id: ${rid}\$" \
-    || die "rule id '${rid}' is not in main's defaults.yaml; land gamma before arming"
+  grep -q -- "id: ${rid}\$" <<< "$RULES_TEXT" \
+    || die "rule id '${rid}' is not in main's ${RULES_FILE}; land gamma before arming"
 done
 
 # 2. A/A check on an unchanged window.
 [ -f "$ROOT/scripts/routing_experiment_readout.py" ] \
   || die "scripts/routing_experiment_readout.py is missing; land beta before arming"
 "$PY" "$ROOT/scripts/routing_experiment_readout.py" --aa --salt "$SALT" --buckets 2 --days "$DAYS" \
+    --roots "$ROOTS_CSV" \
   || { rc=$?; die "the readout's A/A check did not pass for salt '$SALT' (exit $rc: 1 = skewed, 3 = no ledger read, 4 = unproven; its own message above says which); do not arm"; }
 
 # 3. Reload every reachable unit; 4. record the flip.
-"$PY" - "$HERE" "$SALT" "$RULES" "$ROOT/data/orchestrator/routing_experiments.jsonl" $UNITS <<'PYEOF'
+"$PY" - "$HERE" "$SALT" "$RULES" "$ROOT/data/orchestrator/routing_experiments.jsonl" "${ROOT_PORT_PAIRS[@]}" <<'PYEOF'
 import json, sys, datetime, pathlib
-here, salt, rules, ledger, *units = sys.argv[1:]
+here, salt, rules, ledger, *root_port_pairs = sys.argv[1:]
 sys.path.insert(0, here)
 import _config_reload_gate as gate
 
@@ -69,8 +90,7 @@ record = {
     "units": [],
 }
 failed = False
-for unit in units:
-    root, port = unit.rsplit(":", 1)
+for root, port in zip(root_port_pairs[0::2], root_port_pairs[1::2]):
     try:
         report = gate.fetch_reload_report(port, committed_as=f"routing split {salt}", config_path=None)
         applied = report.get("applied")
