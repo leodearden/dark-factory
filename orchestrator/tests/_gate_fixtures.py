@@ -1,10 +1,12 @@
 """A deployed sha, a gate layout and a gate-answering transport for RemoteRunner tests (task 6565).
 
 Every RemoteRunner dispatch first publishes the deployed sha and runs
-ensure-gate over ssh (``RemoteRunner.ensure_gate``).  Tests about something
-else build their runner with :func:`gated_remote_runner`, whose injected
-``run`` answers those two calls itself and hands every other call to the
-test's own fake, so that fake sees exactly the calls it saw before gating:
+ensure-gate over ssh (``RemoteRunner.ensure_gate``), then lists the project's
+local tags to mirror them (task 11840).  Tests about something else build
+their runner with :func:`gated_remote_runner`, whose injected ``run`` answers
+those three calls itself, reporting no tags so no tag push follows, and hands
+every other call to the test's own fake, so that fake sees exactly the calls
+it saw before gating:
 a push arrives as ``git push ...``, without the ``GIT_PUSH_SSH_CONFIG``
 transport options (test_remote_gate.py pins those on the raw argv).
 """
@@ -48,6 +50,12 @@ def is_ensure(argv: list[str]) -> bool:
     return bool(argv) and argv[0] == 'ssh' and argv[-1].endswith(' ensure-gate')
 
 
+def is_tag_listing(argv: list[str]) -> bool:
+    """The ``git for-each-ref ... refs/tags`` listing the dispatch's tag mirror starts with."""
+    plain = without_push_ssh_config(argv)
+    return plain[:2] == ['git', 'for-each-ref'] and plain[-1] == 'refs/tags'
+
+
 def ensure_reply(*, built: bool = False, identity: GateIdentity | None = None) -> str:
     """ensure-gate.sh's stdout for a gate answering *identity* (default: this process's)."""
     answered = identity or local_gate_identity(TEST_DEPLOYED_SHA.sha)
@@ -55,7 +63,11 @@ def ensure_reply(*, built: bool = False, identity: GateIdentity | None = None) -
 
 
 def gated_run(inner: Run, *, built: bool = False) -> Run:
-    """Wrap *inner* so the gate's publish push and ensure ssh succeed without reaching it."""
+    """Wrap *inner* so the gate's publish push and ensure ssh succeed without reaching it.
+
+    The dispatch's local tag listing is answered too, as "no tags", so no tag
+    push reaches *inner* either.
+    """
     reply = ensure_reply(built=built)
 
     async def run(argv: list[str], *, cwd: Any = None) -> tuple[int, str, str]:
@@ -63,6 +75,8 @@ def gated_run(inner: Run, *, built: bool = False) -> Run:
             return (0, '', '')
         if is_ensure(argv):
             return (0, reply, '')
+        if is_tag_listing(argv):
+            return (0, '', '')
         return await inner(without_push_ssh_config(argv), cwd=cwd)
 
     return run

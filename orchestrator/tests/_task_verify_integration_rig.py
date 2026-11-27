@@ -402,6 +402,10 @@ class LaptopHost:
             self._log('rev_parse', None, argv)
             done = subprocess.run(argv, cwd=cwd, capture_output=True, text=True)
             return done.returncode, done.stdout, done.stderr
+        if 'for-each-ref' in argv:
+            self._log('tag_list', None, argv)
+            done = subprocess.run(argv, cwd=cwd, capture_output=True, text=True)
+            return done.returncode, done.stdout, done.stderr
         if 'push' in argv:
             label, request_id = _push_label(argv)
             self._log(label, request_id, argv)
