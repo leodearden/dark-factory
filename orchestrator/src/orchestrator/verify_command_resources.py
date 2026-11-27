@@ -65,6 +65,7 @@ __all__ = [
     'allocate_command_capture',
     'resources_from_reading',
     'watch_relocations',
+    'wrapped_command',
 ]
 
 _CGROUP_FILE = 'cgroup'
@@ -76,6 +77,8 @@ _CAPTURED_FILES = (
     MEMORY_EVENTS,
     *(resource.file_name for resource in PressureResource),
 )
+_SUBSHELL_OPEN = '; exec {__df_err}>&2 2>/dev/null; ( '
+_SUBSHELL_CLOSE = '\n) 2>&$__df_err {__df_err}>&-\n__df_rc=$?\n'
 
 
 class Capture(StrEnum):
@@ -360,9 +363,8 @@ class CommandCapture:
             f' > {directory}/"$__df_f"; done; : > {directory}/{_COMPLETE_FILE}; }} 2>/dev/null'
         )
         return (
-            f'{record_cgroup}; exec {{__df_err}}>&2 2>/dev/null;'
-            f' ( {cmd}\n) 2>&$__df_err {{__df_err}}>&-'
-            f'\n__df_rc=$?\n{copy_counters}\nexit "$__df_rc"'
+            f'{record_cgroup}{_SUBSHELL_OPEN}{cmd}{_SUBSHELL_CLOSE}'
+            f'{copy_counters}\nexit "$__df_rc"'
         )
 
     def read_before_kill(self, relocated: Iterable[str]) -> None:
@@ -463,6 +465,13 @@ class CommandCapture:
         if isinstance(path, _Gap):
             return path
         return _read_directory(self._cgroup_root / path.lstrip('/'))
+
+
+def wrapped_command(script: str) -> str | None:
+    """The command *script* runs when it is ``CommandCapture.wrap``'s output; else ``None``."""
+    _record_cgroup, opened, rest = script.partition(_SUBSHELL_OPEN)
+    command, closed, _copy_counters = rest.rpartition(_SUBSHELL_CLOSE)
+    return command if opened and closed else None
 
 
 @contextlib.contextmanager

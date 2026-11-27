@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Literal
 
 import pytest
+from _command_capture_files import write_capture_directory
 from shared.testing_virtual_clock import virtual_clock_test
 
 _TEST_CMD = 'uv run pytest tests/ -q'
@@ -539,10 +540,12 @@ def _fill_exit_capture(capture) -> None:
     """Leave the capture directory as the in-scope script would after a clean exit."""
     directory = capture.directory
     assert directory is not None
-    for name, text in _CAPTURED_FILES.items():
-        (directory / name).write_text(text)
-    (directory / 'cgroup').write_text(f'0::/user.slice/df.slice/{_CAPTURED_UNIT}\n')
-    (directory / 'complete').write_text('')
+    write_capture_directory(
+        directory,
+        _CAPTURED_FILES,
+        cgroup=f'/user.slice/df.slice/{_CAPTURED_UNIT}',
+        complete=True,
+    )
     capture.launched(_CAPTURED_UNIT)
 
 

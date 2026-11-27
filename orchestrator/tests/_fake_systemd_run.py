@@ -22,6 +22,8 @@ from pathlib import Path
 
 import pytest
 
+from orchestrator.verify_command_resources import wrapped_command
+
 
 @pytest.fixture
 def fake_systemd_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
@@ -55,15 +57,12 @@ def recorded_scope_spawns(argv_dir: Path) -> list[list[str]]:
 
 def scope_payload_command(record: list[str]) -> str:
     """The leg command a recorded spawn's bash payload runs: the ``-c`` string
-    after verify's launch-handshake line, inside the C4 capture wrapper
-    (orchestrator/src/orchestrator/verify_command_resources.py::CommandCapture.wrap)."""
+    after verify's launch-handshake line, unwrapped by
+    orchestrator/src/orchestrator/verify_command_resources.py::wrapped_command."""
     _handshake, newline, wrapped = record[-1].partition('\n')
     assert newline, f'no launch-handshake line in the payload: {record!r}'
-    _record_cgroup, opened, rest = wrapped.partition('; ( ')
-    command, closed, _copy_counters = rest.rpartition(
-        '\n) 2>&$__df_err {__df_err}>&-\n__df_rc=$?\n'
-    )
-    assert opened and closed, f'no capture wrapper around the command: {wrapped!r}'
+    command = wrapped_command(wrapped)
+    assert command is not None, f'no capture wrapper around the command: {wrapped!r}'
     return command
 
 
