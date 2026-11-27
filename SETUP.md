@@ -534,11 +534,21 @@ unknown key, a duplicated key or an empty document rather than reading fewer
 hosts. Anchors and merge keys (`<<: *anchor`) work as in plain YAML, so hosts
 can share a project block and override single keys.
 
-**Today only the two scripts read it.** Until task α2 lands, the orchestrator
-still takes its runner list from the inline `verify_runners` block or from
-`ORCH_VERIFY_RUNNERS` in its environment, which ranks above the yaml (see
-"What stays on the workstation" below). Keep that list and the roster in step
-by hand until then.
+**The orchestrator reads it at start.** Each orchestrator takes its own
+project's hosts, keyed on `fused_memory.project_id`, as its runner list
+(`orchestrator/src/orchestrator/config.py::load_config`):
+
+- An absent file means no roster hosts.
+- A file that fails to parse fails the start. At a reload, it fails the reload
+  and the live config is kept.
+- A roster edit is restart-tier until task γ: a reload reports it as
+  `verify_runners` under `restart_required`.
+- A project's hosts have one home. If the project also has an inline
+  `verify_runners` block or a non-empty `ORCH_VERIFY_RUNNERS`, the load fails
+  and names both. `ORCH_VERIFY_RUNNERS='[]'` declares no inline runners, and it
+  shadows a yaml block.
+- Runner names must be unique, and none may be `local`, the local slot's name.
+- `task_slots` and `trust` are read but have no effect until tasks γ and δ.
 
 ### What lives on the remote host
 
@@ -901,13 +911,15 @@ alone.
 The runner list the orchestrator dispatches to lives on the **dispatching**
 workstation, never on the remote host. The remote's per-host yaml (above) has
 no knowledge of the pool it belongs to; the workstation is what decides which
-hosts participate. Until task α2 lands, that list is the `verify_runners:`
-block in the dispatching project's own `dark-factory-orchestrator.yaml`, or
-`ORCH_VERIFY_RUNNERS` in the orchestrator's environment (the same entries as
-JSON). The environment ranks above the yaml
+hosts participate. That list is the project's entries in the roster file
+(above). A project with no roster entry can declare it inline instead: either
+the `verify_runners:` block in the dispatching project's own
+`dark-factory-orchestrator.yaml`, or `ORCH_VERIFY_RUNNERS` in the
+orchestrator's environment (the same entries as JSON). It cannot use both a
+roster entry and an inline list. The environment ranks above the yaml
 (`config.py::OrchestratorConfig.settings_customise_sources`), and keeps a
-private host name out of a tracked file. Each entry carries the values of one
-host's project entry in the roster.
+private host name out of a tracked file. Each inline entry carries the values
+of one host's project entry in the roster.
 
 Entry shape (`VerifyRunnerConfig`):
 

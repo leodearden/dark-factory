@@ -2135,10 +2135,10 @@ this is the order to run them in. `<host>` is the host's name in the roster.
    its exit code.
 3. **Check:** `scripts/deploy/check_verify_host.py <host>` on its own, at any
    later time; `--json` for a record.
-4. **Wire the runner list.** Until task α2 lands, add the host to the
-   project's `verify_runners` block, or to `ORCH_VERIFY_RUNNERS` in the
-   orchestrator unit's environment to keep its name out of a tracked file.
-   Either is restart-tier.
+4. **Wire the runner list.** The roster entry is the runner list. First
+   remove any inline `verify_runners` block or `ORCH_VERIFY_RUNNERS` entry for
+   that project, or the load fails and names both. Then restart the project's
+   orchestrator: the roster is restart-tier.
 5. **Preflight** with `orchestrator verify-host-preflight --runner <host>`
    once task β has landed: it runs the project's full gate on the host
    through the production dispatch path.
