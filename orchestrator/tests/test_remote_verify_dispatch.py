@@ -19,7 +19,6 @@ import sys
 import uuid
 from collections.abc import Awaitable, Callable, Iterator
 from pathlib import Path
-from typing import Any
 
 import pytest
 from _gate_fixtures import (
@@ -27,13 +26,16 @@ from _gate_fixtures import (
     TEST_DEPLOYED_SHA,
     TEST_DF_REMOTE,
     TEST_GATE_ROOT,
+    RecordingEvents,
+    Run,
     ensure_reply,
     gate_argv,
     gated_remote_runner,
     is_ensure,
     is_gate_publish,
     is_tag_listing,
-    without_push_ssh_config,
+    is_tag_push,
+    tag_refspec,
 )
 from _xdist_crash_fixtures import XDIST_IN_FLIGHT_NODEID, XDIST_SESSION_ABORTED_OUTPUT
 
@@ -937,28 +939,6 @@ def _annotated_tag(repo: Path, name: str) -> None:
     _git(repo, '-c', 'user.name=t', '-c', 'user.email=t@t', 'tag', '-a', name, '-m', 'rel')
 
 
-def _tag_refspec(argv: list[str]) -> str | None:
-    """The refspec of a ``git push`` that pushes tags, else None."""
-    plain = without_push_ssh_config(argv)
-    if plain[:2] != ['git', 'push']:
-        return None
-    return next((word for word in plain[3:] if 'refs/tags/' in word), None)
-
-
-Run = Callable[..., Awaitable[tuple[int, str, str]]]
-
-
-class _RecordingEvents:
-    def __init__(self) -> None:
-        self.events: list[tuple[Any, dict[str, Any]]] = []
-
-    def emit(self, event_type: Any, *, data: dict[str, Any] | None = None, **_: Any) -> None:
-        self.events.append((event_type, dict(data or {})))
-
-    def of(self, event_type: Any) -> list[dict[str, Any]]:
-        return [data for kind, data in self.events if kind == event_type]
-
-
 class _TagScene:
     """A dispatcher checkout and a bare project repo standing in for the laptop's.
 
@@ -990,7 +970,7 @@ class _TagScene:
         return _git(repo, 'rev-parse', f'refs/tags/{tag}')
 
     def tag_pushes(self) -> list[str]:
-        return [spec for spec in map(_tag_refspec, self.argvs) if spec is not None]
+        return [spec for spec in map(tag_refspec, self.argvs) if spec is not None]
 
     async def run(self, argv: list[str], *, cwd: str | None = None) -> tuple[int, str, str]:
         self.argvs.append(list(argv))
@@ -1086,7 +1066,7 @@ class TestTagMirror:
         result = await tag_scene.runner(run=run).run_merge_verify('abc123', _merge_spec())
 
         assert result == _green()
-        assert [spec for spec in map(_tag_refspec, argvs) if spec is not None] == []
+        assert [spec for spec in map(tag_refspec, argvs) if spec is not None] == []
 
     async def test_a_remote_tag_pointing_elsewhere_is_force_mirrored_and_announced(
         self, tag_scene: _TagScene,
@@ -1096,7 +1076,7 @@ class TestTagMirror:
         _annotated_tag(tag_scene.dispatcher, _TAG)
         tag_scene.seed_remote_main()
         _git(tag_scene.remote, 'update-ref', f'refs/tags/{_TAG}', tag_scene.first)
-        store = _RecordingEvents()
+        store = RecordingEvents()
 
         result = await tag_scene.runner().run_merge_verify(
             tag_scene.head, _merge_spec(), event_store=store,
@@ -1153,7 +1133,7 @@ class TestTagMirror:
                 return (0, ensure_reply(), '')
             if is_tag_listing(argv):
                 return (0, f'{"a" * 40} refs/tags/v1', '')
-            if _tag_refspec(argv) is not None:
+            if is_tag_push(argv):
                 return (
                     128, '',
                     'ssh: connect to host laptop.local port 22: Connection timed out\n'
@@ -1165,7 +1145,7 @@ class TestTagMirror:
             await tag_scene.runner(run=run).run_merge_verify('abc123', _merge_spec())
 
         assert excinfo.value.kind == 'transport'
-        assert [spec for spec in map(_tag_refspec, argvs) if spec is not None] == [
+        assert [spec for spec in map(tag_refspec, argvs) if spec is not None] == [
             'refs/tags/*:refs/tags/*',
         ]
         assert not any(':refs/merge-verify/' in ' '.join(argv) for argv in argvs)

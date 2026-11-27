@@ -1,4 +1,4 @@
-"""A deployed sha, a gate layout and a gate-answering transport for RemoteRunner tests (task 6565).
+"""A deployed sha, a gate layout, a gate-answering transport and an event recorder for RemoteRunner tests (task 6565).
 
 Every RemoteRunner dispatch first publishes the deployed sha and runs
 ensure-gate over ssh (``RemoteRunner.ensure_gate``), then lists the project's
@@ -54,6 +54,32 @@ def is_tag_listing(argv: list[str]) -> bool:
     """The ``git for-each-ref ... refs/tags`` listing the dispatch's tag mirror starts with."""
     plain = without_push_ssh_config(argv)
     return plain[:2] == ['git', 'for-each-ref'] and plain[-1] == 'refs/tags'
+
+
+def tag_refspec(argv: list[str]) -> str | None:
+    """The refspec of the tag mirror's ``git push <remote> [+]refs/tags/*:refs/tags/*``, else None."""
+    plain = without_push_ssh_config(argv)
+    if plain[:2] != ['git', 'push']:
+        return None
+    return next((word for word in plain[3:] if 'refs/tags/' in word), None)
+
+
+def is_tag_push(argv: list[str]) -> bool:
+    """A push of the tag mirror, plain or forced."""
+    return tag_refspec(argv) is not None
+
+
+class RecordingEvents:
+    """An event store double keeping every ``emit`` for the test to read back."""
+
+    def __init__(self) -> None:
+        self.events: list[tuple[Any, dict[str, Any]]] = []
+
+    def emit(self, event_type: Any, *, data: dict[str, Any] | None = None, **_: Any) -> None:
+        self.events.append((event_type, dict(data or {})))
+
+    def of(self, event_type: Any) -> list[dict[str, Any]]:
+        return [data for kind, data in self.events if kind == event_type]
 
 
 def ensure_reply(*, built: bool = False, identity: GateIdentity | None = None) -> str:

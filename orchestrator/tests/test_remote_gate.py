@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Any, ClassVar
 
 import pytest
-from _gate_fixtures import without_push_ssh_config
+from _gate_fixtures import RecordingEvents, is_tag_listing, is_tag_push, without_push_ssh_config
 from _task_verify_fixtures import task_verify_spec
 from click.testing import CliRunner
 from df_pytest_isolation import read_leaked_pid
@@ -841,7 +841,7 @@ async def test_a_dispatch_verifies_in_the_deployed_shas_gate_not_the_checkout_he
     verify through the host shim with ORCH_GATE_BIN.
     """
     scene = gate_scene
-    store = _RecordingEvents()
+    store = RecordingEvents()
 
     result = await scene.runner().run_merge_verify(
         scene.head, _spec(), event_store=store, task_id='t-6565',
@@ -869,7 +869,7 @@ async def test_a_dispatch_verifies_in_the_deployed_shas_gate_not_the_checkout_he
 async def test_a_second_dispatch_reuses_the_gate_silently(gate_scene: _GateScene):
     runner = gate_scene.runner()
     await runner.run_merge_verify(gate_scene.head, _spec())
-    store = _RecordingEvents()
+    store = RecordingEvents()
 
     assert await runner.run_merge_verify(gate_scene.head, _spec(), event_store=store) == _VERDICT
 
@@ -883,17 +883,6 @@ async def test_a_second_dispatch_reuses_the_gate_silently(gate_scene: _GateScene
 
 _SHA = 'e' * 40
 _GATE_BIN = f'/gates/{_SHA}/.venv/bin/orchestrator'
-
-
-class _RecordingEvents:
-    def __init__(self) -> None:
-        self.events: list[tuple[Any, dict[str, Any]]] = []
-
-    def emit(self, event_type: Any, *, data: dict[str, Any] | None = None, **_: Any) -> None:
-        self.events.append((event_type, dict(data or {})))
-
-    def of(self, event_type: Any) -> list[dict[str, Any]]:
-        return [data for kind, data in self.events if kind == event_type]
 
 
 _Reply = tuple[int, str, str] | BaseException | Callable[[], Awaitable[tuple[int, str, str]]]
@@ -923,9 +912,9 @@ class _Scripted:
     @staticmethod
     def role(argv: list[str]) -> str:
         plain = without_push_ssh_config(argv)
-        if plain[:2] == ['git', 'for-each-ref']:
+        if is_tag_listing(argv):
             return 'tag_list'
-        if plain[:2] == ['git', 'push'] and any('refs/tags/' in word for word in plain[3:]):
+        if is_tag_push(argv):
             return 'tag_push'
         if plain[:2] == ['git', 'push']:
             if '--delete' in plain:
@@ -993,6 +982,20 @@ async def test_publish_pushes_the_deployed_sha_by_url_from_the_code_checkout():
     assert ensure.startswith(f'{REMOTE_TOOL_PATH_PRELUDE} env GATE_ROOT=/gates SHA={_SHA} ')
     assert 'SOURCE=/laptop/dark-factory bash -c ' in ensure
     assert gate_argv_for(transport.calls[4][1][-1])[:3] == ['verify-merge', '--sha', 'mergesha']
+
+
+@pytest.mark.asyncio
+async def test_the_tag_mirror_pushes_to_the_project_remote_on_the_bounded_transport():
+    transport = _Scripted(tag_list=(0, f'{"a" * 40} refs/tags/v1', ''))
+
+    await _scripted_runner(transport).run_merge_verify('mergesha', _spec())
+
+    assert transport.roles() == [
+        'publish', 'ensure', 'tag_list', 'tag_push', 'verify_push', 'verify', 'delete',
+    ]
+    _, tag_push, cwd = transport.calls[3]
+    assert tag_push == ['git', *GIT_PUSH_SSH_CONFIG, 'push', 'leo-laptop', 'refs/tags/*:refs/tags/*']
+    assert cwd == '/project'
 
 
 def gate_argv_for(remote_cmd: str) -> list[str]:
@@ -1505,7 +1508,7 @@ _BROKEN_GATE = (70, '', 'ensure-gate: fresh gate failed its handshake')
 @pytest.mark.asyncio
 async def test_inv2_single_runner_pool_raises_and_takes_no_verdict():
     transport = _Scripted(ensure=_BROKEN_GATE)
-    store = _RecordingEvents()
+    store = RecordingEvents()
     pool = VerifyRunnerPool([_scripted_runner(transport)], event_store=store, task_id='t')
 
     with pytest.raises(RunnerUnavailable) as excinfo:
@@ -1519,7 +1522,7 @@ async def test_inv2_single_runner_pool_raises_and_takes_no_verdict():
 @pytest.mark.asyncio
 async def test_inv2_two_runner_pool_reports_the_bench_and_adopts_local():
     transport = _Scripted(ensure=_BROKEN_GATE)
-    store = _RecordingEvents()
+    store = RecordingEvents()
     benched: list[tuple[str, RunnerUnavailable]] = []
     local = _Local()
     pool = VerifyRunnerPool(
@@ -1539,7 +1542,7 @@ async def test_inv2_two_runner_pool_reports_the_bench_and_adopts_local():
 async def test_inv2_a_built_gate_announces_stale_then_synced_and_its_verdict_is_adopted():
     identity = local_gate_identity(_SHA).to_wire()
     transport = _Scripted(ensure=(0, json.dumps({'built': True, 'identity': identity}), ''))
-    store = _RecordingEvents()
+    store = RecordingEvents()
     pool = VerifyRunnerPool([_scripted_runner(transport), _Local()], event_store=store, task_id='t')
 
     assert await pool.dispatch('mergesha', _spec()) == _VERDICT
