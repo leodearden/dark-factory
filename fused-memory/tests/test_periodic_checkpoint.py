@@ -306,6 +306,42 @@ def test_collect_targets_omits_an_absent_invocations_ledger() -> None:
     assert 'invocations_ledger' not in {name for name, _ in omitted}
 
 
+def test_the_invocations_ledger_is_checkpointed_after_every_other_store() -> None:
+    class _Store:
+        async def checkpoint(self):
+            return (0, 0, 0)
+
+        async def checkpoint_all(self):
+            return {}
+
+    targets = _collect_targets(
+        taskmaster=_Store(),
+        recon_journal=_Store(),
+        event_buffer=_Store(),
+        ticket_store=_Store(),
+        write_journal=_Store(),
+        memory_service=SimpleNamespace(
+            durable_queue=_Store(),
+            planned_episode_registry=_Store(),
+            overreach_shadow=_Store(),
+        ),
+        recon_ledger=_Store(),
+        invocations_store=_Store(),
+    )
+    assert [name for name, _ in targets] == [
+        'task_backend',
+        'recon_journal',
+        'event_buffer',
+        'ticket_store',
+        'recon_ledger',
+        'write_journal',
+        'durable_queue',
+        'planned_episode_registry',
+        'overreach_shadow',
+        'invocations_ledger',
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Step 1 — existence-guarded override-DB checkpoint helper
 # ---------------------------------------------------------------------------
