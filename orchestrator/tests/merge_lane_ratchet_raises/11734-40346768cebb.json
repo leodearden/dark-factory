@@ -1,0 +1,30 @@
+{
+  "task_id": "11734",
+  "reason": "Net-additive test-isolation guard required by ruling esc-11734-1: conftest.py::_refuse_the_operators_roster_file makes any config load that resolves the session's default verify-host roster path fail loudly, so a test that rebuilds its env and drops the ORCH_VERIFY_HOSTS_FILE pin can never read the operator's private roster. Its two imports stay function-local like conftest's other orchestrator imports (a module-top import after the sys.path setup needs an E402 suppression, removed in step-12); the try/except tolerates a session with neither HOME nor XDG_CONFIG_HOME set.",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/tests/conftest.py",
+      "baseline": 55,
+      "current": 60
+    },
+    {
+      "measure": "function_local_imports",
+      "key": "orchestrator/tests/conftest.py",
+      "baseline": 9,
+      "current": 11
+    },
+    {
+      "measure": "total:cognitive",
+      "key": "<cluster>",
+      "baseline": 5358,
+      "current": 5363
+    },
+    {
+      "measure": "total:function_local_imports",
+      "key": "<cluster>",
+      "baseline": 16,
+      "current": 18
+    }
+  ]
+}
