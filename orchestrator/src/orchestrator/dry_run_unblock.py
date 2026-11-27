@@ -333,6 +333,11 @@ _GRANTED_TOOLS_LINE: str = (
     'Every Bash command no rule above admits is denied permanently: a retry is denied again.'
 )
 
+_UNLINKED_TASK_STATE_SOURCES: str = (
+    'Read reviews at the Reviews directory path above, and task metadata with '
+    'mcp__fused-memory__get_task.'
+)
+
 _INVESTIGATION_ENV_OVERRIDES: Mapping[str, str] = MappingProxyType({
     'CLAUDE_CODE_FORCE_SESSION_PERSISTENCE': '1',
     'DISABLE_AUTO_COMPACT': '1',
@@ -718,7 +723,7 @@ async def run_dry_run_unblock(
             f'Block reason: {reason}\n'
             f'Detail: {detail or "(none)"}\n'
             f'**Reviews directory:** {_reviews_directory(worktree, task_id, reviews_dir)}\n\n'
-            f'{UNLINKED_TASK_STATE_GUIDANCE}\n'
+            f'{UNLINKED_TASK_STATE_GUIDANCE} {_UNLINKED_TASK_STATE_SOURCES}\n\n'
             f'{_GRANTED_TOOLS_LINE}\n\n'
             f'{task_context.block}\n\n'
             'Investigate and emit your structured proposal.'

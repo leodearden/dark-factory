@@ -2857,13 +2857,14 @@ class TestPromptCarriesTaskContext:
     async def test_prompt_says_which_task_state_is_not_under_the_task_dir(self, tmp_path):
         """All nine census sightings of fk-a6083fb7ed86 were unblock-auto
         investigators reading `<worktree>/.task/metadata.json`, which no lane
-        link exposes."""
-        for unlinked in ('metadata.json', 'reviews/', 'verdicts/'):
-            assert unlinked in UNLINKED_TASK_STATE_GUIDANCE, unlinked
-
+        link exposes. The note must point at where this investigator reads
+        that state, since its prompt does not carry it."""
         prompt = await _capture_investigation_prompt(tmp_path, _TaskDocScheduler())
 
         assert UNLINKED_TASK_STATE_GUIDANCE in prompt, prompt
+        start = prompt.index(UNLINKED_TASK_STATE_GUIDANCE)
+        paragraph = prompt[start:].split('\n\n', 1)[0]
+        assert 'mcp__fused-memory__get_task' in paragraph, paragraph
 
     @pytest.mark.asyncio
     async def test_prompt_names_the_reviews_directory_its_caller_chose(self, tmp_path):
