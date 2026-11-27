@@ -5035,6 +5035,8 @@ class OrchestratorConfig(BaseSettings):
     # escalations sit pending until the next orchestrator restart dismisses
     # them unread.  Set ``orphan_l0_reaper_enabled = False`` to disable.
     orphan_l0_reaper_enabled: bool = Field(default=True)
+    # Also the startup strand sweep's classification threshold:
+    # orchestrator/src/orchestrator/harness.py::Harness._dismiss_stale_escalations.
     orphan_l0_timeout_secs: float = Field(default=600.0)
     orphan_l0_check_interval_secs: float = Field(default=60.0)
 

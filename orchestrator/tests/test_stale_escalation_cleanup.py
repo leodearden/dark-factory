@@ -791,3 +791,73 @@ class TestStaleL0StrandEscalationSurvivesRestart:
         assert any(
             r.levelno >= logging.WARNING for r in caplog.records
         ), 'the filing failure must be logged'
+
+
+@pytest.mark.asyncio
+class TestStrandRecordNeedsAWaitingWorkflow:
+    """The level-1 record is filed only when a strand had a workflow waiting (task 5200).
+
+    The router is disabled here so an aged info note is a strand rather than
+    routed: that is the regime whose info-only records were ruled noise on
+    esc-__stale_l0_strand_sweep__-4.  Classification and telemetry are unchanged;
+    only the filing is gated.
+    """
+
+    @staticmethod
+    async def _sweep_one_aged_info_note(harness: Harness) -> EscalationQueue:
+        harness.config.info_l0_router_enabled = False
+        queue = _queue_of(harness)
+        _seed_escalation(
+            queue, 'esc-4242-1', '4242', age_secs=STRAND_AGE_SECS, severity='info'
+        )
+        await harness._dismiss_stale_escalations()
+        return queue
+
+    async def test_a_sweep_stranding_only_info_notes_files_no_record(
+        self, strand_harness: Harness
+    ):
+        """No workflow was waiting, so there is nobody the record could have saved."""
+        queue = await self._sweep_one_aged_info_note(strand_harness)
+
+        assert _get(queue, 'esc-4242-1').resolution_class == 'stale-strand'
+        assert _aggregate_escalations(strand_harness) == []
+        assert [e for e in queue.get_pending() if e.level == 1] == []
+
+    async def test_an_info_only_sweep_keeps_its_strand_telemetry(
+        self, strand_harness: Harness, caplog
+    ):
+        """The noise was the filing, not the telemetry: stamp, event and WARNING stay."""
+        with caplog.at_level(logging.WARNING):
+            queue = await self._sweep_one_aged_info_note(strand_harness)
+
+        record = _get(queue, 'esc-4242-1')
+        assert record.status == 'dismissed'
+        assert record.resolution_class == 'stale-strand'
+        (event,) = _strand_events(strand_harness)
+        assert event['data']['workflow_blocked'] is False
+        assert event['data']['severity'] == 'info'
+        (sweep_line,) = [
+            r.getMessage() for r in caplog.records
+            if r.levelno >= logging.WARNING and 'STALE-STRAND' in r.getMessage()
+        ]
+        assert '0 with a workflow waiting' in sweep_line
+        assert 'no level-1 record filed' in sweep_line
+
+    async def test_a_mixed_sweep_files_one_record_naming_every_strand(
+        self, strand_harness: Harness
+    ):
+        """One waiting workflow files the record, and it still lists the info strand."""
+        strand_harness.config.info_l0_router_enabled = False
+        queue = _queue_of(strand_harness)
+        _seed_escalation(queue, 'esc-5189-7', '5189', age_secs=STRAND_AGE_SECS)
+        _seed_escalation(
+            queue, 'esc-4242-1', '4242', age_secs=STRAND_AGE_SECS, severity='info'
+        )
+
+        await strand_harness._dismiss_stale_escalations()
+
+        (record,) = _aggregate_escalations(strand_harness)
+        assert record.level == 1
+        assert 'esc-5189-7' in record.detail
+        assert 'esc-4242-1' in record.detail
+        assert '1 with a workflow waiting' in record.summary
