@@ -2364,7 +2364,7 @@ class TaskInterceptor:
         """Decision 14 at the status chokepoint; the caller holds the write lock and the write landed.
 
         An explicit release promotes every held follow-up; a landing that starts a task waiting
-        (deferred, done or cancelled into a waiting status) promotes the held tasks it depends on.
+        (:func:`followup_hold.starts_waiting`) promotes the held tasks it depends on.
         """
         emit = self.hold_emit(project_root)
         if releases_holder(before, status, release_holder=release_holder):
@@ -6477,8 +6477,9 @@ class TaskInterceptor:
           unchanged from the original behavior. An edge that would close a cycle
           comes back as the :class:`DependencyCycle` refusal dict, nothing written.
 
-        Once the edge lands, a waiting (any active status but deferred), non-held
-        dependent promotes every held follow-up it depends on (``by='dependent'``,
+        Once the edge lands, a dependent that
+        :func:`followup_hold.waits_on_its_dependencies` promotes every held
+        follow-up it depends on (``by='dependent'``,
         :func:`followup_hold.promote_dependencies_of`; docs/task-authoring.md
         §3.4).  The journal and ``task_modified`` event are emitted regardless of
         which branch the backend takes.

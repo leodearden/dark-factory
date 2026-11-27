@@ -223,7 +223,7 @@ async def hold_birth(
 
 
 def held_by(task: Mapping[str, object]) -> int | None:
-    """The holder an active row waits behind now: its record names the edge, and the edge is the authority.
+    """The holder an active row is parked behind now: its record names the edge, and the edge is the authority.
 
     A promoted row keeps its record but has lost the edge, so it is not held. A record that does
     not parse holds nothing and logs one WARNING naming the task.
@@ -233,7 +233,10 @@ def held_by(task: Mapping[str, object]) -> int | None:
 
 
 def waits_on_its_dependencies(task: Mapping[str, object]) -> bool:
-    """The dependent a held dependency must not be left behind (PRD §3 decision 14, §9 open question 7)."""
+    """True when *task*'s held dependencies must be promoted: its status is in WAITING_STATUSES and it is not itself held.
+
+    A held task is parked behind its holder, not waiting (PRD §3 decision 14, §9 open question 7).
+    """
     return task.get('status') in WAITING_STATUSES and held_by(task) is None
 
 
@@ -428,7 +431,7 @@ _HOLDER_EDGE_STRIP_HINT = (
     'caller may not drop that edge with a dependencies replacement. Keep the holder id in the '
     'dependencies list. A held follow-up leaves the hold by promotion: cite it with x_finding_key '
     'or prd_path (unless it carries finding_set_hold, which a citation does not promote), depend '
-    'on it from an unheld task that is neither deferred nor settled, or have a human call '
+    'on it from an unheld task that is not deferred, done or cancelled, or have a human call '
     'remove_dependency(task, holder). See docs/task-authoring.md §3.4.'
 )
 
