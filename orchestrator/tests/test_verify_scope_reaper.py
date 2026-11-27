@@ -6,7 +6,8 @@ sweep that stops only THIS project's leftover verify scopes:
   step-3/4  — ``verify._verify_scope_name``: the tagged, uuid-suffixed
               ``df-verify-{tag}-<hex>.scope`` unit name, built through
               ``shared/src/shared/verify_scope_tag.py``, which also owns the
-              per-project tag rule and its tests.
+              per-project tag rule and its tests. ``_run_cmd`` refuses a
+              scoped run whose tag that rule would not accept.
   step-5/6  — ``verify.reap_leftover_verify_scopes``: a TAG-SCOPED
               ``systemctl --user list-units`` enumeration + defensive
               re-filter + per-unit ``_kill_cgroup_scope`` reap, fully
@@ -20,12 +21,15 @@ each orchestrator's sweep to its own leftovers.
 """
 import logging
 import re
+import shutil
 from pathlib import Path
 
 import pytest
 from shared.verify_scope_tag import parse_verify_scope_unit, scope_tag_for
 
 from orchestrator import verify
+
+UNREACHED_COMMAND_TIMEOUT_SECS = 120
 
 
 class TestVerifyScopeName:
@@ -61,6 +65,41 @@ class TestVerifyScopeName:
     def test_a_tag_the_shared_parser_would_not_read_is_refused(self) -> None:
         with pytest.raises(ValueError, match='Bad Tag'):
             verify._verify_scope_name('Bad Tag')
+
+
+class TestRunCmdRefusesAScopeItCannotName:
+    """The tag is checked where ``_run_cmd``'s arguments enter, before any spawn,
+    whether or not this host has ``systemd-run``."""
+
+    @pytest.fixture(autouse=True)
+    def no_systemd_run(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(shutil, 'which', lambda _name: None)
+
+    @pytest.mark.asyncio
+    async def test_a_scoped_run_without_a_tag_is_refused(self, tmp_path: Path) -> None:
+        with pytest.raises(ValueError, match='scope_tag'):
+            await verify._run_cmd(
+                'touch spawned', tmp_path,
+                timeout=UNREACHED_COMMAND_TIMEOUT_SECS, use_cgroup_scope=True,
+            )
+        assert not (tmp_path / 'spawned').exists()
+
+    @pytest.mark.asyncio
+    async def test_a_scoped_run_with_a_malformed_tag_is_refused(self, tmp_path: Path) -> None:
+        with pytest.raises(ValueError, match='Bad Tag'):
+            await verify._run_cmd(
+                'touch spawned', tmp_path,
+                timeout=UNREACHED_COMMAND_TIMEOUT_SECS, use_cgroup_scope=True,
+                scope_tag='Bad Tag',
+            )
+        assert not (tmp_path / 'spawned').exists()
+
+    @pytest.mark.asyncio
+    async def test_an_unscoped_run_needs_no_tag(self, tmp_path: Path) -> None:
+        rc, output, timed_out = await verify._run_cmd(
+            'echo hi', tmp_path, timeout=UNREACHED_COMMAND_TIMEOUT_SECS,
+        )
+        assert (rc, output, timed_out) == (0, 'hi\n', False)
 
 
 class TestReapLeftoverVerifyScopes:

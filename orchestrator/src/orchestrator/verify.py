@@ -6641,6 +6641,23 @@ def _exited_outcome(
     return rc, output, False
 
 
+def _launch_scope_unit(use_cgroup_scope: bool, scope_tag: str | None) -> str | None:
+    """The scope unit ``_run_cmd`` launches its command in; ``None`` runs it unscoped.
+
+    The tag is refused whether or not ``systemd-run`` is on PATH, so a missing
+    or malformed tag never hides behind a host without it.
+    """
+    if not use_cgroup_scope:
+        return None
+    if scope_tag is None:
+        raise ValueError(
+            'use_cgroup_scope=True needs a scope_tag '
+            '(shared/src/shared/verify_scope_tag.py::scope_tag_for)'
+        )
+    unit = _verify_scope_name(scope_tag)
+    return unit if shutil.which('systemd-run') is not None else None
+
+
 async def _run_cmd(
     cmd: str,
     cwd: Path,
@@ -6649,7 +6666,7 @@ async def _run_cmd(
     log_path: 'Path | None' = None,
     *,
     use_cgroup_scope: bool = False,
-    scope_tag: str = '',
+    scope_tag: str | None = None,
     slice_name: str | None = None,
     cpu_weight: int | None = None,
     memory_properties: tuple[str, ...] = (),
@@ -6669,7 +6686,9 @@ async def _run_cmd(
     to the subprocess so callers can inject build accelerators like
     ``RUSTC_WRAPPER=sccache`` without mutating the parent process's env.
 
-    When *use_cgroup_scope* is True and ``systemd-run`` is available, the
+    When *use_cgroup_scope* is True, *scope_tag*
+    (``shared/src/shared/verify_scope_tag.py::scope_tag_for``) is required and
+    checked before anything spawns. If ``systemd-run`` is available, the
     command is launched inside a transient systemd ``--user --scope`` (its own
     cgroup) so any abnormal exit after the spawn (a timeout, a cancel, or
     another exception such as a log-write ``OSError``) reaps the WHOLE subtree
@@ -6721,6 +6740,7 @@ async def _run_cmd(
     so that python children (pytest, ruff, pyright via uv) flush their stdout
     per-line — necessary for the partial-log invariant under heavy buffering.
     """
+    scope_unit = _launch_scope_unit(use_cgroup_scope, scope_tag)
     # PYTHONUNBUFFERED is the cheap-but-decisive lever: without it pytest's
     # progress dots stay in stdio buffers and never reach our streaming loop,
     # so a hanging subprocess produces an opaque ``Command timed out after …``
@@ -6763,11 +6783,8 @@ async def _run_cmd(
 
     proc = None
     pgid: int | None = None
-    scope_unit: str | None = None
     handshake: ScopeLaunchHandshake | None = None
     watcher: asyncio.Task[None] | None = None
-    if use_cgroup_scope and shutil.which('systemd-run') is not None:
-        scope_unit = _verify_scope_name(scope_tag)
     # Populated by the clock-stop loop, via _clock_stop_reason evaluated AT
     # THE STOP (task 3806), before raising TimeoutError — so the except
     # handler can emit a message with the real elapsed wall time and, when
