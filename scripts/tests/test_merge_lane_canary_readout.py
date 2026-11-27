@@ -182,6 +182,8 @@ def test_the_readout_values_follow_the_fixture(project, tmp_path):
     text = out.read_text(encoding='utf-8')
 
     assert '| gates per landing | 1 | < 0.3 | FALSE |' in text
+    assert '| voids per landing | 0 | < 0.1 | holds |' in text
+    assert 'discarded before a host (point dispatch, not counted): 1' in text
     assert '| chain-attributed red-main episodes | 1 | = 0 | FALSE |' in text
     assert '| speculation accounting violations | 0 | = 0 | holds |' in text
     assert f'first red {shas["f2"][:12]}' in text

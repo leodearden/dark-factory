@@ -163,13 +163,15 @@ def test_gates_per_landing_is_unmeasured_without_a_landing():
     assert canary.gates_per_landing([ev(5, 'a', reverify=True)], ()) is None
 
 
-def test_voids_per_landing_splits_dispatch_from_adoption_voids():
-    voided = [ev(1, 'a', point='dispatch'), ev(2, 'b', point='dispatch'), ev(3, 'c', point='adoption')]
+def test_voids_per_landing_counts_only_voids_after_a_host_was_acquired():
+    voided = [
+        ev(1, 'a', point='dispatch'), ev(2, 'b', point='dispatch'), ev(3, 'c', point='adoption'), ev(4, 'd'),
+    ]
 
     tally = canary.voids_per_landing(voided, two_landings())
 
-    assert (tally.total, tally.before_host, tally.at_adoption) == (3, 2, 1)
-    assert tally.per_landing == 1.5
+    assert (tally.total, tally.before_host, tally.at_adoption, tally.after_host) == (4, 2, 1, 2)
+    assert tally.per_landing == 1.0
 
 
 def test_voids_per_landing_is_unmeasured_without_a_landing():
@@ -670,7 +672,7 @@ def test_evaluate_carries_each_limit_comparison_and_baseline():
 
     assert {key: (row.limit, row.comparison, row.baseline) for key, row in by_key.items()} == {
         'gates_per_landing': (0.3, lt, '0.84'),
-        'voids_per_landing': (0.1, lt, '0.78'),
+        'voids_per_landing': (0.1, lt, '0.78 (all voids)'),
         'p_gate_after_gate': (0.3, lt, '0.79'),
         'laptop_finished_share': (0.1, lt, '33%'),
         'frozen_tip_violations': (0, eq0, '—'),
