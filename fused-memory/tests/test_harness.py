@@ -2630,12 +2630,13 @@ class TestStage2CycleSummaryHarnessBackstop:
 #
 # Stage 3's presence check is LEDGER-PRIMARY (get_cycle_summary_presence ->
 # ReconLedgerStore.get_by_identity), and its prompt rules
-# `ledger_available:true, present:false` GENUINELY ABSENT ->
-# missing_knowledge / actionable / reconstruct — which _maybe_remediate turns
-# into a real Stage 1 + Stage 2 LLM pass. Today the re-attempt that would have
-# landed the row runs in the driver's `finally`, i.e. AFTER Stage 3 and after
-# remediation, so a transient in-stage write failure burns a whole remediation
-# pass for a row that was there for the taking.
+# `present:false, expected:true` (reason='missing') GENUINELY ABSENT ->
+# missing_knowledge / actionable / carry_forward_ledger_write_gap — which
+# _maybe_remediate turns into a real Stage 1 + Stage 2 LLM pass. Today the
+# re-attempt that would have landed the row runs in the driver's `finally`,
+# i.e. AFTER Stage 3 and after remediation, so a transient in-stage write
+# failure burns a whole remediation pass for a row that was there for the
+# taking.
 #
 # These tests observe the ledger AT STAGE 3'S DISPATCH — the exact row the
 # production presence check would see — rather than asserting on call order.
@@ -2744,7 +2745,8 @@ class TestPreStage3CycleSummaryFlush:
         assert observed[0] is not None, (
             "the write-recovered re-attempt must land the Stage 2 cycle_summary row "
             "BEFORE Stage 3 is dispatched — Stage 3's ledger-primary presence check "
-            'reads present:false as genuine absence and files a reconstruct finding'
+            'reads present:false as genuine absence and files an actionable '
+            'missing_knowledge finding'
         )
 
         payload = json.loads(observed[0].payload_json)
@@ -2835,10 +2837,10 @@ class TestPreStage3CycleSummaryFlush:
         self, journal, event_buffer, mock_memory_service, ledger_store
     ):
         """The negative control: the flush must not SUPPRESS a genuine
-        reconstruct. When the transient fault has not cleared, the re-attempt
-        fails too, Stage 3 still observes absence, and the driver's finally
-        still gets a last-chance attempt — now separated from the flush by a
-        whole Stage-3 turn.
+        missing-row finding. When the transient fault has not cleared, the
+        re-attempt fails too, Stage 3 still observes absence, and the driver's
+        finally still gets a last-chance attempt — now separated from the flush
+        by a whole Stage-3 turn.
         """
         from fused_memory.models.reconciliation import StageId
 
@@ -2872,7 +2874,7 @@ class TestPreStage3CycleSummaryFlush:
         assert run.status == RunStatus.completed
         assert observed == [None], (
             'a genuinely lost row must still reach Stage 3 as ABSENT so the '
-            'reconstruct ruling still fires — the flush reorders the existing '
+            'missing-row ruling still fires — the flush reorders the existing '
             're-attempt, it must never manufacture presence'
         )
         assert stage2_report.stats.get(

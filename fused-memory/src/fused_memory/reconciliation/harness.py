@@ -3675,9 +3675,10 @@ class ReconciliationHarness:
                     # (1) WHY BEFORE STAGE 3, not in the finally: Stage 3's
                     #     presence check is ledger-PRIMARY
                     #     (get_cycle_summary_presence -> get_by_identity) and its
-                    #     prompt rules `ledger_available:true, present:false`
-                    #     GENUINELY ABSENT -> missing_knowledge / actionable /
-                    #     reconstruct, which _maybe_remediate below turns into a
+                    #     prompt rules `present:false, expected:true`
+                    #     (reason='missing') GENUINELY ABSENT -> missing_knowledge /
+                    #     actionable / carry_forward_ledger_write_gap, which
+                    #     _maybe_remediate below turns into a
                     #     real Stage 1 + Stage 2 LLM pass. A CURRENT-cycle in-stage
                     #     write failure must therefore be re-attempted before Stage
                     #     3 is dispatched; the finally's re-attempt lands after both
