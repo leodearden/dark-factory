@@ -4,8 +4,10 @@
 # deterministic arming task: exit 0 = the split is balanced on an unchanged window
 # and every reachable unit reloaded; non-zero = the caller escalates born-at-L2.
 #
-# 1. Confirms main carries the experiment's rule ids (gamma landed), so a reload
-#    cannot silently arm an older table. Main's copy is read once and each id is
+# 1. Confirms main carries the experiment's rule ids, so a reload cannot silently
+#    arm an older table. The ids are read from main's copy of the file named by
+#    ROUTING_EXPERIMENT_RULES_FILE (repo-relative, default
+#    orchestrator/src/orchestrator/defaults.yaml), read once, and each id is
 #    tested against it.
 # 2. Runs scripts/routing_experiment_readout.py --aa (leaf beta) over the trailing
 #    window with the experiment salt, reading only the experiment units' roots: the
@@ -13,7 +15,7 @@
 #    parity skew, drift). Non-zero there stops here.
 # 3. Calls reload_config on every experiment unit through the shared transport
 #    (scripts/_config_reload_gate.py). A unit whose MCP is not listening is SKIPPED
-#    with a warning, never a failure: defaults.yaml is re-read at its next start, so
+#    with a warning, never a failure: its config is re-read at its next start, so
 #    a halted or idle unit arms itself when it comes back. A unit that answers with
 #    a reload error FAILS the arming.
 # 4. Appends one JSON line to data/orchestrator/routing_experiments.jsonl recording
@@ -21,6 +23,7 @@
 #    anchor for "when did arm 1 start".
 #
 # Usage: [ROUTING_EXPERIMENT_UNITS='<project_root>:<port> ...'] \
+#        [ROUTING_EXPERIMENT_RULES_FILE=<repo-relative path>] \
 #          routing_experiment_arm.sh <salt> <rule_id_csv> [days]
 #   e.g. routing_experiment_arm.sh routing-exp-1 large-plan-modules-4,large-plan-modules 30
 set -euo pipefail
@@ -60,14 +63,15 @@ for unit in "${UNIT_LIST[@]}"; do
 done
 ROOTS_CSV="$(IFS=,; printf '%s' "${ROOTS[*]}")"
 
-# 1. The rule ids must be on main's defaults.yaml (the editable install every unit reads).
-RULES_FILE=orchestrator/src/orchestrator/defaults.yaml
+# 1. The rule ids must be on main's copy of the rules file (main is what every
+#    unit's editable install reads).
+RULES_FILE="${ROUTING_EXPERIMENT_RULES_FILE:-orchestrator/src/orchestrator/defaults.yaml}"
 RULES_TEXT="$(git -C "$ROOT" show "main:${RULES_FILE}")" \
-  || die "cannot read ${RULES_FILE} from main (git's message is above)"
+  || die "cannot read ${RULES_FILE} from main (git's message is above); ROUTING_EXPERIMENT_RULES_FILE names it, repo-relative"
 IFS=',' read -r -a RULE_IDS <<< "$RULES"
 for rid in "${RULE_IDS[@]}"; do
   grep -q -- "id: ${rid}\$" <<< "$RULES_TEXT" \
-    || die "rule id '${rid}' is not in main's ${RULES_FILE}; land gamma before arming"
+    || die "rule id '${rid}' is not in main's ${RULES_FILE}; land the experiment's rules before arming"
 done
 
 # 2. A/A check on an unchanged window.
