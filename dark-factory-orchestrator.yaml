@@ -1861,6 +1861,22 @@ merge_deep:
 merge_screen:
   manifest: scripts/merge_screen.yaml
 
+# Narrow merge gate (ruling R4, no shadow since Leo's 2026-11-19 ruling; task
+# 5411). A docs-only or comments-only merge runs its narrow command set instead
+# of the full gate. Rationale and what stays on the full gate:
+# docs/narrow-merge-gate.md. Green tier: to roll back, set enabled: false and
+# apply it with mcp__escalation__reload_config. Docs and comments merges still
+# keep FIFO order; the docs lane is task 10996.
+narrow_merge_gate:
+  enabled: true
+  docs_paths:
+    - "*.md"
+    - "docs/**"
+    - "plans/*.md"
+    - "README*"
+    - "plans/*.capability-manifest.yaml"
+    - "skills/**/*.md"
+
 # TRIAL (Leo 2026-11-14, lock hand-off study): the automatic file reservation
 # is off. A task earns one when its count of skips reaches its tier's threshold,
 # and the count resets only when the task starts or the orchestrator restarts.
