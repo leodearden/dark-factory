@@ -539,6 +539,8 @@ project's hosts, keyed on `fused_memory.project_id`, as its runner list
 (`orchestrator/src/orchestrator/config.py::load_config`):
 
 - An absent file means no roster hosts.
+- A roster that cannot be located, because none of `ORCH_VERIFY_HOSTS_FILE`,
+  `XDG_CONFIG_HOME` and `HOME` is set, fails the load.
 - A file that fails to parse fails the start. At a reload, it fails the reload
   and the live config is kept.
 - A roster edit is restart-tier until task γ: a reload reports it as
@@ -546,7 +548,9 @@ project's hosts, keyed on `fused_memory.project_id`, as its runner list
 - A project's hosts have one home. If the project also has an inline
   `verify_runners` block or a non-empty `ORCH_VERIFY_RUNNERS`, the load fails
   and names both. `ORCH_VERIFY_RUNNERS='[]'` declares no inline runners, and it
-  shadows a yaml block.
+  shadows a yaml block. An `ORCH_VERIFY_RUNNERS` stopgap for a project the
+  roster already names must be removed before an orchestrator that reads the
+  roster (task 11734) is deployed, or its next start fails.
 - Runner names must be unique, and none may be `local`, the local slot's name.
 - `task_slots` and `trust` are read but have no effect until tasks γ and δ.
 
