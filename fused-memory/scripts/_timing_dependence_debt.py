@@ -77,7 +77,7 @@ TIMING_DEPENDENCE_DEBT: dict[str, int] = {
     'orchestrator/tests/test_runner_matrix.py': 6,
     'orchestrator/tests/test_verify_admission_watch.py': 6,
     'orchestrator/tests/test_verify_ruff_config_boundary.py': 6,
-    'orchestrator/tests/test_verify_runner.py': 6,
+    'orchestrator/tests/test_verify_runner.py': 5,
     'orchestrator/tests/test_before_done_script.py': 5,
     'orchestrator/tests/test_cli_verify_task.py': 5,
     'orchestrator/tests/test_decision_registry.py': 5,
