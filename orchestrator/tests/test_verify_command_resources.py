@@ -14,6 +14,7 @@ import tempfile
 from pathlib import Path
 
 import pytest
+from shared.cgroup_stats import CgroupReading, read_cgroup
 
 from orchestrator.verify_command_resources import (
     Capture,
@@ -22,7 +23,6 @@ from orchestrator.verify_command_resources import (
     allocate_command_capture,
     resources_from_reading,
 )
-from shared.cgroup_stats import CgroupReading, read_cgroup
 
 LAUNCHED = 'df-verify-proj-0123abcd-0123456789ab.scope'
 LAUNCH_CGROUP = f'/user.slice/user-1000.slice/user@1000.service/df.slice/{LAUNCHED}'
@@ -208,12 +208,11 @@ class TestCommandResourcesInvariants:
 
     @pytest.mark.parametrize('field', MEASUREMENT_FIELDS)
     def test_an_unavailable_capture_carries_no_measurement(self, field):
+        unavailable = CommandResources(
+            capture=Capture.UNAVAILABLE, capture_reason='no cgroup scope'
+        )
         with pytest.raises(ValueError, match=field):
-            CommandResources(
-                capture=Capture.UNAVAILABLE,
-                capture_reason='no cgroup scope',
-                **{field: 5},
-            )
+            CommandResources.from_dict({**unavailable.to_dict(), field: 5})
 
     def test_relocated_names_its_scopes(self):
         with pytest.raises(ValueError, match='relocated_scopes'):
