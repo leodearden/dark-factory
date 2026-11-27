@@ -1261,6 +1261,7 @@ class TestDecisionQueueRender:
             await pilot.pause()
 
             queue = app.query_one(DecisionQueue)
+            await await_queue_settled(queue)
 
             # park the operator on the second row, so a yanked cursor would show
             assert queue.select_key('decision:dec-low')
@@ -1268,8 +1269,7 @@ class TestDecisionQueueRender:
             _, wide_age, _, wide_question = queue.get_row('decision:dec-low')
             assert len(wide_question) == 172
 
-            await pilot.resize_terminal(100, 40)
-            await pilot.pause()
+            await resize_terminal_and_settle(pilot, queue, 100, 40)
 
             _, narrow_age, _, narrow_question = queue.get_row('decision:dec-low')
 
@@ -1285,8 +1285,7 @@ class TestDecisionQueueRender:
             assert queue.highlighted_key() == 'decision:dec-low'
             assert narrow_age == wide_age
 
-            await pilot.resize_terminal(200, 40)
-            await pilot.pause()
+            await resize_terminal_and_settle(pilot, queue, 200, 40)
 
             _, rewide_age, _, rewide_question = queue.get_row('decision:dec-low')
 
@@ -1334,6 +1333,7 @@ class TestDecisionQueueRender:
             await pilot.pause()
 
             queue = app.query_one(DecisionQueue)
+            await await_queue_settled(queue)
 
             # one row in 20 lines: no scrollbar, so the question gets all 172
             assert queue.scrollable_content_region.width == 200
@@ -1342,7 +1342,7 @@ class TestDecisionQueueRender:
             for index in range(1, 60):
                 write(index)
             app.refresh_registry()
-            await pilot.pause()
+            await await_queue_settled(queue)
 
             # 60 rows in 20 lines: the scrollbar showed up, and was paid for
             assert queue.row_count == 60
@@ -3123,6 +3123,7 @@ class TestDecisionQueueDetail:
             queue = app.query_one(DecisionQueue)
             table = app.query_one(SessionTable)
             detail = app.query_one(DetailPane)
+            await await_queue_settled(queue)
 
             # claim the pane for the QUEUE first, from a row that is not row 0
             assert queue.select_key('decision:dec-low')
@@ -3138,8 +3139,7 @@ class TestDecisionQueueDetail:
 
             wide_question = queue.get_row('decision:dec-low')[3]
 
-            await pilot.resize_terminal(100, 40)
-            await pilot.pause()
+            await resize_terminal_and_settle(pilot, queue, 100, 40)
 
             # the pane stayed where the operator put it
             assert 'BBB parked session question?' in detail.rendered_text
