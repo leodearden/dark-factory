@@ -25,6 +25,7 @@ from _operator_home_fixture import (
 )
 from _plan_tools_mcp_fixture import plan_tools_mcp
 from _zcode_fixture import BASE_URL, measured_output
+from shared.cli_invoke import SubprocessResult, run_cli_subprocess
 from shared.process_cost import ProcessCostBasis
 
 from orchestrator.agents import sandbox_dispatch
@@ -262,14 +263,26 @@ class TestInvokeZCode:
         assert not Path(fake_zcode.capture()['home']).exists()
         assert _listing(worktree) == before
 
+    @pytest.mark.timing(reason='the wall-clock watchdog kill is the behaviour under test')
     async def test_the_wall_clock_kills_a_run_that_overstays(
         self, fake_zcode, worktree, monkeypatch,
     ):
         monkeypatch.setenv('ZCODE_FAKE_SLEEP', '5')
-        result = await _invoke(worktree, timeout_seconds=1)
+        spawns: list[tuple[Path, bool]] = []
+
+        async def recording_runner(
+            cmd: list[str], cwd: Path, env: dict[str, str], **kwargs: Any,
+        ) -> SubprocessResult:
+            home = Path(env['HOME'])
+            spawns.append((home, home.is_dir()))
+            return await run_cli_subprocess(cmd, cwd, env, **kwargs)
+
+        result = await _invoke(worktree, timeout_seconds=1, runner=recording_runner)
         assert result.timed_out is True
         assert result.success is False
-        assert not Path(fake_zcode.capture()['home']).exists()
+        [(home, existed_at_spawn)] = spawns
+        assert existed_at_spawn
+        assert not home.exists()
 
     async def test_an_unbounded_invocation_is_refused_before_any_spawn(
         self, fake_zcode, worktree,
