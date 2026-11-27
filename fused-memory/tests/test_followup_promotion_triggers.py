@@ -165,6 +165,43 @@ async def test_a_dependent_landing_on_pending_promotes_the_held_task(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('status', ['done', 'cancelled'])
+async def test_a_settled_dependent_reopened_to_pending_promotes_the_held_task(
+    stack: Stack, curator_creates: list[PreparedCandidate], status: str,
+) -> None:
+    held = await _file_held(stack, 'The retry loop swallows the timeout')
+    dependent = await stack.seed('Ship the retry budget', {'files': [_FILE]}, status=status)
+    _ok(await stack.call('add_dependency', id=dependent, depends_on=held))
+    await _assert_held(stack, held)
+    assert await _promoted_events(stack) == []
+
+    _ok(await stack.call(
+        'set_task_status', id=dependent, status='pending', reopen_reason='reopened: the retry budget regressed',
+    ))
+
+    assert (await stack.row(dependent))['status'] == 'pending'
+    await _assert_promoted(stack, held, by='dependent', ref=dependent)
+
+
+@pytest.mark.asyncio
+async def test_a_deferred_dependent_landing_on_blocked_promotes_the_held_task(
+    stack: Stack, curator_creates: list[PreparedCandidate],
+) -> None:
+    held = await _file_held(stack, 'The retry loop swallows the timeout')
+    planned = await stack.file_planned(
+        title='PRD leaf: name the retry budget', description='A planning-mode task.',
+        priority='medium', metadata={'files': [_FILE]},
+    )
+    _ok(await stack.call('add_dependency', id=planned, depends_on=held))
+    await _assert_held(stack, held)
+
+    _ok(await stack.call('set_task_status', id=planned, status='blocked'))
+
+    assert (await stack.row(planned))['status'] == 'blocked'
+    await _assert_promoted(stack, held, by='dependent', ref=planned)
+
+
+@pytest.mark.asyncio
 async def test_a_held_task_landing_back_on_pending_stays_held(
     stack: Stack, curator_creates: list[PreparedCandidate],
 ) -> None:
