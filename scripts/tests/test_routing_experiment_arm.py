@@ -15,6 +15,7 @@ import shutil
 import subprocess
 from pathlib import Path
 
+import pytest
 from cli_subprocess_timeout import cli_timeout_from_env
 from git_env import scrubbed_git_env
 
@@ -22,6 +23,7 @@ SCRIPT = Path(__file__).parent.parent / 'routing_experiment_arm.sh'
 BASH = shutil.which('bash') or '/bin/bash'
 RULES_FILE = 'orchestrator/src/orchestrator/defaults.yaml'
 TIMEOUT = cli_timeout_from_env('ROUTING_EXPERIMENT_ARM_TEST_TIMEOUT')
+RULE_A_RULES = 'routing:\n  rules:\n    - id: rule-a\n'
 
 _STUB_READOUT = '''\
 import json, os, sys
@@ -108,4 +110,43 @@ def test_rules_file_missing_from_main_fails_with_a_read_error_not_a_missing_id(t
     assert 'cannot read' in result.stderr
     assert RULES_FILE in result.stderr
     assert "is not in main's" not in result.stderr
+    assert calls == []
+
+
+@pytest.mark.parametrize('separator', [' ', '\n'])
+def test_aa_reads_exactly_the_roots_of_the_experiment_units(tmp_path, separator):
+    repo = _arm_repo(tmp_path, {RULES_FILE: RULE_A_RULES})
+    units = separator.join(['/srv/exp-a:1', '/srv/exp-b:2'])
+
+    result, calls = _run_arm(repo, 'exp-salt', 'rule-a', '14', units=units)
+
+    aa_calls = [argv for argv in calls if '--aa' in argv]
+    assert len(aa_calls) == 1, result.stderr
+    argv = aa_calls[0]
+    assert argv[argv.index('--roots') + 1] == '/srv/exp-a,/srv/exp-b'
+    assert argv[argv.index('--salt') + 1] == 'exp-salt'
+    assert argv[argv.index('--days') + 1] == '14'
+    assert result.returncode == 1
+    assert "the readout's A/A check did not pass" in result.stderr
+
+
+@pytest.mark.parametrize('bad', ['/srv/exp-b', '/srv/exp-b:', ':8100', '/srv/exp-b:80x'])
+def test_malformed_unit_fails_naming_it_before_the_readout(tmp_path, bad):
+    repo = _arm_repo(tmp_path, {RULES_FILE: RULE_A_RULES})
+
+    result, calls = _run_arm(repo, 'exp-salt', 'rule-a', units='/srv/exp-a:1 ' + bad)
+
+    assert result.returncode == 1
+    assert bad in result.stderr
+    assert '<project_root>:<port>' in result.stderr
+    assert calls == []
+
+
+def test_units_naming_no_unit_fails_before_the_readout(tmp_path):
+    repo = _arm_repo(tmp_path, {RULES_FILE: RULE_A_RULES})
+
+    result, calls = _run_arm(repo, 'exp-salt', 'rule-a', units='  \n ')
+
+    assert result.returncode == 1
+    assert 'ROUTING_EXPERIMENT_UNITS' in result.stderr
     assert calls == []
