@@ -482,6 +482,17 @@ class TestClaim:
         assert selection.claim is None
         rig.assert_untouched('D')
 
+    async def test_a_predecessor_the_reads_report_done_leaves_its_dependents_unrefused(
+        self, tmp_path, monkeypatch,
+    ):
+        rig = await _with_p_running(tmp_path, monkeypatch)
+        picture = await rig.picture(p_running(), task('D', deps=('P',)), task('E', deps=('P',)))
+
+        selection = await rig.select(picture, reads_for(picture, dep_statuses={'P': 'done'}))
+
+        assert selection == EarlyStartSelection(None, ())
+        rig.assert_untouched('D', 'E')
+
     async def test_a_claim_that_claims_nobody_writes_nothing(self, tmp_path, monkeypatch):
         rig = await _with_p_running(tmp_path, monkeypatch)
         picture = await rig.picture(p_running(), task('D', deps=('P', 'X')))

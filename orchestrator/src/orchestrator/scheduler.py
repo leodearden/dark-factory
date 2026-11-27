@@ -94,7 +94,13 @@ from orchestrator.config import (
 )
 from orchestrator.delivered_check_owner import derive_check_owner
 from orchestrator.delivered_checks import DeliveredCheckResult, run_delivered_check
-from orchestrator.dependency_verdict import DepKind, DepState, deps_verdict, task_external_deps
+from orchestrator.dependency_verdict import (
+    DepKind,
+    DepState,
+    DepsVerdict,
+    deps_verdict,
+    task_external_deps,
+)
 from orchestrator.deploy_state import awaits_scheduled_restart
 from orchestrator.dispatch_row import FreshRow, refresh_dispatch_row
 from orchestrator.early_start_selection import (
@@ -8528,11 +8534,13 @@ class Scheduler:
         waiting_predecessors: Collection[str],
         rows: Mapping[str, dict] | None = None,
     ) -> EarlyStartShortlist:
-        """Every pending dependent of a waiting predecessor, as a candidate in rank order or a refusal.
+        """Every pending dependent still waiting on a waiting predecessor, as a candidate in rank order or a refusal.
 
         *statuses* overlay the picture's status map.  A task is judged on its
         row in *rows* when it has one, else on the picture's row with its
-        overlaid status.  Synchronous, and writes nothing.
+        overlaid status.  A dependent whose dependencies the overlay reports
+        all satisfied (its predecessor finished since the picture) waits on
+        nothing, so it is neither.  Synchronous, and writes nothing.
         """
         status_map = {**picture.status_map, **statuses}
         candidates: list[EarlyStartCandidate] = []
@@ -8545,7 +8553,14 @@ class Scheduler:
                 row = judged_row(picture_row, status_map, rows or {})
                 if predecessor not in dependency_ids(row):
                     continue
-                reason = self._early_start_qualification_refusal(row, tid, predecessor, picture, status_map)
+                verdict = picture_deps_verdict(
+                    row, picture, status_map, waiting_predecessors=frozenset({predecessor}),
+                )
+                if verdict.satisfied:
+                    continue
+                reason = self._early_start_qualification_refusal(
+                    row, tid, predecessor, verdict, picture, status_map,
+                )
                 if reason is not None:
                     refusals.append(EarlyStartRefusal(reason, dependent=tid, predecessor=predecessor))
                     continue
@@ -8738,19 +8753,20 @@ class Scheduler:
         row: dict,
         tid: str,
         predecessor: str,
+        verdict: DepsVerdict,
         picture: TaskPicture,
         status_map: dict[str, str],
     ) -> EarlyStartRefusalReason | None:
-        """Step (a)'s qualification: why *row* may not start early on *predecessor*'s branch, in the PRD's check order; None when it may."""
+        """Step (a)'s qualification: why *row* may not start early on *predecessor*'s branch, in the PRD's check order; None when it may.
+
+        *verdict* is *row*'s dependency verdict with *predecessor* set aside.
+        """
         if self.lock_table.successor_relation(predecessor) is not None:
             return EarlyStartRefusalReason.PREDECESSOR_HAS_DEPENDENT
         if self.is_deterministic(row):
             return EarlyStartRefusalReason.NOT_CODE_TASK
         if (row.get('metadata') or {}).get('milestone'):
             return EarlyStartRefusalReason.HAS_MILESTONE
-        verdict = picture_deps_verdict(
-            row, picture, status_map, waiting_predecessors=frozenset({predecessor}),
-        )
         if verdict.waiting_predecessor != predecessor:
             return EarlyStartRefusalReason.NOT_ONLY_DEPENDENCY
         eligible, _signal = self._eligible_for_dispatch(
