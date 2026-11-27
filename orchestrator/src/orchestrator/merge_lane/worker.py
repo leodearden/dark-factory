@@ -8707,6 +8707,10 @@ class SpeculativeMergeWorker:
           verify_base — the dispatch-time base facts ({main_sha, merge_base_sha},
             VerifyBaseFacts) the entry's verify classifies against; None until
             its verify resolves them.
+          tree — the in-flight entry's TestedTree wire form ({base_commit,
+            root_commit, members: [{request_id, task_id, merge_commit, tip,
+            own}]}); None elsewhere and until published
+            (plans/merge-pool-batches-prd.md §6.1).
         State values: queued, merging, awaiting_host, awaiting_verify,
           dispatching, verifying, passthrough, gate_reverify, finalizing.
           A request still waiting for the merger whose outcome is already
@@ -8742,6 +8746,7 @@ class SpeculativeMergeWorker:
                 'verify_started_at': None,
                 'verify_age_secs': None,
                 'verify_base': None,
+                'tree': None,
             }
 
         def _infl_entry(infl: InflightEntry, position: int) -> dict:
@@ -8766,6 +8771,7 @@ class SpeculativeMergeWorker:
                 dataclasses.asdict(infl.verify_base)
                 if infl.verify_base is not None else None
             )
+            e['tree'] = infl.tree.to_wire() if infl.tree is not None else None
             return e
 
         # Pre-scan container membership (task 2435 kappa-b) — computed BEFORE
