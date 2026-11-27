@@ -23,8 +23,10 @@ from shared.quality_series.git_lines import GitUnavailable
 from shared.quality_series.landings import (
     LandingSource,
     LinesBase,
+    RecordedLanding,
     recorded_landing_instants,
     recorded_landing_keys,
+    recorded_landings,
 )
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
@@ -364,6 +366,73 @@ class TestRecordedLandingKeys:
 
         with pytest.raises(UnrecognisedTrainEvent):
             recorded_landing_keys(db.conn, recorded_after=None)
+
+
+class TestRecordedLandings:
+    """Each recorded landing's task, sha, time and source; read without git."""
+
+    @pytest.fixture
+    def db(self, tmp_path: Path) -> RunsDbBuilder:
+        """A runs.db outside any git repository; the reader takes the connection and no repo."""
+        return RunsDbBuilder(tmp_path / 'not-a-repo' / 'runs.db')
+
+    def test_a_done_merge_lands_once_at_its_earliest_event_and_any_other_state_not_at_all(
+        self, db: RunsDbBuilder
+    ) -> None:
+        db.merge_done(at_hour(1.0), '401', 'sha-a')
+        db.merge_done(at_hour(2.0), '401', 'sha-a')
+        db.merge_state(at_hour(3.0), '402', 'blocked')
+        db.merge_state(at_hour(4.0), '403', 'superseded', superseded_by='404')
+
+        assert recorded_landings(db.conn) == (
+            RecordedLanding(
+                task_id='401', merge_sha='sha-a', landed_at=at_hour(1.0),
+                source=LandingSource.MERGE_FINALIZED,
+            ),
+        )
+
+    def test_a_coalesced_train_lands_each_member_under_its_merge_commit(
+        self, db: RunsDbBuilder
+    ) -> None:
+        db.train_merged(at_hour(1.0), '503', ['501', '502', '503'], 'train-sha', 'base-sha')
+
+        assert recorded_landings(db.conn) == tuple(
+            RecordedLanding(
+                task_id=member, merge_sha='train-sha', landed_at=at_hour(1.0),
+                source=LandingSource.TRAIN_MERGED,
+            )
+            for member in ('501', '502', '503')
+        )
+
+    def test_an_attributed_solo_passer_lands_its_own_task(self, db: RunsDbBuilder) -> None:
+        db.train_attributed(at_hour(1.0), '601', 'train-x', 'solo-sha')
+
+        assert recorded_landings(db.conn) == (
+            RecordedLanding(
+                task_id='601', merge_sha='solo-sha', landed_at=at_hour(1.0),
+                source=LandingSource.TRAIN_ATTRIBUTED,
+            ),
+        )
+
+    def test_the_landings_are_oldest_first_with_aware_instants(self, db: RunsDbBuilder) -> None:
+        db.merge_done(at_hour(3.0), '903', 'third')
+        db.train_merged(at_hour(1.0), '902', ['901', '902'], 'first', 'base')
+        db.train_attributed(at_hour(2.0), '904', 'train-x', 'second')
+
+        found = recorded_landings(db.conn)
+
+        assert [(r.task_id, r.landed_at) for r in found] == [
+            ('901', at_hour(1.0)), ('902', at_hour(1.0)), ('904', at_hour(2.0)), ('903', at_hour(3.0)),
+        ]
+        assert all(r.landed_at.tzinfo is not None for r in found)
+
+    def test_an_unrecognised_train_payload_is_the_same_typed_refusal(
+        self, db: RunsDbBuilder
+    ) -> None:
+        db.event(at_hour(1.0), 'train_merged', '801', {'train_id': 'train-z', 'verdict': 'other'})
+
+        with pytest.raises(UnrecognisedTrainEvent):
+            recorded_landings(db.conn)
 
 
 class TestRecordedLandingInstants:
