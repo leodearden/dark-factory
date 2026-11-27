@@ -169,6 +169,49 @@ async def test_raising_body_propagates_and_still_freezes_the_tokens_it_recorded(
     assert m.usage == LlmTokenUsage(10, 2, 1)
 
 
+class TestPerModelAttribution:
+    """A tracker bound to a model splits a window's usage by that model (task 9943)."""
+
+    @staticmethod
+    def _client_on(model: str | None) -> SimpleNamespace:
+        return SimpleNamespace(token_tracker=AttributingTokenUsageTracker(model=model))
+
+    @pytest.mark.asyncio
+    async def test_a_bound_tracker_credits_its_model(self):
+        client = self._client_on('gpt-6.1-sol')
+
+        async with measure_llm_tokens(client) as m:
+            client.token_tracker.record('extract_edges.edge', 30, 10)
+
+        assert m.by_model == {'gpt-6.1-sol': LlmTokenUsage(30, 10, 1)}
+        assert m.usage == LlmTokenUsage(30, 10, 1)
+
+    @pytest.mark.asyncio
+    async def test_two_bound_trackers_in_one_window_split_by_model(self):
+        mini, sol = self._client_on('gpt-4o-mini'), self._client_on('gpt-6.1-sol')
+
+        async with measure_llm_tokens(mini) as m:
+            mini.token_tracker.record('dedupe_edges.resolve_edge', 5, 1)
+            sol.token_tracker.record('extract_edges.edge', 30, 10)
+            mini.token_tracker.record('extract_nodes.extract_summaries_batch', 7, 2)
+
+        assert m.by_model == {
+            'gpt-4o-mini': LlmTokenUsage(12, 3, 2),
+            'gpt-6.1-sol': LlmTokenUsage(30, 10, 1),
+        }
+        assert m.usage == LlmTokenUsage(42, 13, 3)
+
+    @pytest.mark.asyncio
+    async def test_an_unbound_tracker_credits_usage_only(self):
+        client = self._client_on(None)
+
+        async with measure_llm_tokens(client) as m:
+            client.token_tracker.record('extract_edges.edge', 30, 10)
+
+        assert m.usage == LlmTokenUsage(30, 10, 1)
+        assert m.by_model == {}
+
+
 class TestGraphitiBackendTokenProbe:
     @pytest.mark.asyncio
     async def test_without_an_llm_client_the_probe_measures_nothing(self, mock_config):

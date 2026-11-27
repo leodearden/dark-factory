@@ -171,6 +171,38 @@ async def test_log_backend_op_journals_measured_tokens_even_without_a_result(jou
 
 
 @pytest.mark.asyncio
+async def test_log_backend_op_splits_measured_tokens_by_model(journal):
+    write_op_id = str(uuid.uuid4())
+    await journal.log_backend_op(
+        write_op_id=write_op_id,
+        backend='graphiti',
+        operation='add_episode',
+        llm_tokens=LlmTokenUsage(input_tokens=12, output_tokens=3, llm_calls=1),
+        llm_tokens_by_model={'gpt-6.1-sol': LlmTokenUsage(input_tokens=12, output_tokens=3, llm_calls=1)},
+    )
+    [row] = await journal.get_backend_ops_for_write_op(write_op_id)
+    assert json.loads(row['result_summary'])['tokens']['by_model'] == {
+        'gpt-6.1-sol': {'input_tokens': 12, 'output_tokens': 3, 'total_tokens': 15, 'llm_calls': 1},
+    }
+
+
+@pytest.mark.asyncio
+async def test_log_backend_op_with_an_empty_model_split_journals_no_by_model(journal):
+    write_op_id = str(uuid.uuid4())
+    await journal.log_backend_op(
+        write_op_id=write_op_id,
+        backend='graphiti',
+        operation='add_episode',
+        llm_tokens=LlmTokenUsage(input_tokens=12, output_tokens=3, llm_calls=1),
+        llm_tokens_by_model={},
+    )
+    [row] = await journal.get_backend_ops_for_write_op(write_op_id)
+    assert json.loads(row['result_summary'])['tokens'] == {
+        'input_tokens': 12, 'output_tokens': 3, 'total_tokens': 15, 'llm_calls': 1,
+    }
+
+
+@pytest.mark.asyncio
 async def test_log_backend_op_without_llm_tokens_keeps_the_plain_result_summary(journal):
     write_op_id = str(uuid.uuid4())
     await journal.log_backend_op(
