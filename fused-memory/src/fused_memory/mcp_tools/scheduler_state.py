@@ -8,6 +8,10 @@ No orchestrator imports — these helpers read on-disk files written by
 the orchestrator process (a separate process).  The format contract is
 shared.scheduler_state.SchedulerStateSnapshot for the JSON snapshot, plus
 the SQLite runs.db schema.
+
+The snapshot-only readers serve fused-memory's internal callers; the
+get_scheduler_state tool serves ``served_scheduler_state``, the view
+cross-checked against the runs.db pause row.
 """
 
 from __future__ import annotations
@@ -15,10 +19,16 @@ from __future__ import annotations
 import json
 import logging
 import time
+from datetime import UTC, datetime
 from pathlib import Path
 
 from shared.project_layout import runs_db, scheduler_state_json
-from shared.scheduler_state import MalformedSnapshotError, SchedulerStateSnapshot
+from shared.scheduler_state import (
+    CheckedSchedulerState,
+    MalformedSnapshotError,
+    SchedulerStateSnapshot,
+    read_scheduler_state_checked,
+)
 
 _log = logging.getLogger(__name__)
 
@@ -79,8 +89,8 @@ def read_scheduler_state_strict(project_root: Path) -> SchedulerStateSnapshot | 
     except OSError as exc:
         raise SchedulerStateUnreadable(path, exc) from exc
     try:
-        return SchedulerStateSnapshot.from_json(json.loads(raw))
-    except (json.JSONDecodeError, UnicodeDecodeError, MalformedSnapshotError) as exc:
+        return SchedulerStateSnapshot.from_bytes(raw)
+    except MalformedSnapshotError as exc:
         raise SchedulerStateUnreadable(path, exc) from exc
 
 
@@ -99,6 +109,11 @@ def read_scheduler_state(project_root: Path) -> SchedulerStateSnapshot:
         _log.warning('read_scheduler_state: %s — returning empty snapshot', exc)
         return SchedulerStateSnapshot.empty()
     return snapshot if snapshot is not None else SchedulerStateSnapshot.empty()
+
+
+def served_scheduler_state(project_root: Path) -> CheckedSchedulerState:
+    """The view get_scheduler_state serves: the snapshot cross-checked against the runs.db pause row as of the wall clock."""
+    return read_scheduler_state_checked(project_root, now=datetime.now(UTC))
 
 
 def effective_lock_depth(project_root: str | Path | None, default: int) -> int:
