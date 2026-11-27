@@ -23,10 +23,12 @@ import logging
 from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 from _overreach_shadow_fixtures import judged_edge, judged_episode, non_judging_shadow
 from shared.async_sqlite_base import CheckpointResult
+from shared.cost_store import CostStore
 
 from fused_memory.server import main as server_main
 from fused_memory.server.tools import (
@@ -227,15 +229,16 @@ async def test_collect_targets_omits_recon_ledger_when_none_or_no_checkpoint():
     assert 'recon_ledger' not in {name for name, _ in targets_no_checkpoint}
 
 
-def _collect_with_memory_service(memory_service) -> list[tuple[str, object]]:
-    return server_main._collect_checkpoint_targets(
-        taskmaster=None,
-        recon_journal=None,
-        event_buffer=None,
-        ticket_store=None,
-        write_journal=None,
-        memory_service=memory_service,
-    )
+def _collect_targets(**overrides: Any) -> list[tuple[str, object]]:
+    stores: dict[str, Any] = {
+        'taskmaster': None,
+        'recon_journal': None,
+        'event_buffer': None,
+        'ticket_store': None,
+        'write_journal': None,
+        'memory_service': SimpleNamespace(),
+    }
+    return server_main._collect_checkpoint_targets(**(stores | overrides))
 
 
 @pytest.mark.asyncio
@@ -244,7 +247,7 @@ async def test_collect_targets_checkpoints_the_overreach_shadow_sidecar(tmp_path
     await store.record(episode=judged_episode(), judgements=[judged_edge('e1', 'overreach')])
     shadow = non_judging_shadow(store)
     try:
-        targets = _collect_with_memory_service(SimpleNamespace(overreach_shadow=shadow))
+        targets = _collect_targets(memory_service=SimpleNamespace(overreach_shadow=shadow))
         assert 'overreach_shadow' in {name for name, _ in targets}
 
         await server_main._run_checkpoint_cycle(targets)
@@ -256,8 +259,88 @@ async def test_collect_targets_checkpoints_the_overreach_shadow_sidecar(tmp_path
 
 
 def test_collect_targets_omits_an_absent_overreach_shadow() -> None:
-    targets = _collect_with_memory_service(SimpleNamespace(overreach_shadow=None))
+    targets = _collect_targets(memory_service=SimpleNamespace(overreach_shadow=None))
     assert 'overreach_shadow' not in {name for name, _ in targets}
+
+
+@pytest.mark.asyncio
+async def test_collect_targets_checkpoints_the_invocations_ledger(tmp_path: Path) -> None:
+    db_path = tmp_path / 'curator_events.db'
+    wal_path = tmp_path / 'curator_events.db-wal'
+    store = CostStore(db_path)
+    await store.open()
+    try:
+        await store.save_invocation(
+            run_id='run-1',
+            task_id='1',
+            project_id='p',
+            account_name='a',
+            model='opus',
+            role='curator',
+            cost_usd=0.01,
+            input_tokens=1,
+            output_tokens=1,
+            cache_read_tokens=0,
+            cache_create_tokens=0,
+            duration_ms=1,
+            capped=False,
+            started_at='2026-11-27T00:00:00+00:00',
+            completed_at='2026-11-27T00:00:01+00:00',
+        )
+        assert wal_path.stat().st_size > 0
+
+        targets = _collect_targets(invocations_store=store)
+        assert 'invocations_ledger' in {name for name, _ in targets}
+
+        await server_main._run_checkpoint_cycle(targets)
+
+        assert server_main._CHECKPOINT_STATUS['invocations_ledger']['busy'] == 0
+        assert wal_path.stat().st_size == 0
+    finally:
+        await store.close()
+
+
+def test_collect_targets_omits_an_absent_invocations_ledger() -> None:
+    explicit_none = _collect_targets(invocations_store=None)
+    omitted = _collect_targets()
+    assert 'invocations_ledger' not in {name for name, _ in explicit_none}
+    assert 'invocations_ledger' not in {name for name, _ in omitted}
+
+
+def test_the_invocations_ledger_is_checkpointed_after_every_other_store() -> None:
+    class _Store:
+        async def checkpoint(self):
+            return (0, 0, 0)
+
+        async def checkpoint_all(self):
+            return {}
+
+    targets = _collect_targets(
+        taskmaster=_Store(),
+        recon_journal=_Store(),
+        event_buffer=_Store(),
+        ticket_store=_Store(),
+        write_journal=_Store(),
+        memory_service=SimpleNamespace(
+            durable_queue=_Store(),
+            planned_episode_registry=_Store(),
+            overreach_shadow=_Store(),
+        ),
+        recon_ledger=_Store(),
+        invocations_store=_Store(),
+    )
+    assert [name for name, _ in targets] == [
+        'task_backend',
+        'recon_journal',
+        'event_buffer',
+        'ticket_store',
+        'recon_ledger',
+        'write_journal',
+        'durable_queue',
+        'planned_episode_registry',
+        'overreach_shadow',
+        'invocations_ledger',
+    ]
 
 
 # ---------------------------------------------------------------------------

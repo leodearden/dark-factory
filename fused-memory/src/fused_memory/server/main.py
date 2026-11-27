@@ -1147,6 +1147,7 @@ async def run_server():
         # unconditionally pre-initialized to None near the top of
         # run_server(), so it's always bound here — no locals() guard needed.
         recon_ledger=recon_ledger,
+        invocations_store=invocations_store,
     )
     if _checkpoint_targets:
         from fused_memory.services.journal_growth_alarm import JournalGrowthAlarm
@@ -1422,6 +1423,7 @@ def _collect_checkpoint_targets(
     memory_service,
     known_projects: dict[str, str] | None = None,
     recon_ledger=None,
+    invocations_store: CostStore | None = None,
 ) -> list[tuple[str, object]]:
     """Gather every live SQLite store that exposes a ``checkpoint`` method.
 
@@ -1458,6 +1460,8 @@ def _collect_checkpoint_targets(
     shadow = getattr(memory_service, 'overreach_shadow', None)
     if shadow is not None and hasattr(shadow, 'checkpoint'):
         targets.append(('overreach_shadow', shadow.checkpoint))
+    if invocations_store is not None and hasattr(invocations_store, 'checkpoint'):
+        targets.append(('invocations_ledger', invocations_store.checkpoint))
     if known_projects:
         for project_id, root in known_projects.items():
             targets.append((
