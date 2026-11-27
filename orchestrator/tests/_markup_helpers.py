@@ -8,8 +8,8 @@ tool call that edits it — the Write/Edit argument terminates early, truncating
 the file and silently dropping that call's sibling arguments (the rationale
 recorded in the "Sentinel-literal hazard" section of
 ``shared/src/shared/toolcall_markup.py``). So every specimen is BUILT from
-:func:`closer` / :func:`param_opener`, whose angle bracket comes from
-``chr(60)``. The source rule is enforced repo-wide by
+:func:`closer` / :func:`param_opener` / :func:`invoke_opener`, whose angle
+bracket comes from ``chr(60)``. The source rule is enforced repo-wide by
 ``tests/scripts/test_no_raw_envelope_literal.py::test_no_markup_handling_file_spells_a_raw_envelope_literal``.
 
 SCHEMA READING. :func:`type_alternatives` is the one reading of what a
@@ -34,6 +34,11 @@ def closer(name: str) -> str:
 def param_opener(name: str) -> str:
     """Build the canonical opening tag for parameter *name*."""
     return LT + 'parameter name="' + name + '">'
+
+
+def invoke_opener(tool: str) -> str:
+    """Build the opening tag of a call to *tool* — a NEXT call a leak swallowed."""
+    return LT + 'invoke name="' + tool + '">'
 
 
 #: The bare invoke closer — the terminator that trails a last-parameter leak.
