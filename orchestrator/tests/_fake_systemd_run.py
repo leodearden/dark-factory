@@ -60,7 +60,9 @@ def scope_payload_command(record: list[str]) -> str:
     _handshake, newline, wrapped = record[-1].partition('\n')
     assert newline, f'no launch-handshake line in the payload: {record!r}'
     _record_cgroup, opened, rest = wrapped.partition('; ( ')
-    command, closed, _copy_counters = rest.rpartition('\n)\n__df_rc=$?\n')
+    command, closed, _copy_counters = rest.rpartition(
+        '\n) 2>&$__df_err {__df_err}>&-\n__df_rc=$?\n'
+    )
     assert opened and closed, f'no capture wrapper around the command: {wrapped!r}'
     return command
 

@@ -329,9 +329,10 @@ class CommandCapture:
         """*cmd* in a subshell, with its scope's counters copied to the directory after it.
 
         The subshell keeps ``exit`` and ``exec`` in *cmd* from skipping the
-        copy. *cmd* starts on the script's first line, so bash's line numbers
-        for it are unchanged. The script starts nothing but ``cat``, and its
-        own statements write nothing to the command's output.
+        copy. *cmd* starts on the script's first line, so bash's error messages
+        for it keep their line numbers. The script starts nothing but ``cat``. Its own
+        shell writes nothing to the output, not even a report of *cmd*'s death
+        by a signal, while *cmd* keeps its own stderr.
         """
         if self.directory is None:
             return cmd
@@ -348,7 +349,9 @@ class CommandCapture:
             f' > {directory}/"$__df_f"; done; : > {directory}/{_COMPLETE_FILE}; }} 2>/dev/null'
         )
         return (
-            f'{record_cgroup}; ( {cmd}\n)\n__df_rc=$?\n{copy_counters}\nexit "$__df_rc"'
+            f'{record_cgroup}; exec {{__df_err}}>&2 2>/dev/null;'
+            f' ( {cmd}\n) 2>&$__df_err {{__df_err}}>&-'
+            f'\n__df_rc=$?\n{copy_counters}\nexit "$__df_rc"'
         )
 
     def read_before_kill(self, relocated: Iterable[str]) -> None:
