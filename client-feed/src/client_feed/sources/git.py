@@ -230,23 +230,24 @@ def _timed_out(session: _CatFile) -> GitError:
     )
 
 
-def _next_chunk(session: _CatFile, *, deadline: float, sha: str) -> bytes:
-    """The next bytes git writes, read straight from the fd so poll sees every byte still unread.
+def _reply_chunks(session: _CatFile, *, deadline: float, sha: str) -> Iterator[bytes]:
+    """Each next run of bytes git writes, read straight from the fd so poll sees every byte still unread.
 
     Past `deadline` the session is killed, so no later read can take this read's reply, and the read is a timeout.
     """
     _, reply = _pipes(session.process)
     descriptor = reply.fileno()
-    remaining = deadline - time.monotonic()
     waiter = select.poll()
     waiter.register(descriptor, select.POLLIN)
-    if remaining <= 0 or not waiter.poll(math.ceil(remaining * 1000)):
-        session.process.kill()
-        raise _timed_out(session)
-    chunk = os.read(descriptor, _REPLY_CHUNK_BYTES)
-    if not chunk:
-        raise _cat_file_error(f'output ended before object {sha} was read', session.process)
-    return chunk
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 or not waiter.poll(math.ceil(remaining * 1000)):
+            session.process.kill()
+            raise _timed_out(session)
+        chunk = os.read(descriptor, _REPLY_CHUNK_BYTES)
+        if not chunk:
+            raise _cat_file_error(f'output ended before object {sha} was read', session.process)
+        yield chunk
 
 
 def _read_blob(session: _CatFile, sha: str) -> bytes:
@@ -259,9 +260,10 @@ def _read_blob(session: _CatFile, sha: str) -> bytes:
         request.flush()
     except OSError as exc:
         raise _cat_file_error(f'request for {sha} not accepted', process) from exc
+    chunks = _reply_chunks(session, deadline=deadline, sha=sha)
     reply = bytearray()
     while b'\n' not in reply:
-        reply += _next_chunk(session, deadline=deadline, sha=sha)
+        reply += next(chunks)
     header_line, _, body = reply.partition(b'\n')
     header = header_line.split()
     if len(header) != 3 or header[1] != b'blob':
@@ -269,10 +271,11 @@ def _read_blob(session: _CatFile, sha: str) -> bytes:
     with _parsing('cat-file', returncode=process.poll()):
         size = int(header[2])
     while len(body) <= size:
-        body += _next_chunk(session, deadline=deadline, sha=sha)
+        body += next(chunks)
     if len(body) != size + 1 or body[size:] != b'\n':
         raise _cat_file_error(f"object {sha}'s reply does not end in a newline right after its {size} bytes", process)
-    return bytes(body[:size])
+    del body[size:]
+    return bytes(body)
 
 
 def _finish(session: _CatFile) -> None:
