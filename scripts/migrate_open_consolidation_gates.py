@@ -586,9 +586,10 @@ async def gate_closure(ctx: RunContext, gate: OpenGate, topic: str) -> ClosureVe
 
 
 def _with_next_calls(ctx: RunContext, gate: OpenGate, report: GateReport) -> GateReport:
-    """PRD D9: a human-curator gate is stamped first, or its runner re-blocks it on resume."""
+    """PRD D9: a human-curator gate is stamped first, or its runner re-blocks it on resume; its pin is acknowledged after the stamp."""
     calls: list[ToolCall] = []
-    if gate.metadata.get(HUMAN_CURATOR_GATE_KEY) is True:
+    curator = gate.metadata.get(HUMAN_CURATOR_GATE_KEY) is True
+    if curator:
         calls.append(ToolCall('update_task', {
             'id': gate.task_id,
             'project_root': ctx.project_root,
@@ -603,14 +604,17 @@ def _with_next_calls(ctx: RunContext, gate: OpenGate, report: GateReport) -> Gat
             note=f'no pending milestone_gate escalation for task {gate.task_id}, so there is nothing to resume yet',
         )
     verdict = report.verdict.value if report.verdict is not None else '-'
-    calls.append(ToolCall('resolve_issue', {
+    resume: dict[str, Any] = {
         'escalation_id': escalation_id,
         'resolution': (
             f'Migrated by scripts/migrate_open_consolidation_gates.py run {ctx.run_id}: '
             f'{verdict}; evaluate_closure closed'
         ),
         'action': 'resume',
-    }))
+    }
+    if curator:
+        resume['acknowledge_declared_pins'] = [escalation_id]
+    calls.append(ToolCall('resolve_issue', resume))
     return replace(report, next_calls=tuple(calls))
 
 
