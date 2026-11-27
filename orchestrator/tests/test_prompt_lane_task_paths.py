@@ -13,9 +13,13 @@ from _briefing_helpers import _mcp_search_envelope, memory_transport
 from _role_splice_contract import SpliceContract, assert_nonempty, assert_opens_own_section
 
 from orchestrator.agents.briefing import BriefingAssembler
-from orchestrator.agents.lane_task_guidance import LANE_TASK_LINKS_GUIDANCE, LANE_TASK_LINKS_SECTION
+from orchestrator.agents.lane_task_guidance import (
+    LANE_TASK_LINKS_GUIDANCE,
+    LANE_TASK_LINKS_SECTION,
+    UNLINKED_TASK_STATE_GUIDANCE,
+)
 from orchestrator.agents.roles import ROLES, AgentRole
-from orchestrator.artifacts import LANE_SYMLINKED_ARTIFACTS, TaskArtifacts
+from orchestrator.artifacts import ARTIFACT_ROOTS, LANE_SYMLINKED_ARTIFACTS, TaskArtifacts
 
 _LANE_PATH = re.compile(r'\.task/[A-Za-z0-9_.-]*[A-Za-z0-9_]')
 _LINKED_PATHS = tuple(f'.task/{name}' for name in LANE_SYMLINKED_ARTIFACTS)
@@ -69,6 +73,14 @@ def test_lane_task_dir_exposes_only_the_linked_artifacts(tmp_path):
     )
 
 
+@pytest.mark.parametrize('name', _UNLINKED_TASK_STATE)
+def test_unlinked_task_state_guidance_names_routed_artifacts_no_link_exposes(name):
+    artifact = name.rstrip('/')
+    assert artifact in ARTIFACT_ROOTS, f'{artifact} is not routed by ARTIFACT_ROOTS'
+    assert artifact not in LANE_SYMLINKED_ARTIFACTS, f'{artifact} is a .task/ link'
+    assert name in UNLINKED_TASK_STATE_GUIDANCE, f'UNLINKED_TASK_STATE_GUIDANCE omits {name}'
+
+
 def _names_a_lane_link(role: AgentRole) -> bool:
     return any(path in role.system_prompt for path in _LINKED_PATHS)
 
@@ -85,22 +97,19 @@ def test_lane_link_roles_name_the_linked_and_the_unlinked_task_state(name):
     prompt = ROLES[name].system_prompt
     for path in _LINKED_PATHS:
         assert path in prompt, f'{name} does not name {path}'
-    for unlinked in _UNLINKED_TASK_STATE:
-        assert unlinked in prompt, (
-            f'{name} describes the .task/ links without saying {unlinked} is not exposed there'
-        )
+    assert UNLINKED_TASK_STATE_GUIDANCE in prompt, (
+        f'{name} describes the .task/ links without UNLINKED_TASK_STATE_GUIDANCE'
+    )
 
 
 def test_every_role_naming_a_lane_link_carries_the_link_section_once():
     remedy = 'Restore the block in orchestrator/src/orchestrator/agents/lane_task_guidance.py.'
     assert_nonempty('LANE_TASK_LINKS_GUIDANCE', LANE_TASK_LINKS_GUIDANCE, remedy=remedy)
     assert_opens_own_section('LANE_TASK_LINKS_SECTION', LANE_TASK_LINKS_SECTION, remedy=remedy)
-    naming = frozenset(name for name, role in ROLES.items() if _names_a_lane_link(role))
-    assert naming, f'no role names any of {_LINKED_PATHS}, so this invariant checks nothing'
     SpliceContract(
         constant_name='LANE_TASK_LINKS_SECTION',
         constant=LANE_TASK_LINKS_SECTION,
-        roles=naming,
+        roles=frozenset(_LANE_LINK_ROLES),
         role_set_name='the roles naming a .task/ link',
         capability=_names_a_lane_link,
         capability_description=f'a mention of {_LINKED_PATHS}',
