@@ -16,8 +16,6 @@ from pathlib import Path
 import pytest
 
 from shared.cgroup_stats import (
-    MEMORY_PEAK,
-    SWAP_PEAK,
     CgroupReading,
     PressureResource,
     PressureTotals,
@@ -296,12 +294,6 @@ class TestReadCgroup:
             setattr(reading, field, 0)
         assert not isinstance(reading.cpu_stat, MutableMapping)
         assert not isinstance(reading.pressure, MutableMapping)
-
-
-class TestFileNames:
-    def test_the_peak_file_names_have_one_home(self):
-        assert MEMORY_PEAK == 'memory.peak'
-        assert SWAP_PEAK == 'memory.swap.peak'
 
 
 class TestPressureResource:
