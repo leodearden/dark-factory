@@ -60,7 +60,6 @@ _NOT_YET_MIGRATED = frozenset({
     'test_merge_verify_lease_guard.py',
     'test_merge_verify_survivor_barrier.py',
     'test_merge_worktree_lifecycle_integration_gate.py',
-    'test_multihost_verify_integration.py',
     'test_rebase_verify_cost.py',
     'test_reconcile_done_step_commits.py',
     'test_reopen_sticks_e2e.py',  # debt: task 11025
