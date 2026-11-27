@@ -13,9 +13,12 @@ from orchestrator.evals.metrics import (
     EndpointKind,
     EvalMetrics,
     compute_composite,
+    dispatched_models,
     is_false_green,
     is_null_work,
+    off_pin_roles,
 )
+from orchestrator.routing import DispatchedRoute, RoutingDecision
 
 
 class TestComputeComposite:
@@ -642,3 +645,87 @@ class TestBlendComposite:
         assert blend_composite(
             0.9, 1.0, 1.0, tests_pass=None, plan_only=True, no_plan=False,
         ) == pytest.approx(0.94, abs=1e-4)
+
+
+# ---------------------------------------------------------------------------
+# Task 8499: the persisted per-role dispatch record and the off-pin accessor.
+# ---------------------------------------------------------------------------
+
+def _dispatched(
+    role: str, model: str, source_layer: str, rule_id: str | None, served: str | None,
+) -> DispatchedRoute:
+    decision = RoutingDecision(
+        model=model, effort='high', budget_usd=5.0, max_turns=80,
+        source_layer=source_layer, rule_id=rule_id,
+    )
+    return DispatchedRoute(role, decision, served)
+
+
+def _record(
+    model: str, served: str | None, source_layer: str, rule_id: str | None,
+) -> dict[str, Any]:
+    return {
+        'model': model, 'served_model_id': served,
+        'source_layer': source_layer, 'rule_id': rule_id,
+    }
+
+
+class TestDispatchedModels:
+    def test_each_role_keeps_its_distinct_records_in_first_dispatch_order(self):
+        sonnet = _dispatched('implementer', 'sonnet', 'config', 'large-plan-steps', 'claude-sonnet-5-5')
+        routes = [
+            sonnet,
+            sonnet,
+            _dispatched('judge', 'sonnet', 'config', None, 'claude-sonnet-5-5'),
+            sonnet,
+            _dispatched('implementer', 'opus', 'policy_rule', 'retry-tier-up', 'claude-opus-5-5'),
+        ]
+
+        assert dispatched_models(routes) == {
+            'implementer': [
+                _record('sonnet', 'claude-sonnet-5-5', 'config', 'large-plan-steps'),
+                _record('opus', 'claude-opus-5-5', 'policy_rule', 'retry-tier-up'),
+            ],
+            'judge': [_record('sonnet', 'claude-sonnet-5-5', 'config', None)],
+        }
+
+    def test_no_routes_is_an_empty_mapping(self):
+        assert dispatched_models([]) == {}
+
+    def test_off_pin_roles_reads_none_as_not_recorded(self):
+        assert off_pin_roles(None) is None
+
+    def test_off_pin_roles_of_an_empty_mapping_is_empty(self):
+        assert off_pin_roles({}) == []
+
+    @pytest.mark.parametrize('off_pin_layer', ['policy_rule', 'role_default'])
+    def test_off_pin_roles_names_a_role_that_left_the_config_layer(self, off_pin_layer: str):
+        dispatched = {
+            'implementer': [
+                _record('sonnet', 'claude-sonnet-5-5', 'config', None),
+                _record('opus', 'claude-opus-5-5', off_pin_layer, None),
+            ],
+            'judge': [_record('sonnet', 'claude-sonnet-5-5', 'config', None)],
+        }
+
+        assert off_pin_roles(dispatched) == ['implementer']
+
+    def test_several_off_pin_roles_come_back_sorted(self):
+        dispatched = {
+            'implementer': [_record('sonnet', None, 'role_default', None)],
+            'architect': [_record('opus', None, 'config', None)],
+            'debugger': [_record('opus', None, 'policy_rule', 'large-plan-steps')],
+        }
+
+        assert off_pin_roles(dispatched) == ['debugger', 'implementer']
+
+    def test_a_legacy_cell_reads_back_as_not_recorded(self):
+        assert EvalMetrics.from_dict({}).dispatched_models is None
+
+    def test_dispatched_models_survive_a_json_round_trip(self):
+        m = EvalMetrics(dispatched_models={
+            'implementer': [_record('sonnet', 'claude-sonnet-5-5', 'config', 'large-plan-steps')],
+            'judge': [_record('sonnet', None, 'config', None)],
+        })
+
+        assert EvalMetrics.from_dict(json.loads(json.dumps(m.to_dict()))) == m
