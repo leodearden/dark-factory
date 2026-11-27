@@ -452,7 +452,8 @@ class EventType(StrEnum):
     # dispatcher — a gate checkout built for the deployed sha (right after
     # runner_stale, kind='gate_checkout'), the project checkout's main ref
     # mirror-forced after a non-fast-forward (kind='project_main_mirror'), or
-    # the project checkout's tags force-mirrored after a refused tag push
+    # the project checkout's tags force-mirrored after a plain tag push was
+    # refused twice, the retry ruling out a ref-lock race between roles
     # (kind='project_tag_mirror'; from_head/to_head null, a tag set has no
     # single head).  data carries {runner, kind, from_head, to_head, forced};
     # forced is True on both project mirror arms and False on gate_checkout.

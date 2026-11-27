@@ -1240,8 +1240,9 @@ async def env_probe_local_run(
 #: reused descriptor.
 HEARTBEAT_STOP_JOIN_SECS: float = 5.0
 
-#: Pause before ``RemoteRunner.publish_sha``'s one retry of a refused publish.
-_PUBLISH_RETRY_DELAY_SECS: float = 1.0
+#: Pause before the one plain retry of a refused push that may have lost a ref
+#: lock race to another role (``RemoteRunner.publish_sha``, ``RemoteRunner._mirror_tags``).
+_REFUSED_PUSH_RETRY_DELAY_SECS: float = 1.0
 
 
 async def _default_ssh_heartbeat_run(
@@ -1605,9 +1606,6 @@ class RemoteRunner:
         # merge worker caches its runners for the process lifetime
         # (_ensure_host_allocator), so the push fires once per new main tip.
         self._last_pushed_main_sha: str | None = None
-        # Likewise the tag listing the last tag mirror delivered, so a cached merge
-        # runner pushes the tag set only when it changes.
-        self._last_mirrored_tags: tuple[str, ...] | None = None
         # β: the in-flight request-id, so cancel_verify() can issue a targeted cancel.
         # One slot: claimed by _dispatch before its first await, cleared when it unwinds.
         self._inflight_request_id: str | None = None
@@ -1685,7 +1683,7 @@ class RemoteRunner:
                 'RemoteRunner %r: publish of gate sha %s refused, retrying once: %s',
                 self.name, sha, exc,
             )
-            await asyncio.sleep(_PUBLISH_RETRY_DELAY_SECS)
+            await asyncio.sleep(_REFUSED_PUSH_RETRY_DELAY_SECS)
             await self._push(target, refspec, cwd=self._code_checkout)
 
     async def reap_idle_gates(self) -> None:
@@ -2094,18 +2092,20 @@ class RemoteRunner:
         """Push every local tag of the project checkout to the remote before a verify.
 
         Unlike main's freshness, the tag set is an INPUT to the verdict (a test
-        may gate on a release tag), so it is synced before every verify or the
-        verify does not run: a failed push raises RunnerUnavailable.  An
+        may gate on a release tag), so it is pushed before EVERY verify, with no
+        dedup against an earlier mirror the remote may since have lost, and a
+        failed push raises RunnerUnavailable so the verify does not run.  An
         unreadable listing is this dispatcher's fault, not the host's, so it is
         logged and skipped; an empty one is skipped because a glob refspec
-        matching nothing makes git push exit 1, and so is the listing this
-        runner last mirrored successfully.
+        matching nothing makes git push exit 1.
 
         INV-2 mirror semantics (task 2884, PRD §3.1), as for main: a refused
-        push (typically a remote tag pointing elsewhere) is retried ONCE with a
-        force refspec, and a forced success emits
-        runner_synced(kind='project_tag_mirror').  A transport failure is
-        re-raised unforced: the host was not reached, so forcing cannot help.
+        push (typically a remote tag pointing elsewhere) is forced once, and a
+        forced success emits runner_synced(kind='project_tag_mirror').  Before
+        forcing, the plain push is retried once after a pause, as publish_sha
+        does: two roles creating one new tag collide on its ref lock, and a
+        force there would announce a divergence that never was.  A transport
+        failure is re-raised unforced: the host was not reached.
         """
         tags = await self._local_tag_refs()
         if tags is None:
@@ -2114,27 +2114,39 @@ class RemoteRunner:
                 self.name, self._cwd,
             )
             return
-        if not tags or tags == self._last_mirrored_tags:
+        if not tags:
             return
+        refused = await self._refused_tag_push()
+        if refused is None:
+            return
+        logger.info('RemoteRunner %r: tag mirror push refused, retrying once: %s', self.name, refused)
+        await asyncio.sleep(_REFUSED_PUSH_RETRY_DELAY_SECS)
+        refused = await self._refused_tag_push()
+        if refused is None:
+            return
+        logger.warning(
+            'RemoteRunner %r: tag mirror push refused twice (%s), force-mirroring tags',
+            self.name, refused,
+        )
+        await self._push(self._git_remote, f'+{_TAG_MIRROR_REFSPEC}', cwd=self._cwd)
+        if event_store is not None:
+            event_store.emit(EventType.runner_synced, task_id=task_id, data={
+                'runner': self.name,
+                'kind': 'project_tag_mirror',
+                'from_head': None,
+                'to_head': None,
+                'forced': True,
+            })
+
+    async def _refused_tag_push(self) -> RunnerUnavailable | None:
+        """The plain tag push's refusal by a reached host, or None once pushed; a transport failure raises."""
         try:
             await self._push(self._git_remote, _TAG_MIRROR_REFSPEC, cwd=self._cwd)
         except RunnerUnavailable as refused:
             if refused.kind == 'transport':
                 raise
-            logger.warning(
-                'RemoteRunner %r: tag mirror push refused (%s), force-mirroring tags',
-                self.name, refused,
-            )
-            await self._push(self._git_remote, f'+{_TAG_MIRROR_REFSPEC}', cwd=self._cwd)
-            if event_store is not None:
-                event_store.emit(EventType.runner_synced, task_id=task_id, data={
-                    'runner': self.name,
-                    'kind': 'project_tag_mirror',
-                    'from_head': None,
-                    'to_head': None,
-                    'forced': True,
-                })
-        self._last_mirrored_tags = tags
+            return refused
+        return None
 
     async def _dispatch(
         self,

@@ -12,6 +12,7 @@ rather than passing against a hand-typed marker string.
 import asyncio
 import dataclasses
 import json
+import logging
 import shlex
 import shutil
 import subprocess
@@ -972,6 +973,23 @@ class _TagScene:
     def tag_pushes(self) -> list[str]:
         return [spec for spec in map(tag_refspec, self.argvs) if spec is not None]
 
+    @property
+    def _pre_receive(self) -> Path:
+        return self.remote / 'hooks' / 'pre-receive'
+
+    def refuse_tags(self) -> None:
+        """The remote's pre-receive hook rejects every tag ref, as a host refusing tags would."""
+        self._pre_receive.write_text(
+            '#!/bin/sh\n'
+            'while read old new ref; do\n'
+            '  case "$ref" in refs/tags/*) echo "tags refused" >&2; exit 1;; esac\n'
+            'done\n'
+        )
+        self._pre_receive.chmod(0o755)
+
+    def accept_tags(self) -> None:
+        self._pre_receive.unlink()
+
     async def run(self, argv: list[str], *, cwd: str | None = None) -> tuple[int, str, str]:
         self.argvs.append(list(argv))
         if is_gate_publish(argv):
@@ -1011,12 +1029,23 @@ def tag_scene(tmp_path: Path) -> _TagScene:
     return _TagScene(tmp_path)
 
 
-async def _verify_as(role: str, runner: RemoteRunner, sha: str) -> VerifyResult:
+async def _verify_as(
+    role: str, runner: RemoteRunner, sha: str, *, event_store: RecordingEvents,
+) -> VerifyResult:
     if role == 'merge':
-        return await runner.run_merge_verify(sha, _merge_spec())
+        return await runner.run_merge_verify(sha, _merge_spec(), event_store=event_store)
     return await runner.run_task_verify(
         _task_spec(tip_sha=sha, task_id='6667'), task_id='6667', archive_root=None,
+        event_store=event_store,
     )
+
+
+def _tag_mirror_events(store: RecordingEvents) -> list[dict[str, object]]:
+    return [data for data in store.of(EventType.runner_synced) if data['kind'] == 'project_tag_mirror']
+
+
+_PLAIN = 'refs/tags/*:refs/tags/*'
+_FORCED = '+refs/tags/*:refs/tags/*'
 
 
 @pytest.mark.asyncio
@@ -1028,14 +1057,17 @@ class TestTagMirror:
         """esc-9646-6: a test gating on a release tag saw it locally and not on the laptop."""
         _annotated_tag(tag_scene.dispatcher, _TAG)
         tag_scene.seed_remote_main()
+        store = RecordingEvents()
 
-        result = await _verify_as(role, tag_scene.runner(), tag_scene.head)
+        result = await _verify_as(role, tag_scene.runner(), tag_scene.head, event_store=store)
 
         assert result == _green()
         assert tag_scene.seen == [(0, _git(tag_scene.dispatcher, 'rev-parse', f'{_TAG}^{{commit}}'))]
         assert tag_scene.tag_object(tag_scene.remote, _TAG) == tag_scene.tag_object(
             tag_scene.dispatcher, _TAG,
         )
+        assert tag_scene.tag_pushes() == [_PLAIN]
+        assert _tag_mirror_events(store) == [], 'a healthy remote never sees a force'
 
     async def test_a_dispatcher_with_no_tags_dispatches_and_pushes_no_tags(
         self, tag_scene: _TagScene,
@@ -1049,7 +1081,7 @@ class TestTagMirror:
         assert tag_scene.tag_pushes() == []
 
     async def test_an_unreadable_local_tag_listing_is_skipped_not_fatal(
-        self, tag_scene: _TagScene,
+        self, tag_scene: _TagScene, caplog: pytest.LogCaptureFixture,
     ):
         argvs: list[list[str]] = []
 
@@ -1063,10 +1095,18 @@ class TestTagMirror:
                 return (128, '', 'fatal: not a git repository')
             return (0, '', '')
 
-        result = await tag_scene.runner(run=run).run_merge_verify('abc123', _merge_spec())
+        with caplog.at_level(logging.WARNING, logger='orchestrator.verify_runner'):
+            result = await tag_scene.runner(run=run).run_merge_verify('abc123', _merge_spec())
 
         assert result == _green()
         assert [spec for spec in map(tag_refspec, argvs) if spec is not None] == []
+        warnings = [
+            record.getMessage() for record in caplog.records
+            if record.name == 'orchestrator.verify_runner' and record.levelno == logging.WARNING
+        ]
+        assert len(warnings) == 1, warnings
+        assert "'laptop'" in warnings[0]
+        assert 'tag set was not mirrored' in warnings[0]
 
     async def test_a_remote_tag_pointing_elsewhere_is_force_mirrored_and_announced(
         self, tag_scene: _TagScene,
@@ -1087,12 +1127,8 @@ class TestTagMirror:
         assert tag_scene.tag_object(tag_scene.remote, _TAG) == tag_scene.tag_object(
             tag_scene.dispatcher, _TAG,
         )
-        assert tag_scene.tag_pushes() == ['refs/tags/*:refs/tags/*', '+refs/tags/*:refs/tags/*']
-        mirrored = [
-            data for data in store.of(EventType.runner_synced)
-            if data['kind'] == 'project_tag_mirror'
-        ]
-        assert mirrored == [{
+        assert tag_scene.tag_pushes() == [_PLAIN, _PLAIN, _FORCED]
+        assert _tag_mirror_events(store) == [{
             'runner': 'laptop', 'kind': 'project_tag_mirror',
             'from_head': None, 'to_head': None, 'forced': True,
         }]
@@ -1103,14 +1139,7 @@ class TestTagMirror:
         """Synced before dispatch, or the runner is benched: no verify on a lagging tag set."""
         _annotated_tag(tag_scene.dispatcher, _TAG)
         tag_scene.seed_remote_main()
-        hook = tag_scene.remote / 'hooks' / 'pre-receive'
-        hook.write_text(
-            '#!/bin/sh\n'
-            'while read old new ref; do\n'
-            '  case "$ref" in refs/tags/*) echo "tags refused" >&2; exit 1;; esac\n'
-            'done\n'
-        )
-        hook.chmod(0o755)
+        tag_scene.refuse_tags()
 
         with pytest.raises(RunnerUnavailable) as excinfo:
             await tag_scene.runner().run_merge_verify(tag_scene.head, _merge_spec())
@@ -1145,28 +1174,73 @@ class TestTagMirror:
             await tag_scene.runner(run=run).run_merge_verify('abc123', _merge_spec())
 
         assert excinfo.value.kind == 'transport'
-        assert [spec for spec in map(tag_refspec, argvs) if spec is not None] == [
-            'refs/tags/*:refs/tags/*',
-        ]
+        assert [spec for spec in map(tag_refspec, argvs) if spec is not None] == [_PLAIN]
         assert not any(':refs/merge-verify/' in ' '.join(argv) for argv in argvs)
         assert tag_scene.seen == []
 
-    async def test_an_unchanged_tag_set_is_mirrored_once_per_runner_and_a_new_tag_is_mirrored_next(
+    async def test_a_tag_the_remote_lost_after_a_mirror_is_restored_by_the_next_dispatch(
         self, tag_scene: _TagScene,
     ):
-        """The merge worker caches its runners, so an unchanged tag set costs no round trip."""
+        """The merge worker caches its runners; an unchanged LOCAL tag set says nothing of the remote's.
+
+        A re-cloned laptop checkout, a ``git tag -d`` or a ``fetch --prune-tags``
+        drops a tag the last mirror delivered, and the next verify must not run
+        without it.
+        """
         _annotated_tag(tag_scene.dispatcher, _TAG)
         tag_scene.seed_remote_main()
-        runner = tag_scene.runner(id_factory=iter(('rid-1', 'rid-2', 'rid-3')).__next__)
+        tagged = _git(tag_scene.dispatcher, 'rev-parse', f'{_TAG}^{{commit}}')
+        runner = tag_scene.runner(id_factory=iter(('rid-1', 'rid-2')).__next__)
 
         await runner.run_merge_verify(tag_scene.head, _merge_spec())
+        _git(tag_scene.remote, 'update-ref', '-d', f'refs/tags/{_TAG}')
         await runner.run_merge_verify(tag_scene.head, _merge_spec())
 
-        assert tag_scene.tag_pushes() == ['refs/tags/*:refs/tags/*']
+        assert tag_scene.tag_pushes() == [_PLAIN, _PLAIN]
+        assert tag_scene.seen == [(0, tagged), (0, tagged)]
 
-        _annotated_tag(tag_scene.dispatcher, 'v0.3-alpha')
-        tag_scene.watched_tag = 'v0.3-alpha'
-        await runner.run_merge_verify(tag_scene.head, _merge_spec())
+    async def test_a_refused_mirror_is_pushed_again_once_the_host_accepts_tags(
+        self, tag_scene: _TagScene,
+    ):
+        """A refused mirror benches the host; the same runner, re-admitted, must not verify on the lagging set."""
+        _annotated_tag(tag_scene.dispatcher, _TAG)
+        tag_scene.seed_remote_main()
+        tagged = _git(tag_scene.dispatcher, 'rev-parse', f'{_TAG}^{{commit}}')
+        runner = tag_scene.runner(id_factory=iter(('rid-1', 'rid-2')).__next__)
+        tag_scene.refuse_tags()
 
-        assert tag_scene.tag_pushes() == ['refs/tags/*:refs/tags/*'] * 2
-        assert tag_scene.seen[-1] == (0, tag_scene.head)
+        with pytest.raises(RunnerUnavailable):
+            await runner.run_merge_verify(tag_scene.head, _merge_spec())
+        tag_scene.accept_tags()
+        refused = tag_scene.tag_pushes()
+        result = await runner.run_merge_verify(tag_scene.head, _merge_spec())
+
+        assert result == _green()
+        assert tag_scene.tag_pushes()[len(refused):] == [_PLAIN]
+        assert tag_scene.seen == [(0, tagged)]
+
+    async def test_a_plain_tag_push_losing_a_ref_lock_is_retried_plain_and_not_announced(
+        self, tag_scene: _TagScene,
+    ):
+        """Two roles creating one new tag collide on its ref lock; nothing diverged, so nothing is forced."""
+        _annotated_tag(tag_scene.dispatcher, _TAG)
+        tag_scene.seed_remote_main()
+        lock = tag_scene.remote / 'refs' / 'tags' / f'{_TAG}.lock'
+        lock.write_text('')
+        store = RecordingEvents()
+
+        async def run(argv: list[str], *, cwd: str | None = None) -> tuple[int, str, str]:
+            reply = await tag_scene.run(argv, cwd=cwd)
+            if is_tag_push(argv) and lock.exists():
+                assert reply[0] != 0 and 'failed to update ref' in reply[2], reply
+                lock.unlink()
+            return reply
+
+        result = await tag_scene.runner(run=run).run_merge_verify(
+            tag_scene.head, _merge_spec(), event_store=store,
+        )
+
+        assert result == _green()
+        assert tag_scene.tag_pushes() == [_PLAIN, _PLAIN]
+        assert _tag_mirror_events(store) == []
+        assert tag_scene.seen == [(0, _git(tag_scene.dispatcher, 'rev-parse', f'{_TAG}^{{commit}}'))]
