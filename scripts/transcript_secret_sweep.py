@@ -20,10 +20,11 @@ the repo ``.env``), and replaces them with ``shared.secret_redaction``'s
 same-length placeholders. It reads only regular files, and skips those
 modified within ``min_age_secs``, which a live session or test run may still
 be appending to. A sweep that redacted or refused anything files one
-``risk_identified`` info escalation, and a sweep that could not run, found a
-required root absent, could not read an orchestrator unit or found no unit
-naming a project root files one ``infra_issue`` info escalation naming each
-shortfall. A dry run (``--dry-run``) rewrites and files nothing and lists what
+``risk_identified`` info escalation, whose detail lists refused lines first and
+one by one, then summarises redacted files by directory; a sweep that could
+not run, found a required root absent, could not read an orchestrator unit or
+found no unit naming a project root files one ``infra_issue`` info escalation
+naming each shortfall. A dry run (``--dry-run``) rewrites and files nothing and lists what
 a real run would redact under ``matched``. On a host with no orchestrator
 units (the laptop), ``--host-configs-dir`` takes project roots from its verify
 configs, whose transcript archive is not required (a verify host archives no
@@ -88,6 +89,8 @@ AGENT_ROLE = 'transcript-secret-sweep'
 DEFAULT_MIN_AGE_SECS = 900.0
 ESCALATION_TIMEOUT_SECS = 30.0
 MAX_DETAIL_LINES = 200
+MAX_DETAIL_BYTES = 4096
+JOURNAL_UNIT = 'transcript-secret-sweep.service'
 NO_SECRETS_CAUSE = 'no secret-bearing values in the environment'
 SHORTFALL_TASK_ID = 'transcript-secret-sweep-shortfall'
 TRANSCRIPT_SUFFIXES = ('.jsonl', '.jsonl' + STAGING_SUFFIX)
@@ -132,6 +135,7 @@ class SweepConfig:
 class FileHits:
     path: Path
     counts: Mapping[str, int]
+    group: Path
 
 
 @dataclass(frozen=True)
@@ -319,12 +323,12 @@ def _scan(config: SweepConfig, needles: NeedlesByMarkup) -> SweepResult:
     deferred: list[Path] = []
     unreadable: list[Path] = []
     clean = 0
-    for path in _swept_files(config.trees, unreadable):
+    for path, group in _swept_files(config.trees, unreadable):
         outcome = _sweep_file(path, needles, cutoff_ns, redact)
         match outcome:
             case FileRedaction():
                 if outcome.redacted:
-                    hits.append(FileHits(path, outcome.counts))
+                    hits.append(FileHits(path, outcome.counts, group))
                 refused.extend(RefusedFileLine(path, line.var, line.line_number) for line in outcome.refused)
             case _Verdict.CLEAN:
                 clean += 1
@@ -346,7 +350,7 @@ def _scan(config: SweepConfig, needles: NeedlesByMarkup) -> SweepResult:
     )
 
 
-def _swept_files(trees: Iterable[SweptTree], unreadable: list[Path]) -> Iterator[Path]:
+def _swept_files(trees: Iterable[SweptTree], unreadable: list[Path]) -> Iterator[tuple[Path, Path]]:
     def note_unlistable(error: OSError) -> None:
         if not isinstance(error, FileNotFoundError):
             unreadable.append(Path(error.filename))
@@ -358,7 +362,12 @@ def _swept_files(trees: Iterable[SweptTree], unreadable: list[Path]) -> Iterator
             subdirs.sort()
             for name in sorted(files):
                 if name.endswith(tree.suffixes):
-                    yield Path(directory) / name
+                    path = Path(directory) / name
+                    yield path, _group_of(tree.root, path)
+
+
+def _group_of(root: Path, path: Path) -> Path:
+    return root / path.relative_to(root).parts[0]
 
 
 def _format_of(name: str) -> tuple[Markup, Codec]:
@@ -406,19 +415,35 @@ def _drop_page_cache(path: Path) -> None:
             os.close(fd)
 
 
-def _counts_label(counts: Mapping[str, int]) -> str:
-    return ', '.join(f'{var}×{n}' for var, n in sorted(counts.items()))
+def _bounded(lines: Sequence[str], now: datetime.datetime) -> str:
+    whole = '\n'.join(lines)
+    if len(lines) <= MAX_DETAIL_LINES and len(whole.encode()) <= MAX_DETAIL_BYTES:
+        return whole
+    budget = MAX_DETAIL_BYTES - len(_overflow_line(len(lines), now).encode())
+    kept: list[str] = []
+    for line in lines[:MAX_DETAIL_LINES]:
+        budget -= len(line.encode()) + 1
+        if budget < 0:
+            break
+        kept.append(line)
+    return '\n'.join([*kept, _overflow_line(len(lines) - len(kept), now)])
 
 
-def _bounded(lines: list[str]) -> list[str]:
-    if len(lines) <= MAX_DETAIL_LINES:
-        return lines
-    overflow = len(lines) - MAX_DETAIL_LINES
-    return [*lines[:MAX_DETAIL_LINES], f'... and {overflow} more line(s): see the sweep\'s journal record']
+def _overflow_line(hidden: int, now: datetime.datetime) -> str:
+    since = now.astimezone(datetime.UTC)
+    until = since + datetime.timedelta(days=1)
+    return (
+        f"... and {hidden} more line(s) not shown. The full record is this run's JSON line in the journal, "
+        'kept about three weeks; journald splits it into 48 KB entries, which this command rejoins, '
+        "printing the first record logged from this run's start: "
+        f"journalctl --user -u {JOURNAL_UNIT} --since '{since:%Y-%m-%d %H:%M:%S} UTC' "
+        f"--until '{until:%Y-%m-%d %H:%M:%S} UTC' --all -o json | "
+        """jq -j '.MESSAGE + (if ._LINE_BREAK == "line-max" then "" else "\\n" end)' | grep '^{' | head -n 1"""
+    )
 
 
 def _escalation_arguments(result: SweepResult, now: datetime.datetime) -> dict[str, object]:
-    occurrences = sum(sum(f.counts.values()) for f in result.redacted)
+    occurrences = _occurrences(result.redacted)
     refused_files = len({line.path for line in result.refused})
     summary = (
         f'Transcript secret sweep redacted live secret values in {len(result.redacted)} file(s) '
@@ -426,21 +451,37 @@ def _escalation_arguments(result: SweepResult, now: datetime.datetime) -> dict[s
         'refused and left un-redacted'
     )
     lines = [
-        *(f'{f.path}: {_counts_label(f.counts)}' for f in result.redacted),
         *(f'{f.path}: refused ({f.var} on line {f.line_number}), left un-redacted' for f in result.refused),
+        *_group_lines(result.redacted),
     ]
     return {
         'task_id': AGENT_ROLE,
         'agent_role': AGENT_ROLE,
         'category': 'risk_identified',
         'summary': summary,
-        'detail': '\n'.join(_bounded(lines)),
+        'detail': _bounded(lines, now),
         'suggested_action': (
             'These live credentials were on disk in agent transcripts or verify logs: consider rotating them. '
             'A refused line still holds its value and needs redacting by hand.'
         ),
         'evidence': [{'observation': summary, 'measured_at': now.isoformat(), 'ref': AGENT_ROLE}],
     }
+
+
+def _group_lines(hits: Sequence[FileHits]) -> list[str]:
+    groups: dict[Path, list[FileHits]] = {}
+    for hit in hits:
+        groups.setdefault(hit.group, []).append(hit)
+    return [_group_line(group, members) for group, members in groups.items()]
+
+
+def _group_line(group: Path, members: Sequence[FileHits]) -> str:
+    names = ', '.join(sorted({var for member in members for var in member.counts}))
+    return f'{group}: {len(members)} file(s), {_occurrences(members)} occurrence(s) of {names}'
+
+
+def _occurrences(hits: Iterable[FileHits]) -> int:
+    return sum(sum(hit.counts.values()) for hit in hits)
 
 
 def _shortfall_arguments(result: SweepResult, now: datetime.datetime) -> dict[str, object]:
@@ -450,7 +491,7 @@ def _shortfall_arguments(result: SweepResult, now: datetime.datetime) -> dict[st
         'agent_role': AGENT_ROLE,
         'category': 'infra_issue',
         'summary': summary,
-        'detail': '\n'.join(_bounded(list(result.shortfall))),
+        'detail': _bounded(result.shortfall, now),
         'suggested_action': (
             'Check that $REPO/.env exists and still defines the secret-bearing variables, and that the '
             'orchestrator unit files are readable and name each project. A missing transcript archive '

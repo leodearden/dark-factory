@@ -5389,7 +5389,17 @@ everything already on disk.
   dark-factory's `.env` alone, so such a value is never matched. Task 6820
   filed this gap as a follow-up.
 - **What it files.** One `risk_identified` info escalation per sweep that
-  redacted or refused anything, naming each path with its per-variable counts.
+  redacted or refused anything. Its detail lists each refused line first
+  (path, line number, variable), then one line per directory group: the first
+  directory under the swept root (an archive or verify-logs task dir, an
+  offline-lane lane, a `~/.claude/projects` session dir, a pytest `pytest-N`
+  session dir), with its file count, occurrence count and variable names. The
+  detail is bounded at `scripts/transcript_secret_sweep.py::MAX_DETAIL_BYTES`
+  UTF-8 bytes and `MAX_DETAIL_LINES` lines. When it overflows, its last line
+  gives the `journalctl ... -o json | jq ... | head -n 1` command that rejoins
+  the run's full record and prints it alone, even when the next night's run
+  falls in the same window: journald splits that line into 48 KB entries and
+  keeps it about three weeks. The record line names each path with its per-variable counts.
   It prints one JSON record line to the journal, and never prints a value.
   A `*.xml.gz` that does not decompress is listed under `unreadable` in that
   record line and left as found.
