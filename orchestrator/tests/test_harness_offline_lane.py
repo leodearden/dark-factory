@@ -95,6 +95,24 @@ class TestOfflineLaneWiring:
         finally:
             await harness._stop_offline_lane()
 
+    async def test_the_harness_built_lane_is_stopping_once_the_harness_drains(
+        self, harness: Harness
+    ):
+        """The worker's stop predicate tracks the drain flag ``Harness.run``'s finally sets on SIGTERM (task 11974)."""
+        harness.config.git.offline_lane_enabled = True
+        harness.config.git.persistent_offline_deep_worktree = True
+
+        await harness._start_offline_lane()
+
+        try:
+            worker = harness._offline_lane_worker
+            assert isinstance(worker, OfflineLaneWorker)
+            assert worker.stopping() is False
+            harness._draining = True
+            assert worker.stopping() is True
+        finally:
+            await harness._stop_offline_lane()
+
     @pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)
     async def test_the_lane_files_a_reproduced_red_through_the_harness_scheduler(
         self, harness: Harness, tmp_path: Path
