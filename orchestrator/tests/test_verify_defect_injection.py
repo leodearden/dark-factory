@@ -317,7 +317,7 @@ def _make_fixture_project(root: Path, *, registers_defect_marker: bool = False) 
     only when the project registers the marker itself, as every workspace member does.
     Its sessions keep their basetemp inside the project, never in the host-wide pytest
     temp root, whose exit-time cleanup of other sessions' dead dirs is unbounded; see
-    ``test_an_xdist_leg_leaves_the_hosts_default_pytest_temp_root_untouched``.
+    ``test_an_xdist_leg_resolves_its_pytest_basetemp_inside_the_fixture_project``.
     """
     root.mkdir(parents=True)
     own_defect = '    defect(ref): registered by the project\n' if registers_defect_marker else ''
