@@ -25,6 +25,7 @@ of a cgroup.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import dataclasses
 import logging
@@ -51,6 +52,8 @@ from shared.cgroup_stats import (
 )
 from shared.proc_group import unified_cgroup_path
 
+from orchestrator.relocated_scopes import SpawnedChild, relocated_scopes
+
 logger = logging.getLogger(__name__)
 
 __all__ = [
@@ -59,6 +62,7 @@ __all__ = [
     'CommandResources',
     'allocate_command_capture',
     'resources_from_reading',
+    'watch_relocations',
 ]
 
 _CGROUP_FILE = 'cgroup'
@@ -463,3 +467,21 @@ def allocate_command_capture(*, cgroup_root: Path = CGROUP_ROOT) -> Iterator[Com
                 shutil.rmtree(directory)
             except OSError as exc:
                 logger.warning('could not remove verify capture directory %s: %s', directory, exc)
+
+
+async def watch_relocations(
+    child: SpawnedChild, *, launched_in: str, capture: CommandCapture
+) -> None:
+    """Note the scopes *child*'s session moved into, after waits of 1, 2, 4 ... seconds.
+
+    Runs until cancelled or *child* exits. A failure is logged at DEBUG and ends
+    the watch, so it never reaches the command's runner.
+    """
+    delay = 1.0
+    try:
+        while child.returncode is None:
+            await asyncio.sleep(delay)
+            capture.note_relocated(await relocated_scopes(child, launched_in=launched_in))
+            delay *= 2
+    except Exception:
+        logger.debug('relocation watch of pid %d stopped', child.pid, exc_info=True)

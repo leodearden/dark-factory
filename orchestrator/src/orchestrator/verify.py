@@ -138,6 +138,7 @@ from orchestrator.verify_cmd import (
     with_junitxml,
     with_pytest_timeout,
 )
+from orchestrator.verify_command_resources import CommandCapture, watch_relocations
 from orchestrator.verify_event_channel import VerifyEventChannel, allocate_verify_event_log
 
 logger = logging.getLogger(__name__)
@@ -6584,6 +6585,7 @@ async def _reap_command_subtree(
     proc: asyncio.subprocess.Process | None,
     pgid: int | None,
     scope_unit: str | None,
+    capture: CommandCapture | None = None,
 ) -> None:
     """Kill a spawned verify command's whole subtree: its launch scope and every
     scope its session moved into
@@ -6594,6 +6596,9 @@ async def _reap_command_subtree(
     costs the kills: a failure finds nothing, and a cancellation during it
     still kills the launch scope and the process group before propagating.
 
+    A *capture* reads the live launch scope's counters just before the kills,
+    naming the scopes discovery found.
+
     A no-op when the spawn never returned a process: either it failed before
     any scope existed, or it was interrupted and asyncio's spawn cleanup
     already killed the child."""
@@ -6603,6 +6608,9 @@ async def _reap_command_subtree(
     try:
         relocated = await _discover_relocated_scopes(proc, scope_unit)
     finally:
+        if capture is not None:
+            with contextlib.suppress(Exception):
+                capture.read_before_kill(relocated)
         launched = [] if scope_unit is None else [scope_unit]
         for unit in [*launched, *sorted(relocated)]:
             await _kill_cgroup_scope(unit)
@@ -6662,11 +6670,15 @@ async def _run_cmd(
     memory_properties: tuple[str, ...] = (),
     clock_stop: ClockStopConfig | None = None,
     defect_plugin: bool = False,
+    capture: CommandCapture | None = None,
 ) -> tuple[int, str, bool]:
     """Run a shell command, return (returncode, combined output, timed_out).
 
     The triple is a ``ScopeLaunchRefused`` when the scope launcher exited
     without ever starting the command (``scope_launch_handshake.py``).
+
+    A scoped command with a *capture* records its C4 resources
+    (``orchestrator/src/orchestrator/verify_command_resources.py``).
 
     When *env* is non-None, it is merged on top of ``os.environ`` and passed
     to the subprocess so callers can inject build accelerators like
@@ -6768,6 +6780,7 @@ async def _run_cmd(
     pgid: int | None = None
     scope_unit: str | None = None
     handshake: ScopeLaunchHandshake | None = None
+    watcher: asyncio.Task[None] | None = None
     if use_cgroup_scope and shutil.which('systemd-run') is not None:
         scope_unit = _verify_scope_name(scope_tag)
     # Populated by the clock-stop loop, via _clock_stop_reason evaluated AT
@@ -6787,10 +6800,13 @@ async def _run_cmd(
             # forwarding stdio to our pipe; --collect auto-removes the scope when
             # it exits (no unit leak on the normal-completion path).
             handshake = ScopeLaunchHandshake()
+            if capture is not None:
+                capture.launched(scope_unit)
             try:
                 proc = await asyncio.create_subprocess_exec(
                     *_scope_launch_argv(scope_unit, slice_name, cpu_weight, memory_properties),
-                    '/bin/bash', '-c', handshake.payload(cmd),
+                    '/bin/bash', '-c',
+                    handshake.payload(cmd if capture is None else capture.wrap(cmd)),
                     cwd=str(cwd),
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.STDOUT,
@@ -6800,6 +6816,10 @@ async def _run_cmd(
                 )
             finally:
                 handshake.release_writer()
+            if capture is not None:
+                watcher = asyncio.create_task(
+                    watch_relocations(proc, launched_in=scope_unit, capture=capture)
+                )
         else:
             proc = await asyncio.create_subprocess_shell(
                 cmd,
@@ -6974,7 +6994,7 @@ async def _run_cmd(
         rc = proc.returncode if proc.returncode is not None else 1
         return _exited_outcome(rc, buf.decode(errors='replace'), handshake)
     except TimeoutError:
-        await _reap_command_subtree(proc, pgid, scope_unit)
+        await _reap_command_subtree(proc, pgid, scope_unit, capture)
         if _cs_timeout_msg:
             # Clock-stop path: include actual wall time and which deadline
             # fired so infra_timeout incidents are distinguishable in the
@@ -6983,14 +7003,17 @@ async def _run_cmd(
             return 1, f'Command clock-stop timed out ({_cs_timeout_msg[-1]}): {cmd}', True
         return 1, f'Command timed out after {timeout}s: {cmd}', True
     except asyncio.CancelledError:
-        await _reap_command_subtree(proc, pgid, scope_unit)
+        await _reap_command_subtree(proc, pgid, scope_unit, capture)
         raise
     except Exception as e:
-        await _reap_command_subtree(proc, pgid, scope_unit)
+        await _reap_command_subtree(proc, pgid, scope_unit, capture)
         return 1, f'Command failed: {e}', False
     finally:
         if handshake is not None:
             handshake.close()
+        if watcher is not None:
+            watcher.cancel()
+            await asyncio.wait({watcher})
 
 
 _CHAIN_BUDGET_EXHAUSTED = 'chain wall-clock budget exhausted before this segment started'
