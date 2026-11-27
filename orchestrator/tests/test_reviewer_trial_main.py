@@ -836,3 +836,67 @@ class TestEveryScoreLoopRunsThroughRunAndScore:
         assert {arm['name']: (arm['trials'], arm['mean_f1']) for arm in report['arms']} == {
             name: (2, f1) for name, f1 in f1_by_arm.items()
         }
+
+
+class TestCampaignRound2ArmsAndTurnCap:
+    """`campaign` resolves the round-2 arms by name and runs every trial at one reviewer turn cap."""
+
+    def _invoke(self, tmp_path: Path, *options: str, trials: str = '1'):
+        manifest = CorpusManifest(diffs=[
+            CorpusDiff(diff_id='d1', language='python', source='synthetic',
+                       diff_text='d', description='d1', ground_truth=[_gt('g1')]),
+        ])
+        fake = _FakeRunAndScore()
+        with _scoring_through(fake, manifest):
+            result = CliRunner().invoke(cli, [
+                'campaign', '--results-dir', str(tmp_path / 'camp'), '--trials', trials,
+                '--split', 'all', '--no-pool', *options,
+            ])
+        return result, fake
+
+    @pytest.mark.usefixtures('code_default_config')
+    def test_round_2_d2_arms_resolve_with_their_models_and_production_s_90_turns(self, tmp_path: Path) -> None:
+        result, fake = self._invoke(
+            tmp_path, '--arms', 'variant_a_xhigh,variant_fable52_solo,variant_codex_sol62', '--briefing', 'd2',
+        )
+
+        assert result.exit_code == 0, f'{result.output}\n{result.exception!r}'
+        arms = fake.awaits[0].variants
+        assert [arm.name for arm in arms] == [
+            'variant_a_xhigh_d2', 'variant_fable52_solo_d2', 'variant_codex_sol62_d2',
+        ]
+        assert [(r.model, r.backend, r.effort) for arm in arms for r in arm.reviewers] == [
+            ('opus', 'claude', 'xhigh'), ('claude-fable-5-2', 'claude', 'high'), ('gpt-6.2-sol', 'codex', 'high'),
+        ]
+        assert fake.awaits[0].kwargs['max_turns'] == 90
+        assert 'turn cap 90' in result.output
+
+    def test_max_turns_30_reaches_every_trial(self, tmp_path: Path) -> None:
+        result, fake = self._invoke(
+            tmp_path, '--arms', 'variant_a,variant_a_xhigh', '--max-turns', '30', trials='2',
+        )
+
+        assert result.exit_code == 0, f'{result.output}\n{result.exception!r}'
+        assert [a.kwargs['max_turns'] for a in fake.awaits] == [30, 30]
+        assert 'turn cap 30' in result.output
+
+    def test_a_non_positive_max_turns_is_a_usage_error(self, tmp_path: Path) -> None:
+        result, fake = self._invoke(tmp_path, '--arms', 'variant_a', '--max-turns', '0')
+
+        assert result.exit_code == 2, f'{result.output}\n{result.exception!r}'
+        assert fake.awaits == []
+
+    def test_an_unknown_arm_is_a_usage_error_naming_it_and_the_known_arms(self, tmp_path: Path) -> None:
+        result, fake = self._invoke(tmp_path, '--arms', 'variant_a,variant_codex_sol99')
+
+        assert result.exit_code == 2, f'{result.output}\n{result.exception!r}'
+        assert 'variant_codex_sol99' in result.output
+        assert 'variant_codex_sol62' in result.output
+        assert fake.awaits == []
+
+    def test_a_repeated_arm_is_a_usage_error_naming_it(self, tmp_path: Path) -> None:
+        result, fake = self._invoke(tmp_path, '--arms', 'variant_a,variant_a_xhigh,variant_a')
+
+        assert result.exit_code == 2, f'{result.output}\n{result.exception!r}'
+        assert 'each arm runs once; repeated: variant_a' in result.output
+        assert fake.awaits == []

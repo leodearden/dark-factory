@@ -48,6 +48,7 @@ from orchestrator.evals.reviewer_trial.variants import (
     ReviewerSpec,
     VariantConfig,
     build_trial_reviewer_role,
+    trial_reviewer_max_turns,
 )
 from orchestrator.mcp_lifecycle import verdict_tools_mcp_server
 from orchestrator.review_inputs import gather_review_subject
@@ -105,6 +106,7 @@ class PanelRunKey:
     prices_sha256: str | None
     gated: bool
     diff_cap_chars: int
+    max_turns: int
 
     @classmethod
     def of(
@@ -113,6 +115,7 @@ class PanelRunKey:
         prices: dict | None,
         usage_gate: UsageGate | None,
         diff_cap_chars: int,
+        max_turns: int,
     ) -> PanelRunKey:
         prices_sha256 = None if prices is None else hashlib.sha256(
             json.dumps(prices, sort_keys=True, default=str).encode(),
@@ -121,6 +124,7 @@ class PanelRunKey:
             prices_sha256=prices_sha256,
             gated=usage_gate is not None,
             diff_cap_chars=diff_cap_chars,
+            max_turns=max_turns,
         )
 
     @classmethod
@@ -129,6 +133,7 @@ class PanelRunKey:
             prices_sha256=data['prices_sha256'],
             gated=data['gated'],
             diff_cap_chars=data['diff_cap_chars'],
+            max_turns=data['max_turns'],
         )
 
 
@@ -429,6 +434,7 @@ async def run_panel(
     prices: dict | None = None,
     usage_gate: UsageGate | None = None,
     diff_cap_chars: int = DIFF_CAP_CHARS,
+    max_turns: int | None = None,
 ) -> PanelRunResult:
     """Run one panel variant against one corpus diff, in a scratch clone of its reviewed tree.
 
@@ -444,9 +450,10 @@ async def run_panel(
     reviews: dict[str, dict] = {}
     errors: list[str] = []
     total_cost = 0.0
+    turns = trial_reviewer_max_turns(max_turns)
 
     async with fixture_checkout(corpus_diff) as checkout:
-        roles = [build_trial_reviewer_role(spec, variant.briefing) for spec in variant.reviewers]
+        roles = [build_trial_reviewer_role(spec, variant.briefing, turns) for spec in variant.reviewers]
         prompts = await _panel_prompts(variant, roles, corpus_diff, checkout, diff_cap_chars)
         tasks: list[asyncio.Task] = []
         for i, (spec, role, prompt) in enumerate(zip(variant.reviewers, roles, prompts, strict=True)):
@@ -483,8 +490,14 @@ async def run_panel(
         total_cost_usd=total_cost,
         wall_clock_ms=elapsed_ms,
         errors=errors,
-        run_key=PanelRunKey.of(prices=prices, usage_gate=usage_gate, diff_cap_chars=diff_cap_chars),
+        run_key=PanelRunKey.of(
+            prices=prices, usage_gate=usage_gate, diff_cap_chars=diff_cap_chars, max_turns=turns,
+        ),
     )
+
+
+# The trial role's fixed turn cap from the module's birth until task 11728: every keyless panel ran at it.
+LEGACY_PANEL_MAX_TURNS = 30
 
 
 def _slot_filename(variant_name: str, diff_id: str, run_key: PanelRunKey | None) -> str:
@@ -515,6 +528,22 @@ def _load_entry(
     return entry
 
 
+def _legacy_hit(out_dir: Path, variant: VariantConfig, diff: CorpusDiff, wanted: PanelRunKey) -> PanelRunResult | None:
+    """This cell's keyless legacy panel when *wanted* asks for the turn cap it ran at, else None."""
+    path = out_dir / _slot_filename(variant.name, diff.diff_id, None)
+    legacy = _load_entry(path, PanelRunResult.from_dict, variant.name, diff.diff_id)
+    if legacy is None or legacy.run_key is not None:
+        return None
+    if wanted.max_turns != LEGACY_PANEL_MAX_TURNS:
+        logger.info(
+            'Not reusing %s: a legacy panel ran at %d turns, wanted %d',
+            path, LEGACY_PANEL_MAX_TURNS, wanted.max_turns,
+        )
+        return None
+    logger.info('Reusing %s, a legacy panel that records no run key', path)
+    return legacy
+
+
 async def run_panel_cached(
     variant: VariantConfig,
     diff: CorpusDiff,
@@ -524,29 +553,30 @@ async def run_panel_cached(
     prices: dict | None = None,
     usage_gate: UsageGate | None = None,
     diff_cap_chars: int = DIFF_CAP_CHARS,
+    max_turns: int | None = None,
 ) -> PanelRunResult:
     """*variant*'s panel on *diff*, reused from *results_dir* only when stored under an equal PanelRunKey.
 
     Each key has its own file. A keyless entry written before the key existed
-    is reused when the key's own file is absent. Why, and how to re-measure
-    one: docs/plan-scoring-and-judge.md, "Reviewer-trial panel cache and
-    score loop (task 6741)".
+    is reused only at the 30-turn cap every such panel ran at, and only when
+    the key's own file is absent. Why, and how to re-measure one:
+    docs/plan-scoring-and-judge.md, "Reviewer-trial panel cache and score
+    loop (task 6741)".
 
     Raises FixtureNotMaterialisable when the panel has to run and its clone cannot be built.
     """
     out_dir = results_dir or _RESULTS_DIR
     out_dir.mkdir(parents=True, exist_ok=True)
-    wanted = PanelRunKey.of(prices=prices, usage_gate=usage_gate, diff_cap_chars=diff_cap_chars)
+    turns = trial_reviewer_max_turns(max_turns)
+    wanted = PanelRunKey.of(prices=prices, usage_gate=usage_gate, diff_cap_chars=diff_cap_chars, max_turns=turns)
     path = out_dir / _slot_filename(variant.name, diff.diff_id, wanted)
 
     cached = _load_entry(path, PanelRunResult.from_dict, variant.name, diff.diff_id)
     if cached is not None and cached.run_key == wanted:
         logger.info('Reusing %s', path)
         return cached
-    legacy_path = out_dir / _slot_filename(variant.name, diff.diff_id, None)
-    legacy = _load_entry(legacy_path, PanelRunResult.from_dict, variant.name, diff.diff_id)
-    if legacy is not None and legacy.run_key is None:
-        logger.info('Reusing %s, a legacy panel that records no run key', legacy_path)
+    legacy = _legacy_hit(out_dir, variant, diff, wanted)
+    if legacy is not None:
         return legacy
     if cached is not None:
         logger.info('Re-running %s: stored under %s, wanted %s', path, cached.run_key, wanted)
@@ -554,7 +584,7 @@ async def run_panel_cached(
     logger.info('Running %s against %s', variant.name, diff.diff_id)
     result = await run_panel(
         variant, diff, stagger_secs=stagger_secs, prices=prices, usage_gate=usage_gate,
-        diff_cap_chars=diff_cap_chars,
+        diff_cap_chars=diff_cap_chars, max_turns=turns,
     )
     atomic_write_text(path, json.dumps(asdict(result), indent=2))
     logger.info(
@@ -574,12 +604,15 @@ async def run_trial(
     usage_gate: UsageGate | None = None,
     diff_cap_chars: int = DIFF_CAP_CHARS,
     stagger_secs: float = 2.0,
+    max_turns: int | None = None,
 ) -> list[PanelRunResult]:
     """Run all (variant x diff) pairs with bounded concurrency, each through run_panel_cached.
 
     *prices* (default-off) is threaded through to each ``run_panel`` call so
     cross-family (codex/gemini) reviewers get a non-sentinel cost column.
-    Reused legacy panels are counted in one warning.
+    Every pair runs at one turn cap, resolved once. Reused legacy panels are
+    counted in one warning; legacy panels this cap passes over are counted in
+    one warning before any reviewer runs.
 
     Raises FixtureEnrichmentMissing, before any reviewer runs, when a
     context-complete variant meets a fixture with no ``context``. Fixtures with
@@ -591,6 +624,8 @@ async def run_trial(
         if unenriched:
             raise FixtureEnrichmentMissing(unenriched)
     _warn_of_sourceless_fixtures(corpus.diffs)
+    turns = trial_reviewer_max_turns(max_turns)
+    _warn_of_passed_over_legacy_panels(variants, corpus.diffs, results_dir or _RESULTS_DIR, turns)
 
     semaphore = asyncio.Semaphore(max_parallel_panels)
     all_results: list[PanelRunResult] = []
@@ -601,6 +636,7 @@ async def run_trial(
                 return await run_panel_cached(
                     variant, diff, results_dir=results_dir, stagger_secs=stagger_secs,
                     prices=prices, usage_gate=usage_gate, diff_cap_chars=diff_cap_chars,
+                    max_turns=turns,
                 )
             except FixtureNotMaterialisable as exc:
                 logger.warning(
@@ -626,9 +662,9 @@ async def run_trial(
     legacy = sum(1 for r in all_results if r.run_key is None)
     if legacy:
         logger.warning(
-            'Reused %d legacy panel(s) from %s that record no run key; see docs/plan-scoring-and-judge.md, '
-            '"Reviewer-trial panel cache and score loop (task 6741)"',
-            legacy, results_dir or _RESULTS_DIR,
+            'Reused %d legacy panel(s) from %s that record no run key (each ran at %d turns); '
+            'see docs/plan-scoring-and-judge.md, "Reviewer-trial panel cache and score loop (task 6741)"',
+            legacy, results_dir or _RESULTS_DIR, LEGACY_PANEL_MAX_TURNS,
         )
     return all_results
 
@@ -652,6 +688,23 @@ def _warn_of_sourceless_fixtures(diffs: Sequence[CorpusDiff]) -> None:
     )
 
 
+def _warn_of_passed_over_legacy_panels(
+    variants: Sequence[VariantConfig], diffs: Sequence[CorpusDiff], out_dir: Path, turns: int,
+) -> None:
+    if turns == LEGACY_PANEL_MAX_TURNS:
+        return
+    passed_over = sum(
+        1 for variant in variants for diff in diffs
+        if (out_dir / _slot_filename(variant.name, diff.diff_id, None)).exists()
+    )
+    if passed_over:
+        logger.warning(
+            'Not reusing %d legacy panel(s) from %s: they ran at %d turns, this run uses %d; '
+            'see docs/plan-scoring-and-judge.md, "Reviewer-trial panel cache and score loop (task 6741)"',
+            passed_over, out_dir, LEGACY_PANEL_MAX_TURNS, turns,
+        )
+
+
 async def run_and_score(
     variants: Sequence[VariantConfig],
     corpus: CorpusManifest,
@@ -663,6 +716,7 @@ async def run_and_score(
     prices: dict | None = None,
     usage_gate: UsageGate | None = None,
     diff_cap_chars: int = DIFF_CAP_CHARS,
+    max_turns: int | None = None,
     on_scored: Callable[[ScoringResult], None] | None = None,
 ) -> list[ScoringResult]:
     """Every reviewer-trial subcommand's score loop: run_trial's panels, each scored through *usage_gate*.
@@ -675,7 +729,7 @@ async def run_and_score(
     panels = await run_trial(
         list(variants), corpus, max_parallel_panels=max_parallel_panels, prices=prices,
         results_dir=results_dir, usage_gate=usage_gate, diff_cap_chars=diff_cap_chars,
-        stagger_secs=stagger_secs,
+        stagger_secs=stagger_secs, max_turns=max_turns,
     )
     scores: list[ScoringResult] = []
     for panel in panels:
