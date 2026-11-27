@@ -74,6 +74,12 @@ embedder:
       api_key: ${OPENAI_API_KEY}
       api_url: ${OPENAI_API_URL:https://api.openai.com/v1}
 
+  # The stalled schedule must fit queue.backend_write_timeout_seconds (enforced
+  # at load); the defaults also fit the 30 s read budget. Restart-only.
+  request_attempts:
+    per_attempt_timeout_seconds: ${EMBEDDER_ATTEMPT_TIMEOUT:8}
+    max_attempts: ${EMBEDDER_MAX_ATTEMPTS:3}
+
 graphiti:
   provider: "falkordb"
   falkordb:

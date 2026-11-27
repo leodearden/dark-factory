@@ -6,13 +6,13 @@ import subprocess
 import sys
 
 import pytest
+from pydantic import ValidationError
+
 from fused_memory.config.request_attempts import (
     SDK_INITIAL_RETRY_DELAY_SECONDS,
     SDK_MAX_RETRY_DELAY_SECONDS,
     RequestAttemptsConfig,
 )
-from pydantic import ValidationError
-
 from fused_memory.config.schema import EmbedderConfig, FusedMemoryConfig, QueueConfig
 
 
