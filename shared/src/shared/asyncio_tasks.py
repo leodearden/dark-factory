@@ -196,7 +196,8 @@ async def gather_unwound(*aws: Awaitable[_Gathered]) -> list[_Gathered]:
     gathered = asyncio.gather(*children)
     gathered.add_done_callback(_consume_outcome)
     try:
-        return await asyncio.shield(gathered)
+        await asyncio.wait((gathered,))
+        return gathered.result()
     except BaseException:
         for child in children:
             if not (isinstance(child, asyncio.Task) and child.cancelling()):
@@ -206,7 +207,7 @@ async def gather_unwound(*aws: Awaitable[_Gathered]) -> list[_Gathered]:
 
 
 def _consume_outcome(gathered: asyncio.Future) -> None:
-    """Retrieve *gathered*'s exception, which a shield cancelled by its caller leaves unretrieved."""
+    """Retrieve *gathered*'s exception, which nothing else retrieves once the caller has stopped waiting for it."""
     if not gathered.cancelled():
         gathered.exception()
 
