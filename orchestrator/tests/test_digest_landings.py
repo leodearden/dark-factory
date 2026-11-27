@@ -8,8 +8,9 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
-from _landing_history import LandingRepo, create_runs_db, record_merge_done, record_train
+from _landing_history import create_runs_db, landing_repo
 from shared.quality_series.git_lines import GitUnavailable
+from shared.testing_landing_history import LandingRepo, record_merge_done, record_train
 
 import orchestrator.digest as digest
 
@@ -36,7 +37,7 @@ def _completed(conn: sqlite3.Connection, task_id: str, at: str) -> None:
 
 @pytest.fixture
 def scene(tmp_path: Path) -> Scene:
-    repo = LandingRepo(tmp_path / 'repo')
+    repo = landing_repo(tmp_path / 'repo')
     before = repo.fast_forward('landed before the window')
     fast_forward = repo.fast_forward('ff')
     train = repo.merge('task/t1')

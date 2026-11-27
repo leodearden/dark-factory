@@ -17,7 +17,7 @@ from escalation.authority import EXECUTOR_IDENTITY, policy_row
 from escalation.models import Escalation
 from escalation.shadow_ruling import ShadowRuling
 from fake_systemctl import install_fake_systemctl
-from landing_history import LandingRepo, record_merge_done, record_train
+from landing_history import landing_repo
 from orchestrator.decision_registry import (
     AuditOutcome,
     AuditVerdict,
@@ -26,6 +26,7 @@ from orchestrator.decision_registry import (
 )
 from orchestrator.digest import PER_DONE_RUN_LABEL
 from shared.project_layout import KNOWN_PROJECT_ROOTS_ENV
+from shared.testing_landing_history import LandingRepo, record_merge_done, record_train
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 from sitting import apply as apply_mod
 from sitting import audits, brief, fleet_state, payloads
@@ -227,7 +228,7 @@ def env(tmp_path, make_tasks_db, project_root_with_tasks_db, monkeypatch) -> Env
         {'id': 120, 'status': 'done'},
     ], directory=project_root_with_tasks_db(df).parent)
     _runs_db(fleet_state.runs_db_path(df))
-    _record_landings(fleet_state.runs_db_path(df), LandingRepo(df))
+    _record_landings(fleet_state.runs_db_path(df), landing_repo(df))
     for n in range(101, 107):
         _esc(e.queue, id=f'esc-{n}-1')
     _esc(e.queue, id='esc-107-1', pin_declared_by=['leo'])
@@ -1098,7 +1099,7 @@ def _pause(root: Path, project: str, reason: str) -> None:
 def _idle_root(env: Env) -> Path:
     """reify: a git repo whose runs.db records no landing, an empty queue, and an installed unit."""
     reify = env.tmp / 'src' / 'reify'
-    LandingRepo(reify)
+    landing_repo(reify)
     (reify / 'data' / 'escalations').mkdir(parents=True)
     _runs_db(fleet_state.runs_db_path(reify))
     _install_unit(env.units_dir, REIFY_UNIT, reify)

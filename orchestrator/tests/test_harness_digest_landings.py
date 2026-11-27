@@ -14,7 +14,8 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
-from _landing_history import LandingRepo, record_merge_done, record_train
+from _landing_history import landing_repo
+from shared.testing_landing_history import LandingRepo, record_merge_done, record_train
 from test_harness_park_stop import _make_harness_with_mocks
 
 import orchestrator.digest as digest
@@ -79,7 +80,7 @@ class TestHarnessDigestLandings:
     async def test_digest_renders_landings_and_keeps_done_runs_as_the_ewa_denominator(
         self, tmp_path: Path, _cost_store_factory,
     ) -> None:
-        repo = LandingRepo(tmp_path / 'repo')
+        repo = landing_repo(tmp_path / 'repo')
         harness = await _harness(tmp_path, repo.root, _cost_store_factory)
         _seed(harness.event_store, repo)
         prev = harness._ewa_value
@@ -98,7 +99,7 @@ class TestHarnessDigestLandings:
     async def test_landings_are_read_off_the_event_loop_thread(
         self, tmp_path: Path, _cost_store_factory, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        repo = LandingRepo(tmp_path / 'repo')
+        repo = landing_repo(tmp_path / 'repo')
         harness = await _harness(tmp_path, repo.root, _cost_store_factory)
         _seed(harness.event_store, repo)
         real = digest.landings_in_window

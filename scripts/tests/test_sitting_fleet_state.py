@@ -15,8 +15,9 @@ import pytest
 from escalation.models import Escalation
 from escalation.shadow_ruling import ShadowRuling, agreement_report
 from fake_systemctl import install_fake_systemctl, systemctl_calls
-from landing_history import LandingRepo, record_merge_done, record_train
+from landing_history import landing_repo
 from orchestrator.decision_registry import DecisionRecord, normalize_escalations_dir
+from shared.testing_landing_history import LandingRepo, record_merge_done, record_train
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 from sitting import fleet_state as mod
 from sitting import inventory, payloads
@@ -164,7 +165,7 @@ def df(tmp_path, make_tasks_db, project_root_with_tasks_db) -> Path:
         {'id': 12, 'status': 'pending'},
         {'id': 13, 'status': 'done'},
     ], directory=project_root_with_tasks_db(root).parent)
-    _record_landings(_build_runs_db(mod.runs_db_path(root)), LandingRepo(root))
+    _record_landings(_build_runs_db(mod.runs_db_path(root)), landing_repo(root))
     queue = root / 'data' / 'escalations'
     _write_escalation(queue, id='esc-10-1', level=1, category='infra_issue')
     _resolved(queue, 'esc-10-2')
@@ -800,7 +801,7 @@ def _quiet_root(tmp_path: Path, name: str = 'reify', *, git: bool = True) -> Pat
     root = tmp_path / 'src' / name
     root.mkdir(parents=True)
     if git:
-        LandingRepo(root)
+        landing_repo(root)
     runs_db = mod.runs_db_path(root)
     runs_db.parent.mkdir(parents=True)
     conn = sqlite3.connect(runs_db)
@@ -841,7 +842,7 @@ class TestActivity:
     def test_a_landing_in_the_window_keeps_an_inactive_unit_active(self, tmp_path):
         quiet = _quiet_root(tmp_path)
         conn = sqlite3.connect(mod.runs_db_path(quiet))
-        record_merge_done(conn, '1', LandingRepo(quiet).fast_forward('landed'), IN_WINDOW)
+        record_merge_done(conn, '1', landing_repo(quiet).fast_forward('landed'), IN_WINDOW)
         conn.commit()
         conn.close()
 
