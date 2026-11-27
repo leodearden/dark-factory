@@ -20,6 +20,7 @@ from unittest.mock import AsyncMock
 import pytest
 from _orch_helpers import HermeticMcpSession
 from _park_test_helpers import make_task
+from shared.psi import PsiSample
 
 from orchestrator.config import OrchestratorConfig
 from orchestrator.delivered_checks import ChecksAtCommit
@@ -36,8 +37,9 @@ from orchestrator.early_start_selection import (
 )
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.overrides import OverrideStore
+from orchestrator.pause_policy import PauseClass
 from orchestrator.pin_reservation import Blocker, BlockerKind
-from orchestrator.scheduler import Scheduler
+from orchestrator.scheduler import Scheduler, SchedulerCallbacks
 from orchestrator.task_picture import TaskPicture
 
 pytestmark = [pytest.mark.usefixtures('code_default_config'), pytest.mark.asyncio]
@@ -107,11 +109,15 @@ class _Rig:
         assert self.scheduler.lock_table.snapshot_successor_of() == {}
 
 
-def _rig(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, **config_overrides: object) -> _Rig:
-    config = OrchestratorConfig(
-        max_per_module=1, lock_depth=12, module_overrides={'two.py': 2},
-        early_start={'enabled': True}, project_root=tmp_path, **config_overrides,
-    )
+def _rig(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *,
+    callbacks: SchedulerCallbacks | None = None, **config_overrides: object,
+) -> _Rig:
+    settings: dict[str, object] = {
+        'max_per_module': 1, 'lock_depth': 12, 'module_overrides': {'two.py': 2},
+        'early_start': {'enabled': True}, 'project_root': tmp_path, **config_overrides,
+    }
+    config = OrchestratorConfig(**settings)
     store = EventStore(tmp_path / 'runs.db', 'run-1')
     overrides = OverrideStore(tmp_path / 'overrides.db')
     session = _RecordingSession()
@@ -123,6 +129,7 @@ def _rig(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, **config_overrides: ob
         override_store=overrides,
         state_snapshot_path=tmp_path / 'scheduler_state.json',
         branch_work_reader=dict,
+        callbacks=callbacks,
     )
     scheduler.finish_startup()
     status = AsyncMock()
@@ -144,8 +151,8 @@ def p_running(files: list[str] | None = None) -> dict:
     return task('P', files=P_FILES if files is None else files, status='in-progress')
 
 
-async def _with_p_running(tmp_path, monkeypatch, **config_overrides) -> _Rig:
-    rig = _rig(tmp_path, monkeypatch, **config_overrides)
+async def _with_p_running(tmp_path, monkeypatch, **rig_overrides) -> _Rig:
+    rig = _rig(tmp_path, monkeypatch, **rig_overrides)
     await rig.dispatch(task('P', files=P_FILES))
     return rig
 
@@ -601,3 +608,146 @@ class TestRow34NeverStartedTwice:
 
         assert selection == EarlyStartSelection(None, (_refusal(Reason.NOT_ELIGIBLE),))
         assert rig.scheduler.lock_table.snapshot_successor_of() == {}
+
+
+class TestRow8PredecessorChecks:
+    async def test_checks_passed_at_the_tip_are_claimed(self, tmp_path, monkeypatch):
+        rig = await _with_p_running(tmp_path, monkeypatch)
+        picture = await rig.picture(p_running(), task('D', deps=('P',)))
+
+        selection = await rig.select(picture, reads_for(picture, checks=ChecksAtCommit.PASSED))
+
+        assert selection.claim is not None
+
+    @pytest.mark.parametrize(('checks', 'reason'), [
+        (ChecksAtCommit.FAILED, Reason.DELIVERED_CHECK_FAILED),
+        (ChecksAtCommit.SCRIPT_KIND, Reason.DELIVERED_CHECK_SCRIPT),
+    ])
+    async def test_checks_not_passed_refuse_the_pair(self, tmp_path, monkeypatch, checks, reason):
+        rig = await _with_p_running(tmp_path, monkeypatch)
+        picture = await rig.picture(p_running(), task('D', deps=('P',)))
+
+        selection = await rig.select(picture, reads_for(picture, checks=checks))
+
+        assert selection == EarlyStartSelection(None, (_refusal(reason),))
+        rig.assert_untouched('D')
+
+
+class TestRow44TheBranchRule:
+    @pytest.mark.parametrize(('branch', 'mark'), [
+        (DependentBranch.UNSTACKED, None),
+        (DependentBranch.STACKED, 'Q'),
+        (DependentBranch.STACKED, None),
+        (DependentBranch.UNREADABLE, None),
+        (DependentBranch.UNREADABLE, 'P'),
+    ], ids=['cut-from-main', 'stacked-on-another', 'stacked-unmarked', 'unreadable', 'unreadable-marked'])
+    async def test_a_branch_not_stacked_on_this_predecessor_is_refused(
+        self, tmp_path, monkeypatch, branch, mark,
+    ):
+        rig = await _with_p_running(tmp_path, monkeypatch)
+        metadata = {} if mark is None else {'early_start': {'predecessor': mark}}
+        picture = await rig.picture(p_running(), task('D', deps=('P',), **metadata))
+
+        selection = await rig.select(picture, reads_for(picture, branch=branch))
+
+        assert selection == EarlyStartSelection(None, (_refusal(Reason.HAS_BRANCH),))
+        rig.assert_untouched('D')
+
+    @pytest.mark.parametrize(('branch', 'mark'), [
+        (DependentBranch.STACKED, 'P'),
+        (DependentBranch.ABSENT, None),
+    ], ids=['stacked-on-this-predecessor', 'no-branch'])
+    async def test_no_branch_or_one_stacked_on_this_predecessor_is_claimed(
+        self, tmp_path, monkeypatch, branch, mark,
+    ):
+        rig = await _with_p_running(tmp_path, monkeypatch)
+        metadata = {} if mark is None else {'early_start': {'predecessor': mark}}
+        picture = await rig.picture(p_running(), task('D', deps=('P',), **metadata))
+
+        selection = await rig.select(picture, reads_for(picture, branch=branch))
+
+        assert selection.claim is not None and selection.refusals == ()
+
+    async def test_the_mark_is_read_from_the_store_row(self, tmp_path, monkeypatch):
+        rig = await _with_p_running(tmp_path, monkeypatch)
+        picture = await rig.picture(p_running(), task('D', deps=('P',), early_start={'predecessor': 'P'}))
+        unmarked = task('D', deps=('P',))
+
+        selection = await rig.select(
+            picture, reads_for(picture, branch=DependentBranch.STACKED, row=unmarked),
+        )
+
+        assert selection == EarlyStartSelection(None, (_refusal(Reason.HAS_BRANCH),))
+
+
+def _saturated() -> PsiSample:
+    return PsiSample(cpu_some10=0.0, mem_some10=99.0, mem_full10=0.0, io_some10=0.0, read_ok=True)
+
+
+async def _held_by_the_switch(tmp_path, monkeypatch):
+    return await _with_p_running(tmp_path, monkeypatch, early_start={'enabled': False}), clear_holds()
+
+
+async def _held_by_host_load(tmp_path, monkeypatch):
+    rig = await _with_p_running(
+        tmp_path, monkeypatch, psi_admission={'enabled': True, 'min_inflight_floor': 1},
+    )
+    assert rig.scheduler.is_dispatched('P')
+    rig.scheduler._read_psi_sample = _saturated
+    return rig, clear_holds()
+
+
+async def _held_by_a_pause(tmp_path, monkeypatch):
+    rig = await _with_p_running(tmp_path, monkeypatch)
+    rig.scheduler.pause('operator says stop', PauseClass.OPERATOR)
+    return rig, clear_holds()
+
+
+async def _held_by_the_warm_base(tmp_path, monkeypatch):
+    probe = AsyncMock(return_value='ok')
+    rig = await _with_p_running(
+        tmp_path, monkeypatch, callbacks=SchedulerCallbacks(warm_base_health_probe=probe),
+        warm_base_hard_down={'enabled': True},
+    )
+    probe.return_value = 'absent'
+    assert await rig.scheduler.acquire_next() is None
+    return rig, clear_holds()
+
+
+def _held_by_the_harness(field: str):
+    async def _setup(tmp_path, monkeypatch):
+        rig = await _with_p_running(tmp_path, monkeypatch)
+        return rig, dataclasses.replace(clear_holds(), **{field: True})
+    return _setup
+
+
+class TestRow11SystemHolds:
+    @pytest.mark.parametrize(('setup', 'reason'), [
+        (_held_by_the_switch, Reason.DISABLED),
+        (_held_by_host_load, Reason.HOST_LOAD),
+        (_held_by_a_pause, Reason.SCHEDULER_PAUSED),
+        (_held_by_the_warm_base, Reason.WARM_BASE_DOWN),
+        (_held_by_the_harness('review_checkpoint'), Reason.REVIEW_CHECKPOINT),
+        (_held_by_the_harness('merge_queue_halted'), Reason.MERGE_QUEUE_HALTED),
+        (_held_by_the_harness('usage_paused'), Reason.USAGE_PAUSED),
+        (_held_by_the_harness('cost_ceiling_breached'), Reason.COST_CEILING),
+    ], ids=[
+        'disabled', 'host-load', 'paused', 'warm-base-down', 'review-checkpoint',
+        'merge-queue-halted', 'usage-paused', 'cost-ceiling',
+    ])
+    async def test_a_hold_refuses_before_any_candidate_and_writes_nothing(
+        self, tmp_path, monkeypatch, setup, reason,
+    ):
+        rig, holds = await setup(tmp_path, monkeypatch)
+        picture = await rig.picture(p_running(), task('D', deps=('P', 'X')), task('E', deps=('P',)))
+        events_before, calls_before = rig.events(), list(rig.session.calls)
+
+        selection = await rig.select(
+            picture, reads_of(pair_reads(picture, 'D'), pair_reads(picture, 'E')), holds=holds,
+        )
+
+        assert selection == EarlyStartSelection(None, (EarlyStartRefusal(reason),))
+        rig.assert_untouched('D', 'E')
+        assert rig.events() == events_before
+        assert rig.session.calls == calls_before
+        rig.status.assert_not_awaited()
