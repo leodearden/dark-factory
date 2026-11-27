@@ -3592,6 +3592,11 @@ def _gate_sequence_transcript(scene: _GateScene) -> list[dict]:
 # variance is unrelated to the kill switch and would make an event-stream
 # golden flaky, so the row turns the cross-check OFF and pins a stream that was
 # then measured identical across three consecutive runs.
+#
+# A second scene choice, also NOT about the deep path: the narrow merge gate
+# (task 5411), which the live yaml turns on.  Its decision records a
+# ``merge_gate_resolution`` row the pre-PRD golden predates, so the row turns
+# the gate OFF too.
 # ═══════════════════════════════════════════════════════════════════════════
 
 _ROW7_FOLLOWERS = 7
@@ -3757,6 +3762,7 @@ class TestRow7KillSwitchByteIdentity:
         # reload does too (OrchestratorConfig is a plain mutable BaseModel), and
         # every enqueued request holds THIS object by reference.
         scene.config.verify_cross_check_remote_green = False
+        scene.config.narrow_merge_gate.enabled = False
         for tag in ('r1', 'r2', 'r3'):
             nxt = scene.worker._intake.pop_next_pickable()
             assert nxt is not None, (
