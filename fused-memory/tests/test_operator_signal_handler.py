@@ -9,7 +9,9 @@ flag set by the SIGTERM/SIGINT handler.
 import asyncio
 import os
 import signal
+import subprocess
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -175,6 +177,38 @@ class TestInstallOperatorStopHandlerIntegration:
         assert s2.should_exit is True
         assert s1.force_exit is False
         assert s2.force_exit is False
+
+
+@pytest.mark.skipif(
+    sys.platform == 'win32',
+    reason='os.kill SIGTERM semantics differ on Windows',
+)
+class TestOneStopSignalStopsBothServersCleanly:
+    """Task 10067: one SIGTERM to a process serving two uvicorn servers is delivered
+    to the operator-stop handler once, and each server's lifespan shutdown is logged
+    through main.py's own logging. The real signal goes to a child process, never to
+    the pytest worker; the driver composes main.py's seams the way run_server does.
+    """
+
+    _DRIVER = Path(__file__).with_name('_two_server_operator_stop.py')
+
+    def test_one_sigterm_one_delivery_and_two_logged_shutdowns(self, tmp_path):
+        child = subprocess.run(
+            [sys.executable, '-I', str(self._DRIVER)],
+            cwd=tmp_path,
+            capture_output=True,
+            text=True,
+        )
+        lines = child.stderr.splitlines()
+
+        assert child.returncode == 0, child.stderr
+        assert sum('Received SIGTERM — initiating operator shutdown' in line for line in lines) == 1, child.stderr
+        assert not [
+            line for line in lines if 'Repeat stop signal' in line or 'Second stop signal' in line
+        ], child.stderr
+        assert sum(
+            line.endswith(' - uvicorn.error - INFO - Application shutdown complete.') for line in lines
+        ) == 2, child.stderr
 
 
 class TestMainExitCode:
