@@ -352,6 +352,13 @@ class TestLLMConfigExtractionRoutes:
                 'decisions_and_rationale': self.ROUTE | {'reasoning_effort': 'extreme'},
             }})
 
+    @pytest.mark.parametrize('misspelt', ['base_url', 'key'])
+    def test_an_unknown_route_leaf_is_refused_by_name(self, misspelt):
+        with pytest.raises(ValidationError, match=misspelt):
+            LLMConfig.model_validate({'extraction_routes': {
+                'decisions_and_rationale': self.ROUTE | {misspelt: 'x'},
+            }})
+
     @pytest.mark.parametrize('blank', ['', '   '])
     def test_a_blank_url_or_key_reads_as_unset(self, blank):
         route = ExtractionRouteConfig(

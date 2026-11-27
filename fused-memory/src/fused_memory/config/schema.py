@@ -316,6 +316,8 @@ class LLMProvidersConfig(BaseModel):
 class ExtractionRouteConfig(BaseModel):
     """One category's graphiti extraction route: the model, effort, endpoint and key it rides."""
 
+    model_config = ConfigDict(extra='forbid')
+
     model: str = Field(description='Model the routed extract_nodes/extract_edges calls are sent to.')
     reasoning_effort: Literal['low', 'medium', 'high'] = Field(
         description='reasoning.effort sent on every routed call, with no temperature.',
