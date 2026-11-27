@@ -1624,6 +1624,24 @@ def _curated_titles(curator: MagicMock) -> list[str]:
     return [bundle.candidate.title for bundle in bundles]
 
 
+_SIBLING_REWRITE = RewrittenTask(
+    title='Task One, unified',
+    description='Both candidates as one task.',
+    details='Every detail of both.',
+    files_to_modify=[],
+    priority='medium',
+)
+
+
+def _combine_onto(index: int, *, fingerprint: str) -> CuratorDecision:
+    """A within-batch combine of a candidate into its sibling at curated *index*."""
+    return CuratorDecision(
+        action='combine', target_id=None, batch_target_index=index,
+        target_fingerprint=fingerprint, rewritten_task=_SIBLING_REWRITE,
+        justification=f'fold into batch {index}',
+    )
+
+
 class TestWorkerBatchDispatch:
     """The worker judges a batch with one curator call and dispatches each ticket."""
 
@@ -1794,6 +1812,76 @@ class TestWorkerBatchDispatch:
 
         assert _outcomes(answers) == [('failed', None), ('created', '77')]
         assert taskmaster.add_task.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_within_batch_combine_folds_into_the_sibling_task(
+        self, make_interceptor, taskmaster,
+    ):
+        """A combine onto batch item 0 rewrites the task item 0 is created as."""
+        curator = _batch_curator(
+            CuratorDecision(action='create', justification='new'),
+            _combine_onto(0, fingerprint='Task One'),
+        )
+        taskmaster.add_task = AsyncMock(return_value={'id': '88', 'title': 'Task One'})
+        taskmaster.get_task = AsyncMock(
+            return_value={'id': '88', 'title': 'Task One', 'status': 'pending'},
+        )
+        interceptor = make_interceptor(curator)
+
+        ticket_ids = await submit_as_one_batch(interceptor, curator, [
+            _titled('Task One'), _titled('Task One, more of it'),
+        ])
+        created, combined = await _resolve_all(interceptor, ticket_ids)
+
+        assert _outcomes([created, combined]) == [('created', '88'), ('combined', '88')]
+        assert combined['reason'].startswith('combine:')
+        taskmaster.update_task.assert_awaited_once()
+        update = taskmaster.update_task.await_args.kwargs
+        assert (update['task_id'], update['title']) == ('88', _SIBLING_REWRITE.title)
+        assert taskmaster.add_task.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_within_batch_combine_onto_a_failed_sibling_degrades_to_create(
+        self, make_interceptor, taskmaster,
+    ):
+        """A combine onto a sibling that was never created is created on its own."""
+        curator = _batch_curator(
+            CuratorDecision(action='create', justification='new'),
+            _combine_onto(0, fingerprint='Task One'),
+        )
+        taskmaster.add_task = AsyncMock(side_effect=[
+            RuntimeError('boom'),
+            {'id': '77', 'title': 'Task One, more of it'},
+        ])
+        interceptor = make_interceptor(curator)
+
+        ticket_ids = await submit_as_one_batch(interceptor, curator, [
+            _titled('Task One'), _titled('Task One, more of it'),
+        ])
+        failed, created = await _resolve_all(interceptor, ticket_ids)
+
+        assert _outcomes([failed, created]) == [('failed', None), ('created', '77')]
+        assert 'batch-target-not-create' in created['reason']
+        taskmaster.update_task.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_within_batch_combine_onto_a_parked_sibling_parks_with_it(
+        self, make_interceptor, taskmaster, ticket_store,
+    ):
+        curator = _batch_curator(
+            CuratorDecision.deferred(DeferReason.LLM_FAILED),
+            _combine_onto(0, fingerprint='Task One'),
+        )
+        interceptor = make_interceptor(curator)
+
+        ticket_ids = await submit_as_one_batch(interceptor, curator, [
+            _titled('Task One'), _titled('Task One, more of it'),
+        ])
+        rows = [await _poll_ticket_resolved(ticket_store, ticket_id) for ticket_id in ticket_ids]
+
+        assert [row['status'] for row in rows] == ['awaiting_curation', 'awaiting_curation']
+        taskmaster.add_task.assert_not_awaited()
+        taskmaster.update_task.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_idempotency_hit_resolves_combined_and_is_not_curated(

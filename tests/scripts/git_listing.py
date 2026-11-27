@@ -1,6 +1,6 @@
 """Git as the authority on which files a repo-wide guard sweeps.
 
-Two things every such guard needs from git:
+What every such guard needs from git:
 
 * ``git`` runs it with every ``GIT_*`` variable except
   ``GIT_CEILING_DIRECTORIES`` scrubbed from the environment, because a hook or
@@ -27,6 +27,13 @@ Two things every such guard needs from git:
   contributes files. Pinned by
   ``tests/scripts/test_nonmember_ruff_config.py::test_the_derivation_excludes_submodules_and_foreign_checkouts``.
   ``-z`` keeps a path holding a space or a quote unmangled.
+* ``tracked_files`` is ``--cached`` alone, the checkout's own index: a staged
+  new file counts, an untracked one does not. Because ``git`` scrubs
+  ``GIT_INDEX_FILE``, under pre-commit that is the default index, a superset of
+  what the commit lands (``git commit --only`` leaves other staged paths in
+  it). It is the choice for a guard whose population is checked-in files, so
+  an untracked scratch file in a checkout cannot fail it (task 10840) and a
+  tracked file cannot hide from it.
 
 IMPORT ME, DO NOT COPY ME.
 
@@ -75,8 +82,15 @@ def git(cwd: Path, *args: str) -> str:
 
 def listed_files(root: Path, *pathspecs: str) -> list[Path]:
     """Existing files under *root* matching *pathspecs* that git tracks, or sees untracked and not ignored."""
-    listing = git(
-        root, 'ls-files', '--cached', '--others', '--exclude-standard', '-z', '--', *pathspecs,
-    )
+    return _ls_files(root, ('--cached', '--others', '--exclude-standard'), pathspecs)
+
+
+def tracked_files(root: Path, *pathspecs: str) -> list[Path]:
+    """Existing files under *root* matching *pathspecs* that are in git's index."""
+    return _ls_files(root, ('--cached',), pathspecs)
+
+
+def _ls_files(root: Path, flags: tuple[str, ...], pathspecs: tuple[str, ...]) -> list[Path]:
+    listing = git(root, 'ls-files', *flags, '-z', '--', *pathspecs)
     candidates = [root / entry for entry in listing.split('\0') if entry]
     return [path for path in candidates if path.is_file()]

@@ -648,6 +648,12 @@ class TestTrailingWindow:
 # ---------------------------------------------------------------------------
 
 
+def _end_tick(store, now: int) -> None:
+    """The store calls that close a tick, in ``__main__.main``'s order."""
+    store.cleanup_old(now)
+    store.maybe_vacuum(now)
+
+
 class TestRetentionAndVacuum:
     def test_cleanup_old_removes_old_rows(self, tmp_path: Path):
         from sampler.store import LoadSampleStore
@@ -700,7 +706,7 @@ class TestRetentionAndVacuum:
         store = LoadSampleStore(tmp_path / 'db.sqlite')
         now = 1_000_000
 
-        store.maybe_vacuum(now)
+        _end_tick(store, now)
         # Call again at now + 1 (less than 86400s later) -> should be False
         assert store.should_vacuum(now + 1) is False
 
@@ -710,7 +716,7 @@ class TestRetentionAndVacuum:
         store = LoadSampleStore(tmp_path / 'db.sqlite')
         now = 1_000_000
 
-        store.maybe_vacuum(now)
+        _end_tick(store, now)
         assert store.should_vacuum(now + 86400) is True
 
     def test_maybe_vacuum_runs_and_records_timestamp(self, tmp_path: Path):
@@ -761,9 +767,9 @@ class TestRetentionAndVacuum:
         store = LoadSampleStore(tmp_path / 'db.sqlite')
         now = 1_000_000
 
-        store.maybe_vacuum(now)
+        _end_tick(store, now)
         # Second call on same day should be a no-op (no error)
-        store.maybe_vacuum(now + 3600)
+        _end_tick(store, now + 3600)
 
         # should_vacuum still False (only 1h elapsed)
         assert store.should_vacuum(now + 3600) is False
@@ -783,6 +789,14 @@ def _count_at(db_path: Path, ts: int) -> int:
         return conn.execute(
             'SELECT COUNT(*) FROM samples WHERE ts = ?', (ts,)
         ).fetchone()[0]
+    finally:
+        conn.close()
+
+
+def _count_all(db_path: Path) -> int:
+    conn = sqlite3.connect(str(db_path))
+    try:
+        return conn.execute('SELECT COUNT(*) FROM samples').fetchone()[0]
     finally:
         conn.close()
 
@@ -1101,6 +1115,97 @@ class TestCleanupIsIntervalGated:
         assert store.should_vacuum(now) is True
 
 
+class TestRetentionIsBoundedPerTick:
+    """No tick deletes more than ``max_rows``; a backlog drains over the ticks after."""
+
+    def test_a_backlog_over_budget_drains_over_several_ticks_never_more_than_the_budget(
+        self, tmp_path: Path
+    ):
+        from sampler.store import LoadSampleStore
+
+        db_path = tmp_path / 'db.sqlite'
+        store = LoadSampleStore(db_path)
+        now = 10_000_000
+        _bulk_insert(db_path, RUNQ.metric, now - THIRTY_DAYS - DAY, 25, step=1)
+        _bulk_insert(db_path, RUNQ.metric, now + THIRTY_DAYS + DAY, 7, step=1)
+        kept = (now - 60, now, now + 60)
+        for ts in kept:
+            store.insert_sample(ts, RUNQ, 1.0)
+
+        returns: list[int] = []
+        last_tick = now
+        for k in range(10):
+            last_tick = now + 5 * k
+            before = _count_all(db_path)
+            deleted = store.cleanup_old(last_tick, max_rows=10)
+            assert deleted <= 10, returns
+            assert before - _count_all(db_path) == deleted, returns
+            returns.append(deleted)
+            if deleted < 10:
+                break
+
+        assert returns == [10, 10, 10, 2]
+        assert _count_all(db_path) == 3
+        assert [_count_at(db_path, ts) for ts in kept] == [1, 1, 1]
+        assert store.should_cleanup(last_tick) is False
+        assert store.cleanup_old(last_tick + 5, max_rows=10) == 0
+
+    def test_a_full_chunk_leaves_the_sweep_due_and_its_clock_unstamped(self, tmp_path: Path):
+        from sampler.store import LoadSampleStore
+
+        db_path = tmp_path / 'db.sqlite'
+        store = LoadSampleStore(db_path)
+        now = 10_000_000
+        _bulk_insert(db_path, RUNQ.metric, now - THIRTY_DAYS - DAY, 15, step=1)
+
+        assert store.cleanup_old(now, max_rows=10) == 10
+        assert _meta(db_path, 'last_cleanup_ts') is None
+        assert store.should_cleanup(now) is True
+
+        assert store.cleanup_old(now + 5, max_rows=10) == 5
+        assert _meta(db_path, 'last_cleanup_ts') == str(now + 5)
+
+    def test_a_backlog_exactly_one_budget_deep_finishes_on_a_zero_row_call(
+        self, tmp_path: Path
+    ):
+        from sampler.store import LoadSampleStore
+
+        db_path = tmp_path / 'db.sqlite'
+        store = LoadSampleStore(db_path)
+        now = 10_000_000
+        _bulk_insert(db_path, RUNQ.metric, now - THIRTY_DAYS - DAY, 10, step=1)
+
+        assert store.cleanup_old(now, max_rows=10) == 10
+        assert _meta(db_path, 'last_cleanup_ts') is None
+
+        assert store.cleanup_old(now + 5, max_rows=10) == 0
+        assert _meta(db_path, 'last_cleanup_ts') == str(now + 5)
+
+    @pytest.mark.parametrize('sweep_due', [True, False], ids=['due', 'not-due'])
+    @pytest.mark.parametrize('bad', [0, -1])
+    def test_a_budget_below_one_row_is_refused(
+        self, tmp_path: Path, bad: int, sweep_due: bool
+    ):
+        """0 would never finish a sweep; -1 is an unbounded LIMIT in SQLite."""
+        from sampler.store import LoadSampleStore
+
+        db_path = tmp_path / 'db.sqlite'
+        store = LoadSampleStore(db_path)
+        now = 10_000_000
+        if not sweep_due:
+            store.cleanup_old(now - 5)
+        stamp = _meta(db_path, 'last_cleanup_ts')
+        assert store.should_cleanup(now) is sweep_due
+        stale = now - THIRTY_DAYS - 60
+        store.insert_sample(stale, RUNQ, 1.0)
+
+        with pytest.raises(ValueError, match=rf'max_rows .* got {bad}$'):
+            store.cleanup_old(now, max_rows=bad)
+
+        assert _count_at(db_path, stale) == 1
+        assert _meta(db_path, 'last_cleanup_ts') == stamp
+
+
 # ---------------------------------------------------------------------------
 # Review suggestion 1: the daily VACUUM was sized for 24h retention, not 30d
 # ---------------------------------------------------------------------------
@@ -1174,9 +1279,11 @@ class TestVacuumIsGatedOnThereBeingSomethingToReclaim:
         store = LoadSampleStore(tmp_path / 'db.sqlite', connect=spy)
         _bulk_insert(store.db_path, 'psi_cpu_some_avg10', 1_000_000, 5000)
 
-        store.maybe_vacuum(1_000_000)
+        _end_tick(store, 1_000_000)
 
-        assert spy.opened, 'the connect spy never fired, so the absence below pins nothing'
+        assert store.should_vacuum(1_000_000 + 1) is False, (
+            'the vacuum gate was never evaluated, so the absence below pins nothing'
+        )
         assert not [sql for sql in spy.executed if _is_vacuum(sql)], (
             'VACUUM rewrote a file with no free pages'
         )
@@ -1195,7 +1302,7 @@ class TestVacuumIsGatedOnThereBeingSomethingToReclaim:
         store = LoadSampleStore(tmp_path / 'db.sqlite')
         _bulk_insert(store.db_path, 'psi_cpu_some_avg10', 1_000_000, 5000)
 
-        store.maybe_vacuum(1_000_000)
+        _end_tick(store, 1_000_000)
 
         assert store.should_vacuum(1_000_000 + 1) is False
         assert store.should_vacuum(1_000_000 + 86400) is True
@@ -1218,6 +1325,34 @@ class TestVacuumIsGatedOnThereBeingSomethingToReclaim:
         )
         assert spy.vacuums_ran_on() == [True]
         assert store.db_path.stat().st_size < size_before
+
+    def test_a_prune_spread_over_several_ticks_is_judged_whole(self, tmp_path: Path):
+        """Ticks run as ``__main__.main`` does: ``cleanup_old`` then ``maybe_vacuum``."""
+        from sampler.store import LoadSampleStore
+
+        spy = ConnectSpy()
+        store = LoadSampleStore(tmp_path / 'db.sqlite', connect=spy)
+        _bulk_insert(store.db_path, 'psi_cpu_some_avg10', 1_000_000, 20_000)
+        now = 1_000_000 + 20_000 * 5
+        chunk = 1_000
+
+        tick = now
+        while store.cleanup_old(tick, retain_seconds=100, max_rows=chunk) == chunk:
+            store.maybe_vacuum(tick)
+            tick += 5
+
+        assert tick > now, 'the prune fit one chunk, so this is not a multi-tick sweep'
+        assert _meta(store.db_path, 'last_vacuum_ts') is None, (
+            'the vacuum gate was evaluated, and its clock stamped, mid-sweep'
+        )
+        assert not [sql for sql in spy.executed if _is_vacuum(sql)], 'compacted mid-sweep'
+
+        store.maybe_vacuum(tick)
+
+        assert spy.vacuums_ran_on() == [True], (
+            'the finished prune left the file mostly free pages, yet it was not compacted'
+        )
+        assert _meta(store.db_path, 'last_vacuum_ts') == str(tick)
 
 
 # ---------------------------------------------------------------------------

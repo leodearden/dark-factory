@@ -43,6 +43,7 @@ from fused_memory.services.memory_service import (
     _serialize_temporal,
     metadata_row_text,
 )
+from fused_memory.services.plan_route import PlanRouteSnapshot, PlanRouteStateName
 from fused_memory.services.queued_writes import (
     QueueCallback,
     QueuedEpisodeWrite,
@@ -8252,11 +8253,7 @@ class TestGetStatusScoping:
 
         await service.get_status(project_id='dark_factory')
 
-        service.durable_queue.get_stats.assert_called_once()
-        call_kwargs = service.durable_queue.get_stats.call_args.kwargs
-        assert call_kwargs.get('group_id') == 'dark_factory', (
-            f'Expected group_id="dark_factory", got call_kwargs={call_kwargs}'
-        )
+        service.durable_queue.get_stats.assert_any_await(group_id='dark_factory')
 
     @pytest.mark.asyncio
     async def test_get_status_without_project_id_passes_no_group_filter(self, service):
@@ -8287,6 +8284,30 @@ class TestGetStatusScoping:
         assert result['queue'] == fixed_stats, (
             f'queue section should equal get_stats output; got {result["queue"]}'
         )
+
+
+class TestGetStatusPlanRoute:
+    """get_status's plan_route reports the in-memory latch even when the queue cannot be counted."""
+
+    @pytest.mark.asyncio
+    async def test_a_queue_that_cannot_be_counted_costs_only_the_parked_count(self, service):
+        service.graphiti.list_graphs = AsyncMock(return_value=[])
+        service.mem0.list_projects = AsyncMock(return_value=[])
+        service.durable_queue.get_stats = AsyncMock(side_effect=RuntimeError('queue db is locked'))
+        capped_since = datetime(2026, 11, 24, 12, tzinfo=UTC)
+        service.plan_route.state = MagicMock(return_value=PlanRouteSnapshot(
+            state=PlanRouteStateName.CAPPED, proxy_host='127.0.0.1:8317',
+            capped_since=capped_since, resets_at=capped_since + timedelta(days=3),
+        ))
+
+        result = await service.get_status()
+
+        assert result['queue'] == {'error': 'queue db is locked'}
+        plan_route = result['plan_route']
+        assert plan_route['state'] == 'capped'
+        assert plan_route['capped_since'] == capped_since.isoformat()
+        assert plan_route['resets_at'] == (capped_since + timedelta(days=3)).isoformat()
+        assert plan_route['parked_items'] is None
 
 
 class TestGetStatusSurfacesFalkorServerSettings:
@@ -11987,7 +12008,7 @@ class TestGetMemoryById:
     @pytest.mark.asyncio
     async def test_content_fallback_to_content_key(self, service):
         """With neither 'data' nor 'memory', content falls back to the third and
-        last key in the canonical _MEM0_CONTENT_KEYS order ('content')."""
+        last key in the canonical ``fused_memory/utils/mem0_content_keys.py::MEM0_CONTENT_KEYS`` order ('content')."""
         payload = {'content': 'c', 'category': 'observations_and_summaries'}
         service.mem0.get_point_by_id = AsyncMock(return_value=payload)
 
@@ -11999,7 +12020,7 @@ class TestGetMemoryById:
 
     @pytest.mark.asyncio
     async def test_no_recognized_content_key_returns_found_with_empty_content(self, service):
-        """A present point whose payload carries NONE of _MEM0_CONTENT_KEYS is still
+        """A present point whose payload carries NONE of ``fused_memory/utils/mem0_content_keys.py::MEM0_CONTENT_KEYS`` is still
         a hit (found), with content=='' and the full raw payload as metadata — the
         documented ('data'→'memory'→'content'→'') precedence's fall-through arm.
 
@@ -14505,6 +14526,42 @@ class TestDeleteMemoryCascade:
         assert parent_event.payload['cascaded_child_ids'] == [
             grandchild, _DM_CHILD_A,
         ]
+
+    @pytest.mark.asyncio
+    async def test_a_child_that_vanished_before_its_delete_is_not_reported_destroyed(
+        self, service
+    ):
+        """`cascaded_child_ids` names what THIS cascade destroyed, nothing more.
+
+        CHILD_B is deleted concurrently between the cascade's listing and its
+        own delete, so its existence read misses and nothing is destroyed
+        there. Reporting it would claim a deletion this call never made.
+        """
+        journal = _mm_install_journal(service)
+        graph = _DMGraph({_DM_PARENT: [_DM_CHILD_A, _DM_CHILD_B]}).install(service)
+
+        async def read_point(memory_id, scope):
+            if memory_id == _DM_CHILD_B:
+                for kids in graph.edges.values():
+                    if memory_id in kids:
+                        kids.remove(memory_id)
+                return None
+            return dict(DEFAULT_POINT_PAYLOAD)
+
+        service.mem0.get_point_by_id = AsyncMock(side_effect=read_point)
+
+        result = await service.delete_memory(
+            memory_id=_DM_PARENT, store='mem0', project_id='test', cascade=True
+        )
+
+        assert result['status'] == 'deleted'
+        assert graph.deleted == [_DM_CHILD_A, _DM_PARENT]
+        assert result['cascaded_child_ids'] == [_DM_CHILD_A]
+        parent_row = next(
+            call.kwargs for call in journal.log_write_op.call_args_list
+            if call.kwargs['params']['memory_id'] == _DM_PARENT
+        )
+        assert _DM_CHILD_B not in parent_row['result_summary']['cascaded_child_ids']
 
     @pytest.mark.asyncio
     async def test_self_parent_terminates_and_deletes_once(self, service):

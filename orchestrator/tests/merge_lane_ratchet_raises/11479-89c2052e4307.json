@@ -1,0 +1,18 @@
+{
+  "task_id": "11479",
+  "reason": "task 11479: the drift check gains a second deferral cause (no warm lane) with its own except arm, and its slot/lane/verify phases split into helpers; drift.py's total rises by 1 (32 -> 33) while the cold lane lifecycle and its finally-guard moved out to liveness.drift_check_lane",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/drift.py",
+      "baseline": 32,
+      "current": 33
+    },
+    {
+      "measure": "total:cognitive",
+      "key": "<cluster>",
+      "baseline": 5269,
+      "current": 5270
+    }
+  ]
+}

@@ -26,11 +26,11 @@ below fails collection until step-2 implements them.
 
 from __future__ import annotations
 
-import asyncio
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _git_fixtures import seed_repo
 from _orch_helpers import MOCK_WORKFLOW_PROJECT_ROOT, pydantic_spec
 from _seed_script_stubs import seed_default_warm_base
 
@@ -50,19 +50,7 @@ from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
 @pytest.fixture
 def git_repo(tmp_path: Path) -> Path:
     """Create a temporary git repository with an initial commit."""
-    repo = tmp_path / 'repo'
-    repo.mkdir()
-    asyncio.run(_setup_repo(repo))
-    return repo
-
-
-async def _setup_repo(repo: Path) -> None:
-    await _run(['git', 'init', '-b', 'main'], cwd=repo)
-    await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=repo)
-    await _run(['git', 'config', 'user.name', 'Test'], cwd=repo)
-    (repo / 'README.md').write_text('# Test\n')
-    await _run(['git', 'add', '-A'], cwd=repo)
-    await _run(['git', 'commit', '-m', 'Initial commit'], cwd=repo)
+    return seed_repo(tmp_path / 'repo')
 
 
 @pytest.fixture
@@ -573,6 +561,104 @@ class TestRequeueReuseSitesRouteThroughGuard:
             'routed through the production acquire_warm_lane entry'
         )
 
+    async def _resumable_lane_with_one_commit(
+        self, git_repo: Path, monkeypatch, *, rebinds_onto: str,
+    ) -> tuple[GitOps, Path, str, str]:
+        """A 'WD' lane one commit over main whose resume rebind is a stand-in.
+
+        The stand-in reproduces the pre-fix rebind: it runs ``checkout -B
+        <rebinds_onto> main``, so the branch it lands on loses the commit,
+        and reports success.
+        """
+        seed_default_warm_base(git_repo)
+        await _add_warm_lane_scripts(git_repo)
+        _, start_ref_raw, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=git_repo)
+        warm_git_ops = GitOps(
+            GitConfig(
+                main_branch='main',
+                branch_prefix='task/',
+                remote='origin',
+                worktree_dir='.worktrees',
+                push_after_advance=False,
+                warm_lane_pool=True,
+            ),
+            git_repo,
+            warm_lane_pool_size=1,
+        )
+        info = await warm_git_ops.acquire_warm_lane('WD', start_ref_raw.strip())
+        assert isinstance(info, WorktreeInfo), f'Acquire failed: {info!r}'
+        await _commit_unique_work(info.path, filename='wd_feature.txt')
+        assert await _commits_over_main(info.path) == 1
+
+        async def _pre_fix_rebind(worktree: Path, full_branch: str, **_: object) -> bool:
+            await _run(['git', 'checkout', '-B', rebinds_onto, 'main'], cwd=worktree)
+            return True
+
+        monkeypatch.setattr(warm_git_ops, 'rebind_branch_to_head', _pre_fix_rebind)
+        return warm_git_ops, info.path, await _head_sha(info.path), start_ref_raw.strip()
+
+    async def test_live_requeue_catches_a_rebind_that_drops_commits(
+        self, git_repo: Path, monkeypatch,
+    ):
+        """The resume's own re-attach is guarded, not only its rebase (task 10991).
+
+        reify task/10089 lost c770e00ea8 to the resume's ``checkout -B``,
+        BEFORE any rebase ran, so this guard's rebase baseline read 0 -> 0.
+        """
+        warm_git_ops, lane, tip, start_ref = await self._resumable_lane_with_one_commit(
+            git_repo, monkeypatch, rebinds_onto='task/WD',
+        )
+
+        with pytest.raises(BranchResetError) as excinfo:
+            await warm_git_ops.acquire_warm_lane('WD', start_ref)
+
+        _, ref_raw, _ = await _run(
+            ['git', 'rev-parse', 'refs/heads/task/WD'], cwd=git_repo,
+        )
+        assert ref_raw.strip() == tip
+        assert await _commits_over_main(lane) == 1
+        assert excinfo.value.restore_ok is True
+        message = str(excinfo.value)
+        assert f'Undid resume attach in {lane}' in message, message
+        assert f'restored the branch to its entry tip {tip}' in message, message
+        assert 'pre-rebase' not in message, message
+
+    async def test_undoing_the_resume_attach_keeps_uncommitted_work(
+        self, git_repo: Path, monkeypatch,
+    ):
+        """The WIP commit runs after the attach, so the undo must not discard WIP."""
+        warm_git_ops, lane, tip, start_ref = await self._resumable_lane_with_one_commit(
+            git_repo, monkeypatch, rebinds_onto='task/WD',
+        )
+        (lane / 'README.md').write_text('# uncommitted resume work\n')
+
+        with pytest.raises(BranchResetError):
+            await warm_git_ops.acquire_warm_lane('WD', start_ref)
+
+        assert await _head_sha(lane) == tip
+        assert (lane / 'README.md').read_text() == '# uncommitted resume work\n'
+
+    async def test_undoing_the_resume_attach_never_moves_another_branch(
+        self, git_repo: Path, monkeypatch,
+    ):
+        """An attach that left the lane on another branch is reported, not reset."""
+        warm_git_ops, lane, tip, start_ref = await self._resumable_lane_with_one_commit(
+            git_repo, monkeypatch, rebinds_onto='task/OTHER',
+        )
+        _, main_raw, _ = await _run(['git', 'rev-parse', 'main'], cwd=git_repo)
+
+        with pytest.raises(BranchResetError) as excinfo:
+            await warm_git_ops.acquire_warm_lane('WD', start_ref)
+
+        assert excinfo.value.restore_ok is False
+        assert 'FAILED TO RESTORE the branch to its entry tip' in str(excinfo.value)
+        _, other_raw, _ = await _run(
+            ['git', 'rev-parse', 'refs/heads/task/OTHER'], cwd=git_repo,
+        )
+        assert other_raw.strip() == main_raw.strip()
+        _, wd_raw, _ = await _run(['git', 'rev-parse', 'refs/heads/task/WD'], cwd=git_repo)
+        assert wd_raw.strip() == tip
+
 
 # ---------------------------------------------------------------------------
 # step-5: workflow-level wiring — TaskWorkflow._inter_iteration_rebase must
@@ -750,6 +836,7 @@ def _make_branch_reset_workflow(*, task_id: str = '2403') -> TaskWorkflow:
     wf.worktree = Path('/tmp/fake-worktree-2403')
     wf.artifacts = MagicMock()
     wf.artifacts.read_iteration_log = MagicMock(return_value=([], []))
+    wf.artifacts.lane_plan_fault = MagicMock(return_value=None)
     wf.plan = {'task_id': task_id, 'steps': []}
     wf.initial_plan = {'task_id': task_id, 'steps': []}
 

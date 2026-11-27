@@ -46,6 +46,7 @@ _MIGRATED_SCRIPTS = [
     ('repair_recon_citation.py', '--target-run-id'),
     ('run_write_triage_config_matrix.py', '--data-root'),
     ('duplicate_cluster_report.py', '--plan'),
+    ('sweep_episode_toolcall_xml_leak.py', '--project-id'),
 ]
 """``(script, a flag its help must show)`` for every migrated script."""
 

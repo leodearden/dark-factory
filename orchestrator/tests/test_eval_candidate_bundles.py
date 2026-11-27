@@ -34,15 +34,16 @@ _SLATE_MODELS_BY_NAME = {
     'mimo-v2.6-pro-endpoint': 'mimo-v2.6-pro',
     'mimo-v2.6-flash-endpoint': 'mimo-v2.6-flash',
 }
-# (model, input_per_1m, output_per_1m) list prices, USD per 1M tokens.
+# (model, input_per_1m, output_per_1m, cached_input_per_1m, cache_write_per_1m)
+# list prices, USD per 1M tokens. None: the provider published no such rate.
 _SLATE_LIST_PRICES = [
-    ('MiniMax-M3.1-Flash', 0.15, 0.60),
-    ('glm-5.3', 1.40, 4.40),
-    ('glm-5.3-flash', 0.15, 0.50),
-    ('deepseek-v4', 0.28, 0.42),
-    ('kimi-latest', 0.60, 2.50),
-    ('mimo-v2.6-pro', 0.435, 0.87),
-    ('mimo-v2.6-flash', 0.14, 0.28),
+    ('MiniMax-M3.1-Flash', 0.15, 0.60, None, None),
+    ('glm-5.3', 1.40, 4.40, 0.26, 1.40),
+    ('glm-5.3-flash', 0.15, 0.50, 0.03, 0.15),
+    ('deepseek-v4', 0.28, 0.42, None, None),
+    ('kimi-latest', 0.60, 2.50, None, None),
+    ('mimo-v2.6-pro', 0.435, 0.87, None, None),
+    ('mimo-v2.6-flash', 0.14, 0.28, None, None),
 ]
 
 
@@ -339,6 +340,7 @@ class TestClaudeEndpointPriceTable:
             assert entry['output_per_1m'] > 0
 
     def test_resolve_cost_usd_resolves_price_table_for_a_candidate_model(self):
+        from orchestrator.agents.token_pricing import TokenUsage
         from orchestrator.evals.configs import DEEPSEEK_MODEL, claude_endpoint_price_table
         from orchestrator.evals.metrics import resolve_cost_usd
 
@@ -350,11 +352,11 @@ class TestClaudeEndpointPriceTable:
         ) / 1_000_000
 
         cost, cost_source = resolve_cost_usd(
-            input_tokens, output_tokens,
+            TokenUsage(input_tokens=input_tokens, output_tokens=output_tokens),
             model=DEEPSEEK_MODEL,
             prices=table,
             cli_cost_usd=99999.0,  # deliberately wrong — must NOT be used
-            is_local_model=True,
+            cli_cost_untrusted=True,
         )
 
         assert cost_source == 'price_table'
@@ -393,6 +395,68 @@ class TestGetConfigByNameAndPropagation:
         assert orch_config.env_overrides.get('ANTHROPIC_BASE_URL') == GLM_BASE_URL
         assert orch_config.models.implementer == bundle.model
 
+
+
+class TestCacheAwareCandidatePricing:
+    """A candidate's cache reads and writes reach its eval cost_usd.
+
+    The usage is the measured endpoint__46074e01 glm-5.3 cell, whose recorded
+    cost_usd of 0.056833 priced only its uncached input and output.
+    """
+
+    @staticmethod
+    def _measured_usage():
+        from orchestrator.agents.token_pricing import TokenUsage
+
+        return TokenUsage(
+            input_tokens=1_193,
+            output_tokens=12_537,
+            cache_read_tokens=1_370_402,
+            cache_create_tokens=13_702,
+        )
+
+    def test_glm_cell_prices_its_cache_tokens(self):
+        from orchestrator.evals.configs import GLM_MODEL, claude_endpoint_price_table
+        from orchestrator.evals.metrics import resolve_cost_usd
+
+        resolved = resolve_cost_usd(
+            self._measured_usage(),
+            model=GLM_MODEL,
+            prices=claude_endpoint_price_table(),
+            cli_cost_usd=0.0,
+            cli_cost_untrusted=True,
+        )
+
+        assert resolved == (pytest.approx(0.43232032), 'price_table')
+
+    def test_mimo_cell_without_a_cached_rate_is_labelled(self):
+        from orchestrator.evals.configs import MIMO_PRO_MODEL, claude_endpoint_price_table
+        from orchestrator.evals.metrics import resolve_cost_usd
+
+        _, cost_source = resolve_cost_usd(
+            self._measured_usage(),
+            model=MIMO_PRO_MODEL,
+            prices=claude_endpoint_price_table(),
+            cli_cost_usd=0.0,
+            cli_cost_untrusted=True,
+        )
+
+        assert cost_source == 'price_table_no_cache_rate'
+
+    def test_runner_seeds_glm_cache_rates_into_config_prices(self, tmp_path):
+        from orchestrator.config import load_config
+        from orchestrator.evals.configs import get_config_by_name
+        from orchestrator.evals.runner import build_eval_orch_config
+
+        cfg_path = tmp_path / 'orchestrator.yaml'
+        cfg_path.write_text(f'project_root: {tmp_path}\n')
+        bundle = get_config_by_name('glm-5.3-endpoint')
+        assert bundle is not None
+
+        cfg = build_eval_orch_config(bundle, {}, load_config(cfg_path))
+
+        assert cfg.prices['glm-5.3'].cached_input_per_1m == 0.26
+        assert cfg.prices['glm-5.3'].cache_write_per_1m == 1.40
 
 
 class TestCandidatePriceCostBasis:
@@ -480,15 +544,25 @@ class TestEndpointSlatePin:
         for name, model in _SLATE_MODELS_BY_NAME.items():
             assert by_name[name].model == model
 
-    @pytest.mark.parametrize(('model', 'input_per_1m', 'output_per_1m'), _SLATE_LIST_PRICES)
-    def test_list_prices_are_pinned_as_rates_only(self, model, input_per_1m, output_per_1m):
+    @pytest.mark.parametrize(
+        ('model', 'input_per_1m', 'output_per_1m', 'cached_input_per_1m', 'cache_write_per_1m'),
+        _SLATE_LIST_PRICES,
+    )
+    def test_list_prices_are_pinned_as_rates_only_and_unset_cache_rates_are_omitted(
+        self, model, input_per_1m, output_per_1m, cached_input_per_1m, cache_write_per_1m,
+    ):
         """Exact equality also pins that the cost-basis tag stays out of this
         projection, which runner.py unpacks into ``PriceEntry(**rates)``."""
         from orchestrator.evals.configs import claude_endpoint_price_table
 
+        cache_rates = {
+            'cached_input_per_1m': cached_input_per_1m,
+            'cache_write_per_1m': cache_write_per_1m,
+        }
         assert claude_endpoint_price_table()[model] == {
             'input_per_1m': input_per_1m,
             'output_per_1m': output_per_1m,
+            **{key: value for key, value in cache_rates.items() if value is not None},
         }
 
     def test_base_urls_are_pinned(self):

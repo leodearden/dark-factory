@@ -32,6 +32,7 @@ from typing import TYPE_CHECKING, Literal
 
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import _INDEX_LOCK_STALE_FLOOR_S, GitOps, _run
+from orchestrator.index_lock_liveness import GitProcessScan, diagnose_index_lock
 from orchestrator.merge_lane.disposition import MergeFailureDisposition, SkewEvidence
 from orchestrator.merge_lane.outcome_facts import ConflictEvidence
 from orchestrator.merge_lane.reverify_gate_decision import (
@@ -50,6 +51,8 @@ from orchestrator.merge_lane.types import (
 )
 from orchestrator.rebase_drops import DroppedCommit, RebaseDropLedger
 from orchestrator.verify import VerifyResult, run_verification
+from orchestrator.verify_evidence import GREEN_OUTCOMES, Leg, module_leg_name, units_from_wire
+from orchestrator.verify_plan import full_suite_type_check_modules, merge_breadth_is_full
 
 if TYPE_CHECKING:
     from orchestrator.config import ModuleConfig, OrchestratorConfig
@@ -88,6 +91,7 @@ async def _run_unscoped_typechecks(
     *,
     block_on_timeout: bool,
     task_id: str | None = None,
+    executed: VerifyResult | None = None,
 ) -> PostMergePyrightResult:
     """Run each module's ``type_check_command`` unscoped against a caller-owned worktree.
 
@@ -105,12 +109,19 @@ async def _run_unscoped_typechecks(
             When ``False``, a timed-out module is appended only to
             ``timed_out_subprojects`` (fail-open, for the post-advance check).
         task_id: Optional task identifier for log messages.
+        executed: The scoped verify this gate follows (pre-advance only). At
+            breadth ``'full'`` a module it already type-checked green is not
+            re-run; see :func:`_type_covered_modules`.
 
     Returns:
         :class:`PostMergePyrightResult` with the classification of each
         module's type-check outcome.
     """
-    active = [mc for mc in module_configs if mc.type_check_command is not None]
+    covered = _type_covered_modules(executed, config)
+    active = [
+        mc for mc in module_configs
+        if mc.type_check_command is not None and mc.prefix not in covered
+    ]
     if not active:
         return PostMergePyrightResult()
 
@@ -156,6 +167,24 @@ async def _run_unscoped_typechecks(
         timed_out_subprojects=timed_out_subprojects,
         detail=detail,
     )
+
+
+def _type_covered_modules(executed: VerifyResult | None, config: OrchestratorConfig) -> frozenset[str]:
+    """The modules whose unscoped pyright *executed* already ran green, or replayed.
+
+    Task 5294: the gate consults what the scoped leg ran rather than handing
+    ``LocalRunner`` a second module set (INV-5). Only breadth ``'full'``
+    consults, so ``'scoped'`` is unchanged. A module counts when the executed
+    plan holds a FULL_SUITE pyright run with a command and its type unit is
+    green; a result without units (an older remote) is decided by its plan.
+    """
+    if executed is None or not merge_breadth_is_full(config):
+        return frozenset()
+    planned = full_suite_type_check_modules(executed.plan)
+    if executed.units is None:
+        return planned
+    green = {unit.unit for unit in units_from_wire(executed.units) if unit.outcome in GREEN_OUTCOMES}
+    return frozenset(prefix for prefix in planned if module_leg_name(prefix, Leg.TYPE) in green)
 
 
 def _elapsed_ms(start: float | None) -> int | None:
@@ -371,7 +400,8 @@ class PlanFilesTouchedResult:
             entry is untouched is told by the fields below: a stale path
             (``missing_from_tree``) or a change a rebase dropped
             (``dropped_by_rebase``) is not under-delivery; an entry in
-            neither is.
+            neither class is unexplained by the gate, not proven
+            under-delivery.
         missing_from_tree: Declared entries that do NOT exist in the branch
             tree at ``branch_head`` and for which no rename resolved.
             ALWAYS a subset of ``not_touched`` (a stale entry is reported in
@@ -436,8 +466,9 @@ which is the human-judgement case the gate was built for)."""
 PLAN_FILES_NOT_TOUCHED_REASON_PREFIX = 'Plan files not touched by branch'
 """Prefix of the ``MergeOutcome.reason`` string emitted by the pre-merge
 Decision-1 check.  When the architect declared specific plan files but
-the branch's history (``base..HEAD``) doesn't touch them, the implementation
-hasn't actually delivered against the plan — short-circuit straight to L1
+the branch's own-work range (``base..HEAD``) does not touch them, the gate
+reports that as a measurement, not a verdict on why (see
+:func:`plan_files_not_touched_reason`) — short-circuit straight to L1
 without involving the steward (mutating plan.json to silence the gate
 would defeat its purpose)."""
 
@@ -472,7 +503,15 @@ def _unwritten_clause(entries: list[str]) -> str:
     return (
         f'The architect declared these files but no commit on the branch '
         f'touched them: {", ".join(entries)}.  '
-        f'Implementation has not delivered against the plan.  '
+        'That is what was measured; it does not establish why.  '
+        'Two common causes: the declared work is missing, or the file was '
+        'correctly declared and legitimately needed no change.  '
+        "To tell them apart, check whether each file relates textually to the "
+        "task's subject, whether the branch touched sibling files in the same "
+        'directory, whether the declared path still exists at branch HEAD, and '
+        "whether the branch's own commits are already ancestors of main "
+        '(git merge-base --is-ancestor <commit> main), meaning the work '
+        'already landed.  '
     )
 
 
@@ -1380,53 +1419,22 @@ async def _map_advance_failure(
         waited = info.get('waited_seconds')
         age_txt = f'{age:.0f}s' if isinstance(age, int | float) else 'unknown'
         waited_txt = f'{waited:.0f}s' if isinstance(waited, int | float) else 'unknown'
-        # Staleness keys ONLY on the age observed BEFORE the stand-off.
-        #
-        # The previous test (`waited > 0 and age > waited`) was wrong and must
-        # not be reintroduced: on the gate path `age_seconds` is re-probed
-        # AFTER the wait (git_ops.advance_main), so it always equals
-        # initial_age + waited + epsilon.  `age > waited` therefore reduces to
-        # `initial_age > -epsilon` — true for a 2-second-old live commit
-        # exactly as for an hour-old leftover — and handed destructive `rm -f`
-        # advice to every ordinary docs-direct-commit-on-main that outlived
-        # the grace.  Only a pre-wait age carries staleness information.
-        #
-        # Both isinstance guards are load-bearing: a missing key yields None,
-        # which must degrade to not-stale (no destructive advice), never
-        # raise.  And the grace is read from the side channel, NEVER through
-        # git_ops.config — this mapper's tests pass a bare MagicMock whose
-        # auto-vivified attribute would make the comparison raise TypeError.
-        # The dict is the whole input, by the same discipline as the
-        # `getattr(git_ops, '_last_park_lock_info', None) or {}` read above.
-        #
-        # And the bar is max(grace, _STALE_LOCK_FLOOR_S), never the grace
-        # alone: grace is tunable to 0 (the blessed probe-only fail-fast
-        # off-switch), at which value EVERY age exceeds it and a live
-        # half-second-old commit would be handed `rm -f`.  See
-        # _STALE_LOCK_FLOOR_S for the full rationale.
-        initial_age = info.get('initial_age_seconds')
-        grace = info.get('grace_seconds')
-        threshold = (
-            max(float(grace), _STALE_LOCK_FLOOR_S)
-            if isinstance(grace, int | float) and not isinstance(grace, bool)
-            else None
+        # The verdict and its sentence are
+        # orchestrator/src/orchestrator/index_lock_liveness.py::diagnose_index_lock's,
+        # which owns why age alone never earns `rm -f`.  The age passed is the
+        # PRE-wait one: `age_seconds` is re-probed after the stand-off, so it
+        # always exceeds the wait and says nothing about staleness.  Every fact
+        # comes from the side channel, NEVER git_ops.config (this mapper's tests
+        # pass a bare MagicMock), and a missing or malformed one degrades to no
+        # advice, never a raise.
+        holder_scan = info.get('holder_scan')
+        diagnosis = diagnose_index_lock(
+            initial_age_s=_seconds_or_none(info.get('initial_age_seconds')),
+            grace_s=_seconds_or_none(info.get('grace_seconds')),
+            stale_floor_s=_STALE_LOCK_FLOOR_S,
+            scan=holder_scan if isinstance(holder_scan, GitProcessScan) else None,
         )
-        stale = (
-            isinstance(initial_age, int | float)
-            and not isinstance(initial_age, bool)
-            and threshold is not None
-            and initial_age > threshold
-        )
-        recovery = (
-            f' The lock was ALREADY {initial_age:.0f}s old when the merge '
-            f'worker FIRST observed it — older than the {threshold:.0f}s '
-            f'staleness floor (max of the configured {grace:.0f}s grace and '
-            f'the {_STALE_LOCK_FLOOR_S:.0f}s pre-commit budget) — so it is '
-            f'likely a crashed-git leftover rather than a live commit: '
-            f'confirm no git process is running in project_root, then clear '
-            f'it with `rm -f {lock_path}`.'
-            if stale else ''
-        )
+        recovery = diagnosis.advice(str(lock_path))
         # WIP-at-risk clause.  Populated ONLY on the mid-park (TOCTOU) path,
         # where advance_main had already taken the dirty snapshot before the
         # foreign lock appeared; empty on the pre-snapshot gate path, where
@@ -3302,29 +3310,23 @@ async def _check_post_merge_equivalence(
 # re-verify (fail-CLOSED policy).
 _OVERLAP_GIT_ERROR_SENTINEL = ['<git-error: re-verify required>']
 
-# Floor (seconds) an index.lock's PRE-wait age must clear before
-# `_map_advance_failure` will call it a crashed-git leftover and offer the
-# destructive `rm -f <lock>` recovery (task 3060, step-19).
-#
-# The threshold CANNOT be the configured grace alone.  `git.merge_park_lock_
-# grace_seconds` is operator-tunable all the way down to 0 — a blessed,
-# documented probe-only fail-fast off-switch (see GitConfig.merge_park_lock_
-# grace_seconds and test_zero_is_accepted_as_probe_only_off_switch) — and at
-# grace=0 EVERY age exceeds the grace, so a keyed-on-grace-alone test hands
-# `rm -f` advice to a live 0.5s-old `git commit --only`.  Deleting a live
-# commit's index.lock corrupts that in-flight commit, so staleness keys on
-# max(grace, this floor): a lock older than this repo's documented pre-commit
-# budget is the only defensible crashed-leftover signal, INDEPENDENT of how
-# the operator tuned the WAIT.  Equal to the GitConfig default (pinned by
-# test_floor_matches_the_documented_pre_commit_budget); not imported FROM
-# orchestrator.config because that is a TYPE_CHECKING-only import here.
-#
-# Aliased from git_ops rather than re-declared: `_await_index_lock_clear`
-# short-circuits its stand-off on the SAME bar (waiting cannot change a
-# verdict that is already "crashed leftover"), and a drift between the two
-# would mean skipping the wait without then explaining why.  The import
-# direction merge_gates -> git_ops is already established above.
+# The minimum first-observed age (seconds) an index.lock must ALSO clear,
+# besides a complete holder scan finding no live git process, before
+# `_map_advance_failure` offers the destructive `rm -f <lock>` recovery (tasks
+# 3060 and 5229).  It is NOT a bound on how long a pre-commit hook runs (a reify
+# one runs 10-60+ minutes); it only covers a holder that just exited or that the
+# scan cannot see.  Equal to the GitConfig default grace (pinned by
+# test_floor_matches_the_default_grace), and aliased from git_ops rather than
+# re-declared, because `_await_index_lock_clear` decides its stand-off
+# short-circuit through the same diagnose_index_lock with the same floor, over
+# the very scan it then hands this mapper in the side channel.
 _STALE_LOCK_FLOOR_S = _INDEX_LOCK_STALE_FLOOR_S
+
+
+def _seconds_or_none(value: object) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return None
+    return float(value)
 
 
 async def _rebase_delta_touched_overlap(

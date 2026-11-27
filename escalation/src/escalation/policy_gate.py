@@ -19,13 +19,14 @@ from typing import Any
 from escalation.authority import (
     COORDINATOR_IDENTITY,
     EXECUTOR_IDENTITY,
+    RULED_BY_HUMAN_FORBIDDEN,
     PolicyRefusal,
     RefusalCode,
     claim_refusal,
     coordinator_denied,
     executor_refusal,
 )
-from escalation.models import Escalation
+from escalation.models import RESOLUTION_CLASS_REQUIRED_CODE, Escalation
 from escalation.policy_state import PolicyStateUnreadable, load_class_states
 from escalation.queue import EscalationQueue
 from escalation.store_identity import QueueKind, StoreIdentity
@@ -51,22 +52,33 @@ def identity_resolve_refusal(
     action: str,
     resolution: str,
     resolution_class: str | None,
+    ruled_by_human: bool | None,
     queue_dir: Path,
     queue_kind: QueueKind,
     now: datetime,
 ) -> dict[str, Any] | None:
     """The error ``resolve_issue`` returns for *identity* on *rec*, or ``None``.
 
-    Only the executor and the coordinator are gated here. The executor needs a
+    First, an identity in :data:`~escalation.authority.RULED_BY_HUMAN_FORBIDDEN`
+    asserting ``ruled_by_human=True`` is refused. Otherwise only the executor
+    and the coordinator are gated here. The executor needs a
     ``resolution_class`` and a verdict of ``None`` from
     :func:`~escalation.authority.executor_refusal`. The coordinator is refused
     while *rec* carries a fresh executor claim.
     """
+    if ruled_by_human is True and identity in RULED_BY_HUMAN_FORBIDDEN:
+        return {
+            'error': (
+                f'{identity} is not a human seat and cannot assert ruled_by_human=True '
+                f'on {rec.id}'
+            ),
+            'code': 'ruled_by_human_forbidden',
+        }
     if identity == EXECUTOR_IDENTITY:
         if resolution_class is None:
             return {
                 'error': 'an executor resolve must state its resolution_class',
-                'code': 'resolution_class_required',
+                'code': RESOLUTION_CLASS_REQUIRED_CODE,
             }
         try:
             state = load_class_states(queue_dir)

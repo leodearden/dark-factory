@@ -215,6 +215,7 @@ class TestGateDoesNotOverReach:
 
         result = await call_resolve_issue(
             server, escalation_id=rec.id, resolution='closing', action='close_only',
+            resolution_class='benign',
         )
 
         assert 'code' not in result, result
@@ -227,6 +228,7 @@ class TestGateDoesNotOverReach:
 
         result = await call_resolve_issue(
             server, escalation_id=rec.id, resolution='go on', action='resume',
+            resolution_class='actionable',
         )
 
         assert 'code' not in result, result

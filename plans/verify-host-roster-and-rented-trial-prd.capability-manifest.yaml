@@ -1,0 +1,303 @@
+# Machine-readable twin of verify-host-roster-and-rented-trial-prd.capability-manifest.md
+prd: plans/verify-host-roster-and-rented-trial-prd.md
+schema_version: 1
+signal_leaves: ["λ"]
+tasks:
+  - label: "α1"
+    task_id: 11733
+    title: "Verify-host roster file parser, provisioning script, contract checker and the known host-tied tests"
+    capabilities:
+      - name: "gate-wrapper-contract-exists"
+        binding: "`grep:scripts/deploy/install_laptop_gate_shim.sh` the ORCH_GATE_BIN wrapper contract the template must keep"
+        verdict: PASS
+      - name: "per-sha-gate-builder-exists"
+        binding: "`grep:orchestrator/src/orchestrator/verify_runner.py::RemoteRunner._dispatch` calls ensure_gate before every remote verify"
+        verdict: PASS
+      - name: "known-host-tied-tests-exist"
+        binding: "`grep:scripts/run_vllm_eval.py` `grep:fused-memory/tests/test_main_ticket_janitor_wiring.py` `grep:shared/tests/test_invocation_outcome.py` the three files the task fixes"
+        verdict: PASS
+      - name: "roster-file-parser"
+        binding: "built here"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["orchestrator/src/orchestrator/verify_host_roster_file.py"]
+          expect: present
+      - name: "provisioning-script-and-checker"
+        binding: "built here"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["scripts/deploy/provision_verify_host.sh", "scripts/deploy/check_verify_host.py"]
+          expect: present
+      - name: "wrapper-template-and-example-roster"
+        binding: "built here"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["scripts/deploy/verify-host-wrapper.template.sh", "config/verify-hosts.example.yaml"]
+          expect: present
+      - name: "script-and-checker-share-one-requirement-table"
+        binding: "built here"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "agreement of the two lists is asserted by the task's own test, not by a pattern"
+  - label: "α2"
+    task_id: 11734
+    title: "The orchestrator reads its verify hosts from the private roster file"
+    capabilities:
+      - name: "environment-ranks-above-the-yaml"
+        binding: "`grep:orchestrator/src/orchestrator/config.py::OrchestratorConfig.settings_customise_sources` returns init, env, yaml, dotenv in that order"
+        verdict: PASS
+      - name: "config-load-entry-point"
+        binding: "`grep:orchestrator/src/orchestrator/config.py::load_config` the one loader every entry point uses"
+        verdict: PASS
+      - name: "roster-parser-available"
+        binding: "producer:task-α1 upstream"
+        verdict: PASS
+      - name: "roster-hook-in-config-loading"
+        binding: "built here"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "verify_host_roster_file"
+          paths: ["orchestrator/src/orchestrator/config.py"]
+          expect: present
+      - name: "both-sources-rejected"
+        binding: "built here; rejection mechanism added and exercised by the task's tests"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "the rejection is proven by a load that fails, not by a pattern"
+  - label: "β"
+    task_id: 11731
+    title: "orchestrator verify-host-preflight: the real gate on a named runner through the production path"
+    capabilities:
+      - name: "merge-verify-spec-builder-wired"
+        binding: "`grep:orchestrator/src/orchestrator/merge_lane/post_merge_verify.py::_PostMergeVerify.run` builds the spec with build_merge_verify_spec for every lane verify"
+        verdict: PASS
+      - name: "remote-dispatch-path-wired"
+        binding: "`grep:orchestrator/src/orchestrator/verify_runner.py::RemoteRunner._dispatch` publish, ensure_gate, verify-merge"
+        verdict: PASS
+      - name: "per-module-failing-ids-and-skips-available"
+        binding: "`grep:orchestrator/src/orchestrator/verify.py::_extract_failing_test_ids_from_junit` failing ids and the skipped vector are parsed from junit"
+        verdict: PASS
+      - name: "cli-group-exists"
+        binding: "`grep:orchestrator/src/orchestrator/cli.py::main` the click group verify-merge and verify-task hang from"
+        verdict: PASS
+      - name: "preflight-command"
+        binding: "built here"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "verify-host-preflight"
+          paths: ["orchestrator/src/orchestrator/cli.py"]
+          expect: present
+      - name: "skip-parity-exceptions-are-owned"
+        binding: "built here; task 7030 owns the reify-dependent guards"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "ownership of each exception entry is checked by the task's own test"
+  - label: "γ"
+    task_id: 11735
+    title: "Live verify-host roster: a reload admits, drains and retires hosts without a restart"
+    capabilities:
+      - name: "reload-entry-point"
+        binding: "`grep:orchestrator/src/orchestrator/harness.py::Harness.reload_config` the only caller of apply_reload on a running orchestrator"
+        verdict: PASS
+      - name: "reload-allowlist"
+        binding: "`grep:orchestrator/src/orchestrator/config.py::RELOADABLE_FIELDS` `grep:orchestrator/src/orchestrator/config.py::apply_reload`"
+        verdict: PASS
+      - name: "merge-lane-allocator"
+        binding: "`grep:orchestrator/src/orchestrator/verify_runner.py::HostAllocator.cancel_and_release` the park path a leaving host must not take"
+        verdict: PASS
+      - name: "task-side-pool"
+        binding: "`grep:orchestrator/src/orchestrator/verify_hosts.py::HostPool.policy` one slot value for every host today"
+        verdict: PASS
+      - name: "remote-runner-buildable-at-reload"
+        binding: "`grep:orchestrator/src/orchestrator/verify_hosts.py::_remote_runner` needs the deployed sha, the checkout resolver and git.main_branch only"
+        verdict: PASS
+      - name: "quarantine-single-writer"
+        binding: "`grep:orchestrator/src/orchestrator/merge_lane/host_quarantine.py::HostQuarantine`"
+        verdict: PASS
+      - name: "roster-source-is-the-private-file"
+        binding: "producer:task-α2 upstream"
+        verdict: PASS
+      - name: "host-change-planner"
+        binding: "built here"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["orchestrator/src/orchestrator/verify_host_roster.py"]
+          expect: present
+      - name: "reload-applies-the-plan"
+        binding: "built here"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "plan_host_changes"
+          paths: ["orchestrator/src/orchestrator/harness.py"]
+          expect: present
+      - name: "host-lifecycle-events"
+        binding: "built here"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "verify_host_retired"
+          paths: ["orchestrator/src/orchestrator/event_store.py"]
+          expect: present
+  - label: "δ"
+    task_id: 11736
+    title: "Per-host trust: probation, local confirmation of every verdict, automatic graduation"
+    capabilities:
+      - name: "local-re-run-of-a-remote-green-wired"
+        binding: "`grep:orchestrator/src/orchestrator/merge_lane/post_merge_verify.py::_PostMergeVerify.run` calls cross_check_remote_green with the runner in hand"
+        verdict: PASS
+      - name: "cross-check-selection"
+        binding: "`grep:orchestrator/src/orchestrator/merge_lane/post_merge_verify.py::_PostMergeVerify._cross_check_remote`"
+        verdict: PASS
+      - name: "live-roster-and-admission-probe"
+        binding: "producer:task-γ upstream"
+        verdict: PASS
+      - name: "host-trust-module"
+        binding: "built here"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["orchestrator/src/orchestrator/merge_lane/host_trust.py"]
+          expect: present
+      - name: "graduation-number-is-config"
+        binding: "built here"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "verify_host_probation_agreements_to_graduate"
+          paths: ["orchestrator/src/orchestrator/config.py"]
+          expect: present
+      - name: "local-re-run-of-a-remote-red"
+        binding: "built here"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "the red path is proven by boundary rows 18 and 19, not by a pattern"
+  - label: "ε"
+    task_id: 11732
+    title: "verify_host_trial_report.py: on-block against off-block landings and mechanism measures"
+    capabilities:
+      - name: "event-vocabulary"
+        binding: "`grep:orchestrator/src/orchestrator/event_store.py::EventType` merge_verify, merge_finalized, dispatch_deferred and task_started are members"
+        verdict: PASS
+      - name: "sampler-vocabulary"
+        binding: "`grep:sampler/src/sampler/metrics.py::METRIC_GROUPS`"
+        verdict: PASS
+      - name: "trial-report-script"
+        binding: "built here"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["scripts/verify_host_trial_report.py"]
+          expect: present
+      - name: "a-block-with-no-host-row-is-not-a-zero"
+        binding: "built here"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "the distinct rendering is asserted by the task's own test over a store with no host rows"
+  - label: "ζ"
+    task_id: 11738
+    title: "Operator sitting: move the laptop's entries into the roster file"
+    capabilities:
+      - name: "orchestrators-read-the-roster-file"
+        binding: "producer:task-α2 upstream, and deployed to the running fleet"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "deployment of α2 to each running orchestrator is checked by the operator at the sitting"
+  - label: "η"
+    task_id: 11737
+    title: "Operator gate: rent the trial server and join it to the tailnet"
+    capabilities:
+      - name: "tools-exist-before-rent-starts"
+        binding: "producer:task-α1 upstream; producer:task-β upstream"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "a human action; the producers' own checks gate it through the dependency"
+  - label: "θ"
+    task_id: 11739
+    title: "Bring-up sitting, Python step: dark-factory and the two solar projects on the rented host"
+    capabilities:
+      - name: "host-rented-and-reachable"
+        binding: "producer:task-η upstream"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "resolved by citing the three preflight records"
+  - label: "ι"
+    task_id: 11740
+    title: "Bring-up sitting, reify step: reify on the rented host"
+    capabilities:
+      - name: "host-serving-the-python-projects"
+        binding: "producer:task-θ upstream"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "resolved by citing reify's preflight record"
+  - label: "κ1"
+    task_id: 11741
+    title: "Trial toggle 1: host OFF"
+    capabilities:
+      - name: "live-disable-and-trusted-host"
+        binding: "producer:task-γ upstream; producer:task-δ upstream; producer:task-θ upstream"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "resolved by citing the verify_host_retired row in every project that uses the host"
+  - label: "κ2"
+    task_id: 11742
+    title: "Trial toggle 2: host ON"
+    capabilities:
+      - name: "previous-block-closed"
+        binding: "producer:task-κ1 upstream"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "resolved by citing the verify_host_admitted rows"
+  - label: "κ3"
+    task_id: 11743
+    title: "Trial toggle 3: host OFF"
+    capabilities:
+      - name: "previous-block-closed"
+        binding: "producer:task-κ2 upstream"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "resolved by citing the verify_host_retired rows"
+  - label: "κ4"
+    task_id: 11744
+    title: "Trial toggle 4: host ON"
+    capabilities:
+      - name: "previous-block-closed"
+        binding: "producer:task-κ3 upstream"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "resolved by citing the verify_host_admitted rows"
+  - label: "λ"
+    task_id: 11745
+    title: "Reading gate: keep, buy or stop"
+    capabilities:
+      - name: "two-on-and-two-off-blocks"
+        binding: "producer:task-κ4 upstream"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "the report prints each block's production-row count; Leo reads it"
+      - name: "report-script"
+        binding: "producer:task-ε upstream"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "ε's own path check gates this task through the dependency"

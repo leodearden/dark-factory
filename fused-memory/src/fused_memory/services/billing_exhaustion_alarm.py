@@ -10,14 +10,20 @@ ONE record lands in the server's primary project root however many writes fail.
 The latch is process-local and flips before the first await, so concurrent
 failures page once. An episode whose page could not be filed stays unpaged,
 and the next exhaustion tries again. The first successful OpenAI-backed write
-resolves the record, and :meth:`BillingExhaustionAlarm.restore` re-latches
-onto a record a previous process left open, so a restart neither re-pages nor
-strands it. A balance that runs dry again within ``REPAGE_COOLDOWN`` of a
-recovery is still settling, so its page waits out the rest of that window
-rather than pushing Leo a second time at once.
+resolves the record. The latch re-checks its page on the first exhaustion at
+least ``REPAGE_COOLDOWN`` after the page was last filed or confirmed pending,
+and on the first after :meth:`BillingExhaustionAlarm.restore` re-latches onto
+a record a previous process left open: a page still pending is folded into,
+so a restart neither re-pages nor strands it, and a page a human closed while
+credits are still out is filed afresh for the same episode. A balance that
+runs dry again within ``REPAGE_COOLDOWN`` of a recovery is still settling, so
+its page waits out the rest of that window rather than pushing Leo a second
+time at once.
 
-:class:`BillingParkPolicy` is the durable queue's side of it: the queue parks
-what the policy names and reports parking and clearing back to the alarm.
+:class:`ApiKeyCreditsParkGuard` is this source's guard in the durable queue's
+``billing_park_policy.py::BillingParkPolicy``: the queue parks what the policy
+names and reports parking and clearing back to the alarm. A plan cap has its
+own page (``plan_cap_alarm.py``), so this alarm ignores every other source.
 """
 
 from __future__ import annotations
@@ -33,11 +39,11 @@ from fused_memory.middleware._folded_escalation import (
     pending_folded_escalations,
     resolve_folded_escalations,
 )
-from fused_memory.services.durable_queue import ParkedWriteEvent
 from fused_memory.services.provider_billing import (
     BillingExhaustion,
     BillingSource,
-    classify_billing_exhaustion,
+    alarm_category_of,
+    billing_evidence_lines,
     exhaustion_of,
 )
 
@@ -45,25 +51,29 @@ logger = logging.getLogger(__name__)
 
 ANCHOR_TASK_ID = 'provider-billing-exhausted'
 _AGENT_ROLE = 'harness-fused-memory-billing-guard'
-_CATEGORY = 'provider_billing_exhausted'
-_LOG_LABEL = 'provider_billing_exhausted'
 #: The anchor is per billing source, so a re-latched record names its source.
 _SOURCE = BillingSource.API_KEY_CREDITS
+_CATEGORY = alarm_category_of(_SOURCE)
+_LOG_LABEL = 'provider_billing_exhausted'
 _UNKNOWN = 'unknown'
 
-#: Right after a top-up, writes that land can interleave with probes that
-#: still meet the old balance while it propagates.
+#: Sets two cadences. An exhaustion this soon after a recovery waits it out,
+#: because right after a top-up, writes that land can interleave with probes
+#: that still meet the old balance while it propagates. A filed page is also
+#: re-checked against the queue no more often than this.
 REPAGE_COOLDOWN = timedelta(minutes=10)
 
 
 @dataclass(frozen=True)
 class BillingAlarmState:
-    """The open episode: what ran out, since when, and the page filed for it."""
+    """The open episode: what ran out, since when, the page filed for it, and
+    when that page was last filed or found still pending (None: re-check)."""
 
     exhaustion: BillingExhaustion
     first_seen: datetime
     first_site: str
     escalation_id: str | None
+    page_confirmed_at: datetime | None = None
 
 
 def _utc_now() -> datetime:
@@ -96,14 +106,20 @@ class BillingExhaustionAlarm:
         return self._state
 
     async def record_exhausted(self, exhaustion: BillingExhaustion, *, site: str) -> None:
+        if exhaustion.source is not _SOURCE:
+            logger.info(
+                '%s: %s exhaustion at %s is not this page\'s source; ignored',
+                _LOG_LABEL, exhaustion.source.value, site,
+            )
+            return
+        now = self._clock()
         latched = self._state
-        if latched is not None and (latched.escalation_id is not None or self._paging):
+        if latched is not None and (self._paging or self._page_is_current(latched, now)):
             logger.debug(
                 '%s: already latched since %s; %s folds into it',
                 _LOG_LABEL, latched.first_seen.isoformat(), site,
             )
             return
-        now = self._clock()
         fresh = latched is None
         if latched is None:
             latched = BillingAlarmState(
@@ -124,9 +140,13 @@ class BillingExhaustionAlarm:
                 (self._recovered_at + self._repage_cooldown).isoformat(),
             )
             return
-        await self._page_unpaged(latched)
+        await self._confirm_or_file_page(latched, now)
 
-    async def _page_unpaged(self, latched: BillingAlarmState) -> None:
+    def _page_is_current(self, latched: BillingAlarmState, now: datetime) -> bool:
+        confirmed_at = latched.page_confirmed_at
+        return confirmed_at is not None and now - confirmed_at < self._repage_cooldown
+
+    async def _confirm_or_file_page(self, latched: BillingAlarmState, now: datetime) -> None:
         self._paging = True
         try:
             escalation_id = await self._page(latched)
@@ -140,12 +160,18 @@ class BillingExhaustionAlarm:
             self._paging = False
         if escalation_id is None:
             logger.warning(
-                '%s: credits exhausted since %s are not paged yet; the next '
-                'exhaustion retries', _LOG_LABEL, latched.first_seen.isoformat(),
+                '%s: could not file or confirm the page for credits exhausted since '
+                '%s; the next exhaustion retries', _LOG_LABEL, latched.first_seen.isoformat(),
             )
             return
+        if latched.escalation_id is not None and latched.escalation_id != escalation_id:
+            logger.warning(
+                '%s: %s did not come back as the pending page for credits '
+                'exhausted since %s; latched onto %s', _LOG_LABEL,
+                latched.escalation_id, latched.first_seen.isoformat(), escalation_id,
+            )
         if self._state is latched:
-            self._state = replace(latched, escalation_id=escalation_id)
+            self._state = replace(latched, escalation_id=escalation_id, page_confirmed_at=now)
 
     async def record_recovered(self, *, site: str) -> None:
         latched = self._state
@@ -233,10 +259,6 @@ class BillingExhaustionAlarm:
             )
 
 
-def _one_line(text: str) -> str:
-    return ' '.join(text.split())
-
-
 def _summary(latched: BillingAlarmState) -> str:
     exhaustion = latched.exhaustion
     return (
@@ -258,14 +280,9 @@ def _suggested_action(exhaustion: BillingExhaustion) -> str:
 def _detail(latched: BillingAlarmState) -> str:
     exhaustion = latched.exhaustion
     return '\n'.join([
-        f'provider={exhaustion.provider}',
-        f'billing_source={exhaustion.source.value}',
-        f'key_scope={exhaustion.key_scope}',
-        f'code={exhaustion.code}',
+        *billing_evidence_lines(exhaustion),
         f'first_seen={latched.first_seen.isoformat()}',
         f'first_site={latched.first_site}',
-        f'error_type={exhaustion.error_type}',
-        f'provider_message={_one_line(exhaustion.provider_message)}',
         '',
         'Durable writes that hit this are parked, not dead-lettered: they drain '
         'by themselves, and this record resolves itself, on the first '
@@ -276,26 +293,20 @@ def _detail(latched: BillingAlarmState) -> str:
     ])
 
 
-class BillingParkPolicy:
-    """Parks the durable writes a provider refuses for exhausted billing.
+class ApiKeyCreditsParkGuard:
+    """The API-key credits source's guard in the durable queue's billing park policy.
 
-    Satisfies ``durable_queue.py::ParkPolicy``; a parked write that lands is
-    the recovery evidence.
+    Its parked rows keep the queue's own horizon.
     """
 
     def __init__(self, alarm: BillingExhaustionAlarm) -> None:
         self._alarm = alarm
 
-    def park_reason(self, exc: BaseException) -> str | None:
-        exhaustion = classify_billing_exhaustion(exc)
-        if exhaustion is None:
-            return None
-        return f'{exhaustion.provider} {exhaustion.source.value} exhausted ({exhaustion.code})'
+    def park_until(self) -> float | None:
+        return None
 
-    async def on_parked(self, event: ParkedWriteEvent) -> None:
-        exhaustion = classify_billing_exhaustion(event.exc)
-        if exhaustion is not None:
-            await self._alarm.record_exhausted(exhaustion, site=f'durable_queue:{event.operation}')
+    async def on_parked(self, exhaustion: BillingExhaustion, *, site: str) -> None:
+        await self._alarm.record_exhausted(exhaustion, site=site)
 
-    async def on_cleared(self) -> None:
-        await self._alarm.record_recovered(site='durable_queue')
+    async def on_cleared(self, *, site: str) -> None:
+        await self._alarm.record_recovered(site=site)

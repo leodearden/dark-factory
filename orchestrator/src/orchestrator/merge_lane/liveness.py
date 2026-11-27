@@ -4,8 +4,9 @@ verify-host-unreachable alarms, and persistent-worktree operational guards
 
 The startup liveness-margin guard (heartbeat-floor vs. reaper-window safety
 check), the in-flight verify's progress evidence (task 5290), the
-verify-host-unreachable alarm/recovery helpers, and the
-persistent warm-merge-verify-worktree serial-lane guards.  These subsystems are
+verify-host-unreachable alarm/recovery helpers, the
+persistent warm-merge-verify-worktree serial-lane guards, and the merge lane's
+worktree-routing seams (which lane a verify, chain build or drift check uses).  These subsystems are
 folded into one module as "operational guards" (PRD Open Q5 resolution —
 see plan.json design_decisions) rather than split into their own modules,
 since none is individually large and all three gate/monitor worker-level
@@ -25,12 +26,13 @@ any of them is seen by the next call.
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import logging
 import math
 import os
 import shlex
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -38,7 +40,7 @@ from escalation.models import Escalation
 from shared.proc_group import cpu_ticks_under_path
 
 from orchestrator.event_store import EventType
-from orchestrator.git_ops import PERSISTENT_MERGE_WORKTREE_NAME, GitOps
+from orchestrator.git_ops import PERSISTENT_MERGE_WORKTREE_NAME, GitOps, WorktreeKind
 from orchestrator.merge_lane.types import (
     MergeRequest,
     QuarantineClass,
@@ -721,7 +723,10 @@ def _resolve_pending_alarm(escalation_queue: Any, sentinel: str, resolution: str
     """
     pending = escalation_queue.get_by_task(sentinel, status='pending')
     for esc in pending:
-        escalation_queue.resolve(esc.id, resolution, resolved_by='orchestrator-verify-host-monitor')
+        escalation_queue.resolve(
+            esc.id, resolution, resolved_by='orchestrator-verify-host-monitor',
+            resolution_class='benign',
+        )
     return tuple(esc.id for esc in pending)
 
 
@@ -1147,6 +1152,30 @@ async def release_chain_build_lane(
     if lane is None:
         return
     await git_ops.release_spec_lane(lane, warm=warm)
+
+
+@contextlib.asynccontextmanager
+async def drift_check_lane(git_ops: GitOps, merge_commit: str) -> AsyncIterator[Path]:
+    """The worktree the drift check's local leg verifies *merge_commit* in.
+
+    Where a warm-lane pool is configured it is a CoW-seeded ``_driftcheck-<hex>``
+    throwaway, never silently cold: an unseedable one raises
+    :class:`~orchestrator.git_ops.WarmSeedUnavailable` and the caller defers.
+    With no pool it is the cold ``_merge-<hex>`` throwaway, held under its lane
+    flock against the periodic reap (task 3018), which must close before the
+    cleanup.  Pinned by orchestrator/tests/test_merge_liveness.py::TestDriftCheckLane
+    and orchestrator/tests/test_merge_drift.py::TestDriftCheckHoldsLaneLease.
+    """
+    if git_ops.pool_in_use():
+        async with git_ops.warm_ephemeral_worktree(WorktreeKind.DRIFT_CHECK, merge_commit) as wt:
+            yield wt
+        return
+    wt = await git_ops.create_ephemeral_verify_worktree(merge_commit)
+    try:
+        async with git_ops.merge_verify_lease(lane_dir=wt):
+            yield wt
+    finally:
+        await git_ops.cleanup_merge_worktree(wt)
 
 
 def per_host_inflight_bound(merge_ahead_bound: int, num_hosts: int) -> int:

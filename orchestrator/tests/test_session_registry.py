@@ -1920,8 +1920,8 @@ _BARE_SHELL_ENTRYPOINTS: tuple[_BareShellEntrypoint, ...] = (
             'decision_cli.py imports this module at module scope as a bare sibling, '
             'and session_registry.py imports decision_cli the same way, when '
             'skills/spawn/spawn-claude.sh, the watcher SKILL.md verb lines '
-            '(write-decision, reap-decisions, close-decision, reopen-decision, '
-            'migrate-decision-projects) and scripts/sitting/payloads.py run '
+            '(write-decision, reap-decisions, close-decision, file-and-close-decision, '
+            'reopen-decision, migrate-decision-projects) and scripts/sitting/payloads.py run '
             'session_registry.py by absolute path with no venv, no install and no '
             'PYTHONPATH. A non-stdlib import here breaks every decision verb.'
         ),
@@ -1935,9 +1935,10 @@ _BARE_SHELL_ENTRYPOINTS: tuple[_BareShellEntrypoint, ...] = (
         probe='from orchestrator import stop_instruction',
         callers=(
             'session_registry.py imports this module at module scope as a bare '
-            'sibling and hands it the five decision verbs (write-decision, '
-            'reap-decisions, close-decision, reopen-decision, '
-            'migrate-decision-projects) when skills/spawn/spawn-claude.sh, the '
+            'sibling and hands it the six decision verbs (write-decision, '
+            'reap-decisions, close-decision, file-and-close-decision, '
+            'reopen-decision, migrate-decision-projects) when '
+            'skills/spawn/spawn-claude.sh, the '
             'watcher SKILL.md verb lines and scripts/sitting/payloads.py run '
             'session_registry.py by absolute path with no venv, no install and no '
             'PYTHONPATH. A non-stdlib import here breaks every decision verb.'
@@ -2624,6 +2625,12 @@ class TestStdlibOnlySelfContainment:
                  '--escalations-dir', _BARE_SHELL_QUEUE],
                 dr.DecisionState.DROPPED, 'esc-1-1', dr.DecisionState.OPEN,
                 id='reopen-decision',
+            ),
+            pytest.param(
+                ['file-and-close-decision', '--id', 'esc-1-1', '--project', 'df', '--text', 'approve?',
+                 '--escalations-dir', _BARE_SHELL_QUEUE, '--state', 'answered', '--evidence', EVIDENCE],
+                None, 'dark_factory-esc-1-1', dr.DecisionState.ANSWERED,
+                id='file-and-close-decision',
             ),
             pytest.param(
                 ['reap-decisions', '--project', 'df', '--escalations-dir', _BARE_SHELL_QUEUE],

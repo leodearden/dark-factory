@@ -143,6 +143,14 @@ class FilerPolicy(BaseModel):
     fix_priority: TaskPriority = TaskPriority.HIGH
 
 
+class NoFilerBlock(Exception):
+    """A policy the defect filer was run on that has no filer: block."""
+
+    def __init__(self, project_id: str) -> None:
+        self.project_id = project_id
+        super().__init__(f'the policy of {project_id} has no filer block')
+
+
 class Policy(BaseModel):
     """One publisher's configuration: its root, its output and inbox, and what the client may see."""
 
@@ -187,15 +195,31 @@ class Policy(BaseModel):
 
     @model_validator(mode='after')
     def _filer_state_dir_stands_apart(self) -> Self:
+        self.require_filer_state_dir_apart(resolved=False)
+        return self
+
+    def require_filer(self) -> FilerPolicy:
+        """THE refusal of a policy without a filer: block, for everything the defect filer runs."""
         if self.filer is None:
-            return self
+            raise NoFilerBlock(self.project_id)
+        return self.filer
+
+    def require_filer_state_dir_apart(self, *, resolved: bool) -> None:
+        """THE rule that filer.state_dir lies outside out_dir, in_dir and project_root; resolved, every symlink is followed first."""
+        if self.filer is None:
+            return
+
+        def seen(path: Path) -> Path:
+            return path.resolve() if resolved else path
+
         for name, path in (
             ('out_dir', self.out_dir),
             ('in_dir', self.in_dir),
             ('project_root', self.project_root),
         ):
-            _require_outside('filer.state_dir', self.filer.state_dir, of=name, container=path)
-        return self
+            _require_outside(
+                'filer.state_dir', seen(self.filer.state_dir), of=name, container=seen(path)
+            )
 
     def is_visible(self, path: str) -> bool:
         return matches_any(self.visible_globs, path)
@@ -223,10 +247,11 @@ class PolicyProblem(StrEnum):
     NOT_A_REPOSITORY_ROOT = 'not_a_repository_root'
     OUT_DIR_UNUSABLE = 'out_dir_unusable'
     OUT_DIR_NOT_OWNED = 'out_dir_not_owned'
+    NO_FILER_BLOCK = 'no_filer_block'
 
 
 class PolicyError(Exception):
-    """A policy file the publisher refuses to start on."""
+    """A policy file the publisher, or the defect filer, refuses to start on."""
 
     def __init__(self, *, config: Path, problem: PolicyProblem, detail: str) -> None:
         self.config = config
@@ -337,4 +362,14 @@ def load_policy(config: Path) -> Policy:
     policy = _validated(config, _read_mapping(config))
     _require_repository_root(config, policy)
     _require_owned_out_dir(config, policy)
+    return policy
+
+
+def load_filer_policy(config: Path) -> Policy:
+    """The policy in `config` for the defect filer, which needs its filer block; no git root check (a subprocess the filer may not run) and no out_dir check (it never writes there)."""
+    policy = _validated(config, _read_mapping(config))
+    try:
+        policy.require_filer()
+    except NoFilerBlock as exc:
+        raise PolicyError(config=config, problem=PolicyProblem.NO_FILER_BLOCK, detail=str(exc)) from exc
     return policy

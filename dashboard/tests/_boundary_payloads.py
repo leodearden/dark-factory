@@ -63,6 +63,7 @@ from shared.task_statuses import TaskStatus
 
 import dashboard.data.task_snapshot as snapshot_mod
 from dashboard.app import app
+from dashboard.asset_build import app_asset_build
 from dashboard.config import DashboardConfig
 from dashboard.data import escalation_corpus
 from dashboard.data.burndown import BURNDOWN_SCHEMA, collect_snapshot
@@ -73,6 +74,7 @@ from dashboard.data.quality_snapshot_sampler import refresh_snapshots
 from dashboard.data.quality_snapshots import BASELINE_HOME
 from dashboard.data.quality_store import QualitySample
 from dashboard.data.scheduler import _scheduler_cache_clear
+from dashboard.data.served_read import join_outlived_waits, unanswered_wait_count
 from dashboard.loops import _QualityStore
 
 T0 = datetime(2026, 10, 4, 9, 0, 0, tzinfo=UTC)
@@ -81,6 +83,7 @@ T0 = datetime(2026, 10, 4, 9, 0, 0, tzinfo=UTC)
 TASKS = '/api/v2/dashboard/tasks'
 BURNDOWN = '/api/v2/dashboard/burndown'
 COSTS = '/api/v2/dashboard/costs'
+PERFORMANCE = '/api/v2/dashboard/performance'
 MERGE_QUEUE = '/api/v2/dashboard/merge-queue'
 ESCALATIONS = '/api/v2/dashboard/escalations'
 ESCALATION_ANALYTICS = '/api/v2/dashboard/escalation-analytics'
@@ -145,7 +148,10 @@ MERGE_ATTEMPTS: tuple[MergeAttempt, ...] = (
     MergeAttempt(timedelta(hours=50), 'blocked', 0),
     MergeAttempt(timedelta(hours=70), 'done', 3000),
 )
-"""One project's merges over three days: three inside 24h, all six inside 7d."""
+"""One project's merges over three days: three inside 24h, all six inside 7d.
+
+The done ones land, at 2h, 20h, 30h and 70h before T0.
+"""
 
 ESCALATIONS_FILED = 5
 ESCALATIONS_ARCHIVED = 3
@@ -430,10 +436,15 @@ def _burndown_family(client: TestClient, workdir: Path) -> dict[str, Any]:
     return bodies
 
 
-def _write_merge_attempts(root: Path) -> None:
-    """*root*'s runs.db, holding :data:`MERGE_ATTEMPTS` as task ids 1, 2, ..."""
+def _write_merge_history(root: Path) -> None:
+    """*root*'s runs.db, holding :data:`MERGE_ATTEMPTS` as task ids 1, 2, ...
+
+    Each done attempt also lands: a ``merge_finalized`` done event at the same
+    instant, under the sha ``sha-<task id>``.
+    """
     store = runs_db_path(root)
     store.parent.mkdir(parents=True)
+    attempts = list(enumerate(MERGE_ATTEMPTS, start=1))
     with closing(sqlite3.connect(store)) as conn:
         conn.executescript(EVENTS_DDL)
         conn.executemany(
@@ -442,7 +453,17 @@ def _write_merge_attempts(root: Path) -> None:
             [
                 ((T0 - attempt.age).isoformat(), f'run-{task_id}', str(task_id),
                  json.dumps({'outcome': attempt.outcome}), attempt.duration_ms)
-                for task_id, attempt in enumerate(MERGE_ATTEMPTS, start=1)
+                for task_id, attempt in attempts
+            ],
+        )
+        conn.executemany(
+            'INSERT INTO events (timestamp, run_id, task_id, event_type, phase, data) '
+            "VALUES (?, ?, ?, 'merge_finalized', 'merge', ?)",
+            [
+                ((T0 - attempt.age).isoformat(), f'run-{task_id}', str(task_id),
+                 json.dumps({'state': 'done', 'merge_sha': f'sha-{task_id}'}))
+                for task_id, attempt in attempts
+                if attempt.outcome == 'done'
             ],
         )
         conn.commit()
@@ -456,12 +477,34 @@ def _window_family(client: TestClient, workdir: Path) -> dict[str, Any]:
         bodies['costs_90d'] = _get(client, COSTS, window='90d')
 
     with _canned_roots(client, workdir / 'merge', {'dark-factory': _substrate(REIFY_COUNTS)}):
-        _write_merge_attempts(app.state.config.project_root)
+        _write_merge_history(app.state.config.project_root)
         for window in ('7d', '24h'):
             with installed_clock(app, fixed_clock(T0)):
                 bodies[f'merge_{window}'] = _get(client, MERGE_QUEUE, window=window)
 
     return bodies
+
+
+def _write_completions(root: Path) -> None:
+    """*root*'s runs.db holding done completions in two hours before :data:`T0`, beside an empty queue."""
+    write_runs_db(root, task_results=[
+        ('1', 'done', T0 - timedelta(hours=2)),
+        ('2', 'done', T0 - timedelta(hours=1, minutes=30)),
+        ('3', 'done', T0 - timedelta(minutes=30)),
+    ])
+    (root / 'data' / 'escalations').mkdir(parents=True, exist_ok=True)
+
+
+def _performance_family(client: TestClient, workdir: Path) -> dict[str, Any]:
+    """/performance over every hour a project completed in, its history included."""
+    with (
+        _canned_roots(
+            client, workdir / 'performance', {'dark-factory': _substrate(REIFY_COUNTS)},
+            furnish={'dark-factory': _write_completions},
+        ),
+        installed_clock(app, fixed_clock(T0)),
+    ):
+        return {'performance_all': _get(client, PERFORMANCE, window='all')}
 
 
 def _file_escalations(config: DashboardConfig) -> None:
@@ -635,6 +678,40 @@ def _render_prds(client: TestClient, at: datetime) -> dict[str, Any]:
         return _get(client, PRDS)
 
 
+_SETTLE_RENDERS = 5
+"""Livelock guard on :func:`render_prds_settled`: each render after the first follows a join, so
+the deepest chain of dependent reads (run-ledger walk → activity, lineage → documents) settles by
+the third."""
+
+
+def render_prds_settled(client: TestClient, at: datetime) -> dict[str, Any]:
+    """GET /prds at *at* from a render in which every read answered within its request wait."""
+    assert client.portal is not None, 'a settled render joins its reads inside a live TestClient'
+    joined: list[tuple[str, ...]] = []
+    body: dict[str, Any] = {}
+    for _ in range(_SETTLE_RENDERS):
+        unanswered = unanswered_wait_count()
+        body = _render_prds(client, at)
+        if unanswered_wait_count() == unanswered:
+            return body
+        joined.append(client.portal.call(join_outlived_waits))
+    raise AssertionError(
+        f'GET /prds still had reads that did not answer within their request waits after '
+        f'{_SETTLE_RENDERS} renders; the work joined after each render: {joined}; the last '
+        f'body\'s data that are not fresh: {_not_fresh(body)}',
+    )
+
+
+def _not_fresh(body: Mapping[str, Any]) -> list[str]:
+    """Each datum of a /prds *body* that is not fresh, named by section and root, with its reason."""
+    return [
+        f'{section}[{label}] {datum["state"]}: {datum["reason"]}'
+        for section in ('PRD_VIEW', 'PRD_CONTENTION')
+        for label, datum in body.get(section, {}).items()
+        if datum['state'] != 'fresh'
+    ]
+
+
 @contextmanager
 def canned_prd_roots(
     client: TestClient,
@@ -656,7 +733,9 @@ def prd_view_family(client: TestClient, workdir: Path) -> dict[str, Any]:
 
     ``prd_view_map_failed_tasks`` is the /tasks body served at the same
     instant as ``prd_view_map_failed``, so its census reason is the one the
-    failed map half carried.
+    failed map half carried. Every /prds render is settled
+    (:func:`render_prds_settled`): no body is shaped by a read that missed its
+    request wait.
     """
     bodies: dict[str, Any] = {}
 
@@ -664,26 +743,26 @@ def prd_view_family(client: TestClient, workdir: Path) -> dict[str, Any]:
     with _canned_roots(
         client, workdir / 'prd_view_fresh', two_projects, furnish=_quietly(two_projects),
     ):
-        bodies['prd_view_fresh'] = _render_prds(client, T0)
+        bodies['prd_view_fresh'] = render_prds_settled(client, T0)
 
     growing = prd_tree()
     with _canned_roots(
         client, workdir / 'prd_view_overlay', {'dark-factory': growing},
         furnish=_quietly(['dark-factory']),
     ):
-        _render_prds(client, T0)
+        render_prds_settled(client, T0)
         _grow_past_lineage(growing)
-        bodies['prd_view_overlay'] = _render_prds(client, T0 + timedelta(seconds=20))
+        bodies['prd_view_overlay'] = render_prds_settled(client, T0 + timedelta(seconds=20))
 
     failing = prd_tree()
     with _canned_roots(
         client, workdir / 'prd_view_map_failed', {'dark-factory': failing},
         furnish=_quietly(['dark-factory']),
     ) as render_tasks:
-        _render_prds(client, T0)
+        render_prds_settled(client, T0)
         _fail_status_map(failing)
         failed_at = T0 + timedelta(seconds=20)
-        bodies['prd_view_map_failed'] = _render_prds(client, failed_at)
+        bodies['prd_view_map_failed'] = render_prds_settled(client, failed_at)
         bodies['prd_view_map_failed_tasks'] = render_tasks(failed_at)
 
     return bodies
@@ -817,7 +896,9 @@ def prd_lanes_family(client: TestClient, workdir: Path) -> dict[str, Any]:
     database; ``prd_lanes_lineage_failed`` a lineage read that fails;
     ``prd_lanes_contended`` adds :data:`CONTENDED_IDS` under a scheduler whose
     lock :data:`CARRIER` holds; ``prd_lanes_queueless`` lays out no escalation
-    queue, so its view is a lower bound that still draws every row.
+    queue, so its view is a lower bound that still draws every row. Every /prds
+    body is a settled render (:func:`render_prds_settled`): none is shaped by a
+    read that missed its request wait.
     """
     bodies: dict[str, Any] = {}
     with holder_processes() as (live, dead):
@@ -846,7 +927,7 @@ def prd_lanes_family(client: TestClient, workdir: Path) -> dict[str, Any]:
             with _canned_roots(
                 client, workdir / name, substrates, schedulers=schedulers, furnish=furnish,
             ) as render_tasks:
-                bodies[name] = _render_prds(client, T0)
+                bodies[name] = render_prds_settled(client, T0)
                 if tasks_body is not None:
                     bodies[tasks_body] = render_tasks(T0)
 
@@ -1151,6 +1232,22 @@ def ragged_store_rows(workdir: Path) -> list[dict[str, Any]]:
     return [{**dict(row), 'project': Path(row['project_id']).name} for row in rows]
 
 
+def _asset_build_family(client: TestClient, workdir: Path) -> dict[str, Any]:
+    """The build identities a real route stamps on its response, beside the ones the app holds."""
+    resp = client.get(MEMORY_GRAPHS)
+    assert resp.status_code == 200, resp.text
+    build = app_asset_build(app)
+    assert build is not None
+    return {
+        'asset_build_served': {
+            'path': MEMORY_GRAPHS,
+            'headers': dict(resp.headers),
+            'body': resp.json(),
+            'expected': {'started': build.started, 'onDisk': build.on_disk()},
+        },
+    }
+
+
 def build_all(workdir: Path) -> dict[str, Any]:
     """Every scenario's served body, keyed by the name the node half reads it under.
 
@@ -1161,10 +1258,12 @@ def build_all(workdir: Path) -> dict[str, Any]:
             **_census_family(client, workdir),
             **_burndown_family(client, workdir),
             **_window_family(client, workdir),
+            **_performance_family(client, workdir),
             **_corpus_family(client, workdir),
             **_check_owner_family(client, workdir),
             **prd_view_family(client, workdir),
             **prd_lanes_family(client, workdir),
             **_quality_family(client, workdir),
             **_quality_snapshot_family(client, workdir),
+            **_asset_build_family(client, workdir),
         }

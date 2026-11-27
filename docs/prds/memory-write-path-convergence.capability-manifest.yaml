@@ -164,16 +164,24 @@ tasks:
 # 25/301 = 8.3% (lexical 0/301), AUC(true pairs vs hard negatives) = 0.2534 (inverted
 # — hard negatives score higher than true duplicates), so the amendment's own
 # consequence clause forbids wiring gate filing on cosine-of-full-content signals,
-# lexical or ANN. Follow-up for the wiring is task 4916 (pending), gated on a
-# detector that clears gate-grade recall on the 3130 fixture — do not re-attempt
-# the wiring on the already-refuted lexical/ANN signals above.
+# lexical or ANN. Follow-up for the wiring was task 4916, gated on a detector that
+# cleared gate-grade recall on the 3130 fixture; it was cancelled 2026-11-17 (see
+# below) — do not re-attempt the wiring on the already-refuted lexical/ANN signals
+# above.
+# RULING 2026-11-17 (Leo) via gate esc-10244-1. This reverses D18's follow-up:
+# task 4916 and gate 10244 are cancelled, and no gate-grade bar was ratified. Gate
+# filing from the weekly duplicate-cluster report is descoped, not pending.
+# Duplicate detection stays with reconciliation Stage 1
+# (plans/memory-auto-consolidation-prd.md D1); the report keeps its regrowth role.
+# The structured record is recall_caveat.gate_filing_ruling in
+# fused-memory/config/duplicate-audit.yaml.
 - label: kappa
   task_id: 3136
   title: 'Scheduled deterministic dedup report feeding gate filing'
   capabilities:
   # 2026-11-14: PASS. Task 3136 delivered scripts/fused-memory-duplicate-audit.timer
-  # (weekly OnCalendar), its service, wrapper and installer. The D18 ruling above
-  # still governs the gate-filing capability below.
+  # (weekly OnCalendar), its service, wrapper and installer. The D18 and
+  # 2026-11-17 rulings above govern the gate-filing capability below.
   - name: timer-unit-committed
     binding: capability→producer — systemd user timer per flag-marker-sweep precedent
     verdict: PASS
@@ -188,7 +196,7 @@ tasks:
     verdict: FAIL
     delivered_check:
       kind: manual
-      reason: integration-fixture property (gate detail cites report clusters); NOT delivered — see 2026-08-30 D18 ruling comment above; follow-up task 4916
+      reason: integration-fixture property (gate detail cites report clusters); NOT delivered — descoped by the 2026-11-17 ruling (esc-10244-1); see the ruling comments above
 - label: lambda
   task_id: 3137
   title: 'Full provenance in search results'

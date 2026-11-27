@@ -26,11 +26,12 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from _write_set_helpers import make_write_set
 
 from orchestrator.agents.write_set import (
     WriteSet,
     compute_write_set,
-    ensure_claude_fleet_dir,
+    ensure_sandbox_dirs,
     write_set_of,
 )
 from orchestrator.artifacts import TaskArtifacts
@@ -148,9 +149,22 @@ class TestComputeWriteSetHappyPath:
     def test_home_derived_static_paths(self, worktree: Path, tmp_home: Path):
         ws = compute_write_set(worktree, task_id='2904', home=tmp_home)
         assert ws.uv_cache == (tmp_home / '.cache' / 'uv').resolve()
+        assert ws.tree_sitter_cache == (tmp_home / '.cache' / 'tree-sitter').resolve()
         assert ws.claude_fleet == (tmp_home / '.claude' / 'fleet').resolve()
         assert ws.tmp == Path('/tmp')
         assert ws.dev == Path('/dev')
+
+    def test_tree_sitter_grant_covers_no_other_cache_peer(
+        self, worktree: Path, tmp_home: Path,
+    ):
+        # The grant is the tree-sitter SUBDIR. Widening it to ~/.cache, or to
+        # any other ancestor of a ~/.cache/<tool> peer, makes a granted path an
+        # ancestor of that peer. /tmp and /dev are left out: the blanket /tmp
+        # scratch grant is an ancestor of tmp_path, so of this fake home.
+        ws = compute_write_set(worktree, task_id='2904', home=tmp_home)
+        peer = tmp_home.resolve() / '.cache' / 'other-tool'
+        granted = [p for p in ws.writable_paths() if p not in (ws.tmp, ws.dev)]
+        assert [p for p in granted if peer.is_relative_to(p)] == []
 
     def test_final_writable_list_excludes_whole_claude_and_hooks_state(
         self, worktree: Path, tmp_home: Path,
@@ -163,7 +177,7 @@ class TestComputeWriteSetHappyPath:
         assert tmp_home.resolve() / '.claude' not in paths
         assert (tmp_home.resolve() / '.claude' / 'hooks' / 'state') not in paths
 
-    def test_writable_paths_returns_exactly_the_eleven_named_fields_in_order(
+    def test_writable_paths_returns_exactly_the_twelve_named_fields_in_order(
         self, worktree: Path, tmp_home: Path,
     ):
         ws = compute_write_set(worktree, task_id='2904', home=tmp_home)
@@ -176,17 +190,19 @@ class TestComputeWriteSetHappyPath:
             ws.git_task_reflogs,
             ws.git_worktree_admin,
             ws.uv_cache,
+            ws.tree_sitter_cache,
             ws.claude_fleet,
             ws.tmp,
             ws.dev,
         ]
         paths = ws.writable_paths()
         assert paths == expected
-        assert len(paths) == 11
+        assert len(paths) == 12
 
     def test_purity_no_makedirs_side_effect(self, worktree: Path, tmp_home: Path):
         ws = compute_write_set(worktree, task_id='2904', home=tmp_home)
         assert not ws.uv_cache.exists()
+        assert not ws.tree_sitter_cache.exists()
 
 
 # ---------------------------------------------------------------------------
@@ -383,25 +399,6 @@ class TestGitdirParsingRobustness:
 # ---------------------------------------------------------------------------
 
 
-def _make_write_set(**overrides: Path) -> WriteSet:
-    """Construct a WriteSet from dummy Paths (hermetic — digest() depends
-    ONLY on writable_paths(), which needs no filesystem)."""
-    base = WriteSet(
-        worktree=Path('/wt'),
-        task_meta=Path('/base/.task-meta/wt'),
-        task_root=Path('/base/.task-meta/task-1'),
-        git_objects=Path('/main/.git/objects'),
-        git_task_refs=Path('/main/.git/refs/heads/task'),
-        git_task_reflogs=Path('/main/.git/logs/refs/heads/task'),
-        git_worktree_admin=Path('/main/.git/worktrees/wt'),
-        uv_cache=Path('/home/.cache/uv'),
-        claude_fleet=Path('/home/.claude/fleet'),
-        tmp=Path('/tmp'),
-        dev=Path('/dev'),
-    )
-    return dataclasses.replace(base, **overrides)
-
-
 class TestWriteSetDigest:
     """Pins WriteSet.digest() — the single owner (INV-5) of the stable
     writable-set hash the β2 ``sandbox_applied`` event carries so an operator
@@ -409,30 +406,30 @@ class TestWriteSetDigest:
     sha256 over the contract-ordered ``writable_paths()`` strings.
     """
 
-    def test_digest_is_deterministic_across_calls(self):
+    def test_digest_is_deterministic_across_calls(self, tmp_path: Path):
         # (a) Same WriteSet → identical hex string across two calls.
-        ws = _make_write_set()
+        ws = make_write_set(tmp_path)
         assert ws.digest() == ws.digest()
 
-    def test_equal_writable_paths_produce_equal_digest(self):
+    def test_equal_writable_paths_produce_equal_digest(self, tmp_path: Path):
         # (b) Two independently-built WriteSets with identical writable_paths()
         # produce the same digest.
-        a = _make_write_set()
-        b = _make_write_set()
+        a = make_write_set(tmp_path)
+        b = make_write_set(tmp_path)
         assert a.writable_paths() == b.writable_paths()
         assert a.digest() == b.digest()
 
-    def test_one_differing_path_changes_digest(self):
+    def test_one_differing_path_changes_digest(self, tmp_path: Path):
         # (c) A WriteSet differing in exactly one writable path yields a
         # different digest.
-        base = _make_write_set()
-        changed = _make_write_set(worktree=Path('/other-wt'))
+        base = make_write_set(tmp_path)
+        changed = make_write_set(tmp_path, worktree=tmp_path / 'other-wt')
         assert base.writable_paths() != changed.writable_paths()
         assert base.digest() != changed.digest()
 
-    def test_digest_is_64_char_lowercase_sha256_hex(self):
+    def test_digest_is_64_char_lowercase_sha256_hex(self, tmp_path: Path):
         # (d) Shape: a 64-char lowercase sha256 hex string.
-        digest = _make_write_set().digest()
+        digest = make_write_set(tmp_path).digest()
         assert isinstance(digest, str)
         assert len(digest) == 64
         assert digest == digest.lower()
@@ -440,57 +437,60 @@ class TestWriteSetDigest:
 
 
 # ---------------------------------------------------------------------------
-# task 2996: ensure_claude_fleet_dir() — side-effecting pre-creation helper
+# tasks 2996 / 3382: ensure_sandbox_dirs() — side-effecting pre-creation helper
 # ---------------------------------------------------------------------------
 
 
-class TestEnsureClaudeFleetDir:
-    """Pins ``ensure_claude_fleet_dir(write_set) -> bool`` — the SEPARATE,
-    explicitly side-effecting helper that materializes ~/.claude/fleet OUTSIDE
-    the sandbox before dispatch (task 2996).
+class TestEnsureSandboxDirs:
+    """Pins ``ensure_sandbox_dirs(write_set) -> list[Path]`` — the SEPARATE,
+    explicitly side-effecting helper that materializes every must-pre-exist
+    carve-out OUTSIDE the sandbox before dispatch: ``claude_fleet`` (task 2996)
+    and ``tree_sitter_cache`` (task 3382). It returns the paths it could NOT
+    create; an empty list means every carve-out is present.
 
     ``compute_write_set`` stays PURE (``test_purity_no_makedirs_side_effect``);
-    this helper is the one place the load-bearing ``claude_fleet`` carve-out is
-    created so BOTH backends can grant it (neither can --bind / add a
-    nonexistent path with parent ~/.claude read-only). Hermetic: ``claude_fleet``
-    always points under ``tmp_path`` — never the real ~/.claude.
+    this helper is the one place those carve-outs are created so BOTH backends
+    can grant them (neither can bind / add a nonexistent path, and the agent
+    cannot create one from inside, where ~/.claude and ~/.cache are read-only).
+
+    This class tests the MODULE-LEVEL helper. ``TestInvokeWiresEnsureSandboxDirs``
+    in ``test_workflow_sandbox_events.py`` tests it through ``TaskWorkflow._invoke``,
+    whose wrapper owns the operator-facing warning.
     """
 
-    def test_creates_dir_and_missing_parents_when_absent(self, tmp_path: Path):
-        # (a) parents=True: a claude_fleet whose parent does not yet exist is
-        # created in full, and the call reports success.
-        claude_fleet = tmp_path / 'nonexistent-home' / '.claude' / 'fleet'
-        ws = _make_write_set(claude_fleet=claude_fleet)
-        assert not claude_fleet.exists()
-        assert not claude_fleet.parent.exists()  # missing parent chain
+    def test_creates_both_carve_outs_and_missing_parents_on_a_fresh_home(
+        self, tmp_path: Path,
+    ):
+        ws = make_write_set(tmp_path)
+        home = tmp_path / 'home'
+        assert not home.exists()
 
-        assert ensure_claude_fleet_dir(ws) is True
+        assert ensure_sandbox_dirs(ws) == []
 
-        assert claude_fleet.is_dir()
-        assert claude_fleet.parent.is_dir()  # parents=True built the chain
+        assert ws.claude_fleet.is_dir()
+        assert ws.tree_sitter_cache.is_dir()
 
-    def test_idempotent_when_dir_already_exists(self, tmp_path: Path):
-        # (b) exist_ok=True: a second call on an already-present dir returns
-        # True and does not raise.
-        claude_fleet = tmp_path / '.claude' / 'fleet'
-        ws = _make_write_set(claude_fleet=claude_fleet)
-        assert ensure_claude_fleet_dir(ws) is True
-        assert claude_fleet.is_dir()
+    def test_idempotent_when_dirs_already_exist(self, tmp_path: Path):
+        ws = make_write_set(tmp_path)
+        assert ensure_sandbox_dirs(ws) == []
 
-        assert ensure_claude_fleet_dir(ws) is True
-        assert claude_fleet.is_dir()
+        assert ensure_sandbox_dirs(ws) == []
 
-    def test_returns_false_when_mkdir_raises_oserror(self, tmp_path: Path):
-        # (c) failure path: a regular FILE cannot be a parent dir, so
-        # mkdir(parents=True) raises NotADirectoryError (an OSError subclass),
-        # which the helper catches -> returns False, and nothing is created.
+        assert ws.claude_fleet.is_dir()
+        assert ws.tree_sitter_cache.is_dir()
+
+    def test_returns_failing_path_and_still_creates_the_other(self, tmp_path: Path):
+        # A regular FILE cannot be a parent dir, so mkdir(parents=True) raises
+        # NotADirectoryError. One failing carve-out must not suppress the rest.
         blocker = tmp_path / 'blocker'
         blocker.write_text('i am a regular file, not a directory\n')
         claude_fleet = blocker / 'fleet'
-        ws = _make_write_set(claude_fleet=claude_fleet)
+        ws = make_write_set(tmp_path, claude_fleet=claude_fleet)
 
-        assert ensure_claude_fleet_dir(ws) is False
+        assert ensure_sandbox_dirs(ws) == [claude_fleet]
+
         assert not claude_fleet.exists()
+        assert ws.tree_sitter_cache.is_dir()
 
 
 # ---------------------------------------------------------------------------

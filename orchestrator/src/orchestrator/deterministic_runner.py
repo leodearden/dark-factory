@@ -105,6 +105,7 @@ from orchestrator.systemd_inspect import (
     _wedged_unit_sentinel,
     inspect_systemd_unit,
 )
+from orchestrator.task_status import TERMINAL_STATUSES
 from orchestrator.workflow import WorkflowOutcome
 
 if TYPE_CHECKING:
@@ -2894,6 +2895,22 @@ class DeterministicRunner:
     # Main runner
     # ------------------------------------------------------------------
 
+    async def _store_row(self, assignment) -> dict:
+        """The dispatched task's row as the store holds it now; the dispatched row when that read fails.
+
+        The scheduler confirmed the row after claiming it, but a write can
+        still land before the runner starts (task 11430).
+        """
+        task_id = str(assignment.task_id)
+        row = await self.scheduler.get_task(task_id)
+        if row is None:
+            logger.warning(
+                'DeterministicRunner: task %s could not be re-read at entry — acting on the dispatched row',
+                task_id,
+            )
+            return assignment.task
+        return row
+
     async def run(self, assignment) -> WorkflowOutcome:
         """Execute the deterministic gate logic for *assignment*.
 
@@ -2914,12 +2931,22 @@ class DeterministicRunner:
         stamp-only fallback on the recovery paths too, and keeps an inspect
         failure from being reported as a deploy-script failure.
 
+        Everything acts on the task row as the store holds it at entry
+        (:meth:`_store_row`); a row already done or cancelled returns DONE
+        with no write and no escalation.
+
         Raises:
             ValueError — if ``always_escalates`` is False with ``before_done=None``
                 (unsupported misconfiguration in β).
         """
         task_id = str(assignment.task_id)
-        task = assignment.task
+        task = await self._store_row(assignment)
+        if task.get('status') in TERMINAL_STATUSES:
+            logger.info(
+                'DeterministicRunner: task %s is already %s in the store — nothing to run',
+                task_id, task.get('status'),
+            )
+            return WorkflowOutcome.DONE
         metadata = task.get('metadata') or {}
         description = task.get('description', '')
         before_done = metadata.get('before_done')
@@ -3367,7 +3394,9 @@ class DeterministicRunner:
                 # had not yet landed when the snapshot was read — so b-self was
                 # skipped and the second dispatch fell through to the
                 # crash-window detector below, filing a born-at-L2 infra_issue
-                # false positive.  Re-read the CURRENT task (a fresh get_task,
+                # false positive.  Since run() acts on the store's row read at
+                # entry (task 11430), this re-read differs from it only when
+                # that entry read failed.  Re-read the CURRENT task (a fresh get_task,
                 # taken at execution time ~seconds later, after the first
                 # dispatch's writes landed): if it is an already-completed
                 # scheduled self-deploy, the deploy is done (scheduled) — return

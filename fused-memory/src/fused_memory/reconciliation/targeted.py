@@ -15,6 +15,7 @@ from shared.task_fields import dependency_ids as task_dependency_ids
 from fused_memory.config.schema import FusedMemoryConfig
 from fused_memory.memory_metadata import (
     RECONCILIATION_COMPLETION_ECHO_MARKER,
+    RECONCILIATION_VERDICT_KEY,
     TARGETED_RECONCILIATION_SOURCE,
     is_reconciliation_completion_echo,
     normalize_supersedes,
@@ -25,6 +26,7 @@ from fused_memory.middleware.task_interceptor import (
     _missing_files,
     interceptor_write_succeeded,
 )
+from fused_memory.models.invocation_ledger import InvocationLedger, LedgerRole
 from fused_memory.models.reconciliation import (
     MemoryHints,
     ReconciliationRun,
@@ -60,6 +62,9 @@ from fused_memory.utils.clip_disclosure import fit_at_word
 from fused_memory.utils.validation import InputValidationError, require_project_root
 
 if TYPE_CHECKING:
+    from shared.cost_store import CostStore
+    from shared.usage_gate import UsageGate
+
     from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
     from fused_memory.middleware.task_interceptor import TaskInterceptor
     from fused_memory.services.planned_episode_registry import PlannedEpisodeRegistry
@@ -224,12 +229,15 @@ class TargetedReconciler:
         escalation_queue_factory: EscalationQueueFactory | None = (
             INSTALLED_ESCALATION_QUEUE_FACTORY
         ),
+        cost_store: 'CostStore | None' = None,
+        usage_gate: 'UsageGate | None',
     ):
         self.memory = memory_service
         self.taskmaster = taskmaster
         self.journal = journal
         self.config = config.reconciliation
-        self.verifier = CodebaseVerifier(config.reconciliation)
+        self.verifier = CodebaseVerifier(config.reconciliation, usage_gate=usage_gate)
+        self._cost_store = cost_store
         self.buffer = event_buffer
         self._escalation_queue_factory = escalation_queue_factory
         self.planned_episode_registry: PlannedEpisodeRegistry | None = None
@@ -607,10 +615,12 @@ class TargetedReconciler:
                     # done-transition later proves premature/false (e.g. the
                     # predates-own-deps architect close-out bug) — so this
                     # fallback is reframed to report the transition without
-                    # claiming the deliverable is verified.
+                    # claiming the deliverable is verified. C5 of
+                    # plans/live-task-facts-at-recall-prd.md: the wording
+                    # names no task status.
                     unverified_completion = True
                     content = (
-                        f"Task '{title}' transitioned to done; "
+                        f"Task '{title}' was marked finished; "
                         "completion not yet verified."
                     )
                     if description:
@@ -833,6 +843,9 @@ class TargetedReconciler:
                     # projects, every one of them verified against the wrong
                     # tree.
                     codebase_root=Path(scope.project_root),
+                    ledger=InvocationLedger.or_none(
+                        self._cost_store, LedgerRole.RECON_VERIFY, run_id, scope.project_id,
+                    ),
                 )
                 # ── verify/codebase audit row contract (task 4343) ──────────
                 # Exactly ONE *outcome* row per invocation of this branch, so
@@ -917,7 +930,7 @@ class TargetedReconciler:
                         metadata={
                             'source': TARGETED_RECONCILIATION_SOURCE,
                             'task_id': task_id,
-                            'verification_verdict': verification.verdict,
+                            RECONCILIATION_VERDICT_KEY: verification.verdict,
                         },
                         causation_id=run_id,
                     )

@@ -60,6 +60,9 @@ from orchestrator.verify import VerifyResult
 from orchestrator.workflow import TaskWorkflow
 from orchestrator.workflow_types import PublishedStewardOutcome, StewardResolved
 
+if TYPE_CHECKING:
+    from orchestrator.branch_stack import StackTarget
+
 
 class FakeMcp:
     """Minimal McpLifecycle stand-in."""
@@ -774,6 +777,7 @@ def _make(
     git_ops.get_main_sha = get_main_sha
     git_ops.resolve_branch_sha = AsyncMock(return_value=None)
     git_ops.has_uncommitted_work = AsyncMock(return_value=False)
+    git_ops.own_delta_cut = AsyncMock(return_value=None)
     git_ops.find_task_citation_commit = AsyncMock(return_value=landing_citation)
     git_ops.commit_effect_present_in_main = AsyncMock(
         return_value=landing_effect_present,
@@ -1102,6 +1106,7 @@ class AgentStub:
                     so.get('reviewer'), so.get('verdict'),
                     so.get('issues'), so.get('summary'),
                     note_dispositions=so.get('note_dispositions'),
+                    defect_rulings=so.get('defect_rulings'),
                 )
             return result
         elif role == 'merger':
@@ -1307,6 +1312,7 @@ def _build_workflow_with_escalation(
     spawn_merge_worker: bool = True,
     steward_factory: type | None = None,
     queue: EscalationQueue | None = None,
+    stack_target: StackTarget | None = None,
 ) -> tuple[TaskWorkflow, FakeScheduler, EscalationQueue]:
     """Wire up a TaskWorkflow with an EscalationQueue attached.
 
@@ -1315,7 +1321,8 @@ def _build_workflow_with_escalation(
     merge work; omitting create_task avoids the 'Task was destroyed but it is
     pending!' warning in pytest teardown.  ``queue`` lets a caller submit
     records, and build a steward that closes over the queue, before the
-    workflow exists; ``steward_factory`` goes to the public constructor argument.
+    workflow exists; ``steward_factory`` and ``stack_target`` go to the public
+    constructor arguments of the same names.
     """
     scheduler = FakeScheduler()
     queue = queue if queue is not None else EscalationQueue(tmp_path / 'escalation_queue')
@@ -1336,6 +1343,7 @@ def _build_workflow_with_escalation(
         merge_queue=merge_queue,
         merge_worker=worker,
         steward_factory=steward_factory,
+        stack_target=stack_target,
     )
     return workflow, scheduler, queue
 

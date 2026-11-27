@@ -11,7 +11,7 @@ import re
 import stat
 from dataclasses import dataclass
 from itertools import pairwise
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from types import UnionType
 from typing import Annotated, Any, Literal, NamedTuple, Union, get_args, get_origin
 
@@ -23,6 +23,7 @@ from pydantic import (
     PrivateAttr,
     TypeAdapter,
     ValidationError,
+    ValidationInfo,
     field_validator,
     model_validator,
 )
@@ -52,13 +53,14 @@ from orchestrator.config_census_ignore import (  # noqa: F401 (re-exported for t
     audit_census_ignore_entries,
     parse_census_ignore_entries,
 )
+from orchestrator.defect_tests_config import DefectTestsConfig
 from orchestrator.implementer_brief_variant import ImplementerBriefVariant
 from orchestrator.merge_pool_config import MergePoolConfig
 from orchestrator.routing import DEFAULT_ALLOWED_MODELS, DEFAULT_LADDER
 from orchestrator.shadow_types import ShadowShape
 from orchestrator.task_priority import PRIORITY_TIERS
 from orchestrator.verify_admission_gate import AdmissionOrder
-from orchestrator.verify_cache.modes import CacheMode, VerifyRole
+from orchestrator.verify_cache.modes import CacheMode, VerifyRole, forced_off, most_conservative
 
 logger = logging.getLogger(__name__)
 
@@ -420,6 +422,31 @@ class BackendsConfig(BaseModel):
     simple_task: str = Field(default='claude')
 
 
+class SplitMatch(BaseModel):
+    """One arm of a salted-hash split of the task id, evaluated by
+    ``orchestrator/src/orchestrator/routing.py::_rule_matches`` via
+    ``shared/src/shared/routing_split.py::split_bucket`` and validated at
+    load and reload.
+    """
+
+    model_config = ConfigDict(extra='forbid', frozen=True)
+
+    salt: str = Field(min_length=1)
+    buckets: int = Field(ge=2)
+    bucket: int = Field(ge=0)
+
+    @field_validator('bucket')
+    @classmethod
+    def _bucket_within_buckets(cls, value: int, info: ValidationInfo) -> int:
+        buckets = info.data.get('buckets')
+        if buckets is not None and value >= buckets:
+            raise ValueError(
+                f'bucket {value} is out of range for buckets={buckets}; '
+                'a split needs 0 <= bucket < buckets'
+            )
+        return value
+
+
 class RuleMatch(BaseModel):
     """Closed match-condition vocabulary for a RoutingRule (task epsilon,
     plans/adaptive-model-routing-prd.md).
@@ -438,6 +465,9 @@ class RuleMatch(BaseModel):
     silently never match; populate ``metadata['priority']`` explicitly if
     you need this condition to fire. See ``orchestrator.routing.
     _rule_matches``'s docstring for the same note.
+
+    ``split`` (a ``SplitMatch``) matches only the task ids that fall in one
+    arm of a salted-hash split.
     """
 
     model_config = ConfigDict(extra='forbid')
@@ -451,6 +481,7 @@ class RuleMatch(BaseModel):
     min_routing_tier: int | None = None
     min_dispatch_count: int | None = None
     simple_saturated: bool | None = None
+    split: SplitMatch | None = None
 
 
 class RuleSet(BaseModel):
@@ -1067,6 +1098,20 @@ class DeliveredChecksConfig(BaseModel):
             'budget remain uncached and are retried next tick (fail-safe wait).'
         ),
     )
+    max_record_fetches_per_tick: int = Field(
+        default=50,
+        ge=1,
+        description=(
+            'Maximum number of terminal dep records '
+            'Scheduler._phase_backfill_terminal_dep_records fetches per '
+            'scheduler tick; the delivered-check gate and the scheduled '
+            'self-deploy hold both read those records. Must be >= 1. A '
+            'never-cached dep it defers makes its dependents wait for a later '
+            'tick, so after a restart it sets how fast the cold record cache '
+            'warms; one slot per tick is kept for never-cached deps while any '
+            'wait.'
+        ),
+    )
     grace_cycles: int = Field(
         default=3,
         ge=1,
@@ -1345,6 +1390,53 @@ class SessionResumeConfig(BaseModel):
         return self
 
 
+class EarlyStartConfig(BaseModel):
+    """Starting a dependent early on its predecessor's branch while the predecessor waits for its merge.
+
+    ``plans/early-start-on-predecessor-branch-prd.md`` section 7, Config.  The
+    defaults live here only, not in ``defaults.yaml``.  Every leaf is green
+    tier.
+    """
+
+    enabled: bool = Field(
+        default=False,
+        description=(
+            'Gates new early starts only; a live pair and a branch with a ledger '
+            'record are handled whatever it says. Off in the code until T7.'
+        ),
+    )
+    pass_interval_secs: float = Field(
+        default=60,
+        gt=0,
+        description='Seconds between timer-driven early-start selection passes (a pass also runs after a merge request).',
+    )
+    picture_max_age_secs: float = Field(
+        default=600,
+        gt=0,
+        description='Seconds the early-start selection keeps its task picture before building a new one.',
+    )
+    merge_entry_alert_secs: float = Field(
+        default=43200,
+        gt=0,
+        description="Seconds a dependent may wait at its merge phase for its predecessor's slot to end before one escalation; the wait stays.",
+    )
+    stop_streak_pause: int = Field(
+        default=5,
+        ge=1,
+        description='Early starts in a row ending in a stop after which the feature pauses itself and escalates once.',
+    )
+    stop_hard_cancel_secs: float = Field(
+        default=300,
+        gt=0,
+        description='Seconds a stopped dependent has to exit after its soft cancel before it is hard-cancelled.',
+    )
+    unknown_streak_alert: int = Field(
+        default=3,
+        ge=1,
+        description='Unknown answers in a row to the landed question after which one escalation is raised.',
+    )
+
+
 class SpeculationProbeConfig(BaseModel):
     """Variable-depth speculative verify placement (task 2359, sibling of
     task 2340's depth telemetry).
@@ -1422,26 +1514,58 @@ class SpeculationProbeConfig(BaseModel):
         return v
 
 
+class _RoleModeFields(NamedTuple):
+    """The VerifyCacheConfig fields holding one verify role's modes."""
+
+    mode: str
+    remote_mode: str
+
+
+#: The roles the verify cache acts for; it has no mode for any other (background is always OFF).
+_ROLE_MODE_FIELDS: dict[VerifyRole, _RoleModeFields] = {
+    'task': _RoleModeFields('task_mode', 'remote_task_mode'),
+    'merge': _RoleModeFields('merge_mode', 'remote_merge_mode'),
+}
+
+
 class VerifyCacheConfig(BaseModel):
     """How far the verify-result cache may act, per verify role
     (plans/verify-result-cache-prd.md § Amendments, A3: per-role modes).
 
     Each role's mode is its own green-tier reload leaf. The kill switch is not
-    here: it lives in the registry's policy_state.
+    here: it lives in the registry's policy_state. Remote replay has its own
+    per-role mode, never less conservative than the role's (A5.2).
     """
 
     model_config = ConfigDict(extra='forbid')
 
     task_mode: CacheMode = CacheMode.OFF
     merge_mode: CacheMode = CacheMode.OFF
+    remote_task_mode: CacheMode = CacheMode.OFF
+    remote_merge_mode: CacheMode = CacheMode.OFF
+    remote_candidates_per_unit: int = Field(default=16, ge=1)
 
     def mode_for(self, role: VerifyRole) -> CacheMode:
-        """*role*'s mode; the cache has no background role, so that is always OFF."""
-        if role == 'task':
-            return self.task_mode
-        if role == 'merge':
-            return self.merge_mode
-        return CacheMode.OFF
+        """*role*'s mode; the cache has no background role, so that is always OFF.
+        DF_VERIFY_CACHE=off forces every role OFF (plans/verify-result-cache-prd.md, Amendment A3)."""
+        fields = _ROLE_MODE_FIELDS.get(role)
+        if forced_off() or fields is None:
+            return CacheMode.OFF
+        return getattr(self, fields.mode)
+
+    def remote_mode_for(self, role: VerifyRole) -> CacheMode:
+        """The mode a remote verify of *role* may act under: the role's own mode, capped by its remote mode."""
+        fields = _ROLE_MODE_FIELDS.get(role)
+        if fields is None:
+            return CacheMode.OFF
+        return most_conservative(self.mode_for(role), getattr(self, fields.remote_mode))
+
+    def with_mode(self, role: VerifyRole, mode: CacheMode) -> 'VerifyCacheConfig':
+        """A validated copy whose *role* acts under *mode*, as a runner pins the mode its dispatcher shipped."""
+        fields = _ROLE_MODE_FIELDS.get(role)
+        if fields is None:
+            raise ValueError(f'the verify cache has no {role!r} mode to pin')
+        return type(self).model_validate({**self.model_dump(), fields.mode: mode})
 
 
 class DepthRow(NamedTuple):
@@ -1562,6 +1686,69 @@ class MergeDeepConfig(BaseModel):
                     f'rows: {unordered!r}'
                 )
         return table
+
+
+class MergeScreenConfig(BaseModel):
+    """The merge pre-verify screen (task 7919, plans/merge-pre-verify-screen-prd.md).
+
+    ``manifest`` is the kill switch: ``None`` (the default) means no screen
+    code runs at any dispatch site. Every bound below fails OPEN: an
+    instrument fault, timeout or unavailable lane lets the item proceed to
+    its ordinary verify. Decisions 3, 4 and 8 of the PRD are the canonical
+    narrative.
+
+    Plain BaseModel (no ``frozen``) so ``_set_leaf`` mutates it in place on
+    hot-reload, as :class:`MergeDeepConfig` does; every leaf is green-tier.
+    """
+
+    manifest: str | None = Field(
+        default=None,
+        description=(
+            'Repo-relative path of the screen manifest, read in the SCREENED '
+            'tree. null is the kill switch: no screen code runs at any site. '
+            'See plans/merge-pre-verify-screen-prd.md decision 3.'
+        ),
+    )
+    timeout_secs: float = Field(
+        default=180.0,
+        gt=0,
+        description=(
+            'Bound on one whole item screen, base re-runs and lane reset '
+            'included. On overrun the item proceeds (fail open). See '
+            'plans/merge-pre-verify-screen-prd.md decisions 4 and 8.'
+        ),
+    )
+    chain_timeout_secs: float = Field(
+        default=30.0,
+        gt=0,
+        description=(
+            'Bound on one chain-tip screen. On overrun the chain proceeds '
+            '(fail open). See plans/merge-pre-verify-screen-prd.md decisions 4 and 8.'
+        ),
+    )
+    error_streak_alarm: int = Field(
+        default=5,
+        ge=1,
+        description=(
+            'Consecutive instrument-error screens that file one info L1 naming '
+            'the kill switch. Errors never block an item. See '
+            'plans/merge-pre-verify-screen-prd.md decision 8.'
+        ),
+    )
+
+    @field_validator('manifest', mode='after')
+    @classmethod
+    def _validate_manifest(cls, manifest: str | None) -> str | None:
+        if manifest is None:
+            return None
+        if not manifest:
+            raise ValueError('manifest must be a repo-relative path or null, not empty')
+        path = PurePosixPath(manifest)
+        if path.is_absolute() or '..' in path.parts:
+            raise ValueError(
+                f'manifest must be repo-relative with no ".." segment; got {manifest!r}'
+            )
+        return manifest
 
 
 class RetentionConfig(BaseModel):
@@ -2406,9 +2593,12 @@ class GitConfig(BaseModel):
             'because parking through a foreign process\'s index lock would '
             'clobber the in-flight commit\'s staged/working state. This knob '
             'governs the WAIT only: the crashed-leftover verdict that offers '
-            'an operator destructive `rm -f <lock>` recovery keys on '
+            'an operator destructive `rm -f <lock>` recovery, and skips the '
+            'wait, requires a holder scan that found no live git process in '
+            'project_root\'s work tree AND a first-observed age past '
             'max(this, merge_gates._STALE_LOCK_FLOOR_S), so lowering it (0 '
-            'included) never widens what counts as a stale lock.'
+            'included) never widens what counts as a stale lock, and no '
+            'setting makes a lock with a live holder count as one.'
         ),
     )
     offline_lane_persist_passes: int = Field(
@@ -3362,6 +3552,11 @@ _OVERRIDABLE_FIELDS = frozenset({
 
 ModuleVerifyCache = Literal['default', 'never']
 
+
+def check_module_verify_cache(owner: str, value: object) -> None:
+    if value not in get_args(ModuleVerifyCache):
+        raise ValueError(f'{owner}: verify_cache is {value!r}, expected one of {get_args(ModuleVerifyCache)}')
+
 _DISCOVERY_EXCLUDED_DIRS = frozenset({
     '.git', '.venv', 'venv', '.worktrees',
     'node_modules', '__pycache__', 'build', 'target', '.gradle',
@@ -3400,11 +3595,7 @@ class ModuleConfig:
     verify_cache: ModuleVerifyCache = 'default'
 
     def __post_init__(self) -> None:
-        if self.verify_cache not in get_args(ModuleVerifyCache):
-            raise ValueError(
-                f'module {self.prefix!r}: verify_cache is {self.verify_cache!r}, '
-                f'expected one of {get_args(ModuleVerifyCache)}',
-            )
+        check_module_verify_cache(f'module {self.prefix!r}', self.verify_cache)
 
 
 def _discover_module_configs(project_root: Path) -> dict[str, ModuleConfig]:
@@ -3572,6 +3763,11 @@ class PriceEntry(BaseModel):
         default=None,
         ge=0,
         description='USD per 1M cached input tokens; None prices them at input_per_1m.',
+    )
+    cache_write_per_1m: float | None = Field(
+        default=None,
+        ge=0,
+        description='USD per 1M cache-creation input tokens; None prices them at input_per_1m.',
     )
 
 
@@ -4559,6 +4755,11 @@ class OrchestratorConfig(BaseSettings):
     steward_completion_timeout: float = Field(default=900.0)
     steward_max_timeouts_per_escalation: int = Field(default=3, ge=2, le=5)
     steward_max_empty_outputs_per_escalation: int = Field(default=2, ge=2, le=4)
+    # 'fresh_per_l0' handles every L0 in a new session with a full briefing plus a
+    # digest of the L0s this steward already concluded; 'resume' keeps one resumed
+    # session across L0s (the shadow-eval comparison arm, task 5820). Behaviour:
+    # orchestrator/src/orchestrator/steward.py::TaskSteward.
+    steward_session_mode: Literal['fresh_per_l0', 'resume'] = Field(default='fresh_per_l0')
 
     # Pre-triage threshold for review suggestions
     suggestion_triage_threshold: int = Field(default=10)
@@ -4834,6 +5035,8 @@ class OrchestratorConfig(BaseSettings):
     # escalations sit pending until the next orchestrator restart dismisses
     # them unread.  Set ``orphan_l0_reaper_enabled = False`` to disable.
     orphan_l0_reaper_enabled: bool = Field(default=True)
+    # Also the startup strand sweep's classification threshold:
+    # orchestrator/src/orchestrator/harness.py::Harness._dismiss_stale_escalations.
     orphan_l0_timeout_secs: float = Field(default=600.0)
     orphan_l0_check_interval_secs: float = Field(default=60.0)
 
@@ -5363,6 +5566,17 @@ class OrchestratorConfig(BaseSettings):
             'or the task leaving the pin queue, resets it.'
         ),
     )
+    park_refused_emit_interval_secs: float = Field(
+        default=1800.0,
+        gt=0,
+        description=(
+            'park_refused is emitted once a dispatch candidate has been refused '
+            'its locks by parks alone, none of which outranks it, for this many '
+            'seconds, then at most once per this many seconds while that lasts. '
+            'A dispatch, a refusal by anything else, or the task leaving the '
+            'dispatch candidates ends the episode.'
+        ),
+    )
 
     # Escalation-watcher subprocess supervisor (AFK hardening, task 1326).
     # Keeps a fresh escalation-watcher-auto agent alive across multi-day AFK
@@ -5430,7 +5644,7 @@ class OrchestratorConfig(BaseSettings):
     # Disable either ceiling by setting to a very high value (no enable-flag
     # needed — mirrors auto_eval_redo_budget_usd pattern).
     watcher_daily_cost_ceiling_usd: float = Field(
-        default=50.0,
+        default=150.0,
         description=(
             'Daily USD ceiling for escalation-watcher invocations (trailing 24h '
             'sum of cost_usd WHERE role LIKE \'%watcher%\'). On breach, '
@@ -5439,7 +5653,7 @@ class OrchestratorConfig(BaseSettings):
         ),
     )
     orch_daily_cost_ceiling_usd: float = Field(
-        default=200.0,
+        default=10000.0,
         description=(
             'Daily USD ceiling for ALL orchestrator invocations (trailing 24h '
             'sum of all cost_usd rows). On breach, pause_scheduler is called '
@@ -5630,6 +5844,9 @@ class OrchestratorConfig(BaseSettings):
     # checks PRD delta). Task 2583 (epsilon) extends this sub-model further.
     delivered_checks: DeliveredChecksConfig = Field(default_factory=DeliveredChecksConfig)
 
+    # Defect-test gates and the verify-leg plugin injection (plans/defect-tests-prd.md).
+    defect_tests: DefectTestsConfig = Field(default_factory=DefectTestsConfig)
+
     # Warm-lane session-resume guard (task γ, plans/warm-lane-session-resume-prd.md).
     # An absent stanza yields the enabled-by-default instance (default_factory
     # suffices — no defaults.yaml edit, like delivered_checks). Read by the
@@ -5647,9 +5864,17 @@ class OrchestratorConfig(BaseSettings):
     # defaults.yaml declares the block explicitly so the knob is discoverable.
     merge_deep: MergeDeepConfig = Field(default_factory=MergeDeepConfig)
 
+    # The merge pre-verify screen (task 7919). manifest null is its kill switch;
+    # the defaults live in MergeScreenConfig only, not in defaults.yaml.
+    merge_screen: MergeScreenConfig = Field(default_factory=MergeScreenConfig)
+
     # The merge pool's order, promotion period and bounce cap (task 9933,
     # plans/priority-at-later-gates-prd.md). Nothing reads it yet.
     merge_pool: MergePoolConfig = Field(default_factory=MergePoolConfig)
+
+    # Early start on a predecessor's branch (plans/early-start-on-predecessor-branch-prd.md).
+    # The defaults live in EarlyStartConfig only, not in defaults.yaml.
+    early_start: EarlyStartConfig = Field(default_factory=EarlyStartConfig)
 
     # Verify-result cache modes per role (task 5652, plans/verify-result-cache-prd.md).
     # An absent stanza is OFF for both roles.
@@ -6895,6 +7120,8 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
     # separate RELOADABLE_FIELDS edit, so chains can be turned on, retuned or
     # killed (chain_cap -> 0) without a restart. See MergeDeepConfig.
     _submodel_leaf_paths('merge_deep', MergeDeepConfig),
+    # The merge screen (task 7919): read per screen, so its kill switch applies live.
+    _submodel_leaf_paths('merge_screen', MergeScreenConfig),
     # The merge pool's knobs (task 9933): every leaf hot, as merge_deep's are.
     _submodel_leaf_paths('merge_pool', MergePoolConfig),
     # Verify-result cache (task 5652): read per verify decision, so green tier;
@@ -6919,6 +7146,8 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
     # count that drifts reads as a checked claim and is not one — the check is
     # test_config.py::TestSessionResumeConfig::test_leaves_in_reloadable_fields.
     _submodel_leaf_paths('session_resume', SessionResumeConfig),
+    # Green tier: T4-T6 read every leaf at use.
+    _submodel_leaf_paths('early_start', EarlyStartConfig),
     # Dispatch-score sub-budgets (task 3819, PRD D8) — same whole-submodel
     # idiom.  Green-tier because a scoring retune used to cost a fleet restart,
     # which is why the old age_alpha / cpm_beta constants were never tuned.
@@ -6939,10 +7168,13 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
     # Live shadow eval (task 5382, plans/live-shadow-eval-prd.md C6): green tier on
     # purpose, NOT auto_eval_redo_budget_usd's restart tier (PRD S2).
     _submodel_leaf_paths('shadow_eval', ShadowEvalConfig),
+    # Defect tests: green tier, so the human gate flips mode without a restart (PRD Config).
+    _submodel_leaf_paths('defect_tests', DefectTestsConfig),
     {
         # Steward grace
         'steward_completion_timeout',
         'steward_lifetime_budget',
+        'steward_session_mode',
         # Scheduler tuning
         'fairness.skip_threshold',
         # Transient-requeue jittered backoff (task 3317 / PRD contract C3,
@@ -6983,6 +7215,8 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
         'pin_reservations_enabled',
         'pin_reservation_max_active',
         'pin_blocked_emit_interval_secs',
+        # park_refused cadence (task 6328): the same flat, tick-time read.
+        'park_refused_emit_interval_secs',
         # Digest + EWA breaker knobs (task 4559).  Explicit literals for the
         # same reason as the backfill_* group above: these are FLAT top-level
         # fields, not a submodel, so _submodel_leaf_paths does not apply.
@@ -7142,9 +7376,11 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
         # lowers the merge fan-out without a restart.
         'merge_verify_max_concurrent_modules',
         # Delivered-check dep-gate sweep budget (task 2580, capability-
-        # delivered-checks PRD delta) — scheduler tuning, same tier as
+        # delivered-checks PRD delta) and the terminal-dep record-fetch budget
+        # (task 9029, S16 D13) — scheduler tuning, same tier as
         # fairness.skip_threshold / starvation_watchdog.*.
         'delivered_checks.max_checks_per_tick',
+        'delivered_checks.max_record_fetches_per_tick',
         # Delivered-check grace-streak escalation knobs (task 2583, epsilon
         # of the same PRD) — same green tier: an operator may flip the kill
         # switch, retune the grace window, or adjust the per-check timeout

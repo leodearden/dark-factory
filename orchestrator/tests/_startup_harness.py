@@ -7,8 +7,11 @@ no ``__init__.py``).
 
 from __future__ import annotations
 
+import asyncio
+import dataclasses
 from collections.abc import Callable
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from _git_fixtures import seed_repo
@@ -17,6 +20,7 @@ from escalation.queue import EscalationQueue
 
 from orchestrator.config import GitConfig
 from orchestrator.harness import Harness
+from orchestrator.scheduler import Scheduler
 
 #: The stubbed table steps in run() order, as (step name, Harness attribute).
 STUBBED_STEPS: tuple[tuple[str, str], ...] = (
@@ -96,18 +100,63 @@ def merge_lane_harness_factory(
 
 
 async def harness_with_real_merge_worker(
-    make: Callable[[], Harness], scheduler: MagicMock,
+    make: Callable[[], Harness], scheduler: Scheduler,
 ) -> Harness:
     """A Harness over the factory's shared escalation dir, holding a real merge worker."""
-    h = make()
+    return await start_real_merge_worker(make(), scheduler)
+
+
+async def start_real_merge_worker(h: Harness, scheduler: Scheduler) -> Harness:
+    """Start *h*'s escalation server and a real merge worker over *scheduler*; *h*."""
     await h._start_escalation_server()
     h.scheduler = scheduler
     await h._start_merge_worker()
     return h
 
 
-async def journal_merge_request(h: Harness, task_id: str) -> str:
-    """Journal a real merge of task *task_id*'s new branch, as the live enqueue does; its id."""
+async def journal_merge_request(
+    h: Harness, task_id: str, *, task_files: list[str] | None = None,
+) -> str:
+    """Journal a real merge of task *task_id*'s new branch, as the live enqueue does; its id.
+
+    *task_files* are the files the journalled request records for the task.
+    """
     request = await branch_merge_request(h.git_ops, h.config, task_id, filename=f'{task_id}.txt')
+    if task_files is not None:
+        request = dataclasses.replace(request, task_files=task_files)
     h._merge_store.record(request)
     return request.request_id
+
+
+#: The merge worker's shutdown outcome. Spelled out: importing the lane's
+#: constant would make this file, and so every file importing it, lane-importing.
+MERGE_WORKER_SHUTDOWN_OUTCOME = SimpleNamespace(
+    status='blocked', reason='Merge worker shutting down',
+    block_category=SimpleNamespace(value='merge_error'),
+    failure_category=None, failure_cause_hint=None,
+)
+
+
+def recovered_request(task_id: str, *, task_files: list[str] | None = None) -> SimpleNamespace:
+    """A merge request of task *task_id* as step 1c0a recovers it, its outcome unset."""
+    return SimpleNamespace(
+        task_id=task_id, request_id=f'mr-recovered-{task_id}',
+        branch=SimpleNamespace(bare_id=task_id), task_files=task_files,
+        result=asyncio.get_running_loop().create_future(),
+    )
+
+
+async def recover_requests(h: Harness, *requests: SimpleNamespace) -> dict:
+    """Run step 1c0a with the journal recovering exactly *requests*; its report."""
+    report = {
+        'recovered': len(requests), 'dropped': 0, 'coalesced': 0,
+        'requests': list(requests), 'journal_corrupt': False,
+    }
+    with patch('orchestrator.harness.recover_pending_merges', AsyncMock(return_value=report)):
+        return await h._recover_pending_merges()
+
+
+async def drain_background_tasks(h: Harness) -> None:
+    """Await the background work *h* has scheduled, such as a recovered outcome's settle."""
+    await asyncio.sleep(0)
+    await asyncio.gather(*h._background_tasks)

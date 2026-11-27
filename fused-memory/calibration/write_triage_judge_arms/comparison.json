@@ -1,0 +1,186 @@
+{
+  "wordings": [
+    "shipped",
+    "psi"
+  ],
+  "models": [
+    "gpt-6.1-sol",
+    "gpt-6.2-sol"
+  ],
+  "baseline": {
+    "wording": "shipped",
+    "model": "gpt-6.1-sol"
+  },
+  "population": {
+    "fixture_path": "tests/fixtures/write_triage_calibration.jsonl",
+    "slate_mode": "retrieved",
+    "project_id": "reify",
+    "t_high": 0.8868282526657318,
+    "t_low": 0.5229672433064231,
+    "candidate_k": 20,
+    "judge_candidate_count": 5,
+    "field_chars": 4000,
+    "case_count": 84,
+    "canonical_aliases_path": "tests/fixtures/write_triage_calibration.canonical_aliases.json"
+  },
+  "arms": [
+    {
+      "wording": "shipped",
+      "model": "gpt-6.1-sol",
+      "report_path": "calibration/write_triage_judge_accuracy_report.json",
+      "judge_system_prompt_sha256": "897885879ce30793ba614b837d1ba28f4732ae8ff27dea41eda65bb1d8fbded5",
+      "figures": {
+        "middle_band": {
+          "n": 73,
+          "correct": 33,
+          "accuracy": 0.4521
+        },
+        "restate_band": {
+          "n": 11,
+          "judged": 11,
+          "verbatim": 0,
+          "correct": 7,
+          "accuracy": 0.6364
+        },
+        "judged": {
+          "n": 84,
+          "correct": 40,
+          "accuracy": 0.4762
+        },
+        "false_contested": 38,
+        "pseudo_contradiction_contested": 5,
+        "duplicate_contested": 33
+      }
+    },
+    {
+      "wording": "shipped",
+      "model": "gpt-6.2-sol",
+      "report_path": "calibration/write_triage_judge_arms/shipped__gpt-6.2-sol.json",
+      "judge_system_prompt_sha256": "897885879ce30793ba614b837d1ba28f4732ae8ff27dea41eda65bb1d8fbded5",
+      "figures": {
+        "middle_band": {
+          "n": 73,
+          "correct": 39,
+          "accuracy": 0.5342
+        },
+        "restate_band": {
+          "n": 11,
+          "judged": 11,
+          "verbatim": 0,
+          "correct": 6,
+          "accuracy": 0.5455
+        },
+        "judged": {
+          "n": 84,
+          "correct": 45,
+          "accuracy": 0.5357
+        },
+        "false_contested": 34,
+        "pseudo_contradiction_contested": 5,
+        "duplicate_contested": 29
+      }
+    },
+    {
+      "wording": "psi",
+      "model": "gpt-6.1-sol",
+      "report_path": "calibration/write_triage_judge_arms/psi__gpt-6.1-sol.json",
+      "judge_system_prompt_sha256": "312a8c9a7f6ff5fff7d6e8b0af8d327b73e8f860d7025cbac70ceb9b8304cd6a",
+      "figures": {
+        "middle_band": {
+          "n": 73,
+          "correct": 34,
+          "accuracy": 0.4658
+        },
+        "restate_band": {
+          "n": 11,
+          "judged": 11,
+          "verbatim": 0,
+          "correct": 6,
+          "accuracy": 0.5455
+        },
+        "judged": {
+          "n": 84,
+          "correct": 40,
+          "accuracy": 0.4762
+        },
+        "false_contested": 38,
+        "pseudo_contradiction_contested": 5,
+        "duplicate_contested": 33
+      }
+    },
+    {
+      "wording": "psi",
+      "model": "gpt-6.2-sol",
+      "report_path": "calibration/write_triage_judge_arms/psi__gpt-6.2-sol.json",
+      "judge_system_prompt_sha256": "312a8c9a7f6ff5fff7d6e8b0af8d327b73e8f860d7025cbac70ceb9b8304cd6a",
+      "figures": {
+        "middle_band": {
+          "n": 73,
+          "correct": 40,
+          "accuracy": 0.5479
+        },
+        "restate_band": {
+          "n": 11,
+          "judged": 11,
+          "verbatim": 0,
+          "correct": 7,
+          "accuracy": 0.6364
+        },
+        "judged": {
+          "n": 84,
+          "correct": 47,
+          "accuracy": 0.5595
+        },
+        "false_contested": 32,
+        "pseudo_contradiction_contested": 5,
+        "duplicate_contested": 27
+      }
+    }
+  ],
+  "effects": {
+    "prompt": {
+      "gpt-6.1-sol": {
+        "psi": {
+          "middle_band_accuracy": 0.0137,
+          "restate_band_accuracy": -0.0909,
+          "judged_accuracy": 0.0,
+          "false_contested": 0,
+          "pseudo_contradiction_contested": 0,
+          "duplicate_contested": 0
+        }
+      },
+      "gpt-6.2-sol": {
+        "psi": {
+          "middle_band_accuracy": 0.0137,
+          "restate_band_accuracy": 0.0909,
+          "judged_accuracy": 0.0238,
+          "false_contested": -2,
+          "pseudo_contradiction_contested": 0,
+          "duplicate_contested": -2
+        }
+      }
+    },
+    "model": {
+      "shipped": {
+        "gpt-6.2-sol": {
+          "middle_band_accuracy": 0.0821,
+          "restate_band_accuracy": -0.0909,
+          "judged_accuracy": 0.0595,
+          "false_contested": -4,
+          "pseudo_contradiction_contested": 0,
+          "duplicate_contested": -4
+        }
+      },
+      "psi": {
+        "gpt-6.2-sol": {
+          "middle_band_accuracy": 0.0821,
+          "restate_band_accuracy": 0.0909,
+          "judged_accuracy": 0.0833,
+          "false_contested": -6,
+          "pseudo_contradiction_contested": 0,
+          "duplicate_contested": -6
+        }
+      }
+    }
+  }
+}

@@ -311,7 +311,7 @@ class TestLaptopCli:
             call = scene.start([scene.module(MODULE, test='sleep 300')])
             request_id = await scene.laptop.until_verifying('verify-task')
             pgf = pgid_file(scene.laptop_worktree_base, request_id)
-            worktree = await scene.until_recorded_cold_worktree(pgf, watching=call)
+            worktree = await scene.until_recorded_cold_worktree(request_id, watching=call)
             pgid = int(pgf.read_text().strip())
 
             call.cancel()

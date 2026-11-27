@@ -428,8 +428,71 @@
     ],
     "usage": "[OPTIONS] COMMAND [ARGS]..."
   },
+  "verify-cache audit-run": {
+    "options": [
+      [
+        "--config PATH",
+        "Path to orchestrator config YAML (REQUIRED unless ORCH_CONFIG_PATH is set). Its project_root is the tree audited."
+      ],
+      [
+        "--log-dir PATH",
+        "Where each module's raw output is written (default: <project_root>/.df-verify-cache-audit)."
+      ],
+      [
+        "--help",
+        "Show this message and exit."
+      ]
+    ],
+    "usage": "[OPTIONS]"
+  },
+  "verify-cache enable": {
+    "options": [
+      [
+        "--reason TEXT",
+        "Why the cache is safe to re-enable; recorded on the policy row.  [required]"
+      ],
+      [
+        "--config PATH",
+        "Path to orchestrator config YAML (REQUIRED unless ORCH_CONFIG_PATH is set). Selects the target project."
+      ],
+      [
+        "--help",
+        "Show this message and exit."
+      ]
+    ],
+    "usage": "[OPTIONS]"
+  },
   "verify-cache status": {
     "options": [
+      [
+        "--config PATH",
+        "Path to orchestrator config YAML (REQUIRED unless ORCH_CONFIG_PATH is set). Selects the target project \u2014 sets project_root and fused_memory.project_id."
+      ],
+      [
+        "--help",
+        "Show this message and exit."
+      ]
+    ],
+    "usage": "[OPTIONS]"
+  },
+  "verify-host-preflight": {
+    "options": [
+      [
+        "--runner TEXT",
+        "A declared verify runner, enabled or not  [required]"
+      ],
+      [
+        "--sha TEXT",
+        "Commit to verify (default: the tip of git.main_branch)"
+      ],
+      [
+        "--reference TEXT",
+        "A second declared runner verifying the same commit, for skip parity"
+      ],
+      [
+        "--json",
+        "Print the runner's record as JSON"
+      ],
       [
         "--config PATH",
         "Path to orchestrator config YAML (REQUIRED unless ORCH_CONFIG_PATH is set). Selects the target project \u2014 sets project_root and fused_memory.project_id."

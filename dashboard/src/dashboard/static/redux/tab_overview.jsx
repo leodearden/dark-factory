@@ -11,6 +11,7 @@ const {
 const { plainDatum } = window.DF_DATUM;
 const { writeQueue, queueCountsText, queueHealth, newestHourOps, opsTotals, opsCaption } = window.DF_MEMORY_READINGS;
 const { todaySpend, spendText } = window.DF_SPEND_READINGS;
+const { hostLoadRows } = window.DF_HOST_LOAD_CARD;
 // The System health decisions (system_health.js); same CANONICAL note.
 const {
   graphitiHealth, mem0Health, taskStoreHealth, fusedMemoryHealth, reconHealth, walHealth, healthTone, healthSummary,
@@ -26,29 +27,6 @@ const EP_OVERVIEW = Object.freeze({
 });
 
 function StatusDot({ kind }) { return <span className={`status-dot ${kind}`}></span>; }
-
-const METRICS = [
-  { key: 'psi_cpu_some_avg10',  label: 'CPU pressure · some',  type: 'psi' },
-  { key: 'psi_cpu_full_avg10',  label: 'CPU pressure · full',  type: 'psi' },
-  { key: 'psi_mem_some_avg10',  label: 'Mem pressure · some',  type: 'psi' },
-  { key: 'psi_mem_full_avg10',  label: 'Mem pressure · full',  type: 'psi' },
-  { key: 'psi_io_some_avg10',   label: 'IO pressure · some',   type: 'psi' },
-  { key: 'psi_io_full_avg10',   label: 'IO pressure · full',   type: 'psi' },
-  { key: 'occt_queue_depth',    label: 'OCCT queue depth',     type: 'int' },
-  { key: 'verify_scopes_live',  label: 'Verify scopes live',   type: 'int' },
-  { key: 'verify_scope_memory_bytes', label: 'Verify scope memory', type: 'bytes' },
-];
-
-/* Format a host-load metric value for display.
- *  type 'psi'   → "X.XX%"  (avg10 stall %; some = tasks stalling, full = all stalling)
- *  type 'bytes' → "X.X GiB" (verify_scope_memory_bytes via 1024**3 = 1073741824)
- *  type 'int'   → integer (occt_queue_depth, verify_scopes_live)
- */
-function formatLoadValue(type, v) {
-  if (type === 'psi')   return `${v.toFixed(2)}%`;
-  if (type === 'bytes') return `${(v / 1073741824).toFixed(1)} GiB`;
-  /* type === 'int' */  return `${Math.round(v)}`;
-}
 
 /* Period of the HostLoadCard /api/load poll, in ms.
  *
@@ -87,6 +65,7 @@ function HostLoadCard({ paused }) {
     return () => { alive = false; clearInterval(id); };
   }, [paused]);
 
+  const rows = hostLoadRows(load);
   return (
     <div className="panel">
       <div className="panel-head">
@@ -95,24 +74,23 @@ function HostLoadCard({ paused }) {
         <span className="meta">5-min window · {LOAD_POLL_INTERVAL_MS / 1000}s poll</span>
       </div>
       <div className="panel-body">
-        <table className="tbl" style={{ width: '100%' }}>
-          <tbody>
-            {METRICS.map(m => {
-              const datum = (load && load[m.key]) || { current: null, sparkline: [] };
-              return (
-                <tr key={m.key}>
-                  <td style={{ color: 'var(--fg-2)', fontSize: 12, width: '30%' }}>{m.label}</td>
-                  <td className="num mono" style={{ width: '12%', fontSize: 12 }}>
-                    {datum.current == null ? '—' : formatLoadValue(m.type, datum.current)}
-                  </td>
+        {rows.length === 0 ? (
+          <span style={{ color: 'var(--fg-3)', fontSize: 11 }}>no load data</span>
+        ) : (
+          <table className="tbl" style={{ width: '100%' }}>
+            <tbody>
+              {rows.map(row => (
+                <tr key={row.key}>
+                  <td style={{ color: 'var(--fg-2)', fontSize: 12, width: '30%' }}>{row.label}</td>
+                  <td className="num mono" style={{ width: '12%', fontSize: 12 }}>{row.text}</td>
                   <td style={{ width: '58%' }}>
-                    <Sparkline values={datum.sparkline} color={P.accent} />
+                    <Sparkline values={row.sparkline} color={P.accent} />
                   </td>
                 </tr>
-              );
-            })}
-          </tbody>
-        </table>
+              ))}
+            </tbody>
+          </table>
+        )}
       </div>
     </div>
   );

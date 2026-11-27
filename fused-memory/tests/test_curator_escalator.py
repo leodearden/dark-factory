@@ -16,8 +16,10 @@ from __future__ import annotations
 
 import asyncio
 import fcntl
+import importlib
 import json
 import logging
+import sys
 import threading
 from typing import IO, Any, Literal, overload
 
@@ -726,15 +728,8 @@ class TestRaisedFailureKeepsZotMarker:
     """Task 5491: the interactive-path raise still says whether it was a ZOT."""
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize('gate', ['no-orchestrator', 'no-escalation-package'])
     @pytest.mark.parametrize('zero_output_timeout', [True, False])
-    async def test_raise_carries_zero_output_timeout(
-        self, tmp_path, monkeypatch, gate, zero_output_timeout,
-    ):
-        if gate == 'no-escalation-package':
-            monkeypatch.setattr(
-                'fused_memory.middleware.curator_escalator.HAS_ESCALATION', False,
-            )
+    async def test_raise_carries_zero_output_timeout(self, tmp_path, zero_output_timeout):
         with pytest.raises(CuratorFailureError) as exc_info:
             await CuratorEscalator().report_failure(
                 project_root=str(tmp_path), project_id='proj-x',
@@ -1825,3 +1820,18 @@ class TestPersistStateConcurrency:
                 )
         finally:
             handle.close()
+
+
+class TestEscalationPackageIsRequired:
+    """Task 10057: escalation is a declared dependency; its absence is a loud import error, not a silent degrade."""
+
+    def test_import_fails_loudly_without_the_escalation_package(self, monkeypatch):
+        for name in ('escalation', 'escalation.dedupe', 'escalation.models', 'escalation.queue'):
+            monkeypatch.setitem(sys.modules, name, None)
+        monkeypatch.delitem(sys.modules, curator_escalator.__name__)
+
+        with pytest.raises(ImportError) as exc_info:
+            importlib.import_module(curator_escalator.__name__)
+
+        assert exc_info.value.name is not None
+        assert exc_info.value.name.split('.')[0] == 'escalation'

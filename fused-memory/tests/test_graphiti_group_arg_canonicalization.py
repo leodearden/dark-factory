@@ -316,10 +316,14 @@ def _public_group_arg_methods() -> set[str]:
 # `edge_uuids_with_prefix`, `reassign_edge` and `redact_episode_content` had
 # been decorated without a row; the derived-surface check (task 6778) found
 # them.
+#
+# `scan_episode_toolcall_leaks` (task 3233) joined because it resolves its
+# group's graph and filters episodes on $group_id, as redact_episode_content does.
 _ALL_GROUP_ARG_SWEEP_CASES = [
     ('get_episode_by_uuid', ('ep1',), {'group_id': _PATH_SHAPED}),
     ('remove_episode', ('ep1',), {'group_id': _PATH_SHAPED}),
     ('redact_episode_content', ('ep1',), {'group_id': _PATH_SHAPED, 'new_content': 'c'}),
+    ('scan_episode_toolcall_leaks', (), {'group_id': _PATH_SHAPED}),
     ('remove_edge', ('e1',), {'group_id': _PATH_SHAPED}),
     ('update_edge', ('e1',), {'fact': 'f', 'group_id': _PATH_SHAPED}),
     (

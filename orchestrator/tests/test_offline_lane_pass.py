@@ -3,6 +3,8 @@ and either a recording engine or the real one over a fake task client (PRD scena
 
 from __future__ import annotations
 
+import asyncio
+import dataclasses
 import logging
 from collections.abc import Sequence
 from dataclasses import dataclass, field
@@ -19,8 +21,10 @@ from _lane_episode_fakes import (
     FakeLedgerClient,
     _run,
 )
+from escalation.queue import EscalationQueue
+from shared.project_layout import escalation_queue_dir
 
-from orchestrator.config import OrchestratorConfig
+from orchestrator.config import LaneCommand, OrchestratorConfig
 from orchestrator.offline_lane_confirm import (
     Confirmed,
     ConfirmMode,
@@ -52,6 +56,10 @@ from orchestrator.offline_lane_records import (
     RunRecordStore,
 )
 from orchestrator.offline_lane_runs import ConfirmRunner
+from orchestrator.verify_cache import keys, registry
+from orchestrator.verify_cache.audit_hook import AUDIT_ESCALATION_SENTINEL, VerifyCacheAuditHook
+from orchestrator.verify_cache.audit_run import AUDIT_COMMAND, AuditNode
+from orchestrator.verify_evidence import UnitTier
 
 GENERIC = LaneLeg.generic(LANE_COMMAND)
 REPRODUCED = Confirmed(ConfirmMode.NARROWED, (A,), (), ())
@@ -289,8 +297,137 @@ async def test_a_generic_command_passes_at_its_own_priority_and_logs_its_sub_run
     assert line.startswith(f'offline-lane: {COMMAND} sub-run head={HEAD1[:12]} status=FAIL ended_by=exit duration=')
 
 
-def test_production_has_no_pass_outcome_hooks_yet(tmp_path):
-    assert lane_pass_outcome_hooks(OrchestratorConfig(project_root=tmp_path), None) == ()
+def test_production_registers_the_verify_cache_audit_hook(tmp_path):
+    (hook,) = lane_pass_outcome_hooks(OrchestratorConfig(project_root=tmp_path), None)
+
+    assert isinstance(hook, VerifyCacheAuditHook)
+    assert asyncio.run(hook(COMMAND, HEAD1, REPRODUCED, ())) == ()
+    assert not registry.registry_db_path(tmp_path).exists()
+
+
+AUDIT_LEG = LaneLeg.generic(LaneCommand(
+    name=AUDIT_COMMAND, command='orchestrator verify-cache audit-run --config cfg.yaml', fix_task_priority='high',
+))
+ALPHA_NODE = str(AuditNode('alpha', 'tests/test_a.py::t1'))
+ALPHA_KEY = keys.UnitKey.of('module:alpha:test', UnitTier.MODULE, 's', (('spec', 's'), ('tree:alpha', 'a' * 40)))
+BETA_NODE = str(AuditNode('beta', 'tests/test_b.py::t1'))
+BETA_KEY = keys.UnitKey.of('module:beta:test', UnitTier.MODULE, 's', (('spec', 's'), ('tree:beta', 'b' * 40)))
+
+
+def _audit_record(store: RunRecordStore, phase: str) -> RunRecord:
+    lane_pass = store.current_pass(AUDIT_COMMAND)
+    assert lane_pass is not None
+    record = dataclasses.replace(_run(phase, lane_pass.head, store.now(), failing=(ALPHA_NODE,)), command=AUDIT_COMMAND)
+    store.write_run(lane_pass, record)
+    return record
+
+
+def _audit_detect(store: RunRecordStore) -> DetectSeam:
+    async def detect() -> tuple[int, str]:
+        return _audit_record(store, 'detect').returncode, ''
+
+    return detect
+
+
+def _audit_confirm(store: RunRecordStore) -> ConfirmSeam:
+    async def confirm(target: ConfirmTarget, detect: RunRecord | None, runner: ConfirmRunner) -> Confirmed:
+        _audit_record(store, 'confirm')
+        return Confirmed(ConfirmMode.INTERSECTED, (ALPHA_NODE,), (), ())
+
+    return confirm
+
+
+class _Tee:
+    """The real engine, with every observation it was shown kept for the test."""
+
+    def __init__(self, engine: PassObserver) -> None:
+        self.engine = engine
+        self.observations: list[PassObservation] = []
+
+    async def observe(self, observation: PassObservation) -> PassEffect:
+        self.observations.append(observation)
+        return await self.engine.observe(observation)
+
+
+def _seed_leaks(project_root: Path, *unit_keys: keys.UnitKey) -> tuple[registry.Registry, tuple[registry.Entry, ...]]:
+    """The project's registry with a green for each of *unit_keys*, every one consumed by HEAD1's landing."""
+    store = registry.Registry(registry.registry_db_path(project_root))
+    entries = tuple(
+        asyncio.run(store.record_green(key, evidence_event_id=7, run_id='r1', sha='abc')) for key in unit_keys
+    )
+    asyncio.run(store.consume(HEAD1, entries))
+    return store, entries
+
+
+def test_a_verify_cache_leak_note_reaches_the_task_the_lane_files(tmp_path):
+    store, (entry,) = _seed_leaks(tmp_path, ALPHA_KEY)
+    config = OrchestratorConfig(project_root=tmp_path)
+    hooks = lane_pass_outcome_hooks(config, EscalationQueue(tmp_path / 'escalations'))
+    lane = Pass(tmp_path)
+    client = FakeLedgerClient(lane.log)
+    engine = _Tee(LaneEngine(config, FakeAncestry(), task_client=client, escalation_queue=None, now=lane.clock))
+
+    async def one_pass() -> None:
+        await lane.run(
+            _audit_detect(lane.store), target=AUDIT_LEG, confirm=_audit_confirm(lane.store), hooks=hooks, engine=engine,
+        )
+
+    asyncio.run(one_pass())
+
+    (note,) = engine.observations[-1].notes
+    assert (note.source, note.node) == ('verify-cache-audit', ALPHA_NODE)
+    assert not asyncio.run(store.view([ALPHA_KEY])).entries
+    assert asyncio.run(store.policy_state()).streak == 1
+    assert client.submitted == []
+
+    lane.clock.advance(minutes=30)
+    asyncio.run(one_pass())
+
+    (filed,) = client.submitted
+    for named in ('module:alpha:test', ALPHA_KEY.key, f'entry {entry.entry_id}', HEAD1):
+        assert named in filed['details'], filed['details']
+    assert asyncio.run(store.policy_state()).streak == 1
+
+
+def test_without_a_wired_queue_the_audit_files_its_kill_switch_blocker_on_the_projects_queue(tmp_path):
+    _seed_leaks(tmp_path, ALPHA_KEY, BETA_KEY)
+    (hook,) = lane_pass_outcome_hooks(OrchestratorConfig(project_root=tmp_path), None)
+    assert isinstance(hook, VerifyCacheAuditHook)
+
+    asyncio.run(hook(AUDIT_COMMAND, HEAD1, Confirmed(ConfirmMode.INTERSECTED, (ALPHA_NODE, BETA_NODE), (), ()), ()))
+
+    (blocker,) = EscalationQueue(escalation_queue_dir(tmp_path)).get_by_task(
+        AUDIT_ESCALATION_SENTINEL, status='pending',
+    )
+    assert blocker.level == 2
+
+
+def test_a_wired_queue_is_the_one_the_audit_files_its_kill_switch_blocker_on(tmp_path):
+    _seed_leaks(tmp_path, ALPHA_KEY, BETA_KEY)
+    wired = EscalationQueue(tmp_path / 'other-escalations')
+    (hook,) = lane_pass_outcome_hooks(OrchestratorConfig(project_root=tmp_path), wired)
+    assert isinstance(hook, VerifyCacheAuditHook)
+
+    asyncio.run(hook(AUDIT_COMMAND, HEAD1, Confirmed(ConfirmMode.INTERSECTED, (ALPHA_NODE, BETA_NODE), (), ()), ()))
+
+    (blocker,) = wired.get_by_task(AUDIT_ESCALATION_SENTINEL, status='pending')
+    assert blocker.level == 2
+    assert EscalationQueue(escalation_queue_dir(tmp_path)).get_by_task(AUDIT_ESCALATION_SENTINEL) == []
+
+
+@pytest.mark.asyncio
+async def test_an_unreadable_registry_costs_the_audit_pass_only_its_notes(tmp_path, caplog):
+    db_path = registry.registry_db_path(tmp_path)
+    db_path.parent.mkdir(parents=True)
+    db_path.write_bytes(b'this is not a sqlite database' * 64)
+    lane = Pass(tmp_path)
+    hooks = lane_pass_outcome_hooks(OrchestratorConfig(project_root=tmp_path), None)
+
+    with caplog.at_level(logging.ERROR, logger='orchestrator.offline_lane_pass'):
+        await lane.run(_audit_detect(lane.store), target=AUDIT_LEG, confirm=_audit_confirm(lane.store), hooks=hooks)
+
+    assert lane.observed().notes == ()
+    assert any('pass-outcome hook' in record.getMessage() for record in caplog.records), caplog.text
 
 
 @pytest.mark.asyncio

@@ -370,6 +370,20 @@ proposing a rename.
 > the read whose `[]` callers are told to trust. Omitting the argument is
 > unchanged. The sentence above is left as the γ2-time record.
 
+> **Amendment (2026-11-26, task 11553).** `resolve_issue` also takes
+> `project_root: str | None = None`, and the table below governs it. Its
+> refusal comes before the tool's own argument checks, the record read and any
+> mutation, and feeds the same §6.4 streak; FastMCP's schema validation
+> (a missing or wrong-typed argument) still runs ahead of it, as for every
+> guarded tool. §5 decision 3 already says it is never correct
+> for an MCP caller to act on another project's queue, and a resolve is a state
+> transition on a record in that queue. A legibility census sighting (task
+> 11553) showed an agent passing `project_root` to `resolve_issue`, as the
+> repo instructions teach for every task operation, and getting a pydantic
+> unexpected-keyword error instead of a store check. Omitting the argument is
+> unchanged. The sentence above and the task 6552 amendment are left as they
+> stand.
+
 | Condition | Result |
 |---|---|
 | arg omitted | proceed, unchanged (fleet-agent path) |

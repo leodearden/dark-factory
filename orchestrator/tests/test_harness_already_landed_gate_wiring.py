@@ -61,6 +61,7 @@ from orchestrator.merge_lane.landing_evidence import (
     validate_landing_evidence,
 )
 from orchestrator.scheduler import TaskAssignment
+from orchestrator.slot_lease import SlotLease
 
 _HARNESS_SRC_PATH = Path(__file__).parent.parent / 'src' / 'orchestrator' / 'harness.py'
 
@@ -1199,7 +1200,7 @@ class TestAlreadyLandedDispatchGateArbitrationHoldIsDurable:
 
         # The operator arbitrates: the hold releases, and the streak state
         # goes with it on the next tick that observes the release.
-        h._escalation_queue.resolve(escalation_id, 'operator arbitrated')
+        h._escalation_queue.resolve(escalation_id, 'operator arbitrated', resolution_class='actionable')
         await h._already_landed_dispatch_gate('42')
 
         assert h._provenance_conflict_sink.note_hold_observed(
@@ -2640,7 +2641,7 @@ class TestAlreadyLandedGateAncestryRejectEmission:
 
         slot = h._launch_slot(
             TaskAssignment(task_id='42', task={'id': '42'}, modules=[]),
-            asyncio.Semaphore(0), [],
+            SlotLease('42', h.scheduler, asyncio.Semaphore(0)), [],
         )
         slot.cancel()
         await asyncio.gather(slot, return_exceptions=True)

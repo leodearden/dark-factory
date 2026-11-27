@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import functools
 import json
 import math
 import os
@@ -24,10 +25,12 @@ import sys
 import tempfile
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import NamedTuple
 
 import pytest
+from shared.testing_own_time import OwnTimeClock
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 # The repo-wide deploy-clock guard's OWN snapshot/compare (task 3797), reused
@@ -319,7 +322,7 @@ def _install_fixed_epoch(bin_dir, epoch):
     shim.chmod(0o755)
 
 
-def _install_spawn_latency(bin_dir, secs):
+def _install_spawn_latency(bin_dir, secs, *, until_first_poll_in=None):
     """Shadow `python3` with a shim that sleeps *secs*, then execs the real one.
 
     bin_dir is first on the script's PATH, so this delays every interpreter
@@ -327,12 +330,18 @@ def _install_spawn_latency(bin_dir, secs):
     `python3 drain_check.py` alike. It delegates rather than replaces, so
     drain_check.py still runs for real. The real interpreter is resolved here,
     before bin_dir is ever on PATH, so the shim cannot find itself.
+
+    Given *until_first_poll_in*, a gate's poll ledger, only the starts made
+    while that ledger is still empty are delayed: those before the first poll.
     """
     real = shutil.which("python3")
     if real is None:
         pytest.fail("no python3 on PATH to delegate the spawn-latency shim to")
+    delay = f"sleep {secs}"
+    if until_first_poll_in is not None:
+        delay = f"[ -s {shlex.quote(str(until_first_poll_in))} ] || {delay}"
     shim = bin_dir / "python3"
-    shim.write_text(f'#!/bin/sh\nsleep {secs}\nexec {shlex.quote(real)} "$@"\n')
+    shim.write_text(f'#!/bin/sh\n{delay}\nexec {shlex.quote(real)} "$@"\n')
     shim.chmod(0o755)
 
 
@@ -431,9 +440,11 @@ _SWEEP_STALL_TIMEOUT_SECS = 15
 def _run_sweep_while_progressing(
     bin_dir, state_path, fleet_dir, trace_path, *extra_args, env,
     stall_timeout=_SWEEP_STALL_TIMEOUT_SECS,
+    stall_clock: Callable[[int], Callable[[], float]] = OwnTimeClock,
 ):
     """`_run_script`, stopped as stalled once `_sweep_progress` has not
-    changed for *stall_timeout* seconds, however long the whole sweep takes.
+    changed for *stall_timeout* seconds counted on *stall_clock*, by default
+    the script's own time, however long the whole sweep takes.
 
     On a stall the TimeoutExpired carries the last progress, the ledger and
     the partial output as notes.
@@ -445,7 +456,7 @@ def _run_sweep_while_progressing(
     try:
         return run_in_new_session_while_progressing(
             cmd, progress=lambda: _sweep_progress(state_path, trace_path),
-            stall_timeout=stall_timeout, env=full_env,
+            stall_timeout=stall_timeout, stall_clock=stall_clock, env=full_env,
         )
     except subprocess.TimeoutExpired as exc:
         exc.add_note(f"last progress={_sweep_progress(state_path, trace_path)!r}")
@@ -453,6 +464,31 @@ def _run_sweep_while_progressing(
         exc.add_note(f"stdout={_decode(exc.stdout)!r}")
         exc.add_note(f"stderr={_decode(exc.stderr)!r}")
         raise
+
+
+# Well above a loaded host's pre-poll interpreter starts, well below the module's pytest timeout.
+_PRE_POLL_OWN_TIME_BUDGET_SECS = 60
+
+
+class _OwnTimeSinceFirstPoll:
+    """The sweep's own time since its gate's first complete poll, so a stall
+    pin measures the re-polling it pins, not the interpreter starts before it.
+    Only _PRE_POLL_OWN_TIME_BUDGET_SECS of that stretch is forgiven, so a sweep
+    that never polls still stalls out."""
+
+    def __init__(self, pid: int, *, trace_path: Path) -> None:
+        self._own_time = OwnTimeClock(pid)
+        self._trace_path = trace_path
+        self._first_poll_at: float | None = None
+
+    def __call__(self) -> float:
+        now = self._own_time()
+        if self._first_poll_at is None and read_drain_poll_trace(
+            self._trace_path, complete_only=True,
+        ):
+            self._first_poll_at = now
+        pre_poll = now if self._first_poll_at is None else self._first_poll_at
+        return now - min(pre_poll, _PRE_POLL_OWN_TIME_BUDGET_SECS)
 
 
 def _script_invocation(bin_dir, state_path, fleet_dir, extra_args, env):
@@ -2495,7 +2531,10 @@ def test_the_awaited_verify_sweep_completes_when_every_interpreter_start_is_star
     )
 
 
-def test_a_sweep_that_only_repolls_the_same_verdict_is_reported_as_stalled(tmp_path):
+_STALL_PIN_TIMEOUT_SECS = 3
+
+
+def _assert_a_repolling_sweep_is_reported_as_stalled(tmp_path, *, first_poll_latency_secs=None):
     bin_dir, state_path, fleet_dir, trace_path, env = _three_unit_drain_sweep(
         tmp_path,
         {
@@ -2504,24 +2543,39 @@ def test_a_sweep_that_only_repolls_the_same_verdict_is_reported_as_stalled(tmp_p
             UNIT_SELF: _hb_drain([]),
         },
     )
-    env["ORCH_DRAIN_VERIFY_MAX_WAIT_SECS"] = "20"
+    env["ORCH_DRAIN_VERIFY_MAX_WAIT_SECS"] = "60"
+    if first_poll_latency_secs is not None:
+        _install_spawn_latency(bin_dir, first_poll_latency_secs, until_first_poll_in=trace_path)
 
     with pytest.raises(subprocess.TimeoutExpired) as exc_info:
         _run_sweep_while_progressing(
-            bin_dir, state_path, fleet_dir, trace_path, "--drain", env=env, stall_timeout=3,
+            bin_dir, state_path, fleet_dir, trace_path, "--drain", env=env,
+            stall_timeout=_STALL_PIN_TIMEOUT_SECS,
+            stall_clock=functools.partial(_OwnTimeSinceFirstPoll, trace_path=trace_path),
         )
 
     polls = read_drain_poll_trace(trace_path)
     calls = [
         [arg for arg in call if arg != "--user"] for call in _load_state(state_path)["calls"]
     ]
-    assert exc_info.value.timeout == 3
+    assert exc_info.value.timeout == _STALL_PIN_TIMEOUT_SECS
     assert polls, (
-        "the stall fired before the gate's first poll, so this run never reached the "
-        "repolling it pins: the stretch before that poll outlasted stall_timeout"
+        "the stall fired before the gate's first poll: the sweep spent over "
+        f"{_PRE_POLL_OWN_TIME_BUDGET_SECS}s of its own time without reaching it, so this "
+        "run never reached the repolling it pins"
     )
     assert all(p == ("verifying", UNIT_R) for p in polls), polls
     assert not [call for call in calls if call[:1] == ["restart"]], calls
+
+
+def test_a_sweep_that_only_repolls_the_same_verdict_is_reported_as_stalled(tmp_path):
+    _assert_a_repolling_sweep_is_reported_as_stalled(tmp_path)
+
+
+def test_a_repolling_sweep_is_reported_as_stalled_however_long_its_first_poll_takes(tmp_path):
+    _assert_a_repolling_sweep_is_reported_as_stalled(
+        tmp_path, first_poll_latency_secs=_STALL_PIN_TIMEOUT_SECS + 1,
+    )
 
 
 def test_each_units_verify_wait_cap_counts_from_its_own_request(tmp_path):

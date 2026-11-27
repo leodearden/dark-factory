@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from typing import Any
 
 import pytest
 
+from orchestrator.agents.token_pricing import FALLBACK_PRICE, TokenUsage, price_tokens
 from orchestrator.evals.metrics import (
+    EndpointKind,
     EvalMetrics,
     compute_composite,
     is_false_green,
@@ -190,11 +193,13 @@ class TestNullWorkGuard:
 class TestResolveCostUsd:
     """A PURE resolver of ``(cost_usd, cost_source)`` implementing Invariant P5.
 
-    Cost provenance ∈ {price_table, cli, unpriced_proxy}:
+    Cost provenance ∈ {price_table, price_table_no_cache_rate, cli, unpriced_proxy}:
       - price_table  → the run's model is listed in ``prices`` (trust the table)
+      - price_table_no_cache_rate → listed, but cache tokens met a missing
+                       cache rate and were priced at input_per_1m (WARNING)
       - cli          → NATIVE cloud endpoint, model unlisted (CLI cost is
                        trustworthy for the real Anthropic API)
-      - unpriced_proxy → a PROXIED endpoint (is_local_model) whose model is
+      - unpriced_proxy → a PROXIED endpoint (cli_cost_untrusted) whose model is
                        unlisted → loud WARNING + a DEFINED fallback, never the
                        raw CLI number (which is wrong for proxied endpoints).
     """
@@ -204,11 +209,11 @@ class TestResolveCostUsd:
 
         # 1_000_000 in @ $2/1M + 500_000 out @ $8/1M = 2.0 + 4.0 = 6.0
         cost, source = resolve_cost_usd(
-            1_000_000, 500_000,
+            TokenUsage(input_tokens=1_000_000, output_tokens=500_000),
             model='model-x',
             prices={'model-x': {'input_per_1m': 2.0, 'output_per_1m': 8.0}},
             cli_cost_usd=99.0,          # must be IGNORED when the model is priced
-            is_local_model=False,
+            cli_cost_untrusted=False,
         )
         assert source == 'price_table'
         assert cost == pytest.approx(6.0)
@@ -219,11 +224,11 @@ class TestResolveCostUsd:
         from orchestrator.evals.metrics import resolve_cost_usd
 
         cost, source = resolve_cost_usd(
-            1_000_000, 500_000,
+            TokenUsage(input_tokens=1_000_000, output_tokens=500_000),
             model='model-x',
             prices={'model-x': PriceEntry(input_per_1m=2.0, output_per_1m=8.0)},
             cli_cost_usd=99.0,
-            is_local_model=False,
+            cli_cost_untrusted=False,
         )
         assert source == 'price_table'
         assert cost == pytest.approx(6.0)
@@ -232,11 +237,11 @@ class TestResolveCostUsd:
         from orchestrator.evals.metrics import resolve_cost_usd
 
         cost, source = resolve_cost_usd(
-            1_000_000, 1_000_000,
+            TokenUsage(input_tokens=1_000_000, output_tokens=1_000_000),
             model='claude-sonnet-4',    # not in prices
             prices={},
             cli_cost_usd=3.5,
-            is_local_model=False,       # NATIVE cloud → CLI cost is trustworthy
+            cli_cost_untrusted=False,       # NATIVE cloud → CLI cost is trustworthy
         )
         assert source == 'cli'
         assert cost == pytest.approx(3.5)
@@ -246,11 +251,11 @@ class TestResolveCostUsd:
 
         with caplog.at_level(logging.WARNING, logger='orchestrator.evals.metrics'):
             cost, source = resolve_cost_usd(
-                1_000_000, 1_000_000,
+                TokenUsage(input_tokens=1_000_000, output_tokens=1_000_000),
                 model='local-llama-70b',    # not in prices
                 prices={},
                 cli_cost_usd=0.0,           # raw CLI cost is WRONG for proxied
-                is_local_model=True,        # PROXIED endpoint (ANTHROPIC_BASE_URL)
+                cli_cost_untrusted=True,        # PROXIED endpoint (ANTHROPIC_BASE_URL)
             )
 
         assert source == 'unpriced_proxy'
@@ -269,14 +274,90 @@ class TestResolveCostUsd:
         from orchestrator.evals.metrics import resolve_cost_usd
 
         cost, source = resolve_cost_usd(
-            1_000_000, 500_000,
+            TokenUsage(input_tokens=1_000_000, output_tokens=500_000),
             model='model-x',
             prices={'model-x': {'input_per_1m': 2.0, 'output_per_1m': 8.0}},
             cli_cost_usd=99.0,
-            is_local_model=True,        # proxied — but priced → price_table wins
+            cli_cost_untrusted=True,        # proxied — but priced → price_table wins
         )
         assert source == 'price_table'
         assert cost == pytest.approx(6.0)
+
+    # Measured counts of eval cell endpoint__46074e01, at GLM-5.3's published rates.
+    _MEASURED_USAGE = TokenUsage(
+        input_tokens=1_193,
+        output_tokens=12_537,
+        cache_read_tokens=1_370_402,
+        cache_create_tokens=13_702,
+    )
+    _GLM_RATES = {
+        'input_per_1m': 1.40,
+        'output_per_1m': 4.40,
+        'cached_input_per_1m': 0.26,
+        'cache_write_per_1m': 1.40,
+    }
+
+    def test_priced_model_prices_cache_tokens_at_their_own_rates(self):
+        from orchestrator.evals.metrics import resolve_cost_usd
+
+        cost, source = resolve_cost_usd(
+            self._MEASURED_USAGE,
+            model='glm-5.3',
+            prices={'glm-5.3': self._GLM_RATES},
+            cli_cost_usd=99.0,
+            cli_cost_untrusted=True,
+        )
+        assert (cost, source) == (pytest.approx(0.43232032), 'price_table')
+
+    def test_missing_cached_rate_labels_and_warns(self, caplog):
+        from orchestrator.evals.metrics import resolve_cost_usd
+
+        usage = TokenUsage(input_tokens=100, output_tokens=10, cache_read_tokens=1_000)
+        with caplog.at_level(logging.WARNING, logger='orchestrator.evals.metrics'):
+            cost, source = resolve_cost_usd(
+                usage,
+                model='mimo-pro',
+                prices={'mimo-pro': {'input_per_1m': 1.0, 'output_per_1m': 4.0}},
+                cli_cost_usd=0.0,
+                cli_cost_untrusted=True,
+            )
+
+        assert source == 'price_table_no_cache_rate'
+        assert cost == pytest.approx((100 * 1.0 + 1_000 * 1.0 + 10 * 4.0) / 1e6)
+        warnings = [
+            r.getMessage() for r in caplog.records
+            if r.levelno >= logging.WARNING and r.name == 'orchestrator.evals.metrics'
+        ]
+        assert any('mimo-pro' in w and 'cached_input_per_1m' in w for w in warnings), warnings
+
+    def test_missing_cache_rates_without_cache_tokens_stay_price_table(self, caplog):
+        from orchestrator.evals.metrics import resolve_cost_usd
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.evals.metrics'):
+            _, source = resolve_cost_usd(
+                TokenUsage(input_tokens=100, output_tokens=10),
+                model='mimo-pro',
+                prices={'mimo-pro': {'input_per_1m': 1.0, 'output_per_1m': 4.0}},
+                cli_cost_usd=0.0,
+                cli_cost_untrusted=True,
+            )
+
+        assert source == 'price_table'
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+    def test_proxied_unlisted_prices_cache_tokens_at_the_fallback(self):
+        from orchestrator.evals.metrics import resolve_cost_usd
+
+        cost, source = resolve_cost_usd(
+            self._MEASURED_USAGE,
+            model='local-llama-70b',
+            prices={},
+            cli_cost_usd=0.0,
+            cli_cost_untrusted=True,
+        )
+
+        assert source == 'unpriced_proxy'
+        assert cost == pytest.approx(price_tokens(FALLBACK_PRICE, self._MEASURED_USAGE).cost_usd)
 
 
 class TestComposeCostSource:
@@ -364,11 +445,23 @@ class TestIsProxiedEndpoint:
 
     def test_runner_uses_the_metrics_singleton(self):
         """Identity, not mere equality — a re-declared local copy in runner.py
-        (the price-table seeding site) would fail this, mirroring
-        ``TestCostPrimitivesSingleHome``'s pin on the cost primitives."""
+        (the price-table seeding site) would fail this."""
         from orchestrator.evals import metrics, runner
 
         assert runner.is_proxied_endpoint is metrics.is_proxied_endpoint
+
+
+class TestEndpointKindAndCostTrustPersistence:
+    def test_the_endpoint_kind_survives_a_json_round_trip_as_the_member(self):
+        m = EvalMetrics(endpoint_kind=EndpointKind.VENDOR_CLOUD)
+        persisted = json.loads(json.dumps(m.to_dict()))
+        assert persisted['endpoint_kind'] == 'vendor_cloud'
+        assert EvalMetrics.from_dict(persisted).endpoint_kind is EndpointKind.VENDOR_CLOUD
+
+    def test_an_empty_record_has_no_endpoint_kind_and_trusts_the_cli_cost(self):
+        m = EvalMetrics.from_dict({})
+        assert m.endpoint_kind is None
+        assert m.cli_cost_untrusted is False
 
 
 # ---------------------------------------------------------------------------
@@ -549,28 +642,3 @@ class TestBlendComposite:
         assert blend_composite(
             0.9, 1.0, 1.0, tests_pass=None, plan_only=True, no_plan=False,
         ) == pytest.approx(0.94, abs=1e-4)
-
-
-# ---------------------------------------------------------------------------
-# Amendment (reviewer: code-reuse) — the cost primitives (_FALLBACK_PRICE / _rate)
-# have a SINGLE home in agents.invoke; metrics re-exports rather than
-# re-declares them, so the copy cannot drift. These guards fail loudly if a
-# future edit reintroduces a local copy in metrics.py.
-# ---------------------------------------------------------------------------
-
-class TestCostPrimitivesSingleHome:
-    """metrics._FALLBACK_PRICE / metrics._rate must BE the invoke singletons
-    (identity, not mere equality) — a re-declared local copy would fail these.
-    """
-
-    def test_fallback_price_is_the_invoke_singleton(self):
-        from orchestrator.agents import invoke
-        from orchestrator.evals import metrics
-
-        assert metrics._FALLBACK_PRICE is invoke._FALLBACK_PRICE
-
-    def test_rate_accessor_is_the_invoke_singleton(self):
-        from orchestrator.agents import invoke
-        from orchestrator.evals import metrics
-
-        assert metrics._rate is invoke._rate

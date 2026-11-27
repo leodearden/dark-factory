@@ -32,8 +32,10 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-sys.path.insert(0, "/home/leo/src/runpod-toolkit")
-sys.path.insert(0, "/home/leo/src/dark-factory/orchestrator/src")
+sys.path.insert(
+    0, os.environ.get("RUNPOD_TOOLKIT_PATH", str(Path(__file__).resolve().parents[2] / "runpod-toolkit"))
+)
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "orchestrator" / "src"))
 from orchestrator.evals.configs import (
     FINAL_RUN_CONFIGS,
     VLLM_EVAL_CONFIGS,
@@ -41,19 +43,27 @@ from orchestrator.evals.configs import (
     get_config_by_name,
 )
 from orchestrator.evals.results import ResultStore
+from orchestrator.evals.runner import WORKFLOW_CELL_TIMEOUT_MINUTES, cell_timeout_minutes
 from orchestrator.evals.snapshots import eval_worktree_root
-from runpod_toolkit.compute import PodStatus, RunPodClient  # type: ignore[import]
-from runpod_toolkit.config import RunPodConfig  # type: ignore[import]
+
+try:
+    from runpod_toolkit.compute import PodStatus, RunPodClient  # type: ignore[import]
+    from runpod_toolkit.config import RunPodConfig  # type: ignore[import]
+except ModuleNotFoundError as exc:
+    raise ModuleNotFoundError(
+        f"{exc}. Set RUNPOD_TOOLKIT_PATH to the runpod-toolkit checkout: it defaults to the "
+        "runpod-toolkit sibling of the checkout this launcher ships in, which a task worktree "
+        "under .worktrees/ does not have.",
+        name=exc.name,
+    ) from exc
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
 SSH_KEY = os.path.expanduser("~/.ssh/id_runpod")
-with open(SSH_KEY + ".pub") as _fh:
-    SSH_PUBKEY = _fh.read().strip()
 
-PROJECT_ROOT = Path("/home/leo/src/dark-factory")
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 ORCHESTRATOR_DIR = PROJECT_ROOT / "orchestrator"
 TASKS_DIR = ORCHESTRATOR_DIR / "src/orchestrator/evals/tasks"
 RESULT_STORE = ResultStore.packaged()
@@ -62,6 +72,9 @@ RESULT_STORE = ResultStore.packaged()
 # (unlike /tmp which is tmpfs); chosen so a mid-batch crash leaves logs
 # behind for forensics.
 EVAL_LOG_DIR = Path("/var/tmp/dark-factory-evals")
+
+OUTER_TIMEOUT_MARGIN_MIN = 20
+"""Room past the cell's own ceiling for worktree setup, uv startup and writing the result file."""
 
 
 def _load_runpod_api_key() -> str:
@@ -85,6 +98,19 @@ def _load_runpod_api_key() -> str:
         "RUNPOD_API_KEY not found. Add `RUNPOD_API_KEY=rpa_...` to "
         f"{PROJECT_ROOT}/.env or export it in your shell."
     )
+
+
+def read_ssh_pubkey() -> str:
+    """The public half of SSH_KEY, which the pod authorises; read when a pod is created, never at import."""
+    pubkey_path = Path(f"{SSH_KEY}.pub")
+    try:
+        return pubkey_path.read_text().strip()
+    except FileNotFoundError:
+        raise RuntimeError(
+            f"{pubkey_path} not found. Create the RunPod key pair with "
+            f"`ssh-keygen -t ed25519 -f {SSH_KEY}`."
+        ) from None
+
 
 # H200 variants to try in priority order when a config requests H200.
 H200_VARIANTS = [
@@ -264,12 +290,12 @@ def build_eval_env() -> dict[str, str]:
     resolve to the shared pool, since ``dark-factory-orchestrator.yaml``
     declares ``accounts_file:
     "${USAGE_ACCOUNTS_FILE:/home/leo/src/dark-factory/config/usage-accounts.yaml}"``.
-    The reason is NOT worktree self-consistency, an argument this
-    docstring used to make and which does not hold: ``PROJECT_ROOT`` is
-    itself a constant hardcoded to the main checkout, so the value
-    exported here is byte-identical to that default and a
-    worktree-launched run rosters main's file either way. Two reasons
-    that do hold:
+    ``PROJECT_ROOT`` is the checkout this launcher ships in, so a run
+    launched from a worktree (which needs ``RUNPOD_TOOLKIT_PATH`` set)
+    rosters that checkout's tracked file and
+    reads that checkout's ``.env``; from the main checkout, as every
+    documented launch line runs, the value equals that default. Two
+    reasons for setting it:
 
     1. IT OVERRIDES AN AMBIENT VALUE. ``env`` starts as
        ``os.environ.copy()`` and the ``.env`` loader below writes into it
@@ -339,8 +365,8 @@ def orchestrator_config_for_spec(spec: dict) -> Path | None:
     The eval CLI requires ``--config`` (or ``ORCH_CONFIG_PATH``) so it
     knows which project's ``project_root`` and ``fused_memory.project_id``
     to use. Different task families target different projects:
-        df_task_*    → /home/leo/src/dark-factory/dark-factory-orchestrator.yaml
-        reify_task_* → /home/leo/src/reify/orchestrator.yaml
+        df_task_*    → <dark-factory checkout>/dark-factory-orchestrator.yaml
+        reify_task_* → <reify checkout>/orchestrator.yaml
 
     Resolves by checking known config-file names under ``spec['project_root']``.
     Returns ``None`` if nothing matches; the caller should fall back to the
@@ -405,8 +431,8 @@ def preflight_baseline(
     typecheck commands. Tests are deliberately skipped (slow + flaky on dev
     box). The throwaway worktree is removed before returning even on error.
 
-    The worktree is created against ``spec['project_root']`` (e.g.
-    ``/home/leo/src/reify`` for reify_task_*), falling back to the
+    The worktree is created against ``spec['project_root']`` (e.g. the
+    reify checkout for reify_task_*), falling back to the
     launcher's ``PROJECT_ROOT`` for backwards compatibility. An empty
     ``lint`` or ``typecheck`` command is treated as "no such step" and
     silently reported clean — reify tasks legitimately ship with an empty
@@ -711,7 +737,7 @@ def bring_up_pod(cfg: EvalConfig, args: argparse.Namespace) -> PodHandle:
 
     try:
         env_vars = {
-            "PUBLIC_KEY": SSH_PUBKEY,
+            "PUBLIC_KEY": read_ssh_pubkey(),
             "MODEL_NAME": hf_model,
             **extra_env,
         }
@@ -1042,6 +1068,24 @@ def _open_task_log(task_id: str, config_name: str):
     return path, open(path, "w")
 
 
+def outer_timeout_min(spec: dict, args: argparse.Namespace) -> float:
+    """The launcher's kill deadline for one cell: --task-timeout-min, else the cell's own ceiling plus OUTER_TIMEOUT_MARGIN_MIN.
+
+    An explicit deadline that does not outlast the ceiling is honoured with a
+    warning: the launcher may kill the cell before it writes a result file.
+    """
+    ceiling = cell_timeout_minutes(spec, args.orch_timeout_min, WORKFLOW_CELL_TIMEOUT_MINUTES)
+    if args.task_timeout_min is None:
+        return ceiling + OUTER_TIMEOUT_MARGIN_MIN
+    if args.task_timeout_min <= ceiling:
+        log(
+            f"WARNING: {spec['id']}: --task-timeout-min {args.task_timeout_min} does not "
+            f"exceed the cell's own ceiling of {ceiling} min, so the launcher may kill "
+            "the cell before it writes a result file"
+        )
+    return args.task_timeout_min
+
+
 def run_one_task(
     spec: dict,
     cfg: EvalConfig,
@@ -1143,6 +1187,7 @@ def run_one_task(
     if args.orch_timeout_min is not None:
         eval_cmd.extend(["--timeout", str(args.orch_timeout_min)])
 
+    outer_min = outer_timeout_min(spec, args)
     t0 = time.monotonic()
 
     try:
@@ -1150,7 +1195,7 @@ def run_one_task(
             eval_cmd,
             cwd=str(ORCHESTRATOR_DIR),
             env=env,
-            timeout=args.task_timeout_min * 60,
+            timeout=outer_min * 60,
             stdout=stdout_target,
             stderr=stderr_target,
         )
@@ -1158,7 +1203,7 @@ def run_one_task(
     except subprocess.TimeoutExpired:
         log(
             f"EVAL TIMEOUT: {task_id} exceeded "
-            f"{args.task_timeout_min} min subprocess limit"
+            f"{outer_min} min subprocess limit"
         )
         rc = -1
     finally:
@@ -1418,12 +1463,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument(
         "--task-timeout-min",
         type=int,
-        default=70,
+        default=None,
         help=(
             "Outer subprocess timeout in minutes (the launcher kills the "
-            "orchestrator subprocess after this). Should be > "
-            "--orch-timeout-min so the orchestrator hits its own timeout "
-            "first and produces a clean result file."
+            "orchestrator subprocess after this). By default, the cell's own "
+            "ceiling (the --orch-timeout-min value, else the fixture's "
+            "timeout_minutes, else the runner's workflow default of "
+            f"{WORKFLOW_CELL_TIMEOUT_MINUTES} min) plus {OUTER_TIMEOUT_MARGIN_MIN} min, "
+            "so the orchestrator hits its own ceiling first and writes a "
+            "result file. An explicit value should exceed that ceiling; one "
+            "that does not is logged as a warning."
         ),
     )
 
@@ -1434,8 +1483,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help=(
             "Inner orchestrator-internal eval timeout in minutes (passed to "
             "`orchestrator eval --timeout`). When unset, the orchestrator "
-            "uses the per-task spec value (default 60 min). Set this much "
-            "higher (e.g. 360) so 'would-be-done' runs have time to finish."
+            "uses the fixture's timeout_minutes, else the runner's workflow "
+            f"default of {WORKFLOW_CELL_TIMEOUT_MINUTES} min. Raise it when "
+            "'would-be-done' runs need longer than that ceiling."
         ),
     )
 

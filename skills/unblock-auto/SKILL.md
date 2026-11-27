@@ -117,14 +117,16 @@ investigation is running on the **merge-stage completion mode** path
 the general risk assessment above: only label `risk_label: "low"` for
 **MECHANICAL** completion classes:
 
-- **Rebase/conflict resolution** confined strictly to files that are
-  already part of the task's own diff (no edits outside the task's
-  declared footprint).
 - **Import/type/lint repairs** against the new `main` tip (e.g. a renamed
   symbol, a moved module, a newly-strict lint rule) — small, mechanical,
   and clearly attributable to the main-tip move.
 - Under a **small line cap** — a handful of lines, not a substantive
   rewrite.
+
+A **rebase conflict against `main` is never `low` in this mode**: the
+low-risk skill aborts on any conflict at its rebase step, so a `low` label
+would only spend an unattended run to end in an abort. Label it `medium` or
+`human-review-required`.
 
 Anything **semantic** — logic edits, a genuinely new test failure unrelated
 to the main-tip move, cross-module changes, or any edit outside the task's

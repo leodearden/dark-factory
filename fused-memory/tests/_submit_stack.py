@@ -12,6 +12,10 @@ Import the fixtures in the explicit re-export form so pytest registers them in t
 ``curator_creates`` creates every curated candidate as filed; ``curator_script`` answers each one
 with the next scripted ``CuratorDecision`` (create when the script is empty) and never re-embeds.
 A test uses one of the two, never both.
+
+The stack's curator reads the store and an in-memory Qdrant corpus embedded to one constant vector,
+never reaches a network service or the LLM, and takes its decisions from ``curator_creates`` /
+``curator_script``.
 """
 
 from __future__ import annotations
@@ -25,6 +29,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 import pytest_asyncio
+from _curator_helpers import ExhaustibleEmbedder, in_memory_corpus_curator
 from shared.followup_hold_records import FOLLOWUP_HOLDER_METADATA_KEY
 
 from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend
@@ -32,7 +37,7 @@ from fused_memory.config.schema import CuratorConfig, FusedMemoryConfig, Taskmas
 from fused_memory.middleware.curator_types import CuratorDecision, PreparedCandidate
 from fused_memory.middleware.task_curator import TaskCurator
 from fused_memory.middleware.task_interceptor import TaskInterceptor
-from fused_memory.middleware.ticket_store import TicketStore
+from fused_memory.middleware.ticket_store import ResolveReason, TicketStatus, TicketStore
 from fused_memory.models.reconciliation import EventType
 from fused_memory.models.scope import resolve_project_id
 from fused_memory.reconciliation.event_buffer import EventBuffer
@@ -50,6 +55,7 @@ class Stack:
     root: str
     backend: SqliteTaskBackend
     interceptor: TaskInterceptor
+    curator: TaskCurator
     server: Any
     ticket_store: TicketStore
     event_buffer: EventBuffer
@@ -103,8 +109,18 @@ class Stack:
         """File through submit_task and return the ticket with its resolve_ticket answer."""
         submitted = await self.call('submit_task', **args)
         assert 'ticket' in submitted, submitted
-        resolved = await self.call('resolve_ticket', ticket=submitted['ticket'], timeout_seconds=30)
-        return submitted['ticket'], resolved
+        return submitted['ticket'], await self.resolve(submitted['ticket'])
+
+    async def resolve(self, ticket: str, *, wait_seconds: float | None = None) -> dict[str, Any]:
+        """The first resolve_ticket answer that is not an expired wait.
+
+        The caller rule of ``server/tools.py::resolve_ticket``: an expired wait is not a decision, so
+        ask again with the same ticket and never re-submit. ``None`` is the tool's own default wait.
+        """
+        while True:
+            answer = await self.call('resolve_ticket', ticket=ticket, timeout_seconds=wait_seconds)
+            if (answer.get('status'), answer.get('reason')) != (TicketStatus.PENDING, ResolveReason.WAIT_TIMEOUT):
+                return answer
 
     async def file_normal(self, **args: Any) -> str:
         _ticket, resolved = await self.submit(**args)
@@ -135,12 +151,17 @@ async def stack(tmp_path: Path) -> AsyncIterator[Stack]:
     config = FusedMemoryConfig()
     config.taskmaster = None
     config.curator = CuratorConfig()
-    interceptor = TaskInterceptor(backend, None, event_buffer, config, ticket_store=ticket_store)
+    curator = in_memory_corpus_curator(
+        ExhaustibleEmbedder(config.embedder.dimensions), config, taskmaster=backend,
+    )
+    interceptor = TaskInterceptor(
+        backend, None, event_buffer, config, ticket_store=ticket_store, curator=curator,
+    )
     server = create_mcp_server(AsyncMock(), task_interceptor=interceptor)
     try:
         yield Stack(
-            root=str(tmp_path / 'proj'), backend=backend, interceptor=interceptor, server=server,
-            ticket_store=ticket_store, event_buffer=event_buffer,
+            root=str(tmp_path / 'proj'), backend=backend, interceptor=interceptor, curator=curator,
+            server=server, ticket_store=ticket_store, event_buffer=event_buffer,
         )
     finally:
         await interceptor.close()

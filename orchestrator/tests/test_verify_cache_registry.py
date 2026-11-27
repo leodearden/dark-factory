@@ -23,6 +23,12 @@ def _registry(path: Path) -> registry.Registry:
     return registry.Registry(path, clock=lambda: _NOW)
 
 
+def _ticking_registry(path: Path) -> registry.Registry:
+    """A registry whose every write is a minute after the last, so recency is ordered."""
+    ticks = iter(range(10_000))
+    return registry.Registry(path, clock=lambda: _NOW + timedelta(minutes=next(ticks)))
+
+
 @pytest.fixture
 def db_path(tmp_path: Path) -> Path:
     return tmp_path / 'verify_cache.db'
@@ -84,6 +90,93 @@ class TestEntries:
         recorded = await store.record_green(_key(tree='b'), evidence_event_id=8, run_id='r2', sha='def')
 
         assert recorded.entry_id != evicted.entry_id
+
+
+class TestCandidates:
+    @pytest.mark.asyncio
+    async def test_each_asked_unit_yields_its_most_recent_greens_first(self, db_path):
+        store = _ticking_registry(db_path)
+        alpha = [
+            await store.record_green(_key(tree=t), evidence_event_id=n, run_id='r1', sha='abc')
+            for n, t in enumerate('abc', start=1)
+        ]
+        beta = await store.record_green(
+            _key('module:beta:test', tree='a'), evidence_event_id=9, run_id='r1', sha='abc',
+        )
+
+        candidates = await store.candidates(['module:alpha:test', 'module:beta:test'], per_unit=2)
+
+        assert candidates == (alpha[2].candidate, alpha[1].candidate, beta.candidate)
+        assert candidates[0] == registry.Candidate(
+            unit_id='module:alpha:test', key=alpha[2].key, entry_id=alpha[2].entry_id, evidence_event_id=3,
+        )
+
+    @pytest.mark.asyncio
+    async def test_unasked_and_unrecorded_units_contribute_nothing(self, db_path):
+        store = _ticking_registry(db_path)
+        await store.record_green(_key(), evidence_event_id=7, run_id='r1', sha='abc')
+        await store.record_green(_key('module:beta:test'), evidence_event_id=8, run_id='r1', sha='abc')
+
+        candidates = await store.candidates(['module:beta:test', 'module:gamma:test'], per_unit=16)
+
+        assert [candidate.unit_id for candidate in candidates] == ['module:beta:test']
+
+    @pytest.mark.asyncio
+    async def test_no_unit_ids_reads_nothing(self, db_path):
+        db_path.write_bytes(b'not a sqlite database, just bytes' * 64)
+
+        assert await _registry(db_path).candidates([], per_unit=16) == ()
+
+    @pytest.mark.asyncio
+    async def test_greens_from_any_host_are_eligible(self, db_path):
+        store = _ticking_registry(db_path)
+        local = await store.record_green(_key(tree='a'), evidence_event_id=7, run_id='local-run', sha='abc')
+        remote = await store.record_green(_key(tree='b'), evidence_event_id=8, run_id='laptop-run', sha='def')
+
+        candidates = await store.candidates(['module:alpha:test'], per_unit=16)
+
+        assert set(candidates) == {local.candidate, remote.candidate}
+
+
+class TestViewOf:
+    @pytest.mark.asyncio
+    async def test_it_holds_the_live_entry_of_each_present_pair(self, store):
+        present = await store.record_green(_key(tree='a'), evidence_event_id=7, run_id='r1', sha='abc')
+        absent = _key(tree='b')
+
+        view = await store.view_of([(present.unit_id, present.key), (absent.unit_id, absent.key)])
+
+        assert view.entries == {(present.unit_id, present.key): present}
+
+    @pytest.mark.asyncio
+    async def test_view_is_view_of_over_the_keys_pairs(self, store):
+        await store.record_green(_key(tree='a'), evidence_event_id=7, run_id='r1', sha='abc')
+        wanted = [_key(tree='a'), _key(tree='b')]
+
+        assert await store.view(wanted) == await store.view_of([(key.unit_id, key.key) for key in wanted])
+
+
+class TestKillSwitch:
+    @pytest.mark.parametrize('disabled_until', [None, _NOW + timedelta(days=14)])
+    def test_a_policy_states_kill_switch_carries_its_window(self, disabled_until):
+        state = registry.PolicyState(
+            disabled_until=disabled_until, reason='2 leaks' if disabled_until else None,
+            streak=2, leaks=('l1', 'l2'),
+        )
+
+        switch = state.kill_switch
+
+        assert switch == registry.KillSwitch(disabled_until=state.disabled_until, reason=state.reason)
+        for now in (_NOW, _NOW + timedelta(days=15)):
+            assert switch.is_disabled(now) is state.is_disabled(now)
+
+    def test_a_disable_without_a_reason_is_rejected_naming_the_field(self):
+        with pytest.raises(ValueError, match='disabled_until'):
+            registry.KillSwitch(disabled_until=_NOW, reason=None)
+
+    def test_a_naive_window_is_rejected(self):
+        with pytest.raises(ValueError, match='2026-11-10'):
+            registry.KillSwitch(disabled_until=datetime(2026, 11, 10), reason='2 leaks')
 
 
 class TestPrune:
@@ -215,7 +308,7 @@ class TestStoreFile:
         assert summary.entries_by_tier == {UnitTier.TREE: 1, UnitTier.MODULE: 1, UnitTier.TEST: 0}
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize('operation', ['view', 'record_green', 'summary'])
+    @pytest.mark.parametrize('operation', ['view', 'record_green', 'summary', 'candidates'])
     @pytest.mark.parametrize('damage', ['garbage', 'directory'])
     async def test_a_damaged_store_is_a_registry_error_naming_it(self, db_path, operation, damage):
         if damage == 'garbage':
@@ -227,6 +320,7 @@ class TestStoreFile:
             'view': lambda: store.view([_key()]),
             'record_green': lambda: store.record_green(_key(), evidence_event_id=7, run_id='r1', sha='abc'),
             'summary': store.summary,
+            'candidates': lambda: store.candidates(['module:alpha:test'], per_unit=16),
         }
 
         with pytest.raises(registry.RegistryError, match=re.escape(str(db_path))):

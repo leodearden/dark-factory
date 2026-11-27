@@ -2877,6 +2877,7 @@ class TestResolveWatcherOutageL2:
             f'Expected status="resolved"; got {resolved.status!r}'
         )
         assert resolved.resolution == WatcherRecoveryEvidence.HEALTHY_ROTATION
+        assert resolved.resolution_class is not None, 'a level-2 close must be classified'
 
     def test_noop_when_no_open_l2(self, tmp_path: Path) -> None:
         """When no pending L2 with root_cause='watcher_supervisor_down', must be a no-op."""
@@ -3173,7 +3174,8 @@ class TestWatcherSupervisorLoopRecoveryResolvesL2:
 
 
 # ---------------------------------------------------------------------------
-# task 1501: _WATCHER_ALLOWED_TOOLS must include promote_to_l2
+# Tools SKILL.md depends on are granted and not disallowed (tasks 1501, 2629,
+# 3176, 3726, 3999, 4081, 10426)
 # ---------------------------------------------------------------------------
 
 _FILING_PAIR = ('mcp__fused-memory__submit_task', 'mcp__fused-memory__resolve_ticket')
@@ -3183,85 +3185,69 @@ _RECORD_AND_MERGE_STATE_READS = (
     'mcp__escalation__merge_status',
     'mcp__escalation__get_merge_queue',
 )
+_REQUIRED_GRANTS: tuple[tuple[str, str], ...] = (
+    ('mcp__escalation__promote_to_l2',
+     'the rotation promotes out-of-scope L1s to a human L2 stream (task 1501)'),
+    ('Task',
+     'the sonnet rotation delegates deep RCA to an opus subagent (task 2629)'),
+    ('Bash(git cat-file:*)',
+     'the orphan-reaper auto-close probes objects and <ref>:<path>s in its '
+     'investigation step and close conditions 2 and 3 (task 4081)'),
+    ('mcp__escalation__get_task_escalations',
+     "the drain reads archived L2s' member_ids to keep already-promoted L1s "
+     'out of work_batch (task 3999)'),
+    *((tool, "SKILL.md's Read-only investigation toolset lists it; the "
+             'single-record read calls get_escalation and the task_failure '
+             'handler reads merge_status.failure_diagnostic (task 3176)')
+      for tool in _RECORD_AND_MERGE_STATE_READS),
+    *((tool, 'filing a finding needs submit_task, which yields only a ticket, '
+             'and resolve_ticket, which yields the task id the resolution '
+             'must cite (task 3726)')
+      for tool in _FILING_PAIR),
+    ('mcp__fused-memory__search_tasks',
+     "SKILL.md's existence checks call it, so a refused lookup would read as "
+     "'no matching task' (task 10426)"),
+)
+
+
+def _disallow_entry_blocks(entry: str, tool: str) -> bool:
+    """Whether disallow-list *entry* blocks *tool*, beyond an exact match.
+
+    A bare tool name blocks every scoped form of it (`Bash` blocks
+    `Bash(git log:*)`), an `mcp__<family>__*` wildcard blocks its family, and
+    a `Bash(<prefix>:*)` rule blocks any Bash rule whose command starts with
+    that prefix (`Bash(git:*)` blocks `Bash(git cat-file:*)`).
+    """
+    if entry == tool or entry == tool.partition('(')[0] or tool_is_granted(tool, {entry}):
+        return True
+    if not (entry.startswith('Bash(') and entry.endswith(':*)') and tool.startswith('Bash(')):
+        return False
+    prefix = entry.removeprefix('Bash(').removesuffix(':*)')
+    return tool.removeprefix('Bash(').startswith(prefix)
 
 
 class TestWatcherAllowedTools:
-    """_WATCHER_ALLOWED_TOOLS includes the L2-promotion tool (task 1501)."""
+    """The rotation's allowed/disallowed tool lists match what SKILL.md uses."""
 
-    def test_promote_to_l2_in_allowed_tools(self) -> None:
-        """mcp__escalation__promote_to_l2 must be in _WATCHER_ALLOWED_TOOLS.
-
-        The autonomous L1-watcher agent can promote escalations to L2 when they
-        exceed its scope — this requires the promote_to_l2 MCP tool in its
-        allowed-tools allowlist (consumer-per-level contract from
-        plans/escalation-l2-tiering.md).
-        """
-        assert 'mcp__escalation__promote_to_l2' in _WATCHER_ALLOWED_TOOLS, (
-            'mcp__escalation__promote_to_l2 must be in _WATCHER_ALLOWED_TOOLS '
-            'so the autonomous watcher can promote L1→L2 escalations; '
-            f'current list: {_WATCHER_ALLOWED_TOOLS}'
-        )
-
-    def test_task_in_allowed_tools(self) -> None:
-        """'Task' must be in _WATCHER_ALLOWED_TOOLS, and not in the disallowed list.
-
-        The sonnet top-level rotation (task 2629) delegates hard or
-        investigation-class items to an opus subagent via the Task tool
-        (SKILL.md "Delegating deep RCA to an opus subagent") instead of
-        running the whole rotation on opus. Task is not blocked by
-        bypassPermissions, so the delegation works today without this entry
-        — but a future tightening of the tool policy (e.g. an exhaustive
-        allowlist, or adding Task to _WATCHER_DISALLOWED_TOOLS) could
-        silently break this cost-optimization design with no test failing.
-        This assertion makes the dependency explicit and enforced.
-        """
-        assert 'Task' in _WATCHER_ALLOWED_TOOLS, (
-            "'Task' must be in _WATCHER_ALLOWED_TOOLS so the watcher rotation "
-            'can delegate deep RCA to an opus subagent (task 2629); '
-            f'current list: {_WATCHER_ALLOWED_TOOLS}'
-        )
-        assert 'Task' not in _WATCHER_DISALLOWED_TOOLS, (
-            "'Task' must not be in _WATCHER_DISALLOWED_TOOLS — that would "
-            'silently break the opus-subagent deep-RCA delegation (task 2629); '
-            f'current list: {_WATCHER_DISALLOWED_TOOLS}'
-        )
-
-    def test_archive_inclusive_read_tool_is_granted(self) -> None:
-        """get_task_escalations must be allowed, and not disallowed.
-
-        allowed_tools reaches the CLI as --allowed-tools, an ALLOWLIST
+    @pytest.mark.parametrize(
+        ('tool', 'why'), _REQUIRED_GRANTS, ids=[tool for tool, _ in _REQUIRED_GRANTS],
+    )
+    def test_required_tool_is_granted_and_not_disallowed(self, tool: str, why: str) -> None:
+        """allowed_tools reaches the CLI as --allowed-tools, an ALLOWLIST
         (shared/src/shared/cli_invoke.py), and MCP tools are not covered by
-        permission-bypass mode (SKILL.md "Headless-mode permission gotchas").
-        Without this entry the drain protocol's archive-inclusive read
-        (task 3999) is permission-denied: a silent no-op.
-        """
-        tool = 'mcp__escalation__get_task_escalations'
+        permission-bypass mode (SKILL.md "Headless-mode permission gotchas"),
+        so an unnamed MCP tool is permission-denied: a silent no-op. The
+        Bash and Task entries work under bypassPermissions today, but a
+        tightened policy, or a broad disallow rule, would strand them with
+        no other test failing."""
         assert tool in _WATCHER_ALLOWED_TOOLS, (
-            f'{tool} must be in _WATCHER_ALLOWED_TOOLS so the drain can read '
-            "archived L2s' member_ids and keep already-promoted L1s out of "
-            f'work_batch (task 3999); current list: {_WATCHER_ALLOWED_TOOLS}'
+            f'{tool} must be in _WATCHER_ALLOWED_TOOLS: {why}; '
+            f'current list: {_WATCHER_ALLOWED_TOOLS}'
         )
-        assert tool not in _WATCHER_DISALLOWED_TOOLS, (
-            f'{tool} must not be in _WATCHER_DISALLOWED_TOOLS — that would '
-            'silently blind the drain to archived L2s (task 3999); '
-            f'current list: {_WATCHER_DISALLOWED_TOOLS}'
+        blockers = [e for e in _WATCHER_DISALLOWED_TOOLS if _disallow_entry_blocks(e, tool)]
+        assert not blockers, (
+            f'{tool} is blocked by _WATCHER_DISALLOWED_TOOLS entries {blockers}: {why}'
         )
-
-    def test_escalation_record_and_merge_state_reads_are_granted(self) -> None:
-        """SKILL.md's Read-only investigation toolset lists these reads; its
-        single-record read calls get_escalation and its task_failure handler
-        reads merge_status.failure_diagnostic (task 3176)."""
-        for tool in _RECORD_AND_MERGE_STATE_READS:
-            assert tool in _WATCHER_ALLOWED_TOOLS, (
-                f'{tool} must be in _WATCHER_ALLOWED_TOOLS: SKILL.md\'s Read-only '
-                f'investigation toolset lists it (task 3176); current list: '
-                f'{_WATCHER_ALLOWED_TOOLS}'
-            )
-            assert tool not in _WATCHER_DISALLOWED_TOOLS, (
-                f'{tool} must not be in _WATCHER_DISALLOWED_TOOLS: SKILL.md\'s '
-                f'Read-only investigation toolset lists it (task 3176); current '
-                f'list: {_WATCHER_DISALLOWED_TOOLS}'
-            )
 
     def test_declare_pin_is_not_granted(self) -> None:
         """Wildcard-aware: an `mcp__escalation__*` grant would cover it too."""
@@ -3273,31 +3259,6 @@ class TestWatcherAllowedTools:
             'skills/escalation-watcher-auto/SKILL.md "Declared pins" (task 3176); '
             f'current list: {_WATCHER_ALLOWED_TOOLS}'
         )
-
-    def test_filing_pair_is_granted(self) -> None:
-        """submit_task and resolve_ticket must be allowed, and not disallowed.
-
-        allowed_tools reaches the CLI as --allowed-tools, an ALLOWLIST
-        (shared/src/shared/cli_invoke.py), and MCP tools are not covered by
-        permission-bypass mode (SKILL.md "Headless-mode permission gotchas"),
-        so an unnamed MCP tool is permission-denied: a silent no-op.
-        Both entries are load-bearing: submit_task returns only a tkt_
-        ticket, and resolve_ticket is the only call that yields the task id
-        the escalation's resolution must cite (task 3726).
-        """
-        for tool in _FILING_PAIR:
-            assert tool in _WATCHER_ALLOWED_TOOLS, (
-                f'{tool} must be in _WATCHER_ALLOWED_TOOLS so the watcher can '
-                'file a finding and close its escalation citing the filed '
-                'task id (submit_task yields only a ticket; resolve_ticket '
-                'yields the task id) (task 3726); '
-                f'current list: {_WATCHER_ALLOWED_TOOLS}'
-            )
-            assert tool not in _WATCHER_DISALLOWED_TOOLS, (
-                f'{tool} must not be in _WATCHER_DISALLOWED_TOOLS — that would '
-                'silently strip the convert-to-tracked-work filing action '
-                f'(task 3726); current list: {_WATCHER_DISALLOWED_TOOLS}'
-            )
 
     def test_skill_tool_is_denied(self) -> None:
         """The bare 'Skill' tool is denied, and never pre-granted.
@@ -3474,6 +3435,7 @@ _READ_ONLY_GRANTED_MCP_TOOLS = frozenset({
     'mcp__fused-memory__get_task',
     'mcp__fused-memory__get_tasks',
     'mcp__fused-memory__search',
+    'mcp__fused-memory__search_tasks',
 })
 _TIER1_BULLET = '- **Tier-1 admin actions ONLY.**'
 
@@ -3908,7 +3870,7 @@ class TestWatcherHasActionableL1:
             return resolve(self, escalation_id, *args, **kwargs)
 
         with patch.object(EscalationQueue, 'resolve', resolve_missing_the_member):
-            queue.resolve(l2_id, 'human answered the cluster')
+            queue.resolve(l2_id, 'human answered the cluster', resolution_class='actionable')
 
         l2, l1 = queue.get(l2_id), queue.get(l1_id)
         assert l2 is not None and l2.status == 'resolved'

@@ -20,6 +20,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any
 
+import aiosqlite
 import pytest
 from _boundary_payloads import (
     LANES_ROOT,
@@ -35,10 +36,12 @@ from _boundary_payloads import (
     prd_lanes_family,
     prd_tree,
     prd_view_family,
+    render_prds_settled,
 )
 from _canned_mcp import CannedMCP, is_metadata_projection
 from _prd_lanes_tree import prd_key
 from _prd_tree import PRD_A
+from _served_reads import forget_escalation_corpus
 from fastapi.testclient import TestClient
 from shared.task_statuses import TaskStatus
 
@@ -248,7 +251,12 @@ def test_a_slow_lineage_read_lands_for_the_next_request(client, tmp_path, monkey
 # --- the request-wide reads are bounded and guarded -------------------------
 
 _REQUEST_READS_WAIT = 0.5
-"""Short, yet long enough for the run-ledger walk the same wait bounds."""
+"""Short, so a held corpus walk's wait ends quickly. It bounds the run-ledger walk too, which a
+cold open can outlast, so a test that needs that walk answered settles its reads first
+(:func:`render_prds_settled`)."""
+_COLD_POOL_WARM_UP = 2.0
+"""Past twice :data:`_REQUEST_READS_WAIT`, so a render issued as soon as the first one's wait expired
+still waits out its own before the pool is warm."""
 
 
 def _unreadable_walk(queues):
@@ -266,11 +274,18 @@ def test_a_corpus_walk_that_raises_degrades_only_the_view(client, tmp_path, monk
     assert body['PRD_CONTENTION'][ROOT]['state'] == 'fresh'
 
 
-def test_a_slow_corpus_walk_never_holds_the_response_and_lands_for_the_next_request(
-    client, tmp_path, monkeypatch,
-):
-    """The walk is released only once the first response is back, so that response cannot have waited on it."""
-    monkeypatch.setattr(prds, 'REQUEST_READS_WAIT_SECONDS', _REQUEST_READS_WAIT)
+def _serve_a_held_corpus_walk(
+    client: TestClient,
+    render: Callable[[datetime], dict[str, Any]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """The /prds body served while the corpus walk is held, and the view once it has landed.
+
+    Every other input lands first, so the corpus walk is the only read the held render can miss.
+    """
+    landed = render_prds_settled(client, T0)['PRD_CONTENTION'][ROOT]
+    assert landed['state'] == 'fresh', landed['reason']
+    forget_escalation_corpus()
     walk = escalation_corpus.walk_corpus
     answered = threading.Event()
 
@@ -279,18 +294,55 @@ def test_a_slow_corpus_walk_never_holds_the_response_and_lands_for_the_next_requ
         return walk(queues)
 
     monkeypatch.setattr(escalation_corpus, 'walk_corpus', _walk_after_the_first_response)
+    try:
+        held = render(T0)
+    finally:
+        answered.set()
+    later = render_prds_settled(client, T0 + timedelta(seconds=20))['PRD_VIEW'][ROOT]
+    return held, later
+
+
+def test_a_slow_corpus_walk_never_holds_the_response_and_lands_for_the_next_request(
+    client, tmp_path, monkeypatch,
+):
+    """The walk is released only once the first response is back, so that response cannot have waited on it."""
+    monkeypatch.setattr(prds, 'REQUEST_READS_WAIT_SECONDS', _REQUEST_READS_WAIT)
     with canned_prd_roots(client, tmp_path, {ROOT: prd_tree()}) as render:
-        try:
-            first = render(T0)
-        finally:
-            answered.set()
-        later = _render_until_fresh(render, T0 + timedelta(seconds=20))
+        first, later = _serve_a_held_corpus_walk(client, render, monkeypatch)
 
     assert first['PRD_VIEW'][ROOT]['state'] == 'unknown'
     assert 'escalations: ' in first['PRD_VIEW'][ROOT]['reason']
     assert first['PRD_CONTENTION'][ROOT]['state'] == 'fresh'
     assert later['state'] == 'fresh'
     assert {state['state'] for state in later['value']['inputs']} == {'fresh'}
+
+
+def test_a_held_corpus_walk_degrades_only_the_view_when_the_run_ledger_opens_cold(
+    client, tmp_path, monkeypatch,
+):
+    """Every run-ledger open completes only once a response is back, so the scenario's first
+    (settling) render's own open outlasts its request wait at any load."""
+    monkeypatch.setattr(prds, 'REQUEST_READS_WAIT_SECONDS', _REQUEST_READS_WAIT)
+    with canned_prd_roots(client, tmp_path, {ROOT: prd_tree()}) as render:
+        responded = threading.Event()
+        client.event_hooks['response'].append(lambda response: responded.set())
+        connect = aiosqlite.connect
+        gated: list[tuple[Any, ...]] = []
+
+        async def _connect_once_a_response_is_back(*args, **kwargs):
+            gated.append(args)
+            await asyncio.to_thread(responded.wait, _SETTLE_DEADLINE)
+            return await connect(*args, **kwargs)
+
+        monkeypatch.setattr(aiosqlite, 'connect', _connect_once_a_response_is_back)
+        held, later = _serve_a_held_corpus_walk(client, render, monkeypatch)
+
+    assert gated, 'the run-ledger open never reached the response gate, so this test no longer forces a cold open'
+    contention = held['PRD_CONTENTION'][ROOT]
+    assert contention['state'] == 'fresh', contention['reason']
+    assert held['PRD_VIEW'][ROOT]['state'] == 'unknown'
+    assert 'escalations: ' in held['PRD_VIEW'][ROOT]['reason']
+    assert later['state'] == 'fresh'
 
 
 def test_a_failed_corpus_walk_after_a_good_one_serves_the_last_good_walk(
@@ -466,6 +518,30 @@ def test_an_unreachable_scheduler_degrades_only_the_contention_line(bodies):
     assert contention['state'] == 'unknown'
     assert 'get_scheduler_state' in contention['reason']
     assert offline['PRD_VIEW'][LANES_ROOT] == bodies['prd_lanes']['PRD_VIEW'][LANES_ROOT]
+
+
+@pytest.mark.timing(reason='a cold run-ledger walk that outlives its request wait is the scenario')
+def test_a_cold_run_ledger_walk_past_its_wait_never_shapes_a_lanes_family_body(
+    client, tmp_path, monkeypatch,
+):
+    """Every walk waits for one shared warm-up the first walk starts, so a render issued before
+    that walk is joined still finds the pool cold."""
+    monkeypatch.setattr(prds, 'REQUEST_READS_WAIT_SECONDS', _REQUEST_READS_WAIT)
+    walk = prds._project_scoped_dbs_labeled
+    warm_up: list[asyncio.Future[None]] = []
+
+    async def _walk_once_the_pool_is_warm(config, pool, relative):
+        if not warm_up:
+            warm_up.append(asyncio.ensure_future(asyncio.sleep(_COLD_POOL_WARM_UP)))
+        await asyncio.shield(warm_up[0])
+        return await walk(config, pool, relative)
+
+    monkeypatch.setattr(prds, '_project_scoped_dbs_labeled', _walk_once_the_pool_is_warm)
+    family = prd_lanes_family(client, tmp_path)
+
+    view = family['prd_lanes']['PRD_VIEW'][LANES_ROOT]
+    assert view['state'] == 'fresh', view['reason']
+    assert family['prd_lanes_scheduler_offline']['PRD_VIEW'][LANES_ROOT] == view
 
 
 def test_a_failed_lineage_read_degrades_only_the_view(bodies):

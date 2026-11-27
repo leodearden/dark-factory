@@ -138,8 +138,8 @@ class TestDisallowListForAmendAndEpisodeTools:
     integrity check) held a live Mem0 silent-rewrite primitive. Its agent_id
     `recon-stage-integrity_check` matches `Mem0UpdateConfig`'s default
     `content_amend_allowed_agent_prefixes` via its `recon-stage-` entry, and
-    `config/config.yaml` leaves that list commented out (only the metadata-patch
-    list is active there), so that default applies — Stage 3 both passed the
+    `config/config.yaml` leaves that list commented out (since task 6431 the
+    whole `mem0_update:` block is), so that default applies — Stage 3 both passed the
     authz gate and held the tool.
 
     This class is a PER-TOOL contract for these three advertised tools. The
@@ -316,10 +316,11 @@ class TestMem0UpdateConfigDefaultAdmitsEveryReconStage:
     the schema default and re-commented the YAML block — which is why the
     default now carries two entries.
 
-    Since task 6181 the YAML `mem0_update:` block is active again, but for the
-    metadata-patch list only (adding `link-heal-`, per
-    plans/write-triage-link-healing-prd.md H1). The content-amend list these
-    tests guard is still the schema default.
+    Task 6181 briefly activated the YAML block for the metadata-patch list only
+    (adding `link-heal-`, per plans/write-triage-link-healing-prd.md H1). Since
+    task 6431 the whole block is commented out again and `link-heal-` lives in
+    the metadata arm's schema default. The content-amend list these tests
+    guard is still the schema default.
     """
 
     def test_schema_default_content_amend_prefixes_are_recon_stage_and_curator(
@@ -334,7 +335,7 @@ class TestMem0UpdateConfigDefaultAdmitsEveryReconStage:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """config/config.yaml leaves `mem0_update.content_amend_allowed_agent_prefixes`
-        commented out (only the metadata-patch list is active there), so the
+        commented out (since task 6431 the whole block is), so the
         schema default pinned above — not an operator override this test cannot
         see — is what actually governs production. Loads the REAL on-disk config the same way
         test_config_schema.py's TestConfigYamlEnablesRequireDoneProvenance does,

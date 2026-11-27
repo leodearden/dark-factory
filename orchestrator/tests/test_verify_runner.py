@@ -21,11 +21,23 @@ from _gate_fixtures import (
     gated_remote_runner,
     gated_run,
 )
+from _git_fixtures import seed_repo
 from _orch_helpers import pydantic_spec, wait_responsive
+from _verify_cache_fixtures import (
+    LOG_MODES,
+    MARKERS_ENV,
+    WORKSPACE_SEED,
+    cache_config,
+    cache_module,
+    put_pytest_on_path,
+)
 
 from orchestrator.config import GitConfig, ModuleConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore, EventType
-from orchestrator.verify import VerifyResult
+from orchestrator.merge_lane.gates import PostMergePyrightResult
+from orchestrator.verify import VerifyResult, run_scoped_verification
+from orchestrator.verify_cache.registry import registry_db_path
+from orchestrator.verify_evidence import UnitOutcome
 from orchestrator.verify_runner import (
     CANCEL_PROBE_INTERVAL_SECS,
     GIT_PUSH_SSH_CONFIG,
@@ -98,6 +110,7 @@ class TestVerifyCommand:
             "test_command": "cargo test",
             "lint_command": None,
             "type_check_command": None,
+            "verify_cache": "default",
         }
 
 
@@ -1306,7 +1319,54 @@ class TestLocalRunnerBundle:
             task_id=None,
             archive_root=None,
             event_store=None,
+            verify_cache=None,
         )
+
+
+@pytest.mark.asyncio
+class TestLocalRunnerHandsTheUnscopedGateWhatRan:
+    """Task 5653 (5294): the unscoped type-check gate is told what the scoped leg
+    executed, after merge-flake suppression, so it can consult that record."""
+
+    @staticmethod
+    def _recording_gate() -> tuple[list[dict[str, Any]], Any]:
+        calls: list[dict[str, Any]] = []
+
+        async def gate(*_args: Any, **options: Any) -> Any:
+            calls.append(options)
+            return MagicMock(broken=False, timed_out=False, failing_subprojects=[], timed_out_subprojects=[])
+
+        return calls, gate
+
+    async def test_a_passing_scoped_result_reaches_the_gate_as_executed(self):
+        scoped = _make_pass_result()
+        calls, gate = self._recording_gate()
+        runner = _make_local_runner(run_scoped=AsyncMock(return_value=scoped), run_unscoped=gate)
+
+        await runner.run_merge_verify('abc123', _make_spec())
+
+        (options,) = calls
+        assert options['executed'] is scoped
+        assert options['block_on_timeout'] is True
+
+    async def test_the_gate_sees_the_flake_suppressed_result_not_the_raw_red(self):
+        from orchestrator import verify as verify_module
+
+        red = _make_fail_result()
+        suppressed = _make_pass_result(summary='suppressed')
+
+        async def suppress(result: VerifyResult, **_kwargs: Any) -> VerifyResult:
+            assert result is red
+            return suppressed
+
+        calls, gate = self._recording_gate()
+        runner = _make_local_runner(run_scoped=AsyncMock(return_value=red), run_unscoped=gate)
+
+        with patch.object(verify_module, 'apply_merge_flake_suppression', suppress):
+            await runner.run_merge_verify('abc123', _make_spec())
+
+        (options,) = calls
+        assert options['executed'] is suppressed
 
 
 # ---------------------------------------------------------------------------
@@ -2169,6 +2229,8 @@ class TestBuildMergeVerifySpec:
         # attr is non-None and truthy, so it would flag every mock module.
         mc.scope_cargo = scope_cargo
         mc.verify_env = None
+        # Task 9123: VerifyCommand carries (and checks) the module's verify_cache.
+        mc.verify_cache = 'default'
         return mc
 
     def _make_config(
@@ -2558,7 +2620,7 @@ class TestRunMergeVerifyOnWorktree:
             run_scoped=run_scoped, run_unscoped=run_unscoped,
         )
 
-        assert result is pass_result
+        assert result == pass_result
 
     async def test_module_configs_reconstructed_from_spec(self):
         """run_scoped is called with module_configs reconstructed from spec."""
@@ -3304,6 +3366,35 @@ class TestRunMergeVerifyOnWorktree:
         )
 
 
+class TestRunnerVerifyConsultsNoRegistry:
+    """A runner's verify joins the cache with no registry (task 5653): every unit is
+    UNAVAILABLE naming why, and the runner writes no registry of its own."""
+
+    @pytest.mark.asyncio
+    async def test_every_unit_is_unavailable_and_no_registry_file_appears(self, tmp_path, monkeypatch):
+        from orchestrator.verify_runner import build_merge_verify_spec, run_merge_verify_on_worktree
+
+        put_pytest_on_path(tmp_path, monkeypatch)
+        markers = tmp_path / 'markers.txt'
+        monkeypatch.setenv(MARKERS_ENV, str(markers))
+        repo = seed_repo(tmp_path / 'repo', WORKSPACE_SEED)
+        config = cache_config(repo, LOG_MODES)
+        modules = [cache_module('alpha', markers), cache_module('beta', markers)]
+
+        result = await run_merge_verify_on_worktree(
+            repo, config, build_merge_verify_spec(config, modules, None),
+            run_scoped=run_scoped_verification,
+            run_unscoped=AsyncMock(return_value=PostMergePyrightResult()),
+        )
+
+        assert result.passed, result.summary
+        assert result.units
+        for unit in result.units:
+            assert unit.outcome is UnitOutcome.UNAVAILABLE, unit
+            assert 'no_registry_on_runner' in (unit.reason or ''), unit
+        assert not registry_db_path(repo).exists()
+
+
 # ---------------------------------------------------------------------------
 # Step-5: run_merge_verify_on_worktree defaults to real merge-path callables
 # ---------------------------------------------------------------------------
@@ -3348,7 +3439,7 @@ class TestRunMergeVerifyOnWorktreeDefaults:
 
         fake_scoped.assert_awaited_once()
         fake_unscoped.assert_awaited_once()
-        assert result is pass_result
+        assert result == pass_result
 
 
 # ---------------------------------------------------------------------------

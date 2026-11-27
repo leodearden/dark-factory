@@ -258,7 +258,7 @@ worktree, and return a structured JSON verdict.
 You MUST output ONLY valid JSON matching the schema provided by the
 --json-schema flag. No markdown fences, no prose outside the JSON.
 """,
-    allowed_tools=[*_ANALYSIS_TOOLS, *_JCODEMUNCH_TOOLS],
+    allowed_tools=[*_ANALYSIS_TOOLS],
     disallowed_tools=['Edit', 'Write'],
     default_model='sonnet',
     default_budget=0.50,
@@ -1142,9 +1142,11 @@ Code: `reviewer_trial/runner.py::PanelRunKey`, `::run_panel_cached`,
 `orchestrator/src/orchestrator/evals/`).
 
 **One keyed panel cache.** `run_panel_cached` is the only panel cache, and
-`run_panel` stamps every result with a `PanelRunKey`. That key holds three
+`run_panel` stamps every result with a `PanelRunKey`. That key holds four
 things: a sha256 of the price table the caller passed (None when the call was
-unpriced), whether a usage gate was offered, and the diff cap. Each key has
+unpriced), whether a usage gate was offered, the diff cap, and the reviewer
+turn cap. The turn cap is production's `max_turns.reviewer` unless the caller
+overrides it (`reviewer_trial/variants.py::trial_reviewer_max_turns`). Each key has
 its own file, `<results_dir>/<variant>__<diff>__<key digest>.json`, written
 atomically. A stored panel is reused only when it records the requested
 variant and diff and an equal key. So an entry written by `smoke` or
@@ -1166,13 +1168,20 @@ table.
 
 **Backfill (INV-13).** Panel entries written before this task carry no
 `run_key` and sit at the bare `<variant>__<diff>.json`. One is honoured as a
-cache hit for any key whose own file is absent, and it is not migrated. This
-mirrors the task-6736 rule for score files above. Each hit is logged at INFO
-naming the file, and `run_trial` logs one WARNING per call counting the legacy
-panels it reused and naming the directory. The packaged results directory and
-finished campaign directories hold such entries, and treating them as misses
-would re-spend every one of them. To re-measure one, delete it or rerun into a
-fresh `--results-dir`.
+cache hit only for a key whose turn cap is 30 and whose own file is absent,
+and it is not migrated. This mirrors the task-6736 rule for score files above.
+Every keyless panel ran at the fixed 30 turns the trial role used until task
+11728 (code: `reviewer_trial/runner.py::LEGACY_PANEL_MAX_TURNS`). At any other
+cap, production's default included, it is re-run into the keyed file and left
+in place. Each hit and each pass-over is logged at INFO naming the file.
+`run_trial` also logs one WARNING per call naming the directory. At 30 turns
+it counts the legacy panels it reused. At any other cap it counts, before any
+reviewer runs, the legacy panels that cap passes over. The packaged results
+directory and finished campaign directories hold such entries. Only `campaign`
+takes `--max-turns`: `smoke`, `calibrate`, `corpus-sanity`, `full`, `sweep`
+and `refresh` run at production's cap, so each one re-spends every packaged
+legacy panel it meets. To re-measure one at 30 turns, delete it or rerun into
+a fresh `--results-dir`.
 
 **One score loop.** `run_and_score` runs `run_trial`'s panels and then scores
 each one through `scorer.py::score_panel_run`, under the same usage gate as
@@ -1187,10 +1196,14 @@ stored, so a rerun measures that cell again.
 **Resuming a campaign.** Each trial directory's panels and scores are keyed by
 the invocation that wrote them. Resumed with the options it was started with,
 a campaign only reduces what is on disk. Resumed with a different
-`--pool`/`--no-pool` or `--diff-cap`, it runs and scores new panels beside the
-old ones, and the report reads only the new ones. A campaign whose panels
-predate the key only reduces, whatever options it is resumed with, because a
-legacy panel is reused under every key (see Backfill above).
+`--pool`/`--no-pool`, `--diff-cap` or `--max-turns`, it runs and scores new
+panels beside the old ones, and the report reads only the new ones. A campaign
+whose panels predate the key only reduces when resumed with `--max-turns 30`.
+Under any other cap its panels are re-run beside the legacy ones (see Backfill
+above). Keyed
+panels written before the turn cap joined the key (task 11728) ran at the old
+fixed 30 turns and are not reused, because their key digest differs: rerun
+into a fresh `--results-dir`, or pass `--max-turns 30` and accept the re-run.
 
 ### Terminal outcome (`terminal_kind`, task 4760)
 

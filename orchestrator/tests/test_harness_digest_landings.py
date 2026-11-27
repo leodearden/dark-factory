@@ -15,10 +15,7 @@ from pathlib import Path
 
 import pytest
 from _landing_history import LandingRepo, record_merge_done, record_train
-from test_harness_park_stop import (
-    _cost_store_factory,  # noqa: F401 -- reused cross-module fixture
-    _make_harness_with_mocks,
-)
+from test_harness_park_stop import _make_harness_with_mocks
 
 import orchestrator.digest as digest
 from orchestrator.config import OrchestratorConfig

@@ -7,7 +7,7 @@ reviewer panel's ``output_schema``/``json.loads`` fallback in
 ``TaskArtifacts.read_verdict(role.name)`` — the same
 clear→invoke→read→defensive-extract→fail-safe shape task 2483 (PRD task γ)
 established for the merger (see ``test_merger_disposition_verdict.py``) — and
-removes the reviewer's now-inert ``mcp__jcodemunch__*`` grant (fold-in κ).
+removes the reviewer's now-inert grant outside its verdict server (fold-in κ).
 
 ``TestRunReviewerVerdictRouting`` cases (a)-(b) (PASS / ISSUES_FOUND payloads
 returned verbatim) fail against the pre-δ structured_output/json.loads
@@ -41,6 +41,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
+from _review_issue_fixtures import contract_issue_without
 from _review_payloads import blocking_review
 from _workflow_helpers import _make
 from shared.cli_invoke import AgentResult, AllAccountsCappedException
@@ -49,7 +50,8 @@ from shared.usage_gate import SessionBudgetExhausted
 from orchestrator.agents.review_briefing import ReviewBriefing
 from orchestrator.agents.roles import REVIEWER_COMPREHENSIVE, reviewers_for
 from orchestrator.artifacts import ReviewsRootMissing
-from orchestrator.mcp.verdict_tools import _envelope
+from orchestrator.mcp.verdict_tools import _envelope, _submit_review_verdict
+from orchestrator.review_issue_contract import IssueField
 from orchestrator.reviewer_failure import (
     ReviewerFailure,
     ReviewerFailureKind,
@@ -62,9 +64,10 @@ from orchestrator.workflow_types import RequeueKind, classify_failure
 class TestReviewerGrantSurface:
     """Structural contract for the reviewer's tool grants (fold-in κ)."""
 
-    def test_no_jcodemunch_grant(self):
-        """The reviewer's inert jcodemunch grant has been removed."""
-        assert 'mcp__jcodemunch__*' not in REVIEWER_COMPREHENSIVE.allowed_tools
+    def test_only_mcp_grant_is_verdict_tools(self):
+        """The reviewer's whole MCP grant surface is its verdict server."""
+        mcp_grants = [t for t in REVIEWER_COMPREHENSIVE.allowed_tools if t.startswith('mcp__')]
+        assert mcp_grants == ['mcp__verdict-tools__*']
 
     def test_has_verdict_tools_grant(self):
         """The verdict-tools grant (added by β/task 2482) is present."""
@@ -181,6 +184,32 @@ class TestRunReviewerVerdictRouting:
 
         result = await f.wf._run_reviewer(REVIEWER_COMPREHENSIVE, 'diff')
 
+        assert result['verdict'] == 'ERROR'
+        assert result['reviewer'] == 'reviewer_comprehensive'
+
+    async def test_a_refused_kindless_submission_is_failsafe_error(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        """INV-6: a reviewer whose only submission the intake refused for a
+        missing kind leaves no verdict, so the gate reads ERROR, never a pass.
+        """
+        f = self._setup(tmp_path)
+        submissions: list[dict] = []
+
+        async def _invoke_submits_kindless_issue(_role, build_prompt, *args, **kwargs):
+            await build_prompt()
+            submissions.append(_submit_review_verdict(
+                f.artifacts, 'reviewer_comprehensive', 'sid',
+                reviewer='reviewer_comprehensive', verdict='ISSUES_FOUND',
+                issues=[contract_issue_without(IssueField.KIND)], summary='one finding',
+            ))
+            return AgentResult(success=True, output='submitted')
+
+        monkeypatch.setattr(f.wf, '_invoke', AsyncMock(side_effect=_invoke_submits_kindless_issue))
+
+        result = await f.wf._run_reviewer(REVIEWER_COMPREHENSIVE, 'diff')
+
+        assert [s['status'] for s in submissions] == ['error']
         assert result['verdict'] == 'ERROR'
         assert result['reviewer'] == 'reviewer_comprehensive'
 

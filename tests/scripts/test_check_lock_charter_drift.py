@@ -2,7 +2,7 @@
 
 WHY THIS SCRIPT EXISTS AT ALL, restated here because it is what every
 assertion below is shaped by.  On 2026-07-29 reify widened its lock-charter
-allowlist 36 -> 58 entries.  dark-factory's in-suite Tier-2 drift guard shells
+allowlist 36 -> 58 entries.  dark-factory's in-suite Tier-2 drift guard then shelled
 out to reify's ``scripts/lock-charter-guard.sh`` LIVE, so every dark-factory
 worktree's full suite went red at once, and task 3118's ``post_merge_verify``
 failed on a 7-file orchestrator-only diff that could not possibly have caused
@@ -13,8 +13,8 @@ by pytest, so a reify commit reports drift where drift belongs instead of
 blocking an unrelated dark-factory merge.
 
 THE OUTCOME CONTRACT IS THE WHOLE POINT, and it is why there is no skip state.
-The in-suite guards degrade to a pytest SKIP when reify is not checked out, and
-a skip is indistinguishable from a pass to anything reading an exit code — the
+The retired in-suite guards degraded to a pytest SKIP when reify was not checked
+out, and a skip is indistinguishable from a pass to anything reading an exit code — the
 precise conflation this task's other half fixes inside verify.  So this script
 has exactly three outcomes, ``EXIT_OK`` / ``EXIT_DRIFT`` / ``EXIT_UNAVAILABLE``,
 and "I could not look" is reported as loudly as "I looked and found drift".
@@ -43,11 +43,13 @@ from __future__ import annotations
 import errno
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
 
 import check_lock_charter_drift as drift
+import lock_charter_sibling
 import pytest
 import shared.reify_checkout as reify_checkout
 from shared.locking import EXTENSIONLESS_FILENAMES, FILE_EXTENSIONS, is_file_path
@@ -78,61 +80,10 @@ def _no_ambient_reify_root(monkeypatch):
     monkeypatch.delenv('REIFY_ROOT', raising=False)
 
 
-def _plant_guard(
-    repo: Path,
-    *,
-    extensions: list[str] | None = None,
-    extensionless: list[str] | None = None,
-    rc: int = 0,
-    sleep_secs: float | None = None,
-    warning: str | None = None,
-) -> Path:
-    """Write a FAKE reify ``scripts/lock-charter-guard.sh`` under *repo* and return it.
-
-    Mimics the real script's flag surface — ``--list-extensions`` and
-    ``--list-extensionless`` each print their vector one entry per line, and an
-    unrecognised flag prints usage to stderr and exits 2 (measured 2026-08-09 on
-    the live script, and recorded on ``_reify_guard_vector`` in the two in-suite
-    copies).  *rc* and *sleep_secs* exist to drive the BROKEN-emitter arms: a
-    script that is present and then fails, and one that hangs.  *warning* is a
-    ``printf`` format written to stderr before answering, so an octal escape in
-    it reaches the stream as a raw byte.
-    """
-    scripts_dir = repo / 'scripts'
-    scripts_dir.mkdir(parents=True, exist_ok=True)
-    script = scripts_dir / 'lock-charter-guard.sh'
-
-    def _emit(values: list[str] | None) -> str:
-        if not values:
-            # `printf '%s\n'` with no operands still prints one empty line, so
-            # an empty vector must emit nothing at all rather than a blank.
-            return ':'
-        joined = ' '.join(f"'{v}'" for v in values)
-        return f"printf '%s\\n' {joined}"
-
-    body = ['#!/usr/bin/env bash']
-    if warning is not None:
-        body.append(f"printf '{warning}\\n' >&2")
-    if sleep_secs is not None:
-        body.append(f'sleep {sleep_secs}')
-    if rc != 0:
-        body.append(f'echo "boom" >&2; exit {rc}')
-    body += [
-        'case "$1" in',
-        f'  --list-extensions) {_emit(extensions)} ;;',
-        f'  --list-extensionless) {_emit(extensionless)} ;;',
-        '  *) echo "usage: lock-charter-guard.sh --list-extensions" >&2; exit 2 ;;',
-        'esac',
-    ]
-    script.write_text('\n'.join(body) + '\n')
-    script.chmod(0o755)
-    return script
-
-
 def _agreeing_repo(tmp_path: Path) -> Path:
     """A planted reify checkout whose guard emits EXACTLY dark-factory's vectors."""
     repo = tmp_path / 'reify'
-    _plant_guard(repo, extensions=DF_EXTENSIONS, extensionless=DF_EXTENSIONLESS)
+    lock_charter_sibling.plant_reify_guard(repo, extensions=DF_EXTENSIONS, extensionless=DF_EXTENSIONLESS)
     return repo
 
 
@@ -176,7 +127,7 @@ class TestCheckVectors:
         """
         repo = tmp_path / 'reify'
         reify_exts = [e for e in DF_EXTENSIONS if e != 'csv'] + ['protobuf']
-        _plant_guard(repo, extensions=sorted(reify_exts), extensionless=DF_EXTENSIONLESS)
+        lock_charter_sibling.plant_reify_guard(repo, extensions=sorted(reify_exts), extensionless=DF_EXTENSIONLESS)
 
         report = drift.check_vectors(repo)
 
@@ -189,7 +140,7 @@ class TestCheckVectors:
     def test_reify_only_extension_does_not_manufacture_a_dark_factory_only_entry(self, tmp_path):
         """One-direction drift must populate exactly one list and leave the other empty."""
         repo = tmp_path / 'reify'
-        _plant_guard(
+        lock_charter_sibling.plant_reify_guard(
             repo,
             extensions=sorted([*DF_EXTENSIONS, 'protobuf']),
             extensionless=DF_EXTENSIONLESS,
@@ -204,7 +155,7 @@ class TestCheckVectors:
 
     def test_dark_factory_only_extension_does_not_manufacture_a_reify_only_entry(self, tmp_path):
         repo = tmp_path / 'reify'
-        _plant_guard(
+        lock_charter_sibling.plant_reify_guard(
             repo,
             extensions=[e for e in DF_EXTENSIONS if e != 'csv'],
             extensionless=DF_EXTENSIONLESS,
@@ -227,7 +178,7 @@ class TestCheckVectors:
         undeclarable on one side.
         """
         repo = tmp_path / 'reify'
-        _plant_guard(
+        lock_charter_sibling.plant_reify_guard(
             repo,
             extensions=DF_EXTENSIONS,
             extensionless=sorted([*DF_EXTENSIONLESS, 'Makefile']),
@@ -252,7 +203,7 @@ class TestCheckVectors:
         defect in any dark-factory branch.
         """
         repo = tmp_path / 'reify'
-        _plant_guard(
+        lock_charter_sibling.plant_reify_guard(
             repo,
             extensions=sorted([*DF_EXTENSIONS, 'protobuf']),
             extensionless=DF_EXTENSIONLESS,
@@ -266,7 +217,7 @@ class TestCheckVectors:
     def test_absent_guard_script_is_unavailable_and_never_ok(self, tmp_path):
         """A reify directory carrying no guard script did not answer the question.
 
-        This is the arm the in-suite guards turn into a pytest SKIP.  Here it
+        This is the arm the retired in-suite guards turned into a pytest SKIP.  Here it
         must be an outcome a caller can see, because a scheduled job whose
         sibling checkout has gone missing is exactly the case where a silent
         green is most dangerous: it would read as "the mirrors agree" forever.
@@ -287,14 +238,14 @@ class TestCheckVectors:
     def test_present_but_failing_guard_is_unavailable_not_ok_and_not_drift(self, tmp_path):
         """A broken emitter is not agreement and it is not disagreement.
 
-        Mirrors ``_reify_guard_vector``'s loud-on-broken rationale: an
+        The loud-on-broken rationale on ``drift._guard_vector``: an
         unrecognised flag on the live script exits 2, so a checker that
         swallowed a non-zero rc into "no output, therefore both vectors empty,
         therefore drift" — or worse, into OK — would report a confident answer
         it never obtained.
         """
         repo = tmp_path / 'reify'
-        _plant_guard(repo, extensions=DF_EXTENSIONS, extensionless=DF_EXTENSIONLESS, rc=3)
+        lock_charter_sibling.plant_reify_guard(repo, extensions=DF_EXTENSIONS, extensionless=DF_EXTENSIONLESS, rc=3)
 
         report = drift.check_vectors(repo)
 
@@ -309,7 +260,7 @@ class TestCheckVectors:
         with no output at all to diagnose it from.
         """
         repo = tmp_path / 'reify'
-        _plant_guard(
+        lock_charter_sibling.plant_reify_guard(
             repo,
             extensions=DF_EXTENSIONS,
             extensionless=DF_EXTENSIONLESS,
@@ -342,7 +293,7 @@ class TestCheckVectors:
     def test_non_utf8_stderr_beside_a_readable_answer_is_still_an_answer(self, tmp_path):
         """stdout is the answer and stderr only commentary: a garbled warning must not void a vector it could read."""
         repo = tmp_path / 'reify'
-        _plant_guard(
+        lock_charter_sibling.plant_reify_guard(
             repo,
             extensions=DF_EXTENSIONS,
             extensionless=DF_EXTENSIONLESS,
@@ -359,13 +310,13 @@ class TestGuardVectorHelper:
 
     def test_raises_guard_unavailable_on_nonzero_rc(self, tmp_path):
         repo = tmp_path / 'reify'
-        script = _plant_guard(repo, extensions=DF_EXTENSIONS, rc=3)
+        script = lock_charter_sibling.plant_reify_guard(repo, extensions=DF_EXTENSIONS, rc=3)
         with pytest.raises(drift.GuardUnavailable):
             drift._guard_vector(script, '--list-extensions')
 
     def test_raises_guard_unavailable_on_timeout(self, tmp_path):
         repo = tmp_path / 'reify'
-        script = _plant_guard(repo, extensions=DF_EXTENSIONS, sleep_secs=30)
+        script = lock_charter_sibling.plant_reify_guard(repo, extensions=DF_EXTENSIONS, sleep_secs=30)
         with pytest.raises(drift.GuardUnavailable):
             drift._guard_vector(script, '--list-extensions', timeout=0.5)
 
@@ -381,7 +332,7 @@ class TestGuardVectorHelper:
 
     def test_returns_the_sorted_stripped_vector(self, tmp_path):
         repo = tmp_path / 'reify'
-        script = _plant_guard(repo, extensions=['zz', 'aa', 'mm'])
+        script = lock_charter_sibling.plant_reify_guard(repo, extensions=['zz', 'aa', 'mm'])
         assert drift._guard_vector(script, '--list-extensions') == ['aa', 'mm', 'zz']
 
     def test_guard_unavailable_is_not_a_bare_exception(self):
@@ -398,7 +349,7 @@ class TestImportIsHermetic:
         """A fresh interpreter whose resolver and process spawners all raise
         must still import the module.
 
-        Module-level resolution is what makes the in-suite guards' constants
+        Module-level resolution is what made the retired in-suite guards' constants
         evaluate at IMPORT time and therefore un-steerable by ``monkeypatch``;
         here it would also make a scheduled job's ``--help`` depend on the
         ambient ``REIFY_ROOT``.  Patching the seams themselves, rather than
@@ -445,35 +396,6 @@ class TestImportIsHermetic:
 # ---------------------------------------------------------------------------
 
 
-def _plant_repo(root: Path, paths: list[str], *, gitlinks: list[str] | None = None) -> Path:
-    """`git init` a checkout at *root* with *paths* tracked, plus any *gitlinks*.
-
-    Gitlinks are planted with ``git update-index --add --cacheinfo 160000,...``
-    rather than a real submodule: that is what actually produces the mode column
-    the sweep filters on, without needing a second repo on disk or network.
-    """
-    root.mkdir(parents=True, exist_ok=True)
-    subprocess.run(['git', 'init', '-q', str(root)], check=True, capture_output=True)
-    for rel in paths:
-        target = root / rel
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text('x\n')
-    if paths:
-        subprocess.run(
-            ['git', '-C', str(root), 'add', '--', *paths], check=True, capture_output=True
-        )
-    for rel in gitlinks or []:
-        subprocess.run(
-            [
-                'git', '-C', str(root), 'update-index', '--add',
-                '--cacheinfo', f'160000,{"0" * 39}1,{rel}',
-            ],
-            check=True,
-            capture_output=True,
-        )
-    return root
-
-
 def _track_non_utf8_path(repo: Path) -> None:
     """Track a file in *repo* whose NAME is bytes that are not valid UTF-8.
 
@@ -502,7 +424,7 @@ class TestCheckCorpus:
         paths = ['a/b.py', 'docs/readme.md', 'ops/Dockerfile']
         for rel in paths:
             assert is_file_path(rel), f'oracle disagrees: {rel} must be accepted'
-        repo = _plant_repo(tmp_path / 'reify', paths)
+        repo = lock_charter_sibling.plant_tracked_repo(tmp_path / 'reify', paths)
 
         report = drift.check_corpus(repo)
 
@@ -522,7 +444,7 @@ class TestCheckCorpus:
             "this case needs an extension the allowlist REJECTS; if 'proto' has "
             'since been allowlisted, pick another absent one'
         )
-        repo = _plant_repo(tmp_path / 'reify', ['a/b.py', 'x/y.proto'])
+        repo = lock_charter_sibling.plant_tracked_repo(tmp_path / 'reify', ['a/b.py', 'x/y.proto'])
 
         report = drift.check_corpus(repo)
 
@@ -541,7 +463,7 @@ class TestCheckCorpus:
         were dropped it would surface as a finding and this case would fail —
         the exclusion is proven to be doing real work, not merely asserted.
         """
-        repo = _plant_repo(tmp_path / 'reify', ['a/b.py'], gitlinks=['vendor/sub.proto'])
+        repo = lock_charter_sibling.plant_tracked_repo(tmp_path / 'reify', ['a/b.py'], gitlinks=['vendor/sub.proto'])
 
         report = drift.check_corpus(repo)
 
@@ -558,7 +480,7 @@ class TestCheckCorpus:
         extension sweep stays scoped to dotted segments.
         """
         assert not is_file_path('README')
-        repo = _plant_repo(tmp_path / 'reify', ['README', 'a/b.py'])
+        repo = lock_charter_sibling.plant_tracked_repo(tmp_path / 'reify', ['README', 'a/b.py'])
 
         assert drift.check_corpus(repo)['findings'] == {}
 
@@ -579,7 +501,7 @@ class TestCheckCorpus:
         A byte offset into ``git ls-files`` output is not something an operator
         can act on; the path is.
         """
-        repo = _plant_repo(tmp_path / 'reify', ['a/b.py'])
+        repo = lock_charter_sibling.plant_tracked_repo(tmp_path / 'reify', ['a/b.py'])
         _track_non_utf8_path(repo)
 
         report = drift.check_corpus(repo)
@@ -594,13 +516,101 @@ class TestCheckCorpus:
         extension; the actionable unit is the extension, and one witness is
         enough to prove it is real.
         """
-        repo = _plant_repo(tmp_path / 'reify', ['a/one.proto', 'b/two.proto', 'c/three.sql'])
+        repo = lock_charter_sibling.plant_tracked_repo(tmp_path / 'reify', ['a/one.proto', 'b/two.proto', 'c/three.sql'])
 
         findings = drift.check_corpus(repo)['findings']
 
         assert set(findings) == {'proto', 'sql'}
         assert findings['proto'] in ('a/one.proto', 'b/two.proto')
         assert findings['sql'] == 'c/three.sql'
+
+
+class TestCheckExtensionless:
+    """``check_extensionless(reify_repo)`` — the extension-less half of the corpus sweep.
+
+    Before task 11623 these two reify-corpus properties were enforced ONLY by
+    the reify parametrizations of the in-suite guards, which read a live sibling
+    on the merge gate.  Those arms are gone, so this part is where the property
+    is still checked: an extension-less tracked file the predicate rejects (the
+    2026-11-23 ``scripts/canon-bin/guard/sccache`` shape), and an allowlisted
+    name that is also a DIRECTORY somewhere in the tree.
+    """
+
+    def test_allowlisted_extensionless_corpus_reports_ok(self, tmp_path):
+        paths = ['LICENSE', 'hooks/pre-commit', 'scripts/canon-bin/guard/sccache', 'a/b.py', 'docs/x.md']
+        for rel in paths:
+            assert is_file_path(rel), f'oracle disagrees: {rel} must be accepted'
+        repo = lock_charter_sibling.plant_tracked_repo(tmp_path / 'reify', paths)
+
+        report = drift.check_extensionless(repo)
+
+        assert report['exit_code'] == drift.EXIT_OK
+        assert report['status'] == 'ok'
+        assert report['findings'] == {}
+        assert report['collisions'] == {}
+
+    def test_unallowlisted_extensionless_tracked_file_is_drift(self, tmp_path):
+        """The Nov-23 shape: reify tracks a no-dot tool name dark-factory has not mirrored."""
+        assert not is_file_path('scripts/canon-bin/guard/newtool')
+        repo = lock_charter_sibling.plant_tracked_repo(
+            tmp_path / 'reify', ['a/b.py', 'scripts/canon-bin/guard/newtool'],
+        )
+
+        report = drift.check_extensionless(repo)
+
+        assert report['exit_code'] == drift.EXIT_DRIFT
+        assert report['status'] == 'drift'
+        assert report['findings'] == {'newtool': 'scripts/canon-bin/guard/newtool'}
+        assert report['collisions'] == {}
+        assert 'newtool' in report['detail']
+        assert 'scripts/canon-bin/guard/newtool' in report['detail']
+        assert 'NOT a fault in any dark-factory branch' in report['detail']
+
+    def test_allowlisted_name_used_as_a_directory_is_a_collision(self, tmp_path):
+        """A member that is also a directory name makes that directory declarable as a file lock."""
+        assert 'cargo' in EXTENSIONLESS_FILENAMES
+        repo = lock_charter_sibling.plant_tracked_repo(tmp_path / 'reify', ['tools/cargo/x.py'])
+
+        report = drift.check_extensionless(repo)
+
+        assert report['exit_code'] == drift.EXIT_DRIFT
+        assert report['findings'] == {}
+        assert report['collisions'] == {'cargo': 'tools/cargo/x.py'}
+        assert 'cargo' in report['detail']
+        assert 'tools/cargo/x.py' in report['detail']
+
+    def test_extensionless_gitlink_is_neither_a_finding_nor_a_collision(self, tmp_path):
+        """A mode-160000 mount point is a directory in THIS repo, correctly rejected."""
+        assert not is_file_path('vendor/sub')
+        repo = lock_charter_sibling.plant_tracked_repo(tmp_path / 'reify', ['a/b.py'], gitlinks=['vendor/sub'])
+
+        report = drift.check_extensionless(repo)
+
+        assert report['exit_code'] == drift.EXIT_OK
+        assert report['findings'] == {}
+        assert report['collisions'] == {}
+
+    def test_gitlink_named_like_an_allowlisted_name_is_a_collision(self, tmp_path):
+        """A submodule mount point is a directory here, so an allowlisted name on it would be declarable as a file lock."""
+        assert 'cargo' in EXTENSIONLESS_FILENAMES
+        repo = lock_charter_sibling.plant_tracked_repo(tmp_path / 'reify', ['a/b.py'], gitlinks=['vendor/cargo'])
+
+        report = drift.check_extensionless(repo)
+
+        assert report['exit_code'] == drift.EXIT_DRIFT
+        assert report['findings'] == {}
+        assert report['collisions'] == {'cargo': 'vendor/cargo'}
+
+    def test_non_git_directory_is_unavailable_and_never_ok(self, tmp_path):
+        plain = tmp_path / 'not-a-checkout'
+        plain.mkdir()
+
+        report = drift.check_extensionless(plain)
+
+        assert report['exit_code'] == drift.EXIT_UNAVAILABLE
+        assert report['status'] == 'unavailable'
+        assert report['findings'] == {}
+        assert report['collisions'] == {}
 
 
 class TestTrackedPaths:
@@ -613,7 +623,7 @@ class TestTrackedPaths:
         in-suite copies: a name list would silently stop excluding the day reify
         renames or adds a submodule.
         """
-        repo = _plant_repo(tmp_path / 'reify', ['a/b.py'], gitlinks=['vendor/sub.proto'])
+        repo = lock_charter_sibling.plant_tracked_repo(tmp_path / 'reify', ['a/b.py'], gitlinks=['vendor/sub.proto'])
 
         paths, gitlinks = drift.tracked_paths(repo)
 
@@ -629,7 +639,7 @@ class TestTrackedPaths:
     def test_raises_guard_unavailable_when_git_is_not_on_path(self, tmp_path, monkeypatch):
         """No ``git`` is "could not look": an escaping FileNotFoundError would
         exit 1, which a caller reads as DRIFT — a false accusation."""
-        repo = _plant_repo(tmp_path / 'reify', ['a/b.py'])
+        repo = lock_charter_sibling.plant_tracked_repo(tmp_path / 'reify', ['a/b.py'])
         empty_bin = tmp_path / 'empty-bin'
         empty_bin.mkdir()
         monkeypatch.setenv('PATH', str(empty_bin))
@@ -639,7 +649,7 @@ class TestTrackedPaths:
 
     def test_raises_guard_unavailable_when_git_hangs(self, tmp_path, monkeypatch):
         """A ``git`` stuck on a lock or a network filesystem is bounded, not waited on."""
-        repo = _plant_repo(tmp_path / 'reify', ['a/b.py'])
+        repo = lock_charter_sibling.plant_tracked_repo(tmp_path / 'reify', ['a/b.py'])
         fake_bin = tmp_path / 'fake-bin'
         fake_bin.mkdir()
         fake_git = fake_bin / 'git'
@@ -653,7 +663,7 @@ class TestTrackedPaths:
     def test_missing_git_makes_the_corpus_sweep_unavailable_not_drift(
         self, tmp_path, monkeypatch,
     ):
-        repo = _plant_repo(tmp_path / 'reify', ['a/b.py'])
+        repo = lock_charter_sibling.plant_tracked_repo(tmp_path / 'reify', ['a/b.py'])
         empty_bin = tmp_path / 'empty-bin'
         empty_bin.mkdir()
         monkeypatch.setenv('PATH', str(empty_bin))
@@ -663,7 +673,7 @@ class TestTrackedPaths:
         assert report['exit_code'] == drift.EXIT_UNAVAILABLE, report
 
     def test_non_utf8_tracked_path_raises_guard_unavailable(self, tmp_path):
-        repo = _plant_repo(tmp_path / 'reify', ['a/b.py'])
+        repo = lock_charter_sibling.plant_tracked_repo(tmp_path / 'reify', ['a/b.py'])
         _track_non_utf8_path(repo)
 
         with pytest.raises(drift.GuardUnavailable):
@@ -672,9 +682,9 @@ class TestTrackedPaths:
     def test_non_utf8_tracked_path_exits_unavailable_never_drift(self, tmp_path):
         """An escaping UnicodeDecodeError exits 1, which this script's own contract
         reads as DRIFT: could-not-look reported as a finding."""
-        repo = _plant_repo(tmp_path / 'reify', ['a/b.py'])
+        repo = lock_charter_sibling.plant_tracked_repo(tmp_path / 'reify', ['a/b.py'])
         _track_non_utf8_path(repo)
-        _plant_guard(repo, extensions=DF_EXTENSIONS, extensionless=DF_EXTENSIONLESS)
+        lock_charter_sibling.plant_reify_guard(repo, extensions=DF_EXTENSIONS, extensionless=DF_EXTENSIONLESS)
 
         env = {k: v for k, v in os.environ.items() if k != 'REIFY_ROOT'}
         proc = subprocess.run(
@@ -694,20 +704,20 @@ class TestCheckComposition:
     """``check`` — the worst of its parts, so an unavailable half is never masked."""
 
     def test_ok_when_both_halves_are_ok(self, tmp_path):
-        repo = _plant_repo(tmp_path / 'reify', ['a/b.py'])
-        _plant_guard(repo, extensions=DF_EXTENSIONS, extensionless=DF_EXTENSIONLESS)
+        repo = lock_charter_sibling.plant_tracked_repo(tmp_path / 'reify', ['a/b.py'])
+        lock_charter_sibling.plant_reify_guard(repo, extensions=DF_EXTENSIONS, extensionless=DF_EXTENSIONLESS)
 
         report = drift.check(repo)
 
         assert report['exit_code'] == drift.EXIT_OK
         assert report['status'] == 'ok'
-        assert set(report['parts']) == {'vectors', 'corpus'}
+        assert set(report['parts']) == {'vectors', 'corpus', 'extensionless'}
         assert report['parts']['vectors']['exit_code'] == drift.EXIT_OK
         assert report['parts']['corpus']['exit_code'] == drift.EXIT_OK
 
     def test_drift_in_either_half_alone_surfaces(self, tmp_path):
-        repo = _plant_repo(tmp_path / 'reify', ['x/y.proto'])
-        _plant_guard(repo, extensions=DF_EXTENSIONS, extensionless=DF_EXTENSIONLESS)
+        repo = lock_charter_sibling.plant_tracked_repo(tmp_path / 'reify', ['x/y.proto'])
+        lock_charter_sibling.plant_reify_guard(repo, extensions=DF_EXTENSIONS, extensionless=DF_EXTENSIONLESS)
 
         report = drift.check(repo)
 
@@ -723,7 +733,7 @@ class TestCheckComposition:
         Reporting OK because the half that COULD run agreed would be the same
         silent green as a pytest skip, one level up.
         """
-        repo = _plant_repo(tmp_path / 'reify', ['a/b.py'])  # no guard script planted
+        repo = lock_charter_sibling.plant_tracked_repo(tmp_path / 'reify', ['a/b.py'])  # no guard script planted
 
         report = drift.check(repo)
 
@@ -738,14 +748,106 @@ class TestCheckComposition:
         A drifting half plus an unavailable half is not a complete drift report:
         the unexamined half may hold worse. The exit code must say so.
         """
-        repo = _plant_repo(tmp_path / 'reify', ['x/y.proto'])  # corpus drifts
-        _plant_guard(repo, extensions=DF_EXTENSIONS, rc=3)  # vectors unavailable
+        repo = lock_charter_sibling.plant_tracked_repo(tmp_path / 'reify', ['x/y.proto'])  # corpus drifts
+        lock_charter_sibling.plant_reify_guard(repo, extensions=DF_EXTENSIONS, rc=3)  # vectors unavailable
 
         report = drift.check(repo)
 
         assert report['parts']['corpus']['exit_code'] == drift.EXIT_DRIFT
         assert report['parts']['vectors']['exit_code'] == drift.EXIT_UNAVAILABLE
         assert report['exit_code'] == drift.EXIT_UNAVAILABLE
+
+    def test_an_extensionless_finding_alone_is_drift(self, tmp_path):
+        """Agreeing vectors and a clean dotted corpus do not mask an extension-less finding."""
+        repo = lock_charter_sibling.plant_tracked_repo(
+            tmp_path / 'reify', ['a/b.py', 'scripts/canon-bin/guard/newtool'],
+        )
+        lock_charter_sibling.plant_reify_guard(repo, extensions=DF_EXTENSIONS, extensionless=DF_EXTENSIONLESS)
+
+        report = drift.check(repo)
+
+        assert report['parts']['vectors']['exit_code'] == drift.EXIT_OK
+        assert report['parts']['corpus']['exit_code'] == drift.EXIT_OK
+        assert report['parts']['extensionless']['exit_code'] == drift.EXIT_DRIFT
+        assert report['exit_code'] == drift.EXIT_DRIFT
+        assert 'newtool' in report['detail']
+
+    def test_an_unreadable_index_makes_both_corpus_parts_unavailable_beside_agreeing_vectors(self, tmp_path):
+        """One failed read of reify's index is "could not look" for both corpus sweeps, never a pass."""
+        repo = _agreeing_repo(tmp_path)  # a guard script, and no git checkout around it
+
+        report = drift.check(repo)
+
+        assert report['parts']['vectors']['exit_code'] == drift.EXIT_OK
+        assert report['parts']['corpus']['exit_code'] == drift.EXIT_UNAVAILABLE
+        assert report['parts']['extensionless']['exit_code'] == drift.EXIT_UNAVAILABLE
+        assert report['exit_code'] == drift.EXIT_UNAVAILABLE
+
+    def test_both_corpus_parts_judge_one_read_of_the_index(self, tmp_path, monkeypatch):
+        """One ``git ls-files`` per reconciliation: no two snapshots of a machine-operated checkout."""
+        repo = lock_charter_sibling.plant_tracked_repo(
+            tmp_path / 'reify', ['a/b.py', 'x/y.proto', 'scripts/canon-bin/guard/newtool'],
+        )
+        lock_charter_sibling.plant_reify_guard(repo, extensions=DF_EXTENSIONS, extensionless=DF_EXTENSIONLESS)
+        real_git = shutil.which('git')
+        assert real_git is not None
+        log = tmp_path / 'git-calls.log'
+        logging_bin = tmp_path / 'logging-bin'
+        logging_bin.mkdir()
+        (logging_bin / 'git').write_text(f'#!/bin/sh\necho "$*" >> \'{log}\'\nexec \'{real_git}\' "$@"\n')
+        (logging_bin / 'git').chmod(0o755)
+        monkeypatch.setenv('PATH', f'{logging_bin}{os.pathsep}{os.environ["PATH"]}')
+
+        report = drift.check(repo)
+
+        assert report['parts']['corpus']['findings'] == {'proto': 'x/y.proto'}
+        assert report['parts']['extensionless']['findings'] == {'newtool': 'scripts/canon-bin/guard/newtool'}
+        assert [line for line in log.read_text().splitlines() if 'ls-files' in line] == [
+            f'-C {repo} ls-files -s -z',
+        ]
+
+
+class TestDriftedByDirection:
+    """``drifted_by_direction`` — the one reader of a `check` report's part layout outside its builders."""
+
+    def test_names_every_drifted_name_in_its_direction_with_its_witness(self, tmp_path):
+        dropped = 'toml'
+        assert dropped in FILE_EXTENSIONS
+        repo = lock_charter_sibling.plant_tracked_repo(
+            tmp_path / 'reify', ['a/b.py', 'x/y.proto', 'scripts/canon-bin/guard/newtool', 'tools/cargo/x.py'],
+        )
+        lock_charter_sibling.plant_reify_guard(
+            repo,
+            extensions=sorted((FILE_EXTENSIONS - {dropped}) | {'zz'}),
+            extensionless=sorted([*EXTENSIONLESS_FILENAMES, 'newtool']),
+        )
+
+        only_in_reify, only_in_dark_factory = drift.drifted_by_direction(drift.check(repo))
+
+        assert {(d.name, d.witness) for d in only_in_reify} == {
+            ('zz', None),
+            ('newtool', None),
+            ('proto', 'x/y.proto'),
+            ('newtool', 'scripts/canon-bin/guard/newtool'),
+        }
+        assert len({d.kind for d in only_in_reify}) == 4
+        assert {(d.name, d.witness) for d in only_in_dark_factory} == {
+            (dropped, None),
+            ('cargo', 'tools/cargo/x.py'),
+        }
+
+    def test_an_ok_report_has_nothing_in_either_direction(self, tmp_path):
+        repo = lock_charter_sibling.plant_tracked_repo(tmp_path / 'reify', ['a/b.py'])
+        lock_charter_sibling.plant_reify_guard(repo, extensions=DF_EXTENSIONS, extensionless=DF_EXTENSIONLESS)
+
+        assert drift.drifted_by_direction(drift.check(repo)) == ([], [])
+
+    def test_a_report_that_compared_nothing_is_refused_not_read_as_empty(self, tmp_path):
+        report = drift.check(tmp_path / 'no-such-reify')
+        assert report['exit_code'] == drift.EXIT_UNAVAILABLE
+
+        with pytest.raises(KeyError):
+            drift.drifted_by_direction(report)
 
 
 # ---------------------------------------------------------------------------
@@ -757,8 +859,7 @@ class TestCheckComposition:
 # matrix, nearest-ancestor precedence, marker-less-dir shadowing, and the whole
 # REIFY_ROOT override contract — in one place, 40-plus cases.  Restating it here
 # would mean two suites to edit for one semantic change, which is the exact
-# duplication the promotion of that module to shared/ existed to remove (see
-# `TestReifyCheckoutAdapter`'s note in fused-memory's copy).
+# duplication the promotion of that module to shared/ existed to remove.
 #
 # What THIS file pins is only what is specific to THIS call site: that it
 # DELEGATES rather than keeping a private copy of the walk, that it binds the
@@ -875,12 +976,50 @@ class TestResolve:
         assert drift.resolve() == reify_checkout.ReifyCheckout(discovered, False)
 
 
+class TestReconcile:
+    """``reconcile(explicit=None)`` — resolution plus check, the body ``main()`` and the heal router share."""
+
+    def test_divergent_reify_root_sibling_is_drift_naming_the_new_name(self, tmp_path, monkeypatch):
+        repo = lock_charter_sibling.plant_divergent_reify(tmp_path / 'reify')
+        monkeypatch.setenv('REIFY_ROOT', str(repo))
+
+        report = drift.reconcile()
+
+        assert report['exit_code'] == drift.EXIT_DRIFT
+        assert report['status'] == 'drift'
+        assert report['parts']['vectors']['vectors']['extensionless']['only_in_reify'] == ['newtool']
+        assert report['parts']['extensionless']['findings'] == {
+            'newtool': 'scripts/canon-bin/guard/newtool',
+        }
+        assert 'newtool' in report['detail']
+
+    def test_missing_reify_root_is_unavailable_naming_the_path(self, tmp_path, monkeypatch):
+        missing = tmp_path / 'no-such-reify'
+        monkeypatch.setenv('REIFY_ROOT', str(missing))
+
+        report = drift.reconcile()
+
+        assert report['exit_code'] == drift.EXIT_UNAVAILABLE
+        assert report['status'] == 'unavailable'
+        assert str(missing) in report['detail']
+
+    def test_explicit_argument_outranks_reify_root(self, tmp_path, monkeypatch):
+        agreeing = lock_charter_sibling.plant_tracked_repo(tmp_path / 'agreeing', ['a/b.py'])
+        lock_charter_sibling.plant_reify_guard(agreeing, extensions=DF_EXTENSIONS, extensionless=DF_EXTENSIONLESS)
+        divergent = lock_charter_sibling.plant_divergent_reify(tmp_path / 'divergent')
+        monkeypatch.setenv('REIFY_ROOT', str(divergent))
+
+        report = drift.reconcile(str(agreeing))
+
+        assert report['exit_code'] == drift.EXIT_OK, report['detail']
+
+
 class TestMainCli:
     """``main(argv)`` — exit code, stream routing, and single-sourced wording."""
 
     def test_returns_the_reports_exit_code_on_ok(self, tmp_path, capsys):
-        repo = _plant_repo(tmp_path / 'reify', ['a/b.py'])
-        _plant_guard(repo, extensions=DF_EXTENSIONS, extensionless=DF_EXTENSIONLESS)
+        repo = lock_charter_sibling.plant_tracked_repo(tmp_path / 'reify', ['a/b.py'])
+        lock_charter_sibling.plant_reify_guard(repo, extensions=DF_EXTENSIONS, extensionless=DF_EXTENSIONLESS)
 
         rc = drift.main(['--reify-repo', str(repo)])
 
@@ -895,8 +1034,8 @@ class TestMainCli:
         A scheduled job that discards stdout and mails stderr is the ordinary
         shape; a drift report on stdout would be silently thrown away by it.
         """
-        repo = _plant_repo(tmp_path / 'reify', ['a/b.py'])
-        _plant_guard(
+        repo = lock_charter_sibling.plant_tracked_repo(tmp_path / 'reify', ['a/b.py'])
+        lock_charter_sibling.plant_reify_guard(
             repo,
             extensions=sorted([*DF_EXTENSIONS, 'protobuf']),
             extensionless=DF_EXTENSIONLESS,
@@ -910,7 +1049,7 @@ class TestMainCli:
         assert captured.out == ''
 
     def test_unavailable_goes_to_stderr(self, tmp_path, capsys):
-        repo = _plant_repo(tmp_path / 'reify', ['a/b.py'])  # no guard script
+        repo = lock_charter_sibling.plant_tracked_repo(tmp_path / 'reify', ['a/b.py'])  # no guard script
 
         rc = drift.main(['--reify-repo', str(repo)])
 
@@ -926,8 +1065,8 @@ class TestMainCli:
         run it most needs to parse — would have to fall back to scraping the
         human text.
         """
-        repo = _plant_repo(tmp_path / 'reify', ['x/y.proto'])
-        _plant_guard(repo, extensions=DF_EXTENSIONS, extensionless=DF_EXTENSIONLESS)
+        repo = lock_charter_sibling.plant_tracked_repo(tmp_path / 'reify', ['x/y.proto'])
+        lock_charter_sibling.plant_reify_guard(repo, extensions=DF_EXTENSIONS, extensionless=DF_EXTENSIONLESS)
 
         rc = drift.main(['--reify-repo', str(repo), '--json'])
 
@@ -936,7 +1075,7 @@ class TestMainCli:
         assert payload['exit_code'] == rc == drift.EXIT_DRIFT
 
     def test_json_is_emitted_for_an_unavailable_run_too(self, tmp_path, capsys):
-        repo = _plant_repo(tmp_path / 'reify', ['a/b.py'])
+        repo = lock_charter_sibling.plant_tracked_repo(tmp_path / 'reify', ['a/b.py'])
 
         rc = drift.main(['--reify-repo', str(repo), '--json'])
 
@@ -945,7 +1084,7 @@ class TestMainCli:
         assert payload['exit_code'] == rc == drift.EXIT_UNAVAILABLE
 
     def test_discovery_miss_message_is_single_sourced(self, monkeypatch, capsys):
-        """The miss wording must be EXACTLY what the in-suite gates say.
+        """The miss wording must be EXACTLY what `reify_skip_reason` says.
 
         Two call sites describing the same condition in two hand-rolled strings
         is how "reify is not checked out" and "your REIFY_ROOT is wrong" get
@@ -1031,9 +1170,9 @@ class TestMainCli:
         unavailable run exit 0 — a skip reported as a pass, which is exactly the
         conflation this script exists to end.
         """
-        repo = _plant_repo(tmp_path / 'reify', ['a/b.py'])
+        repo = lock_charter_sibling.plant_tracked_repo(tmp_path / 'reify', ['a/b.py'])
         if plant_guard:
-            _plant_guard(repo, extensions=DF_EXTENSIONS, extensionless=DF_EXTENSIONLESS)
+            lock_charter_sibling.plant_reify_guard(repo, extensions=DF_EXTENSIONS, extensionless=DF_EXTENSIONLESS)
 
         env = {k: v for k, v in os.environ.items() if k != 'REIFY_ROOT'}
         proc = subprocess.run(

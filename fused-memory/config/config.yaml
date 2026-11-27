@@ -98,6 +98,16 @@ routing:
   # config/schema.py::RoutingConfig.
   openai_api_url: null
   openai_api_key: null
+  # The routing call's model and effort; null keeps llm.model at temperature 0.0. See RoutingConfig.
+  model: null
+  reasoning_effort: null
+
+# The ChatGPT-plan proxy (CLIProxyAPI) every plan-routed call goes through. A
+# cap parks the work and pages L2; it never falls back onto OPENAI_API_KEY
+# (task 9944). Restart-tier.
+plan_route:
+  proxy_url: ${OPENAI_PLAN_PROXY_URL}
+  probe_interval_seconds: 900
 
 queue:
   semaphore_limit: ${SEMAPHORE_LIMIT:3}
@@ -110,6 +120,7 @@ queue:
   backend_read_timeout_seconds: ${BACKEND_READ_TIMEOUT:30}
   backend_write_timeout_seconds: ${BACKEND_WRITE_TIMEOUT:120}
   search_timeout_seconds: ${SEARCH_TIMEOUT:30}
+  # A relative value is anchored at the checkout holding fused-memory/, not the process CWD (fused_memory/config/checkout_anchor.py).
   data_dir: "${QUEUE_DATA_DIR:./data/queue}"
   # Error-aware retry budget (task 1936, membership revised by task 3585).
   # Errors whose class name matches any entry below — walked over the raised
@@ -506,10 +517,14 @@ reconciliation:
     accounts_file: "${DARK_FACTORY_ROOT:/home/leo/src/dark-factory}/config/usage-accounts.yaml"
 
 curator:
+  # Relative registry paths resolve against taskmaster.project_root (the
+  # TaskCurator cwd: the repo root in the deployed unit), not fused-memory/.
+  # Pinned by fused-memory/tests/test_curator_registries_deployed.py.
+
   # Cancelled-premise blocklist: YAML file listing premises proven wrong by
   # revert. Matching candidates are dropped before any LLM call. See
   # fused-memory/config/cancelled_premise_blocklist.yaml for the schema.
-  cancelled_premise_blocklist_path: "config/cancelled_premise_blocklist.yaml"
+  cancelled_premise_blocklist_path: "fused-memory/config/cancelled_premise_blocklist.yaml"
 
   # Recon code-fix premise-verification registry: YAML file listing
   # self-referential recon/fused-memory-internal code-fix premises an
@@ -518,7 +533,7 @@ curator:
   # premise (self-correcting — unlike cancelled_premise_blocklist_path's
   # unconditional forever-drop). See
   # fused-memory/config/recon_code_fix_premise_registry.yaml for the schema.
-  recon_code_fix_premise_registry_path: "config/recon_code_fix_premise_registry.yaml"
+  recon_code_fix_premise_registry_path: "fused-memory/config/recon_code_fix_premise_registry.yaml"
 
   # Recon claim-verification backstop (task 2438): when true, specific
   # code-level tokens a Stage 2 candidate attributes to a completed
@@ -537,7 +552,7 @@ curator:
   # stores, modifying ZERO repo files). Matching candidates are routed before
   # any LLM call to a deterministic PURE-GATE instead of the TDD architect.
   # See fused-memory/config/operational_ask_registry.yaml for the schema.
-  operational_ask_registry_path: "config/operational_ask_registry.yaml"
+  operational_ask_registry_path: "fused-memory/config/operational_ask_registry.yaml"
 
   # Background ticket janitor — see middleware/ticket_janitor.py.
   # Replaces per-call resolve_ticket waits with a server-side sweep that
@@ -563,53 +578,50 @@ summary_rebuild:
 
 # In-place Mem0 amendment (task 3088) — the update_memory MCP tool, which
 # rewrites a record's content and/or metadata while PRESERVING its Qdrant point
-# id. Every leaf is green-tier hot-reloadable (see OPERATIONS.md §6).
-# Only metadata_patch_allowed_agent_prefixes is active; every commented value
-# below, except the agent_prefix_sanctioned_use placeholder, is the shipped
-# default, shown so the knobs are discoverable without reading the schema.
-# Uncomment to change one.
-mem0_update:
-  # Kill switch. false denies every caller on the very next call, allowlisted
-  # or not — this is the knob to flip during a runaway-rewrite incident.
-  # enabled: true
-  # Two independent agent_id-prefix allowlists, one per arm. Widening the
-  # metadata bar ALONE is the supported way to admit an interactive tagging
-  # flow without granting content-amend authority: a mistagged record is cheap
-  # to notice and cheap to correct, a silent content rewrite is neither.
-  # agent_id is self-reported, so this deters misuse by cooperating callers
-  # rather than enforcing a security boundary.
-  #
-  # curator- is part of the SCHEMA DEFAULT (ruling 2026-08-12, promoting the
-  # 2026-08-11 esc-3524-1 ruling (b) from a per-machine override here to an
-  # all-deployments default). Both arms deliberately — gate 3200's
-  # retain-and-tag stamps retained peers via metadata-only patches, so
-  # content_amend alone would be the destructive half without the preserving
-  # half. The role each prefix declares is agent_prefix_sanctioned_use below.
-  # Full rationale: the Mem0UpdateConfig field descriptions in config/schema.py.
-  # content_amend_allowed_agent_prefixes: ['recon-stage-', 'curator-']
-  #
-  # link-heal- is owned by plans/write-triage-link-healing-prd.md H1 and task α
-  # (6181): the link-heal executor (fused-memory/scripts/link_heal.py) writes
-  # metadata-only heals as agent_id link-heal-<run8>, so it holds this arm and
-  # never the content-amend arm. This ACTIVE list overrides the schema default
-  # for this arm, so a future change to Mem0UpdateConfig's default
-  # metadata_patch_allowed_agent_prefixes must be mirrored here by hand.
-  metadata_patch_allowed_agent_prefixes: ['recon-stage-', 'curator-', 'link-heal-']
-  # The role each prefix above declares, rendered into the
-  # Mem0UpdateNotAuthorized refusal for the refusing arm's prefixes. The
-  # shipped default (Mem0UpdateConfig.agent_prefix_sanctioned_use) documents
-  # every prefix on either default allowlist. Setting it here REPLACES that map
-  # wholesale, so restate every entry and add one for any prefix added to
-  # either list. agent_id is self-reported: this makes the norm legible, not
-  # the gate enforceable. Unlike the values above, the placeholder below is
-  # NOT the default and cannot be uncommented as-is: a bare key is YAML null
-  # and fails validation.
-  # agent_prefix_sanctioned_use: {...}  # restate every entry of Mem0UpdateConfig's default
-  # Content-amend burst alarm: escalates, never blocks (a hard block would
-  # risk a legitimate large consolidation cycle failing mid-run over its own
-  # success count). Metadata-only calls do not count toward it.
-  # storm_threshold: 20
-  # storm_window_seconds: 3600.0
+# id. Every leaf is green-tier hot-reloadable (see OPERATIONS.md §6). Every
+# value below, except the agent_prefix_sanctioned_use placeholder, is the
+# shipped default, shown so the knobs are discoverable without reading the
+# schema. Uncomment to change one.
+# mem0_update:
+#   # Kill switch. false denies every caller on the very next call, allowlisted
+#   # or not — this is the knob to flip during a runaway-rewrite incident.
+#   enabled: true
+#   # Two independent agent_id-prefix allowlists, one per arm. Widening the
+#   # metadata bar ALONE is the supported way to admit an interactive tagging
+#   # flow without granting content-amend authority: a mistagged record is cheap
+#   # to notice and cheap to correct, a silent content rewrite is neither.
+#   # agent_id is self-reported, so this deters misuse by cooperating callers
+#   # rather than enforcing a security boundary.
+#   #
+#   # curator- is part of the SCHEMA DEFAULT (ruling 2026-08-12, promoting the
+#   # 2026-08-11 esc-3524-1 ruling (b) from a per-machine override here to an
+#   # all-deployments default). Both arms deliberately — gate 3200's
+#   # retain-and-tag stamps retained peers via metadata-only patches, so
+#   # content_amend alone would be the destructive half without the preserving
+#   # half. The role each prefix declares is agent_prefix_sanctioned_use below.
+#   # Full rationale: the Mem0UpdateConfig field descriptions in config/schema.py.
+#   content_amend_allowed_agent_prefixes: ['recon-stage-', 'curator-']
+#   #
+#   # link-heal- is owned by plans/write-triage-link-healing-prd.md H1, tasks
+#   # 6181 and 6431: the link-heal executor (fused-memory/scripts/link_heal.py)
+#   # writes metadata-only heals as agent_id link-heal-<run8>, so it holds only
+#   # this arm and never the content-amend arm.
+#   metadata_patch_allowed_agent_prefixes: ['recon-stage-', 'curator-', 'link-heal-']
+#   # The role each prefix above declares, rendered into the
+#   # Mem0UpdateNotAuthorized refusal for the refusing arm's prefixes. The
+#   # shipped default (Mem0UpdateConfig.agent_prefix_sanctioned_use) documents
+#   # every prefix on either default allowlist. Setting it here REPLACES that map
+#   # wholesale, so restate every entry and add one for any prefix added to
+#   # either list. agent_id is self-reported: this makes the norm legible, not
+#   # the gate enforceable. Unlike the values above, the placeholder below is
+#   # NOT the default and cannot be uncommented as-is: a bare key is YAML null
+#   # and fails validation.
+#   agent_prefix_sanctioned_use: {...}  # restate every entry of Mem0UpdateConfig's default
+#   # Content-amend burst alarm: escalates, never blocks (a hard block would
+#   # risk a legitimate large consolidation cycle failing mid-run over its own
+#   # success count). Metadata-only calls do not count toward it.
+#   storm_threshold: 20
+#   storm_window_seconds: 3600.0
 
 # Link-heal executor caps, link adjudicator knobs and the scheduled sweep
 # (tasks 6181, 6184, 7159; plans/write-triage-link-healing-prd.md H1, H2). Read
@@ -700,7 +712,7 @@ link_heal:
 # Deterministic auto-consolidation of Mem0 near-duplicate clusters (task 5237,
 # plans/memory-auto-consolidation-prd.md). Recon Stage 1 proposes a cluster, a
 # pure predicate rules on it, and a passing cluster is consolidated WITH NO
-# HUMAN IN THE LOOP. All fourteen leaves are green-tier hot-reloadable: they
+# HUMAN IN THE LOOP. All twenty-two leaves are green-tier hot-reloadable: they
 # are registered in `config/reload.py::RELOADABLE_FIELDS`, which is the
 # authoritative list, and `mcp__escalation__reload_config` applies a change to
 # any of them to a RUNNING server with no restart.
@@ -778,6 +790,24 @@ link_heal:
 #     procedural_knowledge: 1.0
 #     preferences_and_norms: 1.0
 #     observations_and_summaries: 0.7
+#   # The adjudicator (plans/consolidation-adjudicator-prd.md K7). The ranked
+#   # slice and the cap on adjudicator calls per cycle; 0 makes no call.
+#   max_adjudications_per_cycle: 6
+#   # Model and reasoning effort (null for a non-reasoning model). Both are part
+#   # of the adjudicator's identity, so changing either recalibrates it.
+#   adjudicator_model: gpt-6.1-sol
+#   adjudicator_reasoning_effort: low
+#   # Per-call timeout. Not part of the identity: retuning it never recalibrates.
+#   adjudicator_timeout_seconds: 60
+#   # Characters of each member's text shown to the adjudicator (identity).
+#   adjudicator_field_chars: 4000
+#   # Most members a proposal may carry to the adjudicator, the largest cluster
+#   # the eval set measures. At least member_min (identity).
+#   adjudicator_member_max: 8
+#   # Days a non-executed proposal outcome is kept.
+#   outcome_retention_days: 90
+#   # Days an original decision is reused for the same members.
+#   memo_days: 30
 
 write_triage:
   # OPERATOR KNOBS — hand-set, NOT calibration outputs. The keys above the

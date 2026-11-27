@@ -1842,8 +1842,8 @@ def test_memory_readings_js_load_order(
 
 # ---------------------------------------------------------------------------
 # Regression guard: system_health.js (task 6309) destructures window.DF_DATUM
-# and window.DF_TASKS_OFFLINE_BANNER at module scope, and tab_overview.jsx
-# destructures window.DF_SYSTEM_HEALTH — none with a fallback.
+# and window.DF_TASKS_OFFLINE_BANNER at module scope, and tab_overview.jsx and
+# tabs.jsx destructure window.DF_SYSTEM_HEALTH — none with a fallback.
 # ---------------------------------------------------------------------------
 
 _SYSTEM_HEALTH_PREFIX = '/static/redux/system_health.js'
@@ -1867,6 +1867,7 @@ _SYSTEM_HEALTH_ORDER_CASES = [
     (_DATUM_PREFIX, 'datum.js', _SYSTEM_HEALTH_PREFIX, 'system_health.js'),
     ('/static/redux/tasks_offline_banner.js', 'tasks_offline_banner.js', _SYSTEM_HEALTH_PREFIX, 'system_health.js'),
     (_SYSTEM_HEALTH_PREFIX, 'system_health.js', _TAB_OVERVIEW_PREFIX, 'tab_overview.jsx'),
+    (_SYSTEM_HEALTH_PREFIX, 'system_health.js', _TABS_PREFIX, 'tabs.jsx'),
 ]
 
 
@@ -1970,6 +1971,8 @@ _MODULE_EDGES = {
         'tab_tasks.jsx',
     )),
     'render_failure.js': _ModuleEdges(consumers=('app.jsx',)),
+    'performance_history.js': _ModuleEdges(consumers=('tabs.jsx',)),
+    'host_load_card.js': _ModuleEdges(consumers=('tab_overview.jsx',)),
     'poll_scope.js': _ModuleEdges(consumers=('data.js', 'app.jsx')),
     'chart_marks.js': _ModuleEdges(consumers=('charts.jsx', 'tab_escalation_analytics.jsx')),
     'quality_view.js': _ModuleEdges(reads=('chart_marks.js',)),

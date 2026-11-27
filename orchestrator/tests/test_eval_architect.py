@@ -599,6 +599,7 @@ class TestRunArchitectEval:
                 token for name in sorted(ARCHITECT.plan_tools_grants)
                 for token in ('--grant', name)
             ],
+            '--caller-role', ARCHITECT.name,
         ]
 
 
@@ -1173,7 +1174,7 @@ _SCORING_FIELDS = (
     'cost_usd', 'cost_source', 'terminal_kind', 'tests_pass',
     'role_under_test', 'replay_frame', 'input_tokens', 'output_tokens',
     'cache_read_tokens', 'cache_create_tokens', 'turns_used',
-    'tokens_per_second', 'workflow_duration_ms', 'is_local_model',
+    'tokens_per_second', 'workflow_duration_ms', 'cli_cost_untrusted',
 )
 
 
@@ -1192,13 +1193,13 @@ _DEFAULT_INVOKE_USAGE = {
     'input_tokens': 12000, 'output_tokens': 3000,
     'cache_read_tokens': 48000, 'cache_create_tokens': 6000,
     'turns_used': 9, 'tokens_per_second': 656.89,
-    'workflow_duration_ms': 4567, 'is_local_model': False,
+    'workflow_duration_ms': 4567, 'cli_cost_untrusted': False,
 }
 _NO_USAGE = {
     'input_tokens': 0, 'output_tokens': 0,
     'cache_read_tokens': 0, 'cache_create_tokens': 0,
     'turns_used': 0, 'tokens_per_second': 0.0,
-    'workflow_duration_ms': 0, 'is_local_model': False,
+    'workflow_duration_ms': 0, 'cli_cost_untrusted': False,
 }
 _ARCHITECT_CELL_STAMPS = {
     'tests_pass': None, 'role_under_test': 'architect',
@@ -1416,7 +1417,7 @@ _PERSISTED_FIELD_ROWS = [
             'input_tokens': 1000000, 'output_tokens': 500000,
             'cache_read_tokens': 0, 'cache_create_tokens': 0, 'turns_used': 3,
             'tokens_per_second': 109481.06, 'workflow_duration_ms': 4567,
-            'is_local_model': True,
+            'cli_cost_untrusted': True,
         },
         id='proxied-candidate-priced',
     ),

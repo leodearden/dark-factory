@@ -19,6 +19,8 @@ from dashboard.data import performance, redux_api
 from dashboard.data.datum import DatumState, validate_datum
 from dashboard.data.performance import (
     _HISTORY_CACHE,
+    EMPTY_HISTORY,
+    PerformanceHistory,
     PerformanceListing,
     _cutoff,
     _hour_bucketed_history,
@@ -2115,6 +2117,49 @@ class TestAggregatePerformanceHistoryWindowBoundary:
 
 
 # ---------------------------------------------------------------------------
+# One history_labels axis per project (task 10138)
+# ---------------------------------------------------------------------------
+
+TWO_HOURS = ('2026-09-30T10:00', '2026-09-30T11:00')
+
+
+class TestPerformanceHistory:
+    @pytest.mark.parametrize('series', ['p50', 'p95', 'one_pass', 'escalation'])
+    @pytest.mark.parametrize('length', [1, 3])
+    def test_a_series_off_the_axis_is_refused(self, series, length):
+        aligned = {'p50': (1, 2), 'p95': (3, 4), 'one_pass': (50.0, 100.0), 'escalation': (0.0, 25.0)}
+        misaligned = {**aligned, series: tuple(range(length))}
+
+        with pytest.raises(ValueError) as excinfo:
+            PerformanceHistory(labels=TWO_HOURS, **misaligned)
+
+        message = str(excinfo.value)
+        assert series in message
+        assert str(length) in message
+        assert '2' in message
+
+    def test_the_wire_carries_one_axis_and_label_less_blocks(self):
+        history = PerformanceHistory(
+            labels=TWO_HOURS, p50=(1, 2), p95=(3, 4), one_pass=(50.0, 100.0), escalation=(0.0, 25.0),
+        )
+
+        assert history.to_wire() == {
+            'history_labels': ['2026-09-30T10:00', '2026-09-30T11:00'],
+            'time_centiles_history': {'p50': [1, 2], 'p95': [3, 4]},
+            'one_pass_history': {'values': [50.0, 100.0]},
+            'escalation_history': {'values': [0.0, 25.0]},
+        }
+
+    def test_the_empty_history_is_the_same_shape_with_no_hours(self):
+        assert EMPTY_HISTORY.to_wire() == {
+            'history_labels': [],
+            'time_centiles_history': {'p50': [], 'p95': []},
+            'one_pass_history': {'values': []},
+            'escalation_history': {'values': []},
+        }
+
+
+# ---------------------------------------------------------------------------
 # Cards and sparklines share one wall-clock window (task 5594)
 # ---------------------------------------------------------------------------
 
@@ -2233,7 +2278,7 @@ class TestCardsShareTheWallClockWindow:
             [active_idle_conn], days=CARDS_DAYS, now=CARDS_NOW,
         )
         assert sum(entry['count'] for entry in paths['active']) == 3
-        assert history['active']['time_centiles_history']['labels'] == ACTIVE_IN_WINDOW_HOURS
+        assert history['active'].labels == tuple(ACTIVE_IN_WINDOW_HOURS)
 
     @pytest.mark.asyncio
     async def test_default_now_is_the_wall_clock(self, tmp_path, empty_escalations_dir):
@@ -2454,14 +2499,15 @@ class TestPerformanceCardsDatum:
         active = performance_by_label['active']
         assert active['cards']['state'] == 'fresh'
         assert sum(entry['count'] for entry in active['cards']['value']['paths']) == 3
-        assert active['time_centiles_history']['labels'] == ACTIVE_IN_WINDOW_HOURS
+        assert active['history_labels'] == ACTIVE_IN_WINDOW_HOURS
 
         idle = performance_by_label['idle']
         assert idle['cards']['state'] == 'stale'
         assert idle['cards']['as_of'] == (CARDS_NOW - timedelta(days=20)).isoformat()
-        assert idle['time_centiles_history'] == {'labels': [], 'p50': [], 'p95': []}
-        assert idle['one_pass_history'] == {'labels': [], 'values': []}
-        assert idle['escalation_history'] == {'labels': [], 'values': []}
+        assert idle['history_labels'] == []
+        assert idle['time_centiles_history'] == {'p50': [], 'p95': []}
+        assert idle['one_pass_history'] == {'values': []}
+        assert idle['escalation_history'] == {'values': []}
 
     def test_an_unknown_listing_is_served_as_the_unknown_wire_datum(self):
         listing = unread_listing('no runs.db could be read (1 of 1)', days=CARDS_DAYS)
@@ -2756,12 +2802,9 @@ class TestCancelOutcomesAreNotCounted:
             [cancels_conn], days=CARDS_DAYS, now=CARDS_NOW,
         )
         proj = history['proj']
-        assert proj['one_pass_history'] == {
-            'labels': ['2026-09-30T10:00', '2026-09-30T11:00'], 'values': [0.0, 100.0],
-        }
-        assert proj['escalation_history'] == {
-            'labels': ['2026-09-30T10:00', '2026-09-30T11:00'], 'values': [0.0, 0.0],
-        }
+        assert proj.labels == ('2026-09-30T10:00', '2026-09-30T11:00')
+        assert proj.one_pass == (0.0, 100.0)
+        assert proj.escalation == (0.0, 0.0)
         assert 'drained' not in history
 
     @pytest.mark.asyncio
@@ -2925,9 +2968,8 @@ class TestCompletionPathTaxonomy:
         ]
         async with _runs_conn_of(tmp_path, rows) as conn:
             history = await aggregate_performance_history([conn], days=CARDS_DAYS, now=CARDS_NOW)
-        assert history['proj']['one_pass_history'] == {
-            'labels': ['2026-09-30T11:00'], 'values': [66.7],
-        }
-        assert history['proj']['time_centiles_history'] == {
-            'labels': ['2026-09-30T11:00'], 'p50': [1000], 'p95': [1000],
-        }
+        proj = history['proj']
+        assert proj.labels == ('2026-09-30T11:00',)
+        assert proj.one_pass == (66.7,)
+        assert proj.p50 == (1000,)
+        assert proj.p95 == (1000,)

@@ -52,7 +52,7 @@ Understanding the system helps you form accurate root-cause hypotheses without p
 
 ### Root-cause classes and where they surface
 
-**Infra** — fused-memory/Neo4j/Qdrant/jobserver down, disk full:
+**Infra** — fused-memory, FalkorDB, Qdrant or the jobserver down, or disk full:
 - Signature: burst of `infra_issue` and/or MCP-error escalations across **unrelated tasks** in short succession
 - You are read-only: you can *hypothesize* infra from these symptoms but cannot probe host health (no `df`, `systemctl`, `docker` — all blocked). The case where infra kills the auto-watcher itself is covered by the supervisor failsafe.
 
@@ -62,7 +62,7 @@ Understanding the system helps you form accurate root-cause hypotheses without p
 
 **Design** — PRD mis-decomposition / wrong architecture → sibling tasks of the same PRD all stalling:
 - Signature: `design_concern` / `scope_violation` / `risk_identified` escalations clustered around **one subsystem or one set of sibling tasks**
-- RCA tool: fused-memory `get_tasks` to identify parent task, `search` for related design decisions
+- RCA tool: fused-memory `get_task` on each escalated task to compare its `metadata.prd_path` and its `dependencies` (a task record has no parent field), `search_tasks` on the PRD title for siblings that have not escalated, `search` for related design decisions
 
 **Monitor signal** — a synthetic sentinel `task_id` that reports ON a task rather than recording work done on one:
 - Signature: the `task_id` is not a task number but a sentinel — `__recovery_veto_streak__<real_task_id>` (the same recovery veto held a task for N consecutive sweeps) and, by the same shape, `__zero_progress_requeue__<real_task_id>`. The record pins nothing real: the sentinel exists precisely so that observing a hold cannot deepen it, which is why an open L2 in this class never blocks the task it names.
@@ -79,7 +79,7 @@ Deepen RCA when you observe **any** of the following signals:
 
 - **Repeated failures on the same module or merge** — two or more `task_failure` escalations referencing the same file path or recent commit
 - **Burst of infra symptoms** — three or more `infra_issue` or MCP-error escalations in one drain cycle, especially from unrelated tasks
-- **Sibling tasks of one PRD all stalling** — multiple escalations whose task IDs share the same parent task (check via `mcp__fused-memory__get_tasks`)
+- **Sibling tasks of one PRD all stalling** — multiple escalations whose tasks share one `metadata.prd_path` or depend on the same task (check via `mcp__fused-memory__get_task` on each escalated task, reading `metadata.prd_path` and `dependencies`, since a task record has no parent field; then `mcp__fused-memory__search_tasks` on the PRD title for siblings that have not escalated)
 - **Same category + overlapping summaries** from distinct tasks with no obvious individual root cause
 
 Without these signals, log the escalation category and summary, apply the routing table (step 5), and move on.
@@ -94,10 +94,12 @@ The auto-watcher's allowed tools strictly limit what you can access. Use these f
 | `Bash(git log ...)` | Inspect recent commits on a module or branch |
 | `Bash(git diff ...)` | Diff between commits or branches to identify breaking changes |
 | `Bash(git show ...)` | Read a specific commit's diff |
+| `Bash(git cat-file ...)` | Probe the existence (`-e`) or type (`-t`) of an object or a `<ref>:<path>` — the orphan-reaper investigation step and close conditions 2 and 3 |
 | `Bash(git status ...)` | Working-tree state at the project root |
 | `python3 $DARK_FACTORY_ROOT/scripts/task_event_timeline.py` | List and count one task's `runs.db` events before a `root_cause`/`evidence` narrative joins them (read-only). Advisory entry: not in `orchestrator/src/orchestrator/harness.py::_WATCHER_ALLOWED_TOOLS`; it runs because the rotation's `bypassPermissions` mode admits Bash, as `scripts/watcher-rearm.sh` does |
 | `mcp__fused-memory__get_task` | Full task record including metadata and recent history |
-| `mcp__fused-memory__get_tasks` | Task tree — useful for finding sibling tasks of the same parent |
+| `mcp__fused-memory__get_tasks` | Filtered task list — pass `statuses`, `fields` and `page_size`, and page with `offset` until `pagination.has_more` is false before treating a miss as absence; never call it bare (it returns every task in the store). Use it only on a filter narrow enough to page through: whether a task for X already exists is a `search_tasks` question |
+| `mcp__fused-memory__search_tasks` | Semantic search over filed tasks, each hit carrying its current `status`: the existence check for "is there already a task for X". Its corpus excludes deferred and uncommitted tasks |
 | `mcp__fused-memory__search` | Semantic search for prior decisions, related tasks, conventions |
 | `mcp__escalation__get_escalation` | One full escalation record by id, archive included |
 | `mcp__escalation__get_task_escalation_history` | Every escalation ever filed for one task, archive included, as a `{task_id, count, level_filter, escalations}` envelope. It has no `compact`, so the drain's cross-check keeps `get_task_escalations(compact=True)` ([Draining pending escalations](#draining-pending-escalations)) |
@@ -108,7 +110,7 @@ The filing pair `mcp__fused-memory__submit_task` / `mcp__fused-memory__resolve_t
 
 **MCP tool names are per-server.** The `mcp__<server>__` prefix names the server that owns a tool.
 
-- **Task records** are read ONLY through `mcp__fused-memory__get_task` / `mcp__fused-memory__get_tasks` — the escalation server has no `get_task`. This rotation's escalation reads return escalation records, not task records: `mcp__escalation__get_pending_escalations` (pending records; full rows unless `compact=True`), `mcp__escalation__get_task_escalations` (every escalation filed for one task, archive included), `mcp__escalation__get_task_escalation_history` (the same set as a self-describing envelope) and `mcp__escalation__get_escalation` (one record by id, archive included).
+- **Task records** are read ONLY through `mcp__fused-memory__get_task` / `mcp__fused-memory__get_tasks` / `mcp__fused-memory__search_tasks` — the escalation server has no `get_task`. This rotation's escalation reads return escalation records, not task records: `mcp__escalation__get_pending_escalations` (pending records; full rows unless `compact=True`), `mcp__escalation__get_task_escalations` (every escalation filed for one task, archive included), `mcp__escalation__get_task_escalation_history` (the same set as a self-describing envelope) and `mcp__escalation__get_escalation` (one record by id, archive included).
 - **Reading one full escalation record.** Call `mcp__escalation__get_escalation(escalation_id=<id>)`. It is archive-inclusive and returns the full `Escalation.to_dict()` (`escalation/src/escalation/models.py`), which carries every field, including `detail` and `pin_declared_reason`. If `get_escalation` is missing from your toolset or the call is refused (an orchestrator not yet restarted onto the task-3176 grant can still list the tool but deny it), fall back to a non-compact `mcp__escalation__get_pending_escalations(task_id=<its task_id>)` — or `mcp__escalation__get_task_escalations(task_id=<its task_id>)` to include the archive — and pick the row by `id`; those full rows are the same shape. Trying `get_escalation` first is safe: [Graceful Degradation](#graceful-degradation)'s never-a-trial-call rule guards the tools whose call mutates state, and this one is a read.
 - **Tools the server lists but this rotation is not granted.** The escalation server's MCP instructions (`escalation/src/escalation/server_instructions.py`) describe what the SERVER offers. Of the reads it lists, this rotation is not granted `get_task_runtime_state`; it is also not granted `declare_pin` (see [Declared pins](#declared-pins-a-close-can-be-refused-declared_pin_refused)) or any merge-queue mutator ([Hard Constraints](#hard-constraints--never-violate)). The rotation's contract is to call only what `orchestrator/src/orchestrator/harness.py::_WATCHER_ALLOWED_TOOLS` lists (see [Headless-mode permission gotchas](#headless-mode-permission-gotchas-credit-external-pr-4)).
 
@@ -125,7 +127,7 @@ The top-level rotation runs on sonnet (task 2629) to keep the common case — me
 ### Hypothesis formation
 
 A hypothesis is a **stable, human-readable string** you will pass as `root_cause` to `promote_to_l2`. It should be specific enough to deduplicate (the server uses it as a dedup key) but not so specific that it prevents the L2 from evolving as more members are added:
-- Good: `"bad-merge-to-main-breaks-scheduler-imports"`, `"neo4j-connectivity-outage"`, `"prd-decomposition-scope-overlap-in-reconciler"`
+- Good: `"bad-merge-to-main-breaks-scheduler-imports"`, `"falkordb-connectivity-outage"`, `"prd-decomposition-scope-overlap-in-reconciler"`
 - Too vague: `"infra"`, `"failure"`
 - Too specific: `"task-42-import-error-line-17-of-reconciler.py"` (won't match task-43's variant)
 
@@ -730,7 +732,7 @@ These categories require only admin-level MCP operations. Dispatch them directly
 
 Agent discovered it needs to touch files beyond its assigned scope.
 
-**This category is split, and only one half is autonomous.** Path-guard synthetic-anchor records (no real task) are closed autonomously by the branch immediately below. Every **real-task** `scope_violation` is a **judgement-class** item that you `promote_to_l2` — no mechanism exists for you to deliver a scope widening, so resolving one autonomously would re-pend it into an escalate/resume loop. The steps further below trace that; do not treat this heading's "handle and resolve" framing as licence to resume one.
+**This category is split.** Path-guard synthetic-anchor records (no real task) are closed autonomously by the branch immediately below. A real-task `scope_violation` is resumed with a file-level `granted_files` grant only when the request is a clean widening of what the task already does, and promoted to L2 otherwise; "Any other `scope_violation`" below gives both tests. Do not read this heading's "handle and resolve" framing as licence to resume anything that is not a clean file-level widening.
 
 ##### Path-guard synthetic-anchor audit records (no real task — close, do not resume)
 
@@ -838,8 +840,24 @@ Agent found it depends on work that isn't done yet.
 
 1. Check if the prerequisite is an **existing incomplete task** in fused-memory:
    ```
-   mcp__fused-memory__get_tasks(project_root=<project_root>)
+   mcp__fused-memory__search_tasks(project_root=<project_root>, query="<the prerequisite, in the agent's words>")
    ```
+   Then `mcp__fused-memory__get_task` on each candidate whose `status` is not `done` or `cancelled`, to confirm it is the prerequisite. A `deferred` prerequisite is invisible here: the `search_tasks` corpus excludes deferred tasks.
+
+   If the existence check cannot run — `search_tasks` is missing from your toolset, the call is refused (an orchestrator not yet restarted onto the task-10426 grant can still list the tool but deny it), or it returns an `error` payload — that is not "no match", and step 3 does not apply. Do not fall back to paging `get_tasks`: each page is bounded, but the incomplete set is thousands of rows, and reading them all would spend the rotation's context on one record. Promote instead, saying the existence check could not run, never that no task exists:
+   ```python
+   mcp__escalation__promote_to_l2(
+     task_id=<task_id>,
+     agent_role="escalation-watcher-auto",
+     member_ids=[<escalation_id>],
+     root_cause="dependency-check-unavailable:" + <dep_description_slug>,
+     evidence=<the refusal or error text, verbatim>,
+     options=["A: re-run the existence check after the orchestrator restarts onto the search_tasks grant", "B: link the prerequisite by hand (add_dependency), creating it first if it does not exist", "C: something else"],
+     summary="dependency_discovered — existence check unavailable for: " + <dep_description>,
+     category="dependency_discovered",
+   )
+   ```
+   Add to digest: `PROMOTED (L2): dependency_discovered — <task_id> — existence check unavailable: <error>`
 2. **If a matching incomplete task exists:**
    ```
    mcp__fused-memory__add_dependency(id=<task_id>, depends_on=<dep_id>, project_root=<project_root>)
@@ -983,11 +1001,18 @@ git diff-tree --no-commit-id --name-only -r <stale_commit>
 | 4 | Branch tip is an ancestor of main | `git merge-base --is-ancestor <branch> main` exits `0` (YES) | never-merged hollow-done (task 2729's class) |
 | 5 | Amend/rebase-fold signature | orphan is a commit (investigation step), **not** itself an ancestor of main (`git merge-base --is-ancestor <stale_commit> main` exits non-zero), and its deliverable path(s) are present on main (condition 2) | confirms this is genuinely the amend-fold shape, not a coincidence |
 
-Condition 3 detail: read `task["metadata"].get("delivered_checks")` — a list of `{name, kind: "grep"|"script", ...}` descriptors (CLAUDE.md "Delivered-check dependency gate"; `orchestrator/src/orchestrator/delivered_checks.py`). The scheduler's real check runs `git grep`/the script directly — both outside your granted toolset — so approximate read-only, per kind:
-- `grep`-kind with declared `paths`: for each path, `git show main:<path>` (allowed) and read whether `pattern` is present in the dumped content; the check DELIVERS when that presence/absence matches `expect` (`"present"` wants a match, `"absent"` wants none).
+Condition 3 detail: read `task["metadata"].get("delivered_checks")` — a list of `{name, kind: "grep"|"path"|"script", ...}` descriptors (CLAUDE.md "Delivered-check dependency gate"; `orchestrator/src/orchestrator/delivered_checks.py`). The scheduler's real check runs `git grep`/`git ls-tree`/the script directly — all outside your granted toolset — so approximate read-only, per kind:
+- `grep`-kind with declared `paths`: the scheduler's real check runs `pattern` as an EXTENDED REGEX — `git grep -E -e <pattern> main [-- <paths>]`, built by `shared/src/shared/delivered_check_polarity.py::build_grep_argv` (that module's PARITY CONTRACT is the one home for these semantics), then `shared/src/shared/delivered_check_polarity.py::interpret_grep_rc` turns the exit code into the verdict: PASS on a match when `expect="present"`, PASS on no match otherwise. Your read-only stand-in — `git show main:<path>` (allowed) plus reading whether `pattern` occurs in the dumped content — is a LITERAL SUBSTRING read, and the two agree only when `pattern` is **provably literal**: it contains none of the ERE metacharacters `.` `*` `+` `?` `[` `]` `^` `$` `(` `)` `{` `}` `|` and no backslash — if in any doubt, it is not provably literal. Otherwise they disagree in both directions: a pattern `git grep -E` would match can be literally absent (an alternation such as `d3|plotly|recharts|cytoscape`, or a regex-escaped literal such as `or await self\.git_ops\.get_main_sha\(\)`), and conversely a raw escaped pattern can appear literally in a file (manifests quote patterns verbatim) while the ERE it denotes does not match there. Both disagreements read as DELIVERED when the truth is FAILED — a false-safe that auto-closes the escalation and masks the hollow-done capability loss condition 3 exists to catch:
+  - `expect="absent"` (any pattern, whether or not it looks literal): not feasibly verifiable read-only — treat as **failed**. Absence cannot be established by a literal read, and a wrong "absent" is the false-safe direction.
+  - `expect="present"`: DELIVERS only when the pattern is provably literal, `git cat-file -t main:<path>` prints `blob` for EVERY declared path, and the literal read finds the pattern in the `git show main:<path>` output. Require `blob` because a directory dumps a listing of child entry names, not file contents, so a literal pattern can "hit" a filename there. Any declared path that is not a `blob` — a `tree`, a glob pathspec, an unresolvable path — makes the check **failed**, even when the other declared paths are files. A non-literal pattern or a literal miss is **failed** too.
+- `path`-kind: the scheduler's real check, built by `shared/src/shared/delivered_check_polarity.py::build_path_argv` and read by `shared/src/shared/delivered_check_polarity.py::interpret_path_listing`, asks whether each listed path exists on main, a file or a directory alike, and every listed path must agree with `expect`:
+  - `expect="present"`: DELIVERS when `git cat-file -e main:<path>` exits `0` for EVERY listed path; any non-zero exit is **failed**.
+  - `expect="absent"`: treat as **failed**. `git cat-file -e` exits non-zero both for an absent path and for one it could not evaluate, and a wrong "absent" is the false-safe direction.
 - `grep`-kind with no declared `paths` (repo-wide), or any `script`-kind check: not feasibly verifiable read-only — treat as **failed**.
 
 No declared checks trivially satisfies condition 3.
+
+These rules make condition 3 a narrow auto-close path: most `grep`-kind checks will promote. That is the intended, non-masking degradation, not a malfunction, mirroring condition 4's ref-pruning skew below: it can only produce MORE promotions, never fewer, and follows this section's own "When unsure, promote." posture.
 
 Condition 4 detail: this check depends on the branch ref named in the reaper's `[note]` line (see Extraction above) still resolving at the project root. Branch refs are not guaranteed to survive indefinitely post-merge — e.g. `task/1625`, an older merged task branch, no longer resolves as of this writing, confirming refs do get pruned over time and this is not merely a hypothetical risk. When the named branch does not resolve, `git merge-base --is-ancestor <branch> main` fails fatally (`fatal: Not a valid object name '<branch>'`, exit `128`) rather than cleanly reporting "not an ancestor" (exit `1`) — treat a fatal/unresolvable-ref result exactly like a missing branch note: condition 4 cannot be verified → PROMOTE, and note in the promotion that the ref did not resolve (as distinct from "resolved but not an ancestor") so a human can tell branch-pruning inertness apart from a genuine never-merged case. Expect this handler's close rate to skew toward more-recently-merged subjects and to fail-safe to promote once a subject's branch is eventually pruned — that is the intended, non-masking degradation, not a malfunction.
 
@@ -1011,10 +1036,10 @@ mcp__escalation__resolve_issue(
 ```
 Add to digest: `AUTO-CLOSED (L1 <esc_id>): orphan-reaper-amend-folded-step-recurring-df — <task_id> — <one-line summary of the 5 conditions> [benign]`
 
-**Default: promote.** Any failed condition — a GC'd/unresolvable `stale_commit` object, an absent, repo-wide, or `script`-kind `delivered_checks` entry, an absent deliverable path, a missing or unresolvable (pruned) branch ref, or a tip that is not an ancestor of main — routes to `promote_to_l2` exactly like any other [promote-to-L2](#promote-to-l2) category, with `root_cause="orphan-reaper-amend-fold:<task_id>"` and `category=esc["category"]`. **When unsure, promote.** `harness-escalation-revalidation-sweep` remains the regression backstop that re-validates closed records.
+**Default: promote.** Any failed condition — a GC'd/unresolvable `stale_commit` object, an absent deliverable path, a `delivered_checks` entry that does not DELIVER under Condition 3 detail above, a missing or unresolvable (pruned) branch ref, or a tip that is not an ancestor of main — routes to `promote_to_l2` exactly like any other [promote-to-L2](#promote-to-l2) category, with `root_cause="orphan-reaper-amend-fold:<task_id>"` and `category=esc["category"]`. **When unsure, promote.** `harness-escalation-revalidation-sweep` remains the regression backstop that re-validates closed records.
 
 **Non-regression.**
-- **HOLLOW-DONE** (`found_on_main`-done, capability absent from main — task 2729's class): conditions 2/3/4 must **fail** here → promote. Never close on `status == "done"` alone — that is exactly the trap the `stale_task_scoped` carve-out (see [Auto-closing a rubber-stamp L2](#auto-closing-a-rubber-stamp-l2-narrow-close_only-carve-out)) would fall into if applied to this class.
+- **HOLLOW-DONE** (`found_on_main`-done, capability absent from main — task 2729's class): conditions 2/3/4 must **fail** here → promote. Never close on `status == "done"` alone — that is exactly the trap the `stale_task_scoped` carve-out (see [Auto-closing a rubber-stamp L2](#auto-closing-a-rubber-stamp-l2-narrow-close_only-carve-out)) would fall into if applied to this class. Condition 3's `expect="absent"` rule above is what makes it capable of failing here for a regex-bearing check — before it, a regex-only `expect="absent"` check read as DELIVERED and let condition 3 pass, precisely the hollow-done mask this bullet forbids.
 - **PARTIAL LOSS** (a whole file/step dropped): condition 2 fails → promote.
 - **Task 2725 is unchanged.** The orphan-L0 reaper's merged-family dismiss path (`_is_done_step_commit_orphan` + `_is_terminal_merged`) is untouched by this section — this only adds an L1 handler for the promoted L1s that already slip past that dismiss.
 
@@ -1208,7 +1233,7 @@ mcp__escalation__promote_to_l2(
   task_id=<task_id or "infra">,
   agent_role="escalation-watcher-auto",
   member_ids=[<esc_id>, ...],
-  root_cause="infra-outage:<symptom-slug>",  # e.g. "infra-outage:neo4j-connection-refused"
+  root_cause="infra-outage:<symptom-slug>",  # e.g. "infra-outage:falkordb-connection-refused"
   evidence=<summary + any burst pattern observed>,
   options=["A: restart the affected service", "B: investigate logs/connectivity", "C: pause orchestration until resolved", "D: something else"],
   summary="Infrastructure issue: " + <summary>,
@@ -1324,7 +1349,7 @@ Add to digest: `PROMOTED (L2 <id>): risk_identified — <sentinel_task_id> — <
 
 #### Stale-L0 strand sweep L1s (`__stale_l0_strand_sweep__`)
 
-`orchestrator/src/orchestrator/harness.py::Harness._file_stale_l0_strand_escalation` files ONE blocking L1 per startup sweep that dismissed L0s already older than `orphan_l0_timeout_secs`. Notes the info-L0 router owns are never strands (`Harness._snapshot_stale_l0_strands` skips them), so every listed note is one nothing else routed.
+`orchestrator/src/orchestrator/harness.py::Harness._file_stale_l0_strand_escalation` files ONE blocking L1 per startup sweep that dismissed L0s already older than `orphan_l0_timeout_secs`, and only when at least one of them had a workflow waiting (`workflow_blocked=True`, task 5200); the record still lists every strand that sweep dismissed. Notes the info-L0 router owns are never strands (`Harness._snapshot_stale_l0_strands` skips them), so every listed note is one nothing else routed. An info-only record (every strand `workflow_blocked=False`) comes only from builds before task 5200 and is still handled by the branch below.
 
 **Class discriminator.** `task_id == "__stale_l0_strand_sweep__"` AND `agent_role == "harness-stale-l0-strand-sweep"`.
 
@@ -1463,7 +1488,7 @@ Feature-detect **once at startup** (step 2 in the Main Loop) by checking whether
 |-----------|-----------|
 | All present | Full mode: every L1 ends resolved, filed-and-resolved or promoted ([Terminal dispositions](#terminal-dispositions--never-park)). |
 | Filing pair **absent** | Promote every item you would have filed, with its content verbatim in `evidence`. The tree stays total. |
-| `promote_to_l2` **absent** | A misconfiguration: a defect state, not a mode to run in. Autonomous dispatch and file-and-resolve continue. Items whose only disposition is promotion — real-task `scope_violation` included, since a resume delivers nothing and re-escalates — cannot be dispositioned: leave them pending and UNSTAMPED, so the first rotation with `promote_to_l2` back reassesses them at once. |
+| `promote_to_l2` **absent** | A misconfiguration: a defect state, not a mode to run in. Autonomous dispatch and file-and-resolve continue. Items whose only disposition is promotion — a real-task `scope_violation` that is not a clean file-level widening included — cannot be dispositioned: leave them pending and UNSTAMPED, so the first rotation with `promote_to_l2` back reassesses them at once. |
 
 Nothing durable records the items the `promote_to_l2`-absent state leaves pending. The digest is this rotation's final chat message and no component reads it, so it is not a fallback. What an operator sees is the symptom: `orchestrator/src/orchestrator/harness.py::Harness._watcher_has_actionable_l1` keeps re-arming rotations on them.
 
@@ -1545,7 +1570,7 @@ Mode: <"full (promote_to_l2 + filing pair available)" | "DEGRADED (missing: <too
 - PENDING: task_failure — task-12 — verify exhausted after 3 attempts
     Proposal: Blocked because import error in test. To unblock: fix import in tests/test_foo.py line 42. Confidence: high. [risk: low]
 - PENDING: design_concern — task-88 — architectural question about X
-- PENDING (urgent): infra_issue — N/A — Neo4j connection refused
+- PENDING (urgent): infra_issue — N/A — FalkorDB connection refused
 - PENDING: dependency_discovered — task-33 — no matching task for: "GraphitiV2 migration complete"
 ```
 

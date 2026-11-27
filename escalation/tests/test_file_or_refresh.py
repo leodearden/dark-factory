@@ -51,7 +51,7 @@ class _ResolvedAfterLookupQueue(EscalationQueue):
     ) -> list[Escalation]:
         found = super().get_by_task(task_id, status=status, level=level, agent_role=agent_role)
         if found:
-            self.resolve(found[0].id, 'resolved in the gap', resolved_by='test')
+            self.resolve(found[0].id, 'resolved in the gap', resolved_by='test', resolution_class='actionable')
         return found
 
 
@@ -156,7 +156,7 @@ class TestOnlyAPendingRecordAtTheAlarmLevelIsRefreshed:
         first = file_or_refresh(
             queue, ALARM, summary='first', detail='detail', filing_claimant_run_id='run-a',
         )
-        queue.resolve(first.id, 'fixed', resolved_by='test')
+        queue.resolve(first.id, 'fixed', resolved_by='test', resolution_class='actionable')
 
         second = file_or_refresh(
             queue, ALARM, summary='second', detail='detail', filing_claimant_run_id='run-a',

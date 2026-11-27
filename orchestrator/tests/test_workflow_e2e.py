@@ -8,6 +8,7 @@ to the worktree, simulating what real agents would do.
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import os
 from pathlib import Path
@@ -849,6 +850,7 @@ class ReplanningReviewStub(AgentStub):
         if self.replans == 0 and role == 'reviewer_comprehensive':
             review = _make_review(role, 'ISSUES_FOUND', [{
                 'severity': 'blocking',
+                'kind': 'test_quality',
                 'location': 'lib.py:5',
                 'category': 'missing_edge_case',
                 'description': 'No test for empty name',
@@ -1570,7 +1572,7 @@ def _make_resolve_then_dismiss_chained_steward(
     Neither waiter reaches ESCALATED through that trailing publication.
     ``_mark_blocked``'s wait is scoped to its own L0 (task 5563), so the
     chained outcome is foreign and discarded; ESCALATED comes from the
-    ``has_open_l1`` source-of-truth override in
+    open-L1 hand-off override in
     ``TaskWorkflow._await_steward_completion``, which replaces the in-scope
     ``StewardResolved``.  ``run()``'s ESCALATED wait never routes on the
     channel at all: its tail reads the open L1 from the escalation queue.
@@ -3006,8 +3008,8 @@ class TestMarkBlockedFalseDoneGuard:
 
         The steward's ``StewardReescalatedL1`` is about the chained L0, so
         ``_mark_blocked``'s scoped wait discards it (task 5563) and receives
-        only its own L0's ``StewardResolved``.  The ``has_open_l1``
-        source-of-truth override in ``_await_steward_completion`` turns that
+        only its own L0's ``StewardResolved``.  The open-L1 hand-off
+        override in ``_await_steward_completion`` turns that
         would-be requeue into ``StewardReescalatedL1``, which
         ``_mark_blocked``'s single isinstance dispatch (SO-1) routes to
         ESCALATED — no re-pend, no duplicate L1.  This still exercises the
@@ -5518,7 +5520,12 @@ class TestPlanDoneEarlyReturn:
         stub = AgentStub()
         workflow, scheduler = _build_workflow(config, git_ops, task_assignment, stub)
 
-        workflow._plan = AsyncMock(return_value=WorkflowOutcome.PLANNED)
+        async def plan_written(*args, **kwargs):
+            assert workflow.artifacts is not None
+            workflow.artifacts.write_plan(copy.deepcopy(PLAN))
+            return WorkflowOutcome.PLANNED
+
+        workflow._plan = AsyncMock(side_effect=plan_written)
 
         # run()'s SM-2 exit check reads scheduler.get_status back — the real
         # _execute_verify_review_loop body (which would persist 'blocked')

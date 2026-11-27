@@ -1,17 +1,11 @@
 """Live-corpus pins for repaired capability-manifest delivered_check descriptors.
 
-Three populations are pinned. Task 6036 re-anchored descriptors on BOTH sides: the
-producer task's ``metadata.delivered_checks`` entry in tasks.db AND the sidecar
-the stamper copies it from. Tasks 5256 and 6209 resynced sidecars, sidecar-only, to task
-records that had already been repaired. CI can never see the tasks.db half, so
-either way these pins guard the SIDECAR half: a stale sidecar would be
-re-stamped over the repaired record by the next re-decompose. Every resynced
-producer is done, so the resynced rows are also evaluated at HEAD through the
-runtime grep primitive. They read only tracked files in this checkout and open
-no database. Task 6047 re-pointed a FOREIGN descriptor, warm-lane κ, whose
-task-record half lives in reify's store; reify's tree is not this checkout, so
-its non-vacuity is checked behaviourally against committed fixture trees rather
-than at HEAD.
+A repaired descriptor has two halves: the producer task's ``metadata.delivered_checks``
+entry in tasks.db, and the sidecar the stamper copies it from. CI can never see the
+tasks.db half, so these pins guard the SIDECAR half: a stale sidecar would be
+re-stamped over the repaired record by the next re-decompose. Rows whose producer is
+done are also evaluated at HEAD through the runtime primitive for their kind. They
+read only tracked files in this checkout and open no database.
 
 MAINTENANCE CONTRACT: an exact pin also fires on a legitimate later both-sides
 re-repair. In that case, update the row here in the same change and re-run
@@ -24,20 +18,24 @@ import subprocess
 from pathlib import Path
 
 import pytest
-from audit_delivered_checks import load_manifest_checks, structural_findings
+from audit_delivered_checks import evaluate_row, load_manifest_checks, structural_findings
 from committed_git_repo import committed_repo
 from git_checkout_root import checkout_root_or_skip
 from shared.capability_manifest import load_capability_manifest
-from shared.delivered_check_polarity import (
-    CheckOutcome,
-    evaluate_grep_at_tree,
-    evaluate_path_at_tree,
-)
+from shared.delivered_check_polarity import CheckOutcome, evaluate_path_at_tree
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
-# Task 6036: re-anchored on both sides.
+# Task 9538: task 8461's path gate, pinned below and behind the fixture-tree tests.
+_QUALITY_BOUNDARY = (
+    "plans/quality-dashboard-prd.capability-manifest.yaml",
+    8461, "ε", "boundary-test-for-quality-payload",
+    {"kind": "path", "pattern": None, "expect": "present",
+     "paths": ["dashboard/tests/js/boundary_quality.test.mjs"]},
+)
+
+# Tasks 6036 and 9538: re-anchored on both sides.
 _REANCHORED = [
     (
         "docs/prds/recurring-deterministic-tasks.capability-manifest.yaml",
@@ -63,6 +61,7 @@ _REANCHORED = [
         {"kind": "path", "pattern": None, "expect": "present",
          "paths": ["scripts/eval_bootstrap_smoke.sh"]},
     ),
+    _QUALITY_BOUNDARY,
 ]
 
 # Tasks 5256 and 6209: sidecar resynced to the already-repaired task record.
@@ -112,7 +111,81 @@ _RESYNCED_TO_TASK_RECORD = [
     ),
 ]
 
-_REPAIRED_DESCRIPTORS = [*_REANCHORED, *_RESYNCED_TO_TASK_RECORD]
+# Task 6941: sidecar re-pointed after the rename its pattern names; the task-record
+# half is the post-merge operational task 10791.
+_REPOINTED_AFTER_RENAME = [
+    (
+        "plans/quality-metrics-snapshot-prd.capability-manifest.yaml",
+        6394, "S1", "workspace-domain-in-source-measures",
+        {"kind": "grep", "pattern": r"^def measurement_domain\(", "expect": "present",
+         "paths": ["scripts/source_measures.py"]},
+    ),
+    (
+        "plans/quality-metrics-snapshot-prd.capability-manifest.yaml",
+        6395, "S1b", "census-reads-workspace-domain",
+        {"kind": "grep", "pattern": r"measurement_domain\(", "expect": "present",
+         "paths": ["scripts/suite_census_pinning.py"]},
+    ),
+]
+
+# Each site task 6764 must clear, mapped to the suffix restatement as spelled there
+# (the stamper's is already gone and kept as a regression guard).
+_SUFFIX_RESTATEMENT_SITES = {
+    "fused-memory/src/fused_memory/server/manifest_stamping.py":
+        "_SIDECAR_SUFFIX = '.capability-manifest.yaml'",
+    "scripts/audit_delivered_checks.py":
+        'MANIFEST_SUFFIX = ".capability-manifest.yaml"',
+    "scripts/audit_manifest_descriptor_drift.py":
+        '_MANIFEST_SUFFIX = ".capability-manifest.yaml"',
+    "shared/src/shared/delivered_check_polarity.py":
+        "_MANIFEST_SUFFIX = '.capability-manifest.yaml'",
+    "shared/tests/cross_suite_helpers/capability_manifest_corpus.py":
+        "MANIFEST_SUFFIX = '.capability-manifest.yaml'",
+}
+
+# Task 10341: widened to every restatement 6764 removes; the task-record half is
+# the operational task 11697.
+_SUFFIX_GATE = (
+    "plans/review-all-s25-scripts-instruments-prd.capability-manifest.yaml",
+    6764, "ι", "suffix-spellings-gone",
+    {"kind": "grep", "pattern": "^_?(SIDECAR|MANIFEST)_SUFFIX = ", "expect": "absent",
+     "paths": list(_SUFFIX_RESTATEMENT_SITES)},
+)
+_WIDENED_TO_EVERY_RESTATEMENT = [_SUFFIX_GATE]
+
+# Task 11350: S26 rho's codec checks after task 4857 made
+# fused_memory/utils/mem0_content_keys.py the content keys' one home; the
+# task-record half is operational ticket tkt_0RXDHPEK0BDQ0NYMRPNJSBTQJQ.
+_S26_SIDECAR = "plans/review-all-s26-memory-service-write-path-and-graph-client-prd.capability-manifest.yaml"
+_MEMORY_SERVICE = "fused-memory/src/fused_memory/services/memory_service.py"
+_STORE_RECORDS = "fused-memory/src/fused_memory/services/store_records.py"
+_TOOLS = "fused-memory/src/fused_memory/server/tools.py"
+_SPECIMEN_GUARD = "fused-memory/src/fused_memory/reconciliation/preservation_specimen_guard.py"
+_CODEC_READER_IMPORTS = {
+    _TOOLS: "from fused_memory.services.memory_service import MemoryService, metadata_row_text",
+    _SPECIMEN_GUARD: "from fused_memory.services.memory_service import metadata_row_text",
+}
+_STORE_RECORDS_MODULE = (
+    _S26_SIDECAR, 9243, "ρ", "store-records-module",
+    {"kind": "grep", "pattern": r"^def metadata_row_text\(", "expect": "present",
+     "paths": [_STORE_RECORDS]},
+)
+_CODEC_READERS_LEFT = (
+    _S26_SIDECAR, 9243, "ρ", "codec-readers-left-the-service",
+    {"kind": "grep", "pattern": r"memory_service import .*\bmetadata_row_text\b",
+     "expect": "absent", "paths": list(_CODEC_READER_IMPORTS)},
+)
+_CODEC_LEFT = (
+    _S26_SIDECAR, 9243, "ρ", "codec-left-the-service",
+    {"kind": "grep", "pattern": r"^def metadata_row_text\(", "expect": "absent",
+     "paths": [_MEMORY_SERVICE]},
+)
+_RETARGETED_AFTER_4857 = [_STORE_RECORDS_MODULE, _CODEC_READERS_LEFT, _CODEC_LEFT]
+
+_REPAIRED_DESCRIPTORS = [
+    *_REANCHORED, *_RESYNCED_TO_TASK_RECORD, *_REPOINTED_AFTER_RENAME,
+    *_WIDENED_TO_EVERY_RESTATEMENT, *_RETARGETED_AFTER_4857,
+]
 
 _RETIRED_TO_MANUAL = [
     (
@@ -121,7 +194,9 @@ _RETIRED_TO_MANUAL = [
     ),
 ]
 
-# Task 6047: re-pointed foreign descriptor (producer reify:5616).
+# Task 6047: re-pointed foreign descriptor (producer reify:5616). Its task-record half
+# lives in reify's store and reify's tree is not this checkout, so its non-vacuity is
+# checked behaviourally against committed fixture trees rather than at HEAD.
 _KAPPA = (
     "plans/warm-lane-infra-repatriation-prd.capability-manifest.yaml",
     "κ", "reify-scripts-reduced-to-contract-primitives",
@@ -173,6 +248,27 @@ def _kappa_check():
     return check
 
 
+@pytest.fixture(scope="module")
+def sidecar_rows():
+    """Every tracked sidecar's grep and path descriptors, as the drift audit reads them."""
+    return load_manifest_checks(checkout_root_or_skip(), {})[0]
+
+
+def _the_one_row(rows, relpath: str, label: str, capability: str):
+    matches = [row for row in rows
+               if (row.manifest, row.task_label, row.name) == (relpath, label, capability)]
+    assert len(matches) == 1, (
+        f"expected exactly one grep or path {capability!r} under label {label!r} "
+        f"in {relpath}, found {len(matches)}"
+    )
+    return matches[0]
+
+
+def _sidecar_row(rows, descriptor):
+    relpath, _task_id, label, capability, _expected = descriptor
+    return _the_one_row(rows, relpath, label, capability)
+
+
 def _reify_tree_holding(tmp_path: Path, scripts) -> str:
     return committed_repo(tmp_path / "reify", dict.fromkeys(scripts, "#!/bin/sh\n"))
 
@@ -196,30 +292,24 @@ def test_repaired_sidecar_carries_the_repaired_descriptor(
     )
 
 
-assert all(r[4]["kind"] == "grep" for r in _RESYNCED_TO_TASK_RECORD), (
-    "test_resynced_sidecar_descriptor_delivers_at_head evaluates only grep gates; "
-    "teach it the new kind before adding a non-grep row to _RESYNCED_TO_TASK_RECORD"
-)
-_RESYNCED_HEADS = [r[:4] for r in _RESYNCED_TO_TASK_RECORD]
+# Rows whose producer is done. The rest of _REANCHORED, _SUFFIX_GATE and
+# _RETARGETED_AFTER_4857 are left out: their producers (5324, 6764, 9243) are
+# pending, so their forward-looking gates legitimately fail at HEAD.
+_DONE_PRODUCER_HEADS = [
+    r[:4] for r in [*_RESYNCED_TO_TASK_RECORD, _QUALITY_BOUNDARY, *_REPOINTED_AFTER_RENAME]
+]
 
 
 @pytest.mark.parametrize(
     "relpath,task_id,label,capability",
-    _RESYNCED_HEADS,
-    ids=[f"{r[1]}-{r[3]}" for r in _RESYNCED_HEADS],
+    _DONE_PRODUCER_HEADS,
+    ids=[f"{r[1]}-{r[3]}" for r in _DONE_PRODUCER_HEADS],
 )
-def test_resynced_sidecar_descriptor_delivers_at_head(relpath, task_id, label, capability):
-    """Every producer in _RESYNCED_TO_TASK_RECORD is done, so its sidecar gate must
-    deliver at HEAD; _REANCHORED is excluded because it holds a pending producer
-    (5324) whose forward-looking gate legitimately fails at HEAD."""
-    root = checkout_root_or_skip()
-    check = _the_one_capability(root, relpath, label, capability).delivered_check
+def test_done_producer_sidecar_descriptor_delivers_at_head(
+        sidecar_rows, relpath, task_id, label, capability):
+    row = _the_one_row(sidecar_rows, relpath, label, capability)
 
-    assert check is not None
-    outcome = evaluate_grep_at_tree(
-        check.pattern or "", list(check.paths),
-        expect=check.expect, repo_root=root, ref="HEAD",
-    )
+    outcome = evaluate_row(row, repo_root=checkout_root_or_skip(), ref="HEAD")
     assert outcome is CheckOutcome.PASS, (
         f"{relpath} label {label} capability {capability} (task {task_id}) evaluates "
         f"{outcome.value} at HEAD, but its producer is done, so its sidecar "
@@ -247,11 +337,10 @@ def test_retired_capability_is_manual_in_its_sidecar(relpath, task_id, label, ca
     assert isinstance(check.reason, str) and check.reason.strip()
 
 
-def test_audit_structural_section_names_no_reanchored_grep_capability():
+def test_audit_structural_section_names_no_reanchored_grep_capability(sidecar_rows):
     root = checkout_root_or_skip()
     reanchored_greps = {(r[1], r[3]) for r in _REANCHORED if r[4]["kind"] == "grep"}
-    rows = [row for row in load_manifest_checks(root, {})[0]
-            if (row.task_id, row.name) in reanchored_greps]
+    rows = [row for row in sidecar_rows if (row.task_id, row.name) in reanchored_greps]
 
     assert {(row.task_id, row.name) for row in rows} == reanchored_greps
 
@@ -288,4 +377,175 @@ def test_kappa_gate_opens_once_only_the_contract_primitives_remain(tmp_path):
     assert outcome is CheckOutcome.PASS, (
         f"κ's delivered_check evaluates {outcome.value} on a tree holding only "
         f"{_CONTRACT_PRIMITIVES}; a retained primitive must not be in the gate."
+    )
+
+
+_SUFFIX_FREE_SITE = "from shared.capability_manifest import SIDECAR_SUFFIX\n"
+
+
+@pytest.mark.parametrize(
+    "survivor,expected",
+    [
+        *(pytest.param(site, CheckOutcome.FAIL, id=Path(site).stem)
+          for site in _SUFFIX_RESTATEMENT_SITES),
+        pytest.param(None, CheckOutcome.PASS, id="no-survivor"),
+    ],
+)
+def test_suffix_gate_holds_until_no_restatement_survives(
+        tmp_path, sidecar_rows, survivor, expected):
+    """Every restatement 6764 removes is gated, so the gate cannot pass early, and a
+    tree free of all of them delivers, so 6764 can actually finish."""
+    row = _sidecar_row(sidecar_rows, _SUFFIX_GATE)
+    files = dict.fromkeys(_SUFFIX_RESTATEMENT_SITES, _SUFFIX_FREE_SITE)
+    if survivor is not None:
+        files[survivor] = f"{_SUFFIX_RESTATEMENT_SITES[survivor]}\n"
+
+    outcome = evaluate_row(row, repo_root=committed_repo(tmp_path / "sites", files), ref="HEAD")
+    assert outcome is expected, (
+        f"task 6764's delivered_check evaluates {outcome.value} on a tree where "
+        f"{survivor or 'no site'} restates the sidecar suffix; it must hold while any "
+        f"restatement survives and open once none does."
+    )
+
+
+@pytest.mark.parametrize(
+    "files,expected",
+    [
+        pytest.param(
+            {"dashboard/tests/test_boundary_js.py":
+                '"""``js/boundary_quality.test.mjs`` holds their client half."""\n'},
+            CheckOutcome.FAIL, id="prose-only",
+        ),
+        pytest.param(
+            {"dashboard/tests/js/boundary_quality.test.mjs":
+                "import test from 'node:test';\n"},
+            CheckOutcome.PASS, id="file-only",
+        ),
+    ],
+)
+def test_quality_boundary_gate_follows_the_test_file_not_the_prose(
+        tmp_path, sidecar_rows, files, expected):
+    """esc-8461-1's two failure modes, inverted: prose naming the file must not
+    deliver, and the file must deliver whatever it says."""
+    row = _sidecar_row(sidecar_rows, _QUALITY_BOUNDARY)
+    repo = committed_repo(tmp_path / "dashboard", files)
+
+    outcome = evaluate_row(row, repo_root=repo, ref="HEAD")
+    assert outcome is expected, (
+        f"task 8461's delivered_check (kind={row.kind!r}) evaluates {outcome.value} "
+        f"on a tree holding only {sorted(files)}; it must follow the test file's "
+        f"existence, not any mention of its name."
+    )
+
+
+_METADATA_ROW_TEXT_DEF = "def metadata_row_text(row):\n    return ''\n"
+
+
+@pytest.mark.parametrize(
+    "files,expected",
+    [
+        pytest.param(
+            {_STORE_RECORDS: "MEM0_CONTENT_KEYS = ('data', 'memory', 'content')\n"},
+            CheckOutcome.FAIL, id="content-key-tuple-restated",
+        ),
+        pytest.param(
+            {_MEMORY_SERVICE: _METADATA_ROW_TEXT_DEF},
+            CheckOutcome.FAIL, id="helper-still-in-service",
+        ),
+        pytest.param(
+            {_STORE_RECORDS:
+                "from fused_memory.utils.mem0_content_keys import mem0_payload_text\n\n\n"
+                "def metadata_row_text(row):\n    return mem0_payload_text(row)\n"},
+            CheckOutcome.PASS, id="codec-moved",
+        ),
+    ],
+)
+def test_store_records_gate_follows_metadata_row_text_not_a_content_key_tuple(
+        tmp_path, sidecar_rows, files, expected):
+    """A restated content-key tuple must not deliver (task 4857 gave the keys one
+    home), and a store_records.py that defines metadata_row_text over the shared
+    keys must, so 9243 can finish without breaching SPOT."""
+    row = _sidecar_row(sidecar_rows, _STORE_RECORDS_MODULE)
+
+    outcome = evaluate_row(row, repo_root=committed_repo(tmp_path / "fm", files), ref="HEAD")
+    assert outcome is expected, (
+        f"task 9243's store-records-module check evaluates {outcome.value} on a tree "
+        f"holding only {sorted(files)}; it must follow metadata_row_text's move into "
+        f"{_STORE_RECORDS}, not a restated content-key tuple."
+    )
+
+
+_CODEC_READER_REPOINTED = "from fused_memory.services.store_records import metadata_row_text\n"
+
+
+@pytest.mark.parametrize(
+    "survivor,expected",
+    [
+        *(pytest.param(reader, CheckOutcome.FAIL, id=Path(reader).stem)
+          for reader in _CODEC_READER_IMPORTS),
+        pytest.param(None, CheckOutcome.PASS, id="no-survivor"),
+    ],
+)
+def test_codec_readers_gate_holds_until_both_readers_left_the_service(
+        tmp_path, sidecar_rows, survivor, expected):
+    """Each metadata_row_text reader 9243 repoints is gated, so the gate cannot pass
+    early, and a tree where both import from store_records delivers."""
+    row = _sidecar_row(sidecar_rows, _CODEC_READERS_LEFT)
+    files = dict.fromkeys(_CODEC_READER_IMPORTS, _CODEC_READER_REPOINTED)
+    if survivor is not None:
+        files[survivor] = f"{_CODEC_READER_IMPORTS[survivor]}\n"
+
+    outcome = evaluate_row(row, repo_root=committed_repo(tmp_path / "fm", files), ref="HEAD")
+    assert outcome is expected, (
+        f"task 9243's codec-readers-left-the-service check evaluates {outcome.value} on "
+        f"a tree where {survivor or 'no reader'} still imports metadata_row_text from "
+        f"memory_service; it must hold while either reader does and open once neither does."
+    )
+
+
+_WRAPPED_TOOLS_IMPORT = (
+    "from fused_memory.services.memory_service import (\n"
+    "    MemoryService,\n"
+    "    metadata_row_text,\n"
+    ")\n"
+)
+
+
+@pytest.mark.parametrize(
+    "files,expected",
+    [
+        pytest.param(
+            {_MEMORY_SERVICE: _METADATA_ROW_TEXT_DEF,
+             _TOOLS: _WRAPPED_TOOLS_IMPORT,
+             _SPECIMEN_GUARD: _CODEC_READER_REPOINTED},
+            {"codec-readers-left-the-service": CheckOutcome.PASS,
+             "codec-left-the-service": CheckOutcome.FAIL},
+            id="wrapped-survivor",
+        ),
+        pytest.param(
+            {_MEMORY_SERVICE: "class MemoryService:\n    pass\n",
+             _STORE_RECORDS: _METADATA_ROW_TEXT_DEF,
+             **dict.fromkeys(_CODEC_READER_IMPORTS, _CODEC_READER_REPOINTED)},
+            {"codec-readers-left-the-service": CheckOutcome.PASS,
+             "codec-left-the-service": CheckOutcome.PASS},
+            id="codec-moved",
+        ),
+    ],
+)
+def test_codec_left_gate_holds_where_the_readers_line_grep_cannot_see(
+        tmp_path, sidecar_rows, files, expected):
+    """codec-readers-left-the-service greps line by line, so a parenthesized import
+    escapes it; codec-left-the-service holds 9243's gate while memory_service.py
+    still defines the helper that import needs, and opens once the codec moved."""
+    repo = committed_repo(tmp_path / "fm", files)
+
+    outcomes = {
+        descriptor[3]: evaluate_row(
+            _sidecar_row(sidecar_rows, descriptor), repo_root=repo, ref="HEAD")
+        for descriptor in (_CODEC_READERS_LEFT, _CODEC_LEFT)
+    }
+    assert outcomes == expected, (
+        f"task 9243's codec checks evaluate {outcomes} on a tree holding "
+        f"{sorted(files)}; codec-left-the-service must hold the gate while "
+        f"memory_service.py defines metadata_row_text and open once it does not."
     )

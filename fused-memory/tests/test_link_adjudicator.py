@@ -13,12 +13,16 @@ import re
 import shutil
 from collections.abc import Callable, Mapping
 from typing import Any
+from unittest.mock import AsyncMock, patch
 
 import pytest
+from _invocation_ledger import invocation_rows
+from _invocation_tokens import LEDGER_TOKENS, agent_result_with_tokens
 from shared.cap_markers import REAL_CLI_CAP_HIT_MESSAGES, looks_like_capacity_banner
 from shared.claude_endpoint import ClaudeEndpoint
 from shared.cli_invoke import AgentResult, invoke_with_cap_retry, no_mcp_servers_config
 from shared.cli_proxy import CLIENT_ENV_PATH, proxy_endpoint
+from shared.cost_store import CostStore
 from shared.neutral_cwd import neutral_cli_cwd
 
 from fused_memory.config.schema import LinkHealConfig
@@ -47,6 +51,7 @@ from fused_memory.maintenance.link_heal import (
     MISFILE_VERDICTS,
     Verdict,
 )
+from fused_memory.models.invocation_ledger import InvocationLedger, LedgerRole
 
 _WORD_BULLET = re.compile(r'^- \*\*([A-Z]+)\*\*:', re.MULTILINE)
 _CLAUSE_END = re.compile(r'[.;\n]')
@@ -494,6 +499,7 @@ class TestClaudeShardAsker:
         assert call['model'] == 'sonnet'
         assert call['permission_mode'] == 'bypassPermissions'
         assert call['usage_gate'] is None
+        assert 'cost_store' not in call
         assert 'Judge each pair.' in call['system_prompt']
         for item in _SHARD.items:
             assert f'CHILD: {item.child_text}' in call['prompt']
@@ -662,6 +668,49 @@ class TestConfiguredAdjudicator:
         assert len(ask.shards) == 2
         assert [storm['threshold'] for storm in storms] == [2]
         assert _failures(verdicts)[2:] == [AdjudicationFailure.NOT_ATTEMPTED] * 2
+
+
+class TestAdjudicatorInvocationLedger:
+    """Each shard's CLI call lands one invocations row under the run's keys (task 10414)."""
+
+    @pytest.mark.asyncio
+    async def test_each_shard_lands_one_row(self, tmp_path):
+        served = agent_result_with_tokens(
+            success=True, structured_output=_ONE_SAME_ANSWER, cost_usd=0.3,
+        )
+        db_path = tmp_path / 'curator_events.db'
+        async with CostStore(db_path) as store:
+            adjudicate = configured_adjudicator(
+                LinkHealConfig(shard_size=1),
+                brief_text=FIXED_BRIEF,
+                ledger=InvocationLedger(store, LedgerRole.LINK_ADJUDICATOR, 'lh-run', 'proj-h'),
+            )
+            with patch('shared.cli_invoke.invoke_claude_agent', new=AsyncMock(return_value=served)):
+                verdicts = await adjudicate(_pairs(2))
+
+        rows = await invocation_rows(db_path)
+        assert [verdict.verdict for verdict in verdicts] == [Verdict.SAME, Verdict.SAME]
+        assert len(rows) == 2
+        for row in rows:
+            assert row['role'] == 'link_adjudicator'
+            assert row['run_id'] == 'lh-run'
+            assert row['project_id'] == 'proj-h'
+            assert {key: row[key] for key in LEDGER_TOKENS} == LEDGER_TOKENS
+
+    @pytest.mark.asyncio
+    async def test_a_failed_shard_still_lands_a_row(self, tmp_path):
+        failed = agent_result_with_tokens(success=False, timed_out=True)
+        db_path = tmp_path / 'curator_events.db'
+        async with CostStore(db_path) as store:
+            ask = ClaudeShardAsker(
+                brief_text=FIXED_BRIEF,
+                ledger=InvocationLedger(store, LedgerRole.LINK_ADJUDICATOR, 'lh-run', 'proj-h'),
+            )
+            with patch('shared.cli_invoke.invoke_claude_agent', new=AsyncMock(return_value=failed)):
+                reply = await ask(_SHARD)
+
+        assert reply.success is False
+        assert len(await invocation_rows(db_path)) == 1
 
 
 _LIVE_PAIR = LinkPair(

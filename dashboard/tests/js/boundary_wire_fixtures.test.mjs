@@ -15,7 +15,9 @@ import {
   escalationRow,
   escalationsPayload,
   mergeQueueBlock,
+  mergeRecentRow,
   openEscalationItem,
+  performanceEntry,
   qualityBody,
   qualityComparison,
   qualityMarker,
@@ -107,6 +109,27 @@ test('a MERGE_QUEUE block is built only with keys /merge-queue serves', () => {
   const served = payload('merge_7d').MERGE_QUEUE['dark-factory'];
 
   assertBuiltKeysServed(mergeQueueBlock({ bucketMinutes: 60 }), served, 'MERGE_QUEUE[project]');
+});
+
+test('a MERGE_QUEUE recent row is built only with keys /merge-queue serves on one', () => {
+  const served = payload('merge_7d').MERGE_QUEUE['dark-factory'].recent;
+  assert.ok(served.length > 0, 'the merge_7d body serves no recent rows to check the builder against');
+
+  assertBuiltKeysServed(mergeRecentRow(), served[0], 'MERGE_QUEUE[project].recent[0]');
+});
+
+test('a PERFORMANCE entry is built with exactly the keys /performance serves for one', () => {
+  const projects = Object.values(payload('performance_all').PERFORMANCE);
+  assert.equal(projects.length, 1, 'the performance_all body should serve exactly its one project');
+  const [served] = projects;
+  assert.ok(served.history_labels.length > 0, 'the performance_all body serves no history to check the builder against');
+  const built = performanceEntry({ cards: wireDatum(null), labels: ['2026-10-04T07:00'] });
+
+  assertBuiltKeysServed(built, served, 'PERFORMANCE[project]');
+  assertSameKeys(built, served, 'PERFORMANCE[project]');
+  for (const block of ['time_centiles_history', 'one_pass_history', 'escalation_history']) {
+    assertSameKeys(built[block], served[block], `PERFORMANCE[project].${block}`);
+  }
 });
 
 test('a SCHEDULER snapshot, a lock row and a module included, is built only with keys /scheduler serves', () => {

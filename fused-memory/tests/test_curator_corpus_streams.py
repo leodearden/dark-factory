@@ -2,11 +2,12 @@
 
 An agent-followup candidate's pool always holds the parent's other
 non-cancelled follow-ups, whatever files they touch (task 6227). The module
-and dependency streams read only the open backlog (task 6708). The
+and dependency streams read only the open backlog (task 6708). By default the
 embedding stream is switched off through the public config by pointing
-``mem0.qdrant_url`` at a closed loopback port, so these cases never patch a
-private name and never reach a live Qdrant; the embedding stream is
-therefore unavailable in every case here.
+``mem0.qdrant_url`` at a closed loopback port, so it is unavailable. A case
+that opens its stack with an embedder instead gets an in-memory Qdrant
+through the curator's constructor (task 11429). Either way no case patches a
+private name or reaches a live Qdrant or OpenAI.
 """
 
 from __future__ import annotations
@@ -23,9 +24,12 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock
 
+import httpx
+import openai
 import pytest
 import pytest_asyncio
 from _curator_helpers import agent_result, invoke_by_role, make_config, must_not_invoke, tripwire
+from qdrant_client import AsyncQdrantClient
 from shared.cli_invoke import AgentResult
 from shared.task_statuses import ACTIVE
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
@@ -34,11 +38,12 @@ from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend
 from fused_memory.config.schema import FusedMemoryConfig, TaskmasterConfig
 from fused_memory.middleware.curation_deferral import DeferReason
 from fused_memory.middleware.curator_types import (
+    EMBEDDING_INPUT_MAX_BYTES,
     CandidateTask,
     PoolEntry,
     PreparedCandidate,
 )
-from fused_memory.middleware.task_curator import TaskCurator
+from fused_memory.middleware.task_curator import CorpusEmbedder, TaskCurator
 from fused_memory.middleware.task_interceptor import TaskInterceptor
 from fused_memory.middleware.ticket_store import TicketStatus, TicketStore
 from fused_memory.reconciliation.event_buffer import EventBuffer
@@ -159,13 +164,74 @@ class _SiblingFetchFailsBackend(SqliteTaskBackend):
         return task
 
 
+_OVER_THE_WINDOW = 'x' * 60_000
+
+
+def _embedder_refusal() -> openai.BadRequestError:
+    """The 400 OpenAI's embeddings endpoint answers an input it will not embed."""
+    body = {
+        'error': {
+            'message': "Invalid 'input': maximum context length is 8192 tokens.",
+            'type': 'invalid_request_error',
+        },
+    }
+    response = httpx.Response(
+        400, json=body, request=httpx.Request('POST', 'https://api.openai.invalid/v1/embeddings'),
+    )
+    return openai.BadRequestError(
+        f'Error code: 400 - {body}', response=response, body=body['error'],
+    )
+
+
+class _WindowedEmbedder:
+    """An OpenAI-shaped embedder that refuses any input past its token window.
+
+    Each UTF-8 byte counts as a token, the most a byte-level BPE can spend on
+    one, so an input this accepts the real window accepts too.
+    """
+
+    def __init__(self, dimensions: int, max_tokens: int = 8192) -> None:
+        self.inputs: list[str] = []
+        self._max_tokens = max_tokens
+        self._vector = [1.0] + [0.0] * (dimensions - 1)
+
+    async def create(self, input_data: str) -> list[float]:
+        self.inputs.append(input_data)
+        if len(input_data.encode('utf-8', 'surrogatepass')) > self._max_tokens:
+            raise _embedder_refusal()
+        return self._vector
+
+
+def _windowed_embedder() -> _WindowedEmbedder:
+    return _WindowedEmbedder(make_config().embedder.dimensions)
+
+
+class _FailingEmbedder:
+    """An embedder whose every call raises *exc*."""
+
+    def __init__(self, exc: Exception) -> None:
+        self._exc = exc
+
+    async def create(self, input_data: str) -> list[float]:
+        raise self._exc
+
+
+def _embedder_server_error() -> openai.InternalServerError:
+    response = httpx.Response(
+        500, request=httpx.Request('POST', 'https://api.openai.invalid/v1/embeddings'),
+    )
+    return openai.InternalServerError('Error code: 500', response=response, body=None)
+
+
 @asynccontextmanager
 async def _open_stack(
     project_dir: Path,
     backend_cls: type[SqliteTaskBackend],
     *,
     invoke: AsyncMock | None = None,
+    embedder: CorpusEmbedder | None = None,
 ) -> AsyncIterator[CorpusStack]:
+    """A curator over a real SQLite store; *embedder* switches on an in-memory embedding corpus."""
     project_dir.mkdir(parents=True)
     subprocess.run(['git', 'init', '-q', str(project_dir)], check=True, capture_output=True)
     root = str(project_dir.resolve())
@@ -176,6 +242,8 @@ async def _open_stack(
     curator = TaskCurator(
         config=config, taskmaster=backend,
         invoke=invoke if invoke is not None else must_not_invoke(),
+        embedder=embedder,
+        qdrant_client=AsyncQdrantClient(location=':memory:') if embedder is not None else None,
     )
     try:
         yield CorpusStack(root, backend, config, curator)
@@ -712,3 +780,122 @@ async def test_an_integer_spawned_from_submitted_through_submit_task_resolves_cr
         line.startswith(f'[Task {parent_id}]') and 'source=anchor' in line
         for line in prompt.splitlines()
     )
+
+
+@pytest.mark.asyncio
+async def test_an_over_long_fileless_candidate_is_embedded_within_the_window(tmp_path):
+    embedder = _windowed_embedder()
+    async with _open_stack(tmp_path / 'project', SqliteTaskBackend, embedder=embedder) as stack:
+        prepared = await stack.curator.prepare_candidate(
+            CandidateTask(title='Sweep transcript secrets', description=_OVER_THE_WINDOW),
+            'p', stack.root,
+        )
+
+    assert prepared.corpus_error is None
+    assert _unavailable(prepared) == ()
+    assert embedder.inputs
+    assert all(len(text.encode('utf-8')) <= EMBEDDING_INPUT_MAX_BYTES for text in embedder.inputs)
+
+
+@pytest.mark.asyncio
+async def test_an_over_long_fileless_submission_resolves_created(tmp_path):
+    prompts: list[str] = []
+    invoke = invoke_by_role(
+        single=_creating_and_recording(prompts),
+        batch=tripwire('one candidate must take the single spec'),
+    )
+    embedder = _windowed_embedder()
+    async with (
+        _open_stack(
+            tmp_path / 'project', SqliteTaskBackend, invoke=invoke, embedder=embedder,
+        ) as stack,
+        _interceptor_over(stack, tmp_path) as (interceptor, _store),
+    ):
+        submitted = await interceptor.submit_task(
+            stack.root, title='Sweep transcript secrets', description=_OVER_THE_WINDOW,
+        )
+
+        answer = await interceptor.resolve_ticket(
+            submitted['ticket'], stack.root, timeout_seconds=_RESOLVE_DEADLINE_SECONDS,
+        )
+
+    assert answer['status'] == TicketStatus.CREATED
+    [prompt] = prompts
+    assert _EMBEDDING_UNAVAILABLE not in prompt.splitlines()
+    assert embedder.inputs
+    assert all(len(text.encode('utf-8')) <= EMBEDDING_INPUT_MAX_BYTES for text in embedder.inputs)
+
+
+@pytest.mark.asyncio
+async def test_an_over_long_task_is_recorded_and_found_by_an_over_long_query(tmp_path):
+    async with _open_stack(
+        tmp_path / 'project', SqliteTaskBackend, embedder=_windowed_embedder(),
+    ) as stack:
+        await stack.curator.record_task(
+            '1', CandidateTask(title='Sweep transcript secrets', description=_OVER_THE_WINDOW), 'p',
+        )
+        count = await stack.curator.corpus_count('p')
+        hits = await stack.curator.search_corpus(_OVER_THE_WINDOW, 'p', score_threshold=0.0)
+
+    assert count == 1
+    assert [hit['task_id'] for hit in hits] == ['1']
+
+
+@pytest.mark.asyncio
+async def test_a_refused_embedding_is_curated_over_the_remaining_streams_not_deferred(
+    tmp_path, caplog,
+):
+    caplog.set_level(logging.WARNING, logger=_CURATOR_LOGGER)
+    prompts: list[str] = []
+    invoke = invoke_by_role(
+        single=_creating_and_recording(prompts),
+        batch=tripwire('one candidate must take the single spec'),
+    )
+    async with _open_stack(
+        tmp_path / 'project', SqliteTaskBackend, invoke=invoke, embedder=_FailingEmbedder(_embedder_refusal()),
+    ) as stack:
+        prepared = await stack.curator.prepare_candidate(CandidateTask(title='t'), 'p', stack.root)
+        [decision] = await stack.curator.curate_prepared([prepared], 'p', stack.root)
+
+    assert prepared.corpus_error is None
+    assert _unavailable(prepared) == ('embedding',)
+    assert decision.action == 'create'
+    [prompt] = prompts
+    assert _EMBEDDING_UNAVAILABLE in prompt.splitlines()
+    assert decision.to_log_fields()['unavailable_streams'] == ['embedding']
+    assert any(
+        r.name == _CURATOR_LOGGER and r.levelno == logging.WARNING
+        and 'embedding' in r.getMessage() and 'refused' in r.getMessage()
+        for r in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_refused_embedding_with_a_failed_module_read_still_defers(tmp_path):
+    async with _open_stack(
+        tmp_path / 'project', _ModuleReadFailsBackend, embedder=_FailingEmbedder(_embedder_refusal()),
+    ) as stack:
+        prepared = await stack.curator.prepare_candidate(
+            CandidateTask(title='t', files_to_modify=[_CANDIDATE_FILE]), 'p', stack.root,
+        )
+        [decision] = await stack.curator.curate_prepared([prepared], 'p', stack.root)
+
+    assert prepared.corpus_error is not None
+    assert 'module' in prepared.corpus_error
+    assert 'embedding' in prepared.corpus_error
+    assert decision.action == 'defer'
+    assert decision.defer_reason == DeferReason.CORPUS_FAILED
+
+
+@pytest.mark.asyncio
+async def test_an_embedder_server_error_on_the_only_stream_still_defers_corpus_failed(tmp_path):
+    async with _open_stack(
+        tmp_path / 'project', SqliteTaskBackend,
+        embedder=_FailingEmbedder(_embedder_server_error()),
+    ) as stack:
+        prepared = await stack.curator.prepare_candidate(CandidateTask(title='t'), 'p', stack.root)
+        [decision] = await stack.curator.curate_prepared([prepared], 'p', stack.root)
+
+    assert prepared.corpus_error is not None
+    assert decision.action == 'defer'
+    assert decision.defer_reason == DeferReason.CORPUS_FAILED

@@ -538,6 +538,40 @@ class TestTheDeclarationIsMachineChecked:
         assert harness.server.strict_input_validation is False
 
 
+class TestTheLaunchNamesItsCallerRole:
+    """``--caller-role`` names the role this server serves (task 5055).
+
+    It is attribution on markup records only. It is optional, because an
+    orchestrator still running an older launcher spawns this server without
+    it, so both launches must parse and serve.
+    """
+
+    @staticmethod
+    def _lane_argv(tmp_path: Path) -> list[str]:
+        worktree = tmp_path / '.worktrees' / '_lane-3'
+        worktree.mkdir(parents=True)
+        lane = TaskArtifacts.for_task(worktree, '42')
+        lane.init('42', 'X', 'desc')
+        return [
+            '--worktree', str(worktree),
+            '--meta-root', str(lane.lane_root),
+            '--task-root', str(lane.task_root),
+            '--grants-enforced', '--grant', 'add_design_decision',
+        ]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'role_flag', [['--caller-role', 'architect'], []], ids=['labelled', 'unlabelled'],
+    )
+    async def test_the_launch_parses_and_serves(self, tmp_path, role_flag):
+        server = plan_tools.server_from_argv([*self._lane_argv(tmp_path), *role_flag])
+
+        async with Client(server) as client:
+            listed = await client.list_tools()
+
+        assert [tool.name for tool in listed] == ['add_design_decision']
+
+
 # ---------------------------------------------------------------------------
 # (h) — the deliberate-quoting override, on the tool that now DECLARES it.
 # ---------------------------------------------------------------------------

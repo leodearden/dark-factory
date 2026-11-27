@@ -6,7 +6,6 @@ import asyncio
 import contextlib
 import os
 import signal
-import threading
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -14,9 +13,14 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from _held_loop_clock import held_loop_clock
-from _script_survivor import SURVIVOR_SCRIPT, is_alive, kill_survivor, read_survivor_pid
+from _script_survivor import (
+    SURVIVOR_SCRIPT,
+    await_recorded_pid,
+    kill_survivor,
+    needs_group_pidfd_signals,
+)
 from shared.proc_group import SigkillDispatch
-from shared.process_identity import Liveness, capture, liveness
+from shared.process_identity import Liveness, ProcessIdentity, capture, liveness
 
 from orchestrator.before_done_script import (
     REAP_GRACE_SECS,
@@ -99,50 +103,7 @@ def _fake_pgid() -> int:
     return candidate
 
 
-def _wait_for_recorded_pid(
-    pidfile: Path, abandon: threading.Event, *, within: float = 30.0,
-) -> int | None:
-    """Block until *pidfile* holds a complete pid line, or return None once *abandon* is set.
-
-    Runs off-loop because the loop clock may be held.
-    """
-    deadline = time.monotonic() + within
-    while not abandon.is_set():
-        try:
-            text = pidfile.read_text()
-        except FileNotFoundError:
-            text = ''
-        if text.endswith('\n'):
-            return int(text)
-        if time.monotonic() >= deadline:
-            raise AssertionError(
-                f'{pidfile} never held a complete pid line within {within}s: '
-                f'the script never recorded its grandchild'
-            )
-        abandon.wait(0.01)
-    return None
-
-
 RunScriptTask = asyncio.Task[tuple[int, str]]
-
-
-async def _await_recorded_pid(pidfile: Path, run: RunScriptTask) -> int:
-    """The pid the script records for its grandchild, or *run*'s own outcome if it ends first."""
-    abandon = threading.Event()
-    pid_wait = asyncio.ensure_future(
-        asyncio.to_thread(_wait_for_recorded_pid, pidfile, abandon),
-    )
-    try:
-        await asyncio.wait({run, pid_wait}, return_when=asyncio.FIRST_COMPLETED)
-    finally:
-        abandon.set()
-    pid = await pid_wait
-    if pid is None or run.done():
-        outcome = await run
-        raise AssertionError(
-            f'run_script returned {outcome!r} before the script recorded its grandchild'
-        )
-    return pid
 
 
 async def _tear_down_through_the_budget(run: RunScriptTask, release: Callable[[], None]) -> None:
@@ -156,6 +117,35 @@ async def _tear_down_through_the_budget(run: RunScriptTask, release: Callable[[]
     release()
     with contextlib.suppress(ScriptTimeout):
         await run
+
+
+def _wait_until_reaped(pid: int, *, within: float = 30.0) -> None:
+    """Block until ``/proc/<pid>`` is gone; a zombie still has one, so it does not count.
+
+    Runs off-loop because the loop clock may be held.
+    """
+    proc_entry = Path('/proc') / str(pid)
+    deadline = time.monotonic() + within
+    while proc_entry.exists():
+        if time.monotonic() >= deadline:
+            raise AssertionError(
+                f'script pid {pid} was not reaped within {within}s, so the '
+                f'precondition (a reaped script whose child holds its pipe) never held'
+            )
+        time.sleep(0.01)
+
+
+async def _liveness_once_settled(process: ProcessIdentity) -> Liveness:
+    """*process*'s liveness once it reads DEAD, or as it reads after ``REAP_GRACE_SECS``.
+
+    A SIGKILLed group member gets the reap grace the teardown allows its leader.
+    """
+    deadline = time.monotonic() + REAP_GRACE_SECS
+    state = liveness(process)
+    while state is not Liveness.DEAD and time.monotonic() < deadline:
+        await asyncio.sleep(0.05)
+        state = liveness(process)
+    return state
 
 
 @pytest.mark.asyncio
@@ -178,15 +168,13 @@ class TestBeforeDoneSubprocessTimeoutHardening:
     must still happen BEFORE the raise, so the grandchild-is-dead assertion
     stays exactly as it was.
 
-    The teardown disposition is asserted in BOTH directions here, because the
-    two shapes are what the escalation text has to tell apart: a script still
-    running at teardown entry gets a real whole-group SIGKILL (and the
-    grandchild-is-dead assertion corroborates it), while a script that already
-    exited gets NO signal at all — its pid may have been recycled — so the
-    child it spawned is still running when the escalation is filed.  Each of
-    the four ``terminate_process_tree`` branch tests below therefore also
-    pins the value it RETURNS, since those are the tests that independently
-    prove which branch ran.
+    The teardown disposition is asserted for both script shapes: a script
+    still running at teardown entry gets a real whole-group SIGKILL, and so
+    does a script already exited and reaped, through the leader pidfd
+    run_script holds from spawn (task 10370) — a dead child corroborates each.
+    Each of the four ``terminate_process_tree`` branch tests below also pins
+    the value it RETURNS, since those are the tests that independently prove
+    which branch ran.
     """
 
     async def test_timeout_kills_whole_process_group(self, tmp_path: Path):
@@ -198,7 +186,7 @@ class TestBeforeDoneSubprocessTimeoutHardening:
         this script's own process was still running when the kill fired.
         (The exited-script case, where a surviving child holds the pipe open
         and a real exit code IS in hand, is pinned by
-        ``test_deterministic_runner.py::TestDefaultRunnerInnerTimeoutDeployHonesty``.)
+        ``test_timeout_of_a_reaped_script_kills_the_child_holding_its_pipe``.)
 
         The 1s budget counts from the recorded, live grandchild, not from the
         spawn: the loop clock is held until then (``_held_loop_clock``), so a
@@ -231,7 +219,7 @@ class TestBeforeDoneSubprocessTimeoutHardening:
                 ),
             )
             try:
-                grandchild_pid = await _await_recorded_pid(pidfile, run)
+                grandchild_pid = await await_recorded_pid(pidfile, run)
                 grandchild = capture(grandchild_pid)
                 assert grandchild is not None, (
                     f'the precondition is a live, recorded grandchild when the budget '
@@ -283,76 +271,88 @@ class TestBeforeDoneSubprocessTimeoutHardening:
             f'the message must still name the budget it overran: {str(exc)!r}'
         )
 
-        deadline = time.monotonic() + 3.0
-        state = liveness(grandchild)
-        while state is not Liveness.DEAD and time.monotonic() < deadline:
-            await asyncio.sleep(0.05)
-            state = liveness(grandchild)
+        state = await _liveness_once_settled(grandchild)
         assert state is Liveness.DEAD, (
             f'grandchild pid {grandchild_pid} must be dead after timeout — the '
             f'WHOLE process group must be killed, not just the direct child: '
             f'{grandchild} reads {state}'
         )
 
-    async def test_timeout_of_already_exited_script_does_not_signal_the_group(
+    @needs_group_pidfd_signals
+    async def test_timeout_of_a_reaped_script_kills_the_child_holding_its_pipe(
         self, tmp_path: Path,
     ):
-        """The other half of Layer A, measured: when the SCRIPT has already
-        exited, the teardown dispatches NO signal and the child it spawned
-        SURVIVES — so "exited" and "group killed" are independent facts.
+        """A script already exited AND reaped at the timeout still has its whole
+        group SIGKILLed, so the child holding the merged pipe open dies too.
 
-        Mechanism: ``communicate()`` waits for the merged stdout/stderr pipe to
-        CLOSE, and the child holding its write end keeps it open past the
-        script's own exit, while asyncio's child watcher populates
-        ``Process.returncode`` independently.  So ``returncode`` is ALREADY set
-        at teardown entry, and ``terminate_process_tree``'s pid-recycling
-        short-circuit (task 845/3884) fires: refusing to signal a possibly
-        recycled pid beats reaping an orphan.
+        ``communicate()`` waits for the pipe to CLOSE, and the child keeps its
+        write end open past the script's exit, so the script's exit code is in
+        hand at teardown entry. Its pid number may since have been recycled,
+        which is why only the leader pidfd run_script holds from spawn may
+        signal the group (task 10370).
 
-        All three facts are asserted together because the escalation text is
-        built from them, and the defect this pins is text that infers a kill
-        from a timeout rather than reporting what was measured (task 4252
-        reviewer finding).
+        The loop clock is held until the script is measured reaped (its
+        ``/proc`` entry gone, not merely a zombie) with its child alive, so a
+        pid-number killpg could not pass this test.
         """
         script = tmp_path / 'exits-but-child-lives.sh'
         pidfile = tmp_path / 'survivor.pid'
         script.write_text(SURVIVOR_SCRIPT)
         script.chmod(0o755)
 
+        survivor: ProcessIdentity | None = None
         try:
-            # Hang tripwire, as in the sibling test above.
-            with pytest.raises(ScriptTimeout) as excinfo:
-                await asyncio.wait_for(
-                    run_script(
-                        script,
-                        [str(pidfile)],
-                        cwd=tmp_path,
-                        env_overrides=None,
-                        timeout_secs=1,
-                        reap_grace_secs=REAP_GRACE_SECS,
+            with held_loop_clock() as release:
+                # Hang tripwire, as in the sibling test above.
+                run = asyncio.ensure_future(
+                    asyncio.wait_for(
+                        run_script(
+                            script,
+                            [str(pidfile)],
+                            cwd=tmp_path,
+                            env_overrides=None,
+                            timeout_secs=1,
+                            reap_grace_secs=REAP_GRACE_SECS,
+                        ),
+                        timeout=10,
                     ),
-                    timeout=10,
                 )
+                try:
+                    survivor_pid = await await_recorded_pid(pidfile, run)
+                    survivor = capture(survivor_pid)
+                    script_pid = os.getpgid(survivor_pid)
+                    await asyncio.to_thread(_wait_until_reaped, script_pid)
+                    assert (
+                        not run.done()
+                        and survivor is not None
+                        and liveness(survivor) is Liveness.ALIVE
+                    ), (
+                        f'the precondition is script pid {script_pid} reaped while its '
+                        f'child pid {survivor_pid} holds the pipe, before the budget '
+                        f'began; run done={run.done()}, child reads {survivor}'
+                    )
+                    release()
+                    with pytest.raises(ScriptTimeout) as excinfo:
+                        await run
+                finally:
+                    await _tear_down_through_the_budget(run, release)
 
             exc = excinfo.value
             assert exc.exit_code == 7, (
                 f'the script really did run to completion, and its exit code is '
                 f'in hand at the raise site: {exc.exit_code!r}'
             )
-            assert exc.teardown is ProcessTeardown.NOT_SIGNALLED, (
-                f'the direct child was already reaped at teardown entry, so the '
-                f'pid-recycling guard dispatched NOTHING — not a group kill, not '
-                f'even a direct kill: {exc.teardown!r}'
+            assert exc.teardown is ProcessTeardown.GROUP_KILLED, (
+                f'the reaped script\'s group must be SIGKILLed through the leader '
+                f'pidfd held from spawn: {exc.teardown!r}'
             )
-            survivor_pid = read_survivor_pid(pidfile)
-            assert is_alive(survivor_pid), (
-                f'survivor pid {survivor_pid} must still be RUNNING — nothing '
-                f'signalled it, and this is the fact the escalation text has to '
-                f'report: the process holding the deploy output pipe open is '
-                f'still there for an operator to find and kill'
+            state = await _liveness_once_settled(survivor)
+            assert state is Liveness.DEAD, (
+                f'child pid {survivor_pid}, holding the pipe of a script that had '
+                f'already been reaped, must die with the group: {survivor} reads {state}'
             )
         finally:
-            kill_survivor(pidfile)
+            kill_survivor(survivor)
 
     async def test_terminate_process_tree_swallows_process_lookup_error(
         self, tmp_path: Path,
@@ -382,7 +382,7 @@ class TestBeforeDoneSubprocessTimeoutHardening:
         with patch(
             'os.killpg', side_effect=ProcessLookupError('no such process'),
         ) as mock_killpg:
-            result = await terminate_process_tree(mock_proc, pgid, reap_grace_secs=0.05)
+            result = await terminate_process_tree(mock_proc, pgid, leader_pidfd=None, reap_grace_secs=0.05)
 
         mock_killpg.assert_called_once_with(pgid, signal.SIGKILL)
         mock_proc.kill.assert_called_once()
@@ -424,7 +424,7 @@ class TestBeforeDoneSubprocessTimeoutHardening:
             # Hang tripwire: if reap_grace_secs stops bounding the wait, fail
             # loudly instead of stalling the suite.
             result = await asyncio.wait_for(
-                terminate_process_tree(mock_proc, pgid, reap_grace_secs=0.05), timeout=5,
+                terminate_process_tree(mock_proc, pgid, leader_pidfd=None, reap_grace_secs=0.05), timeout=5,
             )
 
         mock_killpg.assert_called_once()
@@ -457,7 +457,7 @@ class TestBeforeDoneSubprocessTimeoutHardening:
             patch('os.killpg', side_effect=lambda pgid, sig: killpg_calls.append((pgid, sig))),
             patch('os.getpgid', side_effect=lambda pid: getpgid_calls.append(pid) or 999),
         ):
-            result = await terminate_process_tree(mock_proc, 12345, reap_grace_secs=0.05)
+            result = await terminate_process_tree(mock_proc, 12345, leader_pidfd=None, reap_grace_secs=0.05)
         assert killpg_calls == [], f'must not killpg a reaped proc (task 845); got {killpg_calls}'
         assert getpgid_calls == [], f'must never re-derive the pgid at kill time; got {getpgid_calls}'
         mock_proc.kill.assert_not_called()
@@ -503,7 +503,7 @@ class TestBeforeDoneSubprocessTimeoutHardening:
 
         killpg_calls: list[tuple[int, int]] = []
         with patch('os.killpg', side_effect=lambda p, s: killpg_calls.append((p, s))):
-            result = await terminate_process_tree(mock_proc, pgid, reap_grace_secs=0.05)
+            result = await terminate_process_tree(mock_proc, pgid, leader_pidfd=None, reap_grace_secs=0.05)
 
         assert killpg_calls == [], (
             f'{scenario}: refused pgid must never be signalled -- killpg on our '

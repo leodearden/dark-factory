@@ -154,3 +154,4 @@ class TestFileDirtyTreeEscalation:
         resolved = h._escalation_queue.get(esc_id)
         assert resolved is not None
         assert resolved.status == 'resolved'
+        assert resolved.resolution_class is not None, 'a level-2 close must be classified'

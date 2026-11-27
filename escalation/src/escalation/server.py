@@ -6,11 +6,11 @@ import asyncio
 import contextlib
 import json
 import logging
-from collections.abc import Awaitable, Callable, Collection, Sequence
+from collections.abc import Awaitable, Callable, Collection, Mapping, Sequence
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated, Any, assert_never, cast
+from typing import TYPE_CHECKING, Annotated, Any, TypeVar, assert_never, cast
 
 from fastmcp import FastMCP
 from fastmcp.server.dependencies import get_http_headers
@@ -22,19 +22,23 @@ from shared.eval_lane import eval_lane_provenance
 # Fully qualified rather than `from shared import ...`: the module is
 # deliberately NOT re-exported from shared/__init__, so `import shared` does
 # not pull fastmcp into every consumer of the base layer.
+from shared.markup_residue_custody import (
+    ResidueCall,
+    log_unpreserved_residue,
+    residue_prose,
+)
 from shared.mcp_markup_middleware import (
     FACT_MARKUP_DETECTED,
     MARKUP_RECURRENCE_ROUTING,
     MARKUP_RESIDUE_ERROR_TYPES,
     MARKUP_STORM_ERROR_TYPE,
-    MARKUP_UNRECOVERED_PARAM_ERROR_TYPE,
-    MARKUP_UNRECOVERED_PARAM_OUTCOME_CAVEAT,
-    MARKUP_UNREPAIRABLE_ERROR_TYPE,
+    HostAttribution,
     MarkupGuardMiddleware,
     RepairPolicy,
+    residue_header_lines,
 )
 from shared.mcp_missing_arguments import MissingArgumentMiddleware
-from shared.merge_state import MergeReason, MergeState
+from shared.merge_state import CANCEL_STATES, MergeReason, MergeState
 from shared.storm_counter import StormCounter
 from shared.task_runtime_state import TaskRuntimeEntry, TaskRuntimeSnapshot
 from shared.uuid_prefix_guard import (
@@ -99,7 +103,12 @@ from escalation.note_to_file import file_note_to_file, note_to_file_refusal
 from escalation.pins import classify_pins
 from escalation.policy_gate import identity_resolve_refusal, perform_claim, queue_kind_of
 from escalation.project_root_guard import ProjectRootGuard
-from escalation.queue import AmendmentOutcome, EscalationQueue, blank_resolve_outcome
+from escalation.queue import (
+    AmendmentOutcome,
+    EscalationQueue,
+    ResolutionClassRequired,
+    blank_resolve_outcome,
+)
 from escalation.queue import observed_submit_response as _observed_submit_response
 from escalation.related_pending import related_pending
 from escalation.server_instructions import ESCALATION_SERVER_INSTRUCTIONS
@@ -931,8 +940,8 @@ _AMENDMENT_TRUNCATION_ANCHOR_TASK_ID = 'l2-amendment-truncation'
 # so there is no caller task to file against even if one were wanted.
 #
 # They are DISTINCT anchors because the two records have opposite dedup needs.
-# A residue record is the ONLY surviving copy of one specific caller's payload,
-# so every one must land on its own; a storm record is a rate alarm about a
+# Each residue record holds a different caller's payload, so folding two would
+# destroy one and every one must land on its own; a storm record is a rate alarm about a
 # condition, so a second one while the first is still open is noise.  One shared
 # anchor would force a single answer to both.
 _MARKUP_RESIDUE_ANCHOR_TASK_ID = 'mcp-markup-residue'
@@ -1061,66 +1070,78 @@ def _emit_uuid_prefix_fact(fact: dict[str, Any]) -> None:
     logger.log(level, '%s %s', FACT_UUID_PREFIX_DETECTED, json.dumps(fact, sort_keys=True))
 
 
-def _markup_residue_prose(record: dict[str, Any]) -> str:
-    """What actually happened to the call, in the reader's own terms.
+def _markup_residue_prose(record: Mapping[str, Any]) -> str:
+    """What happened to the call, then a paragraph on who holds its payload.
 
-    DISPATCHED ON ``error_type``, never assumed, because this sink receives two
-    residue kinds whose triage is OPPOSITE and this server is the only site that
-    produces both.  ``MARKUP_UNREPAIRABLE_ERROR_TYPE`` means the call was
-    REFUSED — nothing was written, and the caller was told, so a human may
-    reasonably wait for it to resend.  ``MARKUP_UNRECOVERED_PARAM_ERROR_TYPE``
-    means the call was FORWARDED without the parameter, and nobody was told: no
-    retry is coming, and whether the call then succeeded is unknown here
-    (``MARKUP_UNRECOVERED_PARAM_OUTCOME_CAVEAT`` says why).  One
-    hardcoded "the call was refused" sentence renders the second kind a record
-    that contradicts its own summary three lines above, and the false half is
-    the half that changes what an operator does.
-
-    ``shared.mcp_markup_middleware`` names the kinds precisely so a sink written
-    when only the refusal existed cannot silently mis-file the newer one; this
-    is that sink, matching the set rather than a single name.
-
-    An UNRECOGNISED kind is filed anyway, with a visibly-hedged body that
-    renders the middleware's own ``summary`` and ``suggested_action`` — the same
-    posture ``orchestrator.mcp.markup_sink`` takes.  Dropping a record kind is
-    the silent fail-soft this PRD exists to end, and an unfamiliar record in the
-    queue is a question an operator can answer.
+    The words are ``shared/src/shared/markup_residue_custody.py::residue_prose``'s.
+    A kind it has no text for is still filed, hedged, and also logged here, so
+    an unfamiliar record is visible in the log as well as in the queue.
     """
-    error_type = record.get('error_type')
-    if error_type == MARKUP_UNREPAIRABLE_ERROR_TYPE:
-        return (
-            'THE CALL WAS REFUSED. The leaked fragment\'s own boundary could '
-            'not be determined, so no repair was attempted and nothing was '
-            'guessed. Nothing this call carried reached the escalation store, '
-            'and the caller WAS told: it holds its own copy and can resend, so '
-            'the payload below is a recovery aid rather than the only route '
-            'back to the data.'
+    prose = residue_prose(record)
+    if prose.call is ResidueCall.UNRECOGNISED:
+        logger.warning(
+            'markup guard: filing an unrecognised residue kind %r — the '
+            'middleware emits something this sink does not know about '
+            '(known: %s)',
+            record.get('error_type'), sorted(MARKUP_RESIDUE_ERROR_TYPES),
         )
-    if error_type == MARKUP_UNRECOVERED_PARAM_ERROR_TYPE:
-        return (
-            'THE CALL WAS FORWARDED WITHOUT THIS PARAMETER. The value below '
-            'was recovered from the leak but could not be typed against the '
-            'parameter\'s declared schema, so it was dropped from the call '
-            'rather than passed through untyped. '
-            f'{MARKUP_UNRECOVERED_PARAM_OUTCOME_CAVEAT} The caller was NOT '
-            'told the value was dropped, so do not wait on a resend of it. The '
-            'payload below is the only surviving copy of it.'
-        )
-    logger.warning(
-        'markup guard: filing an unrecognised residue kind %r — the middleware '
-        'emits something this sink does not know about (known: %s)',
-        error_type, sorted(MARKUP_RESIDUE_ERROR_TYPES),
-    )
-    return '\n'.join([
-        f'UNRECOGNISED RESIDUE KIND {error_type!r}. This sink does not know '
-        'what this call\'s outcome was, so it states neither — the middleware '
-        'grew a record kind that escalation/src/escalation/server.py has not '
-        'been taught. Its own words for what happened follow; treat them, not '
-        'this paragraph, as the account of the call.',
+    return f'{prose.outcome}\n\n{prose.custody}'
+
+
+def _markup_residue_escalation(record: Mapping[str, Any], esc_id: str) -> Escalation:
+    """The queue record that holds one residue *record*'s payload, verbatim.
+
+    ``level`` and ``category`` are read from the RECORD rather than restated,
+    so the middleware stays the single source of the contract (INV-5). Their
+    fallbacks fail toward L2 rather than toward a silently-L0 record nobody
+    reads.
+    """
+    level = int(record.get('level') or 2)
+    subject_task_id = record.get('subject_task_id')
+    detail = '\n'.join([
+        # WHOSE call leaked, FIRST: the record's own `task_id` is the synthetic
+        # anchor, not the caller's. `agent_id` comes from the connection's
+        # identity header when a tool declares none.
+        *residue_header_lines(record),
+        # The OWNER that will exit this hold unprompted (INV-7), read off the
+        # record: the middleware names it.
+        f'owner={record.get("owner")!r}',
+        f'tool={record.get("tool")!r}',
+        f'field={record.get("field")!r}',
+        f'matched_pattern={record.get("matched_pattern")!r}',
+        f'raw_value_chars={len(record.get("raw_value") or "")}',
         '',
-        f'summary: {record.get("summary")!r}',
-        f'suggested_action: {record.get("suggested_action")!r}',
+        _markup_residue_prose(record),
+        '',
+        'RAW PAYLOAD, VERBATIM AND ENTIRE. '
+        'Recover it for the caller if it is still needed, then chase the '
+        'harness serialization leak that produced it and '
+        f'{MARKUP_RECURRENCE_ROUTING}.',
+        '',
+        str(record.get('raw_value') or ''),
     ])
+    # Task 3550 deliberately does NOT stamp filing_claimant_run_id here: filed
+    # under the synthetic _MARKUP_RESIDUE_ANCHOR_TASK_ID and bypassing
+    # _chokepoint_or_submit entirely, so no task-workflow incarnation filed it
+    # and there is no honest identity to record.
+    return Escalation(
+        id=esc_id,
+        task_id=_MARKUP_RESIDUE_ANCHOR_TASK_ID,
+        agent_role=_MARKUP_GUARD_AGENT_ROLE,
+        # Derived from `level`, never asserted beside it: the two are one
+        # decision (see _MARKUP_RESIDUE_SEVERITY).
+        severity=_MARKUP_RESIDUE_SEVERITY if level >= 2 else 'blocking',
+        category=str(record.get('category') or 'mcp_markup_residue'),
+        # The subject is PREFIXED: a reader scanning summaries alone, which is
+        # what the L2 watcher's notification shows, would otherwise have no way
+        # to tell whose call leaked.
+        summary=(
+            f'[{subject_task_id}] ' if subject_task_id else ''
+        ) + str(record.get('summary') or ''),
+        detail=detail,
+        suggested_action=str(record.get('suggested_action') or ''),
+        level=level,
+    )
 
 
 # INV-4 storm escape for root-cause OVER-FOLDING (task 3998).  Canonicalising
@@ -1292,6 +1313,26 @@ def _render_store_identity_block(identity: StoreIdentity) -> str:
     )
 
 
+_CANCEL_STATES_PLACEHOLDER = '{CANCEL_STATES}'
+_CANCEL_STATES_WIRE_LIST = ' | '.join(
+    f"'{state}'" for state in MergeState if state in CANCEL_STATES
+)
+
+_Fn = TypeVar('_Fn', bound=Callable[..., Any])
+
+
+def _render_cancel_states(fn: _Fn) -> _Fn:
+    """Write the CANCEL_STATES wire list into *fn*'s docstring, before FastMCP reads it.
+
+    ``str.replace``, never ``str.format``: the docstring holds other braces.
+    """
+    doc = fn.__doc__ or ''
+    if _CANCEL_STATES_PLACEHOLDER not in doc:
+        raise ValueError(f'{fn.__qualname__}: no {_CANCEL_STATES_PLACEHOLDER} in its docstring')
+    fn.__doc__ = doc.replace(_CANCEL_STATES_PLACEHOLDER, _CANCEL_STATES_WIRE_LIST)
+    return fn
+
+
 def create_server(
     queue: EscalationQueue,
     merge_queue: asyncio.Queue | None = None,
@@ -1448,12 +1489,15 @@ def create_server(
         logger.info('%s %s', FACT_MARKUP_DETECTED, json.dumps(fact, sort_keys=True))
 
     def _file_markup_residue(record: dict[str, Any]) -> str | None:
-        """Persist an unrepairable call's payload, or report a storm burst.
+        """Persist a residue record of either kind, or report a storm burst.
 
         The escalation channel the guard writes to (C2 L187 / INV-7).  Returns
-        the queued id as a ``str`` — the middleware propagates it into the
-        refusal payload so a bounced caller can point an operator at its own
-        preserved data, and treats a non-``str`` as reporting no id.
+        the queued id as a ``str`` — the middleware propagates it to the
+        caller so it can point an operator at its own preserved data, and
+        treats a non-``str`` as reporting no id.  A residue the queue cannot
+        take goes whole to
+        ``shared/src/shared/markup_residue_custody.py::log_unpreserved_residue``
+        and reports no id.
 
         THE QUEUE IS WRITTEN DIRECTLY, and both halves of that are deliberate:
 
@@ -1472,72 +1516,16 @@ def create_server(
         error_type = record.get('error_type')
         if error_type == MARKUP_STORM_ERROR_TYPE:
             return file_storm_once(queue, _MARKUP_STORM_ALARM, record)
-
-        # `level` and `category` are read from the RECORD rather than restated,
-        # so the middleware stays the single source of the contract (INV-5).
-        # The fallbacks matter only if that contract is ever violated, and they
-        # fail toward L2 rather than toward a silently-L0 record nobody reads.
-        level = int(record.get('level') or 2)
-        subject_task_id = record.get('subject_task_id')
-        detail = '\n'.join([
-            # WHOSE call leaked. Rendered FIRST and unconditionally because on
-            # this server it is the only attribution that always resolves: the
-            # middleware's `_identity` reads `agent_id` / `project_root` /
-            # `project_id` off the call's own arguments; no escalation tool
-            # declares `agent_id` or `project_id`, and the tools that accept an
-            # OPTIONAL `project_root` see it omitted by fleet callers, so
-            # `project` below usually stays None. The record's own `task_id` is
-            # the synthetic anchor, not the caller's, so without these two
-            # lines a critical L2 record names nobody at all.
-            f'subject_task_id={subject_task_id!r}',
-            f'subject_agent_role={record.get("subject_agent_role")!r}',
-            # The OWNER that will exit this hold unprompted (INV-7), read off
-            # the record rather than restated: the middleware names it, and a
-            # second spelling here could name a consumer that no longer exists.
-            f'owner={record.get("owner")!r}',
-            f'tool={record.get("tool")!r}',
-            f'field={record.get("field")!r}',
-            f'matched_pattern={record.get("matched_pattern")!r}',
-            f'agent_id={record.get("agent_id")!r}',
-            f'project={record.get("project")!r}',
-            f'raw_value_chars={len(record.get("raw_value") or "")}',
-            '',
-            _markup_residue_prose(record),
-            '',
-            'RAW PAYLOAD, VERBATIM AND ENTIRE — the only surviving copy. '
-            'Recover it for the caller if it is still needed, then chase the '
-            'harness serialization leak that produced it and '
-            f'{MARKUP_RECURRENCE_ROUTING}.',
-            '',
-            str(record.get('raw_value') or ''),
-        ])
-        # Task 3550 deliberately does NOT stamp filing_claimant_run_id here:
-        # filed under the synthetic _MARKUP_RESIDUE_ANCHOR_TASK_ID and bypassing
-        # _chokepoint_or_submit entirely, so no task-workflow incarnation filed it
-        # and there is no honest identity to record.
-        esc = Escalation(
-            id=queue.make_id(_MARKUP_RESIDUE_ANCHOR_TASK_ID),
-            task_id=_MARKUP_RESIDUE_ANCHOR_TASK_ID,
-            agent_role=_MARKUP_GUARD_AGENT_ROLE,
-            # Derived from `level`, never asserted beside it: the two are one
-            # decision (see _MARKUP_RESIDUE_SEVERITY), so if the middleware ever
-            # lowers the level this record follows it down instead of writing a
-            # born-at-L2 severity onto an L0/L1 record.
-            severity=_MARKUP_RESIDUE_SEVERITY if level >= 2 else 'blocking',
-            category=str(record.get('category') or 'mcp_markup_residue'),
-            # The subject is PREFIXED rather than left to the detail: the
-            # record's own task_id is the synthetic anchor, so a reader
-            # scanning summaries alone — which is what the L2 watcher's
-            # notification shows — would otherwise have no way to tell whose
-            # call leaked. Same shape the sibling sink uses.
-            summary=(
-                f'[{subject_task_id}] ' if subject_task_id else ''
-            ) + str(record.get('summary') or ''),
-            detail=detail,
-            suggested_action=str(record.get('suggested_action') or ''),
-            level=level,
-        )
-        return queue.submit(esc)
+        try:
+            return queue.submit(_markup_residue_escalation(
+                record, queue.make_id(_MARKUP_RESIDUE_ANCHOR_TASK_ID),
+            ))
+        except Exception:
+            log_unpreserved_residue(
+                logger, record,
+                why='the escalation queue could not take it', exc_info=True,
+            )
+        return None
 
     mcp.add_middleware(MarkupGuardMiddleware(
         policy=RepairPolicy.FORWARD_REPAIR,
@@ -1550,6 +1538,10 @@ def create_server(
         # server is the one place the residue can actually be preserved.
         escalation_sink=_file_markup_residue,
         fact_sink=_emit_markup_fact,
+        # Attribution only, never a gate: the same header stamp_triage reads.
+        host_attribution=lambda: HostAttribution(
+            agent_id=get_http_headers().get(_IDENTITY_HEADER),
+        ),
     ))
     # --- Truncated-uuid citations (PRD uuid-prefix-resolution §4-C3) ---
     # After the markup guard, so a parameter it recovers is scanned too (B15).
@@ -2430,6 +2422,8 @@ def create_server(
         escalate_model: bool = False,
         recut: bool = False,
         terminate: Any = None,
+        ruled_by_human: bool | None = None,
+        project_root: str | None = None,
     ) -> dict[str, Any]:
         """Resolve or dismiss an escalation.
 
@@ -2538,6 +2532,24 @@ def create_server(
         same code, also with no record change. Written only at resolution —
         never author-supplied otherwise. Not forwarded to the ``park`` action
         (the record stays open at L2, unclassified until eventually resolved).
+        A level-2 close with neither this class nor a non-null resolver default
+        returns ``{'error': ..., 'code': 'resolution_class_required'}`` and
+        changes nothing (plans/instruments-honesty-prd.md decision 8).
+
+        ``ruled_by_human`` is the caller's assertion that a human ruled on THIS
+        record or its sitting docket item and the ``resolution`` text cites
+        that ruling (plans/instruments-honesty-prd.md decision 9). It is stamped
+        on the record and inherited by every cascade member, and not forwarded
+        to ``park``. An identity in ``authority.RULED_BY_HUMAN_FORBIDDEN`` (the
+        executor, the auto-watcher) asserting True gets
+        ``ruled_by_human_forbidden``. Header-less callers are trusted, as for
+        ``resolved_by``; the decision-stream audit checks their assertions.
+
+        *project_root* — optional. When given, it must name the project root
+        this store serves; otherwise the call returns ``{'error': ...}``
+        naming both stores (or naming the reconciliation store), and nothing
+        is read or changed. Omitted or ``''``, the call is unchanged. The rule
+        is ``escalation.project_root_guard::ProjectRootGuard``'s.
 
         **A resolve on an ALREADY-AUTO-DISMISSED record does NOT take effect**
         (task 4495).  ``queue.resolve``'s status check is an atomic
@@ -2602,19 +2614,22 @@ def create_server(
         ``escalation.action_effects`` module docstring for the archive
         verification behind this).
 
-        **Gate precedence**, in order: the argument-validation refusals
+        **Gate precedence**, in order: the ``project_root`` guard (a bare
+        ``{'error': ...}`` with no ``code`` key, the same shape as the sibling
+        tools' refusal) → the argument-validation refusals
         (``invalid_resolution_class``, ``recut_requires_restart``) → the
         connection-capability gate
         (``bad_capability_header`` / ``level_forbidden``) → the policy-table
-        identity gate (``resolution_class_required`` /
-        ``policy_state_unreadable`` / ``level_forbidden`` /
-        ``claimed_by_executor``) → this Table B
+        identity gate (``ruled_by_human_forbidden`` /
+        ``resolution_class_required`` / ``policy_state_unreadable`` /
+        ``level_forbidden`` / ``claimed_by_executor``) → this Table B
         legality gate (``illegal_transition``) → the park-on-info gate
         (``park_on_info``, via ``_park_on_info_refusal``; ``park`` only, on an
         info-severity target, because an info record never pins its task,
         pins.py link 1) → park's early return → the declared-pin gate
-        (``declared_pin_refused``). A caller failing several gates receives the
-        earliest one's error. None of these gates mutates the record, so the
+        (``declared_pin_refused``) → the level-2 class refusal
+        (``resolution_class_required``), raised inside ``queue.resolve``. A
+        caller failing several gates receives the earliest one's error. None of these gates mutates the record, so the
         ordering is an error-reporting precedence only, not a correctness
         difference.
 
@@ -2706,6 +2721,8 @@ def create_server(
         inline, which closes it or re-holds it, instead of being re-pended, see
         ``orchestrator/src/orchestrator/harness.py::Harness._run_held_pure_gate_inline``.
         """
+        if (refusal := project_root_guard.check(project_root)) is not None:
+            return refusal
         if terminate is not None:
             return {
                 'error': (
@@ -2817,8 +2834,8 @@ def create_server(
             }
         if (refusal := identity_resolve_refusal(
             identity, rec, action=action, resolution=resolution,
-            resolution_class=resolution_class, queue_dir=queue.queue_dir,
-            queue_kind=queue_kind, now=datetime.now(UTC),
+            resolution_class=resolution_class, ruled_by_human=ruled_by_human,
+            queue_dir=queue.queue_dir, queue_kind=queue_kind, now=datetime.now(UTC),
         )) is not None:
             return refusal
         if identity is not None:
@@ -2937,15 +2954,19 @@ def create_server(
 
         dismiss = action in _DISMISS_ACTIONS
         resolve_outcome = blank_resolve_outcome()
-        esc = queue.resolve(
-            escalation_id, resolution, dismiss=dismiss,
-            resolved_by=resolved_by, resolution_turns=resolution_turns,
-            resolution_class=resolution_class,
-            granted_files=granted_files,
-            resolution_action=action,
-            recut=recut,
-            outcome=resolve_outcome,
-        )
+        try:
+            esc = queue.resolve(
+                escalation_id, resolution, dismiss=dismiss,
+                resolved_by=resolved_by, resolution_turns=resolution_turns,
+                resolution_class=resolution_class,
+                granted_files=granted_files,
+                resolution_action=action,
+                recut=recut,
+                outcome=resolve_outcome,
+                ruled_by_human=ruled_by_human,
+            )
+        except ResolutionClassRequired as exc:
+            return {'error': str(exc), 'code': exc.code}
         if esc is None:
             return {'error': f'Escalation {escalation_id} not found'}
 
@@ -5827,6 +5848,7 @@ def create_server(
     # ── merge_cancel — explicit cancellation via waiter-future cancel (PRD β2 / task 1632) ──
 
     @mcp.tool()
+    @_render_cancel_states
     async def merge_cancel(request_id: str) -> dict[str, Any]:
         """Cancel an in-flight merge request by its request_id.
 
@@ -5840,16 +5862,8 @@ def create_server(
                                 state verbatim, including its deliberate
                                 forward-compatible passthrough of an unmapped worker
                                 state (escalation/src/escalation/server.py::_map_live_state).
-                                merge-state-vocab:begin partition=CANCEL_STATES
-                                'queued' | 'verifying' | 'gate' | 'finalizing' |
-                                'done' | 'conflict' | 'blocked' | 'abandoned' | 'superseded' |
-                                'no_record' | 'stale_record' | 'journaled' | 'unknown'
-                                merge-state-vocab:end
-                                Source of truth: shared/src/shared/merge_state.py::CANCEL_STATES.
-                                The span above is machine-pinned to it by
-                                scripts/tests/test_merge_state_vocabulary_consistency.py
-                                (the CONTRIBUTING.md lint-command-mirror convention) — edit
-                                the partition, not this list.
+                                {CANCEL_STATES}
+                                Rendered at import from shared/src/shared/merge_state.py::CANCEL_STATES.
             reason    (str|None) — None on success; non-None string on every other path.
             code      (str)   — the lane's refusal, a MergeCancelRefusal value
                                 ('not_live' | 'finalize_window' | 'train_cancel_unsupported').

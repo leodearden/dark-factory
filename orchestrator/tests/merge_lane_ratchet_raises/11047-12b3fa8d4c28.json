@@ -1,0 +1,18 @@
+{
+  "task_id": "11047",
+  "reason": "task 11047 review fix: _retire_item keeps the restart-durable un-chained mark when the merge worker's shutdown outcome retired the request (no verdict; it comes back on the next start), so a graceful stop no longer erases it",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+      "baseline": 1465,
+      "current": 1466
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker::_retire_item",
+      "baseline": 3,
+      "current": 4
+    }
+  ]
+}

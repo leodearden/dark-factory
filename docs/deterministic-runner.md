@@ -9,6 +9,16 @@ name is a member of `deterministic_runner.py`, except `ScriptTimeout`
 (`orchestrator/src/orchestrator/before_done_script.py`) and
 `summarize_predicate_output` (`orchestrator/src/orchestrator/predicate_output.py`).
 
+`run()` acts on the task row as the store holds it at entry, not the row the
+dispatch handed over (task 11430). `_store_row` re-reads it through the
+scheduler's `get_task`; when that read fails, `run()` falls back to the
+dispatched row. A row the store already holds done or cancelled returns DONE
+with no write and no escalation. The scheduler likewise re-reads and re-checks
+its dispatch winner after claiming it
+(`orchestrator/src/orchestrator/scheduler.py::Scheduler._confirm_claim`). So a
+write that lands mid-tick, such as a new dependency or a gate stamp, is seen
+before a gate is re-filed or its preconditions stamped.
+
 Phase β delivers the **pure-gate** pattern
 (`before_done=None`, `always_escalates=True`).
 
@@ -166,10 +176,12 @@ Phase ε **self-restart** sub-path (`before_done.target_unit` == own unit):
   re-fetch fails or is deferred past the per-tick fetch budget
   (`orchestrator/src/orchestrator/scheduler.py::Scheduler._phase_backfill_terminal_dep_records`).
   A dep never yet cached that the budget defers makes its dependents wait
-  (verdict `unknown`) until a later tick fetches it: after a restart the
-  cold cache takes ceil(terminal deps / `delivered_checks.max_checks_per_tick`)
-  ticks to warm.  Only a never-cached dep whose fetch fails outright fails
-  open, for that tick.  Accepted residual: an RP-4 submit that itself failed
+  (verdict `unknown`) until a later tick fetches it.  A held re-validation
+  never takes the last slot from a never-cached dep, so after a restart the
+  cold cache takes ceil(terminal deps / max(1, budget − held re-validations))
+  ticks to warm while fetches succeed, the budget being
+  `delivered_checks.max_record_fetches_per_tick`.  Only a never-cached dep
+  whose fetch fails outright fails open, for that tick.  Accepted residual: an RP-4 submit that itself failed
   reads as `verified`.
 - If scheduling succeeds (`rc == 0`) and `always_escalates=True`
   (act-then-ask): fall through directly to section 3 (the gate) WITHOUT
@@ -202,10 +214,14 @@ Phase γ **cross-unit** sub-path (`target_unit` ≠ own unit or `ORCH_UNIT` unse
   blocked — reporting the three facts the runner MEASURED and no others
   (task 4252): the budget it overran, the script's own exit code when the
   teardown found it already exited (else that none was produced), and
-  WHICH signal that teardown dispatched — which for the common
-  already-exited shape is none at all, leaving the script's children
-  running and the operator told to go find them.  Never a synthetic rc,
-  and never an assumed kill.
+  WHICH signal that teardown dispatched.  The common already-exited shape
+  gets a whole-group SIGKILL through the leader pidfd held from spawn
+  (task 10370).  When no signal is sent, the script's children are left
+  running and the operator is told to go find them: for example when the
+  script was reaped before that pidfd was taken, when the host lacks
+  pidfds or predates Linux 6.9, or when the group was already empty
+  because whatever still holds the output pipe had left it.  Never a
+  synthetic rc, and never an assumed kill.
 - Re-inspect and verify freshness (B7b), delegated to
   `proc_supervision.RestartPlan.execute()`'s `FreshPidVerify` check
   (task 2238/δ): when the pre-deploy baseline had a persistent MainPID

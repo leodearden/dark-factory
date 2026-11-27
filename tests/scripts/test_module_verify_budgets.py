@@ -291,7 +291,7 @@ REPO_ROOT = pathlib.Path(__file__).parents[2]
 # figures did not come from that sweep AT ALL — each is a fleet census of
 # production verify runs (see their entries above), so the 6-way/9-way
 # distinction is not the axis their error bars lie on — nor to `client-feed`,
-# measured separately by task 6966.
+# re-measured separately by task 11846.
 MEASURED_MODULE_SUITE_WORST_SECS: dict[str, float] = {
     'shared': 296.88,
     'escalation': 354.56,
@@ -299,7 +299,7 @@ MEASURED_MODULE_SUITE_WORST_SECS: dict[str, float] = {
     'dashboard': 653.54,
     'sampler': 22.49,
     'cockpit': 130.50,
-    'client-feed': 7.88,
+    'client-feed': 140.89,
     # Task 5654; the runs and their loadavg are in tests/repo_guards/orchestrator.yaml.
     'tests/repo_guards': 165.09,
     # REFRESHED 2026-09-14 from ORCHESTRATOR_BUDGET_CENSUS (5288.0 was a

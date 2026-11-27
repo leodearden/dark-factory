@@ -88,11 +88,11 @@ from escalation.categories import EscalationCategory
 # behavioural anchor pinned to the SAME setup the halt-owner suite exercises --
 # cross-module test-helper imports are established practice here (see
 # test_laptop_warm_verify_boundary.py, test_lane_lock_leak_guard.py).
-from test_halt_owner import (  # noqa: F401 -- `harness` is a fixture used by name
+from test_halt_owner import (
     _FakeMergeWorker,
     _make_wip_esc,
-    harness,
 )
+from test_halt_owner import harness as harness
 
 from orchestrator.agents.roles import (
     MERGE_HALT_ESCALATION_CATEGORIES,

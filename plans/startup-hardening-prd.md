@@ -141,7 +141,9 @@ the nine committed `orchestrator-*.service` files.
 6. **A crashed start is distinguishable in runs.db.** Two additive columns via `add_column_if_missing_sync`
    (the `_migrate_runs_code_sha` idiom): `startup_completed_at TEXT` (stamped at `finish_startup()`) and
    `exit_reason TEXT` (`startup_crash:<step>` from the `except BaseException`, `cancelled` for a SIGTERM
-   `CancelledError`, NULL for a clean return). `finish_run` writes both. OPERATIONS.md §Troubleshooting gains
+   `CancelledError`, NULL for a clean return). `finish_run` writes both. (Design gap found by η, §9 item 1:
+   written only at exit, a live or post-startup-SIGKILLed run reads both-NULL. Task 11332 owns the fix.)
+   OPERATIONS.md §Troubleshooting gains
    the row "an orchestrator unit restarts every ~100 s" whose recipe reads these columns and the journal.
 7. **The watchdog gets an independent detector and stops undoing StartLimit.** `main()` reads `systemctl
    --user show -p NRestarts,Result` for every WATCHED unit on every tick, grace window or not, and persists
@@ -237,4 +239,207 @@ None: no novel substrate (G3 N/A beyond what §2 verified — `asyncio.Queue` en
 
 ## 9. Observation record (η appends here)
 
-_Empty until η runs._
+### 2026-11-22 — η observation (task 8274)
+
+**Window:** 2026-11-15T10:24:00Z to 2026-11-22T11:19:11Z, 7 d 0 h 55 m (7.04 days). The start is when ζ's
+drained sweep began: the esc-8273-1 resolution reads "restart-all-orchestrators.sh --drain ran 10:24-11:00Z".
+The end is the first measurement. Each item below states its own measurement time.
+
+**Context:** the live stores in the MAIN checkouts (`/home/leo/src/dark-factory/data/…`,
+`/home/leo/src/reify/data/…`), read read-only (sqlite `file:…?mode=ro` URIs from system `python3`) from a
+dispatched agent shell (task 8274's worktree) on host leo-MS-7C35. The journal was read with
+`journalctl --user` and live unit state with `systemctl --user show`.
+
+| item | rule | figure | verdict |
+|---|---|---|---|
+| 1. `runs` rows started in the window | every row has `startup_completed_at` or `exit_reason` non-NULL; a both-NULL row is a γ defect | dark-factory: 6 rows, 4 `cancelled`, 2 both-NULL. reify: 6 rows, 4 `cancelled`, 2 both-NULL. All 4 both-NULL rows had completed startup: 2 are live, 2 were SIGKILLed after startup. 0 `startup_crash:*` | **FAIL**: γ (task 8269) persists `startup_completed_at` only at exit, as §3.6 specified. Follow-up: task 11332 (ticket `tkt_0RX9DGW8JRC36T4XYS31M0BQBN`). The SIGKILLs belong to task 7247 |
+| 2. watchdog restart-rate sampling, `--report RESTARTS` | every WATCHED unit has an entry with `sampling_since` ≤ window start and a last sample ≤ ~3 min old; the watchdog timer ran across the whole window with no gap far above its 60 s tick; `--report` prints `RESTARTS` for every running unit. (δ keeps only the last 1800 s of samples by design, so §6's "≥ 7 days of samples" is read as `sampling_since` plus timer continuity.) | 7/7 WATCHED units present, each with `sampling_since` 2026-11-11T17:55:04Z and a last sample 2 s old (30 samples, all NRestarts 0). 10 095 timer ticks in the window, median gap 60.2 s, largest 120.4 s (one missed tick). `RESTARTS` printed for 9/9 running units, all `0/success`. Not sampled: scoping-intake and stream-touch, which are not in WATCHED | **PASS**. The WATCHED gap is owned by pending tasks 9321 and 9815 |
+| 3. crash-loop pages | each in-window `orchestrator-crash-loop-*` or `orchestrator-startup-crash-loop` record matches a journal `Scheduled restart job` burst (≥ 5 within 1800 s, or `start-limit-hit`; ≥ 3 consecutive startup crashes for γ's page). Conversely, every such burst has a record | 0 records in the window across the 9 hosted queues. 0 `Scheduled restart job` lines and 0 start-limit hits on all 9 units. 0 `startup_crash:*` rows in all 9 runs.db | **no episode, detector unexercised**: no false page, no missed page |
+| 4. startup-step L1s | list each in-window `orchestrator-startup-<step>` L1 with its `dedupe_count`, and say whether it names a real fault | 0 L1s in the window across the 9 queues. 0 `startup_step_failed` events in the window in all 9 runs.db | **no step failure in the window, runner's failure path unexercised** |
+| 5. merge-lane cost per restart | per restart, at most one `MERGE_WORKER_SHUTDOWN_REASON` burst, with events = distinct request_ids ≤ the requests outstanding (queued or in flight) at the stop; no burst from a `startup_crash:*` run and none per crash iteration; every burst attributable to one sweep or one deliberate restart | 6 fleet-sweep waves in the window, ζ's included. dark-factory: 4 bursts, 57 / 52 / 66 / 33 events. reify: 5 bursts, 2 / 3 / 6 / 4 / 6 events. Every burst lasts < 1 s and has events = distinct request_ids. Counted independently from `merge_queued`/`merge_finalized`, every burst's requests were outstanding at its stop, and 2 outstanding requests were not in a burst. 0 `startup_crash:*` runs. 3 run ends were SIGKILLed and emitted no burst | **PASS** |
+
+**Overall:** items 2 (restart-rate sampling and `RESTARTS`) and 5 (merge-lane cost) PASS. Item 1 FAILS on the
+γ defect that `startup_completed_at` is persisted only at exit. Items 3 (crash-loop pages) and 4 (startup-step
+L1s) were unexercised: there was no crash loop and no step failure in the window, so neither a false nor a
+missed page occurred.
+
+**Follow-ups:**
+
+- Task 11332, pending, filed by this record (ticket `tkt_0RX9DGW8JRC36T4XYS31M0BQBN`): "γ (task 8269) defect:
+  runs.startup_completed_at is persisted only at exit, so a live or post-startup-SIGKILLed run reads
+  both-NULL — stamp it at finish_startup()" (item 1).
+- Task 7247, pending: the shutdown drain bound. In the window, 4 run ends were SIGKILLed by the 90 s
+  stop-sigterm timeout: dark-factory twice, reify, and solar-challenge-platform (items 1 and 5).
+- Tasks 9321 and 9815, both pending: orchestrator-scoping-intake.service and orchestrator-stream-touch.service
+  are outside `WATCHED`, so they get no crash-loop sampling (item 2).
+- None for items 3–4. No false or missed page was found, so nothing is filed against δ (task 8270).
+
+**Item 1 evidence** (measured 2026-11-22T11:19–11:26Z). The query was `SELECT run_id, started_at, completed_at,
+startup_completed_at, exit_reason, code_sha FROM runs WHERE started_at >= '2026-11-15T10:24:00' ORDER BY
+started_at`, run on each project's `data/orchestrator/runs.db`.
+
+- dark-factory, 6 rows. `exit_reason='cancelled'`: 4 (run-fc741c6ac05d, run-7c108b742770, run-9a6d5c55b0a4,
+  run-c1a1cfef15e7). Each has `startup_completed_at` 24–83 s after `started_at`, and each ended in a systemd
+  stop with `status=130`. NULL: 2, both with NULL `startup_completed_at`. No other value appears. Across the
+  whole table only those 4 rows carry `startup_completed_at`.
+- reify, 6 rows. `exit_reason='cancelled'`: 4 (run-579bc7a3e1c9, run-bd31446a3fb5, run-3fc27174c232,
+  run-d774a0682070), with `startup_completed_at` 35–90 s after `started_at`, each ending in a `status=130`
+  stop. NULL: 2, both with NULL `startup_completed_at`. Across the whole table only those 4 rows carry it.
+- run-64d39f3b97db (dark-factory, started 2026-11-15T11:00:28Z: ζ's own restart, unit MainPID 3122636) is
+  class (ii), KILLED AFTER STARTUP. Orchestrator pid 3122652 logged `Started run run-64d39f3b97db` at
+  11:00:28, then `Task tree populated: 3382 pending tasks` and `Speculative merge worker started` at 11:01:13.
+  On 2026-11-17 the unit logged `Stopping` at 07:12:12, then `State 'stop-sigterm' timed out. Killing.` and
+  `status=9/KILL` at 07:13:42. The next line, `Started run run-fc741c6ac05d`, is at 07:13:49.
+- run-be51184228f6 (dark-factory, started 2026-11-21T01:38:14Z) is class (i), LIVE. The unit has been active
+  since 01:33:38 with MainPID 4058288. Its orchestrator child, pid 4058311, is the process that logged
+  `Started run run-be51184228f6`, then `Task tree populated: 3989 pending tasks` and `Speculative merge worker
+  started` at 01:41:01. The unit has logged no `Stopping` or `Started` line since.
+- run-7dfa13be7c9b (reify, started 2026-11-19T03:24:53Z) is class (ii), KILLED AFTER STARTUP. Pid 2452643
+  logged `Task tree populated: 2583 pending tasks` at 03:25:18 and `Speculative merge worker started` at
+  03:25:19. On 2026-11-21 the unit logged `Stopping` at 01:27:02, then `State 'stop-sigterm' timed out.
+  Killing.` and `status=9/KILL` at 01:28:32. The next line, `Started run run-de3958d3e6bf`, is at 01:28:43.
+- run-de3958d3e6bf (reify, started 2026-11-21T01:28:43Z) is class (i), LIVE. The unit has been active since
+  01:28:33 with MainPID 3888978. Its child, pid 3888996, logged `Task tree populated: 2708 pending tasks` at
+  01:29:55 and `Speculative merge worker started` at 01:29:57.
+- Class (iii) (no startup-complete line before a kill): none.
+- Excluded, because it started before the window: dark-factory run-0dac71f2fe0f (started 2026-11-14). ζ's
+  sweep SIGKILLed it at 2026-11-15T11:00:19Z (stop-sigterm timeout), and it has NULL `completed_at`.
+- Mechanism. §3.6 above specifies both that the column is "stamped at `finish_startup()`" and that
+  "`finish_run` writes both", and γ implements that literally:
+  `orchestrator/src/orchestrator/harness.py::Harness.run` takes the timestamp into a local right after
+  `self.scheduler.finish_startup()`, and hands it to
+  `orchestrator/src/orchestrator/run_store.py::RunStore.finish_run` from its `finally`. The gap is in the
+  design, not a departure from it: persisting only at exit means a row reads both-NULL for as long as its run is
+  live, and forever once a SIGKILL skips the `finally`. That is exactly the row a SIGKILL during startup leaves.
+  Until the process exits through its `finally`, the column cannot tell §3.6's crashed start from a healthy one.
+  The task's rule names a both-NULL row a γ defect, so the verdict stays FAIL. Task 11332 adds the write at the
+  `finish_startup()` moment.
+- The two class (ii) kills are systemd's 90 s stop-sigterm bound: `Stopping` came 90 s before `Killing` both
+  times. So the shutdown drain overran, which is task 7247 and out of scope under §4.
+- The same shape appears across the fleet, from the runs.db of all 9 hosted projects (measured 2026-11-22T11:31Z
+  for the items 3–4 scan). Each project has 6 rows in the window and 0 `startup_crash:*`. Seven projects have 1
+  both-NULL row, the live run. reify and dark-factory have 2, as above. solar-challenge-platform also has 2: one
+  is live (run-37f056969250) and one, run-6d9d7fe5ccbb (started 2026-11-19T03:25:58Z), was SIGKILLed at
+  2026-11-21T01:31:11Z by the same stop-sigterm timeout, about 46 h after it started.
+
+**Item 2 evidence** (measured 2026-11-22T11:27–11:28Z, main checkout at `8436bb9b60`).
+
+- `data/orchestrator/watchdog-restart-rate.json`. Its key set equals the 7 units in
+  `scripts/orchestrator-watchdog.py::WATCHED`, as read from the main checkout's file. The watchdog unit sets no
+  `ORCH_RESTART_RATE_*` override, so `scripts/_watchdog_crash_loop.py`'s defaults apply:
+  `RESTART_RATE_ALARM_COUNT` 5 and `RESTART_RATE_ALARM_WINDOW_SECS` 1800.
+
+  | unit | `sampling_since` | samples | first / last sample | NRestarts | `last_escalation_epoch` | `start_limit_paged` |
+  |---|---|---|---|---|---|---|
+  | each of the 7 WATCHED units (dark-factory, reify, my-solar-challenge, know-live, autopilot-video, solar-challenge-platform, pump-web-ui) | 2026-11-11T17:55:04Z | 30 | 2026-11-22T10:58:23Z / 11:27:30Z | 0 in every sample | none | false |
+
+- Why the samples span only 29 min. `scripts/_watchdog_crash_loop.py` keeps a sample only while `now - epoch <=
+  window_secs`, so `samples` is pruned to the alarm window, while `sampling_since` "is never pruned". So δ
+  cannot persist seven days of samples; that is a restatement of the rule, not a defect. The value of
+  `sampling_since` (four days before the window opened) together with the timer's continuity is what shows
+  the whole window was sampled.
+- Timer continuity. `journalctl --user USER_UNIT=orchestrator-watchdog.service --since '2026-11-15 10:24'`
+  shows 10 095 `Starting` and 10 096 `Finished` lines, from 2026-11-15T10:24:21Z to 2026-11-22T11:27:30Z, and
+  no failed run (the only other lines are 33 `Consumed … CPU time`). The timer is
+  `OnUnitActiveSec=60` with `AccuracySec=5s`. The median gap between starts is 60.2 s, the largest are 120.4 s
+  (2026-11-19T05:48:23Z) and 120.2 s (2026-11-21T02:58:10Z), and only 3 gaps exceed 90 s.
+- `python3 /home/leo/src/dark-factory/scripts/orchestrator-watchdog.py --report` exited 1. Per its docstring,
+  `report()` "return[s] 1 iff any unit is stale": all 9 units were `stale` against a main commit from
+  2026-11-22T08:17Z, inside the 72 h deploy cadence, so the exit is not a failure. The `RESTARTS` column sits
+  beside `VERDICT` and reads `0/success` for all 9 running units: autopilot-video, dark-factory, know-live,
+  my-solar-challenge, pump-web-ui, reify, scoping-intake, solar-challenge-platform, stream-touch.
+- orchestrator-scoping-intake.service and orchestrator-stream-touch.service appear in `--report` but not in
+  WATCHED, so they get no crash-loop sampling. Pending tasks 9321 (add both to WATCHED) and 9815 (S24 δ2a:
+  derive the liveness set from installed sockets) already own that gap, so nothing new is filed for it.
+
+**Items 3–4 evidence** (measured 2026-11-22T11:30–11:33Z).
+
+- Queues scanned. The roots come from the `--config <root>/dark-factory-orchestrator.yaml` of every installed
+  `~/.config/systemd/user/orchestrator-*.service` except the watchdog: autopilot-video, dark-factory, know-live,
+  solar-challenge (unit my-solar-challenge), pump-web-ui, reify, scoping-intake, solar-challenge-platform,
+  stream-touch. In each `<root>/data/escalations` the scan read every top-level `esc-*.json` and every
+  `archive/<date>/esc-*.json`: 8 764 files in all, none unreadable. It selected records whose `task_id` starts
+  with `orchestrator-crash-loop-` or `orchestrator-startup-` (the latter covers `orchestrator-startup-crash-loop`).
+- In-window records with `timestamp` ≥ 2026-11-15T10:24:00Z: none, in any queue.
+- Excluded as out of window: 8 records, all `orchestrator-startup-2c3-streak-alarms` (an L1 `-1` and an L2 `-2`),
+  filed 2026-11-10T20:57Z–2026-11-11T10:48Z.
+  - In dark-factory both are archived 2026-11-11 as `dismissed`. That L2 was resolved by task 9322, which made
+    both `_alarm_subject` helpers tolerate `task_id=None`; it is done and merged as `0a2ff8bb91`.
+  - In autopilot-video, know-live and pump-web-ui both are still `pending`, with `dedupe_count` 0 and no
+    `updated_at`.
+  - Each of those units restarted 6 times in the window. A recurrence would have refreshed the pending L1 in
+    place (§3.1), so `dedupe_count` 0 is in-window evidence that the 2c3 fault did not recur. The six pending
+    records are stale, not live faults.
+- Journal converse check (`journalctl --user USER_UNIT=orchestrator-<unit>.service --since '2026-11-15 10:24'`,
+  all 9 units). 0 `Scheduled restart job` lines and 0 start-limit lines on every unit. Each unit has 6 `Started`
+  lines, and every one follows a `Stopping` line, so each start was a stop/start: a fleet sweep or a manual
+  restart, never a `Restart=` restart. That agrees with NRestarts 0 throughout item 2. No burst reaches the
+  5-in-1800 s threshold, so no page was missed.
+- runs.db corroboration, all 9 projects: `SELECT run_id, timestamp, data FROM events WHERE
+  event_type='startup_step_failed' AND timestamp >= '2026-11-15T10:24:00'` returns 0 rows everywhere. The
+  all-time counts are 1 each in autopilot-video, dark-factory, know-live and pump-web-ui, all on 2026-11-10 (the
+  2c3 fault above), and 0 elsewhere.
+
+**Item 5 evidence** (measured 2026-11-22T11:34–11:45Z).
+
+- The query, on both runs.db: `SELECT run_id, timestamp, task_id, data FROM events WHERE
+  event_type='merge_finalized' AND timestamp >= '2026-11-15T10:24:00' AND json_extract(data,'$.reason') =
+  'Merge worker shutting down'`. The literal is
+  `orchestrator/src/orchestrator/merge_lane/intake_buffers.py::MERGE_WORKER_SHUTDOWN_REASON`. Events are
+  bucketed by event timestamp, so reify's pre-window run ac72adcd8509, which ζ's sweep stopped, is counted.
+  This gives 208 events in dark-factory and 21 in reify, all `state='blocked'`.
+- Restart waves. Each wave stopped all 9 units once, in the same unit order (autopilot-video, know-live,
+  my-solar-challenge, pump-web-ui, reify, scoping-intake, solar-challenge-platform, stream-touch,
+  dark-factory), and every unit has exactly those 6 `Stopping` lines in the window. In the table, "sweep"
+  means `scripts/restart-all-orchestrators.sh`. The wave identification is:
+  - W1, 2026-11-15T10:24–11:00Z: ζ's `--drain` sweep (esc-8273-1).
+  - W2, 11-17T05:51–07:13Z: a sweep, journal identifier `restart-all-orchestrators.sh[1819989]`, which ended
+    "All 9 orchestrator unit(s) restarted and verified fresh".
+  - W3, 11-17T19:40–20:48Z and W4, 11-18T17:30–18:34Z: the same order and pacing, but the driver's own lines
+    are not in the journal under the identifiers searched (`restart-all-orchestrators.sh`, `sh`, `bash`). So
+    the driver is unidentified, though the shape is a fleet sweep.
+  - W5, 11-19T02:28–04:25Z: a sweep, `sh[3752634]`, which ended "All 9 … verified fresh".
+  - W6, 11-21T00:16–01:33Z: unit `orch-redeploy-restart-10802` ran `restart-all-orchestrators.sh --drain`
+    (`sh[4182317]`). It is the sweep that `data/orchestrator/last_redeploy_orchestrator.json` records
+    (2026-11-21T01:33:38Z).
+
+  | project | run_id | burst at (UTC) | events | distinct requests | cause |
+  |---|---|---|---|---|---|
+  | reify | run-ac72adcd8509 | 2026-11-15 10:37:25.16–.19 | 2 | 2 | W1, ζ's sweep |
+  | dark-factory | run-0dac71f2fe0f | none | 0 | 0 | W1, ζ's sweep; SIGKILLed at 11:00:19 (stop-sigterm) |
+  | reify | run-579bc7a3e1c9 | 2026-11-17 06:48:24.81–.87 | 3 | 3 | W2 sweep |
+  | dark-factory | run-64d39f3b97db | none | 0 | 0 | W2 sweep; SIGKILLed at 07:13:42 (stop-sigterm) |
+  | reify | run-bd31446a3fb5 | 2026-11-17 20:14:46.67–.80 | 6 | 6 | W3, fleet sweep (driver not journaled) |
+  | dark-factory | run-fc741c6ac05d | 2026-11-17 20:48:47.48–.99 | 57 | 57 | W3, fleet sweep (driver not journaled) |
+  | reify | run-3fc27174c232 | 2026-11-18 18:17:31.11–.13 | 4 | 4 | W4, fleet sweep (driver not journaled) |
+  | dark-factory | run-7c108b742770 | 2026-11-18 18:34:20.87–21.08 | 52 | 52 (49 tasks) | W4, fleet sweep (driver not journaled) |
+  | reify | run-d774a0682070 | 2026-11-19 03:24:46.54–.58 | 6 | 6 | W5 sweep |
+  | dark-factory | run-9a6d5c55b0a4 | 2026-11-19 04:25:34.69–35.21 | 66 | 66 | W5 sweep |
+  | reify | run-7dfa13be7c9b | none | 0 | 0 | W6 `--drain` sweep; SIGKILLed at 01:28:32 (stop-sigterm) |
+  | dark-factory | run-c1a1cfef15e7 | 2026-11-21 01:33:19.61–20.39 | 33 | 33 | W6 `--drain` sweep |
+
+- Per restart: at most one burst, and none spans more than 0.8 s. No event count exceeds its distinct
+  `request_id` count, so no request was resolved twice. In run-7c108b742770, 3 tasks each had two distinct
+  requests in the queue.
+- Per run: every burst comes from a run with `exit_reason='cancelled'`, or, for ac72adcd8509, from a run
+  that started before the window. No run in the window has `exit_reason` `startup_crash:*`, so there is no
+  crash-iteration burst.
+- Cost per sweep, as burst size. dark-factory: 0 / 0 / 57 / 52 / 66 / 33. reify: 2 / 3 / 6 / 4 / 6 / 0. The
+  three zeros at a SIGKILLed run end are not cheap stops: the SIGKILL skipped `SpeculativeMergeWorker.stop()`,
+  which is the same 90 s stop-sigterm bound as item 1 (task 7247).
+- Bound against the queue, counted independently of the bursts (measured 2026-11-22T11:45–11:48Z, same
+  stores). `stop()` resolves both the waiting queue and in-flight entries, so the base is the requests
+  outstanding at the stop: those with a `merge_queued` event in the burst's own run before the burst and no
+  `merge_finalized` event, of any reason, before it. Each run reads: outstanding / burst size / whether every
+  burst request was outstanding.
+  - dark-factory: fc741c6ac05d 57 / 57 / yes. 7c108b742770 53 / 52 / yes. 9a6d5c55b0a4 66 / 66 / yes.
+    c1a1cfef15e7 34 / 33 / yes.
+  - reify: 579bc7a3e1c9 3 / 3 / yes. bd31446a3fb5 6 / 6 / yes. 3fc27174c232 4 / 4 / yes. d774a0682070 6 / 6 /
+    yes. ac72adcd8509 started 2026-11-13 on older code whose `merge_queued` payloads carry no `request_id`, so it
+    is matched by task: tasks 9849 and 9860 were the only queued-and-unfinalized ones, and they are exactly
+    the burst's 2.
+  - The 2 outstanding requests missing from a burst were not lost. mr-75da9b47 (task 5509, run 7c108b742770)
+    had passed verify at 18:21:46 and got no terminal event at the stop. The next boot re-queued it at 18:34:41,
+    W5's burst blocked it, and it landed `done` at 2026-11-19T13:22:08Z. mr-3618669e (task 6982, run
+    c1a1cfef15e7) was in a passing 3-request chain verify at 2026-11-21T01:27:38Z whose `merge_sha` is
+    `5fddf7c11a`, "Merge task/6982 into main". No `merge_finalized` was written for it, and task 6982 is done.

@@ -1,9 +1,9 @@
 """Tests for the shared per-cycle flood-control policy (task 5240, PRD C4/D6).
 
 ``reconciliation/consolidation_flood_control.py::rank_and_cap`` is the one home
-of the ranking and backlog policy used by the auto-consolidation executor and by
-task 4916's detector-report submitter. Every test here runs ``rank_and_cap``
-against a real ``ConsolidationAutoConfig`` and asserts on the returned plan.
+of the ranking and backlog policy used by the auto-consolidation executor. Every
+test here runs ``rank_and_cap`` against a real ``ConsolidationAutoConfig`` and
+asserts on the returned plan.
 """
 
 from __future__ import annotations

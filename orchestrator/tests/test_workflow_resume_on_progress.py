@@ -74,6 +74,7 @@ def _make_workflow(
     config.recycle_config_dir_on_zero_output = False
     config.judge_after_each_iteration = False
     config.inter_iteration_rebase = False
+    config.backends.implementer = 'claude'
     # These tests pass a plain tmp_path as cwd (not a real linked worktree) and
     # do not assert on sandbox wiring; disable the sandbox block so _invoke does
     # not call compute_write_set(cwd) on a non-worktree path (task 2905 α3).
@@ -684,3 +685,47 @@ class TestProgressTimeoutResumePrompt:
 
         assert seen['resume_session_id'] == 'crash-sid'
         assert seen['prompt'] == CRASH_RECOVERY_RESUME_PROMPT
+
+
+@pytest.mark.asyncio
+class TestProgressTimeoutOnANonResumingBackend:
+    """A progress kill on an implementer backend the resume lifecycle cannot continue.
+
+    MiMo reports its answered steps as transcript_turns, so its wall-clock kill is a
+    progress timeout, but no MiMo session survives for _invoke to resume. Such a
+    kill re-dispatches fresh through the counter-resetting branch.
+    """
+
+    async def test_a_progress_kill_arms_no_resume(self, tmp_path: Path):
+        wf = _make_workflow(tmp_path=tmp_path, max_execute_iterations=1)
+        wf.config.backends.implementer = 'mimo'
+        _stub_iteration_helpers(wf, _progress_timeout_agent_result())
+        wf._last_invoke_session_id = 'killed-sid'
+
+        outcome = await wf._execute_iterations()
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        assert wf.metrics.progress_resume_total == 0
+        assert wf._pending_resume_session_id is None
+        assert wf._pending_resume_role is None
+
+    async def test_a_progress_kill_still_resets_the_wedge_counter(self, tmp_path: Path):
+        wf = _make_workflow(
+            tmp_path=tmp_path,
+            max_execute_iterations=10,
+            max_consecutive_zero_output_timeouts=2,
+        )
+        wf.config.backends.implementer = 'mimo'
+        mock_invoke = _stub_iteration_helpers(wf, _zero_output_agent_result())
+        mock_invoke.side_effect = [
+            _zero_output_agent_result(),
+            _progress_timeout_agent_result(),
+            _zero_output_agent_result(),
+            _zero_output_agent_result(),
+            *(_zero_output_agent_result() for _ in range(6)),
+        ]
+
+        outcome = await wf._execute_iterations()
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        assert mock_invoke.call_count == 4

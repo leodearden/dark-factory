@@ -58,7 +58,6 @@ from _plan_markup_fixtures import (
     corrupt_plan,
     isolate_the_refusal_memo,  # noqa: F401 — autouse; pytest resolves it by name
     on_disk,
-    plan_artifacts,  # noqa: F401 — a fixture, requested by test parameter name
 )
 from shared.plan_deviation import DEVIATION_KINDS
 from shared.toolcall_markup import detect

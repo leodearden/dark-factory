@@ -580,9 +580,10 @@ CREATE TABLE IF NOT EXISTS runs (
     -- (orchestrator.deployed_sha.DeployedSha.sha); NULL when unreadable or the
     -- row predates 6565.  Migrated by _migrate_runs_code_sha.
     code_sha       TEXT,
-    -- Task 8269: when startup finished, and why the run did not return
-    -- cleanly (RunExitReason.column_value); a NULL exit_reason is a clean
-    -- return.  Migrated by _migrate_runs_startup_outcome.
+    -- Task 8269: when startup finished (stamped by mark_startup_completed the
+    -- moment startup finishes), and why the run did not return cleanly
+    -- (RunExitReason.column_value); a NULL exit_reason is a clean return.
+    -- Migrated by _migrate_runs_startup_outcome.
     startup_completed_at TEXT,
     exit_reason          TEXT
 );
@@ -947,26 +948,34 @@ class RunStore:
             conn.close()
         return None if row is None else _task_result_from_row(row)
 
+    def mark_startup_completed(self, run_id: str, at: datetime) -> None:
+        """Record on the runs row that startup finished, at finish_startup()."""
+        completed_text = _utc_iso(at)
+        conn = self._connect()
+        try:
+            conn.execute(
+                'UPDATE runs SET startup_completed_at = ? WHERE run_id = ?',
+                (completed_text, run_id),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
     def finish_run(
         self,
         run_id: str,
         report: HarnessReport,
         *,
-        startup_completed_at: datetime | None = None,
         exit_reason: RunExitReason | None = None,
     ) -> None:
         """Update the runs row with final aggregates and how the run ended, at shutdown."""
-        startup_completed_text = (
-            None if startup_completed_at is None else _utc_iso(startup_completed_at)
-        )
         conn = self._connect()
         try:
             conn.execute(
                 'UPDATE runs SET '
                 'completed_at = ?, total_tasks = ?, completed = ?, '
                 'blocked = ?, escalated = ?, total_cost_usd = ?, '
-                'paused_for_cap = ?, cap_pause_secs = ?, '
-                'startup_completed_at = ?, exit_reason = ? '
+                'paused_for_cap = ?, cap_pause_secs = ?, exit_reason = ? '
                 'WHERE run_id = ?',
                 (
                     report.completed_at,
@@ -977,7 +986,6 @@ class RunStore:
                     report.total_cost_usd,
                     int(report.paused_for_cap),
                     report.cap_pause_duration_secs,
-                    startup_completed_text,
                     None if exit_reason is None else exit_reason.column_value,
                     run_id,
                 ),

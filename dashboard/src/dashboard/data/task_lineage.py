@@ -29,6 +29,7 @@ import httpx
 from dashboard.config import DashboardConfig
 from dashboard.data.datum import Datum, DatumState, aged_at, unknown_datum
 from dashboard.data.prd_attribution import LINEAGE_METADATA_KEYS, LineageEntry, lineage_entry
+from dashboard.data.served_read import wait_shielded
 from dashboard.data.tasks import TaskReadOffline, fetch_metadata_projection
 
 logger = logging.getLogger(__name__)
@@ -119,7 +120,9 @@ async def acquire_lineage(
         refresh = _start_refresh(client, config, root, now=now)
     if refresh is not None:
         with contextlib.suppress(TimeoutError):
-            await asyncio.wait_for(asyncio.shield(refresh), LINEAGE_REQUEST_WAIT_SECONDS)
+            await wait_shielded(
+                refresh, LINEAGE_REQUEST_WAIT_SECONDS, what=f'the lineage read for {root}',
+            )
     return aged_at(_served(_store.get(root, _RootState())), now)
 
 

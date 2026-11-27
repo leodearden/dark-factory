@@ -11,10 +11,10 @@ test_codebook.py.
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import re
-import socket
 import subprocess
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -24,6 +24,7 @@ import yaml
 from legibility import census_trigger as ct
 from legibility.config import Census, LegibilityConfig, NoveltySpike, load_config
 from shared.testing_mcp_stub import StubAnswer, StubMcpServer
+from shared.testing_sockets import refused_port
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
@@ -552,13 +553,12 @@ def test_default_status_fetcher_raises_status_fetch_unavailable_when_unreachable
 ):
     """A refused connection surfaces as StatusFetchUnavailable naming the
     URL, never as a raw transport exception."""
-    with StubMcpServer(stateful=False) as server:
-        pass
-    monkeypatch.setenv("FUSED_MEMORY_MCP_URL", server.url)
-    fetcher = ct.default_status_fetcher(tmp_path)
+    with _refused_url() as url:
+        monkeypatch.setenv("FUSED_MEMORY_MCP_URL", url)
+        fetcher = ct.default_status_fetcher(tmp_path)
 
-    with pytest.raises(ct.StatusFetchUnavailable, match=re.escape(f"unreachable at {server.url}")):
-        fetcher()
+        with pytest.raises(ct.StatusFetchUnavailable, match=re.escape(f"unreachable at {url}")):
+            fetcher()
 
 
 def test_default_status_fetcher_raises_status_fetch_unavailable_on_a_tool_error(
@@ -830,19 +830,20 @@ def test_a_well_formed_completion_states_its_reason(completion):
     assert completion.reason.startswith("completion: ")
 
 
-def _closed_port_url():
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
-        probe.bind(("127.0.0.1", 0))
-        port = probe.getsockname()[1]
-    return f"http://127.0.0.1:{port}"
+@contextlib.contextmanager
+def _refused_url():
+    with refused_port() as port:
+        yield f"http://127.0.0.1:{port}"
 
 
 @pytest.fixture(autouse=True)
 def _no_live_fused_memory(monkeypatch):
     """A decision that reaches the real completion check unasked meets a
-    closed port, never the host's live fused-memory; a test serving a stub
-    sets FUSED_MEMORY_MCP_URL itself."""
-    monkeypatch.setenv("FUSED_MEMORY_MCP_URL", _closed_port_url())
+    closed port held for the whole test, never the host's live fused-memory;
+    a test serving a stub sets FUSED_MEMORY_MCP_URL itself."""
+    with _refused_url() as url:
+        monkeypatch.setenv("FUSED_MEMORY_MCP_URL", url)
+        yield
 
 
 class _RunStore:
@@ -890,9 +891,9 @@ def test_run_completion_check_runs_the_real_script_against_the_observed_project(
 def test_run_completion_check_against_a_closed_port_is_a_store_unreachable_error(
     tmp_path, monkeypatch,
 ):
-    monkeypatch.setenv("FUSED_MEMORY_MCP_URL", _closed_port_url())
-
-    completion = _check(ct.run_completion_check, tmp_path)
+    with _refused_url() as url:
+        monkeypatch.setenv("FUSED_MEMORY_MCP_URL", url)
+        completion = _check(ct.run_completion_check, tmp_path)
 
     assert completion.status is ct.CompletionStatus.ERROR
     assert "store_unreachable" in completion.reason

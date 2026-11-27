@@ -10,7 +10,6 @@ from __future__ import annotations
 from collections.abc import Awaitable, Callable
 
 import pytest
-from _briefing_helpers import briefing as briefing
 from escalation.models import Escalation
 
 from orchestrator.agents.briefing import OPEN_INFO_NOTES_HEADING, BriefingAssembler

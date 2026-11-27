@@ -42,11 +42,15 @@ collector's state never runs ahead of, or behind, the rows computed from it.
 
 Retention
 ---------
-``cleanup_old`` keeps the rows within ±30 days of now and runs at most once a
-day; its DELETE (``RETENTION_DELETE_SQL``) is two range searches of
-idx_samples_ts, not a table scan. ``maybe_vacuum`` runs at most once a day,
+``cleanup_old`` keeps the rows within ±30 days of now. A sweep is due once a
+day, and each tick's call deletes at most ``max_rows`` expired rows. The sweep
+stays due, its clock unstamped, until a call deletes fewer than ``max_rows``,
+which stamps it; so a backlog drains over successive ticks and no tick does
+more than one chunk. Its DELETE (``RETENTION_DELETE_SQL``) is two range
+searches of idx_samples_ts, not a table scan. ``maybe_vacuum`` runs at most once a day,
 and only when the reclaimable fraction of the file is worth a whole-file
-rewrite. Both gates treat a stamp in the future as due.
+rewrite; it waits out an unfinished sweep, so it judges the whole prune. Both
+gates treat a stamp in the future as due.
 
 Trailing window
 ---------------
@@ -124,14 +128,23 @@ _SPLIT_LEGACY_KEYS_SQL = (
 # A VACUUM is worth its whole-file rewrite only past this share of free pages.
 _VACUUM_MIN_RECLAIMABLE_FRACTION = 0.10
 
+# Keeps one tick's share of a retention sweep well inside the tick interval
+# (dashboard/dark-factory-load-sampler.timer::OnUnitActiveSec).
+_RETENTION_ROWS_PER_TICK = 20_000
+
 # Samples a trailing window spans, current value included. One home for it, so
 # ``write_tick`` and ``trailing_window`` cannot disagree about the span.
 _TRAILING_WINDOW_SAMPLES = 60
 
 _SET_META_SQL = 'INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)'
 
-# Bound to (oldest kept ts, newest kept ts); both arms search idx_samples_ts.
-RETENTION_DELETE_SQL = 'DELETE FROM samples WHERE ts < ? OR ts > ?'
+# Bound to (oldest kept ts, newest kept ts, row budget); both arms search
+# idx_samples_ts and the outer delete is by rowid. SQLite as built here
+# rejects DELETE ... LIMIT.
+RETENTION_DELETE_SQL = (
+    'DELETE FROM samples WHERE rowid IN'
+    ' (SELECT rowid FROM samples WHERE ts < ? OR ts > ? LIMIT ?)'
+)
 
 _GET_META_SQL = 'SELECT value FROM meta WHERE key = ?'
 
@@ -458,27 +471,41 @@ class LoadSampleStore:
         *,
         retain_seconds: int = 30 * 24 * 60 * 60,
         interval_seconds: int = 86400,
-    ) -> None:
-        """Delete rows more than ``retain_seconds`` from ``now``, once per interval.
+        max_rows: int = _RETENTION_ROWS_PER_TICK,
+    ) -> int:
+        """Delete up to ``max_rows`` rows more than ``retain_seconds`` from ``now``.
 
         The cutoff is SYMMETRIC about ``now``: rows that far in the future go
         too, because a forward clock step stamps rows that no past-only cutoff
         would ever reach. Both bounds are exclusive — a row at exactly
         ``now ± retain_seconds`` survives.
 
-        The DELETE searches idx_samples_ts from each end, so it costs the rows
-        it removes rather than the table. The interval is stamped only after
-        the DELETE commits, so a failure is retried on the next tick.
+        A sweep is due once per interval. Each call deletes at most
+        ``max_rows`` rows; the sweep stays due, its clock unstamped, until a
+        call deletes fewer than ``max_rows``, which stamps the clock in the
+        same transaction as its DELETE. So a backlog drains over successive
+        calls, and a failure leaves the sweep due for the next tick. The
+        DELETE searches idx_samples_ts from each end, so it costs the rows it
+        removes rather than the table.
+
+        Returns the rows deleted, 0 when no sweep is due. ``max_rows`` below 1
+        raises ValueError, whether or not a sweep is due.
         """
+        if max_rows < 1:
+            raise ValueError(f'cleanup_old: max_rows must be at least 1, got {max_rows}')
         if not self.should_cleanup(now, interval_seconds=interval_seconds):
-            return
+            return 0
         conn = self._connect()
         try:
-            conn.execute(RETENTION_DELETE_SQL, (now - retain_seconds, now + retain_seconds))
+            deleted = conn.execute(
+                RETENTION_DELETE_SQL, (now - retain_seconds, now + retain_seconds, max_rows)
+            ).rowcount
+            if deleted < max_rows:
+                conn.execute(_SET_META_SQL, ('last_cleanup_ts', str(now)))
             conn.commit()
         finally:
             conn.close()
-        self._set_meta('last_cleanup_ts', str(now))
+        return deleted
 
     # ------------------------------------------------------------------
     # Vacuum gating via meta table
@@ -524,12 +551,16 @@ class LoadSampleStore:
         ``reclaimable_fraction`` reaches ``_VACUUM_MIN_RECLAIMABLE_FRACTION``,
         as after a retention change or a bulk prune.
 
+        While a retention sweep is still due (``should_cleanup``) it is not
+        evaluated and its clock is left alone, so a prune spread over several
+        ticks is judged whole, once it finishes.
+
         A skip stamps the clock: finding nothing to reclaim is a successful
         evaluation. A VACUUM stamps it only on success, and a failure, opening
         the connection included, is logged and retried on the next eligible
         tick.
         """
-        if not self.should_vacuum(now):
+        if not self.should_vacuum(now) or self.should_cleanup(now):
             return
         if self.reclaimable_fraction() < _VACUUM_MIN_RECLAIMABLE_FRACTION:
             self._set_meta('last_vacuum_ts', str(now))

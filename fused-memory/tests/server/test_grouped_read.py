@@ -74,7 +74,8 @@ def _child(
     """A scrolled child row, shaped exactly as ``get_memories_by_metadata`` returns.
 
     ``metadata`` is the FULL raw Qdrant payload — so the body lives under the
-    mem0 content key ``data`` (the first of ``_MEM0_CONTENT_KEYS``), not under
+    mem0 content key ``data`` (the first of
+    ``fused_memory/utils/mem0_content_keys.py::MEM0_CONTENT_KEYS``), not under
     a separate 'content' field.
     """
     return {
@@ -1502,6 +1503,21 @@ class TestPromotedParentMetadataShape:
         assert promoted['created_at'] == '2026-08-01T00:00:00+00:00', (
             'created_at lands in the MANAGED half and must still be read back '
             f'from it, got {promoted!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_promoted_parent_carries_writer_task_and_scope(self):
+        record = self._raw_record()
+        record['metadata'].update({'agent_id': 'claude-task-7', 'task_id': '3137'})
+        service = _stub_service(_two_amendments_three_sightings(), parents={_CANONICAL_ID: record})
+
+        promoted = (
+            await group_search_results(service, _PROJECT_ID, [_child_result(_AMEND_1, 0.77)])
+        )[0]
+
+        assert promoted['id'] == _CANONICAL_ID
+        assert (promoted['agent_id'], promoted['task_id'], promoted['project_id']) == (
+            'claude-task-7', '3137', 'dark_factory',
         )
 
 

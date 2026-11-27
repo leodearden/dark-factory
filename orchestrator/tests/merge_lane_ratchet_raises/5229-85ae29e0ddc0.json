@@ -1,0 +1,18 @@
+{
+  "task_id": "5229",
+  "reason": "review findings 1-2 (task 5229): five new park-lock tests in test_git_ops.py drive GitOps._await_index_lock_clear, read the _last_park_lock_info side channel, and spy GitOps._scan_index_lock_holders to pin that the deferral reason judges the stand-off's own scan, as the class's existing tests do",
+  "measures": [
+    {
+      "measure": "private_reads",
+      "key": "orchestrator/tests/test_git_ops.py",
+      "baseline": 104,
+      "current": 111
+    },
+    {
+      "measure": "total:private_reads",
+      "key": "<cluster>",
+      "baseline": 6121,
+      "current": 6128
+    }
+  ]
+}

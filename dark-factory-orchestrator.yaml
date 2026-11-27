@@ -573,11 +573,15 @@ lint_command: "uv run ruff check shared escalation fused-memory orchestrator das
 #     lint coverage above. Filed as [tkt_0RS401FD4JNB5SW8F8JB1DQ38K].
 #   * skills/**/*.sh and SKILL.md bodies are BEHAVIOURAL artifacts —
 #     spawn-claude.sh, spawn/hooks/*.sh, and the SKILL.md text
-#     load_skill_system_prompt injects into agent system prompts — whose
-#     consumer tests exist (enumerated in CORRECTION 1) but never run on the
-#     diff that CHANGES them, for the _has_source_files reason in CORRECTION 2.
-#     Fixing that is a verify/verify_plan production change, a different class
-#     from a yaml edit. Filed as [tkt_0RS401ZAKSC9EJFQDX8KCXCSD3].
+#     load_skill_system_prompt injects into agent system prompts. Filed as
+#     [tkt_0RS401ZAKSC9EJFQDX8KCXCSD3]; task 5296 closed it for the artifacts
+#     named in
+#     orchestrator/src/orchestrator/verify_artifact_consumers.py::BEHAVIOURAL_ARTIFACTS:
+#     at role='task' a diff touching one of them runs its consumer tests
+#     (orchestrator/src/orchestrator/verify_plan.py::with_artifact_consumer_modules
+#     and ::derive_verify_plan). A skills/ artifact absent from that table is
+#     still TRIVIAL at the task leg (verify_plan.py::is_trivial_diff) and is
+#     caught at the merge gate.
 # Both are curator TICKET ids, not task ids: the curator runs asynchronously
 # and decides create/combine/drop, so the resulting task number is not knowable
 # at this commit. 3485's own follow-up for this question was
@@ -1087,8 +1091,8 @@ verify_env:
 # ever gate, that is a deliberate operator decision, not a silent one.
 #
 # LIVE ON THIS PROJECT. This file enables the `laptop` verify runner with
-# verify_drift_check_every_n_lands: 10, so these probes run on both hosts at the
-# first drift check after the deploy that carries them, and every 10 lands after
+# verify_drift_check_every_n_lands: 20, so these probes run on both hosts at the
+# first drift check after the deploy that carries them, and every 20 lands after
 # that. The first check is expected to report the real tool skew measured below
 # as ONE deduped L1 — designed behaviour, not a defect. RESTART-ONLY
 # (deliberately absent from RELOADABLE_FIELDS): the probe list is only
@@ -1590,6 +1594,15 @@ merge_train_max_members: 3
 # serialized), accepted against the oversubscription-flake churn it removes.
 merge_verify_max_concurrent_modules: 1
 
+# Verify-result cache in log mode for both roles: plans/verify-result-cache-prd.md § Modes and rollout, A3.
+# The code default stays off; merge 'on' waits for epsilon (task 5655).
+# Remote replay logs first (A5.2); 'on' is an operator action after three days in log, and remote_merge_mode on also waits for epsilon (task 5655).
+verify_cache:
+  task_mode: log
+  merge_mode: log
+  remote_task_mode: log
+  remote_merge_mode: log
+
 # ── Lever C (multi-host post-merge verify): laptop runner, prefer_remote ──────
 # ENABLED 2026-09-30 (task 5053 = D1; plans/merge-lane-throughput-prd.md). leo-laptop
 # joins this project's merge-verify pool. It takes effect at the next orchestrator
@@ -1611,8 +1624,12 @@ merge_verify_max_concurrent_modules: 1
 # TRUST-ANCHOR TRADE-OFF, EYES OPEN: prefer-local existed because local is the trust
 # anchor (a laptop false green landed a red commit, #5120). Under prefer_remote nearly
 # every verdict is a REMOTE verdict, so verify_drift_check_every_n_lands is the
-# standing fidelity guard: 10 here, not the 20 of the PRD's first draft. A drift check
-# leases BOTH hosts and runs both legs, so 1-in-10 gives back a little local CPU.
+# standing fidelity guard: 1 in 20 landings (Leo's ruling 2026-11-20, down from 1 in 10;
+# the key stays explicit so the value sits beside this rationale). A drift check leases
+# BOTH hosts and runs both legs. Measured 2026-11-12 to 2026-11-19: 14 checks held the
+# workstation merge slot 9.5 h and the laptop's 2.6 h. 77 checks since 2026-10-03 gave 72
+# agreements and 5 divergences: one real laptop false green (2026-10-15), four
+# workstation-side noise. Leo ruled the check is worth keeping at half the rate.
 # verify_cross_check_remote_green: false (2026-10-02, task 5416 OFF step). Leo ruled on
 # esc-5416-2 to shorten the parity window to one day and pre-approved the OFF step. The
 # window ran 2026-10-01T05:01Z to 2026-10-02T05:01Z on the code default TRUE (a blocking
@@ -1631,7 +1648,7 @@ verify_runners:
     gate_checkouts_path: /home/leo/src/dark-factory-gate
     enabled: true
 verify_host_policy: prefer_remote
-verify_drift_check_every_n_lands: 10
+verify_drift_check_every_n_lands: 20
 verify_cross_check_remote_green: false
 # Remote TASK verifies (task 6670, plans/remote-task-leg-verify-prd.md §5.7): the four
 # verify_task_* keys let an implement-phase task verify run on a verify_runners host
@@ -1753,6 +1770,14 @@ git:
       command: "uv run pytest -m warm_lane_bash"
       cwd: "orchestrator"
       fix_task_priority: "high"
+    # The verify-result cache audit (plans/verify-result-cache-prd.md § Audit, task 5655).
+    # PROJECT_ROOT points the head's own config at the lane worktree, so the
+    # audited module set is the head's. DF_VERIFY_CACHE=off forces both roles'
+    # cache modes off (A3). Its red handler is verify_cache/audit_hook.py.
+    - name: verify-cache-audit
+      command: 'DF_VERIFY_CACHE=off PROJECT_ROOT="$PWD" uv run --project orchestrator orchestrator verify-cache audit-run --config dark-factory-orchestrator.yaml'
+      cwd: "."
+      fix_task_priority: "high"
 
 # Variable-depth speculative verify placement (task 2359) — ACTIVATE the deep
 # probe (operator decision, 2026-07-19). probe_fraction=0.5: half of second-slot
@@ -1829,6 +1854,12 @@ merge_deep:
   chain_cap: 6
   # No warm spec pool here, so builds are git-only (8 builds, max 31 s).
   chain_build_timeout_secs: 300
+
+# Merge pre-verify screen (task 7919). Kill switch: a hot reload of manifest: null.
+# It fails open; a streak of errored screens files merge_screen_unavailable.
+# See plans/merge-pre-verify-screen-prd.md decisions 3, 4 and 8.
+merge_screen:
+  manifest: scripts/merge_screen.yaml
 
 # TRIAL (Leo 2026-11-14, lock hand-off study): the automatic file reservation
 # is off. A task earns one when its count of skips reaches its tier's threshold,

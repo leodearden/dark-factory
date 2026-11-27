@@ -9,6 +9,7 @@ onto it after a restart.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import dataclasses
 import json
 import logging
@@ -16,7 +17,7 @@ from collections.abc import Callable, Iterator
 from datetime import UTC, datetime, timedelta
 
 import pytest
-from _fm_helpers import make_insufficient_quota_error
+from _fm_helpers import make_insufficient_quota_error, make_usage_limit_reached_error
 from shared.project_layout import escalation_queue_dir
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
@@ -39,6 +40,7 @@ pytestmark = [
 ]
 
 _FIRST_SEEN = datetime(2026, 11, 19, 6, 50, tzinfo=UTC)
+_ALARM_LOGGER = 'fused_memory.services.billing_exhaustion_alarm'
 
 
 def _exhaustion(**error_kwargs) -> BillingExhaustion:
@@ -134,6 +136,19 @@ class TestThePage:
         assert '(credit_balance_exhausted)' in record['summary']
         assert 'code=credit_balance_exhausted' in record['detail']
         assert '(insufficient_quota)' not in record['summary']
+
+
+class TestOnlyApiKeyCreditsPage:
+    @pytest.mark.asyncio
+    async def test_a_plan_cap_files_nothing(self, tmp_path):
+        plan_cap = classify_billing_exhaustion(make_usage_limit_reached_error())
+        assert plan_cap is not None
+        alarm = _alarm(tmp_path)
+
+        await alarm.record_exhausted(plan_cap, site='durable_queue:add_episode')
+
+        assert alarm.state() is None
+        assert _records(tmp_path) == []
 
 
 class TestAPageThatCouldNotBeFiled:
@@ -255,6 +270,146 @@ class TestRestart:
         assert len(_records(tmp_path)) == 1
 
 
+def _close(tmp_path, page_id: str) -> None:
+    from escalation.queue import EscalationQueue
+
+    EscalationQueue(escalation_queue_dir(tmp_path)).resolve(
+        page_id, 'acknowledged, topping up', resolution_class='actionable',
+    )
+
+
+@contextlib.contextmanager
+def _unopenable_queue(tmp_path) -> Iterator[None]:
+    """Set the queue directory aside and put a file in its place meanwhile."""
+    queue_dir = escalation_queue_dir(tmp_path)
+    aside = tmp_path / 'queue-set-aside'
+    queue_dir.rename(aside)
+    queue_dir.write_text('')
+    try:
+        yield
+    finally:
+        queue_dir.unlink()
+        aside.rename(queue_dir)
+
+
+class TestAPageClosedWhileCreditsAreStillOut:
+    """A latch must not keep claiming a page a human has already closed."""
+
+    @pytest.mark.asyncio
+    async def test_a_page_resolved_while_still_exhausted_re_pages_after_the_cooldown(
+        self, tmp_path,
+    ):
+        clock = _Clock()
+        alarm = _alarm(tmp_path, clock=clock)
+        await alarm.record_exhausted(_exhaustion(), site='durable_queue:add_episode')
+        [first] = _pending(tmp_path)
+        _close(tmp_path, first['id'])
+
+        clock.advance(timedelta(minutes=1))
+        await alarm.record_exhausted(_exhaustion(), site='mem0_write')
+        assert _pending(tmp_path) == []
+
+        clock.advance(REPAGE_COOLDOWN)
+        await alarm.record_exhausted(_exhaustion(), site='mem0_write')
+
+        [second] = _pending(tmp_path)
+        assert second['id'] != first['id']
+        state = alarm.state()
+        assert state is not None
+        assert state.escalation_id == second['id']
+        assert state.first_seen == _FIRST_SEEN
+        assert state.first_site == 'durable_queue:add_episode'
+        assert _FIRST_SEEN.isoformat() in second['summary']
+
+    @pytest.mark.asyncio
+    async def test_concurrent_observations_after_the_cooldown_re_page_once(
+        self, tmp_path, caplog,
+    ):
+        clock = _Clock()
+        alarm = _alarm(tmp_path, clock=clock)
+        await alarm.record_exhausted(_exhaustion(), site='durable_queue:add_episode')
+        [first] = _pending(tmp_path)
+        _close(tmp_path, first['id'])
+        clock.advance(REPAGE_COOLDOWN)
+        caplog.clear()
+
+        with caplog.at_level(logging.WARNING, logger=_ALARM_LOGGER):
+            await asyncio.gather(*(
+                alarm.record_exhausted(_exhaustion(), site=f'durable_queue:op{n}')
+                for n in range(5)
+            ))
+
+        [second] = _pending(tmp_path)
+        # One re-check, not five that each fold into the page the first filed.
+        [latch_move] = [
+            r.getMessage() for r in caplog.records
+            if r.name == _ALARM_LOGGER and first['id'] in r.getMessage()
+        ]
+        assert second['id'] in latch_move
+
+    @pytest.mark.asyncio
+    async def test_a_re_check_that_cannot_read_the_queue_keeps_the_page_and_retries(
+        self, tmp_path,
+    ):
+        clock = _Clock()
+        alarm = _alarm(tmp_path, clock=clock)
+        await alarm.record_exhausted(_exhaustion(), site='durable_queue:add_episode')
+        [first] = _pending(tmp_path)
+        _close(tmp_path, first['id'])
+        clock.advance(REPAGE_COOLDOWN)
+
+        with _unopenable_queue(tmp_path):
+            await alarm.record_exhausted(_exhaustion(), site='mem0_write')
+        state = alarm.state()
+        assert state is not None
+        assert state.escalation_id == first['id']
+
+        await alarm.record_exhausted(_exhaustion(), site='mem0_write')
+
+        [second] = _pending(tmp_path)
+        assert second['id'] != first['id']
+        state = alarm.state()
+        assert state is not None
+        assert state.escalation_id == second['id']
+
+    @pytest.mark.asyncio
+    async def test_a_page_still_pending_after_the_cooldown_is_not_re_filed(self, tmp_path):
+        clock = _Clock()
+        alarm = _alarm(tmp_path, clock=clock)
+        await alarm.record_exhausted(_exhaustion(), site='durable_queue:add_episode')
+        state = alarm.state()
+        assert state is not None
+        paged = state.escalation_id
+
+        for _ in range(3):
+            clock.advance(REPAGE_COOLDOWN)
+            await alarm.record_exhausted(_exhaustion(), site='mem0_write')
+
+        assert len(_records(tmp_path)) == 1
+        state = alarm.state()
+        assert state is not None
+        assert state.escalation_id == paged
+
+    @pytest.mark.asyncio
+    async def test_a_relatched_page_closed_after_a_restart_re_pages_at_once(self, tmp_path):
+        clock = _Clock()
+        await _alarm(tmp_path, clock=clock).record_exhausted(
+            _exhaustion(), site='durable_queue:add_episode',
+        )
+        [first] = _pending(tmp_path)
+
+        restarted = _alarm(tmp_path, clock=clock)
+        await restarted.restore()
+        _close(tmp_path, first['id'])
+        await restarted.record_exhausted(_exhaustion(), site='mem0_write')
+
+        [second] = _pending(tmp_path)
+        assert second['id'] != first['id']
+        state = restarted.state()
+        assert state is not None
+        assert state.escalation_id == second['id']
+
+
 class TestNoProjectRoot:
     @pytest.mark.asyncio
     async def test_a_missing_root_warns_and_never_raises(self, caplog):
@@ -264,6 +419,6 @@ class TestNoProjectRoot:
             await alarm.record_exhausted(_exhaustion(), site='mem0_write')
 
         assert any(
-            r.levelno == logging.WARNING and r.name == 'fused_memory.services.billing_exhaustion_alarm'
+            r.levelno == logging.WARNING and r.name == _ALARM_LOGGER
             for r in caplog.records
         )

@@ -165,6 +165,8 @@ submit_task(project_root=<root>, agent_id=<overlay>, priority=<severity>,
 resolve_ticket(...)   # → the task id, or the curator's drop/combine target
 ```
 
+Tickets filed here go through the curator, which (once task 8376 lands) stamps a complexity hint and, on the treated arm of `routing-exp-2`, may set `complexity="simple"` on a ticket that names files: see `docs/task-authoring.md` §4, "Curator complexity hint".
+
 Record `filed:<id>` (or the `filed:`/`accepted:` a dedup step found) on the finding, and the deciding step in the report. A store that cannot be reached for step 1 means nothing is filed and the report says so; the findings stay `open`. Weakened findings and every `structural` finding go to deliberation.
 
 Then write the two artefacts (shape: `references/report-format.md`) — `<output_dir>/bug-hotspot-survey-<date>[-<n>].md` and `<output_dir>/bug-hotspot-survey-<date>[-<n>]-full-findings.json`; a rerun never overwrites an earlier report (contract §5) — and run the conformance check:

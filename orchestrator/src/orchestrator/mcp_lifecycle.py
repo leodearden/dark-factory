@@ -15,7 +15,6 @@ from typing import Any
 
 import anyio
 import httpx
-from shared.jcodemunch_launch import jcodemunch_server_config
 from shared.mcp_envelope import (  # noqa: F401 — re-exported for agents/memory_recall.py  # debt: task 7688
     tool_error_text,
     tool_text_blocks,
@@ -69,8 +68,6 @@ def apply_mcp_startup_env(
 # task venvs.  Skipping the implicit pre-run sync (--no-sync) and lockfile
 # re-resolution (--frozen) eliminates the resolve/build stall that caused the
 # 0-turn MCP-startup wedge under load (reify esc-4415-240, esc-4437-123).
-# This is the plan_tools analog of the jcodemunch "don't re-resolve/rebuild
-# per launch" durable fix.
 _PLAN_TOOLS_FAST_START_FLAGS: tuple[str, ...] = ('--no-sync', '--frozen')
 
 
@@ -194,6 +191,7 @@ def plan_tools_mcp_server(
     meta_root: Path | None = None,
     task_root: Path | None = None,
     granted_tools: Iterable[str] = (),
+    caller_role: str | None = None,
 ) -> dict:
     """Return a stdio MCP server config dict for the plan-tools server.
 
@@ -251,6 +249,9 @@ def plan_tools_mcp_server(
             args, so the default exposes no tool
             (``orchestrator.mcp.plan_tools.server_from_argv``). One
             ``--grant <name>`` pair per name follows it, sorted.
+        caller_role: The role the launched server serves, emitted as
+            ``--caller-role <role>`` after the grants. Attribution on markup
+            records only (task 5055); ``None`` (default) emits no flag.
 
     Returns:
         Claude Code MCP server config dict with ``command`` and ``args``.
@@ -261,6 +262,7 @@ def plan_tools_mcp_server(
         extra_args=(
             '--grants-enforced',
             *(token for name in sorted(set(granted_tools)) for token in ('--grant', name)),
+            *(() if caller_role is None else ('--caller-role', caller_role)),
         ),
     )
 
@@ -729,7 +731,6 @@ class McpLifecycle:
                     'type': 'http',
                     'url': f'{self.config.url}/mcp',
                 },
-                'jcodemunch': jcodemunch_server_config(),
             },
         }
         if escalation_url:

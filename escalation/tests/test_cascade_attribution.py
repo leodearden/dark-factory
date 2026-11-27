@@ -55,7 +55,7 @@ class TestQueueCascadesStampTheWriter:
     def test_a_resolve_cascade_names_the_parent(self, queue, fired):
         l2, member = _cluster(queue)
 
-        queue.resolve(l2.id, 'fixed upstream', resolved_by='interactive')
+        queue.resolve(l2.id, 'fixed upstream', resolved_by='interactive', resolution_class='actionable')
 
         assert cascade_parent_id(_fired_for(fired, member.id).resolved_by) == l2.id
         assert cascade_parent_id(_fired_for(fired, l2.id).resolved_by) is None

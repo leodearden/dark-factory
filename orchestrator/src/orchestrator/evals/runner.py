@@ -18,6 +18,7 @@ from shared.eval_lane import is_eval_fixture_task_id
 from shared.usage_gate import UsageGate
 
 from orchestrator.agents.briefing import BriefingAssembler
+from orchestrator.agents.token_pricing import TokenUsage
 from orchestrator.config import (
     BackendsConfig,
     BudgetsConfig,
@@ -72,6 +73,7 @@ from .hermeticity import (
     writers_held_by,
 )
 from .metrics import (
+    EndpointKind,
     EvalMetrics,
     RoleUnderTest,
     compute_composite,
@@ -349,7 +351,7 @@ def build_eval_orch_config(
     # claude_endpoint_price_table() into config.prices whenever THIS
     # candidate runs against a PROXIED endpoint — the SAME predicate
     # collect_metrics and run_architect_eval read before calling
-    # resolve_cost_usd(..., is_local_model=...), which is why it has one home
+    # resolve_cost_usd(..., cli_cost_untrusted=...), which is why it has one home
     # (metrics.is_proxied_endpoint) instead of three inline env reads: the
     # table that gets seeded and the flag that decides whether to trust the CLI
     # figure must never disagree. Without this, an operator who forgets to seed
@@ -392,6 +394,18 @@ class CellProfile:
 
 def _corpus_profile() -> CellProfile:
     return CellProfile(build_eval_orch_config, fixture_task_gate)
+
+
+WORKFLOW_CELL_TIMEOUT_MINUTES = 180
+"""A workflow cell verifies cold, and on a loaded host completed cells took 74 to 106 min."""
+
+ARCHITECT_CELL_TIMEOUT_MINUTES = 60
+"""A plan-only architect cell runs no verify."""
+
+
+def cell_timeout_minutes(task: dict, timeout_override: float | None, default: float) -> float:
+    """The cell's wall-clock ceiling: the caller's override, else the fixture's timeout_minutes, else *default*."""
+    return timeout_override or task.get('timeout_minutes', default)
 
 
 async def run_eval(
@@ -442,6 +456,7 @@ async def run_eval(
         ),
         label=judge_config.name if judge_config is not None else config.name,
         role=RoleUnderTest.JUDGE if judge_config is not None else RoleUnderTest.IMPLEMENTER,
+        endpoint_kind=config.endpoint_kind,
         initial_plan=initial_plan,
         replay_framed=False,
         worktree=worktree_path,
@@ -483,6 +498,7 @@ async def run_architect_eval(
             'where an injected deps persists the cell'
         )
     task = load_task(task_path)
+    timeout_minutes = cell_timeout_minutes(task, timeout_override, ARCHITECT_CELL_TIMEOUT_MINUTES)
     deps = deps or ArchitectEvalDeps(store=store or ResultStore.packaged())
     label = cell_label(task, config)
     logger.info(f'Starting architect eval: {label} (trial {trial})')
@@ -493,7 +509,7 @@ async def run_architect_eval(
             config, task, base_config, memory_endpoint=memory_endpoint,
         ),
         usage_gate=usage_gate,
-        timeout_minutes=timeout_override or task.get('timeout_minutes', 60),
+        timeout_minutes=timeout_minutes,
     )
     reference_diff = await read_reference_diff(task, deps)
     scoring = classify_attempt(attempt)
@@ -512,6 +528,7 @@ async def run_architect_eval(
         wall_clock_ms=wall_clock_ms,
         run_id=attempt.address.run_id,
         trial=trial,
+        timeout_minutes=timeout_minutes,
     )
     deps.store.save(result)
     log_architect_cell(label, scoring, metrics, wall_clock_ms)
@@ -552,6 +569,7 @@ async def run_end_to_end(
         ),
         label=f'{arch_config.name}+{impl_config.name}',
         role=RoleUnderTest.END_TO_END,
+        endpoint_kind=impl_config.endpoint_kind,
         initial_plan=None,
         replay_framed=True,
         worktree=None,
@@ -569,6 +587,7 @@ async def _run_workflow_cell(
     *,
     label: str,
     role: RoleUnderTest,
+    endpoint_kind: EndpointKind,
     initial_plan: dict | None,
     replay_framed: bool,
     worktree: Path | None,
@@ -587,6 +606,7 @@ async def _run_workflow_cell(
     (docs/eval-replay-frame.md). The wall clock includes worktree setup.
     """
     cell = f'{task["id"]} × {label}'
+    timeout_minutes = cell_timeout_minutes(task, timeout_override, WORKFLOW_CELL_TIMEOUT_MINUTES)
     logger.info(f'Starting eval: {cell} (trial {trial})')
     start_ms = int(time.monotonic() * 1000)
     worktree, run_id = await _open_cell_worktree(task, worktree)
@@ -599,13 +619,11 @@ async def _run_workflow_cell(
             task, orch_config, worktree, initial_plan,
             replay_framed=replay_framed, usage_gate=gate, task_gate=task_gate,
         )
-        outcome = await _await_outcome(
-            workflow, timeout_override or task.get('timeout_minutes', 60), cell,
-        )
+        outcome = await _await_outcome(workflow, timeout_minutes, cell)
         wall_clock_ms = int(time.monotonic() * 1000) - start_ms
         metrics = await _cell_metrics(
             workflow, worktree, task, role=role, replay_frame=replay_frame,
-            sandbox_backend=sandbox_backend,
+            sandbox_backend=sandbox_backend, endpoint_kind=endpoint_kind,
         )
         result = EvalResult(
             task_id=address.task_id,
@@ -616,6 +634,7 @@ async def _run_workflow_cell(
             wall_clock_ms=wall_clock_ms,
             run_id=address.run_id,
             trial=trial,
+            timeout_minutes=timeout_minutes,
         )
         store.save(result)
     logger.info(
@@ -693,18 +712,33 @@ def _cell_workflow(
     return workflow
 
 
-async def _await_outcome(workflow: TaskWorkflow, timeout_minutes: int, cell: str) -> str:
-    """The workflow's terminal outcome; a timeout or a raise becomes the cell's outcome."""
+async def _await_outcome(workflow: TaskWorkflow, timeout_minutes: float, cell: str) -> str:
+    """The workflow's terminal outcome, where a ceiling that fired or a raise becomes the cell's outcome.
+
+    A workflow can absorb the deadline's cancellation and return CANCELLED, or
+    raise while finalising it, so a fired ceiling is read from the scope and
+    not only from a TimeoutError.
+    """
+    deadline = asyncio.timeout(timeout_minutes * 60)
     try:
-        report = await asyncio.wait_for(workflow.run(), timeout=timeout_minutes * 60)
+        async with deadline:
+            report = await workflow.run()
     except TimeoutError:
-        logger.error(f'Eval {cell} timed out after {timeout_minutes}m')
-        return 'timeout'
+        return _timed_out(cell, timeout_minutes)
     except Exception as e:
+        if deadline.expired():
+            return _timed_out(cell, timeout_minutes)
         logger.error(f'Eval {cell} failed: {e}')
         return WorkflowOutcome.BLOCKED.value
+    if deadline.expired():
+        return _timed_out(cell, timeout_minutes)
     outcome = report.outcome
     return outcome.value if isinstance(outcome, WorkflowOutcome) else str(outcome)
+
+
+def _timed_out(cell: str, timeout_minutes: float) -> str:
+    logger.error(f'Eval {cell} timed out after {timeout_minutes}m')
+    return 'timeout'
 
 
 async def _cell_metrics(
@@ -715,18 +749,19 @@ async def _cell_metrics(
     role: RoleUnderTest,
     replay_frame: str | None,
     sandbox_backend: CellSandbox,
+    endpoint_kind: EndpointKind,
 ) -> dict[str, Any]:
     """The cell's metrics; a collection that raised leaves only the stamps the executor knows."""
     try:
         metrics = await collect_metrics(
             workflow, worktree, task, role=role, replay_frame=replay_frame,
-            sandbox_backend=sandbox_backend,
+            sandbox_backend=sandbox_backend, endpoint_kind=endpoint_kind,
         )
     except Exception as e:
         logger.warning(f'Metric collection failed: {e}')
         return {
             'role_under_test': role, 'replay_frame': replay_frame,
-            'sandbox_backend': sandbox_backend,
+            'sandbox_backend': sandbox_backend, 'endpoint_kind': endpoint_kind,
         }
     return metrics.to_dict()
 
@@ -739,8 +774,9 @@ async def collect_metrics(
     role: RoleUnderTest,
     replay_frame: str | None = None,
     sandbox_backend: CellSandbox,
+    endpoint_kind: EndpointKind,
 ) -> EvalMetrics:
-    """Collect metrics from a completed workflow run, stamped with *role*, *replay_frame* and *sandbox_backend*."""
+    """Collect metrics from a completed workflow run, stamped with *role*, *replay_frame*, *sandbox_backend* and *endpoint_kind*."""
     wf_metrics = workflow.metrics
 
     # Plan completion
@@ -769,13 +805,15 @@ async def collect_metrics(
     # Via the shared predicate, NOT an inline env read: the same signal decides
     # whether build_eval_orch_config seeds the proxied price table, so the two
     # must not be able to drift apart (see is_proxied_endpoint).
-    is_local = is_proxied_endpoint(workflow.config.env_overrides)
+    cli_cost_untrusted = is_proxied_endpoint(workflow.config.env_overrides)
 
     # Cost provenance (Invariant P5): the CLI's own cost figure is wrong for a
     # proxied endpoint, so resolve cost from the config price table by the run's
-    # model, tracking which source was used. Every workflow cell's tokens come
-    # from the implementer, so cost resolves by config.models.implementer
-    # whatever *role* the cell is stamped with. ``run_architect_eval`` resolves through this SAME seam (task 3656) — with
+    # model, tracking which source was used. The workflow totals include every
+    # role's tokens (judge and reviewer too), cache reads and writes included,
+    # and all of them are priced at config.models.implementer whatever *role*
+    # the cell is stamped with; per-role pricing is task 9968.
+    # ``run_architect_eval`` resolves through this SAME seam (task 3656) — with
     # ``model=EvalConfig.model`` and ``prices`` from its own eval orch config,
     # the leaves that actually produced its tokens — and then composes its
     # two-component (architect + plan-judge) label via ``compose_cost_source``.
@@ -783,12 +821,16 @@ async def collect_metrics(
     # resolving and one copying the raw CLI number.
     run_model = workflow.config.models.implementer
     resolved_cost, cost_source = resolve_cost_usd(
-        wf_metrics.total_input_tokens,
-        wf_metrics.total_output_tokens,
+        TokenUsage(
+            input_tokens=wf_metrics.total_input_tokens,
+            output_tokens=wf_metrics.total_output_tokens,
+            cache_read_tokens=wf_metrics.total_cache_read_tokens,
+            cache_create_tokens=wf_metrics.total_cache_create_tokens,
+        ),
         model=run_model,
         prices=workflow.config.prices,
         cli_cost_usd=wf_metrics.total_cost_usd,
-        is_local_model=is_local,
+        cli_cost_untrusted=cli_cost_untrusted,
     )
 
     m = EvalMetrics(
@@ -815,10 +857,11 @@ async def collect_metrics(
         lines_changed=lines_changed,
         files_changed=files_changed,
         tokens_per_second=round(tps, 2),
-        is_local_model=is_local,
+        cli_cost_untrusted=cli_cost_untrusted,
         role_under_test=role,
         replay_frame=replay_frame,
         sandbox_backend=sandbox_backend,
+        endpoint_kind=endpoint_kind,
     )
     # False-green guard — catches the 404-bug signature so the same class of
     # silent failure doesn't need manual quarantine in future runs.

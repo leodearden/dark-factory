@@ -198,7 +198,14 @@ _DROPPED = DroppedCommit(sha=_SHA, subject=_SUBJECT, paths=('index.html',))
 
 _UNWRITTEN_CLAUSE = (
     'The architect declared these files but no commit on the branch touched '
-    'them: real.py.  Implementation has not delivered against the plan.  '
+    'them: real.py.  That is what was measured; it does not establish why.  '
+    'Two common causes: the declared work is missing, or the file was '
+    'correctly declared and legitimately needed no change.  To tell them '
+    "apart, check whether each file relates textually to the task's subject, "
+    'whether the branch touched sibling files in the same directory, whether '
+    'the declared path still exists at branch HEAD, and whether the '
+    "branch's own commits are already ancestors of main (git merge-base "
+    '--is-ancestor <commit> main), meaning the work already landed.  '
 )
 _STALE_CLAUSE = (
     'Declared path does not exist in the tree at branch HEAD (renamed or never '
@@ -225,7 +232,6 @@ class TestPlanFilesNotTouchedReason:
         assert 're-derive' in reason.lower()
         assert 'current main' in reason
         assert 'no commit on the branch touched them' not in reason
-        assert 'Implementation has not delivered' not in reason
 
     def test_a_mixed_reason_scopes_each_clause_to_its_own_entries(self) -> None:
         reason = plan_files_not_touched_reason(PlanFilesTouchedResult(

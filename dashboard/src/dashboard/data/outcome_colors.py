@@ -146,6 +146,7 @@ _CODE_FAMILY: dict[str, str] = {
     'post_merge_equivalence_failed': 'post_merge',
     'post_merge_pyright_broken': 'post_merge',
     'post_rebase_verify_fail': 'post_merge',
+    'screen_failed': 'post_merge',
     # train
     'train_incomplete': 'train',
     'train_rebase_conflict': 'train',

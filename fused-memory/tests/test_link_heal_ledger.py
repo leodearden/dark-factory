@@ -12,6 +12,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
+from shared.sqlite_sync_base import CheckpointResult
 
 from fused_memory.maintenance.link_heal import (
     BasisSource,
@@ -188,6 +189,59 @@ class TestSchema:
             'before_child_snapshot_id', 'before_parent_snapshot_id', 'after_child_snapshot_id',
         }
         LinkHealLedger(db).close()
+
+
+class TestDurability:
+    def test_the_ledger_file_is_in_wal_mode(self, tmp_path):
+        db = tmp_path / 'link_heal.db'
+        LinkHealLedger(db).close()
+
+        conn = sqlite3.connect(db)
+        try:
+            assert conn.execute('PRAGMA journal_mode').fetchone()[0] == 'wal'
+        finally:
+            conn.close()
+
+    def test_the_ledger_connection_carries_the_durability_triad(self, tmp_path, monkeypatch):
+        opened: list[sqlite3.Connection] = []
+        real_connect = sqlite3.connect
+
+        def recording(*args, **kwargs):
+            conn = real_connect(*args, **kwargs)
+            opened.append(conn)
+            return conn
+
+        monkeypatch.setattr(sqlite3, 'connect', recording)
+        ledger = LinkHealLedger(tmp_path / 'link_heal.db')
+        try:
+            (conn,) = opened
+
+            def pragma(name: str):
+                return conn.execute(f'PRAGMA {name}').fetchone()[0]
+
+            assert pragma('journal_mode') == 'wal'
+            assert pragma('synchronous') == 2
+            assert pragma('wal_autocheckpoint') == 100
+            assert pragma('journal_size_limit') == 67108864
+            assert pragma('busy_timeout') == 5000
+        finally:
+            ledger.close()
+
+    def test_checkpoint_truncates_the_wal(self, tmp_path):
+        db = tmp_path / 'link_heal.db'
+        wal = db.with_name(db.name + '-wal')
+        ledger = LinkHealLedger(db)
+        try:
+            ledger.start_run(RunSource.CORPUS, writes=False)
+            assert wal.stat().st_size > 0
+
+            result = ledger.checkpoint()
+
+            assert isinstance(result, CheckpointResult)
+            assert result.busy == 0
+            assert wal.stat().st_size == 0
+        finally:
+            ledger.close()
 
 
 def test_an_adjudication_written_before_prompt_versions_is_never_reused(tmp_path):

@@ -321,6 +321,19 @@ class TestSubagentAgentClassAndFirstTurn:
         agent_class = detectors.classify_agent_class(subagent, inventory.iter_json_lines(subagent))
         assert agent_class is detectors.AgentClass.LEGIBILITY_INSTRUMENT
 
+    def test_a_markerless_subagent_is_unattended_and_its_parent_interactive(self, tmp_path):
+        parent, subagent = _write_parent_and_subagent(tmp_path / MAIN_ENC)
+
+        front = _frontmatter(digest.build_digest(subagent))
+
+        assert detectors.classify_agent_class(subagent, inventory.iter_json_lines(subagent)) is (
+            detectors.AgentClass.UNATTENDED
+        )
+        assert (front['agent_class'], front['n_user_turns']) == ('unattended', 0)
+        assert detectors.classify_agent_class(parent, inventory.iter_json_lines(parent)) is (
+            detectors.AgentClass.INTERACTIVE
+        )
+
     def test_scan_reports_the_subagent_prompt_as_first_turn(self, tmp_path):
         _, subagent = _write_parent_and_subagent(tmp_path / MAIN_ENC)
         assert sampling.scan_transcript(subagent).first_turn_text == DEFAULT_PROMPT
@@ -384,7 +397,7 @@ class TestSubagentDigest:
         _, subagent = self._tree(tmp_path)
         rendered = digest.build_digest(subagent)
         assert _frontmatter(rendered)['n_user_turns'] == 0
-        assert '## User Corrections' not in rendered
+        assert f"## {digest.SECTION_HEADINGS['user_turns']}" not in rendered
 
     def test_parent_digest_names_no_parent(self, tmp_path):
         parent, _ = self._tree(tmp_path)

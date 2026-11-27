@@ -47,6 +47,7 @@ from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 from fastmcp import Client
 from fastmcp.exceptions import ToolError
+from shared.defects import IssueKind
 from shared.mcp_markup_middleware import (
     MARKUP_STORM_ERROR_TYPE,
     MARKUP_UNRECOVERED_PARAM_ERROR_TYPE,
@@ -55,7 +56,7 @@ from shared.mcp_markup_middleware import (
     RepairPolicy,
 )
 from shared.project_layout import escalation_queue_dir
-from shared.toolcall_markup import MARKUP_OVERRIDE_KEY
+from shared.toolcall_markup import MARKUP_OVERRIDE_KEY, repair
 
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.mcp import markup_journal, markup_sink, verdict_tools
@@ -147,6 +148,26 @@ def rooted_at(root: Path | None) -> Callable[[Path], Path | None]:
     return lambda worktree: root
 
 
+def on_the_current_issue_contract(record: dict[str, Any]) -> dict[str, Any]:
+    """*record* with a ``kind`` added to every issue its leak absorbed.
+
+    Every specimen predates the issue contract's required ``kind`` (task 7048),
+    so replayed as recorded its repaired call is refused at intake rather than
+    landing. The recovered ``issues`` text is a verbatim slice of the value
+    (``shared.toolcall_markup`` invariant D5), so it is re-encoded with a kind
+    in place and the leak's markup stays exactly as recorded.
+    """
+    repaired = repair(
+        record['value'], record['param'], record['schema_params'], record['supplied'],
+    )
+    assert repaired is not None, record['tool_use_id']
+    recorded = repaired.recovered.get('issues')
+    if recorded is None:
+        return record
+    issues = [{**issue, 'kind': IssueKind.DEFECT.value} for issue in json.loads(recorded)]
+    return {**record, 'value': record['value'].replace(recorded, json.dumps(issues), 1)}
+
+
 # ---------------------------------------------------------------------------
 # The B14 signal: a REQUIRED list-typed parameter, absorbed and restored.
 # ---------------------------------------------------------------------------
@@ -165,7 +186,7 @@ async def repaired_call(
     recovery rows below, and the durable-journal rows, which want the one
     outcome that never touches the escalation channel (task 4917).
     """
-    record = corpus_specimen(ISSUES_SPECIMEN)
+    record = on_the_current_issue_contract(corpus_specimen(ISSUES_SPECIMEN))
     assert record['expected_outcome'] == 'repaired'
     assert record['expected_recovered'] == ['issues']
     # `issues` is ABSENT from the wire — the caller supplied only these
@@ -351,9 +372,11 @@ FILLERS: dict[str, Any] = {
 
 
 def replay_args(record: dict[str, Any]) -> dict[str, Any]:
-    """The argument map this specimen really arrived with, damage included."""
+    """The argument map this specimen really arrived with, damage included,
+    its absorbed issues brought onto the current issue contract.
+    """
     args = {name: FILLERS[name] for name in record['supplied']}
-    args[record['param']] = record['value']
+    args[record['param']] = on_the_current_issue_contract(record)['value']
     return args
 
 
@@ -1510,7 +1533,7 @@ class TestCreateServerTakesAProjectRootResolver:
         )
         assert asked == []
         seed_plan(artifacts, 'test-1')
-        record = corpus_specimen(ISSUES_SPECIMEN)
+        record = on_the_current_issue_contract(corpus_specimen(ISSUES_SPECIMEN))
 
         async with Client(server) as client:
             await client.call_tool('submit_review_verdict', {

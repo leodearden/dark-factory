@@ -28,6 +28,7 @@ from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _open_l1_fixtures import submit_l1
 from _orch_helpers import (
     MERGE_GATE_BARRIER_TIMEOUT,
     MOCK_WORKFLOW_PROJECT_ROOT,
@@ -50,6 +51,7 @@ from orchestrator.rebase_drops import DroppedCommit
 from orchestrator.verify import VerifyResult
 from orchestrator.workflow import (
     StewardInterrupted,
+    StewardOutcome,
     StewardReescalatedL1,
     StewardResolved,
     StewardTerminalDecision,
@@ -93,6 +95,7 @@ def _make_workflow(*, tmp_path: Path, task_id: str = '2656') -> TaskWorkflow:
 
     scheduler = MagicMock()
     git_ops = MagicMock()
+    git_ops.own_delta_cut = AsyncMock(return_value=None)
 
     wf = TaskWorkflow(
         assignment=assignment,
@@ -810,21 +813,38 @@ class TestSubmitToMergeQueueStalePathMessage:
             f'got: {stale_clause!r}'
         )
 
-    async def test_back_compat_wording_when_nothing_is_stale(
+    async def test_an_untouched_live_entry_states_the_measurement_not_a_verdict(
         self, tmp_path: Path, monkeypatch,
     ):
-        """(c) The pre-existing class's wording is untouched."""
+        """(c) A live entry no commit touched is reported as the measurement
+        it is (task 4806): no claim that the work was not delivered, the two
+        common causes named without asserting either, and the checks that tell
+        them apart.  The prefix head and the routing stay as they were.
+        """
+        from orchestrator.merge_lane.gates import PLAN_FILES_NOT_TOUCHED_REASON_PREFIX
+        from orchestrator.unblock_types import BlockClass, classify_block_reason
+
         wf = _make_workflow(tmp_path=tmp_path)
         wf.plan = {'files': ['a.py']}
         result = PlanFilesTouchedResult(not_touched=['a.py'], missing_from_tree=[])
-        _, _, mark_blocked = _wire_plan_files_gate(wf, monkeypatch, [result, result])
+        _, events, mark_blocked = _wire_plan_files_gate(wf, monkeypatch, [result, result])
 
-        await wf._submit_to_merge_queue('task/2656', pre_rebased=False)
+        outcome = await wf._submit_to_merge_queue('task/2656', pre_rebased=False)
 
         reason = self._reason_of(mark_blocked)
+        assert reason.startswith(f'{PLAN_FILES_NOT_TOUCHED_REASON_PREFIX}: a.py. ')
         assert self._NEVER_TOUCHED_SENTENCE in reason
-        assert 'has not delivered against the plan' in reason
+        assert 'not delivered' not in reason.lower()
+        for cause in ('missing', 'no change'):
+            assert cause in reason, f'cause {cause!r} not named: {reason!r}'
+        for check in ('subject', 'sibling', 'branch HEAD', 'ancestor'):
+            assert check in reason, f'check {check!r} not named: {reason!r}'
         assert 'does not exist in the tree' not in reason.lower()
+        assert classify_block_reason(reason) is BlockClass.MERGE_VERIFY_RED
+        assert outcome == WorkflowOutcome.BLOCKED
+        assert 'plan_files_not_touched' in _merge_attempt_outcomes(events)
+        _, kwargs = mark_blocked.call_args
+        assert kwargs.get('escalate_to_human') is True
 
 
 @pytest.mark.asyncio
@@ -834,8 +854,8 @@ class TestSubmitToMergeQueueRebaseDroppedMessage:
     ``git rebase`` drops a branch commit whose change main already carries
     (the 3490 cache-buster bump), so the gate's ``base..HEAD`` read sees the
     file untouched.  The gate is handed the branch, attributes the entry to
-    the dropped commit, and the block reason says so instead of claiming
-    "Implementation has not delivered".  Routing is unchanged.  When the
+    the dropped commit, and the block reason says so instead of listing it
+    among the files no commit touched.  Routing is unchanged.  When the
     architect narrowing pass reports a narrowed plan, the gate runs a second
     time, and that re-check is handed the branch too.
     """
@@ -873,7 +893,7 @@ class TestSubmitToMergeQueueRebaseDroppedMessage:
         assert 'c2e8f8c14d00' in reason
         assert self._SUBJECT in reason
         assert 'dropped by a rebase' in reason
-        assert 'Implementation has not delivered' not in reason
+        assert 'no commit on the branch touched them' not in reason
         assert outcome == WorkflowOutcome.BLOCKED
         assert 'plan_files_not_touched' in _merge_attempt_outcomes(events)
         assert kwargs.get('escalate_to_human') is True
@@ -1008,6 +1028,8 @@ def _make_run_wf(
     wf._recover_if_already_merged = AsyncMock(return_value=None)  # type: ignore[method-assign]
     wf.config.simple_task_enabled = False
     # wf.plan is already set by _make_workflow → skips the planner entirely.
+    assert wf.artifacts is not None
+    wf.artifacts.write_plan(dict(wf.plan))
     wf._check_branch_on_main = AsyncMock(return_value=None)  # type: ignore[method-assign]
     wf._execute_verify_review_loop = AsyncMock(  # type: ignore[method-assign]
         return_value=WorkflowOutcome.DONE,
@@ -2533,6 +2555,7 @@ def _make_wip_conflict_workflow(*, task_id: str = '2282') -> TaskWorkflow:
     wf.worktree = Path('/tmp/fake-worktree-2282')
     wf.artifacts = MagicMock()
     wf.artifacts.read_iteration_log = MagicMock(return_value=([], []))
+    wf.artifacts.lane_plan_fault = MagicMock(return_value=None)
     wf.plan = {'task_id': task_id, 'steps': []}
     wf.initial_plan = {'task_id': task_id, 'steps': []}
 
@@ -2781,9 +2804,9 @@ class TestAwaitStewardCompletionReturnsOutcome:
 
 
 # ---------------------------------------------------------------------------
-# _await_steward_completion drains multi-outcome bursts and re-asserts
-# has_open_l1 before returning a requeue-producing outcome (review fix,
-# task 2248 / W9-delta, step-13/14)
+# _await_steward_completion drains multi-outcome bursts and re-asserts the
+# open-L1 hand-off override before returning a requeue-producing outcome
+# (review fix, task 2248 / W9-delta, step-13/14)
 # ---------------------------------------------------------------------------
 
 
@@ -2796,12 +2819,28 @@ class TestAwaitStewardCompletionDrainsAndGatesOnOpenL1:
     on the channel). A single ``channel.get()`` only ever saw the leading
     outcome. ``_await_steward_completion`` now (1) drains every outcome
     already queued and reduces to the most-severe disposition, and (2)
-    re-asserts ``escalation_queue.has_open_l1`` as a source-of-truth
-    backstop before returning any requeue-producing outcome — catching the
+    re-checks the escalation queue through the open-L1 hand-off override
+    before returning any requeue-producing outcome — catching the
     publish-timing race where a follow-on L1 is filed but its outcome has
     not yet landed on the channel. ``_mark_blocked`` itself is untouched —
     it still branches once on whatever this method returns.
     """
+
+    @staticmethod
+    def _workflow(
+        tmp_path: Path, *outcomes: StewardOutcome, status: str = 'blocked',
+    ) -> tuple[TaskWorkflow, EscalationQueue]:
+        wf = _make_workflow(tmp_path=tmp_path)
+        wf.config.steward_completion_timeout = 5.0
+        wf._steward_outcome_channel = asyncio.Queue()
+        for n, outcome in enumerate(outcomes, start=1):
+            wf._steward_outcome_channel.put_nowait(
+                PublishedStewardOutcome(f'esc-{n}', outcome),
+            )
+        wf.scheduler.get_status = AsyncMock(return_value=status)
+        queue = EscalationQueue(tmp_path / 'queue')
+        wf.escalation_queue = queue
+        return wf, queue
 
     async def test_drains_multiple_outcomes_and_returns_most_severe(
         self, tmp_path: Path,
@@ -2809,23 +2848,18 @@ class TestAwaitStewardCompletionDrainsAndGatesOnOpenL1:
         """[StewardResolved, StewardReescalatedL1] queued together reduces
         to the more-severe StewardReescalatedL1 — draining both, not just
         the first ``get()``."""
-        wf = _make_workflow(tmp_path=tmp_path)
-        wf.config.steward_completion_timeout = 5.0
-        wf._steward_outcome_channel = asyncio.Queue()
-        wf._steward_outcome_channel.put_nowait(PublishedStewardOutcome(
-            'esc-1', StewardResolved(resolution_text='fixed it'),
-        ))
-        wf._steward_outcome_channel.put_nowait(PublishedStewardOutcome(
-            'esc-2', StewardReescalatedL1(esc_id='L1'),
-        ))
-        wf.scheduler.get_status = AsyncMock(return_value='blocked')
-        wf.escalation_queue = MagicMock()
-        wf.escalation_queue.has_open_l1 = MagicMock(return_value=False)
+        wf, _queue = self._workflow(
+            tmp_path,
+            StewardResolved(resolution_text='fixed it'),
+            StewardReescalatedL1(esc_id='L1'),
+        )
 
         outcome = await wf._await_steward_completion(escalation_id=None)
 
         assert outcome == StewardReescalatedL1(esc_id='L1')
-        assert wf._steward_outcome_channel.empty(), (
+        channel = wf._steward_outcome_channel
+        assert channel is not None
+        assert channel.empty(), (
             'both queued outcomes must be drained, not just the first'
         )
 
@@ -2834,40 +2868,19 @@ class TestAwaitStewardCompletionDrainsAndGatesOnOpenL1:
     ):
         """A lone StewardResolved is overridden by an open L1 — the
         source-of-truth backstop for the publish-timing race."""
-        wf = _make_workflow(tmp_path=tmp_path)
-        wf.config.steward_completion_timeout = 5.0
-        wf._steward_outcome_channel = asyncio.Queue()
-        wf._steward_outcome_channel.put_nowait(PublishedStewardOutcome(
-            'esc-1', StewardResolved(resolution_text='fixed it'),
-        ))
-        wf.scheduler.get_status = AsyncMock(return_value='blocked')
-        wf.escalation_queue = MagicMock()
-        wf.escalation_queue.has_open_l1 = MagicMock(return_value=True)
-        wf.escalation_queue.get_by_task = MagicMock(
-            return_value=[MagicMock(id='L1')],
-        )
+        wf, queue = self._workflow(tmp_path, StewardResolved(resolution_text='fixed it'))
+        l1 = submit_l1(queue, wf.task_id, 'blocking', agent_role='steward')
 
         outcome = await wf._await_steward_completion(escalation_id=None)
 
-        assert outcome == StewardReescalatedL1(esc_id='L1')
-        wf.escalation_queue.get_by_task.assert_called_once_with(
-            wf.task_id, status='pending', level=1,
-        )
+        assert outcome == StewardReescalatedL1(esc_id=l1.id)
 
     async def test_no_open_l1_returns_resolved_unchanged(
         self, tmp_path: Path,
     ):
         """Without an open L1, a clean StewardResolved requeue is preserved
         unchanged — the override is conditional, not unconditional."""
-        wf = _make_workflow(tmp_path=tmp_path)
-        wf.config.steward_completion_timeout = 5.0
-        wf._steward_outcome_channel = asyncio.Queue()
-        wf._steward_outcome_channel.put_nowait(PublishedStewardOutcome(
-            'esc-1', StewardResolved(resolution_text='fixed it'),
-        ))
-        wf.scheduler.get_status = AsyncMock(return_value='blocked')
-        wf.escalation_queue = MagicMock()
-        wf.escalation_queue.has_open_l1 = MagicMock(return_value=False)
+        wf, _queue = self._workflow(tmp_path, StewardResolved(resolution_text='fixed it'))
 
         outcome = await wf._await_steward_completion(escalation_id=None)
 
@@ -2879,37 +2892,24 @@ class TestAwaitStewardCompletionDrainsAndGatesOnOpenL1:
         """StewardInterrupted(wip=True) is also requeue-producing (task-2060
         resume-plan branch) and is likewise gated by an open L1 — not just
         StewardResolved."""
-        wf = _make_workflow(tmp_path=tmp_path)
-        wf.config.steward_completion_timeout = 5.0
-        wf._steward_outcome_channel = asyncio.Queue()
-        wf._steward_outcome_channel.put_nowait(PublishedStewardOutcome(
-            'esc-1', StewardInterrupted('attempt_cap', wip_commits_present=True),
-        ))
-        wf.scheduler.get_status = AsyncMock(return_value='blocked')
-        wf.escalation_queue = MagicMock()
-        wf.escalation_queue.has_open_l1 = MagicMock(return_value=True)
-        wf.escalation_queue.get_by_task = MagicMock(
-            return_value=[MagicMock(id='L1')],
+        wf, queue = self._workflow(
+            tmp_path, StewardInterrupted('attempt_cap', wip_commits_present=True),
         )
+        l1 = submit_l1(queue, wf.task_id, 'blocking', agent_role='steward')
 
         outcome = await wf._await_steward_completion(escalation_id=None)
 
-        assert outcome == StewardReescalatedL1(esc_id='L1')
+        assert outcome == StewardReescalatedL1(esc_id=l1.id)
 
     async def test_terminal_status_still_wins_over_open_l1(
         self, tmp_path: Path,
     ):
         """Terminal precedence is unconditional: a steward-driven 'done'
         status overrides even when an L1 happens to be open."""
-        wf = _make_workflow(tmp_path=tmp_path)
-        wf.config.steward_completion_timeout = 5.0
-        wf._steward_outcome_channel = asyncio.Queue()
-        wf._steward_outcome_channel.put_nowait(PublishedStewardOutcome(
-            'esc-1', StewardResolved(resolution_text='fixed it'),
-        ))
-        wf.scheduler.get_status = AsyncMock(return_value='done')
-        wf.escalation_queue = MagicMock()
-        wf.escalation_queue.has_open_l1 = MagicMock(return_value=True)
+        wf, queue = self._workflow(
+            tmp_path, StewardResolved(resolution_text='fixed it'), status='done',
+        )
+        submit_l1(queue, wf.task_id, 'blocking', agent_role='steward')
 
         outcome = await wf._await_steward_completion(escalation_id=None)
 

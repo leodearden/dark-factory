@@ -112,6 +112,12 @@ class EventType(StrEnum):
     cap_hit = 'cap_hit'
     lock_acquired = 'lock_acquired'
     lock_released = 'lock_released'
+    # A recovered merge request's task holds less than its journalled keys after
+    # orchestrator/src/orchestrator/recovered_merge_holds.py::RecoveredMergeHolds.restore.
+    # data: {request_id, cause (HoldShortfall there), restored: [keys],
+    # unheld: [keys] (empty when underivable), blockers: [{module, owner, kind}],
+    # error: repr of what failed, or None}
+    recovered_merge_hold_incomplete = 'recovered_merge_hold_incomplete'
     # Durable persist of the plan-tightened lock set on the success branch of
     # handle_blast_radius_expansion. Payload: {files, released, acquired,
     # persisted: bool}. Complements lock_released (reason='plan_refinement')
@@ -253,6 +259,11 @@ class EventType(StrEnum):
     # measured_at: ISO-8601 str} — the suppressed pytest node-ids, the merge
     # commit whose verify was suppressed, and when the suppression was decided.
     merge_flake_suppressed = 'merge_flake_suppressed'
+    # One row per flake-debt resolution pass, zero-row passes included, so an hour
+    # with no row means the service is not running.  Producer:
+    # harness.py::Harness._run_flake_debt_resolution_pass; data:
+    # flake_debt_drain.py::ResolutionPassReport.event_data.
+    flake_debt_resolution_pass = 'flake_debt_resolution_pass'
     # One firing of Abort trigger 3 (no in-flight verify progress for a full
     # budget) in orchestrator/src/orchestrator/merge_lane/inflight_verify.py::
     # InflightVerifyRun._abort_no_progress, requeue and cap-out alike.
@@ -299,9 +310,12 @@ class EventType(StrEnum):
     #     {merge_commit, shadow_compare, warm_test_count, cold_test_count}.
     verdict_parity_ok = 'verdict_parity_ok'
     # A due drift check could not acquire both host slots within its settle
-    # window, so it ran nothing and re-arms for the next landing.  Producer:
+    # window, or a warm lane where a pool is configured, so it ran nothing and
+    # re-arms for the next landing.  Producer:
     # merge_lane/drift.py::_run_drift_check.  Payload {merge_sha,
-    # consecutive_deferrals, hosts}, hosts being HostAllocator.host_states().
+    # consecutive_deferrals, hosts, cause, detail}, hosts being
+    # HostAllocator.host_states(), cause a DriftDeferralCause value and detail
+    # the cause's own report (why no warm lane could be seeded), else null.
     drift_check_deferred = 'drift_check_deferred'
     # Land-time remote-green cross-check (task 2822, fix b) telemetry. The
     # AGREE case reuses verdict_parity_ok above; these two give the divergence
@@ -382,6 +396,8 @@ class EventType(StrEnum):
     # escalation (task 2757; Reify 5120 RCA RC-2).  task_id-keyed; payload shape:
     # {reason, category, failure_category, cause_hint}.
     merge_blocked = 'merge_blocked'
+    # One merge pre-verify screen run (task 7919); payload: merge_lane/screen.py::MergeScreen.
+    merge_screen = 'merge_screen'
     # A resumed task branch whose HEAD does not merge cleanly onto main, found at
     # dispatch start before planning (task 7736).  Sole emit site:
     # orchestrator/src/orchestrator/workflow.py::TaskWorkflow._settle_conflicting_base,
@@ -745,6 +761,11 @@ class EventType(StrEnum):
     # when the pin becomes blocked, then at most once per
     # pin_blocked_emit_interval_secs while it stays blocked.
     pin_blocked = 'pin_blocked'
+    # A dispatch candidate was refused its locks by parks alone, none of which
+    # outranks it (task 6328).  Producer, and the one statement of the payload:
+    # scheduler.py::Scheduler._note_park_refusal.  Emitted once the refusal has
+    # lasted park_refused_emit_interval_secs, then at most once per that interval.
+    park_refused = 'park_refused'
     # The starvation watchdog fired on a task (task 3821).  Producer, and the
     # one statement of the payload: scheduler.py::Scheduler._deliver_starvation_finding,
     # whose pin fields come from starvation_watchdog.py::PinOutcome.as_payload;
@@ -1400,12 +1421,15 @@ class EventStore:
         data: dict | None = None,
         cost_usd: float | None = None,
         duration_ms: int | None = None,
-    ) -> None:
-        """Write a single event row.  Never raises."""
+    ) -> int | None:
+        """Write a single event row.  Never raises.
+
+        Returns the inserted row's id, or None when the write failed.
+        """
         try:
             conn = self._connect()
             try:
-                conn.execute(
+                cursor = conn.execute(
                     'INSERT INTO events '
                     '(timestamp, run_id, task_id, event_type, phase, role, '
                     ' data, cost_usd, duration_ms) '
@@ -1423,10 +1447,12 @@ class EventStore:
                     ),
                 )
                 conn.commit()
+                return cursor.lastrowid
             finally:
                 conn.close()
         except Exception:
             logger.warning('event_store.emit failed', exc_info=True)
+            return None
 
     def latest_merge_finalized(
         self,

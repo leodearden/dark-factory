@@ -1481,7 +1481,7 @@ def test_the_cluster_numbers_agree_with_the_ratchet() -> None:
     cluster = set(report['files'])
     domain = tuple(
         dataclasses.replace(member, files=tuple(f for f in member.files if f.path in cluster))
-        for member in source_measures.workspace_domain(REPO_ROOT)
+        for member in source_measures.measurement_domain(REPO_ROOT)
     )
     measured = snapshot.measure_domain(REPO_ROOT, domain)
     assert measured.unreadable == ()

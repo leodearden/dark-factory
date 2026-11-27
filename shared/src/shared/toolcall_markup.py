@@ -144,6 +144,7 @@ __all__ = [
     'repair',
     'scan_parameter_values',
     'strip_markup_override',
+    'swallowed_markup_override',
 ]
 
 # ---------------------------------------------------------------------------
@@ -1189,6 +1190,19 @@ def markup_override_requested(metadata: object) -> bool:
     if parsed is None:
         return False
     return parsed.get(MARKUP_OVERRIDE_KEY) is True
+
+
+def swallowed_markup_override(value: object) -> bool:
+    """Return True iff *value* absorbed a ``metadata`` override set to ``True``.
+
+    A leak swallows only the parameters that FOLLOW the leaking one, so an
+    override found inside a value is evidence of a real leak: it is reported,
+    never honoured. Reads both dialects through :func:`scan_parameter_values`
+    and the flag fail-closed through :func:`markup_override_requested`.
+    """
+    return markup_override_requested(
+        scan_parameter_values(value, ('metadata',)).get('metadata')
+    )
 
 
 def strip_markup_override(metadata: Any) -> Any:

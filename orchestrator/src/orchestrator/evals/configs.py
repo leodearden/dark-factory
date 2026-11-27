@@ -13,14 +13,15 @@ always loses to an existing ``config.prices`` entry).
 
 import logging
 import os
-from collections.abc import Callable
+from collections.abc import Iterator
 from dataclasses import dataclass, field, replace
 
+from orchestrator.agents.token_pricing import price_fields
 from orchestrator.config import default_price_table
 from orchestrator.implementer_brief_variant import ImplementerBriefVariant
 from orchestrator.shadow_types import CostBasis
 
-from .metrics import CANDIDATE_ROLES, RoleUnderTest
+from .metrics import CANDIDATE_ROLES, EndpointKind, RoleUnderTest
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +43,7 @@ class EvalConfig:
     role: RoleUnderTest = RoleUnderTest.IMPLEMENTER
     max_budget_usd: float = 20.0
     env_overrides: dict[str, str] = field(default_factory=dict)
+    endpoint_kind: EndpointKind = EndpointKind.NATIVE_ANTHROPIC
     # The implementer brief variant this candidate runs under; becomes the
     # cell's OrchestratorConfig.implementer_brief_variant (task 5385).
     harness_variant: ImplementerBriefVariant = ImplementerBriefVariant.WHOLE_PLAN
@@ -112,7 +114,7 @@ def _vllm_config(
         env.update(extra_env)
     return EvalConfig(
         name=name, backend='claude', model='sonnet', effort=effort,
-        env_overrides=env,
+        env_overrides=env, endpoint_kind=EndpointKind.SELF_HOSTED_VLLM,
         image=image, gpu_type=gpu_type, gpu_count=gpu_count,
         container_disk_gb=container_disk_gb,
     )
@@ -528,19 +530,25 @@ def get_config_by_name(name: str) -> EvalConfig | None:
     return replace(base, name=name, harness_variant=variant)
 
 
+def registered_configs() -> Iterator[EvalConfig]:
+    """Every config ``get_config_by_name`` resolves by name, static families first.
+
+    A generator, so a candidate family is built only once the families before
+    it are exhausted: a lookup that stops at a static config never builds a ν
+    bundle or logs its missing-credential WARNING. Judge candidates are not
+    among these; ``get_config_by_name`` explains why.
+    """
+    yield from EVAL_CONFIGS
+    yield from FINAL_RUN_CONFIGS
+    yield from ARCHITECT_EVAL_CONFIGS
+    yield from claude_endpoint_candidates()
+    yield from codex_pi_candidates()
+    yield from zcode_candidates()
+    yield from mimo_code_candidates()
+
+
 def _find_registered(name: str) -> EvalConfig | None:
-    families: tuple[Callable[[], list[EvalConfig]], ...] = (
-        lambda: [*EVAL_CONFIGS, *FINAL_RUN_CONFIGS, *ARCHITECT_EVAL_CONFIGS],
-        claude_endpoint_candidates,
-        codex_pi_candidates,
-        zcode_candidates,
-        mimo_code_candidates,
-    )
-    for build_family in families:
-        for cfg in build_family():
-            if cfg.name == name:
-                return cfg
-    return None
+    return next((cfg for cfg in registered_configs() if cfg.name == name), None)
 
 
 # ===== μ OFAT→matrix→confirm driver substrate (eval-revival μ / C4) =====
@@ -755,6 +763,7 @@ def _claude_endpoint_config(
             'ANTHROPIC_BASE_URL': base_url,
             'ANTHROPIC_AUTH_TOKEN': auth_token,
         },
+        endpoint_kind=EndpointKind.VENDOR_CLOUD,
     )
 
 
@@ -815,16 +824,26 @@ def claude_endpoint_candidates() -> list[EvalConfig]:
 
 @dataclass(frozen=True)
 class CandidateEndpointPrice:
-    """One candidate model's list rates (USD per 1M tokens) and how it is billed."""
+    """One candidate model's list rates (USD per 1M tokens) and how it is billed.
+
+    A None cache rate means the provider published none; resolve_cost_usd then
+    labels a cell carrying those tokens 'price_table_no_cache_rate'.
+    """
 
     input_per_1m: float
     output_per_1m: float
     cost_basis: CostBasis
+    cached_input_per_1m: float | None = None
+    cache_write_per_1m: float | None = None
 
     @property
     def imputed(self) -> bool:
         """The dollar figure is modelled, not measured: see CostBasis.imputes_dollars."""
         return self.cost_basis.imputes_dollars
+
+    def rates(self) -> dict[str, float]:
+        """The PriceEntry-shaped rates, omitting every unset cache rate."""
+        return price_fields(self)
 
 
 # List rates from the 2026-09-10 live market check (task 5384). Keyed EXACTLY
@@ -836,10 +855,17 @@ CANDIDATE_ENDPOINT_PRICES: dict[str, CandidateEndpointPrice] = {
     # MiniMax's native list rate from the 2026-11-01 frontier check (task
     # 8086), no long-context surcharge.
     MINIMAX_MODEL: CandidateEndpointPrice(0.15, 0.60, CostBasis.METERED),
-    GLM_MODEL: CandidateEndpointPrice(1.40, 4.40, CostBasis.SUBSCRIPTION),
+    # GLM cache rates from https://docs.z.ai/guides/overview/pricing, retrieved
+    # 2026-11-15: cached input $0.26 / $0.03 per 1M, cache storage limited-time
+    # free. No cache-write price is listed, so writes bill at the input rate.
+    GLM_MODEL: CandidateEndpointPrice(
+        1.40, 4.40, CostBasis.SUBSCRIPTION, cached_input_per_1m=0.26, cache_write_per_1m=1.40,
+    ),
     # LIST price. The 50% promo (0.075/0.25) expired 2026-09-09 24:00 UTC+8;
     # aggregator pages still quote it.
-    GLM_FLASH_MODEL: CandidateEndpointPrice(0.15, 0.50, CostBasis.SUBSCRIPTION),
+    GLM_FLASH_MODEL: CandidateEndpointPrice(
+        0.15, 0.50, CostBasis.SUBSCRIPTION, cached_input_per_1m=0.03, cache_write_per_1m=0.15,
+    ),
     DEEPSEEK_MODEL: CandidateEndpointPrice(0.28, 0.42, CostBasis.METERED),
     KIMI_MODEL: CandidateEndpointPrice(0.60, 2.50, CostBasis.METERED),
     # Imputed list prices from https://mimo.mi.com/docs/en-US/pricing, retrieved
@@ -860,15 +886,13 @@ def claude_endpoint_price_table() -> dict[str, dict[str, float]]:
     seed it manually — an existing ``config.prices`` entry still wins on
     conflict, so a manual seed remains a valid override.
 
-    Rates only: this projection feeds ``PriceEntry``. The cost-basis tag is
-    carried by ``CANDIDATE_ENDPOINT_PRICES`` itself, not by this table.
+    Rates only, with unset cache rates omitted: this projection feeds
+    ``PriceEntry``. The cost-basis tag is carried by
+    ``CANDIDATE_ENDPOINT_PRICES`` itself, not by this table.
     """
     return {
         **default_price_table(),
-        **{
-            model: {'input_per_1m': p.input_per_1m, 'output_per_1m': p.output_per_1m}
-            for model, p in CANDIDATE_ENDPOINT_PRICES.items()
-        },
+        **{model: p.rates() for model, p in CANDIDATE_ENDPOINT_PRICES.items()},
     }
 
 
@@ -917,12 +941,15 @@ def codex_pi_candidates() -> list[EvalConfig]:
     return [
         EvalConfig(
             'codex-gpt6-astra', 'codex', CODEX_ASTRA_MODEL, 'xhigh', role=RoleUnderTest.IMPLEMENTER,
+            endpoint_kind=EndpointKind.VENDOR_CLOUD,
         ),
         EvalConfig(
             'codex-gpt6.1-sol', 'codex', CODEX_SOL_MODEL, 'xhigh', role=RoleUnderTest.IMPLEMENTER,
+            endpoint_kind=EndpointKind.VENDOR_CLOUD,
         ),
         EvalConfig(
             'codex-gpt6.1-terra', 'codex', CODEX_TERRA_MODEL, 'xhigh', role=RoleUnderTest.IMPLEMENTER,
+            endpoint_kind=EndpointKind.VENDOR_CLOUD,
         ),
         # effort 'max' matches the claude-sonnet-max incumbent exactly (and is
         # a valid _pi_thinking level) — model+effort held constant, backend

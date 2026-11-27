@@ -1,7 +1,7 @@
 """Part 2 of the suite census for Python trees (task 5414): how test files pin implementation detail.
 
-Whole-tree and report-only: every tracked ``.py`` test file of the workspace
-domain (``source_measures.workspace_domain``), grouped by its member, measured
+Whole-tree and report-only: every tracked ``.py`` test file of the measurement
+domain (``source_measures.measurement_domain``), grouped by its member, measured
 with the merge-lane ratchet's own measures wherever one exists. The output is a
 count per package, never a ranking.
 """
@@ -25,10 +25,10 @@ from source_measures import (
     MetricsError,
     PatchCall,
     file_size_measures_in_tree,
+    measurement_domain,
     patch_calls_in_tree,
     private_reads_in_tree,
     unique_import_paths,
-    workspace_domain,
 )
 
 _PROSE_MIN_WORDS = 6
@@ -429,7 +429,7 @@ def _member_test_files(domain: Iterable[DomainMember]) -> Iterator[tuple[str, st
 
 
 def measure_python_tree(tree_root: Path) -> PythonPinningCensus:
-    domain = workspace_domain(tree_root)
+    domain = measurement_domain(tree_root)
     first_party = _FirstParty.of(domain)
     prose = _ProseIndex(tree_root, first_party)
     by_package: defaultdict[str, list[_FileMeasures]] = defaultdict(list)
@@ -471,8 +471,8 @@ _EXTRA_IMPORT_ROOTS_SENTENCE = _extra_import_roots_sentence(
 )
 
 _DEFINITIONS = f"""\
-A test file is a tracked `.py` file under a workspace member's tests root, as
-`source_measures.workspace_domain` classifies it: each member listed in the root
+A test file is a tracked `.py` file under a domain member's tests root, as
+`source_measures.measurement_domain` classifies it: each member listed in the root
 pyproject.toml's `[tool.uv.workspace].members` (`{_DECLARED_TESTS_ROOT}/`), plus the
 pseudo-members {_PSEUDO_MEMBERS_TEXT}. A tree with no workspace table is one
 package named by its `[project].name`, whose tests root is

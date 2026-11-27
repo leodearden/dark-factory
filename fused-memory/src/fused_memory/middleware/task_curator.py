@@ -52,8 +52,10 @@ from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Required, TypeAlias, TypedDict, TypeVar
+from typing import TYPE_CHECKING, Any, Protocol, Required, TypeAlias, TypedDict, TypeVar
 
+import openai
+from shared.account_reserve import WorkClass, WorkKind
 from shared.cancel_dispositions import sibling_lookup_values
 from shared.cli_invoke import (
     AgentResult,
@@ -110,6 +112,7 @@ from fused_memory.middleware.curator_types import (
     PoolWithheld,
     PreparedCandidate,
     RewrittenTask,
+    clip_for_embedding,
     clip_for_prompt,
     declared_scope_of,
     embedding_text,
@@ -144,9 +147,11 @@ from fused_memory.middleware.recon_code_fix_premise_guard import (
 from fused_memory.middleware.zero_output_breaker import ZeroOutputBreaker
 from fused_memory.reconciliation.cli_stage_runner import recon_archive_root
 from fused_memory.reconciliation.context_assembler import estimate_tokens
+from fused_memory.services.provider_billing import billing_source_of
 
 if TYPE_CHECKING:
-    from qdrant_client.models import ExtendedPointId
+    from qdrant_client import AsyncQdrantClient
+    from qdrant_client.models import ExtendedPointId, PointStruct
     from shared.cost_store import CostStore
     from shared.usage_gate import UsageGate
 
@@ -361,6 +366,19 @@ class BackfillResult:
     errors: int = 0
 
 
+BACKFILL_UPSERT_BATCH_SIZE = 128
+"""Most points one backfill upsert request carries, far under Qdrant's 32 MiB request limit."""
+
+BACKFILL_DEFAULT_CONCURRENCY = 10
+"""Most embedding calls a backfill keeps in flight unless told otherwise."""
+
+BACKFILL_UPSERT_ATTEMPTS = 3
+"""Most times a backfill sends one batch's upsert before writing its points off."""
+
+BACKFILL_MAX_CONSECUTIVE_FAILED_BATCHES = 3
+"""Batches in a row landing no point after which a backfill stops embedding the rest."""
+
+
 @dataclass
 class PruneResult:
     """Result of a prune_orphans() call."""
@@ -501,34 +519,40 @@ the answer is "create", not a half-hearted combine.
 
 _BATCH_CONTRACT = _CURATOR_CONTRACT + """
 
-## Within-batch duplicates
+## Within-batch duplicates and combines
 
 When you are given a BATCH of N candidates in a single call (sections labelled
 `# Candidate batch_index=0`, `# Candidate batch_index=1`, …), use the following
-additional rules for duplicates that exist WITHIN the batch:
+additional rules for duplicates and combines that exist WITHIN the batch:
 
 1. **Drop to a sibling candidate**: if candidate A is a duplicate of another
    candidate B in this batch (neither has been materialised as a task yet), emit
    `action='drop'` for A and set `batch_target_index=<B's batch_index>`.  Leave
    `target_id` null in this case — there is no existing pool task to reference.
 
-2. **Combine between two new batch items is NOT supported**: "combine" rewrites
-   an *existing* task; two candidates that are both new cannot combine with each
-   other.  Instead, choose one to "create" and emit `action='drop'` with
-   `batch_target_index` pointing at it for the other.
+2. **Combine into a sibling candidate**: if candidate A should be folded into
+   another candidate B in this batch, emit `action='combine'` for A with
+   `batch_target_index=<B's batch_index>` and `target_id` null.  Set
+   `target_fingerprint` to B's title, copied verbatim from the `title:` line of
+   its `# Candidate batch_index=<B>` section, and set `rewritten_task` to the
+   unified task subsuming both: B is created first, then rewritten with it.
+   B's own decision MUST be "create": never combine into a sibling you drop or
+   combine.  Such a combine is not applied, and A is created on its own.
 
-3. **batch_target_index must be valid**: the value MUST reference a *different*
-   candidate index that appears within the batch (0 ≤ batch_target_index < N,
-   batch_target_index ≠ candidate_index).  Do not emit cycles (A→B and B→A).
+3. **batch_target_index must be valid**: on a drop or a combine edge, the value
+   MUST reference a *different* candidate index that appears within the batch
+   (0 ≤ batch_target_index < N, batch_target_index ≠ candidate_index).  Do not
+   emit cycles of drop or combine edges (A→B and B→A).
 
-4. For non-duplicate candidates, batch_target_index MUST be null.
+4. For every decision that is not a drop or combine onto a sibling candidate,
+   batch_target_index MUST be null.
 """
 
 # Bumped whenever _CURATOR_CONTRACT/_BATCH_CONTRACT change materially, so a
 # stale per-(prompt, model, harness) pinned artifact stops resolving and
 # falls back to the (new) in-code baseline instead of pairing new heuristics
 # with an outdated contract assumption.
-_CURATOR_PROMPT_HARNESS_VERSION = 'curator-v1'
+_CURATOR_PROMPT_HARNESS_VERSION = 'curator-v2'
 
 CURATOR_SINGLE_SPEC = PromptSpec(
     prompt_id='curator_single', contract=_CURATOR_CONTRACT, baseline_heuristics=_CURATOR_HEURISTICS,
@@ -782,6 +806,38 @@ def _render_batch_prompt(
 CuratorInvoke: TypeAlias = Callable[..., Awaitable[AgentResult]]
 
 
+EmbedderRefusal = openai.BadRequestError
+
+
+class CorpusEmbedder(Protocol):
+    """What the corpus needs of an embedder; graphiti_core's OpenAIEmbedder satisfies it."""
+
+    async def create(self, input_data: str) -> list[float]:
+        """Embed *input_data*.
+
+        Raise :data:`EmbedderRefusal` for an input that will never embed: the
+        candidate is then curated over its other streams. Any other exception
+        is an outage, and a candidate with no stream left defers CORPUS_FAILED.
+        """
+        ...
+
+
+class CorpusSearchError(RuntimeError):
+    """The corpus could not be searched, so its answer is unknown, not empty.
+
+    ``error_type`` is the cause's class name and ``billing_exhausted`` the
+    billing source the cause reports exhausted, or None.
+    """
+
+    def __init__(self, project_id: str, cause: Exception) -> None:
+        self.error_type = type(cause).__name__
+        self.billing_exhausted = billing_source_of(cause)
+        message = f'curator corpus search failed for project {project_id}: {exception_summary(cause)}'
+        if self.billing_exhausted is not None:
+            message += f' (billing exhausted: {self.billing_exhausted})'
+        super().__init__(message)
+
+
 class TaskCurator:
     """LLM-judged drop/combine/create gate plus the Qdrant corpus backing it."""
 
@@ -796,6 +852,8 @@ class TaskCurator:
         config_dir_base: Path | None = None,
         cost_store: CostStore | None = None,
         invoke: CuratorInvoke = invoke_with_cap_retry,
+        embedder: CorpusEmbedder | None = None,
+        qdrant_client: AsyncQdrantClient | None = None,
     ) -> None:
         self._config = config
         self._invoke = invoke
@@ -808,8 +866,9 @@ class TaskCurator:
         # Parent of the per-process config dir; None means the system tempdir.
         self._config_dir_base = config_dir_base
         self._config_dir: TaskConfigDir | None = None  # lazy, gated only
-        self._qdrant_client = None  # AsyncQdrantClient, lazy
-        self._embedder = None  # OpenAIEmbedder, lazy
+        # Owned and closed by the curator whether injected or built lazily.
+        self._qdrant_client: AsyncQdrantClient | None = qdrant_client
+        self._embedder: CorpusEmbedder | None = embedder
         self._initialized_collections: set[str] = set()
         # Idempotency cache: payload_hash -> (decision, monotonic_time)
         self._decision_cache: dict[str, tuple[CuratorDecision, float]] = {}
@@ -846,7 +905,7 @@ class TaskCurator:
     # Lazy init (mirrors task_dedup.py pattern)
     # ------------------------------------------------------------------
 
-    async def _get_qdrant(self):
+    async def _get_qdrant(self) -> AsyncQdrantClient:
         if self._qdrant_client is None:
             from qdrant_client import AsyncQdrantClient
 
@@ -856,7 +915,7 @@ class TaskCurator:
             )
         return self._qdrant_client
 
-    async def _get_embedder(self):
+    async def _get_embedder(self) -> CorpusEmbedder:
         if self._embedder is None:
             cfg = self._config.embedder
             if cfg.provider == 'openai' and cfg.providers.openai:
@@ -1875,29 +1934,16 @@ class TaskCurator:
                 candidate.title, candidate.description, candidate.files_to_modify,
             )
             embedding = await embedder.create(text)
-
-            from qdrant_client.models import PointStruct
-
-            point_id = self._point_id(project_id, task_id)
-            client = await self._get_qdrant()
-            await client.upsert(
-                collection_name=collection,
-                points=[
-                    PointStruct(
-                        id=point_id,
-                        vector=embedding,
-                        payload={
-                            'task_id': task_id,
-                            'title': candidate.title,
-                            'description': candidate.description[:1000],
-                            'files_to_modify': candidate.files_to_modify or [],
-                            'priority': candidate.priority or DEFAULT_PRIORITY,
-                            'project_id': project_id,
-                            'updated_at': datetime.now(UTC).isoformat(),
-                        },
-                    ),
-                ],
+            point = self._corpus_point(
+                project_id, task_id,
+                title=candidate.title,
+                description=candidate.description,
+                files=candidate.files_to_modify,
+                priority=candidate.priority,
+                vector=embedding,
             )
+            client = await self._get_qdrant()
+            await client.upsert(collection_name=collection, points=[point])
         except Exception:
             logger.warning(
                 'task_curator: record_task failed for %s', task_id, exc_info=True,
@@ -1946,9 +1992,44 @@ class TaskCurator:
     def _point_id(project_id: str, task_id: str) -> str:
         """Deterministic UUID5 point ID for a task in a project.
 
-        Shared by record_task() and backfill_corpus() to ensure idempotent overlap.
+        Every corpus point gets its id here (via _corpus_point, which
+        record_task() and backfill_corpus() share), so the two writers overlap
+        idempotently.
         """
         return str(uuid_mod.uuid5(uuid_mod.NAMESPACE_URL, f'{project_id}/{task_id}'))
+
+    @classmethod
+    def _corpus_point(
+        cls,
+        project_id: str,
+        task_id: str,
+        *,
+        title: str,
+        description: str,
+        files: list[str] | None,
+        priority: str | None,
+        vector: list[float],
+    ) -> PointStruct:
+        """The corpus point for one task, in the one payload shape the corpus holds.
+
+        record_task() and backfill_corpus() both write through it, and
+        search_corpus() reads its payload keys.
+        """
+        from qdrant_client.models import PointStruct
+
+        return PointStruct(
+            id=cls._point_id(project_id, task_id),
+            vector=vector,
+            payload={
+                'task_id': task_id,
+                'title': title,
+                'description': description[:1000],
+                'files_to_modify': files or [],
+                'priority': priority or DEFAULT_PRIORITY,
+                'project_id': project_id,
+                'updated_at': datetime.now(UTC).isoformat(),
+            },
+        )
 
     async def corpus_count(self, project_id: str) -> int:
         """Return the number of points in the curator corpus for a project.
@@ -1980,30 +2061,36 @@ class TaskCurator:
     ) -> list[dict[str, Any]]:
         """Semantic nearest-neighbour search over the curator corpus.
 
-        Read-only: embeds the raw ``query`` string and returns the most
+        Read-only: embeds the ``query`` string and returns the most
         similar filed tasks for ``project_id`` ranked by cosine similarity
         (higher score = more similar). Never creates the collection — a
         missing collection (no tasks ever filed) yields ``[]``.
 
         Args:
-            query: Free-text query, embedded as-is (NOT passed through
-                ``embedding_text``, which composes stored-task fields).
+            query: Free-text query, embedded as-is apart from the
+                ``clip_for_embedding`` bound every corpus vector shares (NOT
+                passed through ``embedding_text``, which composes stored-task
+                fields).
             project_id: Project identifier selecting the collection.
             limit: Max number of hits to return.
             score_threshold: Drop hits below this cosine score server-side.
 
         Returns:
             List of dicts ``{task_id, title, description, files_to_modify,
-            priority, updated_at, score}``. Returns ``[]`` on any error
-            (Qdrant/embedder unavailable), mirroring corpus_count's
-            best-effort degradation.
+            priority, updated_at, score}``. ``[]`` means the corpus was
+            searched with no hit, or its collection does not exist (nothing
+            was ever filed).
+
+        Raises:
+            CorpusSearchError: Qdrant or the embedder failed, so the answer
+                is unknown.
         """
         try:
             client = await self._get_qdrant()
             name = self._collection_name(project_id)
             if not await client.collection_exists(name):
                 return []
-            embedding = await (await self._get_embedder()).create(query)
+            embedding = await (await self._get_embedder()).create(clip_for_embedding(query))
             results = await client.query_points(
                 collection_name=name,
                 query=embedding,
@@ -2026,92 +2113,162 @@ class TaskCurator:
                     },
                 )
             return hits
-        except Exception:
-            logger.warning(
-                'task_curator: search_corpus failed for project %s', project_id, exc_info=True,
-            )
-            return []
+        except Exception as exc:
+            raise CorpusSearchError(project_id, exc) from exc
 
     async def backfill_corpus(
         self,
         tasks: list[dict],
         project_id: str,
+        *,
+        concurrency: int = BACKFILL_DEFAULT_CONCURRENCY,
+        batch_size: int = BACKFILL_UPSERT_BATCH_SIZE,
     ) -> BackfillResult:
         """Upsert embeddings for a flat list of existing task dicts.
 
-        Idempotent: uses the same deterministic UUID5 point-ID scheme as
-        record_task(). Re-running just re-upserts the same points.
+        The corpus is written in batches of at most *batch_size* points: each
+        slice of tasks is embedded, then upserted, before the next slice is
+        embedded. A batch's upsert is sent up to ``BACKFILL_UPSERT_ATTEMPTS``
+        times with its embeddings in hand; a batch it never lands is logged,
+        its points are counted in ``errors``, and the run continues with the
+        next slice. After ``BACKFILL_MAX_CONSECUTIVE_FAILED_BATCHES`` batches
+        in a row land no point, whether every upsert attempt was refused or
+        every embed failed, the run logs one ERROR and stops: the tasks left
+        are counted in ``errors`` without being embedded. Idempotent: uses the
+        same deterministic UUID5 point-ID scheme as record_task(), so a rerun
+        re-upserts the same points, including a failed batch's.
 
         Args:
             tasks: Flat list of task dicts (as returned by flatten_task_tree).
             project_id: Project identifier used for the collection name and point IDs.
+            concurrency: Most embedding calls in flight at once; at least 1.
+            batch_size: Most points one upsert request carries; at least 1.
 
         Returns:
             BackfillResult with counts of upserted, skipped, and error tasks.
+
+        Raises:
+            ValueError: *concurrency* or *batch_size* is below 1, raised before
+                any embed or Qdrant call. ``asyncio.Semaphore(0)`` would
+                otherwise block the run forever without an error.
         """
+        for knob, value in (('concurrency', concurrency), ('batch_size', batch_size)):
+            if value < 1:
+                raise ValueError(f'backfill_corpus: {knob} must be >= 1, got {value}')
         if not tasks:
             return BackfillResult()
 
-        result = BackfillResult()
+        titled = [task for task in tasks if _task_title(task)]
+        result = BackfillResult(skipped=len(tasks) - len(titled))
         collection = await self._ensure_collection(project_id)
         embedder = await self._get_embedder()
         client = await self._get_qdrant()
+        embed_slots = asyncio.Semaphore(concurrency)
+        batches = [titled[start:start + batch_size] for start in range(0, len(titled), batch_size)]
 
-        from qdrant_client.models import PointStruct
-
-        # Embed all tasks with bounded concurrency.
-        sem = asyncio.Semaphore(10)
-        points: list[PointStruct] = []
-
-        async def _embed_one(task: dict) -> None:
-            task_id = str(task.get('id', '') or '')
-            title = str(task.get('title', '') or '').strip()
-            if not title:
-                result.skipped += 1
-                return
-
-            description = str(task.get('description', '') or '')
-            files = _task_files(task)
-            text = embedding_text(title, description, files)
-
-            try:
-                async with sem:
-                    embedding = await embedder.create(text)
-            except Exception:
-                logger.warning(
-                    'task_curator: backfill embed failed for task %s', task_id, exc_info=True,
+        failed_in_a_row = 0
+        for number, batch in enumerate(batches, start=1):
+            if failed_in_a_row == BACKFILL_MAX_CONSECUTIVE_FAILED_BATCHES:
+                unattempted = sum(len(rest) for rest in batches[number - 1:])
+                result.errors += unattempted
+                logger.error(
+                    'task_curator: backfill_corpus project=%s stopped before batch %d/%d: '
+                    '%d batches in a row landed no point; %d tasks not attempted, '
+                    'counted as errors',
+                    project_id, number, len(batches), failed_in_a_row, unattempted,
                 )
-                result.errors += 1
-                return
-
-            point_id = self._point_id(project_id, task_id)
-            points.append(
-                PointStruct(
-                    id=point_id,
-                    vector=embedding,
-                    payload={
-                        'task_id': task_id,
-                        'title': title,
-                        'description': description[:1000],
-                        'files_to_modify': files,
-                        'priority': task.get('priority') or DEFAULT_PRIORITY,
-                        'project_id': project_id,
-                        'updated_at': datetime.now(UTC).isoformat(),
-                    },
-                )
+                break
+            embedded = await asyncio.gather(*(
+                self._backfill_point(task, project_id, embedder, embed_slots) for task in batch
+            ))
+            points = [point for point in embedded if point is not None]
+            landed = await self._upsert_backfill_batch(
+                client, collection, points,
+                project_id=project_id, number=number, total=len(batches),
             )
-
-        await asyncio.gather(*[_embed_one(t) for t in tasks])
-
-        if points:
-            await client.upsert(collection_name=collection, points=points)
-            result.upserted = len(points)
+            result.upserted += landed
+            result.errors += len(batch) - landed
+            failed_in_a_row = 0 if landed else failed_in_a_row + 1
+            if landed:
+                logger.info(
+                    'task_curator: backfill_corpus project=%s batch %d/%d upserted, '
+                    '%d points so far',
+                    project_id, number, len(batches), result.upserted,
+                )
 
         logger.info(
             'task_curator: backfill_corpus complete project=%s upserted=%d skipped=%d errors=%d',
             project_id, result.upserted, result.skipped, result.errors,
         )
         return result
+
+    @staticmethod
+    async def _upsert_backfill_batch(
+        client: AsyncQdrantClient,
+        collection: str,
+        points: list[PointStruct],
+        *,
+        project_id: str,
+        number: int,
+        total: int,
+    ) -> int:
+        """Upsert one backfill batch; how many of *points* landed: all of them, or 0 (logged).
+
+        A failed attempt is retried at once, up to ``BACKFILL_UPSERT_ATTEMPTS``
+        attempts in all. Resending is safe: point ids are deterministic, so an
+        attempt that landed server-side but failed client-side is overwritten
+        with the same points.
+        """
+        if not points:
+            return 0
+        for attempt in range(1, BACKFILL_UPSERT_ATTEMPTS + 1):
+            try:
+                await client.upsert(collection_name=collection, points=points)
+            except Exception as exc:
+                if attempt == BACKFILL_UPSERT_ATTEMPTS:
+                    logger.warning(
+                        'task_curator: backfill_corpus project=%s batch %d/%d of %d points '
+                        'failed to upsert after %d attempts',
+                        project_id, number, total, len(points), attempt, exc_info=True,
+                    )
+                else:
+                    logger.info(
+                        'task_curator: backfill_corpus project=%s batch %d/%d upsert '
+                        'attempt %d/%d failed, retrying: %r',
+                        project_id, number, total, attempt, BACKFILL_UPSERT_ATTEMPTS, exc,
+                    )
+            else:
+                return len(points)
+        return 0
+
+    async def _backfill_point(
+        self,
+        task: dict,
+        project_id: str,
+        embedder: CorpusEmbedder,
+        embed_slots: asyncio.Semaphore,
+    ) -> PointStruct | None:
+        """The corpus point for titled *task*, or None when its embed fails (logged)."""
+        task_id = str(task.get('id', '') or '')
+        title = _task_title(task)
+        description = str(task.get('description', '') or '')
+        files = _task_files(task)
+        try:
+            async with embed_slots:
+                embedding = await embedder.create(embedding_text(title, description, files))
+        except Exception:
+            logger.warning(
+                'task_curator: backfill embed failed for task %s', task_id, exc_info=True,
+            )
+            return None
+        return self._corpus_point(
+            project_id, task_id,
+            title=title,
+            description=description,
+            files=files,
+            priority=task.get('priority'),
+            vector=embedding,
+        )
 
     async def prune_orphans(self, project_id: str, live_task_ids) -> PruneResult:
         """Health-gated reconciliation sweep: delete corpus points for tasks
@@ -2265,8 +2422,10 @@ class TaskCurator:
         where much of what the pool loses is lost (see the pool-cap block in
         ``config/schema.py::CuratorConfig``). A stream whose read fails is
         logged at WARNING and named in ``withheld.unavailable_streams``; when
-        every stream it attempted failed, it raises ``_CorpusUnavailableError``
-        instead, since an empty pool would then only look like no overlap.
+        every stream it attempted failed and some failure was not a refusal of
+        this candidate's input, it raises ``_CorpusUnavailableError`` instead,
+        since an empty pool would then only look like no overlap, and a retry
+        could change it.
         """
         # Resolve lock_depth PER PROJECT, not from a single global scalar:
         # fused-memory serves many projects and each orchestrator resolves its
@@ -2362,7 +2521,7 @@ class TaskCurator:
             )
             admit(dep_entries)
 
-        if reads.every_attempt_failed():
+        if reads.is_outage():
             raise _CorpusUnavailableError(tuple(reads.unavailable))
 
         # Every stream has run, so seen_ids is now the complete admitted set
@@ -2855,6 +3014,9 @@ class TaskCurator:
             timeout_seconds=call.timeout_seconds,
             cap_wait_sanity_secs=_CURATOR_CAP_WAIT_SANITY_SECS,
             park_on_frozen_pool=False,
+            work_class=WorkClass(
+                kind=WorkKind.ESSENTIAL, project_id=call.project_id, role=call.ledger_role,
+            ),
             **self._ledger_kwargs(call.ledger_role),
             **(transcript_scope.as_invoke_kwargs() if transcript_scope else {}),
         )
@@ -3181,16 +3343,28 @@ _T = TypeVar('_T')
 
 @dataclass
 class _StreamReads:
-    """The corpus streams one ``_build_corpus`` call attempted, and those whose read failed."""
+    """The corpus streams one ``_build_corpus`` call attempted, those whose read failed, and which of those refused."""
 
     attempted: list[str] = field(default_factory=list)
     unavailable: list[str] = field(default_factory=list)
+    # The subset of ``unavailable`` whose read raised EmbedderRefusal: a
+    # refusal of this candidate's input, which a retry will not change.
+    refused: list[str] = field(default_factory=list)
 
     async def read(self, stream: str, read: Awaitable[_T], fallback: _T) -> _T:
         """Await *stream*'s *read*; a failure is logged, recorded, and answered with *fallback*."""
         self.attempted.append(stream)
         try:
             return await read
+        except EmbedderRefusal as exc:
+            logger.warning(
+                "task_curator: corpus stream %s refused this candidate's input, "
+                'which a retry will not change: %s',
+                stream, exception_summary(exc),
+            )
+            self.unavailable.append(stream)
+            self.refused.append(stream)
+            return fallback
         except Exception as exc:
             logger.warning(
                 'task_curator: corpus stream %s unavailable: %s', stream, exception_summary(exc),
@@ -3198,13 +3372,20 @@ class _StreamReads:
             self.unavailable.append(stream)
             return fallback
 
-    def every_attempt_failed(self) -> bool:
-        """Whether some stream was attempted and every attempted stream failed."""
-        return bool(self.attempted) and len(self.unavailable) == len(self.attempted)
+    def is_outage(self) -> bool:
+        """Whether some stream was attempted, every attempted stream failed, and a retry could change that.
+
+        A retry could change it when at least one failure was not a refusal.
+        """
+        return (
+            bool(self.attempted)
+            and len(self.unavailable) == len(self.attempted)
+            and len(self.refused) < len(self.unavailable)
+        )
 
 
 class _CorpusUnavailableError(RuntimeError):
-    """Every corpus stream ``_build_corpus`` attempted failed, so no pool can be trusted."""
+    """No attempted corpus stream answered and at least one failed in a way a retry could clear."""
 
     def __init__(self, streams: tuple[str, ...]) -> None:
         super().__init__(f'every corpus stream failed: {", ".join(streams)}')
@@ -3227,6 +3408,11 @@ def _count_absent(task_ids: Iterable[str], admitted: set[str]) -> int:
     moment each cap fires reports entries that end up present.
     """
     return len({tid for tid in task_ids if tid and tid not in admitted})
+
+
+def _task_title(task: dict) -> str:
+    """The stripped title of a raw taskmaster task dict; '' when it has none."""
+    return str(task.get('title', '') or '').strip()
 
 
 def _task_files(task: dict) -> list[str]:
@@ -3404,8 +3590,8 @@ def _parse_decision_dict(
     if target_fingerprint is not None:
         target_fingerprint = str(target_fingerprint)
 
-    # batch_target_index: valid only for 'drop'; carries the sibling index when
-    # the candidate is a duplicate of another batch item (not yet materialised).
+    # batch_target_index: valid only on a batch edge (a drop or combine onto a
+    # sibling batch item not yet materialised); it carries the sibling's index.
     # Wrap int() coercion: if the LLM emits a non-numeric string or other
     # schema-drifted value, treat it as absent (degrade gracefully like every
     # other invalid field in this parser) rather than raising ValueError out
@@ -3421,16 +3607,22 @@ def _parse_decision_dict(
             batch_target_index = None
 
     # Safety: drop/combine must reference a pool task id that actually exists,
-    # UNLESS this is a within-batch drop (batch_target_index set, target_id None).
+    # UNLESS it is a batch edge onto a sibling (batch_target_index set,
+    # target_id None).  Only a batch edge keeps its batch_target_index.
+    is_batch_edge = (
+        action in ('drop', 'combine')
+        and batch_target_index is not None
+        and target_id is None
+    )
     valid_ids = {e.task_id for e in pool}
     if action in ('drop', 'combine'):
         # Guard: LLM emitted BOTH a pool target_id and a within-batch
         # batch_target_index.  We cannot resolve the intent safely, so degrade.
-        if action == 'drop' and batch_target_index is not None and target_id is not None:
+        if batch_target_index is not None and target_id is not None:
             return CuratorDecision(
                 action='create',
                 justification=(
-                    f'ambiguous-drop: both target_id={target_id!r} and '
+                    f'ambiguous-{action}: both target_id={target_id!r} and '
                     f'batch_target_index={batch_target_index} set; '
                     'cannot determine intent'
                 ),
@@ -3439,12 +3631,7 @@ def _parse_decision_dict(
                 cost_usd=cost_usd,
                 degraded=True,
             )
-        is_within_batch_drop = (
-            action == 'drop'
-            and batch_target_index is not None
-            and target_id is None
-        )
-        if not is_within_batch_drop:
+        if not is_batch_edge:
             # Two causes, two branches: they fall on opposite sides of the
             # degraded line (see CuratorDecision.degraded).
             if not target_id:
@@ -3552,7 +3739,7 @@ def _parse_decision_dict(
         pool_sizes=pool_sizes,
         latency_ms=latency_ms,
         cost_usd=cost_usd,
-        batch_target_index=batch_target_index,
+        batch_target_index=batch_target_index if is_batch_edge else None,
     )
 
 
@@ -3691,12 +3878,15 @@ def _parse_batch_decisions(
             )
         results.append(decision)
 
-    # --- Post-parse: validate and sanitize batch_target_index references ---
+    # --- Post-parse: validate and sanitize batch edges (drop or combine) ---
+    # Only a batch edge carries batch_target_index after _parse_decision_dict.
+    # Whether the edge's target sibling is itself created is judged at
+    # dispatch, which sees the sibling's real outcome, not here.
     # 1. Out-of-range or self-referential batch_target_index → degrade to create.
     # 2. Cycle detection: walk the graph of i → batch_target_index[i]; any node
     #    that is part of a cycle is degraded to create with 'batch-cycle'.
     for i, d in enumerate(results):
-        if d.action == 'drop' and d.batch_target_index is not None:
+        if d.batch_target_index is not None:
             bti = d.batch_target_index
             if bti == i or not (0 <= bti < n):
                 results[i] = CuratorDecision(
@@ -3711,7 +3901,7 @@ def _parse_batch_decisions(
                     degraded=True,
                 )
 
-    # Build the directed graph for cycle detection (only batch-drop edges).
+    # Build the directed graph for cycle detection (every batch edge).
     def _find_cycle_members() -> set[int]:
         """Return the set of indices that participate in any cycle.
 
@@ -3736,7 +3926,7 @@ def _parse_batch_decisions(
             colour[node] = 1
             path.append(node)
             d = results[node]
-            if d.action == 'drop' and d.batch_target_index is not None:
+            if d.batch_target_index is not None:
                 target = d.batch_target_index
                 if 0 <= target < n and target != node:
                     dfs(target, path)

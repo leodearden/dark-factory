@@ -36,11 +36,11 @@ from _orch_helpers import MERGE_RESULT_TIMEOUT, wait_responsive
 from test_merge_queue_concurrent_verify import (
     _inject_two_host_allocator,
     _make_fake_remote,
-    config,  # noqa: F401 — pytest fixture re-exported from γ harness
-    git_config,  # noqa: F401 — pytest fixture re-exported from γ harness
-    git_ops,  # noqa: F401 — pytest fixture re-exported from γ harness
-    git_repo,  # noqa: F401 — pytest fixture re-exported from γ harness
 )
+from test_merge_queue_concurrent_verify import config as config
+from test_merge_queue_concurrent_verify import git_config as git_config
+from test_merge_queue_concurrent_verify import git_ops as git_ops
+from test_merge_queue_concurrent_verify import git_repo as git_repo
 from test_merge_queue_dispatch_fill_redispatch import (
     _drive_fill,
     _running_lane,

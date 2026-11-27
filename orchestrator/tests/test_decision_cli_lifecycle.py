@@ -1,9 +1,10 @@
-"""Tests for the reap-decisions, close-decision, reopen-decision and migrate-decision-projects verbs, driven at ``session_registry.py <verb>``."""
+"""Tests for the reap-decisions, close-decision, file-and-close-decision, reopen-decision and migrate-decision-projects verbs, driven at ``session_registry.py <verb>``."""
 
 from __future__ import annotations
 
 import json
 import logging
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -1097,6 +1098,146 @@ class TestCloseDecisionIdentity:
         assert capsys.readouterr().out.strip() == 'esc-42-1'
         [reread] = dr.list_decisions(root=tmp_path)
         assert (reread.state, reread.closing_evidence) == (dr.DecisionState.ANSWERED, EVIDENCE)
+
+
+class TestFileAndCloseDecisionVerb:
+    """One run files an L2's decision and closes exactly the id that filing landed on (task 7495)."""
+
+    def _argv(
+        self, queue: Path, *, local_id: str = 'esc-9-1', project: str = 'df',
+        state: str = 'answered', evidence: str = EVIDENCE,
+    ) -> list[str]:
+        return [
+            'file-and-close-decision', '--id', local_id, '--project', project, '--text', 'approve?',
+            '--escalations-dir', str(queue), '--state', state, '--evidence', evidence,
+        ]
+
+    def _queue(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+        monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+        orch, _recon = two_queues(tmp_path)
+        return orch
+
+    def _decision_files(self, root: Path) -> list[str]:
+        return sorted(path.name for path in dr.decisions_dir(root).glob('*.json'))
+
+    def test_a_fresh_filing_is_closed_under_the_qualified_id(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        queue = self._queue(monkeypatch, tmp_path)
+
+        rc = sr.main(self._argv(queue))
+
+        assert rc == 0
+        assert capsys.readouterr().out.splitlines() == [qid('esc-9-1')]
+        [closed] = dr.list_decisions(root=tmp_path)
+        assert (closed.id, closed.state, closed.closing_evidence) == (
+            'dark_factory-esc-9-1', dr.DecisionState.ANSWERED, EVIDENCE,
+        )
+        assert datetime.fromisoformat(closed.closed_at).tzinfo is not None
+        assert (closed.project, closed.escalations_dir) == ('dark_factory', dr.normalize_escalations_dir(queue))
+
+    def test_a_same_project_legacy_record_at_the_bare_id_is_continued_and_closed(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """The incident: a closed, unstamped record filed before ids were qualified by project."""
+        queue = self._queue(monkeypatch, tmp_path)
+        dr.write_decision(
+            make_decision(id='esc-650-1', project='df', state=dr.DecisionState.DROPPED, escalation_id='esc-650-1'),
+            root=tmp_path,
+        )
+
+        rc = sr.main(self._argv(queue, local_id='esc-650-1', project='dark_factory'))
+
+        assert rc == 0
+        assert capsys.readouterr().out.splitlines() == ['esc-650-1']
+        assert self._decision_files(tmp_path) == ['esc-650-1.json']
+        [closed] = dr.list_decisions(root=tmp_path)
+        assert (closed.state, closed.closing_evidence) == (dr.DecisionState.ANSWERED, EVIDENCE)
+
+    def test_a_filing_that_lands_nothing_exits_nonzero_and_closes_nothing(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        queue = self._queue(monkeypatch, tmp_path)
+        dr.write_decision(
+            make_decision(id=qid('esc-9-1'), project='know_live', state=dr.DecisionState.OPEN),
+            root=tmp_path,
+        )
+        seeded = dr.decision_path_for_id(qid('esc-9-1'), root=tmp_path)
+        before = seeded.read_bytes()
+
+        rc = sr.main(self._argv(queue))
+
+        assert rc != 0
+        err = capsys.readouterr().err
+        assert 'file-and-close-decision' in err
+        assert 'esc-9-1' in err
+        assert seeded.read_bytes() == before
+        assert self._decision_files(tmp_path) == [seeded.name]
+
+    def test_a_close_refusal_after_the_filing_landed_exits_nonzero(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """A same-queue re-file holds a dropped record closed, and dropped -> answered is refused."""
+        queue = self._queue(monkeypatch, tmp_path)
+        dr.write_decision(
+            make_decision(
+                id='esc-650-1', project='df', state=dr.DecisionState.DROPPED, escalation_id='esc-650-1',
+                escalations_dir=str(queue),
+            ),
+            root=tmp_path,
+        )
+
+        rc = sr.main(self._argv(queue, local_id='esc-650-1', state='answered'))
+
+        assert rc != 0
+        assert 'close-decision refused' in capsys.readouterr().err
+        [reread] = dr.list_decisions(root=tmp_path)
+        assert (reread.state, reread.closing_evidence) == (dr.DecisionState.DROPPED, '')
+
+    def test_a_mode2_enrichment_keeping_another_queues_stamp_is_refused_and_left_open(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """The filing folds into an OPEN record of the project's other queue; the close's CAS names this queue."""
+        monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+        orch, recon = two_queues(tmp_path)
+        dr.write_decision(
+            make_decision(
+                id=qid('esc-9-1'), project='df', state=dr.DecisionState.OPEN, escalation_id='esc-9-1',
+                escalations_dir=str(recon),
+            ),
+            root=tmp_path,
+        )
+
+        rc = sr.main(self._argv(orch))
+
+        assert rc != 0
+        assert 'close-decision refused' in capsys.readouterr().err
+        [reread] = dr.list_decisions(root=tmp_path)
+        assert (reread.id, reread.state, reread.closing_evidence) == (qid('esc-9-1'), dr.DecisionState.OPEN, '')
+        assert reread.escalations_dir == dr.normalize_escalations_dir(recon)
+
+    @pytest.mark.parametrize(
+        'unclosable',
+        [pytest.param({'state': 'open'}, id='open-state'), pytest.param({'evidence': '   '}, id='blank-evidence')],
+    )
+    def test_arguments_that_could_never_close_are_refused_before_filing(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, unclosable: dict[str, str]
+    ) -> None:
+        queue = self._queue(monkeypatch, tmp_path)
+
+        rc = sr.main(self._argv(queue, **unclosable))
+
+        assert rc != 0
+        assert self._decision_files(tmp_path) == []
+
+    def test_the_filers_record_slug_is_stamped(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        queue = self._queue(monkeypatch, tmp_path)
+        file_from_a_linked_session(monkeypatch, tmp_path)
+
+        assert sr.main(self._argv(queue)) == 0
+
+        [closed] = dr.list_decisions(root=tmp_path)
+        assert (closed.state, closed.record_slug) == (dr.DecisionState.ANSWERED, 'linked-watcher-record')
 
 
 class TestReopenDecision:

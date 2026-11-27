@@ -68,8 +68,10 @@ from fused_memory.maintenance.link_heal_store import (
     ToolCaller,
     text_sha256,
 )
+from fused_memory.models.invocation_ledger import LedgerRole, invocations_ledger_path
 from fused_memory.models.scope import resolve_project_id
 from fused_memory.server.grouped_read import SIGHTING_KIND
+from fused_memory.server.main import _resolve_curator_cost_store_path
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'link_heal.py'
 
@@ -242,7 +244,7 @@ def env_for(
         census_for=lambda _config: contextlib.nullcontext(census or harness.mem0),
         ledger_dir_for=lambda _config: workspace.ledger_dir,
         home_root_for=lambda _config: str(workspace.home_root),
-        adjudicator_for=lambda _config: adjudicate,
+        adjudicator_for=lambda _config, _ledger: adjudicate,
     )
 
 
@@ -362,6 +364,20 @@ class TestStatus:
         assert await run_cli(env, workspace, 'status') == 0
 
         assert str(workspace.data_dir.resolve() / LEDGER_FILENAME) in capsys.readouterr().out
+
+    def test_adjudicator_rows_land_in_the_servers_invocations_ledger_from_any_cwd(
+        self, workspace, monkeypatch,
+    ):
+        workspace.config_path.write_text(yaml.safe_dump({
+            'reconciliation': {'data_dir': 'data/reconciliation'},
+        }))
+        monkeypatch.chdir(workspace.root)
+
+        config = cli.load_config(str(workspace.config_path))
+
+        assert invocations_ledger_path(cli.config_ledger_dir(config)) == (
+            _resolve_curator_cost_store_path(config)
+        )
 
 
 class TestPlan:
@@ -608,6 +624,18 @@ class TestApplyAndUndo:
         assert undone['outcome'] == 'complete'
 
     @pytest.mark.asyncio
+    async def test_commands_that_never_adjudicate_never_open_the_invocations_ledger(
+        self, harness, workspace, capsys,
+    ):
+        env = env_for(harness, workspace)
+        await plan_from(env, workspace, seed_corpus(harness, workspace, 2), capsys)
+        _code, applied = await apply(env, workspace, capsys)
+
+        assert await run_cli(env, workspace, 'undo', '--run', applied['run_id']) == 0
+
+        assert not invocations_ledger_path(workspace.ledger_dir).exists()
+
+    @pytest.mark.asyncio
     async def test_config_is_read_afresh_at_every_run(self, harness, workspace, capsys):
         env = env_for(harness, workspace)
         await plan_from(env, workspace, seed_corpus(harness, workspace, 4), capsys)
@@ -769,6 +797,29 @@ class TestPlanFromAdjudicator:
 
         assert code == 0
         assert sorted(pair.child_text for pair in fake.pairs) == ['cli sighting 100', 'cli sighting 200']
+
+    @pytest.mark.asyncio
+    async def test_the_adjudicator_writes_to_the_run_invocation_ledger(
+        self, harness, workspace, capsys,
+    ):
+        seed_unrated_sightings(harness, 1)
+        fake = always(Verdict.EXTENDS)
+        ledgers = []
+
+        def adjudicator_for(_config, ledger):
+            ledgers.append(ledger)
+            return fake
+
+        env = dataclasses.replace(env_for(harness, workspace), adjudicator_for=adjudicator_for)
+        code, _report = await plan_adjudicated(env, workspace, capsys, '--project', DF)
+
+        assert code == 0
+        (ledger,) = ledgers
+        assert ledger.role is LedgerRole.LINK_ADJUDICATOR
+        assert ledger.project_id == resolve_project_id(str(workspace.home_root))
+        assert ledger.run_id
+        assert ledger.cost_store is not None
+        assert invocations_ledger_path(workspace.ledger_dir).exists()
 
     @pytest.mark.asyncio
     async def test_project_defaults_to_the_home_project(self, harness, workspace, capsys):

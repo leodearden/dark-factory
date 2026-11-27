@@ -15,7 +15,8 @@ first, installed as ONE wrapping of ``ToolManager.call_tool`` by
 3. the uuid-prefix guard (:class:`shared.uuid_prefix_guard.UuidPrefixGuardMiddleware`),
    innermost of the three, per the order
    ``plans/review-all-s15-fused-memory-mcp-server-boundary-prd.md`` D2 fixes.
-   Present exactly when a prefix resolver is wired.
+   Present exactly when a prefix resolver is wired, and declared never to
+   repair :data:`UUID_PREFIX_EXEMPT_PATHS`.
 
 The safe wrapper must already be installed INSIDE this chain;
 ``fused_memory/server/main.py::_install_tool_dispatch_guards`` owns that
@@ -27,6 +28,7 @@ from __future__ import annotations
 import json
 import logging
 from collections.abc import Mapping
+from types import MappingProxyType
 from typing import Any
 
 from fastmcp.server.middleware import Middleware
@@ -40,6 +42,7 @@ from shared.uuid_prefix_guard import (
     project_from_arguments,
 )
 
+from fused_memory.backends.sqlite_task_backend import PASSTHROUGH_ONLY_METADATA_KEYS
 from fused_memory.server.markup_guard import ResidueFloor, build_markup_guard
 from fused_memory.server.tool_middleware_bridge import install_tool_middleware
 from fused_memory.server.unknown_argument_guard import UnknownArgumentMiddleware
@@ -66,6 +69,13 @@ UUID_PREFIX_EXEMPT_TOOLS: frozenset[str] = frozenset({
 #: Tools that forward an ambiguous prefix unchanged instead of rejecting it
 #: (PRD D3): losing the write is worse than the defect.
 UUID_PREFIX_FORWARD_ON_AMBIGUITY_TOOLS: frozenset[str] = frozenset({'update_task'})
+
+#: update_task accepts these values only verbatim
+#: (``sqlite_task_backend.py::_assert_passthrough_only_keys``), so repairing a
+#: stored value inside them turns an exact echo into a refusal (task 11331).
+UUID_PREFIX_EXEMPT_PATHS: Mapping[str, frozenset[tuple[str, ...]]] = MappingProxyType({
+    'update_task': frozenset(('metadata', key) for key in PASSTHROUGH_ONLY_METADATA_KEYS),
+})
 
 #: Also folded into the result proper, because the agent's client drops
 #: ``_meta`` (``plans/uuid-prefix-resolution-prd.md`` §11 Q1).
@@ -117,6 +127,7 @@ def boundary_guard_chain(
             project_from_arguments(known_projects or {}),
             exempt_tools=UUID_PREFIX_EXEMPT_TOOLS,
             forward_on_ambiguity_tools=UUID_PREFIX_FORWARD_ON_AMBIGUITY_TOOLS,
+            exempt_paths=UUID_PREFIX_EXEMPT_PATHS,
             # escalation_sink is unwired here: a burst still logs the storm
             # escape's ERROR line and rides on the caller's response. Wiring it
             # into a queue is task 9988.

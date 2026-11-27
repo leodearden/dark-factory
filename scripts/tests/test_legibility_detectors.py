@@ -14,8 +14,17 @@ import pytest
 from legibility import coder, detectors, digest, inventory, sampling
 from legibility.detectors import AgentClass, CarrierKind, SignalClass
 from legibility_carrier_fixtures import (
+    CLIENT_RENDERED_IDS,
+    CLIENT_RENDERED_TURNS,
+    LOCAL_COMMAND_STDOUT_TURN,
     PROSE_QUOTING_THE_SCHEMA,
+    SDK_GUI_CLIENT_HUMAN_TURNS,
+    SLASH_COMMAND_ARGLESS_TURN,
+    SLASH_COMMAND_EMPTY_ARGS_TURN,
+    SLASH_COMMAND_WITH_ARGS_TURN,
     TRICKLE_CODER_PREAMBLE,
+    UNMARKED_HEADLESS_SDK_PROMPT_TEXTS,
+    UNMARKED_HEADLESS_SDK_PROMPTS,
     assistant_record,
     briefing_text,
     census_synthesis_prompt,
@@ -524,6 +533,141 @@ class TestUserTurnText:
         assert detectors.user_turn_text(tool_result_record('tu-1', 'output')) is None
 
 
+class TestParseSlashCommandExpansion:
+    def test_message_first_expansion_with_typed_args(self):
+        assert detectors.parse_slash_command_expansion(SLASH_COMMAND_WITH_ARGS_TURN) == (
+            detectors.SlashCommandExpansion(
+                name='/team',
+                args='Should dark-factory split its very large test files?',
+                trailing='',
+            )
+        )
+
+    def test_name_first_expansion_with_empty_args(self):
+        assert detectors.parse_slash_command_expansion(SLASH_COMMAND_EMPTY_ARGS_TURN) == (
+            detectors.SlashCommandExpansion(name='/login', args='', trailing='')
+        )
+
+    def test_expansion_without_an_args_tag_has_no_args(self):
+        assert detectors.parse_slash_command_expansion(SLASH_COMMAND_ARGLESS_TURN) == (
+            detectors.SlashCommandExpansion(name='/reflect', args=None, trailing='')
+        )
+
+    def test_text_after_the_expansion_is_trailing(self):
+        expansion = detectors.parse_slash_command_expansion(
+            SLASH_COMMAND_WITH_ARGS_TURN + '\nand then redo it'
+        )
+
+        assert expansion is not None
+        assert expansion.trailing.strip() == 'and then redo it'
+
+    def test_args_not_adjacent_to_the_name_are_not_its_args(self):
+        expansion = detectors.parse_slash_command_expansion(
+            '<command-name>/unblock</command-name>\nAn unrelated aside.\n'
+            '<command-args>4743</command-args>'
+        )
+
+        assert expansion is not None
+        assert expansion.args is None
+        assert 'An unrelated aside.' in expansion.trailing
+
+    def test_a_turn_quoting_an_expansion_after_prose_is_not_one(self):
+        text = 'Read the digest below.\n\n' + SLASH_COMMAND_WITH_ARGS_TURN
+
+        assert detectors.parse_slash_command_expansion(text) is None
+
+    def test_plain_prose_is_not_an_expansion(self):
+        assert detectors.parse_slash_command_expansion('status?') is None
+
+
+class TestClientRenderedTurn:
+    @pytest.mark.parametrize('text', CLIENT_RENDERED_TURNS, ids=CLIENT_RENDERED_IDS)
+    def test_a_whole_turn_the_client_composed_is_client_rendered(self, text):
+        assert detectors.is_client_rendered_turn(text)
+
+    @pytest.mark.parametrize('text', [
+        pytest.param(
+            '<command-name>/login</command-name>\n<command-args>  \n </command-args>',
+            id='whitespace_only_args',
+        ),
+        pytest.param(
+            '<local-command-stderr>Error: not logged in</local-command-stderr>',
+            id='local_command_stderr',
+        ),
+        pytest.param('\n\n[Request interrupted by user]\n\n', id='interrupt_in_blank_lines'),
+    ])
+    def test_other_client_rendered_shapes(self, text):
+        assert detectors.is_client_rendered_turn(text)
+
+    @pytest.mark.parametrize('text', [
+        pytest.param(SLASH_COMMAND_WITH_ARGS_TURN, id='typed_args'),
+        pytest.param(SLASH_COMMAND_ARGLESS_TURN + '\nwhy did that fail?', id='expansion_then_prose'),
+        pytest.param('[Request interrupted by user]\nno, use the other branch', id='interrupt_then_prose'),
+        pytest.param('I hit [Request interrupted by user] by mistake, carry on', id='interrupt_quoted'),
+        pytest.param('what does <command-name>/reflect</command-name> do?', id='expansion_quoted'),
+        pytest.param(LOCAL_COMMAND_STDOUT_TURN + '\nok now commit', id='stdout_then_prose'),
+        pytest.param(
+            '<local-command-stdout>a</local-command-stdout> fix it '
+            '<local-command-stdout>b</local-command-stdout>',
+            id='prose_between_two_stdout_blocks',
+        ),
+        pytest.param('status?', id='plain_prose'),
+    ])
+    def test_a_turn_holding_human_prose_is_not_client_rendered(self, text):
+        assert not detectors.is_client_rendered_turn(text)
+
+    def test_the_bare_interrupt_marker_stays_an_interrupt_signal(self):
+        hits = detectors.record_hits(user_record('[Request interrupted by user]'))
+
+        assert hits.count(SignalClass.INTERRUPT) == 1
+
+
+# ---------------------------------------------------------------------------
+# (g) dialogue_turn_text -- the one rule for "a human addressed this
+# session", behind the digest's gold turns and n_user_turns and the
+# classifier's INTERACTIVE.
+# ---------------------------------------------------------------------------
+
+_RECORDS_NO_HUMAN_ADDRESSED = [
+    pytest.param(user_record('x', isMeta=True), id='meta'),
+    pytest.param(user_record('x', isSidechain=True), id='sidechain'),
+    pytest.param(tool_result_record('tu-1', 'ok'), id='tool_result_only'),
+    pytest.param(assistant_record(text_block('hi')), id='assistant'),
+    pytest.param(user_record(briefing_text()), id='harness_briefing'),
+]
+
+
+class TestDialogueTurnText:
+    def test_a_human_turn_is_its_text(self):
+        assert detectors.dialogue_turn_text(user_record('please redo it')) == 'please redo it'
+
+    @pytest.mark.parametrize('record', _RECORDS_NO_HUMAN_ADDRESSED)
+    def test_a_record_no_human_addressed_has_no_dialogue_text(self, record):
+        assert detectors.dialogue_turn_text(record) is None
+
+    @pytest.mark.parametrize('text', UNMARKED_HEADLESS_SDK_PROMPTS)
+    def test_a_headless_sdk_prompt_has_no_dialogue_text(self, text):
+        assert detectors.dialogue_turn_text(sdk_prompt(text)) is None
+
+    @pytest.mark.parametrize(('text', 'entrypoint'), SDK_GUI_CLIENT_HUMAN_TURNS)
+    def test_a_gui_client_human_turn_is_its_text(self, text, entrypoint):
+        assert detectors.dialogue_turn_text(sdk_prompt(text, entrypoint=entrypoint)) == text
+
+    @pytest.mark.parametrize('text', CLIENT_RENDERED_TURNS, ids=CLIENT_RENDERED_IDS)
+    def test_a_client_rendered_turn_has_no_dialogue_text(self, text):
+        assert detectors.dialogue_turn_text(user_record(text)) is None
+
+    def test_the_digests_user_turns_are_exactly_the_dialogue_turns(self):
+        records = [
+            user_record('a'), sdk_prompt('b'), user_record('c', isMeta=True),
+            user_record(briefing_text()), user_record(SLASH_COMMAND_ARGLESS_TURN), user_record('d'),
+        ]
+        dialogue = [text for record in records if (text := detectors.dialogue_turn_text(record)) is not None]
+
+        assert dialogue == ['a', 'd']
+        assert [turn['text'] for turn in digest.iter_user_turns(records)] == dialogue
+
+
 # ---------------------------------------------------------------------------
 # Boundary row 1: the sampler and the digest agree on class presence. Each
 # committed transcript holds ONLY its stated class; the first eight are the
@@ -564,6 +708,12 @@ class TestSamplerAndDigestAgreeOnTheCorpus:
 
         assert sampled == digested == (signal in EXPECTED_PRESENT[name])
 
+    @pytest.mark.parametrize('name', sorted(EXPECTED_PRESENT))
+    def test_an_interactive_digest_has_user_turns_and_an_unattended_one_none(self, name):
+        front = coder.parse_frontmatter(digest.build_digest(_CORPUS / name))
+
+        _assert_the_class_and_the_user_turns_agree(front['agent_class'], front['n_user_turns'])
+
 
 # ---------------------------------------------------------------------------
 # Boundary row 2: one agent-class classifier, read by the sampler's stratum
@@ -588,6 +738,13 @@ def _coder_prompt(digest_line):
     return coder.build_prompt(digest_text=digest_line, codebook_index='', invariant_slugs=())
 
 
+_MARKERLESS_HEADLESS_PROMPTS = [
+    pytest.param(UNMARKED_HEADLESS_SDK_PROMPT_TEXTS[name], id=name)
+    for name in ('link_adjudicator', 'path_scope_adjudicator', 'task_curator_candidate')
+]
+"""The headless prompts no marker names: dry_run_unblock's 'Task ID:' /
+'Worktree:' preamble is an orchestrated-task marker."""
+
 _READ_OF_MARKER_SOURCE = (
     user_record('why did the sampler restratify my session?'),
     assistant_record(tool_use_block(
@@ -605,13 +762,13 @@ class TestAgentClassVocabulary:
     def test_agent_classes_are_the_strata_plus_unknown(self):
         assert [c.value for c in AgentClass] == [
             'recon', 'curator-classifier', 'watcher', 'orchestrated-task', 'interactive',
-            'legibility-instrument', 'unknown',
+            'unattended', 'legibility-instrument', 'unknown',
         ]
 
     def test_the_sampler_strata_are_every_class_but_unknown(self):
         assert sampling.STRATA == (
             'recon', 'curator-classifier', 'watcher', 'orchestrated-task', 'interactive',
-            'legibility-instrument',
+            'unattended', 'legibility-instrument',
         )
 
 
@@ -712,6 +869,40 @@ class TestClassifyAgentClass:
             AgentClass.INTERACTIVE
         )
 
+    @pytest.mark.parametrize('text', _MARKERLESS_HEADLESS_PROMPTS)
+    def test_a_markerless_headless_session_is_unattended(self, text):
+        assert _classify(sdk_prompt(text), assistant_record(text_block('done'))) is AgentClass.UNATTENDED
+
+    def test_a_session_whose_only_turn_is_harness_injected_is_unattended(self):
+        assert _classify(user_record(briefing_text())) is AgentClass.UNATTENDED
+
+    @pytest.mark.parametrize('text', CLIENT_RENDERED_TURNS, ids=CLIENT_RENDERED_IDS)
+    def test_a_session_whose_only_turns_are_client_rendered_is_unattended(self, text):
+        assert _classify(user_record(text), assistant_record(text_block('ok'))) is AgentClass.UNATTENDED
+
+    def test_prose_after_a_client_rendered_turn_is_interactive(self):
+        records = [user_record(SLASH_COMMAND_ARGLESS_TURN), user_record('why did that fail?')]
+
+        assert _classify(*records) is AgentClass.INTERACTIVE
+
+    def test_a_slash_command_with_typed_args_is_interactive(self):
+        assert _classify(user_record(SLASH_COMMAND_WITH_ARGS_TURN)) is AgentClass.INTERACTIVE
+
+    def test_records_without_any_user_turn_are_unattended(self):
+        assert _classify(tool_result_record('tu-1', 'ok')) is AgentClass.UNATTENDED
+
+    def test_a_dialogue_turn_after_an_injected_first_turn_is_interactive(self):
+        records = [sdk_prompt('link the two memories'), user_record('actually, stop and explain')]
+
+        assert _classify(*records) is AgentClass.INTERACTIVE
+
+    @pytest.mark.parametrize(('text', 'entrypoint'), SDK_GUI_CLIENT_HUMAN_TURNS)
+    def test_a_gui_client_human_turn_is_interactive(self, text, entrypoint):
+        assert _classify(sdk_prompt(text, entrypoint=entrypoint)) is AgentClass.INTERACTIVE
+
+    def test_a_marker_still_precedes_the_dialogue_fallback(self):
+        assert _classify(sdk_prompt('## Reconciliation Run\nStage 1: sync\n')) is AgentClass.RECON
+
     def test_a_lone_worktree_mention_stays_interactive(self):
         # Both task-preamble lines must co-occur: 'Worktree:' alone is
         # ordinary prose in this project.
@@ -777,6 +968,19 @@ class TestAgentClassEvidence:
 
         assert evidence.first_turn_text == ''
 
+    def test_a_dialogue_turn_is_recorded_whichever_class_wins(self):
+        records = [
+            user_record('<command-name>recon-escalation-watcher</command-name>'),
+            user_record('please check the queue'),
+        ]
+        evidence = detectors.AgentClassEvidence.for_path(_MAIN_DIR_PATH)
+
+        for record in records:
+            evidence = evidence.observe(record)
+
+        assert evidence.agent_class is AgentClass.WATCHER
+        assert evidence.has_dialogue_turn is True
+
     def test_observing_returns_new_evidence_and_leaves_the_old_unchanged(self):
         before = detectors.AgentClassEvidence.for_path(_MAIN_DIR_PATH)
 
@@ -827,9 +1031,20 @@ class TestLegibilityInstrumentSessions:
         )
 
     def test_the_opener_quoted_inside_a_first_turn_is_foreign(self):
-        record = user_record(f'why is this prompt restratified?\n\n{TRICKLE_CODER_PREAMBLE}')
+        records = [
+            user_record(f'why is this prompt restratified?\n\n{TRICKLE_CODER_PREAMBLE}'),
+            user_record('and why only since Tuesday?'),
+        ]
 
-        assert _classify(record) is AgentClass.INTERACTIVE
+        assert _classify(*records) is AgentClass.INTERACTIVE
+
+    def test_a_lone_question_pasting_an_instrument_prompt_is_unattended_with_no_user_turns(self, tmp_path):
+        records = [user_record(f'why is this prompt restratified?\n\n{TRICKLE_CODER_PREAMBLE}')]
+        session = _write_session(tmp_path, '-home-leo-src-dark-factory', records)
+
+        front = coder.parse_frontmatter(digest.build_digest(session.path))
+
+        assert (front['agent_class'], front['n_user_turns']) == (AgentClass.UNATTENDED, 0)
 
     def test_the_opener_in_a_tool_result_is_foreign(self):
         records = [
@@ -884,6 +1099,11 @@ _SHAPES = [
         '-home-leo-src-dark-factory', [user_record('please fix the parser')], 'interactive',
         id='no_marker',
     ),
+    pytest.param(
+        '-home-leo-src-dark-factory',
+        [sdk_prompt('please fix the parser'), assistant_record(text_block('done'))],
+        'unattended', id='headless_no_marker',
+    ),
     pytest.param('-home-leo-src-dark-factory', [], 'unknown', id='empty'),
     pytest.param(
         '-home-leo-src-dark-factory',
@@ -909,21 +1129,48 @@ _SHAPES = [
         ],
         'legibility-instrument', id='census_synthesis_session',
     ),
+    pytest.param(
+        '-home-leo-src-dark-factory',
+        [
+            user_record(SLASH_COMMAND_ARGLESS_TURN),
+            user_record('[Request interrupted by user]'),
+            assistant_record(text_block('ok')),
+        ],
+        'unattended', id='client_rendered_only',
+    ),
 ]
 
 
-@pytest.mark.parametrize(('encoded', 'records', 'expected'), _SHAPES)
-def test_sampler_stratum_and_digest_agent_class_agree(tmp_path, encoded, records, expected):
+def _write_session(tmp_path, encoded, records):
     directory = tmp_path / encoded
     directory.mkdir()
     path = directory / 'sess.jsonl'
     path.write_text(''.join(json.dumps(record) + '\n' for record in records))
-    session = inventory.SessionRecord(
+    return inventory.SessionRecord(
         path=path, encoded_dir=encoded, cwd='/home/leo/src/dark-factory',
         date=date(2026, 10, 11), size_bytes=path.stat().st_size,
     )
 
+
+@pytest.mark.parametrize(('encoded', 'records', 'expected'), _SHAPES)
+def test_sampler_stratum_and_digest_agent_class_agree(tmp_path, encoded, records, expected):
+    session = _write_session(tmp_path, encoded, records)
+
     stratum = sampling.score_session(session).stratum
-    rendered = coder.parse_frontmatter(digest.build_digest(path))['agent_class']
+    rendered = coder.parse_frontmatter(digest.build_digest(session.path))['agent_class']
 
     assert stratum == rendered == expected
+
+
+def _assert_the_class_and_the_user_turns_agree(agent_class, n_user_turns):
+    ruled_out = AgentClass.UNATTENDED if n_user_turns > 0 else AgentClass.INTERACTIVE
+    assert agent_class != ruled_out
+
+
+@pytest.mark.parametrize(('encoded', 'records', 'expected'), _SHAPES)
+def test_an_interactive_digest_has_user_turns_and_an_unattended_one_none(
+    tmp_path, encoded, records, expected,
+):
+    front = coder.parse_frontmatter(digest.build_digest(_write_session(tmp_path, encoded, records).path))
+
+    _assert_the_class_and_the_user_turns_agree(front['agent_class'], front['n_user_turns'])

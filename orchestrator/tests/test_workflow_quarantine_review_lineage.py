@@ -35,6 +35,7 @@ _PARKING_NAME = f'{TASK_ID}-20261112T000000Z'
 _ADJUDICATOR = 'resettled_adjudicator'
 _SETTLED = {
     'severity': 'suggestion',
+    'kind': 'process',
     'location': 'lib.py:3',
     'category': 'naming',
     'description': 'helper name hides its side effect',
@@ -42,6 +43,7 @@ _SETTLED = {
 }
 _RAISED_ON_THE_NEW_BRANCH = {
     'severity': 'suggestion',
+    'kind': 'test_quality',
     'location': 'lib.py:1',
     'category': 'coverage',
     'description': 'farewell has no empty-name case',

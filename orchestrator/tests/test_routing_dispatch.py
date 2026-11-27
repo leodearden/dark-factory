@@ -30,7 +30,7 @@ from _recording_event_store import _RecordingEventStore
 
 from orchestrator.config import OrchestratorConfig
 from orchestrator.event_store import EventStore, EventType
-from orchestrator.routing import RoleDefaults, RoutingDecision
+from orchestrator.routing import PlanShape, RoleDefaults, RoutingDecision
 from orchestrator.routing_dispatch import resolve_and_record_route
 from orchestrator.workflow_types import WorkflowState
 
@@ -143,6 +143,43 @@ class TestEmitsRoutingDecisionEvent:
                 event_store=None,
             )
         assert decision is fake
+
+
+@pytest.mark.asyncio
+class TestRecordsPlanShape:
+    """The event and the in-memory mirror carry the plan shape the caller
+    passed: step and module counts, null when there is none."""
+
+    async def _record(self, plan_shape: PlanShape | None) -> tuple[dict, dict]:
+        rec = _RecordingEventStore()
+        task: dict = {}
+        with patch(f'{_HELPER}.resolve_route', return_value=_fake_decision()):
+            await resolve_and_record_route(
+                role_name='steward',
+                role_defaults=_STEWARD_DEFAULTS,
+                config=_mk_cfg(),
+                task_id='2537',
+                task_metadata={},
+                plan_shape=plan_shape,
+                event_store=rec,
+                in_memory_task=task,
+            )
+        (entry,) = _routing_entries(rec)
+        return entry['data'], task['metadata']['routing']['latest']
+
+    async def test_plan_shape_is_recorded(self) -> None:
+        data, latest = await self._record(PlanShape(step_count=5, module_paths=('a', 'b', 'c')))
+
+        assert (data['plan_steps'], data['plan_modules']) == (5, 3)
+        assert (latest['plan_steps'], latest['plan_modules']) == (5, 3)
+
+    async def test_no_plan_shape_records_nulls(self) -> None:
+        data, latest = await self._record(None)
+
+        for record in (data, latest):
+            assert 'plan_steps' in record and 'plan_modules' in record
+            assert record['plan_steps'] is None
+            assert record['plan_modules'] is None
 
 
 @pytest.mark.asyncio

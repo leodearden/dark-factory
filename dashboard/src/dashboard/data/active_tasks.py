@@ -307,14 +307,15 @@ _root_rotation_offset: int = 0
 def reset_task_snapshot_state() -> None:
     """The ONE reset of the task-snapshot collectors' per-process state.
 
-    That state is the unit cache, the last-good store and the admission
-    rotation. It is for tests and admin use; tests reach it through
-    ``dashboard/tests/conftest.py::fresh_task_snapshot_state``. A test that
-    asserts an ORDER or a cold read must start from a known state rather
+    That state is the unit cache, the last-good store, the unit-row memo and
+    the admission rotation. It is for tests and admin use; tests reach it
+    through ``dashboard/tests/conftest.py::fresh_task_snapshot_state``. A test
+    that asserts an ORDER or a cold read must start from a known state rather
     than inherit whatever the previous test left.
     """
     global _root_rotation_offset
     clear_snapshot_cache()
+    _unit_row_memo.clear()
     _root_rotation_offset = 0
 
 
@@ -435,12 +436,13 @@ def _build_task_row(
     (``agent``/``loops``/``attempts``/``lane``/``phase``/``lane_state``/
     ``runtime_offline``/``runtime_status`` — ``started`` is handled separately by the caller,
     since active rows use ``rt['started']`` while terminal rows hard-code
-    ``0``). Missing keys default to ``None``/``False`` so a bare ``{}`` (used
-    by direct unit tests of this function) is still valid.
+    ``0``). Missing keys default to ``None``/``False`` so a bare ``{}`` is
+    still valid: :func:`_unit_rows` passes one to get the placeholders a
+    render's runtime fields replace.
 
     *now* is the reference instant for the strand verdict — this function
     never reads the clock itself, so every row in one pass is judged against
-    the same instant. ``_shape_one_project`` passes the rows' own ``as_of``
+    the same instant. ``_unit_rows`` is passed the rows' own ``as_of``
     (the instant they were measured, matching ``task_snapshot._strand_split``),
     NOT the render instant, so a stale half is not re-judged against a later
     clock; ``shape_terminal_rows`` passes the render instant, which a terminal
@@ -634,6 +636,103 @@ def _resolve_deps(
     return deps
 
 
+@dataclass(frozen=True, slots=True)
+class UnitRow:
+    """One active row's unit-derived wire fields, held by :class:`UnitRowMemo`.
+
+    Never handed to a consumer: every render copies it (:func:`_with_render_facts`).
+    """
+
+    task_id: int
+    fields: dict
+
+
+def _unit_rows(
+    project: str, snapshot: TaskSnapshot, *, judged_at: datetime,
+) -> tuple[UnitRow, ...]:
+    """The unit-derived half of *snapshot*'s active rows, judged at *judged_at*.
+
+    PURE given its arguments. Each row's runtime fields and ``started`` hold
+    the placeholders an empty runtime dict gives :func:`_build_task_row`;
+    :func:`_with_render_facts` overlays a render's own.
+    """
+    tasks = snapshot.rows.value or []
+    # Lookup table for dep title/status resolution within the same project.
+    by_id: dict[int, dict] = {t['id']: t for t in tasks if isinstance(t.get('id'), int)}
+    hold_reads = HoldReads(
+        carrier_statuses=measured_status_map(snapshot),
+        holder_liveness=snapshot.holder_liveness,
+    )
+    unit_rows: list[UnitRow] = []
+    for task in tasks:
+        task_id = task.get('id')
+        if not isinstance(task_id, int):
+            continue
+        row = _build_task_row(
+            project, task, task_id, {}, task_uid(project, task_id),
+            now=judged_at, hold_reads=hold_reads,
+        )
+        row['started'] = None
+        row['deps'] = _resolve_deps(task, by_id, project, status_map=snapshot.status_map)
+        unit_rows.append(UnitRow(task_id, row))
+    return tuple(unit_rows)
+
+
+def _with_render_facts(unit_row: UnitRow, rt: dict) -> dict:
+    """A new wire row: *unit_row*'s fields under one render's runtime fields *rt*.
+
+    Every key of *rt* is already on the row, so each keeps its wire position.
+    Every container on the row is copied too, so a render owns its row as
+    wholly as when it shaped its own. The external-dep tail of
+    :func:`collect_tasks_with_counts` overwrites ``external_deps`` statuses in
+    place, and a consumer that mutated a shared ``deps`` or ``meta_files``
+    would otherwise corrupt every later render of the unit.
+    """
+    row = dict(unit_row.fields)
+    row.update(rt)
+    row['meta_files'] = list(row['meta_files'])
+    row['deps'] = [dict(dep) for dep in row['deps']]
+    row['external_deps'] = [dict(entry) for entry in row['external_deps']]
+    if row['train'] is not None:
+        row['train'] = dict(row['train'])
+    if row.get('deferral') is not None:
+        row['deferral'] = dict(row['deferral'])
+    return row
+
+
+class UnitRowMemo:
+    """Each project's unit-derived rows, shaped once per unit.
+
+    Keyed by the unit's IDENTITY, one entry per project label. A unit is never
+    mutated, and a refreshed, stale-fallback or unmeasured unit is always a new
+    object, so identity is exactly "the same generation".
+    """
+
+    def __init__(self) -> None:
+        self._held: dict[str, tuple[TaskSnapshot, tuple[UnitRow, ...]]] = {}
+
+    def rows_for(self, project: str, snapshot: TaskSnapshot) -> tuple[UnitRow, ...]:
+        """*snapshot*'s unit rows, judged at its rows' ``as_of``; reshaped only for a new unit."""
+        held = self._held.get(project)
+        if held is not None and held[0] is snapshot:
+            return held[1]
+        judged_at = snapshot.rows.as_of
+        if judged_at is None:
+            raise ValueError(
+                f'project {project}: a unit whose rows carry no as_of has no instant '
+                'to judge them at, so its rows cannot be memoised'
+            )
+        rows = _unit_rows(project, snapshot, judged_at=judged_at)
+        self._held[project] = (snapshot, rows)
+        return rows
+
+    def clear(self) -> None:
+        self._held.clear()
+
+
+_unit_row_memo = UnitRowMemo()
+
+
 def _shape_one_project(
     project: str,
     snapshot: TaskSnapshot,
@@ -643,10 +742,12 @@ def _shape_one_project(
 ) -> list[dict]:
     """Shape one project's ACTIVE rows out of an already-acquired *snapshot*.
 
-    PURE given its arguments: it reads no clock, issues no MCP call and
-    touches no cache. Acquiring the unit is I/O and lives in
-    ``task_snapshot.acquire_snapshot``; turning it into rows is arithmetic and
-    lives here. The split is what lets the shaping be exercised against a
+    PURE given its arguments: it reads no clock and issues no MCP call. The
+    unit-derived half of each row is memoised per unit identity
+    (:class:`UnitRowMemo`), which is transparent because a unit is never
+    mutated; every returned row, and every container in it, is new. Acquiring
+    the unit is I/O and lives in ``task_snapshot.acquire_snapshot``; turning
+    it into rows is arithmetic and lives here. The split is what lets the shaping be exercised against a
     canned unit and the reads be exercised against a canned substrate, with
     neither test having to stand in for the other.
 
@@ -687,40 +788,27 @@ def _shape_one_project(
     degrade to an honest ``None`` via :func:`_runtime_fields`, which is a
     DIFFERENT fault domain from the task-tree read the snapshot reports on.
     """
-    tasks = snapshot.rows.value or []
-    if not tasks:
+    if not snapshot.rows.value:
         return []
-    # ``value is not None <=> as_of is not None`` holds by construction on the
-    # unit; the fallback only keeps a row shaped if that triad were ever broken.
-    judged_at = snapshot.rows.as_of if snapshot.rows.as_of is not None else now
-
     runtime_status = _probe_status(runtime)
     runtime_index: dict[int, TaskRuntimeEntry] = (
         {e.task_id: e for e in runtime.tasks} if runtime is not None and not runtime.offline else {}
     )
-
-    # Lookup table for dep title/status resolution within the same project.
-    by_id: dict[int, dict] = {t['id']: t for t in tasks if isinstance(t.get('id'), int)}
-    hold_reads = HoldReads(
-        carrier_statuses=measured_status_map(snapshot),
-        holder_liveness=snapshot.holder_liveness,
+    # ``value is not None <=> as_of is not None`` holds by construction on the
+    # unit; the fallback only keeps a row shaped if that triad were ever broken,
+    # judged at this render's clock and so never memoised.
+    unit_rows = (
+        _unit_row_memo.rows_for(project, snapshot)
+        if snapshot.rows.as_of is not None
+        else _unit_rows(project, snapshot, judged_at=now)
     )
-
-    active: list[dict] = []
-    for task in tasks:
-        task_id = task.get('id')
-        if not isinstance(task_id, int):
-            continue
-        rt = _runtime_fields(runtime_index, runtime_status, task_id, now=now)
-        uid = task_uid(project, task_id)
-        row = _build_task_row(
-            project, task, task_id, rt, uid, now=judged_at, hold_reads=hold_reads,
+    return [
+        _with_render_facts(
+            unit_row,
+            _runtime_fields(runtime_index, runtime_status, unit_row.task_id, now=now),
         )
-        # active rows: started from the runtime entry; deps from task tree.
-        row['started'] = rt['started']
-        row['deps'] = _resolve_deps(task, by_id, project, status_map=snapshot.status_map)
-        active.append(row)
-    return active
+        for unit_row in unit_rows
+    ]
 
 
 def shape_terminal_rows(
@@ -987,8 +1075,10 @@ async def collect_tasks_with_counts(
     root's shaped row list: the very dicts the external-dep tail then
     overwrites in place, so that overwrite reaches the wire through the
     units. ``dataclasses.replace`` on the frozen records gives the wire its
-    own unit and leaves the cached one's raw rows for the next render to
-    shape; ``TaskSnapshot.rows`` records why the two cannot be one list. A
+    own unit and leaves the cached one's raw rows untouched: the next render
+    of a new unit shapes them, and :class:`UnitRowMemo` reuses the
+    unit-derived half of an unchanged one. ``TaskSnapshot.rows`` records why
+    the shaped and raw rows cannot be one list. A
     unit whose rows were never measured keeps
     ``value is None``, because ``[]`` would claim a measured zero.
 

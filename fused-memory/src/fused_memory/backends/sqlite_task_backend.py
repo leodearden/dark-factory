@@ -1515,7 +1515,7 @@ _METADATA_KEY_PATH = """('$."' || :key || '"')"""
 
 
 def _metadata_lookup_sql(status_count: int | None) -> str:
-    """The one statement behind ``find_tasks_by_metadata``: counts and page, one snapshot.
+    """The one statement behind ``find_tasks_by_metadata``: counts, page, rows and edges, one snapshot.
 
     ``status_count`` is the number of ``:s0, :s1, ...`` status parameters, or
     ``None`` for every status. ``doc`` is the metadata only when it is a JSON
@@ -1563,7 +1563,12 @@ page AS (
 )
 SELECT stats.total, stats.tasks_with_key, stats.malformed_ids,
        page.id, page.title, page.status, page.priority, page.updated_at,
-       CASE WHEN :include_value THEN t.metadata -> {path} END AS value_json
+       CASE WHEN :include_value THEN t.metadata -> {path} END AS value_json,
+       CASE WHEN :include_rows THEN t.metadata END AS metadata_json,
+       CASE WHEN :include_rows THEN (
+           SELECT json_group_array(d.depends_on) FROM dependencies AS d
+           WHERE d.tag = :tag AND d.task_id = page.id
+       ) END AS dependencies_json
 FROM stats
 LEFT JOIN page ON 1
 LEFT JOIN tasks AS t ON t.tag = :tag AND t.id = page.id
@@ -1578,7 +1583,9 @@ def _json_value_type(value: str | int | None) -> str | None:
     return 'text' if isinstance(value, str) else 'integer'
 
 
-def _metadata_lookup_row(row: aiosqlite.Row, *, include_value: bool) -> MetadataLookupRow:
+def _metadata_lookup_row(
+    row: aiosqlite.Row, *, include_value: bool, include_rows: bool,
+) -> MetadataLookupRow:
     out: MetadataLookupRow = {
         'task_id': int(row['id']),
         'title': row['title'],
@@ -1588,6 +1595,9 @@ def _metadata_lookup_row(row: aiosqlite.Row, *, include_value: bool) -> Metadata
     }
     if include_value:
         out['matched_value'] = json.loads(row['value_json'])
+    if include_rows:
+        out['metadata'] = json.loads(row['metadata_json'])
+        out['dependencies'] = sorted(json.loads(row['dependencies_json']))
     return out
 
 
@@ -2182,17 +2192,20 @@ class SqliteTaskBackend:
         offset: int = 0,
         tag: str | None = None,
         include_value: bool = False,
+        include_rows: bool = False,
     ) -> MetadataLookupResult:
         """One page of the tasks whose top-level ``metadata[key]`` matches *value*.
 
         ``value=None`` matches presence; a str or int matches a scalar by
-        equality or a list by membership. The page and its counts come from
-        one statement on the cached read access, and a store
-        error raises rather than reading as no match. Semantics:
+        equality or a list by membership. The page, its counts and, with
+        ``include_rows``, each row's metadata and dependencies come from one
+        statement on the cached read access, and a store error raises rather
+        than reading as no match. Semantics:
         ``plans/task-metadata-lookup-prd.md`` decisions 5-7.
         """
         validate_metadata_lookup(
-            key=key, value=value, statuses=statuses, include_value=include_value,
+            key=key, value=value, statuses=statuses,
+            include_value=include_value, include_rows=include_rows,
             limit=limit, offset=offset,
         )
         await self.ensure_connected()
@@ -2201,7 +2214,8 @@ class SqliteTaskBackend:
             return {'results': [], 'total': 0, 'tasks_with_key': 0, 'malformed_metadata_ids': []}
         params: dict[str, Any] = {
             'tag': tag, 'key': key, 'value': value, 'vtype': _json_value_type(value),
-            'limit': limit, 'offset': offset, 'include_value': include_value,
+            'limit': limit, 'offset': offset,
+            'include_value': include_value, 'include_rows': include_rows,
         }
         params.update({f's{i}': status for i, status in enumerate(statuses or [])})
         sql = _metadata_lookup_sql(None if statuses is None else len(statuses))
@@ -2210,7 +2224,7 @@ class SqliteTaskBackend:
         counts = rows[0]
         return {
             'results': [
-                _metadata_lookup_row(row, include_value=include_value)
+                _metadata_lookup_row(row, include_value=include_value, include_rows=include_rows)
                 for row in rows if row['id'] is not None
             ],
             'total': counts['total'],
@@ -3317,7 +3331,7 @@ class SqliteTaskBackend:
         # carry the STORED done_provenance through verbatim, which can only
         # be judged against the row, so _assert_passthrough_only_keys
         # checks it inside the transaction below. The same floor, from the
-        # same table (_PASSTHROUGH_ONLY_METADATA_KEYS), covers the two defect
+        # same table (_PASSTHROUGH_ONLY_REFUSALS), covers the two defect
         # keys, whose only writers are declare_defect / record_defect_outcome. The gate reads the RAW
         # metadata_mode because _resolve_metadata_mode can itself raise, and
         # resolving first would change which error a bad call surfaces.
@@ -4491,7 +4505,7 @@ def _metadata_object_or_raise(metadata: str | dict, task_id: str | None) -> dict
     return loaded
 
 
-_PASSTHROUGH_ONLY_METADATA_KEYS: Mapping[str, Callable[[str], TaskmasterError]] = (
+_PASSTHROUGH_ONLY_REFUSALS: Mapping[str, Callable[[str], TaskmasterError]] = (
     MappingProxyType(
         {
             'done_provenance': DoneProvenanceWriteAuthorityError,
@@ -4509,10 +4523,13 @@ set_task_status (and the privileged stamp_audit_metadata seam) writes
 defect keys (``fused_memory/backends/defect_records.py``).
 """
 
+PASSTHROUGH_ONLY_METADATA_KEYS: frozenset[str] = frozenset(_PASSTHROUGH_ONLY_REFUSALS)
+"""The key names of :data:`_PASSTHROUGH_ONLY_REFUSALS`, for callers outside this backend."""
+
 
 def _refuse_passthrough_only_keys(incoming: dict, task_id: str) -> None:
     """update_task's pre-connect floor outside replace: any carried key is refused, echo included."""
-    for key, refusal in _PASSTHROUGH_ONLY_METADATA_KEYS.items():
+    for key, refusal in _PASSTHROUGH_ONLY_REFUSALS.items():
         if key in incoming:
             raise refusal(task_id)
 
@@ -4556,7 +4573,7 @@ def _keys_changed_by_write(
 def _assert_passthrough_only_keys(
     stored_raw: str | None, incoming: dict, task_id: str,
 ) -> None:
-    """Refuse a whole-blob replace that would move any :data:`_PASSTHROUGH_ONLY_METADATA_KEYS` key.
+    """Refuse a whole-blob replace that would move any key of :data:`_PASSTHROUGH_ONLY_REFUSALS`.
 
     The contract: update_task may never ADD, CHANGE or REMOVE one of those
     keys. Under metadata_mode='replace' the payload must carry the stored
@@ -4595,7 +4612,7 @@ def _assert_passthrough_only_keys(
     if not isinstance(stored, dict):
         _refuse_passthrough_only_keys(incoming, task_id)
         return
-    for key, refusal in _PASSTHROUGH_ONLY_METADATA_KEYS.items():
+    for key, refusal in _PASSTHROUGH_ONLY_REFUSALS.items():
         if not _json_identical(stored.get(key, _ABSENT), incoming.get(key, _ABSENT)):
             raise refusal(task_id)
 

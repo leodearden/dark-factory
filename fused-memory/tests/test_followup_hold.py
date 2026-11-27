@@ -12,16 +12,27 @@ import sys
 from typing import Any
 
 import pytest
-from shared.followup_hold_records import FOLLOWUP_HOLD_METADATA_KEY, FOLLOWUP_HOLDER_METADATA_KEY
+from pydantic import ValidationError
+from shared.followup_hold_records import (
+    FINDING_SET_HOLD_METADATA_KEY,
+    FOLLOWUP_HOLD_METADATA_KEY,
+    FOLLOWUP_HOLDER_METADATA_KEY,
+)
 
 from fused_memory.middleware.followup_hold import (
     FollowupHolderProtectedError,
     HolderProtection,
+    PromotionDeferral,
+    carry_hold_record,
+    citation_ref,
+    held_by,
     hold_at_create,
     hold_scope,
     is_holder,
+    may_strip_holder_edge,
     protected_status,
     protected_update,
+    releases_holder,
 )
 
 _MARKER = {'project_id': 'dark_factory', 'minted_at': '2026-11-08T00:00:00+00:00'}
@@ -119,6 +130,84 @@ def test_a_low_followup_is_in_hold_scope(metadata: Any, priority: str) -> None:
 ])
 def test_a_task_outside_the_hold_rule_is_not_held(metadata: Any, priority: str | None) -> None:
     assert not hold_scope(metadata, priority)
+
+
+_SET_MARKER = {'ruling': 'Leo 2026-11-12 on fk-c0932f0b7df1'}
+_FINDING_SET = {
+    'source': 'review-all',
+    'x_finding_key': ['fk-c0932f0b7df1'],
+    'x_finding_run': 'review-all-dark_factory-20261008',
+    FINDING_SET_HOLD_METADATA_KEY: _SET_MARKER,
+}
+
+
+@pytest.mark.parametrize(('metadata', 'priority'), [
+    (_FINDING_SET, 'low'),
+    (_FINDING_SET, 'polish'),
+    ({**_FINDING_SET, 'human_decomposed': True}, 'low'),
+    ({**_FINDING_SET, 'prd_path': 'plans/x-prd.md'}, 'low'),
+    ({**_FINDING_SET, 'complexity': 'simple'}, 'low'),
+    ({**_FINDING_SET, 'x_finding_key': 'fk-x'}, 'low'),
+    (json.dumps({**_FINDING_SET, 'human_decomposed': True}), 'low'),
+], ids=['low', 'polish', 'planning-birth', 'prd-path', 'simple', 'scalar-finding-key', 'json-string'])
+def test_a_marked_finding_set_member_is_in_hold_scope(metadata: Any, priority: str) -> None:
+    assert hold_scope(metadata, priority)
+
+
+@pytest.mark.parametrize(('metadata', 'priority'), [
+    (_FINDING_SET, 'medium'),
+    ({**_FINDING_SET, 'task_kind': 'deterministic'}, 'low'),
+    ({**_FINDING_SET, 'execution_class': 'operational'}, 'low'),
+    ({'source': 'review-all', FINDING_SET_HOLD_METADATA_KEY: _SET_MARKER}, 'low'),
+    ({**_FINDING_SET, 'x_finding_key': []}, 'low'),
+    ({**_FINDING_SET, FINDING_SET_HOLD_METADATA_KEY: None}, 'low'),
+], ids=['medium', 'deterministic', 'execution-class', 'no-finding-key', 'empty-finding-key', 'marker-none'])
+def test_a_marked_task_outside_the_finding_set_arm_is_not_held(metadata: Any, priority: str) -> None:
+    assert not hold_scope(metadata, priority)
+
+
+@pytest.mark.parametrize(('metadata', 'priority', 'reason'), [
+    (_FINDING_SET, 'medium', "priority 'medium'"),
+    ({**_FINDING_SET, 'task_kind': 'deterministic'}, 'low', "task_kind 'deterministic'"),
+    ({**_FINDING_SET, 'execution_class': 'operational'}, 'low', "execution_class 'operational'"),
+    ({'source': 'review-all', FINDING_SET_HOLD_METADATA_KEY: _SET_MARKER}, 'low', 'x_finding_key'),
+    ({**_FINDING_SET, 'x_finding_key': []}, 'low', 'x_finding_key'),
+], ids=['medium', 'deterministic', 'execution-class', 'no-finding-key', 'empty-finding-key'])
+def test_a_valid_marker_the_rule_refuses_warns_naming_the_task_and_why(
+    metadata: Any, priority: str, reason: str, caplog: pytest.LogCaptureFixture,
+) -> None:
+    with caplog.at_level('WARNING', logger='fused_memory.middleware.followup_hold'):
+        assert not hold_scope(metadata, priority, task_id=42)
+
+    [message] = caplog.messages
+    assert 'task 42' in message and FINDING_SET_HOLD_METADATA_KEY in message, message
+    assert _SET_MARKER['ruling'] in message and reason in message, message
+
+
+def test_a_held_or_unmarked_task_logs_nothing(caplog: pytest.LogCaptureFixture) -> None:
+    with caplog.at_level('WARNING', logger='fused_memory.middleware.followup_hold'):
+        assert hold_scope(_FINDING_SET, 'low', task_id=42)
+        assert hold_scope(_FOLLOWUP, 'low', task_id=43)
+        assert not hold_scope(_FOLLOWUP, 'medium', task_id=44)
+
+    assert caplog.messages == []
+
+
+@pytest.mark.parametrize('marker', [
+    {},
+    {'ruling': ''},
+    {**_SET_MARKER, 'extra': 1},
+    'yes',
+], ids=['empty', 'empty-ruling', 'extra-key', 'string'])
+def test_a_malformed_finding_set_marker_is_not_held_and_warns(
+    marker: object, caplog: pytest.LogCaptureFixture,
+) -> None:
+    with caplog.at_level('WARNING', logger='fused_memory.middleware.followup_hold'):
+        assert not hold_scope({**_FINDING_SET, FINDING_SET_HOLD_METADATA_KEY: marker}, 'low', task_id=42)
+
+    assert any(
+        FINDING_SET_HOLD_METADATA_KEY in message and 'task 42' in message for message in caplog.messages
+    ), caplog.messages
 
 
 _HELD_AT = '2026-11-19T04:30:00+00:00'
@@ -261,3 +350,145 @@ def test_the_refusal_carries_the_holder_and_its_held_count() -> None:
     assert error.event_payload() == {
         'holder_id': '9', 'attempted_status': 'cancelled', 'protection': 'protected_status', 'held_count': 2,
     }
+
+
+_HOLD_RECORD = {'holder': 9, 'held_at': _HELD_AT}
+
+
+def _held_row(status: str = 'pending', *, dependencies: list[Any] | None = None, record: Any = None) -> dict[str, Any]:
+    return {
+        'id': 12,
+        'status': status,
+        'dependencies': [3, 9] if dependencies is None else dependencies,
+        'metadata': {**_FOLLOWUP, FOLLOWUP_HOLD_METADATA_KEY: _HOLD_RECORD if record is None else record},
+    }
+
+
+@pytest.mark.parametrize('status', ['pending', 'deferred', 'in-progress', 'blocked'])
+def test_a_row_with_its_record_and_holder_edge_is_held_by_that_holder(status: str) -> None:
+    assert held_by(_held_row(status)) == 9
+
+
+def test_a_row_whose_metadata_is_a_json_string_is_read_the_same() -> None:
+    row = {**_held_row(), 'metadata': json.dumps(_held_row()['metadata'])}
+
+    assert held_by(row) == 9
+
+
+def test_string_dependency_ids_name_the_holder_edge() -> None:
+    assert held_by(_held_row(dependencies=['3', '9'])) == 9
+
+
+@pytest.mark.parametrize('row', [
+    {'id': 12, 'status': 'pending', 'dependencies': [9], 'metadata': dict(_FOLLOWUP)},
+    _held_row(dependencies=[3]),
+    _held_row(dependencies=[]),
+    {**_held_row(), 'dependencies': None},
+    _held_row('done'),
+    _held_row('cancelled'),
+], ids=['record-absent', 'edge-absent', 'no-dependencies', 'dependencies-none', 'done', 'cancelled'])
+def test_a_row_without_both_record_and_edge_or_settled_is_not_held(row: dict[str, Any]) -> None:
+    assert held_by(row) is None
+
+
+def test_a_promoted_row_keeps_its_record_but_is_not_held() -> None:
+    promoted = {**_HOLD_RECORD, 'promoted': {'by': 'citation', 'at': _HELD_AT, 'ref': 'fk-1'}}
+
+    assert held_by(_held_row(dependencies=[3], record=promoted)) is None
+
+
+@pytest.mark.parametrize('record', [
+    {'holder': 'x', 'held_at': _HELD_AT},
+    {**_HOLD_RECORD, 'extra': 1},
+    'held',
+], ids=['holder-not-int', 'extra-key', 'not-an-object'])
+def test_a_malformed_record_is_not_held_and_warns(record: Any, caplog: pytest.LogCaptureFixture) -> None:
+    with caplog.at_level('WARNING', logger='fused_memory.middleware.followup_hold'):
+        assert held_by(_held_row(record=record)) is None
+
+    assert any('task 12 carries' in message for message in caplog.messages)
+
+
+@pytest.mark.parametrize(('payload', 'expected'), [
+    ({'x_finding_key': 'fk-1'}, 'fk-1'),
+    ({'x_finding_key': ['fk-1', 'fk-2']}, 'fk-1'),
+    ({'prd_path': 'plans/x-prd.md'}, 'plans/x-prd.md'),
+    ({'x_finding_key': 'fk-1', 'prd_path': 'plans/x-prd.md'}, 'fk-1'),
+    (json.dumps({'x_finding_key': ['fk-1']}), 'fk-1'),
+    ({}, None),
+    (None, None),
+    ({'x_finding_key': []}, None),
+    ({'x_finding_key': ''}, None),
+    ({'prd_path': ''}, None),
+    ({'x_finding_key': 7}, None),
+    ({'prd_path': ['plans/x-prd.md']}, None),
+], ids=[
+    'finding-key', 'finding-key-list', 'prd-path', 'finding-key-wins', 'json-string', 'empty',
+    'none', 'empty-list', 'empty-string', 'empty-prd-path', 'non-string-key', 'non-string-prd-path',
+])
+def test_citation_ref_names_the_first_citation(payload: Any, expected: str | None) -> None:
+    assert citation_ref(payload) == expected
+
+
+@pytest.mark.parametrize('status', ['done', 'cancelled', 'deferred'])
+def test_an_explicit_release_of_the_holder_releases_its_held_tasks(status: str) -> None:
+    assert releases_holder(_HOLDER_ROW, status, release_holder=True)
+
+
+@pytest.mark.parametrize(('task', 'status', 'release_holder'), [
+    (_HOLDER_ROW, 'cancelled', False),
+    (_HOLDER_ROW, 'cancelled', 'true'),
+    (_PLAIN_ROW, 'cancelled', True),
+    (_HOLDER_ROW, 'pending', True),
+], ids=['not-released', 'truthy-string', 'non-holder', 'pending'])
+def test_anything_short_of_an_explicit_release_releases_nothing(
+    task: dict[str, Any], status: str, release_holder: Any,
+) -> None:
+    assert not releases_holder(task, status, release_holder=release_holder)
+
+
+@pytest.mark.parametrize('agent_id', [None, 'claude-task-8418-architect'], ids=['header-less', 'agent-session'])
+def test_a_human_actor_may_strip_the_holder_edge(agent_id: str | None) -> None:
+    assert may_strip_holder_edge(agent_id)
+
+
+@pytest.mark.parametrize('agent_id', [
+    'orchestrator', 'harness-x', 'steward-1', 'recon-stage-2', 'escalation-watcher',
+    'orchestrator-deterministic',
+])
+def test_a_machine_actor_may_not_strip_the_holder_edge(agent_id: str) -> None:
+    assert not may_strip_holder_edge(agent_id)
+
+
+def test_a_promotion_deferral_refuses_an_extra_key() -> None:
+    with pytest.raises(ValidationError):
+        PromotionDeferral.model_validate({'guard': 'g', 'reason': 'r', 'extra': 'x'})
+
+
+_STORED_HELD = {FOLLOWUP_HOLD_METADATA_KEY: _HOLD_RECORD, 'files': ['a.py']}
+
+
+@pytest.mark.parametrize(('payload', 'replace', 'expected'), [
+    ({'x_finding_key': ['fk-1']}, True, {'x_finding_key': ['fk-1'], FOLLOWUP_HOLD_METADATA_KEY: _HOLD_RECORD}),
+    ({}, True, {FOLLOWUP_HOLD_METADATA_KEY: _HOLD_RECORD}),
+    ({FOLLOWUP_HOLD_METADATA_KEY: None}, False, {FOLLOWUP_HOLD_METADATA_KEY: _HOLD_RECORD}),
+    (
+        {FOLLOWUP_HOLD_METADATA_KEY: {**_HOLD_RECORD, 'holder': 3}, 'files': ['b.py']}, False,
+        {FOLLOWUP_HOLD_METADATA_KEY: _HOLD_RECORD, 'files': ['b.py']},
+    ),
+], ids=['replace-drops-it', 'replace-with-nothing', 'merge-nulls-it', 'merge-rewrites-it'])
+def test_an_update_that_would_drop_or_rewrite_the_hold_record_carries_it(
+    payload: dict[str, Any], replace: bool, expected: dict[str, Any],
+) -> None:
+    assert carry_hold_record(_STORED_HELD, payload, replace=replace) == expected
+
+
+@pytest.mark.parametrize(('stored', 'payload', 'replace'), [
+    (_STORED_HELD, {'x_finding_key': ['fk-1']}, False),
+    (_STORED_HELD, {**_STORED_HELD, 'files': ['b.py']}, True),
+    (json.dumps(_STORED_HELD), {'files': ['b.py']}, False),
+    ({'files': ['a.py']}, {'files': ['b.py']}, True),
+    (None, {}, True),
+], ids=['merge-without-it', 'replace-echoing-it', 'json-stored', 'never-held', 'no-metadata'])
+def test_an_update_that_leaves_the_hold_record_carries_nothing(stored: Any, payload: dict[str, Any], replace: bool) -> None:
+    assert carry_hold_record(stored, payload, replace=replace) is None

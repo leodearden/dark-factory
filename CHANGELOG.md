@@ -10,12 +10,99 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Changed
 
+- `scan_memory_content` now reports records containing a caller-supplied needle. Before, every walked record was re-checked with the tool-call-leak detector, so a custom-needle hunt never reported a match and came back as a clean, complete scan (false absence). Custom needles are now the verdict, as a literal, case-sensitive substring match, and they are honoured with `exhaustive=True`, which now skips only the prefilter. The MCP tool's default `limit` is 1000 (pass `null` for an uncapped walk), and each match's `metadata` omits `data`/`memory`/`content`; `get_memory_by_id` returns the full body. A match's `excerpt` is now a window centred where its earliest matched fragment begins, with `…` on each elided side, not always the first 240 characters. An empty-string needle is rejected with a `ValueError`, since every record contains it. A prefiltered custom-needle scan is complete only while `data` has no text index; `exhaustive=True` does not depend on that. The Mem0 content-key tuple and its text reader have one home, `fused_memory/utils/mem0_content_keys.py` (task 4857).
 - The starvation watchdog's `esc-__starvation_auto_pin_cap__` L1 now reports a CHANGE in the capped cohort, not the standing backlog. It is filed only on a new non-live holder, a new module behind a non-live holder (a live holder's lock turnover is never news), or growth past `max(10, 50%)` of the last announcement. It is refreshed in place while open, and resolved when the cohort drains or every holder is live. It is filed only when some blocker's holder is non-live, or when no waiting task has a recorded blocker while locks are held: a progressing holder, including one just dispatched or finishing, never files it. A tick with no lock held (the first ticks after a restart) leaves an open L1 as it is. A cap alarm parked at L2 for a human counts as open: no L1 is filed beside it, it is never rewritten, and it is resolved with the rest. The watchdog's refusal counts, waiting cohort, per-task announcements and last announcement now survive restarts in `scheduler_eligibility.db`, so a restart no longer re-announces the cohort a day later. A hot-reload that stops the cohort firing, or disabling the watchdog, drains it and resolves the L1. The cap stays 3, and the interim `skip_threshold: 150` stays until task 10578. Amends PRD D9 (Leo, 2026-11-13 and 2026-11-16) (task 9636).
 - `update_task` with none of `prompt`, `metadata`, `title`, `description`, `details`, `priority` or `dependencies` now raises `NoFieldsToUpdateError` (wire `error_type='NoFieldsToUpdateError'`) instead of bumping `updated_at` and returning `updated: True`; `dependencies=[]` and `metadata='{}'` still write (task 4867).
 - fused-memory's primary and recon-report MCP servers now refuse a tool call naming an argument the tool does not declare, instead of silently dropping it: a structured `ToolError` with `code='unknown_argument'`, each unknown name with its `closest_declared` name (a spelling guess, so no ready-to-resubmit call is offered) and the `declared` list. Nothing runs, and the server logs one WARNING per refusal. The declared set is read live from the tool's schema; the guard lets the call through unchecked when there is no usable schema. Fixed the in-repo callers that relied on the drop: the dashboard's Unpin no longer clears the whole override row (it sent `fields`; now one `field` per call), and its pin-queue reorder sends `ordered_task_ids` (task 4867).
 - fused-memory's task-mention scan (`fused_memory/utils/canonical_labels.py::scan_content`) now refuses digits glued to a letter or underscore (`task 8c7e163fcf` and `reify:8c7e163` yield nothing, no longer Task 8 and reify:8), reads every number of a `tasks A, B and C` / `tasks A/B` list after the plural task word (not only the first), and, given a project registry, reads `Reify task N` and `in reify, task N` as `reify:N` instead of the local Task N. Write-time derived referents (`utils/referent_resolution.py::resolve_referents`) change accordingly; without a registry the project-name reading is off (task 10082).
 
 ### Added
+
+#### The filing curator can combine two candidates of one batch (task 8416)
+
+The curator may now combine two candidates the worker drains in one batch,
+lifting batch rule 2: `action='combine'` with `batch_target_index=<B>`,
+`target_id` null, `target_fingerprint` set to B's title and a
+`rewritten_task`. B must itself be created. It is then rewritten through the
+ordinary combine path, under every combine guard.
+
+- A combine whose target sibling was not created (dropped, combined, failed
+  or refused) is created on its own with a reason starting
+  `batch-target-not-create`. It also writes a combine-audit refusal row with
+  `refused_reason: batch-target-not-create`. A combine onto a parked sibling
+  parks with it, as a drop does.
+- A within-batch drop onto a sibling now writes a combine-audit row. That row
+  records the target unchanged: `new` equals `old`, and `items_after` equals
+  `items_before`.
+- Every combine-audit row carries `action` (`combine` or `drop`). A row
+  without the key predates it and was a combine.
+- The parser keeps `batch_target_index` only on a batch edge. A drop or
+  combine that sets both `target_id` and `batch_target_index` degrades to
+  `ambiguous-<action>`.
+- The curator prompt harness is now `curator-v2`. Heuristics artifacts pinned
+  under `curator-v1` stop resolving, and the in-code baseline is used until
+  they are re-pinned.
+
+#### Held follow-ups are promoted (task 8418)
+
+A held follow-up now leaves the hold by promotion: one write drops its holder
+edge and stamps `followup_hold.promoted {by, at, ref}`, and every held task it
+depends on is promoted with it. `pending_since` is left as it is. See
+`docs/task-authoring.md` §3.4.
+
+- Triggers: an edge from a pending, unheld task (`add_dependency`, a
+  born-with dependency, an `update_task` replacement); a landing on `pending`
+  from `deferred` (`commit_planning`, `set_task_status`, the deferral sweep);
+  a citation (`x_finding_key` or `prd_path` written by `update_task`); a
+  combine of a candidate outside the hold rule; a human
+  `remove_dependency(task, holder)` or replacement dropping the holder id; and
+  `release_holder=True`, which promotes every active held follow-up before
+  targeted reconciliation runs, so a cancel-release no longer files one L1
+  per held follow-up.
+- Two new event types: `followup_promoted {task_id, by, ref}` and
+  `followup_promotion_deferred {task_id, by, ref, guard, reason}`.
+- Two new refusals: `followup_holder_edge_strip_refused`, for a machine-role
+  `update_task` replacement that drops the holder edge, and
+  `followup_promotion_deferred`, for a human removal a guard defers.
+- A promotion guard hook, `followup_hold.py::register_promotion_guard`; none
+  is registered by default. A guard that raises counts as a deferral.
+- A promotion that another write set off never fails that write: its error
+  is reported in `post_write_warnings` (`post_create_warnings` on a filing),
+  and the write's event and reconciliation still run. `release_holder=True`
+  on a holder already at the release status releases whatever is still
+  held, so a release that stopped partway can be finished.
+- `update_task` keeps a held task's `followup_hold` record: a write that
+  would drop or rewrite it, a `replace` included, carries the stored record.
+- `TaskInterceptor.hold_emit(project_root)` gives a caller outside the
+  interceptor the journaling `emit` every promotion function takes.
+
+#### New `park_refused` event and `park_refused_emit_interval_secs` (task 6328)
+
+**Old behaviour.** Only the scored scan's top candidate earns skips and fairness
+parks. A candidate below it that was refused its locks by a same-tier (or
+lower-tier) park earned nothing and left no trace: no skip, no park, no event. It
+waited as long as the park's owner did. 6040 waited about 70 h behind 5221's
+critical park, while 5221 waited on 3096's hold of `harness.py`.
+
+**New behaviour.**
+
+- **New `park_refused` event** for a dispatch candidate refused by parks alone, none
+  of which outranks it. Higher-tier fairness parks (fairness working as designed),
+  pin reservations (they report through `pin_blocked`) and any held blocker are out
+  of the class. Payload `{task_id, priority, episode_secs, blockers: [{module, owner,
+  kind}], park_owners: [{owner, source, tier|pin_order, park_age_secs,
+  waiting_on}]}`; `waiting_on` is the owner's own blockers, or `null` when the owner
+  is not in the tick's task list. Dispatch decisions are unchanged.
+- **New config key `park_refused_emit_interval_secs`**, default `1800`, `gt=0`,
+  green tier. The first event comes once the refusal has lasted one interval, then at
+  most once per interval. A dispatch, a refusal by anything else, or the task leaving
+  the dispatch candidates ends the episode; a scoped tick (task 8480) does not.
+- **New read `ModuleLockTable.top_park_rank(owner)`**: the strongest rank among the
+  stack tops the owner holds.
+
+The operator lever is to pin the waiting task: OPERATIONS.md §5, "A task waiting on a
+peer's park". Why visibility rather than an automatic reservation:
+`plans/scheduler-dispatch-scoring-and-lock-layer-prd.md` §7, "Annotation (task 6328)".
 
 #### Low follow-ups are held behind a per-project follow-up holder (task 8417)
 
@@ -87,8 +174,9 @@ per category, and the headline leaves out categories the previous report did not
 sweep. Each category's detector stderr is kept beside its plan as
 `plan-<STAMP>-<category>.stderr.log`. A previous report that cannot be read is
 refused before that project's sweep starts. The report is
-`authoritative: false` and files nothing. Gate filing stays blocked on the detector's
-recall and belongs to task 4916. `--plan` mode rebuilds a report from saved plans with
+`authoritative: false` and files nothing. Gate filing from the report is descoped by
+the 2026-11-17 ruling (esc-10244-1), recorded as `recall_caveat.gate_filing_ruling`.
+`--plan` mode rebuilds a report from saved plans with
 no store access, which seeds the 2026-08-11 T0 baseline. Settings live in
 `fused-memory/config/duplicate-audit.yaml`, including the recall caveat every report
 carries. See OPERATIONS.md §12, "Weekly duplicate-cluster report (Sun 06:30)".

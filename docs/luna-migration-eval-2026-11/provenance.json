@@ -1,0 +1,691 @@
+{
+ "task_id": 9945,
+ "branch": "task/9945",
+ "rulings": [
+  "amendment (Leo, 2026-11-19): no API fallback; graphiti flips wait for 9944",
+  "esc-9945-2 (Leo, 2026-11-22): API credit restored; embeddings are not a gate"
+ ],
+ "pre_registration_commit": {
+  "git_sha": "18b3d29f3aa729b9fa7ac988bc4a78059d5120f6",
+  "git_sha_before_rebase": "e5f94986f55e45b4d13ea1d91b7c2a5301497813",
+  "subject": "docs(9945): PRE-REGISTRATION — gpt-4o-mini vs gpt-6-luna per call site: frame, arms, bars, decision rule",
+  "design_md_blob": "25c0753ed1b926dd743db9804752bb64d42cf900",
+  "design_md_blob_note": "The git hash-object id of design.md as the pre-registration committed it. A rebase cannot orphan it: `git cat-file -p <blob>` recovers the pre-registered §1-§2."
+ },
+ "code_pins": "Each run's git_sha is its commit on task/9945 when this file was written, and a later rebase rewrites it. git_sha_before_rebase is the sha HEAD carried when the run executed. code_blobs survive any rebase (`git log --all --find-object=<blob>`).",
+ "cited_shas": {
+  "054fb34dbf": "a3d11aa45a",
+  "40d32a178a": "b02247bb5e",
+  "e5f94986f5": "18b3d29f3a",
+  "note": "design.md §2 cites the pre-rebase shas; these are the same commits after the 2026-11-22 rebase onto main 075c405abc."
+ },
+ "pre_flight": {
+  "at": "2026-11-22, before 12:04:52Z",
+  "plan_proxy_models": "GET $OPENAI_PLAN_PROXY_URL/models: HTTP 200, 37 models, gpt-6-luna listed",
+  "api_key_chat": "one chat.completions call, gpt-4o-mini, max_tokens 1, on OPENAI_API_KEY: HTTP 200 (gpt-4o-mini-2024-07-18)",
+  "embeddings": "not probed (ruling esc-9945-2)"
+ },
+ "endpoints": {
+  "control": {
+   "host": "api.openai.com",
+   "env_vars": [
+    "OPENAI_API_KEY"
+   ],
+   "via": "config llm.providers.openai"
+  },
+  "luna-low": {
+   "host": "127.0.0.1:8317",
+   "env_vars": [
+    "OPENAI_PLAN_PROXY_URL",
+    "OPENAI_PLAN_PROXY_KEY"
+   ]
+  },
+  "note": "Variable names only; no key is recorded."
+ },
+ "runs": [
+  {
+   "step": "frame",
+   "argv": [
+    "uv",
+    "run",
+    "python",
+    "scripts/luna_migration_eval.py",
+    "frame",
+    "--dir",
+    "../docs/luna-migration-eval-2026-11",
+    "--graph",
+    "dark_factory",
+    "--graph",
+    "reify",
+    "--graph",
+    "know_live",
+    "--graph",
+    "market_predictor",
+    "--graph",
+    "autopilot_video",
+    "--graph",
+    "pump_web_ui",
+    "--graph",
+    "scoping_intake",
+    "--graph",
+    "solar_challenge",
+    "--graph",
+    "solar_challenge_platform",
+    "--graph",
+    "stream_touch",
+    "--extraction-window",
+    "2026-08-01T00:00:00Z",
+    "2026-11-18T00:00:00Z",
+    "--cap",
+    "3",
+    "--fixture-window",
+    "2026-10-01T00:00:00Z",
+    "2026-11-18T00:00:00Z",
+    "--resolve-n",
+    "200",
+    "--summaries-n",
+    "80",
+    "--nodes-per-episode",
+    "2",
+    "--journal",
+    "/home/leo/src/dark-factory/data/reconciliation/write_journal.db",
+    "--journal-window",
+    "2026-11-04T00:00:00Z",
+    "2026-11-18T00:00:00Z",
+    "--classifier-per-category",
+    "50",
+    "--router-n",
+    "300",
+    "--worksheet",
+    "/tmp/9945-worksheet.jsonl",
+    "--summary-inputs",
+    "/tmp/9945-summary-inputs.jsonl"
+   ],
+   "cwd": "/home/leo/src/dark-factory/.worktrees/9945/fused-memory",
+   "exit_code": 0,
+   "invocations": 3,
+   "started_at": "2026-11-22T12:23:57Z",
+   "finished_at": "2026-11-22T12:27:17Z",
+   "git_sha": "a3d11aa45a77f811dd3b146722f98db68c61d358",
+   "git_sha_before_rebase": "054fb34dbf",
+   "code_blobs": {
+    "fused-memory/scripts/luna_migration_eval.py": "3c71d16244361f5f66b393141ad8dbc6fd2b7a2f",
+    "fused-memory/scripts/luna_eval_frame.py": "0e13da23296c4832f51fd95a4b5003fa2d12cfd3",
+    "fused-memory/scripts/audit_ruling_overreach.py": "ed4667d89a800f7e9fb6c699b5805de81a4675f2",
+    "fused-memory/scripts/replay_overreach_extraction.py": "2d124e2826327593db3fd516643f154d2970bc00",
+    "fused-memory/scripts/_graph_script_cli.py": "0031a78823833af525840c841c1942664892af56",
+    "fused-memory/src/fused_memory/backends/falkor_read_only.py": "f4121fd3961608d921399907b5a95d2705909a51"
+   },
+   "graphiti_core_version": "0.28.2",
+   "openai_version": "2.31.0",
+   "versions_via": "importlib.metadata.version in this worktree's .venv (CPython 3.13.9)",
+   "output": "frame.json and the four fixture files (committed in the pre-registration commit); /tmp/9945-worksheet.jsonl (sha256 106a6708...) and /tmp/9945-summary-inputs.jsonl (sha256 9176413a...), never committed",
+   "notes": [
+    "Read-only: GRAPH.RO_QUERY through ReadOnlyGraphReader; the write journal at sqlite mode=ro.",
+    "Invocations 1 (12:04:52Z-12:08:24Z) and 2 (about 12:09Z-12:12:41Z), with the same argv at 2b98f2d23b (pre-rebase), exited 1 and wrote nothing: 'the graph changed while the frame was drawn' on dark_factory summary items. Fixed by a3d11aa45a (pre-rebase 054fb34dbf); invocation 3, recorded here, exited 0. design.md §2.1 and the step-23 deviations record it.",
+    "code_blobs are the blobs at the pre-registration commit; the frame-reaching files are unchanged since a3d11aa45a."
+   ]
+  },
+  {
+   "step": "replay",
+   "argv": [
+    "uv",
+    "run",
+    "python",
+    "scripts/replay_overreach_extraction.py",
+    "replay",
+    "--worksheet",
+    "/tmp/9945-worksheet.jsonl",
+    "--baseline-report",
+    "../docs/luna-migration-eval-2026-11/frame.json",
+    "--arm",
+    "control",
+    "--arm",
+    "luna-low",
+    "--out",
+    "../docs/luna-migration-eval-2026-11/replay.jsonl"
+   ],
+   "cwd": "/home/leo/src/dark-factory/.worktrees/9945/fused-memory",
+   "exit_code": 0,
+   "invocations": 1,
+   "started_at": "2026-11-22T12:38:04Z",
+   "finished_at": "2026-11-22T12:59:45Z",
+   "git_sha": "18b3d29f3aa729b9fa7ac988bc4a78059d5120f6",
+   "git_sha_before_rebase": "e5f94986f55e45b4d13ea1d91b7c2a5301497813",
+   "code_blobs": {
+    "fused-memory/scripts/replay_overreach_extraction.py": "2d124e2826327593db3fd516643f154d2970bc00",
+    "fused-memory/scripts/audit_ruling_overreach.py": "ed4667d89a800f7e9fb6c699b5805de81a4675f2",
+    "fused-memory/src/fused_memory/backends/graphiti_client.py": "d817fe07f74695d466092337069969e532b12725",
+    "fused-memory/src/fused_memory/backends/falkor_read_only.py": "f4121fd3961608d921399907b5a95d2705909a51",
+    "fused-memory/src/fused_memory/config/schema.py": "cdcd6f36a24a762ab94d422ac0b9fcf9f496372c",
+    "fused-memory/config/config.yaml": "e93dc44a30aa8f0ef611baa3bdb49ba59c553f7f"
+   },
+   "graphiti_core_version": "0.28.2",
+   "openai_version": "2.31.0",
+   "versions_via": "importlib.metadata.version in this worktree's .venv (CPython 3.13.9)",
+   "output": "replay.jsonl",
+   "stdout_summary": "108 replayed records (54 per arm), 0 failure lines; 216 Responses calls, all HTTP 200: 108 to api.openai.com, 108 to the plan proxy; no embeddings call"
+  },
+  {
+   "step": "run resolve_edge",
+   "argv": [
+    "uv",
+    "run",
+    "python",
+    "scripts/luna_migration_eval.py",
+    "run",
+    "--site",
+    "resolve_edge",
+    "--dir",
+    "../docs/luna-migration-eval-2026-11",
+    "--arm",
+    "control",
+    "--arm",
+    "luna-low",
+    "--out",
+    "../docs/luna-migration-eval-2026-11/runs.jsonl"
+   ],
+   "cwd": "/home/leo/src/dark-factory/.worktrees/9945/fused-memory",
+   "exit_code": 0,
+   "invocations": 1,
+   "started_at": "2026-11-22T12:38:36Z",
+   "finished_at": "2026-11-22T12:49:04Z",
+   "git_sha": "18b3d29f3aa729b9fa7ac988bc4a78059d5120f6",
+   "git_sha_before_rebase": "e5f94986f55e45b4d13ea1d91b7c2a5301497813",
+   "code_blobs": {
+    "fused-memory/scripts/luna_migration_eval.py": "3c71d16244361f5f66b393141ad8dbc6fd2b7a2f",
+    "fused-memory/scripts/luna_eval_frame.py": "0e13da23296c4832f51fd95a4b5003fa2d12cfd3",
+    "fused-memory/scripts/luna_eval_sites.py": "737ad397983b85e7f761358f316ad711828c186a",
+    "fused-memory/scripts/luna_eval_score.py": "b36df2371ca17640e05d6cae79dd225b2972c770",
+    "fused-memory/scripts/replay_overreach_extraction.py": "2d124e2826327593db3fd516643f154d2970bc00",
+    "fused-memory/scripts/audit_ruling_overreach.py": "ed4667d89a800f7e9fb6c699b5805de81a4675f2",
+    "fused-memory/scripts/_graph_script_cli.py": "0031a78823833af525840c841c1942664892af56",
+    "fused-memory/scripts/score_write_triage_pairs.py": "ffed4f3c506764167b8d3b287a596ed9f0472295",
+    "fused-memory/src/fused_memory/backends/graphiti_client.py": "d817fe07f74695d466092337069969e532b12725",
+    "fused-memory/src/fused_memory/backends/falkor_read_only.py": "f4121fd3961608d921399907b5a95d2705909a51",
+    "fused-memory/src/fused_memory/config/schema.py": "cdcd6f36a24a762ab94d422ac0b9fcf9f496372c",
+    "fused-memory/config/config.yaml": "e93dc44a30aa8f0ef611baa3bdb49ba59c553f7f"
+   },
+   "graphiti_core_version": "0.28.2",
+   "openai_version": "2.31.0",
+   "versions_via": "importlib.metadata.version in this worktree's .venv (CPython 3.13.9)",
+   "output": "docs/luna-migration-eval-2026-11/runs.jsonl",
+   "stdout_summary": "400 replayed records (200 per arm), 0 failure lines; 400 HTTP 200; no embeddings call"
+  },
+  {
+   "step": "run summaries",
+   "argv": [
+    "uv",
+    "run",
+    "python",
+    "scripts/luna_migration_eval.py",
+    "run",
+    "--site",
+    "summaries",
+    "--dir",
+    "../docs/luna-migration-eval-2026-11",
+    "--summary-inputs",
+    "/tmp/9945-summary-inputs.jsonl",
+    "--arm",
+    "control",
+    "--arm",
+    "luna-low",
+    "--out",
+    "../docs/luna-migration-eval-2026-11/runs.jsonl"
+   ],
+   "cwd": "/home/leo/src/dark-factory/.worktrees/9945/fused-memory",
+   "exit_code": 0,
+   "invocations": 1,
+   "started_at": "2026-11-22T12:49:05Z",
+   "finished_at": "2026-11-22T12:54:40Z",
+   "git_sha": "18b3d29f3aa729b9fa7ac988bc4a78059d5120f6",
+   "git_sha_before_rebase": "e5f94986f55e45b4d13ea1d91b7c2a5301497813",
+   "code_blobs": {
+    "fused-memory/scripts/luna_migration_eval.py": "3c71d16244361f5f66b393141ad8dbc6fd2b7a2f",
+    "fused-memory/scripts/luna_eval_frame.py": "0e13da23296c4832f51fd95a4b5003fa2d12cfd3",
+    "fused-memory/scripts/luna_eval_sites.py": "737ad397983b85e7f761358f316ad711828c186a",
+    "fused-memory/scripts/luna_eval_score.py": "b36df2371ca17640e05d6cae79dd225b2972c770",
+    "fused-memory/scripts/replay_overreach_extraction.py": "2d124e2826327593db3fd516643f154d2970bc00",
+    "fused-memory/scripts/audit_ruling_overreach.py": "ed4667d89a800f7e9fb6c699b5805de81a4675f2",
+    "fused-memory/scripts/_graph_script_cli.py": "0031a78823833af525840c841c1942664892af56",
+    "fused-memory/scripts/score_write_triage_pairs.py": "ffed4f3c506764167b8d3b287a596ed9f0472295",
+    "fused-memory/src/fused_memory/backends/graphiti_client.py": "d817fe07f74695d466092337069969e532b12725",
+    "fused-memory/src/fused_memory/backends/falkor_read_only.py": "f4121fd3961608d921399907b5a95d2705909a51",
+    "fused-memory/src/fused_memory/config/schema.py": "cdcd6f36a24a762ab94d422ac0b9fcf9f496372c",
+    "fused-memory/config/config.yaml": "e93dc44a30aa8f0ef611baa3bdb49ba59c553f7f"
+   },
+   "graphiti_core_version": "0.28.2",
+   "openai_version": "2.31.0",
+   "versions_via": "importlib.metadata.version in this worktree's .venv (CPython 3.13.9)",
+   "output": "docs/luna-migration-eval-2026-11/runs.jsonl",
+   "stdout_summary": "90 replayed records (45 per arm), 0 failure lines; 90 HTTP 200; NullEmbedder, no embeddings call"
+  },
+  {
+   "step": "run classifier",
+   "argv": [
+    "uv",
+    "run",
+    "python",
+    "scripts/luna_migration_eval.py",
+    "run",
+    "--site",
+    "classifier",
+    "--dir",
+    "../docs/luna-migration-eval-2026-11",
+    "--arm",
+    "control",
+    "--arm",
+    "luna-low",
+    "--out",
+    "../docs/luna-migration-eval-2026-11/runs.jsonl"
+   ],
+   "cwd": "/home/leo/src/dark-factory/.worktrees/9945/fused-memory",
+   "exit_code": 0,
+   "invocations": 1,
+   "started_at": "2026-11-22T12:54:40Z",
+   "finished_at": "2026-11-22T13:10:51Z",
+   "git_sha": "18b3d29f3aa729b9fa7ac988bc4a78059d5120f6",
+   "git_sha_before_rebase": "e5f94986f55e45b4d13ea1d91b7c2a5301497813",
+   "code_blobs": {
+    "fused-memory/scripts/luna_migration_eval.py": "3c71d16244361f5f66b393141ad8dbc6fd2b7a2f",
+    "fused-memory/scripts/luna_eval_frame.py": "0e13da23296c4832f51fd95a4b5003fa2d12cfd3",
+    "fused-memory/scripts/luna_eval_sites.py": "737ad397983b85e7f761358f316ad711828c186a",
+    "fused-memory/scripts/luna_eval_score.py": "b36df2371ca17640e05d6cae79dd225b2972c770",
+    "fused-memory/scripts/replay_overreach_extraction.py": "2d124e2826327593db3fd516643f154d2970bc00",
+    "fused-memory/scripts/audit_ruling_overreach.py": "ed4667d89a800f7e9fb6c699b5805de81a4675f2",
+    "fused-memory/scripts/_graph_script_cli.py": "0031a78823833af525840c841c1942664892af56",
+    "fused-memory/scripts/score_write_triage_pairs.py": "ffed4f3c506764167b8d3b287a596ed9f0472295",
+    "fused-memory/src/fused_memory/routing/classifier.py": "f4cae8563d96f42c6b4978b204bb1fce226dab2f",
+    "fused-memory/src/fused_memory/routing/router.py": "ab348c8c4b301ae4f900cec858eeabd3a18856ee",
+    "fused-memory/src/fused_memory/routing/openai_client.py": "002b71e0d78c4e4ea0c5ead71e3bbc6d65b09081",
+    "fused-memory/src/fused_memory/backends/graphiti_client.py": "d817fe07f74695d466092337069969e532b12725",
+    "fused-memory/src/fused_memory/backends/falkor_read_only.py": "f4121fd3961608d921399907b5a95d2705909a51",
+    "fused-memory/src/fused_memory/config/schema.py": "cdcd6f36a24a762ab94d422ac0b9fcf9f496372c",
+    "fused-memory/config/config.yaml": "e93dc44a30aa8f0ef611baa3bdb49ba59c553f7f"
+   },
+   "graphiti_core_version": "0.28.2",
+   "openai_version": "2.31.0",
+   "versions_via": "importlib.metadata.version in this worktree's .venv (CPython 3.13.9)",
+   "output": "docs/luna-migration-eval-2026-11/runs.jsonl",
+   "stdout_summary": "406 replayed records (203 per arm), 0 failure lines; 406 HTTP 200"
+  },
+  {
+   "step": "run router",
+   "argv": [
+    "uv",
+    "run",
+    "python",
+    "scripts/luna_migration_eval.py",
+    "run",
+    "--site",
+    "router",
+    "--dir",
+    "../docs/luna-migration-eval-2026-11",
+    "--arm",
+    "control",
+    "--arm",
+    "luna-low",
+    "--out",
+    "../docs/luna-migration-eval-2026-11/runs.jsonl"
+   ],
+   "cwd": "/home/leo/src/dark-factory/.worktrees/9945/fused-memory",
+   "exit_code": 0,
+   "invocations": 2,
+   "started_at": "2026-11-22T13:10:51Z",
+   "finished_at": "2026-11-22T13:50:28Z",
+   "git_sha": "18b3d29f3aa729b9fa7ac988bc4a78059d5120f6",
+   "git_sha_before_rebase": "e5f94986f55e45b4d13ea1d91b7c2a5301497813",
+   "code_blobs": {
+    "fused-memory/scripts/luna_migration_eval.py": "3c71d16244361f5f66b393141ad8dbc6fd2b7a2f",
+    "fused-memory/scripts/luna_eval_frame.py": "0e13da23296c4832f51fd95a4b5003fa2d12cfd3",
+    "fused-memory/scripts/luna_eval_sites.py": "737ad397983b85e7f761358f316ad711828c186a",
+    "fused-memory/scripts/luna_eval_score.py": "b36df2371ca17640e05d6cae79dd225b2972c770",
+    "fused-memory/scripts/replay_overreach_extraction.py": "2d124e2826327593db3fd516643f154d2970bc00",
+    "fused-memory/scripts/audit_ruling_overreach.py": "ed4667d89a800f7e9fb6c699b5805de81a4675f2",
+    "fused-memory/scripts/_graph_script_cli.py": "0031a78823833af525840c841c1942664892af56",
+    "fused-memory/scripts/score_write_triage_pairs.py": "ffed4f3c506764167b8d3b287a596ed9f0472295",
+    "fused-memory/src/fused_memory/routing/classifier.py": "f4cae8563d96f42c6b4978b204bb1fce226dab2f",
+    "fused-memory/src/fused_memory/routing/router.py": "ab348c8c4b301ae4f900cec858eeabd3a18856ee",
+    "fused-memory/src/fused_memory/routing/openai_client.py": "002b71e0d78c4e4ea0c5ead71e3bbc6d65b09081",
+    "fused-memory/src/fused_memory/backends/graphiti_client.py": "d817fe07f74695d466092337069969e532b12725",
+    "fused-memory/src/fused_memory/backends/falkor_read_only.py": "f4121fd3961608d921399907b5a95d2705909a51",
+    "fused-memory/src/fused_memory/config/schema.py": "cdcd6f36a24a762ab94d422ac0b9fcf9f496372c",
+    "fused-memory/config/config.yaml": "e93dc44a30aa8f0ef611baa3bdb49ba59c553f7f"
+   },
+   "graphiti_core_version": "0.28.2",
+   "openai_version": "2.31.0",
+   "versions_via": "importlib.metadata.version in this worktree's .venv (CPython 3.13.9)",
+   "output": "docs/luna-migration-eval-2026-11/runs.jsonl",
+   "stdout_summary": "600 replayed records (300 per arm), 0 failure lines. Invocation 1 ran 106 fixtures per arm (213 HTTP 200), invocation 2 the remaining 194 (388 HTTP 200: 194 to api.openai.com, 194 to the plan proxy).",
+   "notes": [
+    "Invocation 1 started 2026-11-22T13:10:51Z and was killed by an orchestrator restart after 106 fixtures per arm, with no exit code. The restart rebased task/9945 and saved the outputs in a WIP commit, which was undone (mixed reset) so HEAD was again the pre-registration commit.",
+    "Invocation 2, the identical argv, started 2026-11-22T13:35:30Z and resumed the remaining fixtures.",
+    "The rebase changed no file that any run executes: every code_blob and uv.lock is identical at e5f94986f5 and 18b3d29f3a."
+   ]
+  },
+  {
+   "step": "score",
+   "argv": [
+    "uv",
+    "run",
+    "python",
+    "scripts/luna_migration_eval.py",
+    "score",
+    "--dir",
+    "../docs/luna-migration-eval-2026-11",
+    "--calls-per-day",
+    "/tmp/9945-calls-per-day.json",
+    "--plan-window-usd-per-week",
+    "280",
+    "470",
+    "--out",
+    "../docs/luna-migration-eval-2026-11/report.json"
+   ],
+   "cwd": "/home/leo/src/dark-factory/.worktrees/9945/fused-memory",
+   "exit_code": 0,
+   "invocations": 2,
+   "started_at": "2026-11-22T14:51:48Z",
+   "finished_at": "2026-11-22T14:53:42Z",
+   "git_sha": "6e768f83001b08b162aca2f9f3aefd80b3364c1c",
+   "code_blobs": {
+    "fused-memory/scripts/luna_migration_eval.py": "3c71d16244361f5f66b393141ad8dbc6fd2b7a2f",
+    "fused-memory/scripts/luna_eval_score.py": "b36df2371ca17640e05d6cae79dd225b2972c770",
+    "fused-memory/scripts/luna_eval_frame.py": "0e13da23296c4832f51fd95a4b5003fa2d12cfd3",
+    "fused-memory/scripts/luna_eval_sites.py": "737ad397983b85e7f761358f316ad711828c186a",
+    "fused-memory/scripts/replay_overreach_extraction.py": "2d124e2826327593db3fd516643f154d2970bc00",
+    "fused-memory/scripts/audit_ruling_overreach.py": "ed4667d89a800f7e9fb6c699b5805de81a4675f2",
+    "fused-memory/scripts/_graph_script_cli.py": "0031a78823833af525840c841c1942664892af56",
+    "fused-memory/scripts/score_write_triage_pairs.py": "ffed4f3c506764167b8d3b287a596ed9f0472295"
+   },
+   "graphiti_core_version": "0.28.2",
+   "openai_version": "2.31.0",
+   "versions_via": "importlib.metadata.version in this worktree's .venv (CPython 3.13.9)",
+   "output": "report.json",
+   "output_sha256": "05f9a311d5bc5e7d96d0419e422d72577dd75522cf97ffab583d571676346b34",
+   "inputs": {
+    "calls_per_day_file": "/tmp/9945-calls-per-day.json",
+    "calls_per_day_sha256": "36e950896928070e743892acde2106bc99b720e5390f06b19600c2a1e85c9e77"
+   },
+   "notes": [
+    "No LLM, graph or network call: score reads only files in --dir and the calls-per-day file.",
+    "Invocation 1 (14:51:48Z-14:51:53Z) ran the same arguments under '../.venv/bin/python' directly, the interpreter uv run resolves in this worktree. Invocation 2 (14:53:29Z-14:53:42Z) ran the argv above, the one in luna_migration_eval.py's usage docstring. Both exited 0, and report.json was byte-identical (sha256 above).",
+    "Every script this run executed has the same blob as at the router run, so no instrument changed between the arms and the score.",
+    "After scoring, and only then, the classifier and router run logs' ERROR/WARNING lines were read and attributed to an arm by the request line just before each (api.openai.com or the plan proxy). Classifier: 14 luna and 1 control \"'null' is not a valid MemoryCategory\", matching runs.jsonl's fallback field. Router: 6 luna unparsed completions (5 truncated at max_completion_tokens 256, 1 empty) and 4 control answers naming a store that is not a SourceStore. design.md §3 reports them."
+   ]
+  },
+  {
+   "step": "rescore",
+   "argv": [
+    "uv",
+    "run",
+    "python",
+    "scripts/luna_migration_eval.py",
+    "score",
+    "--dir",
+    "../docs/luna-migration-eval-2026-11",
+    "--calls-per-day",
+    "/tmp/9945-calls-per-day.json",
+    "--plan-window-usd-per-week",
+    "280",
+    "470",
+    "--out",
+    "../docs/luna-migration-eval-2026-11/report.json"
+   ],
+   "cwd": "/home/leo/src/dark-factory/.worktrees/9945/fused-memory",
+   "exit_code": 0,
+   "invocations": 1,
+   "git_sha": "2192aad359082e9d6c2d88ff4cd40336d38b2fd2",
+   "code_blobs": {
+    "fused-memory/scripts/luna_migration_eval.py": "3c71d16244361f5f66b393141ad8dbc6fd2b7a2f",
+    "fused-memory/scripts/luna_eval_score.py": "b36df2371ca17640e05d6cae79dd225b2972c770",
+    "fused-memory/scripts/luna_eval_frame.py": "0e13da23296c4832f51fd95a4b5003fa2d12cfd3",
+    "fused-memory/scripts/luna_eval_sites.py": "779548b336f7e28a97e5a293a2f7684180e2de68",
+    "fused-memory/scripts/replay_overreach_extraction.py": "2d124e2826327593db3fd516643f154d2970bc00",
+    "fused-memory/scripts/audit_ruling_overreach.py": "ed4667d89a800f7e9fb6c699b5805de81a4675f2",
+    "fused-memory/scripts/_graph_script_cli.py": "0031a78823833af525840c841c1942664892af56",
+    "fused-memory/scripts/score_write_triage_pairs.py": "ffed4f3c506764167b8d3b287a596ed9f0472295"
+   },
+   "output": "report.json",
+   "output_sha256": "a1d616c50b91b3462728410f6921ba8ae8dd8cfbd953e2c23ec8c24aaee8d68b",
+   "inputs": {
+    "calls_per_day_file": "/tmp/9945-calls-per-day.json",
+    "calls_per_day_sha256": "36e950896928070e743892acde2106bc99b720e5390f06b19600c2a1e85c9e77",
+    "ratings_summaries_sha256": "48c31bc25e3ae7b3e064864c84f42aaa4a647720df5bdbefb7c69efa539cd4ac"
+   },
+   "notes": [
+    "Re-run on 2026-11-22 for esc-9945-3 after one summary rating was corrected; no LLM, graph or network call.",
+    "Correction: ratings-summaries.json item reify/ea2a4400-9469-4784-84e8-8fc16892e9b8 node 661ececa-32ab-440f-a29f-0f832826b807 letter A (luna-low under the key) faithful -> dropped. The arm's answer omitted the node; graphiti kept the stored summary and run_summaries recorded it. The recorded text's sha256 equals fixtures-summaries.json summary_sha256 for the item (2,248 chars, past graphiti's 500-char applied cap). It is the only one of the 160 arm summaries that matches its input's sha256. design.md §2.4 rates it dropped.",
+    "Only sites.summaries.decision.statistics.faithful_rate changed: difference 0.1375 -> 0.125, ci [0.0411, 0.2339] -> [0.0309, 0.2191], candidate_only 14 -> 13. passes is unchanged (true).",
+    "luna_eval_sites.py differs from the score run's blob: run_summaries now records None for a node whose summary is unchanged by the call. score does not execute that function."
+   ]
+  }
+ ],
+ "adjudication": {
+  "blinding_residuals": [
+   "Before adjudication, only counts by (site, arm, kind), HTTP status counts per endpoint, exit codes and log ERROR/WARNING line counts were read from run outputs.",
+   "The router log (invocation 1) showed two production ERROR lines quoting a SourceStore value that does not parse and three WARNING lines quoting truncated JSON. Each quotes the start of one completion. Which arm produced each was not read; under design.md §2.8 they score as the broad route.",
+   "The classifier log held 15 ERROR lines, counted and not read.",
+   "The router log (invocation 2) held 2 ERROR and 3 WARNING lines, counted and not read.",
+   "The replay log showed graphiti_core edge_operations WARNING lines (an unparseable valid_at; an edge whose endpoint was not among the extracted nodes); they were not read per arm.",
+   "Extraction: before labelling, the adjudicator saw the blind worksheet's TOTAL of 666 minted edges over 54 episodes across both arms, the distribution of edges per episode (1 to 79), and the edge field names (edge_uuid, fact, source_name, target_name). No per-arm edge count, per-arm content or token total was seen.",
+   "Extraction: replay.jsonl, the replay log and anything scored from them were not opened while labelling. After labelling, validate_verdicts read replay.jsonl to check coverage and printed only the accepted and stale counts.",
+   "Extraction: near-duplicate facts sat side by side within an episode, so an adjudicator could infer that the two copies come from different arms. Edges also differed in surface style (e.g. 'Task 166 (solar_challenge_platform)' against 'Task 166'; 'Liveness-snapshot memory' against 'liveness-snapshot memory'). No style-to-arm mapping was checked, and near-duplicates were labelled alike.",
+   "Extraction: the running label tally over the UNION of arms was printed once, after all 54 episodes were labelled; it was never printed per arm.",
+   "resolve_edge: before labelling, the adjudicator saw the worksheet's 200 rows, their field names (fact, fixture_id, invalidation_candidates, related) and the totals of related facts (566, 1 to 10 per fixture) and invalidation candidates (1844, 0 to 10 per fixture). No arm output was opened while labelling. Some related and candidate facts were near-duplicates in different wording; they carry no arm attribution, since they were drawn from the stored graph before either arm ran.",
+   "routing: the worksheet's line count (230 discordant classifier and router items, of 503 fixtures) was seen in the step-25 session before any routing labelling. Each row shows both arms' labels in sha256(fixture_id:label) order, so the adjudicator saw which two labels were in dispute but not which arm gave which. The classifier inputs are the write journal's stored content, at most 200 characters, the same text both arms classified.",
+   "summaries: before rating, the adjudicator saw the worksheet's 80 items over 45 fixtures, the total input sizes, and that no A or B summary was None, so nothing would be rated dropped. No run output beyond the worksheet was opened while rating.",
+   "summaries: the A/B summaries showed two recognisable styles. One condensed the episode and its facts, often with typographic apostrophes; the other restated previous-summary sentences, often with generic connectives. Letters are assigned per item by sha256(fixture_id:arm), so a style is not tied to a letter. Which style belongs to which arm was not known while rating, but the styles themselves were visible."
+  ],
+  "extraction": {
+   "adjudicator": "claude-task-9945-implementer, the role that ran the arms, in a later session of the same task; single, self-blinded, no sub-agents",
+   "procedure": "one sitting in one session on 2026-11-22, after the step-24 data commit 47c32c4115. `replay_overreach_extraction.py worksheet --replay ../docs/luna-migration-eval-2026-11/replay.jsonl --worksheet /tmp/9945-worksheet.jsonl --out /tmp/9945-blind-extraction.jsonl` (rc 0) wrote the blind worksheet. Rows were labelled in worksheet order 0..53, every minted edge in its emitted order, each episode body read in full beside its edges. Per-episode label files were compiled into verdicts-extraction.json once all 54 were written. Identical fact strings within an episode were checked for consistent labels: 0 inconsistent of 657 distinct.",
+   "rubric": "docs/ruling-overreach-guard-design-2026-10-01/design.md §2.6 verbatim, with its §2.10 garble conventions, and design.md §2.6's reading for non-decision records: holding means 'states the record's own assertion within its scope'",
+   "conventions": [
+    "holding: the record's own assertion, its point, stated within its scope. In a status record ('As of D, task X has status S') the status is that assertion, so it is a holding, not bookkeeping.",
+    "bookkeeping: an incidental who, when, which task, run, commit, escalation or file location that is not the record's assertion.",
+    "context: the grounds, measurements, mechanism, history or background a record gives for its assertion, including another task's plan described as background to a coordination rule.",
+    "A dropped 'As of D' on a status fact is not overreach (iv): graphiti carries the record's reference time as the edge's valid_at, and the status itself is unchanged.",
+    "overreach (iv) was applied when a dropped qualifier narrowed who, which or under what condition the assertion holds (e.g. 'a remediation pass's Stage 1', 'whichever lands second', 'In a .worktrees/<id> dispatch', 'Right').",
+    "A faithful fact on a generic or wrong endpoint ('task', 'Stage 2', a task the fact is not about) is misbound, per §2.10."
+   ],
+   "verdict_file": "verdicts-extraction.json",
+   "verdicts": 666,
+   "label_counts_union": {
+    "holding": 426,
+    "bookkeeping": 76,
+    "context": 121,
+    "overreach": 38,
+    "misbound": 5,
+    "unjudgeable": 0
+   },
+   "validated": "replay_overreach_extraction.py::validate_verdicts over both arms' minted edges under frame.json sample.definition: 666 accepted, 0 stale. Only the counts were printed."
+  },
+  "resolve_edge": {
+   "adjudicator": "claude-task-9945-implementer, the role that ran the arms, in a later session of the same task; single, self-blinded, no sub-agents",
+   "procedure": "one sitting in one session on 2026-11-22, after the step-25 data commit 8900533e16. The worksheet /tmp/9945-resolve-gold.jsonl had been written by `luna_migration_eval.py worksheet --kind resolve_gold --dir $EVAL --out /tmp/9945-resolve-gold.jsonl` (rc 0) in the step-25 session. Fixtures were labelled in worksheet order 000..199, each shown as its new fact, its related facts R0.. and its invalidation candidates I0.., in batches of 12 to 18, every batch written to disk before the next was shown. runs.jsonl was not opened. Labels were compiled into gold-resolve-edge.json, mapping R/I indices to uuids, once all 200 were written.",
+   "rubric": "design.md §2.6 resolve_edge gold: the duplicate set among the related facts, the contradicted candidates among related and invalidation candidates, or unjudgeable",
+   "conventions": [
+    "duplicate: the related fact states the same proposition (same subject, relation and object) as the new fact, and the new fact adds no information the related fact lacks: phrasing-only differences, or the related fact is a strict refinement that entails the new one.",
+    "not a duplicate: the new fact adds a detail, an extra object, a different object/name, or a different relation.",
+    "contradicted: the candidate and the new fact cannot both hold of the same thing at the same time. A different plan, scope or time, or a merely related statement, is not a contradiction.",
+    "unjudgeable: the new fact or its candidates are too garbled to decide either question.",
+    "related facts are drawn from the new edge's own (source, target) node pair (luna_eval_frame.py::_resolve_fixture), so a related fact with a generic subject ('The code', 'The tests') is read as about the same two entities. (Added at fixture 031; fixture 004 re-checked under it before moving on.)",
+    "a later state that supersedes an earlier one on the same thing ('X survives only for Y' then 'X is deleted as Y no longer calls it') is a contradiction.",
+    "(refined at fixture 061, before 061 was written; 031 and 035 re-checked under it) an attribution wrapper describing the same end state ('The decision keeps/places X', 'e702d9e includes X') duplicates a new fact stating that end state. 'keeps X' differs from 'adds X' only when the new fact is about the change itself (035: 'The import additions ... include gc'). A future plan or proposal ('should', 'is proposed', 'will', 'can ... after') is not the fact that it is done.",
+    "(added at fixture 079) an evaluative add-on with no checkable content ('is now a stronger choice') is not added information; a factual qualifier (a condition, time, scope or object) is."
+   ],
+   "verdict_file": "gold-resolve-edge.json",
+   "verdicts": 200,
+   "label_counts": {
+    "with_duplicates": 54,
+    "without_duplicates": 146,
+    "with_contradicted": 4,
+    "unjudgeable": 0
+   },
+   "validated": "luna_eval_score.py::load_resolve_gold over the worksheet rows: 200 accepted. Only the counts above were printed."
+  },
+  "routing": {
+   "adjudicator": "claude-task-9945-implementer, the role that ran the arms, in a later session of the same task; single, self-blinded, no sub-agents",
+   "procedure": "one sitting in the same session as the resolve_edge gold, after its commit 980459bd4e. The worksheet /tmp/9945-routing.jsonl had been written by `luna_migration_eval.py worksheet --kind routing --dir $EVAL --runs $EVAL/runs.jsonl --out /tmp/9945-routing.jsonl` (rc 0) in the step-25 session. Items were labelled in worksheet order 000..229 (95 classifier, then 135 router), each shown as its site, its text and its two labels in sha256 order, in batches of 40 to 70, every batch written to disk before the next was shown. Each item was judged against the production prompt's own definitions, routing/classifier.py::CLASSIFICATION_SYSTEM_PROMPT and routing/router.py::ROUTING_SYSTEM_PROMPT, on the text the arms saw. runs.jsonl and the fixture files' reference_category were not opened.",
+   "rubric": "design.md §2.6 routing: the correct label from the site's full vocabulary, which may be neither arm's",
+   "conventions": [
+    "temporal_facts: the record's point is a status or a change event: \"Task '...' completed. Landed in commit ...\", \"As of D ...\", \"no longer lives in X; moved to Y\", \"seeded ... on D\".",
+    "entities_and_relations: the point is how code or project things are structured or connected, even when a task or plan is credited with it.",
+    "decisions_and_rationale: the point is a choice and why (\"Decision: ...\", ruled, chose, declined).",
+    "preferences_and_norms: a rule for how things should be done: a convention, a style or placement rule, a norm for addressing Leo.",
+    "procedural_knowledge: how to do something: steps, a workflow, a gotcha with how to avoid or reproduce it.",
+    "observations_and_summaries: a high-level takeaway or session recap, not one structural fact.",
+    "judged on the query's own wording against the prompt's cue phrases; a query that names a topic with no cue phrase is broad.",
+    "(added at item 042, before it was written; 031/033 already agree) a record that calls itself a gotcha is procedural_knowledge, the project's own category for gotcha-class entries, unless it is phrased as a convention or rule.",
+    "(added at item 085) a naming, style, shape or placement rule for tests is preferences_and_norms; \"use helper X to do Y\" is procedural_knowledge.",
+    "a \"Completed: <title> / Description: ...\" record is a completion event, like \"Task '...' completed.\": temporal_facts.",
+    "'conventions and gotchas for ...', or a query that asks for a convention, is preference (\"what's the convention\").",
+    "'blockers for: ...' is relational (\"what depends on X\").",
+    "'resolution for: ...' asks how an issue was settled; no type names that, so it is broad.",
+    "a task title, a review finding, a bug title or a keyword string over a topic is broad.",
+    "a short query (about 6 words or fewer) that names only specific identifiers (a symbol, file, field or device name) is entity_lookup (\"what is X\", \"how are X and Y related\").",
+    "'recent', 'history', 'since', 'what changed' make it temporal; 'status' alone does not.",
+    "an error message plus the command that hit it asks how to fix it: procedural."
+   ],
+   "verdict_file": "verdicts-routing.json",
+   "verdicts": {
+    "classifier": 95,
+    "router": 135
+   },
+   "label_counts": {
+    "classifier": {
+     "temporal_facts": 29,
+     "preferences_and_norms": 25,
+     "procedural_knowledge": 27,
+     "entities_and_relations": 12,
+     "decisions_and_rationale": 1,
+     "observations_and_summaries": 1
+    },
+    "router": {
+     "broad": 104,
+     "temporal": 1,
+     "procedural": 6,
+     "preference": 15,
+     "entity_lookup": 7,
+     "relational": 2
+    }
+   },
+   "gold_neither_offered_label": {
+    "classifier": 29,
+    "router": 13
+   },
+   "validated": "luna_eval_score.py::load_routing_verdicts over the worksheet rows: 230 accepted. Only the counts above, over the union of arms, were printed."
+  },
+  "summaries": {
+   "adjudicator": "claude-task-9945-implementer, the role that ran the arms, in a later session of the same task; single, self-blinded, no sub-agents",
+   "procedure": "one sitting in one session on 2026-11-22, after the routing-gold commit c4f74bc61c. The worksheet /tmp/9945-summaries.jsonl and the key /tmp/9945-ratings-summaries-key.json had been written in the step-25 session by `luna_migration_eval.py worksheet --kind summaries --dir $EVAL --runs $EVAL/runs.jsonl --summary-inputs /tmp/9945-summary-inputs.jsonl --out /tmp/9945-summaries.jsonl --key-out /tmp/9945-ratings-summaries-key.json` (rc 0); /tmp/9945-summary-inputs.jsonl still had the design.md sha256 9176413a.... Items were rated in worksheet order 000..079, in batches of 3 to 6. Each item was shown as its node name, the episode body (first 900 to 1500 characters), up to 4 incident facts, and A and B split into sentences, each sentence beside its best-matching input sentence by content-token overlap and the tokens absent from every input. Claims were then checked by regex search over the full inputs: previous summary, episode body, previous episodes and incident facts. Every batch was written to disk before the next was shown. The key was moved into $EVAL only after all 160 ratings were on disk.",
+   "rubric": "design.md §2.6 summaries: faithful, unsupported (asserts or contradicts beyond its inputs) or dropped (no summary for the node)",
+   "conventions": [
+    "faithful: every claim in the summary is stated in, or follows directly from, the inputs. Condensing, omitting, re-ordering and paraphrasing are not judged; which facts were kept is not judged. A summary cut off mid-sentence is judged on what it does say.",
+    "unsupported: at least one claim asserts beyond the inputs (a name, number, status, relation or event no input states), or contradicts them (a negation flipped, a number changed, a plan stated as done, or a state that a later input explicitly supersedes stated as current), or binds an input fact to the wrong entity (a fact about W stated of this node, or two inputs' entities conflated).",
+    "dropped: no summary for the node (None or empty).",
+    "a generalisation is unsupported only when it changes what can be checked (a scope, a quantifier, a condition); a neutral umbrella word for listed items ('several tests', 'multiple fixes') is not.",
+    "meta-text ('the context does not say ...') is judged as a claim: unsupported only if false of the inputs.",
+    "the rationale quotes the summary span the rating rests on; for unsupported it also names the input it lacks or the input span it contradicts.",
+    "(added at item 012, before its B was written) an added generic purpose phrase ('for efficiency', 'ensuring consistency', 'is crucial for') is not judged unsupported unless it contradicts a rationale the inputs state.",
+    "(applied at item 050; 040 A re-rated under it before moving on) a superseded state is unsupported only when the superseding input is in view: the summary itself, the episode or a previous episode states the later state.",
+    "(fixed at item 056; 030 A re-rated under it) episode order is not a reliable clock (a 'previous' episode can record the later state), so supersession is read from the inputs' own words: an input that says the thing was retired, removed, deleted, superseded or 'no longer' exists supersedes a statement that it is pending, open or present. A task's cancellation does not supersede a statement of what its branch does."
+   ],
+   "rating_file": "ratings-summaries.json",
+   "key_file": {
+    "name": "ratings-summaries-key.json",
+    "sha256": "2f6666fa1f345e484d6335eebd29cea10548e6bdedb16e47bf0c0206fab90a13",
+    "opened": "never before all 160 ratings were written; moved from /tmp/9945-ratings-summaries-key.json, then read only by load_summary_ratings"
+   },
+   "ratings": 160,
+   "label_counts": {
+    "faithful": 143,
+    "unsupported": 17,
+    "dropped": 0
+   },
+   "re_ratings_before_unblinding": [
+    "040 A, faithful to unsupported, at item 050, when the supersession convention was first applied.",
+    "030 A, faithful to unsupported, at item 056, when supersession was fixed to be read from the inputs' own words rather than episode order.",
+    "After item 079, every summary rated faithful in items 000-049 was re-scanned for pending, planned or hedged claims against an explicit later state in its inputs; none changed."
+   ],
+   "validated": "luna_eval_score.py::load_summary_ratings over luna_migration_eval.py::_offered_summary_items of runs.jsonl and the key: 80 items, each rated under both arms, 160 entries accepted. Only the counts above, over the union of arms, were printed."
+  }
+ },
+ "calls_per_day": {
+  "measured_at": "2026-11-22T14:48Z-14:50Z",
+  "source": "/home/leo/src/dark-factory/data/reconciliation/write_journal.db, opened file:...?mode=ro (luna_eval_frame.py::open_journal)",
+  "window": [
+   "2026-11-15T00:00:00Z",
+   "2026-11-22T00:00:00Z"
+  ],
+  "days": 7,
+  "queries": [
+   "SELECT b.created_at, w.operation, w.params FROM backend_ops b LEFT JOIN write_ops w ON w.id = b.write_op_id WHERE b.backend='graphiti' AND b.operation='add_episode' AND b.created_at >= ? AND b.created_at < ?",
+   "SELECT params FROM write_ops WHERE operation='add_memory' AND created_at >= ? AND created_at < ?",
+   "SELECT params FROM write_ops WHERE operation='search' AND created_at >= ? AND created_at < ?"
+  ],
+  "llm_reach": "luna_eval_frame.py::LlmReachProbe over each add_memory row's journalled content and each search row's query (no stores override), through the production WriteClassifier.classify and ReadRouter.route; the probe answers locally, so no LLM was called",
+  "measured": {
+   "window": [
+    "2026-11-15T00:00:00",
+    "2026-11-22T00:00:00"
+   ],
+   "days": 7,
+   "graphiti_add_episode_rows": 6495,
+   "graphiti_add_episode_unjoined": 0,
+   "graphiti_add_episode_by_write_op_category": {
+    "add_memory/decisions_and_rationale": 6486,
+    "add_memory/observations_and_summaries": 5,
+    "add_memory/temporal_facts": 4
+   },
+   "add_memory_rows": 8141,
+   "add_memory_by_resolved_category": {
+    "observations_and_summaries": 2890,
+    "decisions_and_rationale": 3732,
+    "procedural_knowledge": 1378,
+    "preferences_and_norms": 137,
+    "temporal_facts": 4
+   },
+   "add_memory_llm_reaching": 4995,
+   "search_rows": 16824,
+   "search_rows_with_stores": 0,
+   "search_rows_truncated": 190,
+   "search_llm_reaching": 14802
+  },
+  "sites": {
+   "extraction": {
+    "calls_per_day": 2.571,
+    "tag": "M",
+    "derivation": "non-decision graphiti add_episode rows/day (M) x 2.0 calls/episode (control replay: 108 llm_calls over 54 episodes, M)"
+   },
+   "resolve_edge": {
+    "calls_per_day": 5.452,
+    "tag": "I",
+    "derivation": "non-decision graphiti add_episode rows/day (M) x 4.24 minted edges/episode (control replay: 229 over 54, M) x 1 resolve call per minted edge (I: assumes every minted edge has a related or hybrid-search candidate edge and misses the exact-fact fast path)"
+   },
+   "summaries": {
+    "calls_per_day": 1.286,
+    "tag": "I",
+    "derivation": "non-decision graphiti add_episode rows/day (M) x 1 batched summaries call/episode (control runs: 1 llm_call per episode record, M), an upper bound (I): an episode none of whose entities exceeds 4 x MAX_SUMMARY_CHARS makes no call"
+   },
+   "classifier": {
+    "calls_per_day": 713.571,
+    "tag": "I",
+    "derivation": "add_memory journal rows/day whose 200-char prefix LlmReachProbe sends to the LLM (4995 of 8141, M), an upper bound (I): the journal records the resolved category, so caller-categorised writes, which skip the classifier, cannot be excluded"
+   },
+   "router": {
+    "calls_per_day": 2114.571,
+    "tag": "M",
+    "derivation": "search journal rows/day with no stores override whose query LlmReachProbe sends to the LLM (14802 of 16824, M); the 190 truncated queries were probed on their journalled prefix"
+   }
+  },
+  "population_note": "The graphiti sites are counted over non-decision episodes only, the class design.md §1 measures and any graphiti flip would move (decisions_and_rationale is excluded). Over all categories the journal holds 6495 graphiti add_episode rows in the window, 927.9/day.",
+  "file": {
+   "extraction": 2.571,
+   "resolve_edge": 5.452,
+   "summaries": 1.286,
+   "classifier": 713.571,
+   "router": 2114.571
+  }
+ }
+}

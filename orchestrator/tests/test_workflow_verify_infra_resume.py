@@ -96,6 +96,7 @@ def _make(
     wf.worktree = Path('/tmp/fake-worktree-1883')
     wf.artifacts = MagicMock()
     wf.artifacts.read_iteration_log = MagicMock(return_value=([], []))
+    wf.artifacts.lane_plan_fault = MagicMock(return_value=None)
 
     # Stub _mark_blocked — the loop must NOT call this on transient retry
     wf._mark_blocked = AsyncMock(return_value=WorkflowOutcome.BLOCKED)

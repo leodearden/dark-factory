@@ -1,9 +1,10 @@
 """The plan DOCUMENT substrate the two plan-tools markup suites share.
 
 ``test_plan_tools_markup_repair`` and ``test_plan_tools_markup_self_name`` both
-drive plan-tools' lazy read-repair, so both need the same three things and
-neither may own a second copy: a ``TaskArtifacts`` over a temp worktree, a
-clean plan document to poison, and the same reading of what landed on disk.
+drive plan-tools' lazy read-repair, so both need the same two things and
+neither may own a second copy: a clean plan document to poison, and the same
+reading of what landed on disk. The ``TaskArtifacts`` over a temp worktree they
+drive it through is ``_orch_suite_fixtures.py::plan_artifacts``.
 
 The refusal memo belongs here for a sharper reason than tidiness. It is
 process-local by design and therefore shared by every test in a pytest RUN,
@@ -21,7 +22,6 @@ import json
 
 import pytest
 
-from orchestrator.artifacts import TaskArtifacts
 from orchestrator.mcp import plan_markup_repair
 
 #: The clean ``design_decisions[0].decision`` every specimen is built around.
@@ -32,16 +32,8 @@ DECISION_PROSE = (
 
 
 # ---------------------------------------------------------------------------
-# The fixtures.
+# The autouse fixture.
 # ---------------------------------------------------------------------------
-
-
-@pytest.fixture()
-def plan_artifacts(tmp_path):
-    """TaskArtifacts over a temp worktree — mirrors ``test_plan_tools_server``."""
-    a = TaskArtifacts(tmp_path)
-    a.init('test-1', 'Test task', 'A test')
-    return a
 
 
 @pytest.fixture(autouse=True)

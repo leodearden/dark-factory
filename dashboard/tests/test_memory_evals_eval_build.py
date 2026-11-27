@@ -88,8 +88,10 @@ def _single_alarm_tree(tmp_path: Path) -> tuple[Path, Path]:
 
 
 def _only_row(payload: dict[str, Any], eval_id: str) -> dict[str, Any]:
+    """The single verdict entry of *eval_id*'s single metric row."""
     (row,) = next(ev for ev in payload['evals'] if ev['eval_id'] == eval_id)['metrics']
-    return row
+    (entry,) = row['verdicts']
+    return entry
 
 
 def _linked_id(row: dict[str, Any]) -> str | None:

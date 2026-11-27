@@ -43,6 +43,7 @@ from orchestrator.exit_contract import VERDICT_LOG_ATTRIBUTE, ExitVerdictKind
 from orchestrator.git_ops import GitOps
 from orchestrator.harness import TaskReport
 from orchestrator.scheduler import TaskAssignment
+from orchestrator.slot_lease import SlotLease
 from orchestrator.verify import VerifyResult
 from orchestrator.verify_categories import FailureCategory
 from orchestrator.workflow import WorkflowMetrics
@@ -747,7 +748,7 @@ async def _run_stubbed_slot(
             modules=[],
         )
         sem = asyncio.Semaphore(1)
-        result = await harness._run_slot(assignment, sem)
+        result = await harness._run_slot(assignment, SlotLease(assignment.task_id, harness.scheduler, sem))
 
     assert result is not None
     return result

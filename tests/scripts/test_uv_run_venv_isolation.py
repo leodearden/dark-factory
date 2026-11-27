@@ -4,8 +4,8 @@ SCOPE, stated precisely because the honest boundary is narrower than the
 invariant one would want.  This module sweeps every committed unit whose start
 runs ``uv run``: in its ExecStart, or one level down, in the checkout's shell
 wrapper its ExecStart executes (read as text by shell_uv_run_sites, never run).
-A second arm sweeps every non-test ``*.sh`` the checkout lists, by content,
-whether or not a unit runs it.
+A second arm sweeps every non-test ``*.sh`` in git's index (a staged script
+counts, an untracked one does not), by content, whether or not a unit runs it.
 It does NOT follow a wrapper's own callees, a wrapper not named ``*.sh``, a uv
 the wrapper reaches through a variable whose name never mentions uv, or a
 ``*_CMD`` seam a unit overrides through ``Environment=`` (no committed unit
@@ -48,7 +48,7 @@ import subprocess
 from collections.abc import Callable
 
 import pytest
-from git_listing import git, listed_files
+from git_listing import git, tracked_files
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 from shell_logical_lines import logical_lines
 from systemd_unit_invariants import (
@@ -73,6 +73,7 @@ _EXPECTED_UV_RUN_UNITS = frozenset(
         "dashboard/dark-factory-dashboard.service",
         "dashboard/dark-factory-load-sampler.service",
         "fused-memory/fused-memory.service.example-systemd-config",
+        "scripts/client-feed-filer.service.template",
         "scripts/client-feed.service.template",
         "scripts/dashboard.service.template",
         "scripts/exception-owner-sweep.service",
@@ -85,6 +86,7 @@ _EXPECTED_UV_RUN_UNITS = frozenset(
         "scripts/legibility-trickle-health@.service",
         "scripts/legibility-trickle@.service",
         "scripts/local-model-serving/lms-arm@.service",
+        "scripts/lock-charter-drift-check.service",
         "scripts/memory-metadata-coverage-census.service",
         "scripts/orchestrator-autopilot-video.service",
         "scripts/orchestrator-dark-factory.service",
@@ -95,12 +97,13 @@ _EXPECTED_UV_RUN_UNITS = frozenset(
         "scripts/orchestrator-solar-challenge-platform.service",
         "scripts/orchestrator-stream-touch.service",
         "scripts/return-brief.service",
+        "scripts/timeout-headroom-selfcheck.service",
         "scripts/transcript-secret-sweep.laptop.conf",
         "scripts/transcript-secret-sweep.service",
     }
 )
 
-# Every non-test shell script in the checkout that runs `uv run`, whether or not
+# Every non-test shell script in git's index that runs `uv run`, whether or not
 # a unit runs it; asserted by EQUALITY for the reason _EXPECTED_UV_RUN_UNITS states.
 _EXPECTED_UV_RUN_SCRIPTS = frozenset(
     {
@@ -117,13 +120,17 @@ _EXPECTED_UV_RUN_SCRIPTS = frozenset(
         "scripts/fused-memory-link-heal.sh",
         "scripts/fused-memory-memory-eval.sh",
         "scripts/install-exception-owner-sweep-timer.sh",
+        "scripts/install-lock-charter-drift-check-timer.sh",
+        "scripts/install-timeout-headroom-selfcheck-timer.sh",
         "scripts/legibility/install-transcript-check-timer.sh",
         "scripts/legibility/install-trickle-health-timer.sh",
         "scripts/legibility/install-trickle-timer.sh",
         "scripts/local-model-serving/install-lms-units.sh",
+        "scripts/lock-charter-drift-check.sh",
         "scripts/memory-metadata-coverage-census.sh",
         "scripts/rerun_cap_tainted.sh",
         "scripts/return-brief.sh",
+        "scripts/timeout-headroom-selfcheck.sh",
         "scripts/transcript-secret-sweep.sh",
     }
 )
@@ -244,9 +251,8 @@ def uv_run_level_flags(exec_start: str) -> list[str] | None:
 
     None means exactly one thing: this command is not a ``uv run`` invocation,
     so the invariant does not apply and callers SKIP.  That is a real answer —
-    scripts/orchestrator-watchdog.service runs a bare Python probe and
-    scripts/jcodemunch-watcher.service.template runs ``uvx``, an EPHEMERAL
-    environment that never touches the shared venv.  The None-vs-raise split
+    scripts/orchestrator-watchdog.service runs a bare Python probe that never
+    touches the shared venv.  The None-vs-raise split
     follows the contract stated once at
     systemd_unit_invariants.py::config_arg_from_exec_start.  A unit whose
     ExecStart is a shell wrapper running ``uv run`` inside it also answers None
@@ -446,14 +452,14 @@ def discover_uv_run_units() -> list[str]:
 
 
 def discover_uv_run_scripts(root: pathlib.Path = REPO_ROOT) -> list[str]:
-    """*root*-relative paths of every non-test shell script git lists that runs `uv run`.
+    """*root*-relative paths of every non-test shell script git's index holds that runs `uv run`.
 
     An UnreadableShellUvRun INCLUDES the path rather than skipping it, for the
-    reasons discover_uv_run_units gives.  listed_files raises on a git failure,
+    reasons discover_uv_run_units gives.  tracked_files raises on a git failure,
     so discovery never silently answers [].
     """
     scripts = []
-    for path in listed_files(root, *_NON_TEST_SHELL_SCRIPTS):
+    for path in tracked_files(root, *_NON_TEST_SHELL_SCRIPTS):
         rel_path = path.relative_to(root).as_posix()
         try:
             if not script_uv_run_sites(rel_path, root):
@@ -584,7 +590,7 @@ def test_script_discovery_covers_every_known_uv_run_script() -> None:
     assert discovered, (
         "discovery found no shell script running `uv run` at all, so the "
         "parametrized sweeps below would check no script and report green. "
-        f"Check that git lists the checkout's *.sh files (REPO_ROOT={REPO_ROOT})."
+        f"Check that git's index holds the checkout's *.sh files (REPO_ROOT={REPO_ROOT})."
     )
     missing = _EXPECTED_UV_RUN_SCRIPTS - discovered
     extra = discovered - _EXPECTED_UV_RUN_SCRIPTS
@@ -601,7 +607,8 @@ def test_script_discovery_covers_every_known_uv_run_script() -> None:
         "carries the same obligation, so add it to the constant. A script whose "
         "`uv run` this scan cannot read also lands here, deliberately (see "
         "discover_uv_run_scripts); its own case below names the defect. A test "
-        "fixture belongs under a tests/ directory, which discovery excludes."
+        "fixture belongs under a tests/ directory, which discovery excludes. "
+        "Discovery reads git's index, so an untracked script never lands here."
     )
 
 
@@ -868,7 +875,36 @@ def test_discover_uv_run_scripts_reads_every_shell_script_outside_test_trees(
             "scripts/notes.txt": "uv run --frozen --project shared python x.py\n",
         },
     )
+    git(tmp_path, "add", "-A")
     assert discover_uv_run_scripts(tmp_path) == ["scripts/a.sh", "scripts/odd.sh", "top.sh"]
+
+
+_FIXTURE_GIT_IDENTITY = (
+    "-c", "user.email=uv-run-sweep-guard@example.invalid",
+    "-c", "user.name=uv run sweep guard",
+    "-c", "commit.gpgsign=false",
+)
+
+
+def test_discover_uv_run_scripts_ignores_an_untracked_script(tmp_path: pathlib.Path) -> None:
+    """An untracked script is not swept; a committed one is, and so is a staged one, because it is what the commit lands."""
+    git(tmp_path, "init", "-q")
+    _plant(tmp_path, {"scripts/a.sh": "uv run --no-sync --project shared python x.py\n"})
+    git(tmp_path, "add", "scripts/a.sh")
+    git(tmp_path, *_FIXTURE_GIT_IDENTITY, "commit", "--no-verify", "-q", "-m", "fixture")
+    _plant(tmp_path, {"scripts/new.sh": "uv run --no-sync --project shared python y.py\n"})
+    git(tmp_path, "add", "scripts/new.sh")
+    _plant(
+        tmp_path,
+        {"plans/study/repro/trial.sh": "nice uv run --project shared pytest tests/scripts/ -q\n"},
+    )
+    assert discover_uv_run_scripts(tmp_path) == ["scripts/a.sh", "scripts/new.sh"], (
+        "task 10840: an untracked plans/.../repro/trial.sh in the main checkout "
+        "refused every commit there that selected screen:uv_run_venv_isolation, "
+        "the nightly legibility trickle's codebook commit included. The sweep's "
+        "population is checked-in scripts, i.e. git's index: a committed script "
+        "and a staged one are swept, an untracked one is not."
+    )
 
 
 def test_script_uv_run_sites_names_the_script_it_read(tmp_path: pathlib.Path) -> None:

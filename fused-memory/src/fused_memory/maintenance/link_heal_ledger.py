@@ -36,6 +36,7 @@ from types import MappingProxyType
 from typing import Any
 
 from shared.sqlite_column_migration import add_column_if_missing_sync
+from shared.sqlite_sync_base import CheckpointResult, apply_full_durability_pragmas_sync
 
 from fused_memory.maintenance.link_heal import (
     BasisSource,
@@ -55,6 +56,7 @@ from fused_memory.maintenance.link_heal_store import (
 
 LEDGER_FILENAME = 'link_heal.db'
 LOCK_FILENAME = 'link_heal.lock'
+_BUSY_TIMEOUT_MS = 5000
 
 UNDO_ACTION = 'undo'
 
@@ -546,11 +548,15 @@ class UndoStepRow:
 
 
 class LinkHealLedger:
-    """``link_heal.db``: runs, adjudications and actions. One connection; a commit per operation."""
+    """``link_heal.db``: runs, adjudications and actions.
+
+    One connection, in WAL under the shared durability triad; a commit per operation.
+    """
 
     def __init__(self, db_path: Path) -> None:
         self.db_path = db_path
         self._conn = sqlite3.connect(db_path)
+        apply_full_durability_pragmas_sync(self._conn, busy_timeout_ms=_BUSY_TIMEOUT_MS)
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(_SCHEMA)
         for table, column, column_ddl in _ADDED_COLUMNS:
@@ -559,6 +565,10 @@ class LinkHealLedger:
 
     def close(self) -> None:
         self._conn.close()
+
+    def checkpoint(self) -> CheckpointResult:
+        """Truncate the WAL into the main database file."""
+        return CheckpointResult.from_pragma_rows(self._conn.execute('PRAGMA wal_checkpoint(TRUNCATE)'))
 
     def start_run(self, source: RunSource, *, writes: bool) -> str:
         run_id = new_run_id()

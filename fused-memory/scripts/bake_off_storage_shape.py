@@ -5648,9 +5648,9 @@ async def run_bake_off(
     # NEVER let this run attach to the shared durable write queue.
     #
     # `MemoryService.initialize()` is not a mem0-only spin-up: it builds a
-    # `DurableWriteQueue` on `config.queue.data_dir`, which defaults to a
-    # RELATIVE path (`./data/queue`).  Run from the repo root — the natural
-    # cwd — that is the very queue DB the live fused-memory server is using.
+    # `DurableWriteQueue` on `config.queue.data_dir`, which the schema anchors
+    # at the checkout (fused_memory/config/checkout_anchor.py), so from EVERY
+    # cwd that is the very queue DB the live fused-memory server is using.
     # Initialising it would run `_recover_in_flight()`, flipping the other
     # process's in-flight rows back to pending, and start workers that drain
     # real user writes through `memory.mem0` — the backend whose

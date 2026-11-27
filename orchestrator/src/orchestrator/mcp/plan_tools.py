@@ -22,11 +22,13 @@ Heuristic 14's measurement of this file and its split: task 7082's commit.
 
 Usage (stdio transport, spawned by orchestrator):
     # Direct-interpreter no-uv hot path (production, task 1776):
-    <sys.executable> -m orchestrator.mcp.plan_tools --worktree /path/to/worktree
+    <sys.executable> -m orchestrator.mcp.plan_tools --worktree /path/to/worktree \
+        --grants-enforced [--grant NAME ...]
 
     # uv fallback with fast-start flags (task 1775, backward-compat):
     uv run --project <orchestrator-dir> --no-sync --frozen \
-        python -m orchestrator.mcp.plan_tools --worktree /path/to/worktree
+        python -m orchestrator.mcp.plan_tools --worktree /path/to/worktree \
+        --grants-enforced [--grant NAME ...]
 """
 
 from __future__ import annotations
@@ -46,10 +48,11 @@ from types import MappingProxyType
 from typing import Any, Concatenate, ParamSpec, TypeVar
 
 from fastmcp import FastMCP
+from shared.markup_override_param import accepts_markup_override
 from shared.mcp_markup_middleware import (
+    HostAttribution,
     MarkupGuardMiddleware,
     RepairPolicy,
-    accepts_markup_override,
 )
 from shared.mcp_missing_arguments import MissingArgumentMiddleware
 from shared.plan_deviation import DeviationRecord, UnknownDeviationKind
@@ -1163,7 +1166,10 @@ def _report_task_already_done(
 
     The architect calls this when it has determined that the task's work
     is already on main at *commit*.  The workflow validates the claim
-    (commit reachable from main) and sets task status to ``done``.
+    (a full 40-character lowercase hex sha, reachable from main and
+    attributable to this task) and sets task status to ``done``.  Nothing
+    is validated here, so a malformed *commit* is refused only after the
+    session has ended.
     """
     artifacts.write_already_done(commit=commit, evidence=evidence)
     return {'status': 'ok', 'commit': commit}
@@ -1387,8 +1393,7 @@ def _markup_subject_task_id(artifacts: TaskArtifacts) -> str:
     no plan yet (a ``create_plan`` refused before any plan exists); an explicit
     "unattributed" only when even that is empty — the last two fallbacks are
     ``markup_sink``'s, applied to whatever this returns. An unreadable plan
-    degrades to the same fallback rather than losing the record: the payload it
-    carries is the only copy that exists.
+    degrades to the same fallback rather than losing the record.
     """
     try:
         plan = artifacts.read_plan()
@@ -1536,26 +1541,37 @@ def _markup_fact_sink(
 
 def create_server(
     artifacts: TaskArtifacts, granted_tools: frozenset[str] | None = None,
+    caller_role: str | None = None,
 ) -> FastMCP:
-    """Create the plan-tools MCP server.
+    """Create the plan-tools MCP server; the one home of its grant policy.
 
-    *granted_tools* ``None`` registers every tool. Otherwise only the granted
-    names stay registered, so an ungranted tool neither lists nor dispatches;
-    a granted name this server does not register raises ``ValueError``.
+    *granted_tools* ``None`` registers every tool, for in-process callers.
+    Otherwise only the granted names stay registered, so an ungranted tool
+    neither lists nor dispatches. A granted name this server does not
+    register is dropped with a WARNING rather than refused, because a
+    running launcher can name a tool this on-disk server has since renamed
+    or removed: plans/plan-deviation-recording-prd.md D14.
+
+    *caller_role* names the role this server serves on its markup records;
+    ``None`` leaves them attributed from each call's arguments alone.
     """
-    mcp, registered = _server_with_every_tool(artifacts)
+    mcp, registered = _server_with_every_tool(artifacts, caller_role)
     if granted_tools is not None:
         unknown = sorted(granted_tools - registered)
         if unknown:
-            raise ValueError(
-                f'plan-tools grant names unregistered tool(s) {unknown}; '
-                f'registered: {sorted(registered)}'
+            logger.warning(
+                'plan-tools grant names tool(s) %s this server does not '
+                'register (registered: %s); dropping them',
+                unknown, sorted(registered),
             )
-        _restrict_to_grant(mcp, registered, granted_tools)
+        for name in registered - granted_tools:
+            mcp.local_provider.remove_tool(name)
     return mcp
 
 
-def _server_with_every_tool(artifacts: TaskArtifacts) -> tuple[FastMCP, frozenset[str]]:
+def _server_with_every_tool(
+    artifacts: TaskArtifacts, caller_role: str | None = None,
+) -> tuple[FastMCP, frozenset[str]]:
     mcp = FastMCP('plan-tools')
     registered: list[str] = []
 
@@ -1580,6 +1596,8 @@ def _server_with_every_tool(artifacts: TaskArtifacts) -> tuple[FastMCP, frozense
     #   orchestrator/mcp/plan_markup_stamp.py's docstring.
     # * The one journal both sinks share:
     #   orchestrator/src/orchestrator/mcp/markup_sink.py::make_escalation_sink.
+    # * The caller role, named by the launch because no tool here declares
+    #   one: shared/src/shared/mcp_markup_middleware.py::HostAttribution.
     journal = _markup_fact_journal(artifacts)
     mcp.add_middleware(
         MarkupGuardMiddleware(
@@ -1587,6 +1605,10 @@ def _server_with_every_tool(artifacts: TaskArtifacts) -> tuple[FastMCP, frozense
             exempt_tools=frozenset(),
             escalation_sink=_markup_escalation_sink(artifacts, journal),
             fact_sink=_markup_fact_sink(artifacts, journal),
+            host_attribution=(
+                None if caller_role is None
+                else lambda: HostAttribution(agent_role=caller_role)
+            ),
         )
     )
     mcp.add_middleware(MissingArgumentMiddleware())
@@ -1989,8 +2011,10 @@ def _server_with_every_tool(artifacts: TaskArtifacts) -> tuple[FastMCP, frozense
         provenance pointing at ``commit``.
 
         Args:
-            commit: The git SHA on main that contains this task's work.
-                Must be reachable from main; the orchestrator verifies this.
+            commit: The full 40-character lowercase hex SHA (e.g. from
+                ``git log --format=%H``) of the commit on main that contains
+                this task's work; a short hash is refused. Must be reachable
+                from main; the orchestrator verifies this.
             evidence: Brief description of what you found — file/symbol
                 names that match this task's expected output, or why the
                 commit appears to subsume this task's scope.
@@ -2033,8 +2057,10 @@ def _server_with_every_tool(artifacts: TaskArtifacts) -> tuple[FastMCP, frozense
 
         Args:
             commit: The git SHA of THIS BRANCH's tip that holds the
-                completed work. The orchestrator resolves the branch tip
-                itself and rejects the report if it does not match.
+                completed work, full or an unambiguous abbreviation (at
+                least 7 hex characters). A branch or other ref name is
+                rejected. The orchestrator resolves the branch tip itself
+                and rejects the report if it does not match.
             evidence: Brief description of what you checked — how you
                 established the clean fast-forward, and where the passing
                 verify and review results came from.
@@ -2142,13 +2168,6 @@ def _server_with_every_tool(artifacts: TaskArtifacts) -> tuple[FastMCP, frozense
     return mcp, frozenset(registered)
 
 
-def _restrict_to_grant(
-    mcp: FastMCP, registered: frozenset[str], granted: frozenset[str],
-) -> None:
-    for name in registered - granted:
-        mcp.local_provider.remove_tool(name)
-
-
 # ---------------------------------------------------------------------------
 # CLI entry point
 # ---------------------------------------------------------------------------
@@ -2169,32 +2188,27 @@ def _artifacts_from_args(argv: list[str] | None = None) -> TaskArtifacts:
 def server_from_argv(argv: list[str] | None = None) -> FastMCP:
     """The server a stdio launch with *argv* serves, over its artifacts.
 
-    A launch carrying ``--grants-enforced`` or any ``--grant`` exposes only
-    the granted tools, so a marked launch with no grant exposes none. A
-    granted name this server does not register is dropped with a WARNING,
-    where ``create_server`` raises. A launch carrying neither keeps every
-    tool and logs a WARNING. Why both cases exist:
-    plans/plan-deviation-recording-prd.md D14.
+    A launch declaring ``--grants-enforced`` exposes exactly its ``--grant``
+    tools; one without it exposes none and logs a WARNING. The grant policy
+    itself is :func:`create_server`'s.
     """
     args = _cli_parser().parse_args(argv)
-    mcp, registered = _server_with_every_tool(_artifacts_from_namespace(args))
-    granted: frozenset[str] = frozenset(args.grant or ())
-    if not (args.grants_enforced or granted):
-        logger.warning(
-            'plan-tools launched without --grants-enforced or any --grant: exposing '
-            'every plan-tools tool, because the launcher predates task 7717. '
-            'Task 10803 removes this path.'
-        )
-        return mcp
-    unknown = sorted(granted - registered)
-    if unknown:
-        logger.warning(
-            'plan-tools launch grants tool(s) %s that this server does not register: '
-            'dropping them, because the launcher predates their rename or removal.',
-            unknown,
-        )
-    _restrict_to_grant(mcp, registered, granted)
-    return mcp
+    return create_server(
+        _artifacts_from_namespace(args), _launch_grant(args), args.caller_role,
+    )
+
+
+def _launch_grant(args: argparse.Namespace) -> frozenset[str]:
+    granted = frozenset(args.grant or ())
+    if args.grants_enforced:
+        return granted
+    logger.warning(
+        'plan-tools launched without --grants-enforced: exposing no tool and '
+        'ignoring grant(s) %s. orchestrator.mcp_lifecycle.plan_tools_mcp_server '
+        'always passes the marker.',
+        sorted(granted),
+    )
+    return frozenset()
 
 
 def _cli_parser() -> argparse.ArgumentParser:
@@ -2225,8 +2239,15 @@ def _cli_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         '--grants-enforced', action='store_true',
         help=(
-            'Expose only the --grant tools, so none when no grant is given. '
-            'Every launcher from task 7717 on passes it.'
+            'Required: without it the server exposes no tool, whatever --grant '
+            'names. With it the server exposes exactly the --grant tools.'
+        ),
+    )
+    parser.add_argument(
+        '--caller-role', default=None,
+        help=(
+            'Attribution only: the role this server serves, named on its '
+            'markup records. Optional, because older launchers pass none.'
         ),
     )
     return parser

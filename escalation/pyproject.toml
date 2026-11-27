@@ -50,6 +50,11 @@ dark-factory-shared = { workspace = true }
 orchestrator = { workspace = true }
 
 [tool.pytest.ini_options]
+markers = [
+    "defect(ref): this test reproduces the declared defect <ref>; the binding is read statically by shared/src/shared/defect_enumerator.py (plans/defect-tests-prd.md decision 8). Not deselected by default.",
+    "criterion(id): this test evidences acceptance criterion <id> (plans/client-feed-prd.md §7.7). Not deselected by default.",
+    "timing(reason): a deadline, grace period or timeout is the behaviour under test, named by reason=; the timing-dependence lint (fused-memory/scripts/_timing_dependence.py) accepts a real sleep, an elapsed-vs-literal assert or a literal wait deadline only under it. Not deselected by default.",
+]
 # Default per-test timeout. Catches deadlocked lock implementations and
 # accidental hangs; slow tests opt out with @pytest.mark.timeout(N).
 # See shared/pyproject.toml for the full rationale, including why this is large

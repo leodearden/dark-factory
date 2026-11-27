@@ -6,8 +6,16 @@ import json
 from pathlib import Path
 
 import pytest
+from escalation.models import RESOLUTION_CLASSES
 from escalation.shadow_ruling import SHADOW_RULING_MARKER
-from orchestrator.decision_registry import DecisionRecord, decision_path_for_id, qualify_decision_id
+from orchestrator.decision_registry import (
+    DecisionRecord,
+    decision_path_for_id,
+    decisions_dir,
+    list_decisions,
+    normalize_escalations_dir,
+    write_decision,
+)
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 from sitting import payloads as mod
 from sitting.inventory import OpenItem, decision_key, escalation_key, queue_tag
@@ -38,6 +46,8 @@ FINDING = mod.Finding(escalation_id='esc-6798-1', summary='rebase hazard', detai
 PREPARED = mod.PreparedMarker(recommendation='B', no_lean_reason='', sitting_id='nightly-2026-09-26',
                               prepared_at='2026-09-26T05:30:00+00:00')
 AGREED = mod.AgreedMarker(answer='B', agreed=True, answer_rounds=1, at='2026-09-26T09:00:00+00:00')
+#: The provenance every resolve_issue_payload call must state.
+PROVENANCE = {'resolution_class': 'actionable', 'ruled_by_human': True}
 
 DF_QUEUE = '/src/dark-factory/data/escalations'
 DF_RECON_QUEUE = '/src/dark-factory/data/reconciliation/escalations'
@@ -88,7 +98,8 @@ def _argvs(payload: mod.ApplyPayload) -> list[list[str]]:
 
 def _all_builder_payloads() -> list[mod.ApplyPayload]:
     return [
-        mod.resolve_issue_payload('esc-4803-2', 'ruled B', 'resume', resolved_by='leo', resolution_turns=2),
+        mod.resolve_issue_payload('esc-4803-2', 'ruled B', 'resume', resolved_by='leo', resolution_turns=2,
+                                  **PROVENANCE),
         mod.update_task_payload('4803', PROJECT_ROOT, RULING, existing=None),
         mod.append_details_payload('5255', PROJECT_ROOT, FINDING),
         mod.add_dependency_payload('5255', '4803', PROJECT_ROOT),
@@ -118,16 +129,19 @@ class TestResolveIssuePayload:
 
     @pytest.mark.parametrize('action', sorted(_server_resolve_actions()))
     def test_every_server_action_is_accepted(self, action):
-        payload = mod.resolve_issue_payload('esc-1-1', 'r', action, resolved_by='leo', resolution_turns=1)
+        payload = mod.resolve_issue_payload('esc-1-1', 'r', action, resolved_by='leo', resolution_turns=1,
+                                            **PROVENANCE)
 
         assert _args(payload)['action'] == action
 
     def test_unknown_action_is_refused(self):
         with pytest.raises(ValueError):
-            mod.resolve_issue_payload('esc-1-1', 'r', 'dismiss', resolved_by='leo', resolution_turns=1)
+            mod.resolve_issue_payload('esc-1-1', 'r', 'dismiss', resolved_by='leo', resolution_turns=1,
+                                      **PROVENANCE)
 
     def test_resolution_turns_is_carried_as_an_int(self):
-        payload = mod.resolve_issue_payload('esc-1-1', 'r', 'resume', resolved_by='leo', resolution_turns=3)
+        payload = mod.resolve_issue_payload('esc-1-1', 'r', 'resume', resolved_by='leo', resolution_turns=3,
+                                            **PROVENANCE)
 
         assert _args(payload)['resolution_turns'] == 3
         assert type(_args(payload)['resolution_turns']) is int
@@ -135,7 +149,37 @@ class TestResolveIssuePayload:
     @pytest.mark.parametrize('turns', ['3', True, 0, -1, 2.0])
     def test_non_int_or_non_positive_turns_are_refused(self, turns):
         with pytest.raises(ValueError):
-            mod.resolve_issue_payload('esc-1-1', 'r', 'resume', resolved_by='leo', resolution_turns=turns)
+            mod.resolve_issue_payload('esc-1-1', 'r', 'resume', resolved_by='leo', resolution_turns=turns,
+                                      **PROVENANCE)
+
+    @pytest.mark.parametrize('omitted', sorted(PROVENANCE))
+    def test_each_provenance_field_is_required(self, omitted):
+        stated = {k: v for k, v in PROVENANCE.items() if k != omitted}
+
+        with pytest.raises(TypeError, match=omitted):
+            mod.resolve_issue_payload('esc-1-1', 'r', 'resume', resolved_by='leo', resolution_turns=1, **stated)
+
+    @pytest.mark.parametrize('resolution_class', sorted(RESOLUTION_CLASSES))
+    @pytest.mark.parametrize('ruled_by_human', [True, False])
+    def test_the_args_carry_the_class_and_the_human_ruling_flag(self, resolution_class, ruled_by_human):
+        payload = mod.resolve_issue_payload('esc-1-1', 'r', 'resume', resolved_by='leo', resolution_turns=1,
+                                            resolution_class=resolution_class, ruled_by_human=ruled_by_human)
+
+        assert _args(payload)['resolution_class'] == resolution_class
+        assert _args(payload)['ruled_by_human'] is ruled_by_human
+
+    def test_a_class_outside_the_vocabulary_is_refused_naming_the_legal_values(self):
+        with pytest.raises(ValueError) as refused:
+            mod.resolve_issue_payload('esc-1-1', 'r', 'resume', resolved_by='leo', resolution_turns=1,
+                                      resolution_class='urgent', ruled_by_human=True)
+
+        assert all(legal in str(refused.value) for legal in RESOLUTION_CLASSES)
+
+    @pytest.mark.parametrize('flag', ['true', 1, 0, None])
+    def test_a_non_bool_human_ruling_flag_is_refused(self, flag):
+        with pytest.raises(ValueError, match='ruled_by_human'):
+            mod.resolve_issue_payload('esc-1-1', 'r', 'resume', resolved_by='leo', resolution_turns=1,
+                                      resolution_class='actionable', ruled_by_human=flag)
 
 
 class TestUpdateTaskPayload:
@@ -240,31 +284,55 @@ class TestCloseDecisionArgv:
     @pytest.mark.parametrize(
         ('queue_dir', 'local_id'), [(DF_QUEUE, 'esc-4803-2'), (DF_RECON_QUEUE, 'recon-esc-4803-2')]
     )
-    def test_an_unlinked_item_is_filed_and_closed_under_the_derived_id(self, queue_dir, local_id):
+    def test_an_unlinked_item_is_one_file_and_close_run_of_its_local_id(self, queue_dir, local_id):
         item = _l2(queue_dir)
 
-        write, close = _argvs(mod.close_decision_argv(item, 'dropped', 'Leo: drop it'))
+        (argv,) = _argvs(mod.close_decision_argv(item, 'dropped', 'Leo: drop it'))
 
-        assert (write[2], close[2]) == ('write-decision', 'close-decision')
-        assert _flag(write, '--id') == local_id
-        assert _flag(close, '--id') == mod.sitting_decision_id(item)
-        assert _flag(close, '--id') == qualify_decision_id(item.project, local_id)
-        for argv in (write, close):
-            assert _flag(argv, '--project') == item.project
-            assert _flag(argv, '--escalations-dir') == item.queue_dir
-        assert _flag(write, '--escalation-id') == 'esc-4803-2'
+        assert argv[2] == 'file-and-close-decision'
+        assert _flag(argv, '--id') == local_id
+        assert _flag(argv, '--project') == item.project
+        assert _flag(argv, '--escalations-dir') == item.queue_dir
+        assert _flag(argv, '--escalation-id') == 'esc-4803-2'
+        assert (_flag(argv, '--state'), _flag(argv, '--evidence')) == ('dropped', 'Leo: drop it')
+        assert 'close-decision' not in argv
+        assert 'write-decision' not in argv
 
     @pytest.mark.parametrize('queue_dir', [DF_QUEUE, DF_RECON_QUEUE])
     def test_the_filed_record_is_the_one_the_close_names(self, tmp_path, monkeypatch, queue_dir):
         monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
-        item = _l2(queue_dir)
-        write, close = _argvs(mod.close_decision_argv(item, 'answered', 'gate evidence'))
+        argvs = _argvs(mod.close_decision_argv(_l2(queue_dir), 'answered', 'gate evidence'))
 
-        assert session_registry.main(write[2:]) == 0
-        assert session_registry.main(close[2:]) == 0
+        assert [session_registry.main(argv[2:]) for argv in argvs] == [0] * len(argvs)
 
-        path = decision_path_for_id(_flag(close, '--id'), root=tmp_path)
-        record = DecisionRecord.from_json(path.read_text())
+        (record,) = [
+            r for r in list_decisions(root=tmp_path)
+            if r.escalation_id == 'esc-4803-2' and r.escalations_dir == normalize_escalations_dir(queue_dir)
+        ]
+        assert (record.state, record.closing_evidence) == ('answered', 'gate evidence')
+
+    @pytest.mark.parametrize(
+        ('state', 'escalations_dir'),
+        [('dropped', ''), ('open', normalize_escalations_dir(DF_QUEUE))],
+        ids=['closed-unstamped', 'open-same-queue'],
+    )
+    def test_a_same_project_legacy_record_at_the_bare_id_is_continued_and_closed(
+        self, tmp_path, monkeypatch, state, escalations_dir
+    ):
+        """Task 7495: a record filed before ids were qualified by project is the one the close lands on."""
+        monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+        item = _l2(DF_QUEUE)
+        legacy = DecisionRecord(
+            id='esc-4803-2', project='dark_factory', text='old ask', filed_at='2026-08-01T00:00:00+00:00',
+            escalation_id='esc-4803-2', state=state, escalations_dir=escalations_dir,
+        )
+        write_decision(legacy, root=tmp_path)
+        argvs = _argvs(mod.close_decision_argv(item, 'answered', 'gate evidence'))
+
+        assert [session_registry.main(argv[2:]) for argv in argvs] == [0] * len(argvs)
+
+        assert sorted(path.name for path in decisions_dir(tmp_path).glob('*.json')) == ['esc-4803-2.json']
+        record = DecisionRecord.from_json(decision_path_for_id('esc-4803-2', root=tmp_path).read_text())
         assert (record.state, record.closing_evidence) == ('answered', 'gate evidence')
 
     @pytest.mark.parametrize('evidence', ['', '   '])
@@ -277,39 +345,38 @@ class TestCloseDecisionArgv:
             mod.close_decision_argv(_l2(), 'open', 'evidence')
 
 
-class TestSittingDecisionId:
-    def test_a_primary_queue_prefixes_the_project(self):
-        assert mod.sitting_decision_id(_l2()) == 'dark_factory-esc-4803-2'
+class TestUnlinkedFilingId:
+    """The project-LOCAL id an unlinked item's payload files; write-decision alone qualifies it by project."""
+
+    def _filed(self, item: OpenItem) -> str:
+        (argv,) = _argvs(mod.close_decision_argv(item, 'answered', 'gate evidence'))
+        return _flag(argv, '--id')
+
+    def test_a_primary_queue_files_the_bare_escalation_id(self):
+        assert self._filed(_l2()) == 'esc-4803-2'
 
     def test_a_recon_queue_adds_its_tag(self):
-        assert mod.sitting_decision_id(_l2(DF_RECON_QUEUE)) == 'dark_factory-recon-esc-4803-2'
+        assert self._filed(_l2(DF_RECON_QUEUE)) == 'recon-esc-4803-2'
 
     def test_any_other_queue_adds_its_digest_tag(self):
-        item = _l2('/elsewhere/queue')
+        assert self._filed(_l2('/elsewhere/queue')) == f'{queue_tag("/elsewhere/queue")}-esc-4803-2'
 
-        assert mod.sitting_decision_id(item) == f'dark_factory-{queue_tag("/elsewhere/queue")}-esc-4803-2'
-
-    def test_one_escalation_id_in_two_projects_or_two_queues_gives_distinct_ids(self):
-        ids = {
-            mod.sitting_decision_id(_l2()),
-            mod.sitting_decision_id(_l2(DF_RECON_QUEUE)),
-            mod.sitting_decision_id(_l2('/src/know-live/data/escalations', project='know_live')),
-        }
+    def test_one_escalation_id_in_three_queues_gives_distinct_ids(self):
+        ids = {self._filed(_l2(queue_dir)) for queue_dir in (DF_QUEUE, DF_RECON_QUEUE, '/elsewhere/queue')}
 
         assert len(ids) == 3
 
     @pytest.mark.parametrize('queue_dir', [DF_QUEUE, DF_RECON_QUEUE, '/elsewhere/queue'])
     def test_the_id_survives_the_registrys_sanitiser(self, tmp_path, queue_dir):
-        derived = mod.sitting_decision_id(_l2(queue_dir))
+        local = self._filed(_l2(queue_dir))
 
-        assert decision_path_for_id(derived, root=tmp_path).stem == derived
+        assert decision_path_for_id(local, root=tmp_path).stem == local
 
-    def test_an_item_with_no_escalation_id_is_refused(self):
-        item = OpenItem(key=decision_key('lone'), decision_id='lone', decision_project='dark_factory',
-                        project='dark_factory')
+    def test_an_item_with_no_decision_and_no_escalation_id_is_refused(self):
+        item = OpenItem(key=decision_key('lone'), project='dark_factory', queue_dir=DF_QUEUE)
 
-        with pytest.raises(ValueError):
-            mod.sitting_decision_id(item)
+        with pytest.raises(ValueError, match='only an escalation item'):
+            mod.close_decision_argv(item, 'answered', 'gate evidence')
 
 
 class TestMarkers:

@@ -15,6 +15,7 @@ import orchestrator_projects
 import pytest
 from escalation.authority import EXECUTOR_IDENTITY, policy_row
 from escalation.models import Escalation
+from escalation.shadow_ruling import ShadowRuling
 from fake_systemctl import install_fake_systemctl
 from landing_history import LandingRepo, record_merge_done, record_train
 from orchestrator.decision_registry import (
@@ -333,6 +334,30 @@ class TestSections:
         assert 'claude-opus' in sections[TITLES[4]] and '$2.50' in sections[TITLES[4]]
         assert EVIDENCE in sections[TITLES[5]] and 'dec-close-1' in sections[TITLES[5]]
         assert 'lifetime: 1' in sections[TITLES[5]]
+
+
+class TestAgreementTable:
+    def test_an_attended_seat_close_renders_in_the_not_human_ruled_column(self, env):
+        """A seat closing a stamped record without a ruling is counted, not compared
+        (plans/instruments-honesty-prd.md decision 10)."""
+        ruling = ShadowRuling(
+            ruling_class='risk_identified_branch_behind_main', proposed_action='close_only',
+            evidence='probe output quoted verbatim', confidence=0.8,
+        )
+        _esc(env.queue, id='esc-110-1', category='risk_identified',
+             agent_role='claude-task-110-implementer', status='dismissed',
+             resolved_at=IN_WINDOW, resolved_by='escalation-watcher', resolution_action='close_only',
+             resolution_class='actionable', triaged_by='watcher-a',
+             triage_note=f'probe: rc=0\n{ruling.to_note_line()}')
+
+        section = _sections(mod.render(env.build()))[TITLES[1]]
+
+        header = next(line for line in section.splitlines() if line.startswith('| class |'))
+        columns = [cell.strip() for cell in header.strip('|').split('|')]
+        row = next(line for line in section.splitlines() if line.startswith(f'| {ruling.ruling_class} |'))
+        cells = [cell.strip() for cell in row.strip('|').split('|')]
+        assert cells[columns.index('not human-ruled')] == '1'
+        assert cells[columns.index('agreed')] == '0'
 
 
 class TestAutonomousClosesSection:

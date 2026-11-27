@@ -88,6 +88,17 @@ def make_repo(path: Path) -> Repo:
     return repo
 
 
+def clone_of_checkout(checkout: Path, destination: Path) -> Repo:
+    """A shared, unchecked-out clone whose main is `checkout`'s HEAD commit, so no live ref or store is read."""
+    commit = Repo(checkout).rev('HEAD^{commit}')
+    Repo(destination.parent).git(
+        'clone', '--quiet', '--shared', '--no-checkout', str(checkout), str(destination)
+    )
+    repo = Repo(destination)
+    repo.git('update-ref', 'refs/heads/main', commit)
+    return repo
+
+
 def path_with_git_replaced_on(bin_dir: Path, subcommand: str, shell: str) -> str:
     """A PATH whose `git` runs the POSIX-sh snippet `shell` for `subcommand` and is the real git for every other."""
     real_git = shutil.which('git')

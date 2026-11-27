@@ -13,10 +13,11 @@ Three related surfaces, all additive and backward-compatible:
                                         the log line and in the structured
                                         merge_heartbeat event.
 
-Fixture block (_setup_repo, git_repo/git_config/git_ops/config, _make_req,
-_make_item, _make_entry, _make_mock_allocator) is ported from
-test_merge_queue_finalize_head_visibility.py:44-137 so these snapshot tests
-build InflightEntry state exactly the way the existing ones do.
+Fixture block (git_config/git_ops/config, _make_req, _make_item,
+_make_entry, _make_mock_allocator) is ported from
+test_merge_queue_finalize_head_visibility.py so these snapshot tests build
+InflightEntry state exactly the way the existing ones do; git_repo seeds
+through _git_fixtures.py::seed_repo instead.
 
 Steps covered:
   3275/step-3 RED — snapshot()['hosts'] block
@@ -39,12 +40,13 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from _gate_fixtures import TEST_DEPLOYED_SHA
+from _git_fixtures import seed_repo
 from _merge_lane_fakes import lane_scene_config
 from escalation.queue import EscalationQueue
 
 from orchestrator.config import GitConfig, OrchestratorConfig, VerifyRunnerConfig
 from orchestrator.event_store import EventStore
-from orchestrator.git_ops import GitOps, MergeResult, _run
+from orchestrator.git_ops import GitOps, MergeResult
 from orchestrator.merge_lane.types import (
     InflightStatus,
     LandingCandidate,
@@ -63,24 +65,12 @@ from orchestrator.merge_lane.worker import (
 )
 from orchestrator.verify_runner import HostAllocator, HostLease, RunnerUnavailable
 
-# ── fixtures (ported verbatim from test_merge_queue_finalize_head_visibility) ──
-
-
-async def _setup_repo(repo: Path) -> None:
-    await _run(['git', 'init', '-b', 'main'], cwd=repo)
-    await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=repo)
-    await _run(['git', 'config', 'user.name', 'Test'], cwd=repo)
-    (repo / 'README.md').write_text('# Test\n')
-    await _run(['git', 'add', '-A'], cwd=repo)
-    await _run(['git', 'commit', '-m', 'Initial commit'], cwd=repo)
+# ── fixtures (ported from test_merge_queue_finalize_head_visibility) ──────────
 
 
 @pytest.fixture
 def git_repo(tmp_path: Path) -> Path:
-    repo = tmp_path / 'repo'
-    repo.mkdir()
-    asyncio.run(_setup_repo(repo))
-    return repo
+    return seed_repo(tmp_path / 'repo')
 
 
 @pytest.fixture

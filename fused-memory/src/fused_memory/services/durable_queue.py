@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import contextvars
 import json
 import logging
 import random
@@ -233,16 +234,28 @@ class ParkedWriteEvent:
     exc: BaseException
 
 
+@dataclass(frozen=True)
+class ParkDecision:
+    """Why a failure parks its row, and when parked rows next re-probe.
+
+    ``retry_at`` is an epoch time; None keeps the queue's own horizon.
+    """
+
+    reason: str
+    retry_at: float | None = None
+
+
 class ParkPolicy(Protocol):
     """Names the failures that clear only when a human acts, so they PARK.
 
-    A parked row never dead-letters. It is re-probed every
+    A parked row never dead-letters. It is re-probed at the decision's
+    ``retry_at`` when the policy names one, else every
     ``retry_max_delay_seconds``, and a parked row that completes unparks
     every other. Both hooks run after the commit and outside the semaphore,
     and a raising hook is logged and swallowed, as ``on_dead_letter`` is.
     """
 
-    def park_reason(self, exc: BaseException) -> str | None: ...
+    def park_decision(self, exc: BaseException) -> ParkDecision | None: ...
 
     async def on_parked(self, event: ParkedWriteEvent) -> None: ...
 
@@ -266,9 +279,48 @@ POST_EXECUTE_DEAD_PREFIX = (
 CLAIMABLE_STATUSES: tuple[str, ...] = ('pending', 'retry', 'parked')
 _CLAIMABLE_SQL = 'status IN ({})'.format(', '.join(f"'{s}'" for s in CLAIMABLE_STATUSES))
 
+@dataclass(frozen=True)
+class _AttemptBudget:
+    """One queue attempt's write budget, and the task running that attempt."""
+
+    owner: asyncio.Task[Any] | None
+    timeout: asyncio.Timeout
+
+
+_ATTEMPT_BUDGET: contextvars.ContextVar[_AttemptBudget | None] = contextvars.ContextVar(
+    'durable_queue_attempt_budget', default=None,
+)
+
+
+def release_attempt_budget() -> None:
+    """Disarm the current queue attempt's write budget: its backend write LANDED.
+
+    An executor calls this the instant its backend write lands. Cancelling the
+    attempt after that cannot un-land the write; it only sends the item down
+    the retry path, which re-executes it: the duplicate ``executed`` exists to
+    prevent.
+
+    Only the attempt's own task can disarm it. asyncio copies the attempt's
+    context into every task the attempt creates, and such a task can neither
+    vouch that the attempt's write landed nor act on a budget whose attempt
+    may already have ended. The owner sees its budget only inside the budget's
+    scope, where it is armed or expiring. So outside a queue attempt, in any
+    other task, or once the budget has expired, this is a no-op: it never
+    raises.
+    """
+    attempt = _ATTEMPT_BUDGET.get()
+    if attempt is None or attempt.owner is not asyncio.current_task():
+        return
+    if attempt.timeout.expired():
+        return
+    attempt.timeout.reschedule(None)
+
 
 class DurableWriteQueue:
-    """SQLite WAL-backed write queue with per-group workers and global semaphore."""
+    """SQLite WAL-backed write queue with per-group workers and global semaphore.
+
+    Every time the queue stamps on a row or compares against one is read from *clock*.
+    """
 
     def __init__(
         self,
@@ -286,8 +338,10 @@ class DurableWriteQueue:
         on_terminal: TerminalHookFn | None = None,
         on_dead_letter: DeadLetterHookFn | None = None,
         park_policy: ParkPolicy | None = None,
+        clock: Callable[[], float] = time.time,
     ):
         self._data_dir = Path(data_dir)
+        self._clock = clock
         self._execute_write = execute_write
         self._on_terminal = on_terminal
         self._on_dead_letter = on_dead_letter
@@ -394,7 +448,7 @@ class DurableWriteQueue:
         if callback is not None:
             check_callback_pairing(value, callback)
         group_id = value.envelope.group_id
-        now = time.time()
+        now = self._clock()
         async with self._require_access().write() as db:
             cursor = await db.execute(
                 # `executed` = 0 is a RECORDED negative, distinct from a legacy
@@ -419,7 +473,7 @@ class DurableWriteQueue:
         for value, callback in values:
             if callback is not None:
                 check_callback_pairing(value, callback)
-        now = time.time()
+        now = self._clock()
         ids: list[int] = []
         groups_seen: set[str] = set()
         async with self._require_access().write() as db:
@@ -487,7 +541,7 @@ class DurableWriteQueue:
         """
         lock = self._group_locks[group_id]
         async with lock:
-            now = time.time()
+            now = self._clock()
             async with self._require_access().write() as db:
                 rows = list(await db.execute_fetchall(
                     "SELECT * FROM write_queue "
@@ -507,6 +561,9 @@ class DurableWriteQueue:
 
     async def _process_item(self, item: QueueItem) -> None:
         """Execute the write, handle success/failure.
+
+        The write budget bounds the attempt until its backend write lands
+        (``release_attempt_budget``), never the post-landing tail.
 
         Callbacks run *before* marking completed so that a callback
         failure triggers retry instead of being silently lost.
@@ -542,10 +599,14 @@ class DurableWriteQueue:
                     item.callback_type, value, row_id=item.id, raw_payload=item.payload,
                 )
                 with self._executing(item):
-                    result = await asyncio.wait_for(
-                        self._execute_write(value),
-                        timeout=self._write_timeout_seconds,
-                    )
+                    async with asyncio.timeout(self._write_timeout_seconds) as budget:
+                        token = _ATTEMPT_BUDGET.set(
+                            _AttemptBudget(owner=asyncio.current_task(), timeout=budget)
+                        )
+                        try:
+                            result = await self._execute_write(value)
+                        finally:
+                            _ATTEMPT_BUDGET.reset(token)
                 # The backend write LANDED. Anything that fails below is a
                 # post-execute failure, which is a materially different fact
                 # for anyone deciding whether a dead item is safe to replay.
@@ -560,11 +621,11 @@ class DurableWriteQueue:
                 terminal = ('completed', None)
                 landed_after_park = item.status == 'parked'
             except Exception as exc:
-                reason = self._park_reason(exc, executed=executed)
-                if reason is None:
+                decision = self._park_decision(exc, executed=executed)
+                if decision is None:
                     terminal = await self._handle_failure(item, exc, executed=executed)
                 else:
-                    parked = await self._park(item, exc, reason)
+                    parked = await self._park(item, exc, decision)
 
         if parked is not None:
             await self._notify_parked(parked)
@@ -792,7 +853,7 @@ class DurableWriteQueue:
             await db.execute(
                 "UPDATE write_queue SET status = 'completed', completed_at = ?, "
                 "attempts = attempts + 1 WHERE id = ?",
-                (time.time(), item.id),
+                (self._clock(), item.id),
             )
 
     def _is_transient(self, exc: BaseException) -> bool:
@@ -815,8 +876,8 @@ class DurableWriteQueue:
             return (FailureClass.TRANSIENT, self._transient_max_attempts)
         return (FailureClass.NORMAL, item.max_attempts)
 
-    def _park_reason(self, exc: Exception, *, executed: bool) -> str | None:
-        """Why *exc* parks its item, or None to retry or dead-letter it.
+    def _park_decision(self, exc: Exception, *, executed: bool) -> ParkDecision | None:
+        """How *exc* parks its item, or None to retry or dead-letter it.
 
         A write that already LANDED never parks: a probe re-runs it, so an
         unbounded park would duplicate it every period, where the retry path
@@ -825,17 +886,31 @@ class DurableWriteQueue:
         if self._park_policy is None or executed or isinstance(exc, QueueDecodeError):
             return None
         try:
-            return self._park_policy.park_reason(exc)
+            return self._park_policy.park_decision(exc)
         except Exception:
-            logger.warning('park_policy.park_reason failed; not parking', exc_info=True)
+            logger.warning('park_policy.park_decision failed; not parking', exc_info=True)
             return None
 
-    async def _park(self, item: QueueItem, exc: Exception, reason: str) -> ParkedWriteEvent:
+    async def _park(
+        self, item: QueueItem, exc: Exception, decision: ParkDecision,
+    ) -> ParkedWriteEvent:
         """Park *item*, attempts unchanged, and re-arm every parked row to one
         horizon, so the queue probes about once per worker per period rather
-        than once per parked row."""
+        than once per parked row. The decision's ``retry_at``, never earlier
+        than now, is that horizon when set.
+
+        The horizon is the deciding failure's, whatever parked each other row:
+        rows parked for different reasons pull each other onto the latest
+        park's horizon, because a row does not record which reason parked it."""
+        reason = decision.reason
         error_msg = f'parked ({reason}): {type(exc).__name__}: {exc}'
-        horizon = time.time() + self._retry_max_delay_seconds
+        now = self._clock()
+        if decision.retry_at is not None:
+            horizon = max(decision.retry_at, now)
+            horizon_source = "the park policy's probe time"
+        else:
+            horizon = now + self._retry_max_delay_seconds
+            horizon_source = 'retry_max_delay_seconds'
         async with self._require_access().write() as db:
             await db.execute(
                 "UPDATE write_queue SET status = 'parked', next_retry_at = ?, error = ? "
@@ -847,8 +922,8 @@ class DurableWriteQueue:
                 (horizon,),
             )
         logger.info(
-            'Item %d (%s, group_id=%s) parked, re-probe in %.1fs [%s]: %s',
-            item.id, item.operation, item.group_id, self._retry_max_delay_seconds,
+            'Item %d (%s, group_id=%s) parked, re-probe in %.1fs (%s) [%s]: %s',
+            item.id, item.operation, item.group_id, horizon - now, horizon_source,
             FailureClass.PARKED, error_msg,
         )
         return ParkedWriteEvent(
@@ -896,7 +971,7 @@ class DurableWriteQueue:
                     + random.uniform(0, self._retry_base_seconds),
                     self._retry_max_delay_seconds,
                 )
-                next_retry = time.time() + delay
+                next_retry = self._clock() + delay
                 await db.execute(
                     "UPDATE write_queue SET status = 'retry', attempts = ?, "
                     "next_retry_at = ?, error = ?, "
@@ -1026,7 +1101,7 @@ class DurableWriteQueue:
         if row:
             min_created = row[0] if isinstance(row, tuple) else row[0]
             if min_created is not None:
-                oldest_pending_age = time.time() - min_created
+                oldest_pending_age = self._clock() - min_created
 
         # No new index: idx_wq_status_group is on (status, group_id,
         # next_retry_at), so both spellings below seek the status='dead'

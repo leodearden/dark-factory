@@ -202,6 +202,9 @@ EOF
 
 UNITS=("$STORE_UNIT:render_store_unit" "$PRUNE_UNIT:render_prune_unit" "$PRUNE_TIMER:render_prune_timer")
 
+# Succeeds when the installed unit is exactly what its render prints.
+unit_is_current() { [ -f "$UNIT_DIR/$1" ] && cmp -s <("$2") "$UNIT_DIR/$1"; }
+
 credential() { sed -n "s/^$1=//p" "$CREDENTIALS"; }
 
 # One reason per line why the credentials file cannot start the store, or
@@ -278,7 +281,7 @@ check_units() {
         render="${entry#*:}"
         if [ ! -f "$UNIT_DIR/$unit" ]; then
             check_failed "unit $UNIT_DIR/$unit is missing"
-        elif ! cmp -s <("$render") "$UNIT_DIR/$unit"; then
+        elif ! unit_is_current "$unit" "$render"; then
             check_failed "unit $UNIT_DIR/$unit differs from what this installer renders for $unit"
         fi
     done
@@ -338,16 +341,10 @@ check_host_config() {
 }
 
 # ── 3. apply ──────────────────────────────────────────────────────────────
-UNIT_CHANGED="no"
 write_unit() {
-    local unit="$1" render="$2" target="$UNIT_DIR/$1"
-    if [ -f "$target" ] && cmp -s <("$render") "$target"; then
-        UNIT_CHANGED="no"
-        return
-    fi
+    local target="$UNIT_DIR/$1" render="$2"
     "$render" >"$target.tmp"
     mv -f "$target.tmp" "$target"
-    UNIT_CHANGED="yes"
     log "wrote $target"
 }
 
@@ -391,11 +388,18 @@ apply() {
     fi
 
     mkdir -p "$UNIT_DIR"
-    write_unit "$STORE_UNIT" render_store_unit
-    local store_changed="$UNIT_CHANGED"
-    write_unit "$PRUNE_UNIT" render_prune_unit
-    write_unit "$PRUNE_TIMER" render_prune_timer
-    local timer_changed="$UNIT_CHANGED"
+    local store_changed=no timer_changed=no
+    if ! unit_is_current "$STORE_UNIT" render_store_unit; then
+        write_unit "$STORE_UNIT" render_store_unit
+        store_changed=yes
+    fi
+    if ! unit_is_current "$PRUNE_UNIT" render_prune_unit; then
+        write_unit "$PRUNE_UNIT" render_prune_unit
+    fi
+    if ! unit_is_current "$PRUNE_TIMER" render_prune_timer; then
+        write_unit "$PRUNE_TIMER" render_prune_timer
+        timer_changed=yes
+    fi
 
     systemctl --user daemon-reload
     systemctl --user enable "$STORE_UNIT"

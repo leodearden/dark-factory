@@ -133,11 +133,14 @@ async def _fake_create_wt(*_a, **_k):
     return Path('/fake/wt'), 'run-mu'
 
 
-async def _fake_collect(_wf, _wt, _task, *, role, replay_frame=None, sandbox_backend):
-    return EvalMetrics(role_under_test=role, replay_frame=replay_frame, sandbox_backend=sandbox_backend)
+async def _fake_collect(_wf, _wt, _task, *, role, replay_frame=None, sandbox_backend, endpoint_kind):
+    return EvalMetrics(
+        role_under_test=role, replay_frame=replay_frame,
+        sandbox_backend=sandbox_backend, endpoint_kind=endpoint_kind,
+    )
 
 
-async def _raising_collect(_wf, _wt, _task, *, role, replay_frame=None, sandbox_backend):
+async def _raising_collect(_wf, _wt, _task, *, role, replay_frame=None, sandbox_backend, endpoint_kind):
     raise RuntimeError('metric collection exploded')
 
 
@@ -196,6 +199,7 @@ async def test_a_cell_whose_metric_collection_raised_still_records_the_backend(
 
     assert result.metrics['sandbox_backend'] == 'landlock'
     assert 'role_under_test' in result.metrics
+    assert result.metrics['endpoint_kind'] == 'native_anthropic'
 
 
 def test_a_cell_recorded_before_the_field_reads_back_as_none() -> None:

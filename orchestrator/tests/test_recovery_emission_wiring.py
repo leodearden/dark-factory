@@ -1163,7 +1163,7 @@ class TestHumanParkedHoldsDoNotAlarm:
         """COUNTER-SIGNAL: a closed L2 is no longer in front of anyone."""
         harness, clock = clocked
         holder = _outside_l2(_queue(harness), 'esc-9-2', members=('esc-1',))
-        _queue(harness).resolve(holder.id, 'answered')
+        _queue(harness).resolve(holder.id, 'answered', resolution_class='actionable')
         _bind_reports(harness, {'T1': _pinned_hold(escalations=[_ref('esc-1', level=1)])})
 
         await _sweeps(harness, clock, 3)

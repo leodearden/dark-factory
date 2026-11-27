@@ -21,6 +21,7 @@ from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from _code_writer_links import assert_writes_c5
 
 from fused_memory.reconciliation.stage1_stall_detector import (
     _GATE_BACKLOG_ESCALATION_CATEGORY,
@@ -187,6 +188,23 @@ class TestTrackHumanOperatorStalls:
 
         # search must NOT have been awaited (deterministic count only)
         memory_service.search.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('task_id', ['42', '3105,4223'])
+    async def test_a_marker_declares_no_task_link(self, task_id):
+        """C5: a flag-cited id may be composite or name another project's task, so the marker links none and names no status."""
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata = AsyncMock(return_value=0)
+        memory_service.add_memory = AsyncMock(return_value={'memory_ids': ['m1']})
+
+        await track_human_operator_stalls(
+            memory_service=memory_service, project_id='proj', run_id='run-001',
+            task_ids=[task_id],
+        )
+
+        written = memory_service.add_memory.await_args.kwargs
+        assert written['metadata']['task_id'] == task_id
+        assert_writes_c5(written, project_id='proj', subject=None)
 
     @pytest.mark.asyncio
     async def test_count_failure_treats_prior_as_zero(self):

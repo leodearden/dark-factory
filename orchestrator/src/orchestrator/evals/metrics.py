@@ -9,13 +9,10 @@ from enum import StrEnum
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 
-# Cost primitives (the USD/1M fallback rate + the PriceEntry-or-dict accessor)
-# have a SINGLE home in agents.invoke (task 2459); this module imports them from
-# agents.invoke rather than re-declaring them, so the three-way copy can never
-# drift (reviewer: code-reuse). resolve_cost_usd below mirrors invoke's Invariant-P5 policy.
-# agents.invoke has no import cycle back to evals (it reaches only
-# config/fm_retry/shared.*), so a module-level import is safe.
-from orchestrator.agents.invoke import _FALLBACK_PRICE, _rate
+# The per-token cost formula and its primitives have a SINGLE home in
+# agents.token_pricing, a leaf module that invoke._estimate_cost prices through
+# too, so runtime and eval figures cannot drift apart.
+from orchestrator.agents.token_pricing import FALLBACK_PRICE, TokenUsage, price_tokens
 from orchestrator.shadow_types import ReferenceKind
 
 from .cell_sandbox import CellSandbox
@@ -74,6 +71,20 @@ class RoleUnderTest(StrEnum):
     END_TO_END = 'end_to_end'
 
 
+class EndpointKind(StrEnum):
+    """Who serves the candidate's model, as its config builder declares it.
+
+    Orthogonal to the harness, which ``EvalConfig.backend`` records.
+    """
+
+    NATIVE_ANTHROPIC = 'native_anthropic'
+    """Anthropic's own API serves the model."""
+    SELF_HOSTED_VLLM = 'self_hosted_vllm'
+    """A vLLM server we run, whether a workstation or a RunPod pod."""
+    VENDOR_CLOUD = 'vendor_cloud'
+    """A third-party model vendor's hosted API, metered or subscription, whichever harness drives it."""
+
+
 # The roles an OFAT candidate can vary; END_TO_END is a methodology stage.
 CANDIDATE_ROLES: frozenset[RoleUnderTest] = frozenset({
     RoleUnderTest.IMPLEMENTER, RoleUnderTest.ARCHITECT, RoleUnderTest.JUDGE,
@@ -95,9 +106,13 @@ class EvalMetrics:
 
     # Efficiency
     cost_usd: float = 0.0
-    # Cost provenance (Invariant P5): one of 'price_table' | 'cli' |
-    # 'unpriced_proxy' | 'mixed'. The first three are what
-    # :func:`resolve_cost_usd` resolves for a SINGLE invocation's spend.
+    # Cost provenance (Invariant P5): one of 'price_table' |
+    # 'price_table_no_cache_rate' | 'cli' | 'unpriced_proxy' | 'mixed'. The
+    # first four are what :func:`resolve_cost_usd` resolves for a SINGLE
+    # invocation's spend. 'price_table_no_cache_rate' is a listed model whose
+    # entry lacks a cache rate its tokens needed: the figure prices those cache
+    # tokens at input_per_1m in place of the missing rate, which over-states
+    # cache reads and under-states a provider's surcharged cache writes.
     # 'mixed' is producible only by the ARCHITECT path, whose cost_usd is a
     # TWO-COMPONENT sum (architect spend + plan-judge spend): when those two
     # components' sources disagree, :func:`compose_cost_source` says so rather
@@ -105,6 +120,17 @@ class EvalMetrics:
     # trustworthy native-cloud source) so a result JSON persisted before this
     # field existed reads back sanely.
     cost_source: str = 'cli'
+    # True when the role's env routed the Claude CLI to a non-Anthropic base URL
+    # (is_proxied_endpoint), so resolve_cost_usd never takes the CLI's own cost
+    # figure. Legacy cells stored this as 'is_local_model' (results.py legacy rule).
+    cli_cost_untrusted: bool = False
+    # The declared EvalConfig.endpoint_kind of the config whose env the cell's
+    # workflow ran under, which is not always the labelled candidate: run_eval's
+    # implementer config (on a judge cell, the pinned implementer, not the judge
+    # candidate), run_end_to_end's impl_config (not the architect), and the
+    # architect config on an architect cell. None for a cell recorded before
+    # task 9970.
+    endpoint_kind: EndpointKind | None = None
     workflow_duration_ms: int = 0
     turns_used: int = 0
     iterations: int = 0          # implementer re-invocations
@@ -141,11 +167,6 @@ class EvalMetrics:
 
     # Inference speed
     tokens_per_second: float = 0.0       # output_tokens / generation_seconds
-    # True when env_overrides has ANTHROPIC_BASE_URL — i.e. a PROXIED endpoint.
-    # Repurposed by Invariant P5 as the cost-source signal: a proxied endpoint's
-    # CLI cost is untrustworthy, so an unlisted model there resolves to
-    # 'unpriced_proxy' (see resolve_cost_usd) rather than the raw CLI number.
-    is_local_model: bool = False
 
     # Derived
     composite_score: float = 0.0
@@ -305,6 +326,8 @@ class EvalMetrics:
     def __post_init__(self) -> None:
         if self.reference_kind is not None:
             self.reference_kind = ReferenceKind(self.reference_kind)
+        if self.endpoint_kind is not None:
+            self.endpoint_kind = EndpointKind(self.endpoint_kind)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -673,52 +696,55 @@ def is_proxied_endpoint(env_overrides: dict[str, str] | None) -> bool:
     return bool((env_overrides or {}).get('ANTHROPIC_BASE_URL'))
 
 
-# ``_FALLBACK_PRICE`` (the DEFINED, logged degradation rate used only for a
-# PROXIED endpoint whose model is unlisted — Invariant P5 / the
-# loud-over-silent-degradation norm) and ``_rate`` (the PriceEntry-or-dict
-# accessor) are imported from agents.invoke at the top of this module — a single
-# home so the copy cannot drift (reviewer: code-reuse).
 def resolve_cost_usd(
-    input_tokens: int,
-    output_tokens: int,
+    usage: TokenUsage,
     *,
     model: str,
     prices: dict[str, Any] | None,
     cli_cost_usd: float,
-    is_local_model: bool,
+    cli_cost_untrusted: bool,
 ) -> tuple[float, str]:
-    """Resolve ``(cost_usd, cost_source)`` for a run, per Invariant P5.
+    """Resolve ``(cost_usd, cost_source)`` for one invocation's *usage*, per Invariant P5.
 
-    ``cost_source`` ∈ ``{'price_table', 'cli', 'unpriced_proxy'}``:
+    ``cost_source`` ∈ ``{'price_table', 'price_table_no_cache_rate', 'cli',
+    'unpriced_proxy'}``:
 
-    - **price_table** — the run's *model* is listed in *prices*: cost is the
-      token-weighted price-table figure ``(in*input_per_1m +
-      out*output_per_1m)/1e6`` (the identical formula
-      ``invoke._estimate_cost`` uses). This wins even for a proxied endpoint —
-      a listed price is always preferred to the (proxy-untrustworthy) CLI
-      number.
-    - **cli** — a NATIVE cloud endpoint (``is_local_model=False``) whose model
+    - **price_table** — the run's *model* is listed in *prices*: cost prices
+      all four token counts through ``agents.token_pricing.price_tokens``, the
+      formula ``invoke._estimate_cost`` uses. This wins even for a proxied
+      endpoint — a listed price is always preferred to the
+      (proxy-untrustworthy) CLI number.
+    - **price_table_no_cache_rate** — listed, but the entry lacks a cache rate
+      that nonzero cache tokens needed. Those tokens are priced at
+      input_per_1m in place of the missing rate, and a WARNING names the
+      missing keys.
+    - **cli** — a NATIVE cloud endpoint (``cli_cost_untrusted=False``) whose model
       is unlisted: the CLI's own ``cli_cost_usd`` is trustworthy for the real
       Anthropic API, so it is used verbatim.
-    - **unpriced_proxy** — a PROXIED endpoint (``is_local_model=True`` —
+    - **unpriced_proxy** — a PROXIED endpoint (``cli_cost_untrusted=True`` —
       ``ANTHROPIC_BASE_URL`` set) whose model is unlisted: the CLI cost is
       WRONG for a proxied endpoint, so emit a loud WARNING (mirroring task
-      2459) and fall back to a DEFINED ``_FALLBACK_PRICE`` figure — never a
+      2459) and price the usage at the DEFINED ``FALLBACK_PRICE`` — never a
       silent or raw-CLI number.
 
-    Pure: no I/O, no config access; *prices* is passed in by the caller.
-    Accepts ``PriceEntry`` objects and plain dicts interchangeably (via
-    :func:`_rate`), exactly as invoke.py does.
+    Pure apart from logging: no I/O, no config access; *prices* is passed in
+    by the caller, and ``PriceEntry`` objects and plain dicts are accepted
+    interchangeably.
     """
     entry = prices.get(model) if prices else None
     if entry is not None:
-        cost = (
-            input_tokens * _rate(entry, 'input_per_1m')
-            + output_tokens * _rate(entry, 'output_per_1m')
-        ) / 1_000_000
-        return cost, 'price_table'
+        priced = price_tokens(entry, usage)
+        if not priced.defaulted_rates:
+            return priced.cost_usd, 'price_table'
+        logger.warning(
+            'Price entry for model %r has no %s; its cache tokens were priced '
+            'at input_per_1m in place of the missing rate (add the rate to '
+            'config.prices to silence)',
+            model, ', '.join(sorted(priced.defaulted_rates)),
+        )
+        return priced.cost_usd, 'price_table_no_cache_rate'
 
-    if not is_local_model:
+    if not cli_cost_untrusted:
         # Native cloud endpoint — the CLI's own cost figure is trustworthy.
         return cli_cost_usd, 'cli'
 
@@ -728,13 +754,9 @@ def resolve_cost_usd(
         'No configured price for proxied-endpoint model %r; the CLI cost is '
         'unreliable for a proxied endpoint, falling back to $%.2f/1M input, '
         '$%.2f/1M output (add it to config.prices to silence)',
-        model, _FALLBACK_PRICE['input_per_1m'], _FALLBACK_PRICE['output_per_1m'],
+        model, FALLBACK_PRICE['input_per_1m'], FALLBACK_PRICE['output_per_1m'],
     )
-    cost = (
-        input_tokens * _FALLBACK_PRICE['input_per_1m']
-        + output_tokens * _FALLBACK_PRICE['output_per_1m']
-    ) / 1_000_000
-    return cost, 'unpriced_proxy'
+    return price_tokens(FALLBACK_PRICE, usage).cost_usd, 'unpriced_proxy'
 
 
 def compose_cost_source(primary: str, *, secondary_cost_usd: float) -> str:

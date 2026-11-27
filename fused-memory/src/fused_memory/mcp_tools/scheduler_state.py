@@ -52,22 +52,53 @@ def clear_lock_depth_cache() -> None:
     _lock_depth_fallback_logged.clear()
 
 
+class SchedulerStateUnreadable(Exception):
+    """The snapshot file exists but cannot be read or parsed as a snapshot.
+
+    Carries the snapshot :attr:`path`. Deliberately NOT an ``OSError`` or
+    ``ValueError`` subclass, so an ``except OSError`` or ``except ValueError``
+    cannot swallow it by accident.
+    """
+
+    def __init__(self, path: Path, cause: BaseException) -> None:
+        self.path = path
+        super().__init__(f'{path}: {type(cause).__name__}: {cause}')
+
+
+def read_scheduler_state_strict(project_root: Path) -> SchedulerStateSnapshot | None:
+    """Read the scheduler state snapshot, or ``None`` when the read reports it absent.
+
+    A snapshot that is present but unreadable, not JSON, or not shaped like a
+    snapshot raises :class:`SchedulerStateUnreadable` rather than reading as absent.
+    """
+    path = scheduler_state_json(project_root)
+    try:
+        raw = path.read_bytes()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise SchedulerStateUnreadable(path, exc) from exc
+    try:
+        return SchedulerStateSnapshot.from_json(json.loads(raw))
+    except (json.JSONDecodeError, UnicodeDecodeError, MalformedSnapshotError) as exc:
+        raise SchedulerStateUnreadable(path, exc) from exc
+
+
 def read_scheduler_state(project_root: Path) -> SchedulerStateSnapshot:
     """Read and parse the scheduler state snapshot the orchestrator wrote.
 
     Returns ``SchedulerStateSnapshot.empty()`` when the file is absent,
     unreadable, not JSON, or not shaped like a snapshot.  A missing file is
     normal before the first orchestrator tick and is handled silently; any
-    other failure is logged as a warning first.
+    other failure is logged as a warning first.  Callers that must tell an
+    absent snapshot from an unreadable one use :func:`read_scheduler_state_strict`.
     """
-    path = scheduler_state_json(project_root)
     try:
-        return SchedulerStateSnapshot.from_json(json.loads(path.read_bytes()))
-    except FileNotFoundError:
-        pass
-    except (json.JSONDecodeError, UnicodeDecodeError, MalformedSnapshotError, OSError) as exc:
-        _log.warning('read_scheduler_state: %s: %s — returning empty snapshot', path, exc)
-    return SchedulerStateSnapshot.empty()
+        snapshot = read_scheduler_state_strict(project_root)
+    except SchedulerStateUnreadable as exc:
+        _log.warning('read_scheduler_state: %s — returning empty snapshot', exc)
+        return SchedulerStateSnapshot.empty()
+    return snapshot if snapshot is not None else SchedulerStateSnapshot.empty()
 
 
 def effective_lock_depth(project_root: str | Path | None, default: int) -> int:

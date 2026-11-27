@@ -35,10 +35,10 @@ function loadMergeQueue() {
 
 const { api: mergeQueue, window: loadedWindow } = loadMergeQueue();
 const {
-  projectInQueue, inQueueOver, inQueueHistory, latencyCaption, depthBucketCaption,
+  projectInQueue, inQueueOver, inQueueHistory, latencyCaption,
   queuedSince, projectSpeculative, speculativeOver, hitRateText, recentTotal,
   projectDepth, projectAttempts, attemptCount, attemptsOver, attemptsHistory, worstP95Over,
-  totalHint,
+  totalHint, projectLandingRate, landingRateCaption, landingRateReading,
 } = mergeQueue;
 const { isDatum, datumView, EM_DASH, LOWER_BOUND_PREFIX, missingParts } = loadedWindow.DF_DATUM;
 const { recentMergesCaption } = loadedWindow.DF_WINDOW_CHIP;
@@ -113,10 +113,17 @@ function entryReading(spec, recent, served = inQueue('fresh', 0)) {
   return { ...entryWith(served), speculative: spec, recent_total: recent };
 }
 
-// A served depth series value: data/merge_queue.py::DepthSeries, its leading
+// A served depth series value: merge_attempt counts per bucket, its leading
 // zero buckets trimmed by the shaper.
-function depthSeries(labels, values, bucketMinutes = 15) {
-  return { labels, values, bucket_minutes: bucketMinutes };
+function depthSeries(labels, values) {
+  return { labels, values };
+}
+
+// A served landing-rate value: landings per day at each point over the trailing
+// window the server names, its leading zero points trimmed by the shaper, and
+// the window mean the server counted over the whole window.
+function landingRate(labels, values, trailingMinutes = 1440, windowMean = 0) {
+  return { labels, values, trailing_minutes: trailingMinutes, window_mean_per_day: windowMean };
 }
 
 const UNTIMED = Object.freeze({ p50: null, p95: null, p99: null, mean_ms: null });
@@ -165,9 +172,11 @@ test('the module exposes its readers and assigns window.DF_MERGE_QUEUE', () => {
     Object.keys(mergeQueue).sort(),
     [
       'attemptCount', 'attemptsHistory', 'attemptsOver',
-      'depthBucketCaption', 'hitRateText', 'inQueueHistory', 'inQueueOver', 'latencyCaption',
+      'hitRateText', 'inQueueHistory', 'inQueueOver',
+      'landingRateCaption', 'landingRateReading', 'latencyCaption',
       'projectAttempts', 'projectDepth',
-      'projectInQueue', 'projectSpeculative', 'queuedSince', 'recentTotal', 'speculativeOver',
+      'projectInQueue', 'projectLandingRate', 'projectSpeculative', 'queuedSince', 'recentTotal',
+      'speculativeOver',
       'totalHint', 'worstP95Over',
     ],
   );
@@ -357,29 +366,58 @@ test('latencyCaption: a latency block without the split states nothing rather th
   assert.equal(latencyCaption(undefined), '');
 });
 
-// ── depthBucketCaption: the width the server counted the depth series at ────
+// ── landingRateCaption / landingRateReading: the throughput panel's words ──
 
-test('depthBucketCaption: each width the server ladder serves today', () => {
-  assert.equal(depthBucketCaption({ bucket_minutes: 15 }), '15-min buckets');
-  assert.equal(depthBucketCaption({ bucket_minutes: 60 }), '1-h buckets');
-  assert.equal(depthBucketCaption({ bucket_minutes: 360 }), '6-h buckets');
-  assert.equal(depthBucketCaption({ bucket_minutes: 1440 }), '1-day buckets');
+test('landingRateCaption: names the trailing window the server counted each point over', () => {
+  assert.equal(landingRateCaption({ trailing_minutes: 1440 }), 'landings/day · 1-day trailing');
+  assert.equal(landingRateCaption({ trailing_minutes: 10080 }), 'landings/day · 7-day trailing');
+  assert.equal(landingRateCaption({ trailing_minutes: 60 }), 'landings/day · 1-h trailing');
+  assert.equal(landingRateCaption({ trailing_minutes: 90 }), 'landings/day · 90-min trailing');
 });
 
-test('depthBucketCaption: a width outside the ladder is computed, not looked up', () => {
-  assert.equal(depthBucketCaption({ bucket_minutes: 90 }), '90-min buckets');
-  assert.equal(depthBucketCaption({ bucket_minutes: 120 }), '2-h buckets');
-  assert.equal(depthBucketCaption({ bucket_minutes: 2880 }), '2-day buckets');
-});
-
-test('depthBucketCaption: a depth naming no usable width states none', () => {
+test('landingRateCaption: a rate naming no usable trailing window states none', () => {
   const holes = [
-    undefined, null, {}, { bucket_minutes: null }, { bucket_minutes: 0 },
-    { bucket_minutes: -15 }, { bucket_minutes: 7.5 }, { bucket_minutes: '15' },
+    undefined, null, {}, { trailing_minutes: null }, { trailing_minutes: 0 },
+    { trailing_minutes: -15 }, { trailing_minutes: 7.5 }, { trailing_minutes: '15' },
   ];
-  for (const depth of holes) {
-    assert.equal(depthBucketCaption(depth), EM_DASH, JSON.stringify(depth));
+  for (const series of holes) {
+    assert.equal(landingRateCaption(series), EM_DASH, JSON.stringify(series));
   }
+});
+
+test('landingRateReading: a window with no landings reads a measured zero, saying so', () => {
+  assert.equal(landingRateReading(landingRate([], [])), '0/day · no landings in this window');
+});
+
+test('landingRateReading: the mean is the served window mean, not an average of the points', () => {
+  assert.equal(landingRateReading(landingRate([T1, T2], [2, 3], 1440, 2 / 7)), 'now 3/day · mean 0.29/day');
+});
+
+test('landingRateReading: rates of 1 or more show at most one decimal, a trailing .0 dropped', () => {
+  assert.equal(
+    landingRateReading(landingRate([T1, T2], [27.43, 31], 1440, 29.24)), 'now 31/day · mean 29.2/day',
+  );
+  assert.equal(landingRateReading(landingRate([T1, T2], [2, 3], 1440, 4)), 'now 3/day · mean 4/day');
+});
+
+test('landingRateReading: rates below 1 keep two significant figures, never a false 0/day', () => {
+  for (const [mean, text] of [[0.14, '0.14'], [1 / 30, '0.033'], [1 / 3650, '0.00027']]) {
+    const reading = landingRateReading(landingRate([T1, T2], [2, 3], 1440, mean));
+    assert.equal(reading, `now 3/day · mean ${text}/day`);
+    assert.doesNotMatch(reading, /mean 0\/day/);
+  }
+  assert.equal(landingRateReading(landingRate([T1, T2], [0.5, 0.14], 1440, 1)), 'now 0.14/day · mean 1/day');
+});
+
+test('landingRateReading: a rate serving no usable window mean states none', () => {
+  for (const mean of [null, NaN, '0.5']) {
+    assert.equal(
+      landingRateReading(landingRate([T1, T2], [2, 3], 1440, mean)), `now 3/day · mean ${EM_DASH}`,
+      String(mean),
+    );
+  }
+  const { window_mean_per_day: _dropped, ...unmeaned } = landingRate([T1, T2], [2, 3]);
+  assert.equal(landingRateReading(unmeaned), `now 3/day · mean ${EM_DASH}`);
 });
 
 // ── queuedSince: when a queued row joined, from the probe instant and its age ─
@@ -414,13 +452,14 @@ test('queuedSince: reads its inputs and alters neither', () => {
   assert.deepEqual([entry, row], pristine);
 });
 
-// ── projectSpeculative / recentTotal / projectDepth / projectAttempts: one
-// project's runs.db readings, stamped ─────────────────────────────────────
+// ── projectSpeculative / recentTotal / projectDepth / projectLandingRate /
+// projectAttempts: one project's runs.db readings, stamped ────────────────
 
 for (const [field, reader, value] of [
   ['speculative', projectSpeculative, counts(5, 3)],
   ['recent_total', recentTotal, 228],
   ['depth', projectDepth, depthSeries([T1, T2], [2, 0])],
+  ['landing_rate', projectLandingRate, landingRate([T1, T2], [2, 1.5])],
   ['attempts', projectAttempts, attemptsValue({ done: 3, conflict: 1 }, timedLatency(900, 4))],
 ]) {
   test(`${field}: the served Datum, stamped with the /merge-queue receipt as a copy`, () => {

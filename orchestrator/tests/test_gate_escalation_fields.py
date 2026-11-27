@@ -471,7 +471,7 @@ class TestResumeCitesTheGatesOwnCategory:
         )
         queue.resolve(
             review.id, 'ran as review-dark_factory-20261012',
-            resolved_by='interactive', resolution_action='resume',
+            resolved_by='interactive', resolution_action='resume', resolution_class='actionable',
         )
         newer = _seed_escalation(
             queue, '42', 'orchestrator-deterministic', resolved=True, category='milestone_gate',

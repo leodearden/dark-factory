@@ -141,7 +141,7 @@ class TestRestartRecutIssuesARuling:
         member = _file_l1(queue, '43')
         l2 = _file_l1(queue, '42', level=2, members=[member.id])
 
-        await _resolve(server, harness, escalation_id=l2.id, action='restart', recut=True)
+        await _resolve(server, harness, escalation_id=l2.id, action='restart', recut=True, resolution_class='actionable')
 
         archived = queue.get(l2.id)
         assert archived is not None and archived.recut is True

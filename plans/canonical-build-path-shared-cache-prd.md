@@ -262,7 +262,21 @@ Exit 126 means "this command cannot run in the mode its build directory requires
   its device and inode equal the worktree root's. Then change directory to
   `CANON/<path relative to the worktree root>`.
 - Otherwise: `/usr/bin/bwrap --dev-bind / / --bind <worktree root> CANON --chdir CANON/<relative>
-  --die-with-parent`, with the outer process's working directory left at the real path.
+  --die-with-parent --info-fd <fd>`, with the outer process's working directory left at the real path.
+  The outer process does not exec bwrap. It stays resident as bwrap's parent, in the caller's process
+  group, and exits with bwrap's status (the command's status, or 128+N for signal N).
+- Signals at the namespace boundary (ruled by Leo 2026-11-23, esc-10418-3, reify task 10418). bwrap is
+  started with TERM, INT and HUP ignored, except a signal the caller already ignored, which stays ignored.
+  Inside, the command runs under `/usr/bin/env --default-signal=<those signals> --`, so it gets the
+  caller's dispositions back. The outer process forwards TERM, INT and HUP to the `child-pid` bwrap writes
+  to the info fd, through a pidfd. A signal that arrives before the pid is known is delivered once it is.
+  The rule: entering the namespace is invisible to whoever kills the command. On every kill path (TERM or
+  INT to the started pid, TERM or INT to its process group, TERM to each descendant, SIGKILL to the pid
+  or the group), the command's own trap runs, or nothing survives, exactly as in real-path mode. A plain
+  exec of bwrap fails this: bwrap dies of the signal and its parent-death signal SIGKILLs the command
+  mid-trap (measured, bwrap 0.9.0). There is one signal policy, in canon_cache.py's supervisor. The
+  namespace parent reuses its forwarder, and the supervisor never leaves the command ignoring a signal
+  the caller did not ignore.
 - `PWD` is set to the new working directory. Arguments and `CARGO_*` values that are paths under the
   worktree's real root are rewritten to CANON (`--manifest-path`, `--target-dir`, `CARGO_TARGET_DIR`).
 - Exported for the command: `REIFY_CANON_ACTIVE` (the tree's device and inode), and
@@ -368,8 +382,12 @@ yaml and never carried in `verify_env`, which the workstation copies to the lapt
   file, that directory is removed first and the fact is logged.
 - **Sandboxed agent launches** (`agents/sandbox_dispatch.py::wrap_command`, reached from
   `agents/invoke.py::_sandbox_wrap`): when `build_canon.root` is set, the command is prefixed, before the
-  landlock helper, with `/usr/bin/bwrap --dev-bind / / --bind <lane> <root> --die-with-parent`. The
-  session's working directory and write-set are unchanged. A bwrap that fails is a failed launch.
+  landlock helper, with `/usr/bin/bwrap --dev-bind / / --bind <lane> <root>`. The session's working
+  directory and write-set are unchanged. A bwrap that fails is a failed launch. There is no
+  `--die-with-parent` (ruled by Leo 2026-11-23, esc-10418-3). Agent sessions are always stopped by their
+  process group (`shared/cli_invoke.py`: TERM to the group, a grace period, then SIGKILL), and bwrap stays
+  in that group. So the session gets TERM directly, as an unwrapped landlock launch does today. Adding the
+  flag would SIGKILL it as soon as bwrap died of that same TERM.
 - **All agent launches** (`workflow.py::TaskWorkflow._build_agent_env`): `PATH` as above.
 - `verify.py::run_main_tip_sweep`'s vanished-worktree detection also recognises `build_canon.root` in error
   text, since compiler errors name CANON for a leg that ran there.
@@ -448,14 +466,24 @@ Dark-factory `scripts/deploy/`:
   directories, then signals rclone to drop its directory cache.
 - `build_cache_drift_probe.sh`: prints one digest line per cache-key input of a host (compiler binaries
   including `cc1`, `cc1plus` and `as`, toolchain, system package versions, prebuilt archives, tool
-  versions). It is the committed form of the study's `prd-scout/S8-drift-probe.sh`, plus one line per
-  pkg-config module that reify's dependencies probe, with its version and `libdir`, or `ABSENT`. The
-  module list is derived from reify's `Cargo.lock` each run: every registry crate's
-  `[package.metadata.system-deps]` entries and `x11-dl`'s probe list (32 modules at reify `27c69f616f`).
-  A build script that bakes a pkg-config answer into generated source makes its crate and every
-  dependent miss on a host that answers differently; gate α's 18 cross-host misses were `libxss-dev`
-  present on one host only (`xscrnsaver`), which the fixed package list did not see. Whole-system
-  package or module lists are not compared: the hosts legitimately differ in hundreds of unrelated ones.
+  versions). `cc1`, `cc1plus` and `as` are printed although sccache hashes only the compiler driver: a
+  host whose driver matches but whose `cc1` differs would serve the other host's objects. It is the
+  committed form of the study's `prd-scout/S8-drift-probe.sh`, plus one line per pkg-config module that
+  reify's dependencies probe, with its version and `libdir`, or `ABSENT`. The module list is derived
+  from reify's `Cargo.lock` each run: every registry crate's `[package.metadata.system-deps]` entries
+  and `x11-dl`'s probe list (30 modules at reify `27c69f616f`). A target-scoped `cfg(...)` table of
+  system-deps entries is descended one level, and every target's modules are listed without evaluating
+  the cfg. A module listed only for a non-Linux target is usually `ABSENT` on both Linux hosts; when it
+  is not, its line can differ without being a key input, which errs toward a false difference, never a
+  missed one. A build script that bakes a pkg-config answer into generated source makes its crate and
+  every dependent miss on a host that answers differently; gate α's 18 cross-host misses were
+  `libxss-dev` present on one host only (`xscrnsaver`), which the fixed package list did not see.
+  `#info.cargo.registry-sources-missing` names the locked registry crates whose source is not on the
+  host. It is informational and never compared: which sources a host holds depends on what it last
+  fetched (a Linux build never downloads `windows-*` or `objc2-*` crates), not on a key input. A missing
+  crate that declares system-deps still shows, as `pkg-config.<module>` lines absent on that host only.
+  Whole-system package or module lists are not compared: the hosts legitimately differ in hundreds of
+  unrelated ones.
 - `check_build_cache_in_service.py --observations <file> --host <runner> --since <ISO> --min-runs N
   [--canon-root <path> --status-json <file>]`:
 
@@ -505,6 +533,7 @@ compiling a C file through `cc`. No row asserts a wall-clock bound.
 | 23 | DF | results in order: 2 degraded; a third; a healthy one; with the L1 closed by hand, 2 more degraded; 10 consecutive; neutral results interleaved; a `real_path` result with and without `expect_canon`; a `read_only_server` result; a `backend none` result under `incremental` policy | L1 at the second; nothing at the third; cleared by the healthy one; refiled; L2 at the tenth with the L1 superseded; neutral changes nothing; `real_path` is degraded only with `expect_canon`; read-only is degraded; `none` under `incremental` is healthy |
 | 24 | DF | a result with `build_cache` `None` | neutral; no observation row |
 | 25 | DF | the lane alarm of the task-verify-lanes PRD after the ladder is extracted | that PRD's own boundary row 20 passes unchanged |
+| 26 | reify | a command at CANON entered through the namespace (C3), whose TERM/INT trap takes 0.3 s; TERM and INT to the started pid and to its group, TERM to each descendant, SIGKILL to the pid and to the group | after a TERM or INT, the trap completes and its status is returned; after a SIGKILL, nothing the command started remains (reify task 10418) |
 
 ## 7. Pre-conditions
 
@@ -653,7 +682,7 @@ files (`config.py`, `verify.py`, `harness.py`) are contended, and pinning the ch
   configuration and `build_canon` in its yaml; reset the laptop's task-verify lanes and merge lane so
   their build directories are recreated; wait for laptop verifies; run the drift probe on both hosts and
   compare (on 2026-11-19, after `libxss-dev` and `libocct-draw-dev` were installed on the workstation, the
-  study's probe and the 32 reify-probed pkg-config modules showed no difference); run the in-service check with `--min-runs 5` and `--canon-root`; then set `expect_canon` for
+  study's probe and the reify-probed pkg-config modules showed no difference); run the in-service check with `--min-runs 5` and `--canon-root`; then set `expect_canon` for
   the laptop. Watch the laptop's verify memory cap for a killed compile, and verify wall time for a slow
   store (decisions 14, 15).
   Signal: the in-service check exits 0 for the laptop, and an observation row for a laptop verify shows
@@ -714,3 +743,10 @@ files (`config.py`, `verify.py`, `harness.py`) are contended, and pinning the ch
    the two. Passing it as a cargo `--config` argument would not. Decide at β2.
 9. **How the observer reaches `VerifyRunnerPool.dispatch`.** A late-bound process-wide sink avoids editing
    the pool's five construction sites; decide at η against what task 10737 does for its own alarm.
+10. **One store process for both addresses.** One rclone binds 127.0.0.1 and the tailscale address. When
+    the workstation has no tailscale address, its own builds lose the store too, fall back to
+    `local_fallback`, and fire the degraded alarm. Accepted (task 10969): two listener processes over one
+    directory each keep their own directory cache, and a key PUT through one read 404 through the other
+    after that process had looked it up (measured 2026-11-25, rclone v1.75.0, default flags), so
+    splitting the listeners would split the cache between the hosts. Trigger to revisit: a workstation
+    degraded alarm whose cause was tailscale, not the store.

@@ -27,9 +27,27 @@ import pytest
 from _gate_fixtures import TEST_DEPLOYED_SHA, gated_remote_runner
 from _git_fixtures import RepoSeed, seed_repo
 from _orch_helpers import wait_responsive
+from _verify_artifact_fixtures import (
+    ARTIFACT_MODULES,
+    ARTIFACT_ORCH_MC,
+    ARTIFACT_SCRIPTS_MC,
+    ARTIFACT_TESTS_SCRIPTS_MC,
+    ROOT_YAML,
+    SPAWN_SH,
+    UNBLOCK_SKILL,
+    registry_config,
+)
+from _verify_cache_fixtures import TEST_CODE
+from _verify_cache_units import record_entry, unit_key
 
 from orchestrator import task_verify_dispatch
-from orchestrator.config import GitConfig, ModuleConfig, OrchestratorConfig, apply_reload
+from orchestrator.config import (
+    GitConfig,
+    ModuleConfig,
+    OrchestratorConfig,
+    VerifyCacheConfig,
+    apply_reload,
+)
 from orchestrator.event_store import EventType
 from orchestrator.git_ops import GitOps
 from orchestrator.task_verify_dispatch import (
@@ -39,11 +57,24 @@ from orchestrator.task_verify_dispatch import (
     TaskVerifyPolicy,
     eligible,
 )
-from orchestrator.task_verify_spec import TaskVerifySpec, task_spec_from_json
+from orchestrator.task_verify_spec import (
+    TaskVerifySpec,
+    apply_task_verify_spec,
+    task_spec_from_json,
+)
 from orchestrator.verify import VerifyInfraError, VerifyResult, run_scoped_verification
 from orchestrator.verify_admission_gate import AdmissionPlan
+from orchestrator.verify_cache.modes import CacheMode
+from orchestrator.verify_cache.registry import Registry
+from orchestrator.verify_cache.replay import CacheAccess
 from orchestrator.verify_categories import INFRA_TRANSIENT_CATEGORIES
 from orchestrator.verify_hosts import HostPool
+from orchestrator.verify_plan import (
+    ScopeKind,
+    derive_verify_plan,
+    executed_module_prefixes,
+    with_artifact_consumer_modules,
+)
 from orchestrator.verify_runner import (
     HostAllocator,
     MergeVerifySpec,
@@ -243,7 +274,16 @@ class TestDispatchDecision:
 
 _A_PY = 'orchestrator/src/orchestrator/a.py'
 _B_PY = 'fused_memory/src/fused_memory/b.py'
-_SEED = RepoSeed(files=((_A_PY, 'A = 1\n'), (_B_PY, 'B = 1\n')), message='initial commit')
+_SEED = RepoSeed(
+    files=(
+        (_A_PY, 'A = 1\n'),
+        (_B_PY, 'B = 1\n'),
+        (UNBLOCK_SKILL, '# unblock-auto\n'),
+        (SPAWN_SH, '#!/bin/sh\n'),
+        (ROOT_YAML, 'test_command: true\n'),
+    ),
+    message='initial commit',
+)
 _DISPATCH_LOGGER = 'orchestrator.task_verify_dispatch'
 
 Answer = tuple[int, str, str]
@@ -346,7 +386,8 @@ class _Hooks:
 
 class _LocalRun:
     """A recording stand-in for run_scoped_verification; *body*, when set, is
-    awaited with the call's admission plan before the verdict."""
+    awaited with the call's admission plan before the verdict. Each call's
+    ``verify_cache`` is kept apart in *caches*, so *calls* compares as before."""
 
     def __init__(self, observe: Callable[[], object]) -> None:
         self.result = _result(True, summary='local verdict')
@@ -354,9 +395,11 @@ class _LocalRun:
         self.observe = observe
         self.body: Callable[[AdmissionPlan], Awaitable[None]] | None = None
         self.calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+        self.caches: list[CacheAccess | None] = []
         self.observed: list[object] = []
 
     async def __call__(self, *args: Any, **kwargs: Any) -> VerifyResult:
+        self.caches.append(kwargs.pop('verify_cache', None))
         self.calls.append((args, kwargs))
         self.observed.append(self.observe())
         if self.body is not None:
@@ -435,6 +478,8 @@ def _harness(
     transport: _Transport | None = None,
     modules: list[ModuleConfig] | None = None,
     runner_kwargs: dict[str, Any] | None = None,
+    config: OrchestratorConfig | None = None,
+    verify_cache: CacheAccess | None = None,
 ) -> _Harness:
     repo = seed_repo(tmp_path / 'repo', _SEED)
     base = _git(repo, 'rev-parse', 'HEAD')
@@ -460,7 +505,9 @@ def _harness(
     )
     harness = _Harness(
         repo=repo, base=base, tip=tip,
-        config=OrchestratorConfig(git=GitConfig(main_branch='main'), verify_env_probes=[]),
+        config=config if config is not None else OrchestratorConfig(
+            git=GitConfig(main_branch='main'), verify_env_probes=[],
+        ),
         modules=modules if modules is not None else [
             ModuleConfig('orchestrator', test_command='true'),
             ModuleConfig('fused_memory', test_command='true'),
@@ -472,6 +519,7 @@ def _harness(
     harness.dispatcher = task_verify_dispatch.TaskVerifyDispatcher(
         pool, GitOps(GitConfig(main_branch='main'), repo),
         policy_of=lambda _config: harness.policy, run_local=harness.local,
+        verify_cache=verify_cache,
     )
     return harness
 
@@ -482,6 +530,113 @@ _ORCH_ONLY = TaskVerifyPolicy(host_policy='remote_modules', remote_modules=('orc
 def _assert_turn_left(h: _Harness) -> None:
     assert h.laptop_turns() == (0, 0)
     assert h.pool.holders() == {}
+
+
+# ---------------------------------------------------------------------------
+# Task 5653 (A3): a local verdict joins the task-role verify cache, a parity re-run does not
+# ---------------------------------------------------------------------------
+
+
+def _access(tmp_path: Path) -> CacheAccess:
+    return CacheAccess(registry=Registry(tmp_path / 'verify_cache.db'), orchestrator_code=TEST_CODE)
+
+
+@pytest.mark.asyncio
+class TestLocalArmsJoinTheTaskCache:
+    async def test_the_local_policy_verifies_through_the_access_it_was_given(self, tmp_path: Path) -> None:
+        access = _access(tmp_path)
+        h = _harness(tmp_path, TaskVerifyPolicy(), verify_cache=access)
+
+        await h.call()
+
+        [cache] = h.local.caches
+        assert cache is access
+
+    @pytest.mark.parametrize(('policy', 'remotes', 'quarantined', 'reason'), [
+        pytest.param(TaskVerifyPolicy(host_policy='remote_all'), (), False, 'no_host', id='no-host'),
+        pytest.param(
+            TaskVerifyPolicy(host_policy='remote_modules', remote_modules=('fused_memory',)),
+            ('laptop',), False, 'not_eligible', id='not-eligible',
+        ),
+        pytest.param(_ORCH_ONLY, ('laptop',), True, 'local_granted_first', id='race-won-locally'),
+    ])
+    async def test_a_remote_dispatch_that_falls_back_to_local_joins_too(
+        self, tmp_path: Path, policy: TaskVerifyPolicy, remotes: tuple[str, ...], quarantined: bool,
+        reason: str,
+    ) -> None:
+        access = _access(tmp_path)
+        h = _harness(tmp_path, policy, remotes=remotes, verify_cache=access)
+        if quarantined:
+            h.quarantine.add('laptop')
+
+        await h.call()
+
+        assert h.only_sidecar()['reason'] == reason
+        [cache] = h.local.caches
+        assert cache is access
+
+    @pytest.mark.parametrize(('parity', 'remote', 'reason'), [
+        pytest.param({'cross_check_every_n': 1}, _result(True), 'cross_check', id='cross-check'),
+        pytest.param(
+            {'red_confirms_locally': True}, _result(False, category='test_failure'), 'red_confirm',
+            id='red-confirm',
+        ),
+    ])
+    async def test_a_parity_rerun_of_a_remote_verdict_stays_outside_the_cache(
+        self, tmp_path: Path, parity: dict[str, Any], remote: VerifyResult, reason: str,
+    ) -> None:
+        policy = dataclasses.replace(_ORCH_ONLY, **parity)
+        h = _harness(
+            tmp_path, policy, transport=_Transport(verify=_answers(remote)), verify_cache=_access(tmp_path),
+        )
+
+        await h.call()
+
+        assert h.only_sidecar()['reason'] == reason
+        assert h.local.caches == [None]
+
+    async def test_a_dispatcher_given_no_access_verifies_outside_the_cache(self, tmp_path: Path) -> None:
+        h = _harness(tmp_path, TaskVerifyPolicy())
+
+        await h.call()
+
+        assert h.local.caches == [None]
+
+
+@pytest.mark.asyncio
+class TestTheRemoteArmShipsAViewOfTheTaskCache:
+    """Task 9123 (A5): the remote leg ships a view of the dispatcher's own cache, and none outside it."""
+
+    async def test_a_dispatcher_in_the_cache_ships_its_registrys_greens_under_the_configs_mode(
+        self, tmp_path: Path,
+    ) -> None:
+        access = _access(tmp_path)
+        assert access.registry is not None
+        green = await record_entry(access.registry, unit_key('module:orchestrator:test'))
+        config = OrchestratorConfig(
+            git=GitConfig(main_branch='main'), verify_env_probes=[],
+            verify_cache=VerifyCacheConfig(task_mode=CacheMode.ON, remote_task_mode=CacheMode.ON),
+        )
+        h = _harness(
+            tmp_path, _ORCH_ONLY, transport=_Transport(verify=_answers(_result(True))),
+            verify_cache=access, config=config,
+        )
+
+        await h.call()
+
+        assert h.only_sidecar()['reason'] == 'remote'
+        view = _sent_spec(h.transport).verify_cache
+        assert view is not None
+        assert view.mode is CacheMode.ON
+        assert green.candidate in view.candidates
+
+    async def test_a_dispatcher_outside_the_cache_ships_no_view(self, tmp_path: Path) -> None:
+        h = _harness(tmp_path, _ORCH_ONLY, transport=_Transport(verify=_answers(_result(True))))
+
+        await h.call()
+
+        assert h.only_sidecar()['reason'] == 'remote'
+        assert _sent_spec(h.transport).verify_cache is None
 
 
 # ---------------------------------------------------------------------------
@@ -850,6 +1005,103 @@ class TestRemoteLeg:
         assert h.local.calls == []
         assert h.only_sidecar()['reason'] == 'dispatcher_error'
         _assert_turn_left(h)
+
+
+# ---------------------------------------------------------------------------
+# Behavioural-artifact consumers widen the dispatched module set (task 5296)
+# ---------------------------------------------------------------------------
+
+
+def _artifact_config(registry: list[ModuleConfig]) -> OrchestratorConfig:
+    return registry_config(registry, git=GitConfig(main_branch='main'), verify_env_probes=[])
+
+
+def _reader_over(repo: Path) -> Callable[[str], str | None]:
+    def read(path: str) -> str | None:
+        target = repo / path
+        return target.read_text(encoding='utf-8') if target.is_file() else None
+    return read
+
+
+@pytest.mark.asyncio
+class TestArtifactConsumerWidening:
+    @pytest.mark.parametrize(('artifact', 'task_set', 'expected'), [
+        pytest.param(UNBLOCK_SKILL, [], ('orchestrator',), id='skill-prompt'),
+        pytest.param(ROOT_YAML, [], ('tests/scripts',), id='root-yaml'),
+        pytest.param(
+            SPAWN_SH, [ARTIFACT_ORCH_MC], ('orchestrator', 'scripts', 'tests/scripts'),
+            id='spawn-sh-beside-own-module',
+        ),
+    ])
+    async def test_the_remote_spec_carries_the_consumer_modules(
+        self, tmp_path: Path, artifact: str, task_set: list[ModuleConfig],
+        expected: tuple[str, ...],
+    ) -> None:
+        h = _harness(
+            tmp_path, TaskVerifyPolicy(host_policy='remote_all'), touch=artifact,
+            transport=_Transport(verify=_answers(_result(True))),
+            modules=list(task_set), config=_artifact_config(ARTIFACT_MODULES),
+        )
+
+        result = await h.call(task_files=[artifact])
+
+        assert result.passed is True
+        assert h.only_sidecar()['reason'] == 'remote'
+        spec = _sent_spec(h.transport)
+        assert tuple(vc.prefix for vc in spec.verify_commands) == expected
+        assert spec.global_verify_command is None
+        applied, modules = apply_task_verify_spec(OrchestratorConfig(verify_env_probes=[]), spec)
+        remote_modules = with_artifact_consumer_modules(applied, modules, spec.task_files, 'task')
+        plan = derive_verify_plan(
+            list(spec.task_files), remote_modules, applied, _reader_over(h.repo), role='task',
+        )
+        assert [run.scope_kind for run in plan.runs] != [ScopeKind.TRIVIAL]
+        assert executed_module_prefixes(plan) == frozenset(expected)
+
+    async def test_a_deleted_source_file_never_suppresses_a_present_artifact(
+        self, tmp_path: Path,
+    ) -> None:
+        h = _harness(
+            tmp_path, TaskVerifyPolicy(host_policy='remote_all'), touch=UNBLOCK_SKILL,
+            transport=_Transport(verify=_answers(_result(True))),
+            modules=[], config=_artifact_config(ARTIFACT_MODULES),
+        )
+
+        await h.call(task_files=['skills/factory-init/scripts/find_escalation_port.py', UNBLOCK_SKILL])
+
+        assert h.only_sidecar()['reason'] == 'remote'
+        spec = _sent_spec(h.transport)
+        assert tuple(vc.prefix for vc in spec.verify_commands) == ('orchestrator',)
+
+    async def test_eligibility_is_decided_over_the_consumer_modules(self, tmp_path: Path) -> None:
+        h = _harness(
+            tmp_path, TaskVerifyPolicy(host_policy='remote_modules', remote_modules=('tests/scripts',)),
+            touch=ROOT_YAML, transport=_Transport(verify=_answers(_result(True))),
+            modules=[], config=_artifact_config(ARTIFACT_MODULES),
+        )
+
+        await h.call(task_files=[ROOT_YAML])
+
+        sidecar = h.only_sidecar()
+        assert (sidecar['decision'], sidecar['reason']) == ('remote', 'remote')
+        assert h.local.calls == []
+
+    async def test_a_consumer_module_override_keeps_the_verify_local(self, tmp_path: Path) -> None:
+        orchestrator_with_env = dataclasses.replace(ARTIFACT_ORCH_MC, verify_env={'X': '1'})
+        registry = [orchestrator_with_env, ARTIFACT_SCRIPTS_MC, ARTIFACT_TESTS_SCRIPTS_MC]
+        h = _harness(
+            tmp_path, TaskVerifyPolicy(host_policy='remote_all'), touch=UNBLOCK_SKILL,
+            transport=_Transport(verify=_answers(_result(True))),
+            modules=[], config=_artifact_config(registry),
+        )
+
+        result = await h.call(task_files=[UNBLOCK_SKILL])
+
+        assert result is h.local.result
+        sidecar = h.only_sidecar()
+        assert (sidecar['reason'], sidecar['decision']) == ('not_eligible', 'local')
+        assert h.transport.log == []
+        assert h.local.calls == [h.expected_call(task_files=[UNBLOCK_SKILL])]
 
 
 # ---------------------------------------------------------------------------

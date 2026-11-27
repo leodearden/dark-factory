@@ -45,6 +45,8 @@ from _fm_helpers import lease_isolated_monkeypatch, load_script_module
 from _fm_qdrant_live import QDRANT_URL, qdrant_skipif
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
+from fused_memory.config.schema import QueueConfig
+
 pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'bake_off_storage_shape.py'
@@ -4445,11 +4447,11 @@ def _driver_config() -> _FakeConfig:
                 openai=types.SimpleNamespace(api_key='sk-fake-must-be-cleared'),
             ),
         ),
-        # The SHARED durable-write-queue path, as it comes out of the schema:
-        # relative, so from the repo root it resolves onto the live server's
+        # The SHARED durable-write-queue path, as the schema yields it:
+        # anchored at the checkout, so from every cwd it is the live server's
         # own queue DB.  The driver must repoint it at a per-run temp dir
         # before `MemoryService.initialize()` can attach to it.
-        queue=types.SimpleNamespace(data_dir='./data/queue'),
+        queue=types.SimpleNamespace(data_dir=QueueConfig().data_dir),
     )
 
 
@@ -5026,11 +5028,11 @@ class TestRunBakeOffWiring:
     def test_it_never_attaches_to_the_shared_durable_write_queue(
         self, small_run, six_arm_run,
     ):
-        """The data-loss guard at bake_off_storage_shape.py:2947-2967.
+        """The data-loss guard in bake_off_storage_shape.py::run_bake_off.
 
-        `config.queue.data_dir` comes out of the schema RELATIVE
-        (`./data/queue`), so run from the repo root — the natural cwd — an
-        un-repointed run initialises the live server's own queue DB:
+        `config.queue.data_dir` comes out of the schema anchored at the
+        checkout, so from every cwd an un-repointed run initialises the live
+        server's own queue DB:
         `_recover_in_flight()` flips the other process's in-flight rows back
         to pending, workers drain real user writes through the backend whose
         prefix was just repointed at `_test_e2_bakeoff_*`, and the
@@ -5039,8 +5041,8 @@ class TestRunBakeOffWiring:
         artifact and the logs.
 
         Deleting the two repoint lines broke no test in this suite until this
-        one existed, which is what `_driver_config`'s `./data/queue` was put
-        there for.
+        one existed, which is what `_driver_config`'s shared queue path was
+        put there for.
         """
         shared = _driver_config().queue.data_dir
         runs = (small_run, six_arm_run)

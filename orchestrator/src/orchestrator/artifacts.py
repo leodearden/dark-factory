@@ -1,8 +1,12 @@
-"""Manages the .task/ directory structure in each worktree."""
+"""A task's artifacts, routed to their lane or task ``.task-meta`` root by
+``ARTIFACT_ROOTS``, and the worktree ``.task/`` links
+(``LANE_SYMLINKED_ARTIFACTS``) that expose some of them to agents.
+"""
 
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import logging
 import os
@@ -19,12 +23,13 @@ from types import MappingProxyType
 from typing import Any
 
 from shared import safe_io
+from shared.defects import issue_kind_of
 from shared.plan_deviation import DeviationRecord
 
 from orchestrator import file_mutex
 from orchestrator.config import TASK_META_DIRNAME
 from orchestrator.review_issue_contract import REVIEW_ISSUE_OFF_CONTRACT_FACT, check_issues
-from orchestrator.review_payload import NoteDisposition, Verdict, normalize_review
+from orchestrator.review_payload import DefectRuling, NoteDisposition, Verdict, normalize_review
 from orchestrator.scope_drift import InvalidScopeRequest, ScopeDriftReport, ScopeRequest
 
 logger = logging.getLogger(__name__)
@@ -707,6 +712,52 @@ LANE_SYMLINKED_ARTIFACTS: tuple[str, ...] = ('plan.json', 'iterations.jsonl')
 """The task-root artifacts the lane ``.task/`` exposes to agents."""
 
 
+class LanePlanFaultKind(Enum):
+    """How the lane ``.task/plan.json`` fails to read this task's plan."""
+
+    NOT_A_LINK = 'not_a_link'
+    WRONG_TARGET = 'wrong_target'
+    EMPTY = 'empty'
+
+
+_LANE_PLAN_FAULT_MEANINGS: Mapping[LanePlanFaultKind, str] = MappingProxyType({
+    LanePlanFaultKind.NOT_A_LINK: 'is not a symlink (absent, a regular file or a directory)',
+    LanePlanFaultKind.WRONG_TARGET: "is a symlink to something other than this task's plan",
+    LanePlanFaultKind.EMPTY: "reaches this task's plan, which is absent, empty or not a regular file",
+})
+
+
+@dataclass(frozen=True)
+class LanePlanOccupant:
+    """The regular file a lane ``.task/plan.json`` holds in place of its link, fingerprinted before a relink discards it."""
+
+    size: int
+    sha256: str
+    matches_plan: bool
+
+    def describe(self) -> str:
+        sameness = 'identical to' if self.matches_plan else 'different from'
+        return f'a regular file of {self.size} bytes, sha256 {self.sha256}, {sameness} the task plan'
+
+
+@dataclass(frozen=True)
+class LanePlanFault:
+    """Why the lane ``.task/plan.json`` does not read this task's plan, and the paths involved."""
+
+    kind: LanePlanFaultKind
+    lane_path: Path
+    resolved_path: Path
+    plan_path: Path
+    occupant: LanePlanOccupant | None = None
+
+    def describe(self) -> str:
+        held = '' if self.occupant is None else f'; the lane entry is {self.occupant.describe()}'
+        return (
+            f'lane plan {self.lane_path} {_LANE_PLAN_FAULT_MEANINGS[self.kind]}: '
+            f'it resolves to {self.resolved_path}; the task plan is {self.plan_path}{held}'
+        )
+
+
 @dataclass
 class ReviewAggregation:
     """Aggregated review results from all reviewers."""
@@ -718,6 +769,7 @@ class ReviewAggregation:
     reviewer_errors: list[str] = field(default_factory=list)
     errored_reviews: dict[str, dict] = field(default_factory=dict)
     note_dispositions: tuple[NoteDisposition, ...] = ()
+    defect_rulings: tuple[DefectRuling, ...] = ()
 
     @property
     def all_reviewers_errored(self) -> bool:
@@ -751,7 +803,7 @@ def _warn_off_contract_issues(reviewer_name: str, issues: tuple[dict, ...]) -> N
 
 
 def format_issue_section(heading: str, issues: Iterable[Mapping[str, Any]], *, issue_level: int = 2) -> str:
-    """*heading*, then each review issue under a level-*issue_level* heading: reviewer, category, location, issue and suggested fix."""
+    """*heading*, then each review issue under a level-*issue_level* heading: reviewer, category, kind, location, issue and suggested fix."""
     issue_heading = '#' * issue_level
     lines = [heading]
     for issue in issues:
@@ -760,7 +812,12 @@ def format_issue_section(heading: str, issues: Iterable[Mapping[str, Any]], *, i
         category = issue.get('category', '')
         description = issue.get('description', '')
         fix = issue.get('suggested_fix', '')
+        reading = issue_kind_of(issue)
         lines.append(f'{issue_heading} [{reviewer}] {category}')
+        lines.append(
+            f'**Kind:** {reading.kind}'
+            + (f' (read fail-closed: kind {reading.flag})' if reading.flagged else '')
+        )
         if location:
             lines.append(f'**Location:** {location}')
         lines.append(f'**Issue:** {description}')
@@ -776,6 +833,27 @@ def _replace_with_symlink(link: Path, target: Path) -> None:
     else:
         link.unlink(missing_ok=True)
     os.symlink(target, link)
+
+
+def _regular_file_occupant(lane: Path, plan: Path) -> LanePlanOccupant | None:
+    """Fingerprint *lane* when it is a readable regular file rather than a link, else None."""
+    if lane.is_symlink() or not lane.is_file():
+        return None
+    try:
+        content = lane.read_bytes()
+        matches_plan = plan.is_file() and plan.read_bytes() == content
+    except OSError:
+        return None
+    return LanePlanOccupant(len(content), hashlib.sha256(content).hexdigest(), matches_plan)
+
+
+def _is_nonempty_file(path: Path) -> bool:
+    """Whether *path*, followed through any symlink, is a regular file of at least one byte."""
+    try:
+        status = path.stat()
+    except FileNotFoundError:
+        return False
+    return stat.S_ISREG(status.st_mode) and status.st_size > 0
 
 
 class TaskArtifacts:
@@ -1065,12 +1143,31 @@ class TaskArtifacts:
         durable path already IS the lane path (legacy single-root mode), where
         a self-referential symlink would be broken.
         """
-        lane_task = self.worktree / '.task'
-        lane_task.mkdir(parents=True, exist_ok=True)
+        (self.worktree / '.task').mkdir(parents=True, exist_ok=True)
         for name in LANE_SYMLINKED_ARTIFACTS:
-            durable = self.artifact_path(name)
-            if durable != lane_task / name:
-                _replace_with_symlink(lane_task / name, durable)
+            link = self._lane_link(name)
+            if link is not None:
+                _replace_with_symlink(link, self.artifact_path(name))
+
+    def _lane_link(self, name: str) -> Path | None:
+        """``<worktree>/.task/<name>``, or None where that path IS ``artifact_path(name)`` (legacy single-root)."""
+        lane = self.worktree / '.task' / name
+        return None if lane == self.artifact_path(name) else lane
+
+    def lane_plan_fault(self) -> LanePlanFault | None:
+        """Why the agent-facing ``.task/plan.json`` does not read this task's non-empty plan, else None; changes nothing."""
+        plan = self.artifact_path('plan.json')
+        lane = self._lane_link('plan.json') or plan
+        resolved = Path(os.path.realpath(lane))
+        if lane != plan and not lane.is_symlink():
+            return LanePlanFault(
+                LanePlanFaultKind.NOT_A_LINK, lane, resolved, plan, _regular_file_occupant(lane, plan),
+            )
+        if resolved != Path(os.path.realpath(plan)):
+            return LanePlanFault(LanePlanFaultKind.WRONG_TARGET, lane, resolved, plan)
+        if not _is_nonempty_file(lane):
+            return LanePlanFault(LanePlanFaultKind.EMPTY, lane, resolved, plan)
+        return None
 
     def write_blocking_dependency(
         self,
@@ -1766,6 +1863,7 @@ class TaskArtifacts:
         suggestions = []
         errored_reviews = {}
         note_dispositions: list[NoteDisposition] = []
+        defect_rulings: list[DefectRuling] = []
 
         for reviewer_name, review in reviews.items():
             payload = normalize_review(review)
@@ -1774,6 +1872,7 @@ class TaskArtifacts:
             else:
                 _warn_off_contract_issues(reviewer_name, payload.issues)
             note_dispositions.extend(payload.note_dispositions)
+            defect_rulings.extend(payload.defect_rulings)
             blocking.extend(
                 {**issue, 'reviewer': reviewer_name} for issue in payload.blocking_issues
             )
@@ -1790,6 +1889,7 @@ class TaskArtifacts:
             reviewer_errors=list(errored_reviews),
             errored_reviews=errored_reviews,
             note_dispositions=tuple(note_dispositions),
+            defect_rulings=tuple(defect_rulings),
         )
 
     def validate_plan_prerequisites(self) -> None:

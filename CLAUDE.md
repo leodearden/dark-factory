@@ -259,6 +259,16 @@ measured 2026-09-27 (CLI 2.1.283), `Grep` answered "Path does not exist:
 orchestrator/src/orchestrator. Note: your current working directory is
 .../orchestrator/src".
 
+Leave a directory before you delete it. In an interactive session, a shell
+that `cd`'d into a scratch worktree or a `mktemp -d` dir and then removed it is
+stranded: the next call is refused unrun ("Working directory ... no longer
+exists, so this command was not run"), even one that opens with an absolute
+`cd`. Neither `cd ..` from a subdirectory of the removed tree nor the anchor
+above gets you out of a scratch worktree: both leave the shell inside it. Do the
+entered work in a subshell, `( cd "$D" && ... )`, or pass the directory
+instead (`git -C`, `uv run --directory`). The full rule's single home is
+`orchestrator/src/orchestrator/agents/bash_cwd_guidance.py::DELETED_CWD_GUIDANCE`.
+
 ## Memory Usage
 
 ### When to read memory
@@ -352,6 +362,25 @@ It resolves the live store from wherever you are standing (`--db` and
 type and the Python type its values arrive as, and refuses loudly rather than
 reporting an empty schema. It states no column names of its own, deliberately:
 the store is the only copy of them that cannot be stale.
+
+The reconciliation TICKET store, which holds the `tkt_…` ids `submit_task`
+returns, is a second store with the same two traps. WHERE it is: one
+fused-memory server serves every project on this host, so ONE ticket store
+serves them all, in that server's reconciliation data dir:
+`/home/leo/src/dark-factory/data/reconciliation/tickets.db`. `data/` is
+untracked, so no worktree has one, and `fused-memory/data/tickets.db` is a
+0-byte decoy. The location's one home is
+`fused-memory/src/fused_memory/server/main.py::resolve_data_dir`
+(`reconciliation.data_dir` in `fused-memory/config/config.yaml`, overridable by
+`RECONCILIATION_DATA_DIR`). WHAT SHAPE it is: its key is not a task store's
+`id`, and the same tool answers with `--db`.
+
+<!-- tickets-db-schema-lookup:begin
+     EXECUTED by tests/scripts/test_tasks_db_schema_convention.py, with the
+     store swapped for a fixture. Degrade it into a hand-written sqlite query
+     and that guard goes red. -->
+- **Ticket store shape**: `python scripts/tasks_db_schema.py --db /home/leo/src/dark-factory/data/reconciliation/tickets.db`
+<!-- tickets-db-schema-lookup:end -->
 
 ## Model Routing
 
@@ -498,3 +527,4 @@ directly, not just interactive agents.
 - **Memory skill**: `/memory` — detailed reference for memory operations, categories, search patterns
 - **Config**: `fused-memory/config/config.yaml`, `.mcp.json`
 - **Design invariants**: `docs/legibility/design-invariants.md` — checkable invariants gating `/prd` decompose (G7) and `/review` phase 2
+- **Verify-result cache**: `OPERATIONS.md` §11a "Verify-result cache" — per-role modes, unit outcomes, audit and kill switch, R-cache-1/2 pointers

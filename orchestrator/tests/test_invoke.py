@@ -1112,14 +1112,14 @@ class TestInvokePiFlags:
     async def test_wildcard_spec_is_dropped_and_logged(self, tmp_path, caplog):
         with caplog.at_level(logging.WARNING):
             mock_run = await self._invoke(
-                tmp_path, allowed_tools=['mcp__jcodemunch__*', 'Read'],
+                tmp_path, allowed_tools=['mcp__verdict-tools__*', 'Read'],
             )
         cmd = mock_run.call_args.args[0]
         tools_csv = cmd[cmd.index('--tools') + 1]
         assert 'read' in tools_csv.split(',')
-        assert 'jcodemunch' not in tools_csv
+        assert 'verdict' not in tools_csv
         warning_records = [r for r in caplog.records if r.levelno >= logging.WARNING]
-        assert any('mcp__jcodemunch__*' in r.getMessage() for r in warning_records), (
+        assert any('mcp__verdict-tools__*' in r.getMessage() for r in warning_records), (
             f'expected a WARNING naming the dropped spec; got: {[r.getMessage() for r in warning_records]}'
         )
 

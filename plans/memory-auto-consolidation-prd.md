@@ -6,6 +6,10 @@ review, four reviewers, Leo ruled every finding in-window the same day).
 the hazard-gate half of C4 and C6, rows B4 and B8, and the §11 rollout (its §13 lists them):
 an LLM adjudicator sits between the predicate and any human, and the executor files no
 curator gate. Read that document first; the text below is unchanged and partly superseded.
+**Note 2026-11-17:** task 4916, named below as the shared flood-control block's other
+consumer (D6, §§7-10) and as the task waiting on the `seeded_from` recall measurement (D1),
+was cancelled by Leo's ruling on esc-10244-1. Gate filing from the weekly duplicate-cluster
+report is descoped, the executor is the block's only consumer, and nothing below waits on 4916.
 **Project:** dark_factory. **Approach:** B+H (contracts + boundary-test sketch; G5 hit:
 four packages touched, twelve mechanisms, the MCP write boundary and the task interceptor
 are load-bearing seams).

@@ -38,9 +38,16 @@ def _is_strict_int(value: object) -> TypeGuard[int]:
 
 
 def validate_metadata_query(
-    *, key: object, value: object, statuses: Sequence[str] | None, include_value: object,
+    *,
+    key: object,
+    value: object,
+    statuses: Sequence[str] | None,
+    include_value: object,
+    include_rows: object,
 ) -> None:
-    """What is looked up: the key, the value, the status vocabulary and the value opt-in.
+    """What is looked up: the key, the value, the status vocabulary and the opt-ins.
+
+    Each opt-in, ``include_value`` and ``include_rows``, must be a real bool.
 
     A misspelt status is rejected, because it would otherwise read as a key
     that no task carries.
@@ -54,8 +61,9 @@ def validate_metadata_query(
     unknown = [s for s in statuses or () if s not in _KNOWN_STATUSES]
     if unknown:
         raise _offending('statuses', unknown, f'drawn from {_KNOWN_STATUSES}')
-    if not isinstance(include_value, bool):
-        raise _offending('include_value', include_value, 'a bool')
+    for name, flag in (('include_value', include_value), ('include_rows', include_rows)):
+        if not isinstance(flag, bool):
+            raise _offending(name, flag, 'a bool')
 
 
 def validate_metadata_lookup(
@@ -64,6 +72,7 @@ def validate_metadata_lookup(
     value: object,
     statuses: object,
     include_value: object,
+    include_rows: object,
     limit: object,
     offset: object,
 ) -> None:
@@ -72,7 +81,10 @@ def validate_metadata_lookup(
         isinstance(statuses, list) and all(isinstance(s, str) for s in statuses)
     ):
         raise _offending('statuses', statuses, 'None or a list of status strings')
-    validate_metadata_query(key=key, value=value, statuses=statuses, include_value=include_value)
+    validate_metadata_query(
+        key=key, value=value, statuses=statuses,
+        include_value=include_value, include_rows=include_rows,
+    )
     if not _is_strict_int(limit) or limit < 1:
         raise _offending('limit', limit, 'an int >= 1')
     if not _is_strict_int(offset) or offset < 0:

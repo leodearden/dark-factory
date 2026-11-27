@@ -45,11 +45,11 @@ from test_merge_queue_concurrent_verify import (
     _make_branch_with_file,
     _make_config_no_runners,
     _make_fake_remote,
-    config,  # noqa: F401 — pytest fixture re-exported from γ harness
-    git_config,  # noqa: F401 — pytest fixture re-exported from γ harness
-    git_ops,  # noqa: F401 — pytest fixture re-exported from γ harness
-    git_repo,  # noqa: F401 — pytest fixture re-exported from γ harness
 )
+from test_merge_queue_concurrent_verify import config as config
+from test_merge_queue_concurrent_verify import git_config as git_config
+from test_merge_queue_concurrent_verify import git_ops as git_ops
+from test_merge_queue_concurrent_verify import git_repo as git_repo
 
 from orchestrator.merge_lane.types import QueuedBranch
 from orchestrator.merge_lane.worker import MergeRequest, SpeculativeMergeWorker

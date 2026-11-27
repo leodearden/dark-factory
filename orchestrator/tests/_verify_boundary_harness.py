@@ -59,7 +59,7 @@ import warnings
 from collections.abc import Awaitable, Callable, Mapping
 from collections.abc import Set as AbstractSet
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import Any, NamedTuple, TypeVar
 
 from _gate_fixtures import gate_argv
 from _leader_stderr import drain_exited_stderr
@@ -283,7 +283,9 @@ def tagged_pids(tag: str) -> set[int]:
     """Pids whose environment holds exactly ``HOLDER_TAG_ENV=<tag>``, never this process.
 
     An unreadable entry (vanished, or another user's) is skipped, and a
-    zombie reads an empty environ, so only live processes match.
+    zombie reads an empty environ, so only live processes match.  A live
+    process mid-exec reads empty too, so one snapshot can miss it; see
+    :func:`wait_pid_tagged`.
     """
     wanted = f'{HOLDER_TAG_ENV}={tag}'.encode()
     pids: set[int] = set()
@@ -305,6 +307,32 @@ def sweep_tagged(tag: str, *, kill: Callable[[int, int], None] = os.kill) -> Non
     for pid in tagged_pids(tag):
         with contextlib.suppress(ProcessLookupError, PermissionError):
             kill(pid, signal.SIGKILL)
+
+
+def wait_pid_tagged(
+    pid: int,
+    tag: str,
+    *,
+    timeout: float | None = None,
+    interval: float = 0.05,
+    _tagged_pids: Callable[[str], AbstractSet[int]] = tagged_pids,
+) -> bool:
+    """Poll until *pid* carries ``HOLDER_TAG_ENV=<tag>``; return whether the last probe saw it.
+
+    One :func:`tagged_pids` snapshot is not a verdict on a process that may
+    still be exec'ing: its environ reads 0 bytes across the exec (measured,
+    esc-6179-4), so a :func:`sleeper_spec` build, which publishes its pid
+    before ``exec sleep``, can be missed.  The verdict and the ``timeout=0``
+    case are :func:`_poll_until_settled`'s.
+
+    *timeout* defaults to :func:`row_discovery_ceiling_secs`, resolved when
+    the wait starts, as in :func:`wait_for_pgid_file`.  *_tagged_pids* is a
+    private seam for the self-tests.
+    """
+    timeout = row_discovery_ceiling_secs() if timeout is None else timeout
+    return _poll_until_settled(
+        lambda: pid in _tagged_pids(tag), bool, timeout=timeout, interval=interval,
+    )
 
 
 def spawn_verify_merge(
@@ -790,6 +818,31 @@ def read_proc_state(pid: int) -> StatFields | None:
     return read_stat_fields(Path('/proc') / str(pid), skip_malformed=False)
 
 
+_Probed = TypeVar('_Probed')
+
+
+def _poll_until_settled(
+    probe: Callable[[], _Probed],
+    settled: Callable[[_Probed], bool],
+    *,
+    timeout: float,
+    interval: float,
+    clock: Callable[[], float] = time.monotonic,
+) -> _Probed:
+    """Repeat *probe* until *settled* holds of its result or *timeout* passes; return that result.
+
+    The result is always the probe of the returning iteration, so a caller
+    descheduled across the deadline never asserts on a stale observation;
+    ``timeout=0`` is exactly one probe.
+    """
+    deadline = clock() + timeout
+    while True:
+        result = probe()
+        if settled(result) or clock() >= deadline:
+            return result
+        time.sleep(interval)
+
+
 def wait_pids_exited(
     pids: AbstractSet[int],
     *,
@@ -806,19 +859,17 @@ def wait_pids_exited(
     code under test's -- the same criterion as
     ``shared/src/shared/proc_group.py::pid_running`` (task 3955).
 
-    The verdict is always the probe of the returning iteration, so a caller
-    descheduled across the deadline never asserts on a stale observation;
-    ``timeout=0`` is exactly one probe.
+    The verdict and the ``timeout=0`` case are :func:`_poll_until_settled`'s.
     """
-    deadline = _clock() + timeout
-    while True:
-        running = {
+    def running() -> dict[int, StatFields]:
+        return {
             pid: state for pid in pids
             if (state := _read_state(pid)) is not None and not state.terminated
         }
-        if not running or _clock() >= deadline:
-            return running
-        time.sleep(interval)
+
+    return _poll_until_settled(
+        running, lambda survivors: not survivors, timeout=timeout, interval=interval, clock=_clock,
+    )
 
 
 class PreKillTree(NamedTuple):

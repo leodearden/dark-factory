@@ -13,6 +13,7 @@ from orchestrator.cli import main
 from orchestrator.evals.configs import (
     ARCHITECT_EVAL_CONFIGS,
     EVAL_CONFIGS,
+    FINAL_RUN_CONFIGS,
     VLLM_EVAL_CONFIGS,
     EvalConfig,
     get_config_by_name,
@@ -25,14 +26,15 @@ VLLM_NAMES: frozenset[str] = frozenset(cfg.name for cfg in VLLM_EVAL_CONFIGS)
 
 @pytest.fixture
 def vllm_env_sandbox(monkeypatch):
-    """Replace each vLLM config's env_overrides with a deep copy for test isolation.
+    """Sandbox the env_overrides of every config the CLI injects ANTHROPIC_BASE_URL into.
 
-    Monkeypatch restores the original dicts on teardown, so the module-level
-    singletons are never mutated. Shared-reference invariant between
-    VLLM_EVAL_CONFIGS and EVAL_CONFIGS is preserved because we're swapping
-    the attribute on the same EvalConfig instances.
+    `orchestrator/src/orchestrator/evals/cli.py::eval_cmd` writes it into
+    VLLM_EVAL_CONFIGS and FINAL_RUN_CONFIGS; each gets a deep copy here, and
+    monkeypatch restores the original dicts on teardown. Shared-reference
+    invariant between VLLM_EVAL_CONFIGS and EVAL_CONFIGS is preserved because
+    we're swapping the attribute on the same EvalConfig instances.
     """
-    for cfg in VLLM_EVAL_CONFIGS:
+    for cfg in [*VLLM_EVAL_CONFIGS, *FINAL_RUN_CONFIGS]:
         monkeypatch.setattr(cfg, 'env_overrides', copy.deepcopy(cfg.env_overrides))
 
 

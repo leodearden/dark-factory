@@ -39,7 +39,7 @@ _CANONICAL_EXTENSIONS = [
     'lock', 'log',
     'manifest', 'md', 'mjs', 'mts',
     'npmrc', 'png', 'py', 'python-version',
-    'ri', 'rs', 'scss', 'service', 'sh', 'step', 'stl', 'svg',
+    'ri', 'rs', 'scss', 'service', 'sh', 'stderr', 'step', 'stl', 'svg',
     'template', 'timer', 'tombstones', 'toml', 'ts', 'tsv', 'tsx', 'txt', 'typed',
     'yaml', 'yml',
 ]
@@ -142,6 +142,8 @@ _ACCEPT_PATHS = [
     'docs/reify-language-spec.tombstones',  # reify
     # reify #9058 (α-first): the first tracked reify `.tsv`, landed by reify #8662.
     'tests/infra/affected-crates-direct-sets.tsv',  # reify
+    # reify #10618 (α-first): trybuild expected output for reify #10554's must_not_compile cases.
+    'crates/reify-eval-core/tests/must_not_compile/await_inside_section.stderr',  # reify
 ]
 
 # REJECT corpus (α/γ shared vector — all must return False).  Verbatim duplicate
@@ -192,7 +194,9 @@ _DOTTED_DIRECTORY_PATHS = [
 # identical to the 2026-07-31 measurement): every tracked path whose final
 # segment contains no '.'.  dark-factory contributes Dockerfile LICENSE
 # pre-commit pre-merge-commit project-checks; reify adds cargo
-# cargo-audit-orphans reference-transaction.  Union = the 8 below.
+# cargo-audit-orphans reference-transaction, and sccache
+# (scripts/canon-bin/guard/sccache, reify task 10232, measured on reify main
+# 2026-11-23).  Union = the 9 below.
 # ---------------------------------------------------------------------------
 
 _CANONICAL_EXTENSIONLESS = [
@@ -204,11 +208,13 @@ _CANONICAL_EXTENSIONLESS = [
     'pre-merge-commit',
     'project-checks',
     'reference-transaction',
+    'sccache',
 ]
 
 # One REAL tracked path per canonical extension-less name — dark-factory unless
 # the comment says reify (same convention as _ACCEPT_PATHS above).  Verified
-# tracked with `git ls-files --error-unmatch` on 2026-08-09.  Enforced complete
+# tracked with `git ls-files --error-unmatch` on 2026-08-09 (the sccache entry
+# on 2026-11-23).  Enforced complete
 # by TestExtensionlessFilenames::test_accept_corpus_covers_every_canonical_name.
 _EXTENSIONLESS_ACCEPT_PATHS = [
     'LICENSE',
@@ -220,6 +226,8 @@ _EXTENSIONLESS_ACCEPT_PATHS = [
     'hooks/reference-transaction',
     # reify
     'scripts/agent-bin/cargo',
+    # reify
+    'scripts/canon-bin/guard/sccache',
     # reify
     'scripts/cargo-audit-orphans',
 ]

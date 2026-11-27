@@ -391,21 +391,32 @@ can point at something a human should look at. Code: `orchestrator/src/orchestra
   alarm stays open and the baseline stays. That case is the first ticks after a restart,
   before holders re-dispatch. Resolving there would close a standing wedge at every restart,
   and since a resolve keeps the baseline, the same wedge would never be re-filed.
-- *Liveness* (`orchestrator/src/orchestrator/blocker_liveness.py`). A HELD module's owner must
-  be a slot this scheduler process has dispatched and not released (`Scheduler._dispatched`);
-  otherwise the reason is `lock_without_slot`, a lock no running slot will release. A dispatched
-  owner with a live claimant is live: `shared.task_claimant.has_live_claimant` at
-  `claimant_liveness_ttl_secs`, the dispatch gate's own predicate and TTL. A workflow heartbeats
-  for its whole slot, merge phase included, so a slow holder reads live. Without a live claimant,
-  a dispatched owner is `no_live_claimant` when `in-progress` and `blocked` when `blocked`. It is
-  live when `pending` (dispatched, not yet claimed), terminal, or gone from the active read: its
-  slot is unwinding to its release. The slot's own exit path bounds that unwinding, and the
-  terminal-status watcher force-releases a slot that never unwinds
-  (`orchestrator/src/orchestrator/harness.py::Harness._force_release_wedged_slot`). The cap L1
-  reads the lock view and the in-flight set together, after the tick's awaits. A PARKED blocker's owner is followed to its own blockers, at most
-  `PARK_FOLLOW_DEPTH` = 3 parks deep (park, park, park, holder). A cycle, a deeper chain, or an
-  owner absent from the read or terminal is non-live. A park owner whose modules are all free
-  waits only for a run slot, which is live.
+- *Liveness* (`orchestrator/src/orchestrator/blocker_liveness.py`; AMENDED 2026-11-24, task
+  10700; AMENDED 2026-11-25, task 11627). A HELD module's owner must be a slot this scheduler
+  process has dispatched and not released (`Scheduler._dispatched`); otherwise the reason is
+  `lock_without_slot`, a lock no running slot will release. A dispatched owner is live when
+  terminal, `pending` with no claimant (dispatched, not yet claimed), or gone from the active
+  read: its slot awaits its claim or is unwinding to its release. The slot's own exit path
+  bounds that unwinding, and the terminal-status watcher force-releases a slot that never unwinds
+  (`orchestrator/src/orchestrator/harness.py::Harness._force_release_wedged_slot`). Any other
+  dispatched owner is live while someone alive holds it:
+  `shared.task_claimant.is_stranded_any_status` at `claimant_liveness_ttl_secs`, the dispatch
+  gate's `has_live_claimant` (its predicate and TTL) plus the legacy `metadata.infra_hold`
+  exemption. A workflow heartbeats for its whole slot, merge phase included, so a slow holder
+  reads live. An owner no one alive holds is `blocked` when `blocked`
+  (`shared.task_claimant.is_stranded_blocked`) and `no_live_claimant` in any other non-terminal
+  status. A `pending` owner still carrying a claimant whose heartbeat went stale is a slot whose
+  requeue exit hung past the TTL. Nothing else watches a non-terminal hung slot, so it reads
+  `no_live_claimant`, non-live as a stranded `blocked` owner is. The cap L1 reads the lock view
+  and the in-flight set together, after the tick's awaits. It judges claimant heartbeats as of
+  the tick's task read (`TickContext.tasks_read_at`), not the phase's wall clock, because the
+  phases between the two can outlast `claimant_liveness_ttl_secs`: judged at the phase's clock,
+  heartbeating holders filed the false `no_live_claimant` cap L1s
+  `esc-__starvation_auto_pin_cap__-160` and `-162` (task 11627). A heartbeat that goes stale
+  during a long tick is named on the next tick. A PARKED blocker's owner is followed
+  to its own blockers, at most `PARK_FOLLOW_DEPTH` = 3 parks deep (park, park, park, holder). A
+  cycle, a deeper chain, or an owner absent from the read or terminal is non-live. A park owner
+  whose modules are all free waits only for a run slot, which is live.
 - *FILE* when no cap alarm is open, the cohort alarms, and it is news against the last
   announcement: a new non-live holder, a new module behind a non-live holder (a live
   holder's lock turnover is never news), or growth to
@@ -650,6 +661,28 @@ progress is deliberately not in the key. The key must be computable from lock-ta
 state alone and stay stable from tick to tick. Branch progress is the asynchronously
 refreshed `work_product` view, and the score already credits it as continuity, which
 decides who is TRIED first. Precedence decides only whose park may block whom.
+
+**Annotation (task 6328).** The class: a candidate that is not the scored scan's top is
+refused its locks by a same-tier (or lower-tier) park whose pending owner itself waits
+on holders. It earns no skip, no park and no event, so it waits as long as the owner
+does. 6040 waited about 70 h behind 5221's park, while 5221 waited on 3096's hold of
+`harness.py`. Chosen: option (c), visibility plus a documented lever. The
+`park_refused` event names the parks, each park's priority and age, and what each owner
+waits on. The lever is to pin the waiting candidate: 6040's head pin reservation
+shadows the peer's park on the shared keys, the peer's park is restored at the
+candidate's dispatch, and no held lock is touched (OPERATIONS.md §5). The automatic
+backstop is C4's `lock_refused` gate, bounded by its auto-pin cap: at the cap the task
+joins the waiting cohort that C4's cap L1 speaks for (task 9636). Rejected for now:
+option (b), bounding how long a park may block. It is the "Park leases / expiry" row by
+another name, and it lifts C7's `backfill_max_park_age_secs` cutoff, whose named
+casualty is an owner that never dispatches. Deferred: option (a), a bounded automatic
+pin. It adds an automatic below-rank-1 reservation trigger ("refused by parks alone")
+that has never been simulated, and the "Below-rank-1 park INSTALLATION" row admits only
+a gated follow-up. Whether automatic reservations act on dispatch at all is under Leo's
+ruling at gate task 10128, which reviews the 2026-11-15..29 trial with
+`fairness.skip_threshold` at 1000000; its "change" arm names "reserve only for a task
+that has been overtaken". `park_refused` counts are the frequency evidence a later (a)
+would need. See `orchestrator/src/orchestrator/park_refusal.py`.
 
 ## 8. Pre-conditions and substrate verification (G3)
 

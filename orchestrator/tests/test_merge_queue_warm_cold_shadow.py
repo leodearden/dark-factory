@@ -12,6 +12,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _git_fixtures import seed_repo
 from _harness_store_paths import point_harness_stores_at
 from _merge_lane_fakes import FakeVerifier, VerifyScript, lane_scene_config
 from _orch_helpers import (
@@ -843,23 +844,10 @@ class TestSubmitShadowDivergenceEscalation:
 # --- Real-git fixtures for create_ephemeral_verify_worktree ---
 
 
-async def _setup_repo(repo: Path) -> None:
-    """Set up a minimal git repo with one commit."""
-    await _run(['git', 'init', '-b', 'main'], cwd=repo)
-    await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=repo)
-    await _run(['git', 'config', 'user.name', 'Test'], cwd=repo)
-    (repo / 'README.md').write_text('# Test\n')
-    await _run(['git', 'add', '-A'], cwd=repo)
-    await _run(['git', 'commit', '-m', 'Initial commit'], cwd=repo)
-
-
 @pytest.fixture
 def git_repo_wcs(tmp_path: Path) -> Path:
     """Real git repository for warm/cold shadow tests."""
-    repo = tmp_path / 'repo'
-    repo.mkdir()
-    asyncio.run(_setup_repo(repo))
-    return repo
+    return seed_repo(tmp_path / 'repo')
 
 
 @pytest.fixture
@@ -1779,39 +1767,18 @@ class TestRunPostMergeVerifyOnResultCallback:
 # --- Integration: _verify_and_advance calls _maybe_schedule_shadow_compare ---
 
 
-async def _setup_wcs_repo(repo: Path) -> None:
-    """Set up a minimal git repo for integration tests (step-15)."""
-    from orchestrator.git_ops import _run
-
-    await _run(['git', 'init', '-b', 'main'], cwd=repo)
-    await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=repo)
-    await _run(['git', 'config', 'user.name', 'Test'], cwd=repo)
-    (repo / 'README.md').write_text('# Test\n')
-    await _run(['git', 'add', '-A'], cwd=repo)
-    await _run(['git', 'commit', '-m', 'Initial commit'], cwd=repo)
-
-
 @pytest.fixture
-def wcs_repo(tmp_path: Path) -> Path:
-    """Minimal git repo for step-15 integration tests."""
-    repo = tmp_path / 'repo'
-    repo.mkdir()
-    asyncio.run(_setup_wcs_repo(repo))
-    return repo
-
-
-@pytest.fixture
-def wcs_git_ops(wcs_repo: Path) -> GitOps:
-    """GitOps with persistent_merge_worktree OFF (wired in config, not git_ops)."""
+def wcs_git_ops(git_repo_wcs: Path) -> GitOps:
+    """GitOps with persistent_merge_worktree ON (warm path active)."""
     git = GitConfig(
         main_branch='main',
         branch_prefix='task/',
         remote='origin',
         worktree_dir='.worktrees',
         push_after_advance=False,
-        persistent_merge_worktree=True,  # warm path active
+        persistent_merge_worktree=True,
     )
-    return GitOps(git, wcs_repo)
+    return GitOps(git, git_repo_wcs)
 
 
 async def _make_task_branch(
@@ -1855,7 +1822,7 @@ class TestVerifyAndAdvanceShadowCompareScheduling:
 
     @pytest.mark.asyncio
     async def test_done_land_schedules_the_cold_leg(
-        self, wcs_git_ops: GitOps, wcs_repo: Path,
+        self, wcs_git_ops: GitOps, git_repo_wcs: Path,
     ) -> None:
         """A warm-verify 'done' land spawns the cold leg and persists the cadence.
 
@@ -1864,7 +1831,7 @@ class TestVerifyAndAdvanceShadowCompareScheduling:
         the escalation queue handed to ``SpeculativeMergeWorker(...)`` is the
         one that reaches the leg.
         """
-        cfg = _make_warm_cold_config(wcs_repo, persistent=True, shadow_compare=True)
+        cfg = _make_warm_cold_config(git_repo_wcs, persistent=True, shadow_compare=True)
         wt = await _make_task_branch(wcs_git_ops, 'task-sched', 'f.py', 'x = 1\n')
         req = _make_smw_req('task-sched', 'task-sched', wt, cfg)
 
@@ -1900,13 +1867,13 @@ class TestVerifyAndAdvanceShadowCompareScheduling:
             'the escalation queue handed to the SMW constructor must reach the '
             'cold leg it schedules'
         )
-        saved = _load_shadow_compare_state(_shadow_state_path(wcs_repo))
+        saved = _load_shadow_compare_state(_shadow_state_path(git_repo_wcs))
         assert saved.merges_since_last_shadow == 0
         assert saved.last_shadow_run_at > 0.0
 
     @pytest.mark.asyncio
     async def test_done_land_does_not_await_cold_leg(
-        self, wcs_git_ops: GitOps, wcs_repo: Path,
+        self, wcs_git_ops: GitOps, git_repo_wcs: Path,
     ) -> None:
         """The 'done' outcome must arrive BEFORE the cold compare completes.
 
@@ -1915,7 +1882,7 @@ class TestVerifyAndAdvanceShadowCompareScheduling:
         running.  ``await_start`` is what keeps that non-vacuous — it proves a
         leg really was spawned rather than skipped.
         """
-        cfg = _make_warm_cold_config(wcs_repo, persistent=True, shadow_compare=True)
+        cfg = _make_warm_cold_config(git_repo_wcs, persistent=True, shadow_compare=True)
         wt = await _make_task_branch(
             wcs_git_ops, 'task-noblock', 'g.py', 'y = 2\n'
         )

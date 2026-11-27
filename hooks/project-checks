@@ -240,8 +240,16 @@ fi
 # At most GATE_SLOTS units run at once: a staged shared/ or escalation/ file,
 # or a repo-root module other than conftest.py, lists every module's type
 # check, on a host whose merge verifies already load it. Units are reported
-# in listing order. An interrupt (INT, or TERM sent to this hook alone) stops
-# every running unit's whole process tree; the unit logs go on any exit.
+# in listing order. Each unit runs in its own session, so a terminal's Ctrl-C
+# or hangup reaches only this hook, and a SIGKILL to the commit's group, which
+# no hook can trap, reaches no unit at all. On INT, TERM or HUP the hook TERMs
+# the whole process group of every unit it has not yet collected, orphaned
+# descendants included even once the unit's own shell has exited, and ignores
+# further INT, TERM and HUP while it does. The unit logs go on any exit.
+# No command substitution runs while those traps are armed: bash drops a
+# trapped SIGINT that lands while it reaps one whose child then exits normally
+# (tests/scripts/test_project_checks_merge_gate_parity.py::test_a_ctrl_c_that_lands_while_the_hook_reaps_a_helper_mid_launch_stops_the_launched_unit),
+# so every unit's log is named by its index in one directory made beforehand.
 GATE_SLOTS=4
 gate_start=$SECONDS
 staged="$(cd "$ROOT" && git -c core.quotepath=false diff --cached --no-renames --name-only --diff-filter=ACMRD)" || {
@@ -260,46 +268,51 @@ if [ -z "$listing" ]; then
 else
     gate_units=()
     gate_commands=()
-    gate_logs=()
     gate_pids=()
     gate_collected=0
     gate_failed=false
-    gate_process_tree() {
-        local child
-        echo "$1"
-        for child in $(pgrep -P "$1"); do gate_process_tree "$child"; done
-    }
     gate_stop_units() {
-        local job tree=()
-        for job in $(jobs -rp); do tree+=($(gate_process_tree "$job")); done
-        [ "${#tree[@]}" -eq 0 ] || kill -TERM "${tree[@]}" 2>/dev/null
+        local pid live=($(jobs -rp))
+        local -A groups=()
+        for pid in "${live[@]}" "${gate_pids[@]:gate_collected}"; do groups["-$pid"]=1; done
+        [ "${#groups[@]}" -eq 0 ] || kill -TERM -- "${live[@]}" "${!groups[@]}" 2>/dev/null
     }
     gate_collect_next() {
         local i=$gate_collected unit_rc=0
-        gate_collected=$((gate_collected + 1))
         wait "${gate_pids[$i]}" || unit_rc=$?
+        gate_collected=$((gate_collected + 1))
         if [ "$unit_rc" -eq 0 ]; then
             echo "  ok ${gate_units[$i]}"
         else
             echo "pre-commit: ${gate_units[$i]} FAILED (rc=$unit_rc): ${gate_commands[$i]}"
-            tail -n 60 "${gate_logs[$i]}"
+            tail -n 60 "$gate_log_dir/$i.log"
             gate_failed=true
         fi
     }
-    trap 'rm -f "${gate_logs[@]}"' EXIT
-    trap 'gate_stop_units; exit 130' INT
-    trap 'gate_stop_units; exit 143' TERM
+    gate_interrupted() {
+        trap '' INT TERM HUP
+        gate_stop_units
+        exit "$1"
+    }
+    gate_log_dir="$(mktemp -d)" || {
+        echo "pre-commit: could not create the merge-gate unit log directory (mktemp rc=$?);"
+        echo "  refusing the commit rather than skipping the merge-gate checks."
+        exit 1
+    }
+    trap 'rm -rf "$gate_log_dir"' EXIT
+    trap 'gate_interrupted 130' INT
+    trap 'gate_interrupted 143' TERM
+    trap 'gate_interrupted 129' HUP
     while IFS=$'\t' read -r unit command; do
         if [ "$((${#gate_pids[@]} - gate_collected))" -ge "$GATE_SLOTS" ]; then
             gate_collect_next
         fi
-        log="$(mktemp)"
+        log="$gate_log_dir/${#gate_pids[@]}.log"
         echo "  running $unit: $command"
-        (cd "$ROOT" && bash -c "$command") < /dev/null > "$log" 2>&1 &
+        (cd "$ROOT" && exec setsid -w bash -c "$command") < /dev/null > "$log" 2>&1 &
         gate_pids+=("$!")
         gate_units+=("$unit")
         gate_commands+=("$command")
-        gate_logs+=("$log")
     done <<< "$listing"
     while [ "$gate_collected" -lt "${#gate_pids[@]}" ]; do
         gate_collect_next

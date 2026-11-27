@@ -13,6 +13,7 @@ from unittest.mock import DEFAULT, AsyncMock, MagicMock, patch
 import httpx
 import pytest
 import pytest_asyncio
+from _code_writer_links import assert_writes_c5, structural_task_links, subject_task
 from _fm_helpers import LoopFreedomProbe
 from _qdrant_responses import missing_collection_404
 from qdrant_client.http.exceptions import UnexpectedResponse
@@ -33,6 +34,8 @@ from shared.testing import make_gate_mock
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.config.schema import TaskmasterConfig
+from fused_memory.memory_metadata import RECONCILIATION_COMPLETION_ECHO_MARKER
+from fused_memory.models.invocation_ledger import LedgerRole
 from fused_memory.models.reconciliation import (
     AssembledPayload,
     EventSource,
@@ -2098,8 +2101,7 @@ class TestStage1CycleSummaryRemediationBackstop:
         remediation driver. The finally-block backstop must still fire and
         stamp the breadcrumb even though _run_remediation_pass completes
         normally instead of raising, and even though this except branch
-        builds a differently-shaped `_error` record (`'deferred': True`, no
-        `error_type` of a raising exception)."""
+        writes the deferral variant of the `_error` record (`'deferred': True`)."""
         import json
 
         from shared.cli_invoke import AllAccountsCappedException
@@ -4741,6 +4743,67 @@ async def test_make_stages_returns_clean_instances(journal, event_buffer, mock_m
 
 
 @pytest.mark.asyncio
+async def test_make_stages_hands_the_cost_store_to_every_stage(
+    journal, event_buffer, mock_memory_service,
+):
+    """Every stage's CLI call carries the harness's invocations ledger store (task 10414)."""
+    from fused_memory.models.reconciliation import Watermark
+    from fused_memory.reconciliation.cli_stage_runner import StageResult
+
+    store = MagicMock(name='cost_store')
+    harness = make_harness(
+        journal=journal,
+        event_buffer=event_buffer,
+        memory_service=mock_memory_service,
+        taskmaster=AsyncMock(),
+        cost_store=store,
+    )
+    ledgers = []
+
+    async def capture_run_stage_via_cli(**kwargs):
+        ledgers.append(kwargs['ledger'])
+        return StageResult(success=True, report={'summary': 'ok'})
+
+    stages = harness._make_stages(_scope('test-project', '/tmp/test-project'))
+    for stage in stages:
+        with (
+            patch.object(stage, 'assemble_payload', AsyncMock(return_value='payload')),
+            patch(
+                'fused_memory.reconciliation.stages.base.run_stage_via_cli',
+                side_effect=capture_run_stage_via_cli,
+            ),
+        ):
+            await stage.run(
+                events=[],
+                watermark=Watermark(project_id='test-project'),
+                prior_reports=[],
+                run_id='run-h',
+            )
+
+    assert [ledger.cost_store for ledger in ledgers] == [store] * len(stages)
+    assert [ledger.role for ledger in ledgers] == [
+        LedgerRole.for_stage(stage.stage_id) for stage in stages
+    ]
+
+
+def test_harness_builds_its_judge_with_the_cost_store(journal, event_buffer, mock_memory_service):
+    """The judge writes its LLM call to the harness's invocations ledger (task 10414)."""
+    store = MagicMock(name='cost_store')
+
+    with patch('fused_memory.reconciliation.harness.Judge') as judge_cls:
+        make_harness(
+            journal=journal,
+            event_buffer=event_buffer,
+            memory_service=mock_memory_service,
+            taskmaster=AsyncMock(),
+            config=make_harness_config(judge_enabled=True),
+            cost_store=store,
+        )
+
+    assert judge_cls.call_args.kwargs['cost_store'] is store
+
+
+@pytest.mark.asyncio
 async def test_cancellation_cleanup_failure_preserves_cancelled_error(
     journal,
     event_buffer,
@@ -5401,14 +5464,19 @@ def _remediation_pass_under_test(harness):
     )
 
 
-def _assert_run_failure_record(err, *, error_type, failed_stage, message, errorname, errorcode):
+def _assert_run_failure_record(
+    err, *, error_type, failed_stage, message, errorname, errorcode, message_in_traceback=True,
+):
     """Every key is read by indexing, so a missing sqlite key fails even when
-    the expected value is None."""
+    the expected value is None. A driver that records its own message instead
+    of the exception's passes message_in_traceback=False."""
     assert err['error_type'] == error_type
+    assert err['error_message'] == message
     assert err['failed_stage'] == failed_stage
     assert err['traceback'], 'the failure record must carry the traceback'
     assert error_type in err['traceback']
-    assert message in err['traceback']
+    if message_in_traceback:
+        assert message in err['traceback']
     assert err['sqlite_errorname'] == errorname
     assert err['sqlite_errorcode'] == errorcode
 
@@ -5551,13 +5619,85 @@ async def test_remediation_pass_cancellation_terminalises_row_as_failed(
 
     row = await _settled_remediation_row(journal)
     assert row.status == 'failed'
-    err = row.stage_reports['_error']
-    assert err['error_type'] == 'CancelledError'
-    assert err['failed_stage'] == 'task_knowledge_sync'
-    assert err['traceback']
-    assert err['sqlite_errorname'] is None
+    _assert_run_failure_record(
+        row.stage_reports['_error'],
+        error_type='CancelledError', failed_stage='task_knowledge_sync',
+        message='Remediation pass cancelled (shutdown, timeout or external cancellation)',
+        message_in_traceback=False, errorname=None, errorcode=None,
+    )
     assert 'memory_consolidator' in row.stage_reports
     assert row.id not in {r.id for r in await journal.get_running_runs()}
+
+
+@pytest.mark.asyncio
+async def test_run_full_cycle_cancellation_records_traceback_and_sqlite_classification(
+    journal, event_buffer, mock_memory_service,
+):
+    """A cancelled full cycle records the same failure evidence as the
+    remediation pass, traceback and sqlite classification included."""
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    await event_buffer.push(_make_event())
+    stage_entered = asyncio.Event()
+    harness.stages[0].run = _stalling_stage_run(stage_entered)
+    _mock_stage_run(harness.stages[1])
+    _mock_stage_run(harness.stages[2])
+
+    outer_task = asyncio.create_task(harness.run_full_cycle('test-project', 'buffer_size:1'))
+    await _cancel_once_entered(outer_task, stage_entered)
+    with pytest.raises(asyncio.CancelledError):
+        await outer_task
+
+    [row] = await journal.get_recent_runs('test-project', limit=1)
+    assert row.run_type == 'full'
+    assert row.status == 'failed'
+    _assert_run_failure_record(
+        row.stage_reports['_error'],
+        error_type='CancelledError', failed_stage='memory_consolidator',
+        message='Run cancelled (timeout or external cancellation)',
+        message_in_traceback=False, errorname=None, errorcode=None,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ('drive', 'run_type'),
+    [
+        pytest.param(
+            lambda harness: harness.run_full_cycle('test-project', 'buffer_size:1'), 'full',
+            id='full_cycle',
+        ),
+        pytest.param(_remediation_pass_under_test, 'remediation', id='remediation_pass'),
+    ],
+)
+async def test_all_accounts_capped_deferral_records_traceback_and_sqlite_classification(
+    journal, event_buffer, mock_memory_service, drive, run_type,
+):
+    """An AllAccountsCapped deferral, in either driver, records the same
+    classified failure evidence as any other run-ending exception, plus its
+    ``deferred`` marker."""
+    from shared.cli_invoke import AllAccountsCappedException
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    await event_buffer.push(_make_event())
+    harness.stages[0].run = _raising_stage_run(
+        lambda: AllAccountsCappedException(retries=3, elapsed_secs=1.0, label='stage'),
+    )
+    _mock_stage_run(harness.stages[1])
+    _mock_stage_run(harness.stages[2])
+
+    await drive(harness)
+
+    [row] = await journal.get_recent_runs('test-project', limit=1)
+    assert row.run_type == run_type
+    assert row.status == 'failed'
+    err = row.stage_reports['_error']
+    assert err['deferred'] is True
+    _assert_run_failure_record(
+        err,
+        error_type='AllAccountsCappedException', failed_stage='memory_consolidator',
+        message='stage: all accounts capped after 3 retries (1.0s elapsed)',
+        errorname=None, errorcode=None,
+    )
 
 
 @pytest.mark.asyncio
@@ -11518,6 +11658,36 @@ class TestReplayDeferredWritesCompletionSummaryDedup:
             f'Expected an INFO log mentioning task 517 but got: '
             f'{[r.message for r in caplog.records]}'
         )
+
+    @pytest.mark.asyncio
+    async def test_a_replayed_completion_echo_keeps_its_task_link(
+        self, journal, event_buffer, mock_memory_service
+    ):
+        """C5: a deferred completion echo replays verbatim and still links its task."""
+        mock_memory_service.search = AsyncMock(return_value=[])
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+        content = "Task 'Wire the census' completed. Added the census module"
+        await event_buffer.defer_write(
+            'test-project',
+            content,
+            'observations_and_summaries',
+            {
+                **RECONCILIATION_COMPLETION_ECHO_MARKER,
+                'task_id': '4102',
+                '_deferred': True,
+                '_causation_id': 'run-1',
+            },
+            agent_id='targeted-reconciliation',
+        )
+
+        await harness._replay_deferred_writes(ProjectId('test-project'))
+
+        mock_memory_service.add_memory.assert_awaited_once()
+        replayed = mock_memory_service.add_memory.call_args.kwargs
+        assert replayed['content'] == content
+        assert structural_task_links(replayed, project_id='test-project') == {
+            subject_task('test-project', '4102'),
+        }
 
     @pytest.mark.asyncio
     async def test_no_transition_bypasses_dedup(
@@ -18459,11 +18629,44 @@ class TestHarnessReconcileStatusCorrection:
         )
 
         # The functionally meaningful census fields must survive removal of
-        # the citation. (Deliberately not locking the surrounding prose here
-        # — that would make the test brittle to harmless rephrasing.)
-        assert 'done=' in content
-        assert 'total=' in content
-        assert 'active=' in content
+        # the citation, as structured metadata rather than prose (C5).
+        metadata = harness.memory.add_memory.call_args.kwargs['metadata']
+        assert metadata['task_count_done'] == 2
+        assert metadata['task_count_total'] == 5
+        assert metadata['active_tasks'] == [3, 4, 5]
+
+    @pytest.mark.asyncio
+    async def test_superseding_write_names_no_task_status(
+        self, journal, event_buffer, mock_memory_service
+    ):
+        """C5: the census record has no subject task, so it links none, and its
+        text names no task status; the counts live only in its metadata."""
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+        cached_memory = {
+            'id': 'stale-memory-id',
+            'created_at': '2026-06-30T00:00:00+00:00',
+            'metadata': {
+                'kind': 'project_status_correction',
+                'task_count_done': 1,
+                'task_count_total': 3,
+                'active_tasks': [2, 3],
+            },
+        }
+        harness.memory.get_memories_by_metadata = AsyncMock(return_value=[cached_memory])
+        harness.memory.add_memory = AsyncMock(return_value={'status': 'created'})
+        harness.memory.delete_memory = AsyncMock(return_value={'status': 'deleted'})
+
+        await harness._reconcile_status_correction(
+            'test-project', {'1': 'done', '2': 'done', '3': 'pending'}
+        )
+
+        written = harness.memory.add_memory.call_args.kwargs
+        assert_writes_c5(written, project_id='test-project', subject=None)
+        assert written['metadata']['kind'] == 'project_status_correction'
+        assert written['metadata']['supersedes'] == ['stale-memory-id']
+        assert written['metadata']['task_count_done'] == 2
+        assert written['metadata']['task_count_total'] == 3
+        assert written['metadata']['active_tasks'] == [3]
 
     @pytest.mark.asyncio
     async def test_query_exception_fails_open(
@@ -21193,21 +21396,19 @@ def test_routed_record_is_invisible_to_the_orchestrator_l1_guards(
 
     `EscalationQueue.has_open_l1` is LEVEL-1-ONLY
     (`escalation/queue.py::EscalationQueue.has_open_l1`, which delegates to
-    `get_by_task(task_id, status='pending', level=1)`), and the orchestrator
-    reads it UNCATEGORIZED — i.e. "is a human already on this task?" — at
-    guards that divert real work: TWO sites in `orchestrator/workflow.py`.
+    `get_by_task(task_id, status='pending', level=1)`), and the orchestrator's
+    guards that divert real work — "is a human already on this task?" — read
+    pending LEVEL-1 records only.
     That population is enumerated authoritatively,
     in `path::symbol` form, in the `FINDING_TASK_ESCALATION_LEVEL` comment block
     of `fused_memory/reconciliation/finding_task_escalation.py` — read it there
     rather than restating it here, and do not reintroduce bare line pins
     (CLAUDE.md: cite as `path/to/module.py::symbol`, never `module.py:1234`).
-    Deliberately a POINTER and not a summary-with-names: an earlier revision
-    named one of the two workflow.py sites and read as if that were the whole
-    set, which is how the block's own list came to be missing one (see the
-    correction note in it).
+    Deliberately a POINTER and not a summary-with-names: a summary here would
+    read as the whole set and drift from the block's list.
 
-    A recon-authored L1 would answer YES to every one of them, turning a
-    PASSIVE observation into a gate on dispatch. The two assertions below are
+    A recon-authored L1 sitting on the task could answer YES to them, turning
+    a PASSIVE observation into a gate on dispatch. The two assertions below are
     together the executable proof that the collision class is closed WITHOUT
     sacrificing the acceptance criterion — the record is still on the task's
     own ladder, it simply is not an L1.
@@ -21225,10 +21426,10 @@ def test_routed_record_is_invisible_to_the_orchestrator_l1_guards(
 
     queue = EscalationQueue(queue_dir)
 
-    # (1) Invisible to every uncategorized L1 guard above.
+    # (1) Invisible to every level-1 guard above.
     assert queue.has_open_l1('4458') is False, (
         'a routed recon finding must NOT register as an open L1 — that is the '
-        'signal every uncategorized orchestrator guard reads as "a human is '
+        'signal every orchestrator level-1 guard reads as "a human is '
         'handling this task"'
     )
 

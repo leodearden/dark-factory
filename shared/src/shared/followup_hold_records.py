@@ -1,9 +1,10 @@
-"""``metadata.followup_holder`` and ``metadata.followup_hold``: the follow-up holder's marker and a held task's record.
+"""``metadata.followup_holder``, ``metadata.followup_hold`` and ``metadata.finding_set_hold``: the follow-up hold's records.
 
 Contract: plans/follow-up-filing-shape-prd.md §4.3 and §3 decisions 9-14. A held task is one with a
 dependency edge on its project's holder; the edge is the authority for "held now" and
-``followup_hold`` is its history. Both keys are machine-written only, by
-fused-memory/src/fused_memory/middleware/followup_hold.py. The schema lives in shared so
+``followup_hold`` is its history. ``followup_holder`` and ``followup_hold`` are machine-written
+only, by fused-memory/src/fused_memory/middleware/followup_hold.py. ``finding_set_hold`` is
+caller-written at filing, by the findings instrument (decision 9). The schema lives in shared so
 fused-memory's write boundary and the orchestrator parse the same classes.
 """
 
@@ -11,11 +12,13 @@ from __future__ import annotations
 
 from enum import StrEnum
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 __all__ = [
+    'FINDING_SET_HOLD_METADATA_KEY',
     'FOLLOWUP_HOLDER_METADATA_KEY',
     'FOLLOWUP_HOLD_METADATA_KEY',
+    'FindingSetHold',
     'FollowupHold',
     'FollowupHolder',
     'PromotionCause',
@@ -24,6 +27,7 @@ __all__ = [
 
 FOLLOWUP_HOLDER_METADATA_KEY = 'followup_holder'
 FOLLOWUP_HOLD_METADATA_KEY = 'followup_hold'
+FINDING_SET_HOLD_METADATA_KEY = 'finding_set_hold'
 
 _RECORD_CONFIG = ConfigDict(frozen=True, extra='forbid')
 
@@ -64,3 +68,11 @@ class FollowupHold(BaseModel):
     holder: int
     held_at: str
     promoted: PromotionRecord | None = None
+
+
+class FindingSetHold(BaseModel):
+    """Stamped on each member of a cleanup set ruled not to be scheduled individually: held behind the holder, never promoted by a citation."""
+
+    model_config = _RECORD_CONFIG
+
+    ruling: str = Field(min_length=1)

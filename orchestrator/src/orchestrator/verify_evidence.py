@@ -8,6 +8,7 @@ import hashlib
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from enum import Enum, StrEnum
+from types import MappingProxyType
 from typing import Any, Protocol
 
 from orchestrator.verify_cache.modes import CacheMode
@@ -33,12 +34,26 @@ class Leg(StrEnum):
     TYPE = 'type'
 
 
+#: The ``ModuleConfig`` field holding each leg's command.
+COMMAND_FIELD_BY_LEG: Mapping[Leg, str] = MappingProxyType({
+    Leg.TEST: 'test_command', Leg.LINT: 'lint_command', Leg.TYPE: 'type_check_command',
+})
+if set(COMMAND_FIELD_BY_LEG) != set(Leg):
+    raise AssertionError(f'a Leg has no command field: {sorted(set(Leg) - set(COMMAND_FIELD_BY_LEG))}')
+
+
 class UnitOutcome(StrEnum):
     RAN_GREEN = 'ran_green'
     RAN_RED = 'ran_red'
     CACHE_HIT = 'cache_hit'
     WOULD_HIT = 'would_hit'
     UNAVAILABLE = 'unavailable'
+
+
+#: The outcomes whose unit verdict is green: every red is RAN_RED.
+GREEN_OUTCOMES = frozenset({
+    UnitOutcome.RAN_GREEN, UnitOutcome.CACHE_HIT, UnitOutcome.WOULD_HIT, UnitOutcome.UNAVAILABLE,
+})
 
 
 class VerifySite(StrEnum):
@@ -78,13 +93,24 @@ def counts_as_branch_verdict(data: Mapping[str, Any]) -> bool:
 
 @dataclass(frozen=True)
 class VerifyUnit:
-    """One verified unit and how its verdict was reached; ``key`` is its cache key, when it has one."""
+    """One verified unit and how its verdict was reached; ``key`` is its cache key, when it has one.
+
+    ran_red is every red. would_hit and unavailable imply the leg ran green.
+    ``evidence_event_id`` is the replayed green (cache_hit), the green a replay
+    would have served (would_hit), or, on ran_red, the green a log-mode replay
+    would have wrongly served.
+    """
 
     unit: str
     tier: UnitTier
     key: str | None
     outcome: UnitOutcome
     evidence_event_id: int | None = None
+    reason: str | None = None
+
+    @property
+    def would_have_leaked(self) -> bool:
+        return self.outcome is UnitOutcome.RAN_RED and self.evidence_event_id is not None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -93,6 +119,7 @@ class VerifyUnit:
             'key': self.key,
             'outcome': str(self.outcome),
             'evidence_event_id': self.evidence_event_id,
+            'reason': self.reason,
         }
 
     @classmethod
@@ -103,6 +130,22 @@ class VerifyUnit:
 def module_leg_name(module_prefix: str | None, leg: str) -> str:
     """The unit name of one module leg, e.g. ``module:scripts:type``."""
     return f'module:{module_prefix or GLOBAL_MODULE}:{leg}'
+
+
+class LegCommands(Protocol):
+    @property
+    def test_command(self) -> str | None: ...
+    @property
+    def lint_command(self) -> str | None: ...
+    @property
+    def type_check_command(self) -> str | None: ...
+
+
+def module_unit_ids(module_prefix: str | None, commands: LegCommands) -> tuple[str, ...]:
+    """The unit of every leg of module *module_prefix* whose command *commands* sets."""
+    return tuple(
+        module_leg_name(module_prefix, leg) for leg, attr in COMMAND_FIELD_BY_LEG.items() if getattr(commands, attr)
+    )
 
 
 def module_leg_unit(module_prefix: str | None, leg: str, rc: int) -> VerifyUnit:

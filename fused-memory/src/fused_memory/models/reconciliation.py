@@ -23,6 +23,8 @@ class EventType(StrEnum):
     followup_held = 'followup_held'
     followup_hold_backfilled = 'followup_hold_backfilled'
     followup_holder_protected = 'followup_holder_protected'
+    followup_promoted = 'followup_promoted'
+    followup_promotion_deferred = 'followup_promotion_deferred'
 
 
 class EventSource(StrEnum):
@@ -132,7 +134,9 @@ class StageReport(BaseModel):
     items_flagged: list[dict] = Field(default_factory=list)
     stats: dict = Field(default_factory=dict)
     llm_calls: int = 0
-    tokens_used: int = 0
+    tokens_used: int = 0  # input + output only; rule at cli_stage_runner.py::StageResult
+    cache_read_tokens: int = 0
+    cache_create_tokens: int = 0
     # None = unrecorded (legacy journal rows, harness-synthesized reports); never
     # read it as completed.
     agent_outcome: StageAgentOutcome | None = None

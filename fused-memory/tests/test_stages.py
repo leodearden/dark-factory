@@ -3,6 +3,7 @@
 import contextlib
 import json
 import logging
+import re
 import subprocess
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
@@ -12,6 +13,8 @@ from unittest.mock import ANY, AsyncMock, MagicMock, patch
 import pytest
 import pytest_asyncio
 from _clip_assertions import assert_elided
+from _code_writer_links import assert_writes_c5
+from _count_call_spelling import non_keyword_count_calls
 from _flag_for_stage2_pool_fake import LiveFlagPool
 from _fm_git_repos import init_ab_commit_repo, init_merge_history_repo
 from _fm_helpers import (
@@ -34,6 +37,7 @@ from shared.task_claimant import DEFAULT_CLAIMANT_HEARTBEAT_TTL
 
 import fused_memory.reconciliation.stages.base as base_module
 from fused_memory.config.schema import ReconciliationConfig
+from fused_memory.models.invocation_ledger import InvocationLedger, LedgerRole
 from fused_memory.models.reconciliation import (
     EventSource,
     EventType,
@@ -2988,9 +2992,7 @@ class TestProactiveSampling:
 
     # --- Step 10: 'Your Task' section includes proactive step ---
 
-    @pytest.mark.asyncio
-    async def test_payload_your_task_includes_proactive_step(self, mock_deps, watermark):
-        """The 'Your Task' section in the payload includes a proactive spot-check instruction."""
+    async def _payload_with_active_tasks(self, mock_deps, watermark) -> str:
         stage = make_configured_task_knowledge_sync_stage(mock_deps, project_id='test_project', project_root='/tmp/test_project')
         mock_deps['taskmaster'].get_tasks.return_value = {
             'tasks': [
@@ -2998,8 +3000,12 @@ class TestProactiveSampling:
                 self._make_task(2, 'blocked'),
             ]
         }
+        return await stage.assemble_payload([], watermark, [])
 
-        payload = await stage.assemble_payload([], watermark, [])
+    @pytest.mark.asyncio
+    async def test_payload_your_task_includes_proactive_step(self, mock_deps, watermark):
+        """The 'Your Task' section in the payload includes a proactive spot-check instruction."""
+        payload = await self._payload_with_active_tasks(mock_deps, watermark)
 
         # The 'Your Task' section should instruct the agent to review the proactive sample
         assert 'Proactive Task Sample' in payload
@@ -3009,6 +3015,16 @@ class TestProactiveSampling:
         assert proactive_step_count >= 1, (
             "The 'Your Task' instruction section should reference the Proactive Task Sample"
         )
+
+    @pytest.mark.asyncio
+    async def test_payload_spells_count_gate_with_keyword_filters(self, mock_deps, watermark):
+        payload = await self._payload_with_active_tasks(mock_deps, watermark)
+
+        offending = non_keyword_count_calls(payload)
+        assert offending == [], (
+            f'Stage 2 payload spells count_memories_by_metadata positionally: {offending}'
+        )
+        assert 'count_memories_by_metadata(' in payload[payload.index('## Your Task'):]
 
     # --- Step: lazy iterable acceptance (task-709) ---
 
@@ -3328,6 +3344,63 @@ class TestRunIdValidation(BaseStageValidationTest):
         assert f'run_id: {run_id_value}' in captured_kwargs['payload']
 
 
+class TestStageInvocationLedger(BaseStageValidationTest):
+    """Each stage hands its run's ledger keys to its CLI call and reports its tokens (task 10414)."""
+
+    _STAGES = [
+        pytest.param(MemoryConsolidator, StageId.memory_consolidator, id='stage1'),
+        pytest.param(TaskKnowledgeSync, StageId.task_knowledge_sync, id='stage2'),
+        pytest.param(IntegrityCheck, StageId.integrity_check, id='stage3'),
+    ]
+
+    async def _run_capturing(self, stage) -> tuple[dict, StageReport]:
+        captured: dict = {}
+
+        async def capture_run_stage_via_cli(**kwargs):
+            captured.update(kwargs)
+            return StageResult(
+                success=True,
+                report={'summary': 'ok'},
+                tokens_used=1500,
+                cache_read_tokens=50000,
+                cache_create_tokens=4000,
+            )
+
+        with self._patch_stage(stage, cli_side_effect=capture_run_stage_via_cli):
+            report = await stage.run(
+                events=[],
+                watermark=Watermark(project_id=stage.project_id),
+                prior_reports=[],
+                run_id='run-l',
+            )
+        return captured, report
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(('stage_cls', 'stage_id'), _STAGES)
+    async def test_stage_passes_its_ledger_and_reports_its_tokens(
+        self, mock_deps, stage_cls, stage_id,
+    ):
+        store = MagicMock(name='cost_store')
+        stage = stage_cls(stage_id, **mock_deps, cost_store=store)
+
+        captured, report = await self._run_capturing(stage)
+
+        assert captured['ledger'] == InvocationLedger(
+            store, LedgerRole.for_stage(stage_id), 'run-l', stage.project_id,
+        )
+        assert report.tokens_used == 1500
+        assert report.cache_read_tokens == 50000
+        assert report.cache_create_tokens == 4000
+
+    @pytest.mark.asyncio
+    async def test_stage_without_store_passes_no_ledger(self, mock_deps):
+        stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
+
+        captured, _report = await self._run_capturing(stage)
+
+        assert captured['ledger'] is None
+
+
 class TestStage2GuardrailProjectIdGating:
     """Tests that the contamination guardrail is injected only for the
     autopilot_video project, not for other projects like dark_factory.
@@ -3541,75 +3614,37 @@ class TestTierConfig:
 
 
 class TestProjectIdGuidelineConstants:
-    """_PROJECT_ID_GUIDELINE template and per-stage constants in prompts/__init__.py."""
+    """PROJECT_ID_GUIDELINE, the one project_id guideline every stage shares."""
 
-    def test_template_exists(self):
-        """_PROJECT_ID_GUIDELINE exists in prompts/__init__.py."""
-        from fused_memory.reconciliation.prompts import _PROJECT_ID_GUIDELINE
-        assert isinstance(_PROJECT_ID_GUIDELINE, str)
+    PREVIOUSLY_LISTED_TOOLS = (
+        'search', 'get_entity', 'get_episodes', 'get_status', 'add_memory',
+        'delete_memory', 'update_edge', 'update_memory', 'redact_episode_content',
+        'delete_episode', 'get_tasks', 'get_task', 'set_task_status', 'submit_task',
+        'resolve_ticket', 'update_task', 'remove_task', 'add_dependency',
+        'remove_dependency',
+    )
 
-    def test_template_has_tools_placeholder(self):
-        """_PROJECT_ID_GUIDELINE contains a {tools} placeholder."""
-        from fused_memory.reconciliation.prompts import _PROJECT_ID_GUIDELINE
-        assert '{tools}' in _PROJECT_ID_GUIDELINE
+    def test_guideline_formats_its_project_id_placeholder(self):
+        from fused_memory.reconciliation.prompts import PROJECT_ID_GUIDELINE
 
-    def test_template_has_double_brace_project_id(self):
-        """_PROJECT_ID_GUIDELINE escapes project_id as {{project_id}} so it survives .format(tools=...)."""
-        from fused_memory.reconciliation.prompts import _PROJECT_ID_GUIDELINE
-        # After formatting with tools, the {project_id} placeholder must survive
-        formatted = _PROJECT_ID_GUIDELINE.format(tools='search')
-        assert '{project_id}' in formatted
+        assert isinstance(PROJECT_ID_GUIDELINE, str)
+        assert '{project_id}' in PROJECT_ID_GUIDELINE
+        assert 'project_id="p"' in PROJECT_ID_GUIDELINE.format(project_id='p')
 
-    def test_stage1_constant_exists(self):
-        """_STAGE1_PROJECT_ID_GUIDELINE exists in prompts/__init__.py."""
-        from fused_memory.reconciliation.prompts import _STAGE1_PROJECT_ID_GUIDELINE
-        assert isinstance(_STAGE1_PROJECT_ID_GUIDELINE, str)
+    def test_guideline_names_no_tool(self):
+        from fused_memory.reconciliation.prompts import PROJECT_ID_GUIDELINE
 
-    def test_stage2_constant_exists(self):
-        """_STAGE2_PROJECT_ID_GUIDELINE exists in prompts/__init__.py."""
-        from fused_memory.reconciliation.prompts import _STAGE2_PROJECT_ID_GUIDELINE
-        assert isinstance(_STAGE2_PROJECT_ID_GUIDELINE, str)
+        for name in self.PREVIOUSLY_LISTED_TOOLS:
+            assert re.search(rf'\b{name}\b', PROJECT_ID_GUIDELINE) is None, name
 
-    def test_stage3_constant_exists(self):
-        """_STAGE3_PROJECT_ID_GUIDELINE exists in prompts/__init__.py."""
-        from fused_memory.reconciliation.prompts import _STAGE3_PROJECT_ID_GUIDELINE
-        assert isinstance(_STAGE3_PROJECT_ID_GUIDELINE, str)
+    def test_guideline_points_task_tools_at_project_root(self):
+        from fused_memory.reconciliation.prompts import PROJECT_ID_GUIDELINE
 
-    def test_stage1_constant_has_project_id_placeholder(self):
-        """_STAGE1_PROJECT_ID_GUIDELINE contains {project_id} placeholder."""
-        from fused_memory.reconciliation.prompts import _STAGE1_PROJECT_ID_GUIDELINE
-        assert '{project_id}' in _STAGE1_PROJECT_ID_GUIDELINE
-
-    def test_stage2_constant_has_project_id_placeholder(self):
-        """_STAGE2_PROJECT_ID_GUIDELINE contains {project_id} placeholder."""
-        from fused_memory.reconciliation.prompts import _STAGE2_PROJECT_ID_GUIDELINE
-        assert '{project_id}' in _STAGE2_PROJECT_ID_GUIDELINE
-
-    def test_stage3_constant_has_project_id_placeholder(self):
-        """_STAGE3_PROJECT_ID_GUIDELINE contains {project_id} placeholder."""
-        from fused_memory.reconciliation.prompts import _STAGE3_PROJECT_ID_GUIDELINE
-        assert '{project_id}' in _STAGE3_PROJECT_ID_GUIDELINE
-        """Stage 1 guideline does not include task write tools (Stage 1 is memory-only)."""
-        from fused_memory.reconciliation.prompts import _STAGE1_PROJECT_ID_GUIDELINE
-        assert 'get_tasks' not in _STAGE1_PROJECT_ID_GUIDELINE
-        assert 'set_task_status' not in _STAGE1_PROJECT_ID_GUIDELINE
-        assert 'add_task' not in _STAGE1_PROJECT_ID_GUIDELINE
-        assert 'submit_task' not in _STAGE1_PROJECT_ID_GUIDELINE
-        assert 'resolve_ticket' not in _STAGE1_PROJECT_ID_GUIDELINE
-
-    def test_stage3_does_not_include_write_tools(self):
-        """Stage 3 guideline does not include write tools (Stage 3 is read-only)."""
-        from fused_memory.reconciliation.prompts import _STAGE3_PROJECT_ID_GUIDELINE
-        assert 'add_memory' not in _STAGE3_PROJECT_ID_GUIDELINE
-        assert 'delete_memory' not in _STAGE3_PROJECT_ID_GUIDELINE
-        assert 'set_task_status' not in _STAGE3_PROJECT_ID_GUIDELINE
-        assert 'add_task' not in _STAGE3_PROJECT_ID_GUIDELINE
-        assert 'submit_task' not in _STAGE3_PROJECT_ID_GUIDELINE
-        assert 'resolve_ticket' not in _STAGE3_PROJECT_ID_GUIDELINE
+        assert 'project_root' in PROJECT_ID_GUIDELINE
 
 
 class TestStagePayloadProjectIdGuideline:
-    """All three stages include the per-stage project_id guideline in their assembled payload."""
+    """All three stages include the shared PROJECT_ID_GUIDELINE, filled in, in their payload footer."""
 
     @pytest.fixture
     def memory_mock(self):
@@ -3634,32 +3669,11 @@ class TestStagePayloadProjectIdGuideline:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
-        'stage_class,stage_id,expected_guideline_import,extra_setup,expected_tools,excluded_tools',
+        'stage_class,stage_id,extra_setup',
         [
-            (
-                'MemoryConsolidator',
-                StageId.memory_consolidator,
-                '_STAGE1_PROJECT_ID_GUIDELINE',
-                'limits',
-                ['add_memory'],                          # Stage 1 has memory write access
-                ['get_tasks', 'set_task_status', 'add_task', 'submit_task', 'resolve_ticket'],  # Stage 1 has no task tools
-            ),
-            (
-                'TaskKnowledgeSync',
-                StageId.task_knowledge_sync,
-                '_STAGE2_PROJECT_ID_GUIDELINE',
-                'taskmaster',
-                ['submit_task', 'resolve_ticket', 'set_task_status'],  # Stage 2 has full MCP access
-                [],
-            ),
-            (
-                'IntegrityCheck',
-                StageId.integrity_check,
-                '_STAGE3_PROJECT_ID_GUIDELINE',
-                None,
-                ['get_tasks'],                           # Stage 3 reads tasks
-                ['add_memory', 'delete_memory', 'set_task_status', 'add_task', 'submit_task', 'resolve_ticket'],  # read-only
-            ),
+            ('MemoryConsolidator', StageId.memory_consolidator, 'limits'),
+            ('TaskKnowledgeSync', StageId.task_knowledge_sync, 'taskmaster'),
+            ('IntegrityCheck', StageId.integrity_check, None),
         ],
     )
     async def test_stage_payload_contains_project_id_guideline(
@@ -3667,20 +3681,13 @@ class TestStagePayloadProjectIdGuideline:
         mock_deps_for_stage,
         stage_class,
         stage_id,
-        expected_guideline_import,
         extra_setup,
-        expected_tools,
-        excluded_tools,
     ):
-        """Each stage's assembled payload contains the per-stage project_id guideline
-        with the project_id correctly interpolated, and with the correct tool list."""
-        from fused_memory.reconciliation import prompts as prompts_module
+        """Each stage's payload carries the guideline with its project_id filled in,
+        and its system prompt carries it raw, with the {project_id} placeholder."""
+        from fused_memory.reconciliation.prompts import PROJECT_ID_GUIDELINE
 
-        guideline_template = getattr(prompts_module, expected_guideline_import)
         project_id = 'test_proj'
-        expected_guideline = guideline_template.format(project_id=project_id)
-
-        # Build stage instance
         cls_map = {
             'MemoryConsolidator': MemoryConsolidator,
             'TaskKnowledgeSync': TaskKnowledgeSync,
@@ -3697,30 +3704,10 @@ class TestStagePayloadProjectIdGuideline:
             stage._current_run_id = 'test-run'
             mock_deps_for_stage['taskmaster'].get_tasks.return_value = {'tasks': []}
 
-        watermark = Watermark(project_id=project_id)
-        payload = await stage.assemble_payload([], watermark, [])
+        payload = await stage.assemble_payload([], Watermark(project_id=project_id), [])
 
-        assert expected_guideline in payload, (
-            f'{stage_class} payload missing per-stage project_id guideline.\n'
-            f'Expected: {expected_guideline!r}\n'
-            f'Payload snippet: {payload[-500:]!r}'
-        )
-
-        # Verify stage-specific tool names appear in the guideline within the payload
-        for tool in expected_tools:
-            assert tool in payload, (
-                f'{stage_class} payload guideline missing expected tool {tool!r}. '
-                f'Payload: {payload[-300:]!r}'
-            )
-
-        # Verify excluded tools are not in the guideline portion of the payload
-        # (they may appear elsewhere in the payload's task/memory data, so we check
-        # that the guideline constant itself doesn't include them)
-        for tool in excluded_tools:
-            assert tool not in expected_guideline, (
-                f'{stage_class} guideline should NOT include {tool!r} but does: '
-                f'{expected_guideline!r}'
-            )
+        assert PROJECT_ID_GUIDELINE.format(project_id=project_id) in payload
+        assert PROJECT_ID_GUIDELINE in stage.get_system_prompt()
 
     @pytest.mark.asyncio
     async def test_stage2_payload_contains_project_root_instruction(
@@ -4838,30 +4825,30 @@ class TestRunStageCapHandling:
 
 
 # ---------------------------------------------------------------------------
-# _RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS: canonical minutes-scale override
+# RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS: canonical minutes-scale override
 # forwarded to invoke_with_cap_retry (task 1401); single value pin lives here.
 # ---------------------------------------------------------------------------
 
 
 class TestCliStageRunnerCapWaitSanityBound:
-    """_RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS is the single canonical constant
+    """RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS is the single canonical constant
     imported by all three stage runners and forwarded to invoke_with_cap_retry;
     prevents stalling the reconciliation queue under cap."""
 
     def test_constant_importable_and_minutes_scale(self):
-        """(a) _RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS is importable from
+        """(a) RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS is importable from
         fused_memory.reconciliation and pinned to the documented 30-min policy."""
         from fused_memory.reconciliation import (
-            _RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS,
+            RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS,
         )
 
-        assert _RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS == 1800.0
+        assert RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS == 1800.0
 
     @pytest.mark.asyncio
     async def test_run_stage_via_cli_forwards_cap_wait_sanity_secs(self, tmp_path):
-        """(b) run_stage_via_cli forwards cap_wait_sanity_secs=_RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS."""
+        """(b) run_stage_via_cli forwards cap_wait_sanity_secs=RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS."""
         from fused_memory.reconciliation import (
-            _RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS,
+            RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS,
         )
 
         config = ReconciliationConfig(
@@ -4884,7 +4871,7 @@ class TestCliStageRunnerCapWaitSanityBound:
                 config=config,
                 mcp_config={'mcpServers': {}},
             )
-        assert mock.call_args.kwargs['cap_wait_sanity_secs'] == _RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS
+        assert mock.call_args.kwargs['cap_wait_sanity_secs'] == RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS
 
 
 # ---------------------------------------------------------------------------
@@ -10389,6 +10376,10 @@ class TestTrackFlagPersistence:
 
         assert result == {'flag-A': 3}  # 2 prior + 1 (this cycle)
         memory_service.add_memory.assert_awaited_once()
+        # C5: a flag marker has no subject task, and names no task status.
+        assert_writes_c5(
+            memory_service.add_memory.await_args.kwargs, project_id='reify', subject=None,
+        )
 
     @pytest.mark.asyncio
     async def test_count_called_with_metadata_filter_for_flag_id(self):
@@ -10532,6 +10523,8 @@ class TestWriteEscalationMarkers:
         assert meta.get('source') == 'stage2_escalation_marker'
         assert meta.get('flag_id') == 'flag-Y'
         assert meta.get('run_id') == 'run-7'
+        # C5: a flag marker has no subject task, and names no task status.
+        assert_writes_c5(call.kwargs, project_id='proj', subject=None)
 
     @pytest.mark.asyncio
     async def test_write_failure_logs_warning_does_not_raise(self, caplog):

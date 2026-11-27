@@ -45,13 +45,18 @@ import functools
 import json
 import logging
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, NamedTuple, TypeGuard, get_args
-from urllib.parse import urlsplit
+from typing import TYPE_CHECKING, Any, NamedTuple, get_args
 
 from fused_memory.config.schema import (
     JudgeReasoningEffort,
     WriteTriageConfig,
     blank_means_inherit,
+)
+from fused_memory.llm.openai_responses import (
+    TokenUsage,
+    call_openai_responses,
+    endpoint_host,
+    read_token_usage,
 )
 from fused_memory.routing.json_extract import extract_json
 from fused_memory.server.grouped_read import PARENT_ID_KEY
@@ -72,6 +77,7 @@ from fused_memory.server.write_triage import (
     JudgeUsage,
     TriageJudgeVerdict,
 )
+from fused_memory.services.plan_route import PlanRoute, PlanRouteSite
 from fused_memory.utils.clip_disclosure import TruncationFact, elide_text
 
 if TYPE_CHECKING:
@@ -872,6 +878,8 @@ class _JudgeRoute(NamedTuple):
     host: str | None
     url_from: str
     key_from: str
+    #: Whether the call rides the plan route's cap gate (task 9944).
+    via_plan_route: bool = False
 
 
 class _ProviderCredentials(NamedTuple):
@@ -901,7 +909,7 @@ def _judge_route(
     base_url = client_kwargs.get('base_url')
     return _JudgeRoute(
         provider=provider,
-        host=urlsplit(base_url).netloc.rpartition('@')[2] if base_url else None,
+        host=endpoint_host(base_url),
         url_from=source(judge_url_set, 'base_url', 'api_url'),
         key_from=source(judge_key_set, 'api_key', 'api_key'),
     )
@@ -916,11 +924,33 @@ def _announce_judge_route(route: _JudgeRoute) -> None:
     goes with nothing else to show for it. One line per change, not per call.
     """
     logger.info(
-        'write_triage judge route: %s at %s (base_url from %s), api_key from %s',
+        'write_triage judge route: %s at %s%s (base_url from %s), api_key from %s',
         route.provider,
         route.host or 'the SDK default endpoint',
+        ' via the plan route' if route.via_plan_route else '',
         route.url_from,
         route.key_from,
+    )
+
+
+def _on_the_plan_route(
+    creds: _ProviderCredentials, memory_service: Any, provider: str,
+) -> _ProviderCredentials:
+    """*creds* riding the plan route's gated client when their base_url is the plan proxy.
+
+    The anthropic arm is never gated. A memory_service without a real
+    :class:`PlanRoute` judges ungated, as it did before the route existed.
+    """
+    route = getattr(memory_service, 'plan_route', None)
+    base_url = creds.client_kwargs.get('base_url')
+    if provider == 'anthropic' or not isinstance(route, PlanRoute) or not base_url:
+        return creds
+    http_client = route.http_client_for(base_url, site=PlanRouteSite.WRITE_TRIAGE_JUDGE)
+    if http_client is None:
+        return creds
+    return creds._replace(
+        client_kwargs={**creds.client_kwargs, 'http_client': http_client},
+        route=creds.route._replace(via_plan_route=True),
     )
 
 
@@ -978,34 +1008,24 @@ class _JudgeReply(NamedTuple):
     usage: JudgeUsage | None
 
 
-def _is_token_count(value: object) -> TypeGuard[int]:
-    return isinstance(value, int) and not isinstance(value, bool)
-
-
 def _usage_from(
     usage: object, *, input_field: str, output_field: str, details_field: str | None,
 ) -> JudgeUsage | None:
     """Read a provider's *usage* object as a :class:`JudgeUsage`, or ``None``.
 
-    Counts are taken only when they are real ``int``s — never coerced, because
-    ``int()`` of an unspecced Mock is 1 and a ``bool`` is an ``int``. Never
-    raises: usage is metadata about a call that already succeeded, so an
-    unreadable one is carried as ``None`` (which the eval reports as unpriced)
-    rather than turning a good verdict into a fail-open.
+    An unreadable usage is carried as ``None`` (which the eval reports as
+    unpriced) rather than turning a good verdict into a fail-open; the
+    never-coercing rule is :func:`fused_memory.llm.openai_responses.read_token_usage`'s.
     """
-    input_tokens = getattr(usage, input_field, None)
-    output_tokens = getattr(usage, output_field, None)
-    if not (_is_token_count(input_tokens) and _is_token_count(output_tokens)):
-        return None
-    reasoning_tokens = None
-    if details_field is not None:
-        details = getattr(usage, details_field, None)
-        reasoning_tokens = getattr(details, 'reasoning_tokens', None)
-    return JudgeUsage(
-        input_tokens,
-        output_tokens,
-        reasoning_tokens if _is_token_count(reasoning_tokens) else None,
-    )
+    return _judge_usage(read_token_usage(
+        usage, input_field=input_field, output_field=output_field,
+        details_field=details_field,
+    ))
+
+
+def _judge_usage(usage: TokenUsage | None) -> JudgeUsage | None:
+    """*usage* as a :class:`JudgeUsage`, field by field, so a renamed or added field raises."""
+    return JudgeUsage(**usage._asdict()) if usage is not None else None
 
 
 async def _call_llm(
@@ -1048,7 +1068,6 @@ async def _call_llm(
             f'{list(_KNOWN_PROVIDERS)}',
         )
     creds = _provider_credentials(memory_service, provider)
-    _announce_judge_route(creds.route)
     if reasoning_effort is not None and not creds.serves_responses_api:
         why = (
             'the anthropic arm has no reasoning-effort parameter'
@@ -1061,6 +1080,8 @@ async def _call_llm(
             f'sent: {why}. Set it to null for this arm, or judge on an endpoint '
             'that serves the Responses API.',
         )
+    creds = _on_the_plan_route(creds, memory_service, provider)
+    _announce_judge_route(creds.route)
     if provider == 'anthropic':
         return await _call_anthropic(creds, model=model, prompt=prompt, timeout=timeout)
     if creds.serves_responses_api:
@@ -1084,44 +1105,31 @@ async def _call_openai_responses(
     Exactly one sampling control is sent. A set *reasoning_effort* goes out as
     ``reasoning``, with no ``temperature``, which reasoning models reject.
     Unset means a non-reasoning model, pinned to ``temperature=0.0`` as on the
-    other two arms.
+    other two arms. The call itself is
+    :func:`fused_memory.llm.openai_responses.call_openai_responses`;
+    ``JUDGE_SYSTEM_PROMPT`` is read here, per call, so a run-time swap of it
+    (``scripts/write_triage_judge_wording.py``) reaches the wire.
     """
-    import openai  # per-call import, matching judge.py
-
-    sampling: dict[str, Any] = (
-        {'temperature': 0.0}
-        if reasoning_effort is None
-        else {'reasoning': {'effort': reasoning_effort}}
+    reply = await call_openai_responses(
+        creds.client_kwargs,
+        model=model,
+        instructions=JUDGE_SYSTEM_PROMPT,
+        user_content=prompt,
+        text_format={'type': 'json_object'},
+        max_output_tokens=_JUDGE_MAX_OUTPUT_TOKENS,
+        timeout=timeout,
+        reasoning_effort=reasoning_effort,
+        max_retries=_JUDGE_SDK_MAX_RETRIES,
     )
-    async with openai.AsyncOpenAI(
-        **creds.client_kwargs, max_retries=_JUDGE_SDK_MAX_RETRIES,
-    ) as client:
-        response = await asyncio.wait_for(
-            client.responses.create(
-                model=model,
-                instructions=JUDGE_SYSTEM_PROMPT,
-                input=prompt,
-                max_output_tokens=_JUDGE_MAX_OUTPUT_TOKENS,
-                text={'format': {'type': 'json_object'}},
-                **sampling,
-            ),
-            timeout=timeout,
-        )
     # An incomplete answer is not a verdict even when its partial text parses,
     # and the logged reason must say so: an exhausted budget would otherwise
     # read as an empty body, indistinguishable from a model that answered
     # nothing (INV-2).
-    if getattr(response, 'status', None) == 'incomplete':
-        reason = getattr(getattr(response, 'incomplete_details', None), 'reason', None)
-        raise _reject(f'response incomplete ({reason})', response.output_text)
+    if reply.incomplete:
+        raise _reject(f'response incomplete ({reply.incomplete_reason})', reply.text)
     return _JudgeReply(
-        response.output_text or '',
-        _usage_from(
-            getattr(response, 'usage', None),
-            input_field='input_tokens',
-            output_field='output_tokens',
-            details_field='output_tokens_details',
-        ),
+        reply.text or '',
+        _judge_usage(reply.usage),
     )
 
 

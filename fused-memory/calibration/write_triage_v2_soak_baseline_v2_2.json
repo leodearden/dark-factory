@@ -1,5 +1,6 @@
 {
   "rubric": "v2.2",
+  "brief_sha256": "7cd0bad3b1845c40d044b27946c703ba3d20a853aef6abd6140b5df8b56540c1",
   "cell_rules": {
     "hidden_detail": "A restated write adds something a reader acting on its record would need (HOME, LOSS, no CONFLICT), and a sighting is only counted, never shown.",
     "hidden_conflict": "A restated write disputes its record (CONFLICT), and the dispute sits in a sighting a reader of the record never sees.",

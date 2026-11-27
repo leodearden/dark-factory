@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import math
 import os
 import signal
 import subprocess
@@ -25,6 +26,7 @@ from _verify_boundary_harness import (
     tagged_pids,
     wait_for_marker_stable,
     wait_for_pgid_file,
+    wait_pid_tagged,
     wait_pids_exited,
     wait_subtree_live,
 )
@@ -1431,15 +1433,24 @@ def test_kill_holder_tree_sweeps_the_session_escaped_orphan_of_an_already_reaped
 
 
 def test_tagged_pids_finds_a_session_escaped_grandchild_and_nothing_else():
-    """tagged_pids(tag) names exactly one holder's tree, session escapes included."""
+    """tagged_pids(tag) names exactly one holder's tree, session escapes included.
+
+    The grandchild prints its own pid, so it is past its exec when probed: a
+    process mid-exec reads an empty environ (esc-6179-4), and one snapshot of
+    it would be no verdict.
+    """
     sleep_secs = f'273.{os.getpid() % 1000:03d}'
+    grandchild_source = (
+        'import os, time\n'
+        'print(os.getpid(), flush=True)\n'
+        f'time.sleep({sleep_secs})\n'
+    )
     leader = TaggedPopen(
         [
             sys.executable, '-c',
-            'import subprocess, time\n'
-            f'child = subprocess.Popen(["sleep", "{sleep_secs}"], start_new_session=True, '
-            'stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n'
-            'print(child.pid, flush=True)\n'
+            'import subprocess, sys, time\n'
+            f'subprocess.Popen([sys.executable, "-c", {grandchild_source!r}], '
+            'start_new_session=True, stdin=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n'
             'time.sleep(300)\n',
         ],
         stdout=subprocess.PIPE,
@@ -1473,3 +1484,30 @@ def test_tagged_pids_finds_a_session_escaped_grandchild_and_nothing_else():
         bystander.wait(timeout=5)
         if leader.stdout is not None:
             leader.stdout.close()
+
+
+def test_wait_pid_tagged_polls_past_a_snapshot_that_misses_the_pid():
+    """One environ snapshot can miss a live process mid-exec (esc-6179-4), so a miss must not end the poll."""
+    pid, other_pid = 7, 8
+    asked: list[str] = []
+    probes = iter([set(), {other_pid}, {pid, other_pid}])
+
+    def fake_tagged_pids(tag: str) -> set[int]:
+        asked.append(tag)
+        return next(probes)
+
+    assert wait_pid_tagged(pid, 'tag-a', timeout=math.inf, interval=0, _tagged_pids=fake_tagged_pids)
+    assert asked == ['tag-a'] * 3
+
+
+def test_wait_pid_tagged_returns_the_final_probes_miss_at_the_deadline():
+    """timeout=0 is exactly one probe, and its miss is the verdict."""
+    pid, other_pid = 7, 8
+    asked: list[str] = []
+
+    def fake_tagged_pids(tag: str) -> set[int]:
+        asked.append(tag)
+        return {other_pid}
+
+    assert wait_pid_tagged(pid, 'tag-a', timeout=0, _tagged_pids=fake_tagged_pids) is False
+    assert asked == ['tag-a']

@@ -184,6 +184,7 @@ class TestResolveIssueDoesNotRewriteAStaleSnapshot:
         await call_resolve_issue(
             create_server(queue), escalation_id=l2, resolution='closing the cluster',
             action='close_only',
+            resolution_class='benign',
         )
 
         stored_l2 = queue.get(l2)

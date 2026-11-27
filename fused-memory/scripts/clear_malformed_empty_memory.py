@@ -65,13 +65,18 @@ Usage
 
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
+
 import argparse
 import asyncio
 import json
 import logging
-import sys
 from typing import Any
 
+from fused_memory.utils.mem0_content_keys import mem0_payload_text
 from fused_memory.utils.store_mutation_preflight import assert_store_mutation_allowed
 
 logger = logging.getLogger('clear_malformed_empty_memory')
@@ -80,29 +85,6 @@ logger = logging.getLogger('clear_malformed_empty_memory')
 # ---------------------------------------------------------------------------
 # Pure core
 # ---------------------------------------------------------------------------
-
-# Payload keys tried in order when extracting a Mem0 memory's text content
-# from its raw Qdrant payload dict. Reused verbatim from
-# audit_duplicate_memories.py's _CONTENT_KEYS so 'empty content' is judged
-# identically to how the dedup sweep judges it ('data' is the canonical
-# Qdrant scroll-payload content key for infer=False writes).
-_CONTENT_KEYS: tuple[str, ...] = ('data', 'memory', 'content')
-
-
-def extract_content(payload: dict) -> str:
-    """Return the first non-empty string among payload['data'], ['memory'],
-    ['content'], trying _CONTENT_KEYS in order.
-
-    Returns '' when no key is present or every present value is empty/not a
-    string -- mirrors audit_duplicate_memories.fetch_procedural_memories's
-    content-extraction fallback exactly.
-    """
-    for key in _CONTENT_KEYS:
-        value = payload.get(key)
-        if isinstance(value, str) and value:
-            return value
-    return ''
-
 
 def is_malformed_empty_payload(payload: dict) -> bool:
     """True iff *payload* matches the malformed-empty fingerprint: empty
@@ -113,9 +95,9 @@ def is_malformed_empty_payload(payload: dict) -> bool:
     category, or a set agent_id) can NEVER match, so this predicate
     structurally cannot authorize deleting a real memory.
 
-    Note: 'empty content' is judged only over the recognized _CONTENT_KEYS
-    ('data', 'memory', 'content') -- this predicate assumes the standard
-    Mem0 payload shape. A record that stored its text under some other key
+    Note: 'empty content' is judged only over the recognized
+    ``fused_memory/utils/mem0_content_keys.py::MEM0_CONTENT_KEYS`` -- this
+    predicate assumes the standard Mem0 payload shape. A record that stored its text under some other key
     while also having category=None and agent_id=None would be
     misclassified as malformed. In practice this risk is very low (real
     observations_and_summaries records always carry a category, and the
@@ -124,7 +106,7 @@ def is_malformed_empty_payload(payload: dict) -> bool:
     pipeline.
     """
     return (
-        extract_content(payload) == ''
+        mem0_payload_text(payload) == ''
         and payload.get('category') is None
         and payload.get('agent_id') is None
     )

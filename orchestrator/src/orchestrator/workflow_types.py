@@ -286,6 +286,7 @@ def _disposition_table() -> dict[type[BaseException], BlockDisposition]:
         SessionBudgetExhausted,
     )
 
+    from orchestrator.branch_stack import RestackBlocked, RestackConflict
     from orchestrator.git_ops import (
         BranchResetError,
         CitationPatternInvalid,
@@ -297,6 +298,8 @@ def _disposition_table() -> dict[type[BaseException], BlockDisposition]:
         MergeParkError,
         MergeVerifyLeaseContended,
         MergeVerifyLeaseHeld,
+        ScreenLaneUnavailable,
+        StackRecordUnconfirmed,
         WarmLaneDiskPressure,
         WarmLaneLockContention,
         WarmLaneLockTimeout,
@@ -625,6 +628,37 @@ def _disposition_table() -> dict[type[BaseException], BlockDisposition]:
             reason_prefix='Task branch checked out in another worktree',
             block_class=BlockClass.AGENT_FAILURE,
         ),
+        # Re-stacking a dependent onto its predecessor's new tip (task 10473,
+        # PRD early-start 5.3). A conflict left the branch, tree and record as
+        # they were, so it requeues without charging the task. Every other
+        # stop (refused, abort failed, record failed) blocks and goes to a
+        # human, as BranchResetError does: it may leave a rebase in progress
+        # or a branch on a base its record does not name. The result's
+        # message names the branch, its old tip and base, and any recovery.
+        RestackConflict: BlockDisposition(
+            category=FailureCategory.NONE,
+            escalate_to_human=False,
+            requeue_kind=RequeueKind.REQUEUE,
+            counts_against_requeue_cap=False,
+            reason_prefix='restack_conflict',
+            block_class=BlockClass.AGENT_FAILURE,
+        ),
+        RestackBlocked: BlockDisposition(
+            category=FailureCategory.NONE,
+            escalate_to_human=True,
+            requeue_kind=RequeueKind.BLOCK,
+            counts_against_requeue_cap=True,
+            reason_prefix='Re-stack blocked: branch and record may need restoring',
+            block_class=BlockClass.AGENT_FAILURE,
+        ),
+        StackRecordUnconfirmed: BlockDisposition(
+            category=FailureCategory.NONE,
+            escalate_to_human=True,
+            requeue_kind=RequeueKind.BLOCK,
+            counts_against_requeue_cap=True,
+            reason_prefix='Stack-base record unconfirmed',
+            block_class=BlockClass.AGENT_FAILURE,
+        ),
         # ── BD-2 completeness rows: exported by the 4 covered modules, but
         # not (today) caught by name anywhere in _drive()'s ladder ─────────
         # NOTE (amendment, reviewer_comprehensive correctness): this row is
@@ -791,6 +825,19 @@ def _disposition_table() -> dict[type[BaseException], BlockDisposition]:
             requeue_kind=RequeueKind.BLOCK,
             counts_against_requeue_cap=True,
             reason_prefix='Ephemeral probe worktree add failed after retries',
+            block_class=BlockClass.AGENT_FAILURE,
+        ),
+        # BD-2-completeness-only row (task 7919): a merge screen lane's flock
+        # was not won in time. merge_lane/screen.py::MergeScreen catches it at
+        # source and falls back to an ephemeral worktree, so it never reaches
+        # _drive() or classify_failure(). An escape would mean a contended
+        # lane, MergeVerifyLeaseContended's transient shape.
+        ScreenLaneUnavailable: BlockDisposition(
+            category=FailureCategory.NONE,
+            escalate_to_human=False,
+            requeue_kind=RequeueKind.REQUEUE,
+            counts_against_requeue_cap=False,
+            reason_prefix='merge_screen_lane_unavailable',
             block_class=BlockClass.AGENT_FAILURE,
         ),
         # BD-2-completeness-only rows (task 7332), the same category as

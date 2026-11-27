@@ -32,6 +32,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _git_fixtures import seed_repo
 from _seed_script_stubs import seed_default_warm_base
 
 from orchestrator.config import GitConfig, OrchestratorConfig
@@ -46,6 +47,7 @@ from orchestrator.harness import Harness, TaskReport
 from orchestrator.lane_lifecycle import LANE_STATE_DIRNAME
 from orchestrator.merge_lane.worker import _classify_branch_presence
 from orchestrator.scheduler import TaskAssignment
+from orchestrator.slot_lease import SlotLease
 from orchestrator.warm_lane_pool import LaneState
 from orchestrator.workflow import WorkflowOutcome
 
@@ -54,21 +56,10 @@ from orchestrator.workflow import WorkflowOutcome
 # ---------------------------------------------------------------------------
 
 
-async def _init_repo(repo: Path) -> None:
-    await _run(['git', 'init', '-b', 'main'], cwd=repo)
-    await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=repo)
-    await _run(['git', 'config', 'user.name', 'Test'], cwd=repo)
-    (repo / 'README.md').write_text('# Test\n')
-    await _run(['git', 'add', '-A'], cwd=repo)
-    await _run(['git', 'commit', '-m', 'Initial commit'], cwd=repo)
-
-
 @pytest.fixture
 def ig_git_repo(tmp_path: Path) -> Path:
     """Temporary git repo with an initial commit for integration-gate tests."""
-    repo = tmp_path / 'repo'
-    repo.mkdir()
-    asyncio.run(_init_repo(repo))
+    repo = seed_repo(tmp_path / 'repo')
     seed_default_warm_base(repo)
     return repo
 
@@ -314,7 +305,7 @@ async def _run_synthetic_hard_cancel_slot(
             modules=[],
         )
         sem = asyncio.Semaphore(1)
-        return await harness._run_slot(assignment, sem)
+        return await harness._run_slot(assignment, SlotLease(assignment.task_id, harness.scheduler, sem))
 
 
 # ===========================================================================

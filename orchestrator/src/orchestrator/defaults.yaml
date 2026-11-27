@@ -288,10 +288,32 @@ routing:
       set:
         model: opus
         max_turns: 120
+    # Experiment 1 of plans/routing-experiment-substrate-prd.md moves the
+    # large-plan-modules threshold from 3 to 4 on arm 1 of split salt
+    # routing-exp-1 (2 buckets); arm 0 keeps today's >=3 rule. An arm-1 plan
+    # with exactly 3 modules and <12 steps falls through to the role's
+    # configured model and max_turns. Revert: delete `split` from both rules
+    # and reload. dark-factory-orchestrator.yaml deliberately keeps the
+    # pre-experiment table (dark-factory is out of experiment 1).
+    - id: large-plan-modules-4
+      match:
+        role: [implementer, debugger]
+        plan_min_modules: 4
+        split:
+          salt: routing-exp-1
+          buckets: 2
+          bucket: 1
+      set:
+        model: opus
+        max_turns: 120
     - id: large-plan-modules
       match:
         role: [implementer, debugger]
         plan_min_modules: 3
+        split:
+          salt: routing-exp-1
+          buckets: 2
+          bucket: 0
       set:
         model: opus
         max_turns: 120
@@ -335,7 +357,9 @@ routing:
     # Listed LAST, deliberately: first-match-wins means a large-plan retry
     # matches large-plan-steps/large-plan-modules FIRST and keeps their opus +
     # max_turns=120 headroom (retry-tier-up sets no max_turns). Placing it
-    # before them would strip that headroom from large-plan retries.
+    # before them would strip that headroom from large-plan retries. On
+    # experiment 1's arm 1 a 3-module, <12-step plan is not a large plan, so
+    # its retry lands here: opus at the role's configured max_turns.
     #
     # Inert at tier 0 (min_routing_tier>=1), so the default-tier resolution is
     # byte-equivalent to pre-mu (invariant 3) -- a fresh dispatch never matches
@@ -948,15 +972,17 @@ watcher_backend: claude
 # watcher_daily_cost_ceiling_usd: ceiling for escalation-watcher invocations
 #   only (role LIKE '%watcher%').  This is the early-warning trip — runaway
 #   watcher dispatch is the most likely cost source during AFK windows.
-#   Trip reason: cost_ceiling_watcher_exceeded (default 50.0).
+#   Trip reason: cost_ceiling_watcher_exceeded (default 150.0).
 #
 # orch_daily_cost_ceiling_usd: ceiling for ALL orchestrator invocations
 #   (entire invocations table, trailing 24h).  Final safety net.
-#   Trip reason: cost_ceiling_orch_exceeded (default 200.0).
+#   Trip reason: cost_ceiling_orch_exceeded (default 10000.0).
 #
-# Disable a ceiling by setting it to a very high value.
-watcher_daily_cost_ceiling_usd: 50.0
-orch_daily_cost_ceiling_usd: 200.0
+# Disable a ceiling by setting it to a very high value.  The orch-wide
+# default is effectively off: it stays as an opt-in tripwire (task 8262;
+# ruling in plans/cross-project-weights-study-2026-11-12/rulings.md).
+watcher_daily_cost_ceiling_usd: 150.0
+orch_daily_cost_ceiling_usd: 10000.0
 
 # Merge-queue train coalescing (tasks 1717-1722)
 #

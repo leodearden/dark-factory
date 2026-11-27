@@ -11,6 +11,7 @@ import logging
 
 import pytest
 from _review_issue_fixtures import ON_CONTRACT_VALUES, contract_issue, contract_issue_without
+from shared.defects import IssueKind, IssueKindFlag, IssueKindReading, issue_kind_of
 
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.review_issue_contract import (
@@ -40,6 +41,7 @@ def _only_deviation(intake: IssueIntake) -> IssueDeviation:
 USABLE_FIXTURES: tuple[dict[str, object], ...] = (
     contract_issue(severity='high'),
     contract_issue(severity=' Blocking '),
+    contract_issue(kind=' Docs '),
     contract_issue_without(IssueField.LOCATION, file='pkg/mod.py', line=12),
     contract_issue_without(IssueField.LOCATION, file='pkg/mod.py'),
     contract_issue_without(IssueField.LOCATION, file='pkg/mod.py', line=True),
@@ -118,6 +120,82 @@ class TestSeverityVocabulary:
         assert deviation.deviation is Deviation.OFF_VOCABULARY
         assert deviation.recorded_as == 'blocking'
         assert not deviation.unusable
+
+
+class TestKindVocabulary:
+    @pytest.mark.parametrize('kind', list(IssueKind))
+    def test_every_kind_is_accepted_as_given(self, kind):
+        issue = contract_issue(kind=kind.value)
+
+        intake = check_issues([issue])
+
+        assert intake.issues == (issue,)
+        assert intake.deviations == ()
+
+    def test_case_and_whitespace_variant_is_recorded_as_its_member_and_flagged(self):
+        intake = check_issues([contract_issue(kind=' Docs ')])
+
+        assert intake.issues[0]['kind'] == IssueKind.DOCS
+        assert _only_deviation(intake) == IssueDeviation(
+            index=0,
+            field=IssueField.KIND,
+            deviation=Deviation.OFF_VOCABULARY,
+            received=' Docs ',
+            recorded_as=IssueKind.DOCS.value,
+        )
+        assert intake.unusable == ()
+
+    def test_an_unknown_kind_leaves_the_issue_unusable(self):
+        intake = check_issues([contract_issue(kind='bug')])
+
+        assert intake.issues == ()
+        assert intake.unusable == (
+            IssueDeviation(
+                index=0,
+                field=IssueField.KIND,
+                deviation=Deviation.OFF_VOCABULARY,
+                received='bug',
+                recorded_as=None,
+            ),
+        )
+
+    @pytest.mark.parametrize(
+        ('received', 'member'),
+        [
+            *((kind.value, kind) for kind in IssueKind),
+            (' Docs ', IssueKind.DOCS),
+            ('TEST_QUALITY', IssueKind.TEST_QUALITY),
+        ],
+    )
+    def test_issue_kind_of_reads_every_kind_the_intake_records_unflagged(
+        self, received, member,
+    ):
+        [recorded] = check_issues([contract_issue(kind=received)]).issues
+
+        assert issue_kind_of(recorded) == IssueKindReading(member)
+
+    def test_the_intake_canonicalises_a_variant_issue_kind_of_alone_would_flag(self):
+        received = contract_issue(kind=' Docs ')
+
+        [recorded] = check_issues([received]).issues
+
+        assert issue_kind_of(received).flag is IssueKindFlag.UNRECOGNISED
+        assert issue_kind_of(recorded) == IssueKindReading(IssueKind.DOCS)
+
+    @pytest.mark.parametrize(
+        'issue',
+        [contract_issue_without(IssueField.KIND), contract_issue(kind='bug')],
+        ids=['missing', 'unknown'],
+    )
+    def test_a_refused_kind_is_described_with_every_contract_kind(self, issue):
+        [deviation] = check_issues([issue]).unusable
+
+        text = deviation.describe()
+
+        assert text.startswith('issues[0].kind')
+        for kind in IssueKind:
+            assert repr(kind.value) in text
+        assert len(text) < _JOURNAL_FIELD_CAP, text
 
 
 class TestOneReadingOfSeverity:
@@ -283,6 +361,10 @@ class TestUnusableIssues:
             (contract_issue(severity=None), IssueField.SEVERITY, Deviation.MISSING),
             (contract_issue(severity='  '), IssueField.SEVERITY, Deviation.MISSING),
             (contract_issue(severity=3), IssueField.SEVERITY, Deviation.NOT_A_STRING),
+            (contract_issue_without(IssueField.KIND), IssueField.KIND, Deviation.MISSING),
+            (contract_issue(kind=None), IssueField.KIND, Deviation.MISSING),
+            (contract_issue(kind='  '), IssueField.KIND, Deviation.MISSING),
+            (contract_issue(kind=3), IssueField.KIND, Deviation.NOT_A_STRING),
             (contract_issue_without(IssueField.DESCRIPTION), IssueField.DESCRIPTION, Deviation.MISSING),
             (contract_issue(description=None), IssueField.DESCRIPTION, Deviation.MISSING),
             (contract_issue(description=''), IssueField.DESCRIPTION, Deviation.MISSING),

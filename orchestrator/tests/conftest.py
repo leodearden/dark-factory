@@ -91,8 +91,12 @@ from _orch_helpers import (  # noqa: E402
     reap_leaked_aiosqlite_connections,
     reap_leaked_claimant_heartbeats,
     stamp_stock_routing_config,
+    unchanged_dispatch_row,
 )
 from shared.config_models import UsageCapConfig  # noqa: E402
+from shared.pytest_fake_clock import (  # noqa: E402  # debt: ticket tkt_0RX7VH710F56TR7A4GHW9M6WNK
+    fake_clock as fake_clock,
+)
 
 from orchestrator.agents.briefing import BriefingAssembler  # noqa: E402
 from orchestrator.config import (  # noqa: E402
@@ -320,10 +324,7 @@ def tree_pass(request: pytest.FixtureRequest) -> TreePass:
 def briefing(tmp_path: Path) -> BriefingAssembler:
     """Minimal BriefingAssembler over a stub OrchestratorConfig (no I/O).
 
-    Shared by ``test_roles_wait_pattern.py`` and
-    ``test_roles_background_warning.py`` (task 3747 — the two files were
-    forked from a common ancestor and carried byte-identical copies of this
-    fixture until they were consolidated here).
+    The suite's one shared ``briefing``, so no test module imports one.
     """
     config = OrchestratorConfig(
         project_root=tmp_path,
@@ -367,6 +368,9 @@ def _isolate_orch_config(monkeypatch, tmp_path):
     ``code_default_config`` fixture runs after this autouse fixture and still
     wins (re-pointing ORCH_CONFIG_PATH at a guaranteed-absent file) for the
     default-asserting tests.
+
+    The audit lane runs this suite with DF_VERIFY_CACHE=off, which forces every cache mode off
+    (verify_cache/modes.py::forced_off), so a test that wants the flag sets it explicitly.
     """
     monkeypatch.setenv("ORCH_CONFIG_PATH", str(REPO_ROOT / "dark-factory-orchestrator.yaml"))
     monkeypatch.setenv("ORCH_PROJECT_ROOT", str(tmp_path))
@@ -374,6 +378,9 @@ def _isolate_orch_config(monkeypatch, tmp_path):
     monkeypatch.setenv("ORCH_VERIFY_HOST_POLICY", "prefer_local")
     monkeypatch.setenv("ORCH_VERIFY_USE_CGROUP_SCOPE", "false")
     monkeypatch.setenv("ORCH_VERIFY_COLD_PREPROVISION_COMMAND", "")
+    from orchestrator.verify_cache.modes import VERIFY_CACHE_ENV
+
+    monkeypatch.delenv(VERIFY_CACHE_ENV, raising=False)
 
 
 @pytest.fixture
@@ -570,16 +577,17 @@ def df_warm_lane_script_dir(monkeypatch, tmp_path: Path):
 
 
 def pytest_configure(config: pytest.Config) -> None:
-    """Refuse an unsafe ``--basetemp``, arm the suite-wide defences, register the opt-out markers.
+    """Refuse an unsafe ``--basetemp``, arm the suite-wide defences, register plugins and markers.
 
     The ``reject_unsafe_basetemp`` call comes FIRST and is unrelated to the
     marker below: it aborts collection when ``--basetemp`` points inside a live
     task worktree, where every git command this suite runs would resolve against
     the enclosing worktree's repo (task 3355, incident esc-3072-3).
 
-    It also arms the UsageGate probe-dir sweep confinement (task 6275),
-    importing ``shared.usage_gate`` here because a module-level import after
-    this file's ``sys.path`` setup would need a new ``E402`` suppression.
+    It also arms the UsageGate probe-dir sweep confinement (task 6275) and
+    registers the ``_orch_suite_fixtures`` fixture plugin, importing both here
+    because a module-level import after this file's ``sys.path`` setup would
+    need a new ``E402`` suppression.
 
     ``orchestrator/pyproject.toml``'s ``[tool.pytest.ini_options] markers``
     list is outside this task's locked scope, so the marker used by the
@@ -598,6 +606,7 @@ def pytest_configure(config: pytest.Config) -> None:
     from shared import usage_gate
 
     arm_usage_gate_sweep_confinement(config, usage_gate)
+    config.pluginmanager.import_plugin('_orch_suite_fixtures')
     config.addinivalue_line(
         'markers',
         'real_psi_reader: opt a test OUT of the autouse `_hermetic_psi_reader` '
@@ -607,10 +616,23 @@ def pytest_configure(config: pytest.Config) -> None:
     )
     config.addinivalue_line(
         'markers',
+        'real_dispatch_row_refresh: opt a test OUT of the autouse '
+        '`_hermetic_dispatch_row` patch so the Scheduler re-reads its dispatch '
+        'winner through its own read_task/get_statuses (task 11430).',
+    )
+    config.addinivalue_line(
+        'markers',
         f'{REAL_MCP_SESSION_MARKER}: opt a test OUT of the autouse forbid_live_mcp '
         'guard so shared.mcp_session.McpSession runs for real (stub server / '
         'mocked transport only) — task 7802',
     )
+
+
+def _patch_unless_marked(monkeypatch, request, marker: str, target: str, hermetic: object) -> None:
+    """Install the *hermetic* default at *target* unless the test carries the opt-out *marker*."""
+    if request.node.get_closest_marker(marker):
+        return
+    monkeypatch.setattr(target, hermetic)
 
 
 @pytest.fixture(autouse=True)
@@ -670,9 +692,26 @@ def _hermetic_psi_reader(monkeypatch, request):
     A test may instead reassign ``scheduler._read_psi_sample``
     post-construction, as the saturation tests do.
     """
-    if request.node.get_closest_marker('real_psi_reader'):
-        return
-    monkeypatch.setattr('orchestrator.scheduler.read_psi_sample', idle_psi_sample)
+    _patch_unless_marked(
+        monkeypatch, request, 'real_psi_reader',
+        'orchestrator.scheduler.read_psi_sample', idle_psi_sample,
+    )
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_dispatch_row(monkeypatch, request):
+    """Default every Scheduler's re-read of its dispatch winner to an echo of the snapshot row (task 11430).
+
+    Patches the module-level ``orchestrator.scheduler.refresh_dispatch_row``,
+    bound at ``Scheduler.__init__``, with ``_orch_helpers.py::unchanged_dispatch_row``:
+    a per-dispatch fused-memory read in every bare-Scheduler test would trip
+    ``forbid_live_mcp``.  Same seam pattern as ``_hermetic_psi_reader`` above.
+    A test marked ``real_dispatch_row_refresh`` keeps the real re-read.
+    """
+    _patch_unless_marked(
+        monkeypatch, request, 'real_dispatch_row_refresh',
+        'orchestrator.scheduler.refresh_dispatch_row', unchanged_dispatch_row,
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -701,6 +740,16 @@ def forbid_live_mcp(monkeypatch, request):
     yield recorder
 
     assert_no_live_attempts(recorder)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_mcp_lifecycle_session(monkeypatch):
+    """Every test starts with no McpLifecycle session, and one its own start() makes is undone at teardown.
+
+    ``orchestrator/src/orchestrator/mcp_lifecycle.py::McpLifecycle.start`` assigns that
+    global, only stop() clears it, and ``mcp_call`` prefers it over its url (task 9528).
+    """
+    monkeypatch.setattr('orchestrator.mcp_lifecycle._session', None)
 
 
 @pytest.fixture(autouse=True)
@@ -1004,6 +1053,10 @@ def make_steward(tmp_path: Path):
       - ``steward_max_timeouts_per_escalation`` = 3,
         ``steward_max_empty_outputs_per_escalation`` = 2
       - ``suggestion_triage_threshold`` = 10
+      - ``steward_session_mode`` = the Field's own production default, read off
+        ``OrchestratorConfig.model_fields`` so mode-agnostic tests run the
+        shipped arm (an unassigned knob would be a MagicMock that silently
+        selects one)
       - triage + steward ``models`` / ``budgets`` / ``max_turns`` / ``effort`` / ``backends``
       - ``escalation.host`` / ``escalation.port``
       - ``timeouts.steward`` / ``steward_completion_timeout`` — the
@@ -1071,6 +1124,7 @@ def make_steward(tmp_path: Path):
         config.steward_max_timeouts_per_escalation = 3
         config.steward_max_empty_outputs_per_escalation = 2
         config.suggestion_triage_threshold = 10
+        config.steward_session_mode = OrchestratorConfig.model_fields['steward_session_mode'].default
         config.models.triage = 'sonnet'
         config.budgets.triage = 2.0
         config.max_turns.triage = 25

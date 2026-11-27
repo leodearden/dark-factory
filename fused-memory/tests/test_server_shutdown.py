@@ -129,30 +129,30 @@ class TestGracefulShutdownJournalClosedDespiteMemoryServiceError:
 
 
 class TestGracefulShutdownClosesCuratorCostStore:
-    """step-5: _graceful_shutdown must await curator_cost_store.close() when provided."""
+    """step-5: _graceful_shutdown must await invocations_store.close() when provided."""
 
     @pytest.mark.asyncio
-    async def test_curator_cost_store_closed_on_happy_path(self):
-        """curator_cost_store.close() must be awaited once on the happy path."""
+    async def test_invocations_store_closed_on_happy_path(self):
+        """invocations_store.close() must be awaited once on the happy path."""
         memory_service = MagicMock()
         memory_service.close = AsyncMock()
 
-        curator_cost_store = MagicMock()
-        curator_cost_store.close = AsyncMock()
+        invocations_store = MagicMock()
+        invocations_store.close = AsyncMock()
 
         await _graceful_shutdown(
             memory_service=memory_service,
             task_interceptor=None,
             harness_loop_task=None,
             recon_journal=None,
-            curator_cost_store=curator_cost_store,
+            invocations_store=invocations_store,
         )
 
-        curator_cost_store.close.assert_awaited_once()
+        invocations_store.close.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_curator_cost_store_closed_even_when_memory_service_raises(self):
-        """curator_cost_store.close() must be awaited even if memory_service.close() raises.
+    async def test_invocations_store_closed_even_when_memory_service_raises(self):
+        """invocations_store.close() must be awaited even if memory_service.close() raises.
 
         Mirrors TestGracefulShutdownJournalClosedDespiteMemoryServiceError in
         test_server_shutdown.py — each cleanup step runs under its own shield.
@@ -160,22 +160,22 @@ class TestGracefulShutdownClosesCuratorCostStore:
         memory_service = MagicMock()
         memory_service.close = AsyncMock(side_effect=RuntimeError('memory close failed'))
 
-        curator_cost_store = MagicMock()
-        curator_cost_store.close = AsyncMock()
+        invocations_store = MagicMock()
+        invocations_store.close = AsyncMock()
 
         await _graceful_shutdown(
             memory_service=memory_service,
             task_interceptor=None,
             harness_loop_task=None,
             recon_journal=None,
-            curator_cost_store=curator_cost_store,
+            invocations_store=invocations_store,
         )
 
-        curator_cost_store.close.assert_awaited_once()
+        invocations_store.close.assert_awaited_once()
 
 
 class TestGracefulShutdownQuiescesCuratorGate:
-    """curator_usage_gate.shutdown() must be awaited before curator_cost_store.close().
+    """curator_usage_gate.shutdown() must be awaited before invocations_store.close().
 
     Fixes the race where a 429-driven cap event fires just before shutdown
     and its background save_account_event task writes to an already-closed
@@ -200,7 +200,7 @@ class TestGracefulShutdownQuiescesCuratorGate:
 
     @pytest.mark.asyncio
     async def test_gate_shutdown_before_cost_store_close(self):
-        """curator_usage_gate.shutdown() must complete before curator_cost_store.close().
+        """curator_usage_gate.shutdown() must complete before invocations_store.close().
 
         Ordering is critical: gate.shutdown() cancels/drains background tasks
         that may still be writing to the CostStore's SQLite connection.
@@ -213,7 +213,7 @@ class TestGracefulShutdownQuiescesCuratorGate:
         curator_usage_gate = MagicMock(
             shutdown=AsyncMock(side_effect=lambda: call_order.append('gate_shutdown'))
         )
-        curator_cost_store = MagicMock(
+        invocations_store = MagicMock(
             close=AsyncMock(side_effect=lambda: call_order.append('store_close'))
         )
 
@@ -223,7 +223,7 @@ class TestGracefulShutdownQuiescesCuratorGate:
             harness_loop_task=None,
             recon_journal=None,
             curator_usage_gate=curator_usage_gate,
-            curator_cost_store=curator_cost_store,
+            invocations_store=invocations_store,
         )
 
         assert call_order == ['gate_shutdown', 'store_close'], (
@@ -253,6 +253,40 @@ class TestGracefulShutdownQuiescesCuratorGate:
         )
 
         curator_usage_gate.shutdown.assert_awaited_once()
+
+
+class TestGracefulShutdownClosesCostStoreAfterHarness:
+    """The recon stages, judge and verify loop write their invocations rows through
+    invocations_store until the harness loop stops (task 10414)."""
+
+    @pytest.mark.asyncio
+    async def test_cost_store_closes_after_the_harness_loop_stops(self):
+        call_order: list[str] = []
+        started = asyncio.Event()
+
+        async def _recon_loop():
+            started.set()
+            try:
+                await asyncio.sleep(9999)
+            except asyncio.CancelledError:
+                call_order.append('harness_stopped')
+                raise
+
+        harness_loop_task = asyncio.create_task(_recon_loop())
+        await started.wait()
+        invocations_store = MagicMock(
+            close=AsyncMock(side_effect=lambda: call_order.append('store_close'))
+        )
+
+        await _graceful_shutdown(
+            memory_service=MagicMock(close=AsyncMock()),
+            task_interceptor=None,
+            harness_loop_task=harness_loop_task,
+            recon_journal=None,
+            invocations_store=invocations_store,
+        )
+
+        assert call_order == ['harness_stopped', 'store_close']
 
 
 class TestGracefulShutdownClosesTaskInterceptor:

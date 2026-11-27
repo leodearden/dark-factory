@@ -612,6 +612,7 @@ def _ts_led_indexes(conn: sqlite3.Connection) -> set[str]:
 
 class TestTheCleanupDeleteIsAnIndexSearch:
     def test_both_arms_of_the_cutoff_search_an_index_led_by_ts(self, tmp_path: Path):
+        """A chunk costs the rows it removes, not the table."""
         from sampler.store import RETENTION_DELETE_SQL
 
         _store(tmp_path)
@@ -619,7 +620,7 @@ class TestTheCleanupDeleteIsAnIndexSearch:
         try:
             plan = [
                 row[3]
-                for row in conn.execute(f'EXPLAIN QUERY PLAN {RETENTION_DELETE_SQL}', (1, 2))
+                for row in conn.execute(f'EXPLAIN QUERY PLAN {RETENTION_DELETE_SQL}', (1, 2, 3))
             ]
             ts_led = _ts_led_indexes(conn)
         finally:
@@ -627,9 +628,11 @@ class TestTheCleanupDeleteIsAnIndexSearch:
 
         assert ts_led, 'no index on samples is led by ts'
         searches = [step for step in plan if step.startswith('SEARCH samples')]
-        assert len(searches) == 2, plan
-        for step in searches:
-            assert any(f'INDEX {name} ' in f'{step} ' for name in ts_led), plan
+        by_ts = [s for s in searches if any(f'INDEX {name} ' in f'{s} ' for name in ts_led)]
+        assert len(by_ts) == 2, plan
+        assert all(
+            'USING INTEGER PRIMARY KEY' in step for step in searches if step not in by_ts
+        ), plan
         assert not any(step.startswith('SCAN samples') for step in plan), plan
 
     def test_a_store_written_before_the_index_gains_it_and_keeps_its_rows(self, tmp_path: Path):

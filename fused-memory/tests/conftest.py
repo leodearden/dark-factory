@@ -70,10 +70,10 @@ _shared_src = os.path.join(
 if _shared_src not in sys.path:
     sys.path.insert(0, _shared_src)
 
-# Make the sibling 'escalation' workspace package importable without installing it.
-# curator_escalator.py uses a try/except guard (HAS_ESCALATION) — adding the src
-# path here (before test files are collected) ensures the guard resolves to True so
-# tests that exercise the escalation-routing branch can actually run.
+# Likewise insert this worktree's escalation/src at the front of sys.path so
+# that `import escalation` loads the local code rather than whatever editable
+# install the uv workspace has pinned to another tree (mirrors the shared/src
+# insertion above).
 _escalation_src = os.path.join(
     os.path.dirname(os.path.dirname(_tests_dir)),  # workspace root
     'escalation', 'src',
@@ -89,6 +89,9 @@ from _fm_helpers import (  # noqa: E402
     resolve_xdist_worker_id,
 )
 from _graphiti_fake import FakeGraphitiClient  # noqa: E402
+from shared.pytest_fake_clock import (  # noqa: E402  # debt: ticket tkt_0RX7VH710F56TR7A4GHW9M6WNK
+    fake_clock as fake_clock,
+)
 
 from fused_memory.backends.graphiti_client import GraphitiBackend  # noqa: E402
 from fused_memory.config.schema import (  # noqa: E402

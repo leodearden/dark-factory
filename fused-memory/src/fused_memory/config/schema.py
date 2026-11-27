@@ -496,10 +496,64 @@ class RoutingConfig(BaseModel):
             'llm.providers.openai.api_key. Restart-only, like openai_api_url.'
         ),
     )
+    model: str | None = Field(
+        default=None,
+        description=(
+            "The routing LLM's own model. None or blank INHERITS llm.model. A set "
+            'model is a pin that never inherits an endpoint: it requires both '
+            'openai_api_url and openai_api_key, else routing degrades to its '
+            'non-LLM path (routing/openai_client.py::routing_endpoint). '
+            'Restart-only, like openai_api_url.'
+        ),
+    )
+    reasoning_effort: Literal['low', 'medium', 'high'] | None = Field(
+        default=None,
+        description=(
+            'The reasoning effort the routing call sends to the pinned '
+            'routing.model, which it requires: an effort on the inherited '
+            'llm.model is refused at load. None KEEPS the non-reasoning '
+            'request: temperature 0.0 and max_tokens. Set, it is sent with '
+            'max_completion_tokens and no temperature '
+            '(routing/openai_client.py::routing_chat_params). Restart-only, '
+            'like openai_api_url.'
+        ),
+    )
 
-    @field_validator('openai_api_url', 'openai_api_key')
+    @field_validator('openai_api_url', 'openai_api_key', 'model')
     @classmethod
     def _blank_leaf_inherits(cls, value: str | None) -> str | None:
+        return blank_means_inherit(value)
+
+    @model_validator(mode='after')
+    def _effort_needs_a_pinned_model(self) -> 'RoutingConfig':
+        """The API refuses reasoning_effort for a non-reasoning model, and the routing layer degrades
+        every such call to its non-LLM path, so an effort on the inherited llm.model fails at load."""
+        if self.reasoning_effort is not None and self.model is None:
+            raise ValueError(
+                f'routing.reasoning_effort {self.reasoning_effort!r} requires routing.model; '
+                'an effort is never sent to the inherited llm.model',
+            )
+        return self
+
+
+# --- Plan route ---
+
+class PlanRouteConfig(BaseModel):
+    """The ChatGPT-plan proxy that every plan-routed call goes through (task 9944)."""
+
+    proxy_url: str | None = Field(
+        default=None,
+        description='Base URL of the plan proxy; a call whose base_url equals it is gated on the cap.',
+    )
+    probe_interval_seconds: float = Field(
+        default=900.0,
+        gt=0,
+        description='Longest wait between probes of a capped plan, however far off its reset is.',
+    )
+
+    @field_validator('proxy_url')
+    @classmethod
+    def _blank_proxy_url_is_unset(cls, value: str | None) -> str | None:
         return blank_means_inherit(value)
 
 
@@ -538,7 +592,14 @@ class QueueConfig(BaseModel):
     backend_read_timeout_seconds: float = Field(default=30.0)
     backend_write_timeout_seconds: float = Field(default=120.0)
     search_timeout_seconds: float = Field(default=15.0)
-    data_dir: str = Field(default='./data/queue')
+    # A relative value is anchored at the checkout root at load
+    # (config/checkout_anchor.py::anchor_at_checkout), never the process CWD (task 10210).
+    data_dir: str = Field(default='./data/queue', validate_default=True)
+
+    @field_validator('data_dir')
+    @classmethod
+    def _anchor_data_dir(cls, value: str) -> str:
+        return anchor_at_checkout(value)
 
     @model_validator(mode='after')
     def _validate_transient_max_attempts(self) -> 'QueueConfig':
@@ -2632,30 +2693,38 @@ class CuratorConfig(BaseModel):
     deferral_backoff_base_seconds: float = Field(default=60.0, gt=0)
     deferral_backoff_max_seconds: float = Field(default=1800.0, gt=0)
 
-    # Cancelled-premise blocklist: path (absolute, or relative to server cwd)
-    # of a YAML file listing premises proven wrong by revert. Matching
-    # candidates are dropped before any LLM call. None disables the guard.
+    # Cancelled-premise blocklist: path (absolute, or relative to the
+    # TaskCurator's cwd, which the server sets to taskmaster.project_root; the
+    # process cwd only when a curator is built without one) of a YAML file
+    # listing premises proven wrong by revert. Matching candidates are dropped
+    # before any LLM call. None disables the guard.
     # See fused-memory/config/cancelled_premise_blocklist.yaml for the schema.
     cancelled_premise_blocklist_path: str | None = Field(
         default=None,
         description=(
-            "Path (absolute or relative to server cwd) of a YAML file listing "
+            "Path (absolute, or relative to the TaskCurator's cwd, which the server "
+            "sets to taskmaster.project_root; the process cwd only when a curator "
+            "is built without one) of a YAML file listing "
             "premises proven wrong by revert; matching candidates are dropped "
             "before any LLM call. None disables the guard."
         ),
     )
 
     # Recon code-fix premise-verification registry: path (absolute, or relative
-    # to server cwd) of a YAML registry of self-referential recon code-fix
-    # premises. Matching candidates are dropped BEFORE any LLM call ONLY WHILE
-    # the live source/tests still refute the premise (self-correcting — unlike
+    # to the TaskCurator's cwd, which the server sets to taskmaster.project_root;
+    # the process cwd only when a curator is built without one) of a YAML
+    # registry of self-referential recon code-fix premises. Matching candidates
+    # are dropped BEFORE any LLM call ONLY WHILE the live source/tests still
+    # refute the premise (self-correcting — unlike
     # cancelled_premise_blocklist_path's unconditional forever-drop). None
     # disables the guard. See
     # fused-memory/config/recon_code_fix_premise_registry.yaml for the schema.
     recon_code_fix_premise_registry_path: str | None = Field(
         default=None,
         description=(
-            "Path (absolute or relative to server cwd) of a YAML registry of "
+            "Path (absolute, or relative to the TaskCurator's cwd, which the server "
+            "sets to taskmaster.project_root; the process cwd only when a curator "
+            "is built without one) of a YAML registry of "
             "self-referential recon code-fix premises; matching candidates are "
             "dropped BEFORE any LLM call only while the live source/tests still "
             "refute the premise. None disables the guard."
@@ -2683,8 +2752,10 @@ class CuratorConfig(BaseModel):
         ),
     )
 
-    # Operational-ask registry: path (absolute, or relative to server cwd) of a
-    # YAML registry of recurring operational live-data/live-mutation asks —
+    # Operational-ask registry: path (absolute, or relative to the TaskCurator's
+    # cwd, which the server sets to taskmaster.project_root; the process cwd
+    # only when a curator is built without one) of a YAML registry of recurring
+    # operational live-data/live-mutation asks —
     # deliverables that are already-built+unit-tested scripts whose remaining
     # work is dry-run -> human-review -> apply against live external stores,
     # modifying ZERO repo files. The TDD architect cannot author a RED->GREEN
@@ -2695,7 +2766,9 @@ class CuratorConfig(BaseModel):
     operational_ask_registry_path: str | None = Field(
         default=None,
         description=(
-            "Path (absolute or relative to server cwd) of a YAML registry of "
+            "Path (absolute, or relative to the TaskCurator's cwd, which the server "
+            "sets to taskmaster.project_root; the process cwd only when a curator "
+            "is built without one) of a YAML registry of "
             "recurring operational live-data/live-mutation asks; matching "
             "candidates are routed BEFORE any LLM call to a deterministic "
             "PURE-GATE instead of the TDD architect. None disables the gate."
@@ -2779,10 +2852,12 @@ def _default_curator_usage_cap() -> UsageCapConfig:
     )
 
 
-#: The reasoning efforts the write-triage judge may send on the Responses API.
-#: The single home of that vocabulary: the judge's resolver reads it with
-#: ``typing.get_args`` rather than restating the words.
-JudgeReasoningEffort = Literal['none', 'low', 'medium', 'high']
+#: The reasoning efforts a caller may send on the OpenAI Responses API.
+#: The single home of that vocabulary: the write-triage judge's resolver reads
+#: it with ``typing.get_args`` rather than restating the words.
+ReasoningEffort = Literal['none', 'low', 'medium', 'high']
+#: The write-triage judge's name for :data:`ReasoningEffort`.
+JudgeReasoningEffort = ReasoningEffort
 
 
 def _require_cutoffs_in_unit_range(
@@ -3278,10 +3353,10 @@ class Mem0UpdateConfig(BaseModel):
         ),
     )
     metadata_patch_allowed_agent_prefixes: list[str] = Field(
-        default_factory=lambda: ['recon-stage-', 'curator-'],
+        default_factory=lambda: ['recon-stage-', 'curator-', 'link-heal-'],
         description=(
-            'agent_id prefixes authorized to PATCH METADATA in place. Ships '
-            'identical to the content-amend list but is independently '
+            'agent_id prefixes authorized to PATCH METADATA in place. Ships as '
+            'the content-amend list plus link-heal-, and is independently '
             'configurable, and that is the point: widening THIS list alone '
             'remains the supported way to admit a new interactive tagging flow '
             'without granting content-amend authority. A mistagged patch is '
@@ -3290,7 +3365,13 @@ class Mem0UpdateConfig(BaseModel):
             'this one: gate 3200 ratified retain-and-tag, whose folded entries '
             'are retained as topic-stamped peers via a metadata-only patch — '
             'content_amend alone would be the destructive half without the '
-            'preserving half. Green-tier hot-reloadable via reload_config.'
+            'preserving half. link-heal- admits the link-heal executor\'s '
+            'metadata-only heals (fused-memory/scripts/link_heal.py, agent_id '
+            'link-heal-<run8>; plans/write-triage-link-healing-prd.md H1, task '
+            '6181); task 6431 made it a schema default on this arm only, '
+            'mirroring curator-\'s 2026-08-12 ruling, so no config.yaml '
+            'override is needed on any deployment. Green-tier hot-reloadable '
+            'via reload_config.'
         ),
     )
     agent_prefix_sanctioned_use: dict[str, str] = Field(
@@ -3702,6 +3783,94 @@ class ConsolidationAutoConfig(BaseModel):
             'hot-reloadable.'
         ),
     )
+    max_adjudications_per_cycle: int = Field(
+        default=6,
+        ge=0,
+        description=(
+            'The ranked slice and the cap on adjudicator calls per cycle, read '
+            "by task γ's executor. 0 makes no call. Green-tier hot-reloadable. "
+            'plans/consolidation-adjudicator-prd.md K4, K7.'
+        ),
+    )
+    adjudicator_model: str = Field(
+        default='gpt-6.1-sol',
+        min_length=1,
+        description=(
+            'OpenAI model the consolidation adjudicator calls; part of its '
+            'identity, so a change recalibrates. Read by '
+            'reconciliation/consolidation_adjudicator.py. Green-tier '
+            'hot-reloadable. plans/consolidation-adjudicator-prd.md K3, K7.'
+        ),
+    )
+    adjudicator_reasoning_effort: ReasoningEffort | None = Field(
+        default='low',
+        description=(
+            "The adjudicator model's reasoning effort, or null for a "
+            'non-reasoning model; part of its identity. Read by '
+            'reconciliation/consolidation_adjudicator.py. Green-tier '
+            'hot-reloadable. plans/consolidation-adjudicator-prd.md K3, K7.'
+        ),
+    )
+    adjudicator_timeout_seconds: float = Field(
+        default=60,
+        gt=0,
+        description=(
+            'Per-call timeout of the adjudicator; deliberately outside its '
+            'identity. Read by reconciliation/consolidation_adjudicator.py. '
+            'Green-tier hot-reloadable. plans/consolidation-adjudicator-prd.md '
+            'K3, K7, §12 Q3.'
+        ),
+    )
+    adjudicator_field_chars: int = Field(
+        default=4000,
+        gt=0,
+        description=(
+            "Characters of each member's text the adjudicator is shown; part "
+            'of its identity. Read by reconciliation/consolidation_adjudicator.py. '
+            'Green-tier hot-reloadable. plans/consolidation-adjudicator-prd.md K3, K7.'
+        ),
+    )
+    adjudicator_member_max: int = Field(
+        default=8,
+        ge=1,
+        description=(
+            'Most members a proposal may carry to the adjudicator, the largest '
+            'cluster the eval set measures; at least member_min (enforced '
+            'below) and part of the identity. Read by the adjudicator, '
+            'reconciliation/consolidation_adjudicator_calibration.py and task '
+            "γ's executor. Green-tier hot-reloadable. "
+            'plans/consolidation-adjudicator-prd.md K1, K7.'
+        ),
+    )
+    outcome_retention_days: int = Field(
+        default=90,
+        gt=0,
+        description=(
+            "Days a non-executed proposal outcome is kept, read by task γ's "
+            'executor. Green-tier hot-reloadable. '
+            'plans/consolidation-adjudicator-prd.md K6, K7.'
+        ),
+    )
+    memo_days: int = Field(
+        default=30,
+        gt=0,
+        description=(
+            'Days an original decision is reused for the same members, read by '
+            "task γ's executor. Green-tier hot-reloadable. "
+            'plans/consolidation-adjudicator-prd.md K4, K7.'
+        ),
+    )
+
+    @model_validator(mode='after')
+    def _adjudicator_member_max_admits_member_min(self):
+        """Reject an adjudicator size bound no proposal could ever satisfy."""
+        if self.member_min > self.adjudicator_member_max:
+            raise ValueError(
+                f'consolidation_auto.member_min ({self.member_min}) must be <= '
+                f'adjudicator_member_max ({self.adjudicator_member_max}); an '
+                'inverted range refuses every proposal before the adjudicator.',
+            )
+        return self
 
     @model_validator(mode='after')
     def _member_range_is_coherent(self):
@@ -3903,6 +4072,7 @@ class FusedMemoryConfig(BaseSettings):
     graphiti: GraphitiBackendConfig = Field(default_factory=GraphitiBackendConfig)
     mem0: Mem0BackendConfig = Field(default_factory=Mem0BackendConfig)
     routing: RoutingConfig = Field(default_factory=RoutingConfig)
+    plan_route: PlanRouteConfig = Field(default_factory=PlanRouteConfig)
     queue: QueueConfig = Field(default_factory=QueueConfig)
     # Bare submodel for the same per-leaf-reload reason as write_triage below —
     # here it buys the INVERSE disposition: reload.py descends into it and
