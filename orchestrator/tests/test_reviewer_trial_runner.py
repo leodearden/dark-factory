@@ -1451,6 +1451,23 @@ class TestPanelCache:
 
         assert [call.kwargs['max_turns'] for call in spy.await_args_list] == [90, 90]
 
+    @pytest.mark.usefixtures('code_default_config')
+    @pytest.mark.asyncio
+    async def test_run_trial_runs_every_pair_at_one_resolved_production_budget(
+        self, source: _Source, tmp_path: Path,
+    ) -> None:
+        diffs = [_diff_in(source, diff_id='d1'), _diff_in(source, diff_id='d2')]
+
+        with (
+            _counted_reviewers(),
+            patch('orchestrator.evals.reviewer_trial.runner.run_panel_cached', wraps=run_panel_cached) as spy,
+        ):
+            await run_trial(
+                [_unpinned_reviewer()], CorpusManifest(diffs=diffs), results_dir=tmp_path / 'results', stagger_secs=0,
+            )
+
+        assert [call.kwargs['production_budget'] for call in spy.await_args_list] == [12.0, 12.0]
+
     @pytest.mark.asyncio
     async def test_run_trial_threads_its_stagger_to_each_panel(self, source: _Source, tmp_path: Path) -> None:
         with (
@@ -1669,3 +1686,32 @@ class TestRunAndScore:
 
         assert [c['max_turns'] for c in reviewer_calls] == [30]
         assert [p.run_key.max_turns for p in _stored_panels(results_dir) if p.run_key is not None] == [30]
+
+    @pytest.mark.asyncio
+    async def test_run_and_score_threads_its_production_budget_to_the_panels(
+        self, source: _Source, tmp_path: Path,
+    ) -> None:
+        reviewer_calls: list[dict] = []
+        write_verdict = _make_verdict_writing_invoke('ISSUES_FOUND', issues=[_BLOCKING_ISSUE])
+        results_dir = tmp_path / 'results'
+
+        async def reviewer(**kwargs):
+            reviewer_calls.append(kwargs)
+            return await write_verdict(**kwargs)
+
+        async def matcher(**kwargs: object):
+            return answered({'matches': []})
+
+        with (
+            patch('orchestrator.evals.reviewer_trial.runner.invoke_agent', side_effect=reviewer),
+            patch('orchestrator.evals.reviewer_trial.scorer.invoke_agent', matcher),
+        ):
+            await run_and_score(
+                [_unpinned_reviewer()], CorpusManifest(diffs=[_scored_diff(source, 'd_ok', 'OK_MARKER')]),
+                results_dir=results_dir, stagger_secs=0, production_budget=5.0,
+            )
+
+        assert [c['max_budget_usd'] for c in reviewer_calls] == [5.0]
+        assert [
+            p.run_key.reviewer_budgets_usd for p in _stored_panels(results_dir) if p.run_key is not None
+        ] == [(5.0,)]
