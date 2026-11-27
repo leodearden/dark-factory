@@ -1227,6 +1227,48 @@ class TestPanelCache:
         infos = [r.getMessage() for r in caplog.records if r.levelno == logging.INFO]
         assert any(str(entry) in message for message in infos), infos
 
+    @pytest.mark.usefixtures('code_default_config')
+    @pytest.mark.asyncio
+    async def test_an_unpinned_keyless_legacy_entry_is_rerun_at_production_s_budget(
+        self, source: _Source, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        variant, diff, results_dir = _unpinned_reviewer(), _diff_in(source), tmp_path / 'results'
+        entry = _write_legacy_panel(results_dir, PanelRunResult(
+            variant_name=variant.name, diff_id=diff.diff_id, reviews={'r1': _make_review('r1')},
+        ))
+        legacy_bytes = entry.read_bytes()
+
+        with (
+            caplog.at_level(logging.INFO, logger='orchestrator.evals.reviewer_trial.runner'),
+            _counted_reviewers() as dispatched,
+        ):
+            result = await run_panel_cached(variant, diff, results_dir=results_dir, stagger_secs=0, max_turns=30)
+
+        assert dispatched == ['ungated']
+        assert result.run_key is not None
+        assert result.run_key.reviewer_budgets_usd == (12.0,)
+        assert entry.read_bytes() == legacy_bytes
+        infos = [r.getMessage() for r in caplog.records if r.levelno == logging.INFO]
+        assert any(str(entry) in message for message in infos), infos
+
+    @pytest.mark.asyncio
+    async def test_an_unpinned_keyless_legacy_entry_is_reused_at_the_5_dollars_it_ran_at(
+        self, source: _Source, tmp_path: Path,
+    ) -> None:
+        variant, diff, results_dir = _unpinned_reviewer(), _diff_in(source), tmp_path / 'results'
+        legacy = PanelRunResult(
+            variant_name=variant.name, diff_id=diff.diff_id, reviews={'r1': _make_review('r1')},
+        )
+        _write_legacy_panel(results_dir, legacy)
+
+        with _counted_reviewers() as dispatched:
+            result = await run_panel_cached(
+                variant, diff, results_dir=results_dir, stagger_secs=0, max_turns=30, production_budget=5.0,
+            )
+
+        assert dispatched == []
+        assert result == legacy
+
     @pytest.mark.asyncio
     async def test_a_corrupt_legacy_entry_is_rerun_even_at_its_30_turn_cap(
         self, source: _Source, tmp_path: Path,
@@ -1339,6 +1381,60 @@ class TestPanelCache:
         [warning] = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
         assert 'Not reusing 2 legacy panel' in warning and str(results_dir) in warning, warning
         assert 'ran at 30 turns, this run uses 90' in warning, warning
+
+    @pytest.mark.usefixtures('code_default_config')
+    @pytest.mark.asyncio
+    async def test_run_trial_counts_the_legacy_panels_its_budget_passes_over_before_any_reviewer_runs(
+        self, source: _Source, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        variant, results_dir = _unpinned_reviewer(), tmp_path / 'results'
+        diffs = [_diff_in(source, diff_id='d1'), _diff_in(source, diff_id='d2')]
+        for diff in diffs:
+            _write_legacy_panel(results_dir, PanelRunResult(variant_name=variant.name, diff_id=diff.diff_id))
+        warned_before_dispatch: list[bool] = []
+
+        async def _run_panel_noting_the_warning(*args, **kwargs) -> PanelRunResult:
+            warned_before_dispatch.append(any(
+                'legacy panel' in r.getMessage() for r in caplog.records if r.levelno == logging.WARNING
+            ))
+            return await run_panel(*args, **kwargs)
+
+        with (
+            caplog.at_level(logging.INFO, logger='orchestrator.evals.reviewer_trial.runner'),
+            _counted_reviewers() as dispatched,
+            patch('orchestrator.evals.reviewer_trial.runner.run_panel', side_effect=_run_panel_noting_the_warning),
+        ):
+            await run_trial(
+                [variant], CorpusManifest(diffs=diffs), results_dir=results_dir, stagger_secs=0, max_turns=30,
+            )
+
+        assert dispatched == ['ungated', 'ungated']
+        assert warned_before_dispatch == [True, True]
+        [warning] = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert 'Not reusing 2 legacy panel' in warning and str(results_dir) in warning, warning
+        assert '$5.00' in warning and '$12.00' in warning, warning
+
+    @pytest.mark.asyncio
+    async def test_run_trial_at_the_legacy_turns_and_budget_reuses_every_legacy_panel(
+        self, source: _Source, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        variant, results_dir = _unpinned_reviewer(), tmp_path / 'results'
+        diffs = [_diff_in(source, diff_id='d1'), _diff_in(source, diff_id='d2')]
+        for diff in diffs:
+            _write_legacy_panel(results_dir, PanelRunResult(variant_name=variant.name, diff_id=diff.diff_id))
+
+        with (
+            caplog.at_level(logging.INFO, logger='orchestrator.evals.reviewer_trial.runner'),
+            _counted_reviewers() as dispatched,
+        ):
+            await run_trial(
+                [variant], CorpusManifest(diffs=diffs), results_dir=results_dir, stagger_secs=0,
+                max_turns=30, production_budget=5.0,
+            )
+
+        assert dispatched == []
+        [warning] = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert 'Reused 2 legacy panel' in warning, warning
 
     @pytest.mark.usefixtures('code_default_config')
     @pytest.mark.asyncio
