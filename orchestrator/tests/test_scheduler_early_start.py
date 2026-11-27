@@ -491,6 +491,15 @@ class TestClaim:
         assert selection.claim is None
         rig.assert_untouched('D')
 
+    async def test_a_waiting_predecessor_holding_no_keys_is_not_claimed_on(self, tmp_path, monkeypatch):
+        rig = _rig(tmp_path, monkeypatch)
+        picture = await rig.picture(p_running(), task('D', deps=('P',)))
+
+        selection = await rig.select(picture, reads_for(picture))
+
+        assert selection == EarlyStartSelection(None, ())
+        rig.assert_untouched('D', 'P')
+
     async def test_a_predecessor_the_reads_report_done_leaves_its_dependents_unrefused(
         self, tmp_path, monkeypatch,
     ):
@@ -725,6 +734,21 @@ class TestRow34NeverStartedTwice:
         selection = await rig.select(picture, reads_for(picture))
 
         assert selection == EarlyStartSelection(None, (_refusal(Reason.NOT_ELIGIBLE),))
+        assert rig.scheduler.lock_table.snapshot_successor_of() == {}
+
+
+    async def test_a_dependent_holding_a_restored_hold_is_not_claimed(self, tmp_path, monkeypatch):
+        rig = await _with_p_running(tmp_path, monkeypatch)
+        assert rig.scheduler.restore_hold('D', D_FILES, reason='recovered merge hold').acquired
+        held = rig.scheduler.lock_table.held_modules('D')
+        picture = await rig.picture(p_running(), task('D', deps=('P',)))
+
+        selection = await rig.select(picture, reads_for(picture))
+
+        assert selection == EarlyStartSelection(None, (_refusal(Reason.NOT_ELIGIBLE),))
+        assert not rig.scheduler.is_dispatched('D')
+        assert rig.scheduler.lock_table.held_modules('D') == held
+        assert rig.scheduler.lock_table.successor_relation('D') is None
         assert rig.scheduler.lock_table.snapshot_successor_of() == {}
 
 
