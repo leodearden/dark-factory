@@ -68,6 +68,7 @@ from orchestrator.offline_lane_pass import (
     DetectSeam,
     LaneLeg,
     PassOutcomeHook,
+    never_stopping,
     run_pass,
 )
 from orchestrator.offline_lane_records import Leg, RunRecordStore
@@ -125,6 +126,8 @@ class OfflineLaneWorker:
             seams; without them it files and raises nothing, and logs so.
         pass_outcome_hooks: The section 5.7 hooks each red pass asks.
         now: The clock the run records and the engine share.
+        stopping: True while the lane's host is stopping; a sub-run a signal
+            ended then leaves its pass with no effect.  Defaults to never.
     """
 
     def __init__(
@@ -141,9 +144,11 @@ class OfflineLaneWorker:
         escalation_queue: EscalationQueue | None = None,
         pass_outcome_hooks: Sequence[PassOutcomeHook] = (),
         now: Callable[[], datetime] | None = None,
+        stopping: Callable[[], bool] = never_stopping,
     ) -> None:
         self.git_ops = git_ops
         self.config = config
+        self.stopping = stopping
         self.lock_path = Path(lock_path)
         self._now = now or _utc_now
         self.records = RunRecordStore(config.project_root, clock=self._now)
@@ -331,6 +336,7 @@ class OfflineLaneWorker:
                 store=self.records,
                 engine=self._engine,
                 hooks=self._hooks,
+                stopping=self.stopping,
             )
 
     # ------------------------------------------------------------------
