@@ -83,7 +83,7 @@ def trial_production_budget(override: float | None = None) -> float:
     budget = OrchestratorConfig().budgets.reviewer if override is None else override
     if budget <= 0:
         raise ValueError(f'a reviewer budget must be positive, got {budget}')
-    return budget
+    return float(budget)
 
 
 def trial_reviewer_budget(spec: ReviewerSpec, production_budget: float | None = None) -> float:

@@ -435,19 +435,23 @@ class TestTrialReviewerBudget:
         )
 
         assert role.default_budget == 5.0
+        assert panel_budgets(VARIANT_A, 5.0) == (5.0,)
+
+    def test_an_int_override_resolves_to_a_float(self) -> None:
+        assert type(trial_production_budget(5)) is float
+        assert [type(budget) for budget in panel_budgets(VARIANT_A, 5)] == [float]
 
     def test_a_pinned_spec_ignores_production_s_budget_and_the_override(
         self, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         monkeypatch.setenv('ORCH_BUDGETS__REVIEWER', '7.5')
 
-        fable = build_trial_reviewer_role(VARIANT_FABLE52_SOLO.reviewers[0], production_budget=5.0)
-        sol = build_trial_reviewer_role(VARIANT_CODEX_SOL62.reviewers[0], production_budget=5.0)
+        fable = build_trial_reviewer_role(VARIANT_FABLE52_SOLO.reviewers[0], production_budget=6.0)
+        sol = build_trial_reviewer_role(VARIANT_CODEX_SOL62.reviewers[0], production_budget=6.0)
 
         assert fable.default_budget == 10.0
         assert sol.default_budget == 5.0
-        assert panel_budgets(VARIANT_C, 5.0) == (4.0, 2.0, 2.0)
-        assert panel_budgets(VARIANT_A, 5.0) == (5.0,)
+        assert panel_budgets(VARIANT_C, 6.0) == (4.0, 2.0, 2.0)
 
     def test_a_non_positive_budget_is_refused_naming_it(self) -> None:
         with pytest.raises(ValueError, match=r'got 0\b'):

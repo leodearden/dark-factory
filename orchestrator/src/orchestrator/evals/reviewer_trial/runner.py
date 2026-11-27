@@ -110,7 +110,7 @@ class PanelRunKey:
     gated: bool
     diff_cap_chars: int
     max_turns: int
-    reviewer_budgets_usd: tuple[float, ...]   # each reviewer's USD budget, in panel order
+    reviewer_budgets_usd: tuple[float, ...]   # each reviewer's USD budget in panel order; floats, so 5 and 5.0 share a slot
 
     @classmethod
     def of(
@@ -130,7 +130,7 @@ class PanelRunKey:
             gated=usage_gate is not None,
             diff_cap_chars=diff_cap_chars,
             max_turns=max_turns,
-            reviewer_budgets_usd=tuple(reviewer_budgets_usd),
+            reviewer_budgets_usd=tuple(float(budget) for budget in reviewer_budgets_usd),
         )
 
     @classmethod
@@ -140,7 +140,7 @@ class PanelRunKey:
             gated=data['gated'],
             diff_cap_chars=data['diff_cap_chars'],
             max_turns=data['max_turns'],
-            reviewer_budgets_usd=tuple(data['reviewer_budgets_usd']),
+            reviewer_budgets_usd=tuple(float(budget) for budget in data['reviewer_budgets_usd']),
         )
 
 

@@ -133,6 +133,14 @@ def _unpinned_reviewer(name: str = 'r1_unpinned') -> VariantConfig:
     )
 
 
+def _pinned_at(budget: float, name: str = 'r1_pinned') -> VariantConfig:
+    """A one-reviewer panel pinned at *budget*, as written, int or float."""
+    return VariantConfig(
+        name=name, description='Test',
+        reviewers=[ReviewerSpec(name='r1', model='opus', specialization='Testing.', budget=budget)],
+    )
+
+
 def _make_review(name: str = 'test', verdict: str = 'PASS') -> dict:
     return {
         'reviewer': name,
@@ -1202,6 +1210,29 @@ class TestPanelCache:
                 await run_panel_cached(variant, diff, results_dir=results_dir, stagger_secs=0, **_full_style())
 
         assert dispatched == ['ungated', 'gated']
+
+    @pytest.mark.parametrize(('as_int', 'as_float'), [
+        pytest.param(
+            (_unpinned_reviewer(), {'production_budget': 5}), (_unpinned_reviewer(), {'production_budget': 5.0}),
+            id='production-budget',
+        ),
+        pytest.param(
+            (_pinned_at(5), {}), (_pinned_at(5.0), {}),
+            id='pinned-budget',
+        ),
+    ])
+    @pytest.mark.asyncio
+    async def test_an_int_budget_is_served_from_its_float_s_slot(
+        self, source: _Source, tmp_path: Path, as_int: tuple, as_float: tuple,
+    ) -> None:
+        diff, results_dir = _diff_in(source), tmp_path / 'results'
+
+        with _counted_reviewers() as dispatched:
+            for variant, budget in (as_int, as_float):
+                await run_panel_cached(variant, diff, results_dir=results_dir, stagger_secs=0, **budget)
+
+        assert dispatched == ['ungated']
+        assert len(list(results_dir.glob('*.json'))) == 1
 
     @pytest.mark.asyncio
     async def test_an_identical_call_is_served_from_the_cache(self, source: _Source, tmp_path: Path) -> None:
