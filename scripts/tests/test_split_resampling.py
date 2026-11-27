@@ -56,7 +56,8 @@ def test_percentile_interval_reads_unsorted_values_as_their_sorted_order():
 
 
 def test_a_wider_level_contains_the_narrower_interval_on_the_same_values():
-    values = [random.Random(11).gauss(0.0, 1.0) for _ in range(500)]
+    rng = random.Random(11)
+    values = [rng.gauss(0.0, 1.0) for _ in range(500)]
     narrow_low, narrow_high = split_resampling.percentile_interval(values, 0.90)
     wide_low, wide_high = split_resampling.percentile_interval(values, 0.97)
 
@@ -75,7 +76,8 @@ def test_percentile_interval_refuses_fewer_than_two_values():
 
 
 def test_null_cuts_are_the_inclusive_p95_and_p99():
-    values = [random.Random(5).expovariate(1.0) for _ in range(300)]
+    rng = random.Random(5)
+    values = [rng.expovariate(1.0) for _ in range(300)]
     cuts = statistics.quantiles(values, n=100, method='inclusive')
 
     assert split_resampling.null_cuts(values) == (cuts[94], cuts[98])

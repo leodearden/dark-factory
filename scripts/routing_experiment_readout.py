@@ -16,7 +16,6 @@ Exit codes:
 from __future__ import annotations
 
 import argparse
-import itertools
 import json
 import math
 import os
@@ -42,6 +41,7 @@ from shared.project_layout import KNOWN_PROJECT_ROOTS_ENV, known_project_roots, 
 from shared.routing_split import split_bucket
 from shared.sqlite_readonly import connect_readonly
 from shared.tasks_db_readonly import TaskDbUnreadable, connect_ro
+from split_resampling import null_cuts, permuted_arms
 from systemd_unit_environment import SystemdUnanswered, UnitNotLoaded, inspect_unit
 
 EXIT_OK = 0  # report printed
@@ -807,22 +807,16 @@ def _null_diffs(
 ) -> dict[tuple[int, int], list[float]]:
     """Signed differences per (arm, metric index) under random relabelling of the pooled tasks.
 
-    Each resample draws one random ordering of all but the last arm's worth of
-    tasks; every metric reads that same draw, sliced into consecutive arms of
-    the observed sizes, with the last arm as its complement. That is a
-    permutation of the observed labels at half a shuffle's cost. A resample in
-    which an arm has no eligible task is skipped for that metric.
+    Every metric reads the same split_resampling.permuted_arms draw, with the
+    last arm as its complement. A resample in which an arm has no eligible task
+    is skipped for that metric.
     """
     diffs: dict[tuple[int, int], list[float]] = {pair: [] for pair in testable}
     if not testable:
         return diffs
-    population = range(sum(sizes))
-    bounds = list(itertools.accumulate(sizes[:-1], initial=0))
     indices = sorted({index for _, index in testable})
     totals = {index: columns[index].totals() for index in indices}
-    for _ in range(resamples):
-        order = rng.sample(population, bounds[-1])
-        drawn_arms = [order[low:high] for low, high in itertools.pairwise(bounds)]
+    for drawn_arms in permuted_arms(sizes, resamples, rng):
         sums = {
             index: _resampled_arm_sums(columns[index], totals[index], drawn_arms)
             for index in indices
@@ -837,8 +831,8 @@ def _null_diffs(
 def _null_band(diffs: Sequence[float]) -> NullBand | None:
     if len(diffs) < 2:
         return None
-    cuts = statistics.quantiles([abs(diff) for diff in diffs], n=100, method='inclusive')
-    return NullBand(p95=cuts[94], p99=cuts[98], mde=_MDE_Z * statistics.stdev(diffs))
+    p95, p99 = null_cuts([abs(diff) for diff in diffs])
+    return NullBand(p95=p95, p99=p99, mde=_MDE_Z * statistics.stdev(diffs))
 
 
 def _metric_row(
