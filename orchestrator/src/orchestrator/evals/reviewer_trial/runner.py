@@ -49,6 +49,7 @@ from orchestrator.evals.reviewer_trial.variants import (
     VariantConfig,
     build_trial_reviewer_role,
     panel_budgets,
+    trial_production_budget,
     trial_reviewer_max_turns,
 )
 from orchestrator.mcp_lifecycle import verdict_tools_mcp_server
@@ -510,6 +511,15 @@ async def run_panel(
 
 # The trial role's fixed turn cap from the module's birth until task 11728: every keyless panel ran at it.
 LEGACY_PANEL_MAX_TURNS = 30
+# The incumbent arms' pinned budget until task 11912: every keyless panel of an arm taking production's ran at it.
+LEGACY_PRODUCTION_BUDGET_USD = 5.0
+
+
+def _ran_like_legacy(variant: VariantConfig, max_turns: int, reviewer_budgets_usd: Sequence[float]) -> bool:
+    """Whether *variant*'s keyless legacy panels ran at *max_turns* and *reviewer_budgets_usd*."""
+    return max_turns == LEGACY_PANEL_MAX_TURNS and tuple(reviewer_budgets_usd) == panel_budgets(
+        variant, LEGACY_PRODUCTION_BUDGET_USD,
+    )
 
 
 def _slot_filename(variant_name: str, diff_id: str, run_key: PanelRunKey | None) -> str:
@@ -541,15 +551,16 @@ def _load_entry(
 
 
 def _legacy_hit(out_dir: Path, variant: VariantConfig, diff: CorpusDiff, wanted: PanelRunKey) -> PanelRunResult | None:
-    """This cell's keyless legacy panel when *wanted* asks for the turn cap it ran at, else None."""
+    """This cell's keyless legacy panel when *wanted* asks for the turn cap and budgets it ran at, else None."""
     path = out_dir / _slot_filename(variant.name, diff.diff_id, None)
     legacy = _load_entry(path, PanelRunResult.from_dict, variant.name, diff.diff_id)
     if legacy is None or legacy.run_key is not None:
         return None
-    if wanted.max_turns != LEGACY_PANEL_MAX_TURNS:
+    if not _ran_like_legacy(variant, wanted.max_turns, wanted.reviewer_budgets_usd):
         logger.info(
-            'Not reusing %s: a legacy panel ran at %d turns, wanted %d',
-            path, LEGACY_PANEL_MAX_TURNS, wanted.max_turns,
+            'Not reusing %s: a legacy panel ran at %d turns and budgets %s, wanted %d turns and budgets %s',
+            path, LEGACY_PANEL_MAX_TURNS, panel_budgets(variant, LEGACY_PRODUCTION_BUDGET_USD),
+            wanted.max_turns, wanted.reviewer_budgets_usd,
         )
         return None
     logger.info('Reusing %s, a legacy panel that records no run key', path)
@@ -573,8 +584,9 @@ async def run_panel_cached(
     The key holds each reviewer's budget, so an unpinned panel re-runs when
     *production_budget* (or production's own) changes. Each key has its own
     file. A keyless entry written before the key existed is reused only at
-    the 30-turn cap every such panel ran at, and only when the key's own file
-    is absent. Why, and how to re-measure one:
+    the 30-turn cap and the budgets every such panel ran at (an arm taking
+    production's budget ran at LEGACY_PRODUCTION_BUDGET_USD), and only when
+    the key's own file is absent. Why, and how to re-measure one:
     docs/plan-scoring-and-judge.md, "Reviewer-trial panel cache and score
     loop (task 6741)".
 
@@ -623,14 +635,16 @@ async def run_trial(
     diff_cap_chars: int = DIFF_CAP_CHARS,
     stagger_secs: float = 2.0,
     max_turns: int | None = None,
+    production_budget: float | None = None,
 ) -> list[PanelRunResult]:
     """Run all (variant x diff) pairs with bounded concurrency, each through run_panel_cached.
 
     *prices* (default-off) is threaded through to each ``run_panel`` call so
     cross-family (codex/gemini) reviewers get a non-sentinel cost column.
-    Every pair runs at one turn cap, resolved once. Reused legacy panels are
-    counted in one warning; legacy panels this cap passes over are counted in
-    one warning before any reviewer runs.
+    Every pair runs at one turn cap and one production budget, each resolved
+    once. Reused legacy panels are counted in one warning; legacy panels this
+    cap or budget passes over are counted in one warning before any reviewer
+    runs.
 
     Raises FixtureEnrichmentMissing, before any reviewer runs, when a
     context-complete variant meets a fixture with no ``context``. Fixtures with
@@ -643,7 +657,8 @@ async def run_trial(
             raise FixtureEnrichmentMissing(unenriched)
     _warn_of_sourceless_fixtures(corpus.diffs)
     turns = trial_reviewer_max_turns(max_turns)
-    _warn_of_passed_over_legacy_panels(variants, corpus.diffs, results_dir or _RESULTS_DIR, turns)
+    budget = trial_production_budget(production_budget)
+    _warn_of_passed_over_legacy_panels(variants, corpus.diffs, results_dir or _RESULTS_DIR, turns, budget)
 
     semaphore = asyncio.Semaphore(max_parallel_panels)
     all_results: list[PanelRunResult] = []
@@ -654,7 +669,7 @@ async def run_trial(
                 return await run_panel_cached(
                     variant, diff, results_dir=results_dir, stagger_secs=stagger_secs,
                     prices=prices, usage_gate=usage_gate, diff_cap_chars=diff_cap_chars,
-                    max_turns=turns,
+                    max_turns=turns, production_budget=budget,
                 )
             except FixtureNotMaterialisable as exc:
                 logger.warning(
@@ -708,18 +723,21 @@ def _warn_of_sourceless_fixtures(diffs: Sequence[CorpusDiff]) -> None:
 
 def _warn_of_passed_over_legacy_panels(
     variants: Sequence[VariantConfig], diffs: Sequence[CorpusDiff], out_dir: Path, turns: int,
+    production_budget: float,
 ) -> None:
-    if turns == LEGACY_PANEL_MAX_TURNS:
-        return
     passed_over = sum(
-        1 for variant in variants for diff in diffs
+        1 for variant in variants
+        if not _ran_like_legacy(variant, turns, panel_budgets(variant, production_budget))
+        for diff in diffs
         if (out_dir / _slot_filename(variant.name, diff.diff_id, None)).exists()
     )
     if passed_over:
         logger.warning(
             'Not reusing %d legacy panel(s) from %s: they ran at %d turns, this run uses %d; '
+            "arms taking production's budget ran at $%.2f, this run uses $%.2f; "
             'see docs/plan-scoring-and-judge.md, "Reviewer-trial panel cache and score loop (task 6741)"',
             passed_over, out_dir, LEGACY_PANEL_MAX_TURNS, turns,
+            LEGACY_PRODUCTION_BUDGET_USD, production_budget,
         )
 
 
@@ -735,19 +753,21 @@ async def run_and_score(
     usage_gate: UsageGate | None = None,
     diff_cap_chars: int = DIFF_CAP_CHARS,
     max_turns: int | None = None,
+    production_budget: float | None = None,
     on_scored: Callable[[ScoringResult], None] | None = None,
 ) -> list[ScoringResult]:
     """Every reviewer-trial subcommand's score loop: run_trial's panels, each scored through *usage_gate*.
 
-    With *score_dir*, a score is stored beside the key of the panel it scored:
-    a stored score is reused, and only a measured one is stored. *on_scored*
-    sees each score as it lands. See
+    *max_turns* and *production_budget* reach run_trial, which resolves each
+    once for every panel. With *score_dir*, a score is stored beside the key
+    of the panel it scored: a stored score is reused, and only a measured one
+    is stored. *on_scored* sees each score as it lands. See
     docs/plan-scoring-and-judge.md, "Reviewer-trial panel cache and score loop (task 6741)".
     """
     panels = await run_trial(
         list(variants), corpus, max_parallel_panels=max_parallel_panels, prices=prices,
         results_dir=results_dir, usage_gate=usage_gate, diff_cap_chars=diff_cap_chars,
-        stagger_secs=stagger_secs, max_turns=max_turns,
+        stagger_secs=stagger_secs, max_turns=max_turns, production_budget=production_budget,
     )
     scores: list[ScoringResult] = []
     for panel in panels:
