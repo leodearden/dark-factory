@@ -48,8 +48,12 @@ covered here:
 
 FAILS OPEN.  A degraded read, a timeout or any other failure logs a WARNING and
 lets the submission through.  Refusing on a backend blip would block every
-recon reset gate, including the genuine ones a human needs to see.  Unlike
-Stage 1's layer, which escalates an unresolved cycle, this one is handed no
+recon reset gate, including the genuine ones a human needs to see.  A
+composite subject is read component by component under one shared ceiling,
+each unread component getting an equal share of what remains; a citation
+already read refuses the gate whatever a later component does, and a
+component that times out or fails is unresolved on its own.  Unlike Stage 1's
+layer, which escalates an unresolved cycle, this one is handed no
 escalation channel, so a persistent outage is audible here only as those
 WARNINGs; the gate it admits still lands in front of a human.
 
@@ -97,7 +101,8 @@ __all__ = [
 
 logger = logging.getLogger(__name__)
 
-#: Ceiling on one submission's corroboration.  Exceeding it fails open.
+#: Ceiling on one submission's corroboration, shared by every component of
+#: its subject.  Exceeding it fails open.
 PRESERVED_SPECIMEN_GATE_TIMEOUT_SECONDS: float = 15.0
 
 
@@ -235,16 +240,61 @@ def preserved_specimen_reset_error(subject: str, citation: str) -> dict[str, Any
     }
 
 
-async def _corroborate_each(
+async def _corroborate_component(
+    memory_service: Any,
+    project_id: str,
+    task_id: str,
+    *,
+    timeout_seconds: float,
+    log: logging.Logger,
+) -> PreservationCorroboration:
+    try:
+        return await asyncio.wait_for(
+            corroborate_preservation(memory_service, project_id, task_id, log=log),
+            timeout=timeout_seconds,
+        )
+    except TimeoutError:
+        log.warning(
+            'preserved_specimen_gate_guard: corroboration of task %s in project %s '
+            'timed out after %.2fs — unresolved',
+            task_id, project_id, timeout_seconds,
+        )
+        return PreservationCorroboration(citation=None, degraded=True)
+    except Exception:
+        log.warning(
+            'preserved_specimen_gate_guard: corroboration of task %s in project %s '
+            'failed — unresolved',
+            task_id, project_id, exc_info=True,
+        )
+        return PreservationCorroboration(citation=None, degraded=True)
+
+
+async def _corroborate_until_cited(
     memory_service: Any,
     project_id: str,
     task_ids: tuple[str, ...],
+    *,
+    timeout_seconds: float,
     log: logging.Logger,
 ) -> dict[str, PreservationCorroboration]:
-    return {
-        task_id: await corroborate_preservation(memory_service, project_id, task_id, log=log)
-        for task_id in task_ids
-    }
+    """Corroborate *task_ids* in order under one ceiling, stopping at the first citation.
+
+    Each read gets an equal share of what remains, so a slow or hung component
+    can neither discard a citation already read nor starve a later component
+    of its read.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_seconds
+    verdicts: dict[str, PreservationCorroboration] = {}
+    for position, task_id in enumerate(task_ids):
+        share = (deadline - loop.time()) / (len(task_ids) - position)
+        verdict = await _corroborate_component(
+            memory_service, project_id, task_id, timeout_seconds=share, log=log,
+        )
+        verdicts[task_id] = verdict
+        if verdict.citation is not None:
+            break
+    return verdicts
 
 
 async def preserved_specimen_gate_error(
@@ -283,26 +333,9 @@ async def preserved_specimen_gate_error(
         return reset_gate_subject_required_error(subject)
 
     project_id = resolve_project_id(project_root)
-    subjects = ','.join(task_ids)
-    try:
-        verdicts = await asyncio.wait_for(
-            _corroborate_each(memory_service, project_id, task_ids, log),
-            timeout=timeout_seconds,
-        )
-    except TimeoutError:
-        log.warning(
-            'preserved_specimen_gate_guard: corroboration of gate_subject=%s in '
-            'project %s timed out after %.2fs — unresolved, submission proceeds',
-            subjects, project_id, timeout_seconds,
-        )
-        return None
-    except Exception:
-        log.warning(
-            'preserved_specimen_gate_guard: corroboration of gate_subject=%s in '
-            'project %s failed — unresolved, submission proceeds',
-            subjects, project_id, exc_info=True,
-        )
-        return None
+    verdicts = await _corroborate_until_cited(
+        memory_service, project_id, task_ids, timeout_seconds=timeout_seconds, log=log,
+    )
 
     for task_id, verdict in verdicts.items():
         if verdict.citation is not None:
