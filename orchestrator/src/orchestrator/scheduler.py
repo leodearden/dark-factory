@@ -106,6 +106,8 @@ from orchestrator.early_start_selection import (
     EarlyStartSelection,
     EarlyStartShortlist,
     StepReads,
+    branch_admits,
+    check_refusal,
     picture_deps_verdict,
 )
 from orchestrator.eligibility_clock import EligibilityClock, EligibilityClockStore
@@ -7098,16 +7100,22 @@ class Scheduler:
         if cfg_psi.enabled:
             psi_sample = self._read_psi_sample()
             self._warn_psi_degradations(_psi_degradations(psi_sample, cfg_psi))
-            in_flight = len(self._dispatched)
-            if psi_sample.saturated(cfg_psi) and in_flight >= cfg_psi.min_inflight_floor:
-                hold = PsiHold(
-                    metric=psi_sample.tripping_metric(cfg_psi),
-                    sample=psi_sample,
-                    in_flight=in_flight,
-                    floor=cfg_psi.min_inflight_floor,
-                )
+            hold = self._psi_hold(psi_sample)
         ctx.psi_hold = hold
         return _CONTINUE
+
+    def _psi_hold(self, sample: PsiSample) -> PsiHold | None:
+        """The admission hold *sample* imposes: saturated, with in-flight at or above the floor. A READ."""
+        cfg_psi = self.config.psi_admission
+        in_flight = len(self._dispatched)
+        if not (sample.saturated(cfg_psi) and in_flight >= cfg_psi.min_inflight_floor):
+            return None
+        return PsiHold(
+            metric=sample.tripping_metric(cfg_psi),
+            sample=sample,
+            in_flight=in_flight,
+            floor=cfg_psi.min_inflight_floor,
+        )
 
     def _warn_psi_degradations(self, degraded: Mapping[str, str]) -> None:
         """WARN once, naming every degraded component, when any of them is
@@ -8578,9 +8586,15 @@ class Scheduler:
         """Re-derive the candidates against the live lock table and the reads, and claim the first that passes.
 
         Synchronous: nothing can start a task between the checks and the claim.
-        Each read dependent is judged on its store row against fresh
-        dependency statuses; a candidate step (b) did not read is skipped.
+        The system holds are read before any candidate (invariant 13).  Each
+        read dependent is judged on its store row against fresh dependency
+        statuses; a candidate step (b) did not read is skipped.
         """
+        held = self._early_start_hold_reasons(holds)
+        if held:
+            return EarlyStartSelection(
+                claim=None, refusals=tuple(EarlyStartRefusal(reason) for reason in held),
+            )
         statuses = dict(reads.statuses)
         for pair in reads.pairs.values():
             statuses.update(pair.dependent_row.dep_statuses)
@@ -8592,10 +8606,13 @@ class Scheduler:
             pair = reads.pairs.get(dependent)
             if pair is None or pair.predecessor != predecessor or not self.lock_table.is_held(predecessor):
                 continue
-            if dependent in self._dispatched or self.lock_table.is_held(dependent):
-                refusals.append(EarlyStartRefusal(
-                    EarlyStartRefusalReason.NOT_ELIGIBLE, dependent=dependent, predecessor=predecessor,
-                ))
+            reason = check_refusal(pair.predecessor_checks)
+            if reason is None and not branch_admits(pair.dependent_row.task, predecessor, pair.dependent_branch):
+                reason = EarlyStartRefusalReason.HAS_BRANCH
+            if reason is None and (dependent in self._dispatched or self.lock_table.is_held(dependent)):
+                reason = EarlyStartRefusalReason.NOT_ELIGIBLE
+            if reason is not None:
+                refusals.append(EarlyStartRefusal(reason, dependent=dependent, predecessor=predecessor))
                 continue
             keys = list(candidate.keys)
             tier = candidate.priority.base_tier or coerce_tier(candidate.task.get('priority'))
@@ -8627,6 +8644,23 @@ class Scheduler:
             )
             return EarlyStartSelection(claim=claim, refusals=tuple(refusals))
         return EarlyStartSelection(claim=None, refusals=tuple(refusals))
+
+    def _early_start_hold_reasons(self, holds: EarlyStartHolds) -> list[EarlyStartRefusalReason]:
+        """Every system hold on early starts: the scheduler's own, then the harness's in *holds*.
+
+        Reads only: the host-load gate is read without its degradation warning
+        and touches no state (invariant 12).
+        """
+        reasons: list[EarlyStartRefusalReason] = []
+        if not self.config.early_start.enabled:
+            reasons.append(EarlyStartRefusalReason.DISABLED)
+        if self.config.psi_admission.enabled and self._psi_hold(self._read_psi_sample()) is not None:
+            reasons.append(EarlyStartRefusalReason.HOST_LOAD)
+        if self._paused:
+            reasons.append(EarlyStartRefusalReason.SCHEDULER_PAUSED)
+        if self._warm_base_hard_down:
+            reasons.append(EarlyStartRefusalReason.WARM_BASE_DOWN)
+        return reasons + holds.reasons()
 
     def release_early_start_claim(self, claim: EarlyStartClaim) -> bool:
         """The release path for a claim whose launch fails (PRD section 5.4 (d)); False when it is not the live claim.

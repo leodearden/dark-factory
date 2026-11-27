@@ -13,6 +13,8 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
 
+from shared.early_start_mark import early_start_predecessor
+
 from orchestrator.delivered_checks import ChecksAtCommit
 from orchestrator.dependency_verdict import DepsVerdict, deps_verdict
 from orchestrator.dispatch_row import FreshRow
@@ -174,6 +176,16 @@ class EarlyStartHolds:
     usage_paused: bool
     cost_ceiling_breached: bool
 
+    def reasons(self) -> list[EarlyStartRefusalReason]:
+        """The holds that hold, in a fixed order."""
+        flags = (
+            (self.review_checkpoint, EarlyStartRefusalReason.REVIEW_CHECKPOINT),
+            (self.merge_queue_halted, EarlyStartRefusalReason.MERGE_QUEUE_HALTED),
+            (self.usage_paused, EarlyStartRefusalReason.USAGE_PAUSED),
+            (self.cost_ceiling_breached, EarlyStartRefusalReason.COST_CEILING),
+        )
+        return [reason for holds, reason in flags if holds]
+
 
 @dataclass(frozen=True)
 class EarlyStartClaim:
@@ -215,3 +227,24 @@ def picture_deps_verdict(
         deferred_terminal_deps=picture.deferred_terminal_deps,
         waiting_predecessors=waiting_predecessors,
     )
+
+
+def branch_admits(task: Mapping[str, Any], predecessor: str, branch: DependentBranch) -> bool:
+    """No task branch, or one stacked on *predecessor* by an earlier early start (row 44).
+
+    *task* is the dependent's store row, so its mark is the one step (b) re-read.
+    """
+    if branch is DependentBranch.ABSENT:
+        return True
+    return branch is DependentBranch.STACKED and early_start_predecessor(task.get('metadata')) == predecessor
+
+
+def check_refusal(checks: ChecksAtCommit) -> EarlyStartRefusalReason | None:
+    """Why the predecessor's delivered checks at its tip refuse the pair (row 8); None when they passed."""
+    return _CHECK_REFUSALS.get(checks)
+
+
+_CHECK_REFUSALS = {
+    ChecksAtCommit.SCRIPT_KIND: EarlyStartRefusalReason.DELIVERED_CHECK_SCRIPT,
+    ChecksAtCommit.FAILED: EarlyStartRefusalReason.DELIVERED_CHECK_FAILED,
+}
