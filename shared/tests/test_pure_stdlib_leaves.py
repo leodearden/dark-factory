@@ -120,7 +120,6 @@ PURE_STDLIB_LEAVES = (
     'testing_fake_clock',
     'testing_mcp_stub',
     'testing_own_time',
-    'testing_reify_layout',
     'testing_repo_wide_tests',
     'testing_sockets',
     'testing_streams',

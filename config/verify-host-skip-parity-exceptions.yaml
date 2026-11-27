@@ -1,9 +1,3 @@
 # Tests a verify-host preflight may skip on one runner and run on its reference: docs/verify-host-preflight.md.
 # Every entry names its owner, the task or ticket that will remove it (INV-12); the loader refuses an ownerless entry.
-exceptions:
-  - test_id: "tests.test_verify_role_integration::test_role_env_propagates_to_reify_verify_plan[merge]"
-    owner: {type: task, id: 7030}
-    reason: Needs a reify checkout at the workstation's reify sha, which task 7030 provisions on verify hosts.
-  - test_id: "tests.test_verify_role_integration::test_role_env_propagates_to_reify_verify_plan[task]"
-    owner: {type: task, id: 7030}
-    reason: Needs a reify checkout at the workstation's reify sha, which task 7030 provisions on verify hosts.
+exceptions: []

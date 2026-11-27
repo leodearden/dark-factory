@@ -158,10 +158,11 @@ def resolve_dark_factory_root() -> Path | None:
     `shared.reify_checkout.resolve_reify_checkout` (task 3978), which honors a
     bad ``REIFY_ROOT`` VERBATIM and never falls through.  That opposite choice is
     right for ITS consumer and wrong for this one, because the two differ in what
-    a bad override costs.  reify_checkout feeds a pytest GATE: honoring verbatim
-    yields a loud ``pytest -rs`` skip naming the bad path, so the operator sees
-    the typo and nothing silently passes.  This function feeds a SPAWNED AGENT'S
-    ENVIRONMENT: honoring a stale export ships it to the rotation, whose
+    a bad override costs.  reify_checkout feeds the off-gate lock-charter drift
+    check: honoring verbatim yields a loud exit-2 UNAVAILABLE report naming the
+    bad path, so the operator sees the typo and nothing silently passes.  This
+    function feeds a SPAWNED AGENT'S ENVIRONMENT: honoring a stale export ships
+    it to the rotation, whose
     ``cd $DARK_FACTORY_ROOT && scripts/watcher-rearm.sh`` then trips that
     script's own guard (``scripts/watcher-rearm.sh:150-152``, exit 2) — verbatim
     census sighting #4, i.e. re-creating the very failure this module exists to
