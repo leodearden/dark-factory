@@ -2,6 +2,7 @@
 
 import functools
 import os
+import random
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -9,6 +10,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
+from _audit_hook import recording
 from _git_repo import (
     Repo,
     make_repo,
@@ -214,6 +216,41 @@ def test_blob_reader_reads_committed_bytes_in_one_session(repo: Repo) -> None:
         assert read(shas['a.txt']) == b'alpha\n'
 
 
+def test_blob_reader_reads_blobs_larger_than_a_pipe_holds_and_stays_in_step_after_them(
+    repo: Repo,
+) -> None:
+    random_bytes = random.Random(0).randbytes
+    committed = {
+        '200k.bin': random_bytes(200 * 1024),
+        '64k.bin': random_bytes(64 * 1024),
+        '64k-minus-1.bin': random_bytes(64 * 1024 - 1),
+        'small.txt': b'read after the large ones\n',
+    }
+    for path, content in committed.items():
+        repo.write(path, content)
+    commit = repo.commit('large', when=T0)
+    shas = {entry.path: entry.object_sha for entry in tree_entries(repo.root, commit)}
+
+    with blob_reader(repo.root) as read:
+        contents = {path: read(shas[path]) for path in committed}
+
+    assert contents == committed
+
+
+def test_a_blob_reader_session_starts_no_thread_however_many_blobs_it_reads(repo: Repo) -> None:
+    committed = {f'{i:02}.txt': f'{i}\n'.encode() for i in range(20)}
+    for path, content in committed.items():
+        repo.write(path, content)
+    commit = repo.commit('many', when=T0)
+    entries = tree_entries(repo.root, commit)
+
+    with recording() as record, blob_reader(repo.root) as read:
+        contents = {entry.path: read(entry.object_sha) for entry in entries}
+
+    assert contents == committed
+    assert record.thread_starts == ()
+
+
 def test_an_unknown_commit_raises_a_typed_error_without_a_path(repo: Repo) -> None:
     repo.write('a.txt', 'a\n')
     repo.commit('one', when=T0)
@@ -254,6 +291,56 @@ def test_a_blob_read_git_never_answers_fails_as_a_timeout(
     assert caught.value.returncode is None
     assert 'timed out' in caught.value.reason
     assert time.monotonic() - started < 15
+
+
+@pytest.mark.timing(
+    reason='a read that outlasts its deadline kills the session, so no later read can take its late reply'
+)
+def test_a_read_after_a_timed_out_read_never_takes_the_late_reply(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    answers_the_first_request_once_asked_again = (
+        'read first; read second; printf \'%s blob 4\\nlate\\n\' "$first"; read third; exit 0'
+    )
+    monkeypatch.setenv(
+        'PATH',
+        path_with_git_replaced_on(
+            tmp_path / 'bin', 'cat-file', answers_the_first_request_once_asked_again
+        ),
+    )
+    replies: list[bytes] = []
+
+    with pytest.raises(GitError) as caught, blob_reader(tmp_path, timeout_secs=0.5) as read:
+        with pytest.raises(GitError) as timed_out:
+            read('a' * 40)
+        replies.append(read('b' * 40))
+
+    assert 'timed out' in timed_out.value.reason
+    assert caught.value.subcommand == 'cat-file'
+    assert replies == []
+
+
+@pytest.mark.parametrize(
+    'reply_format',
+    ['', '%s blob 10', '%s blob 10\\nabc'],
+    ids=['nothing', 'mid-header', 'mid-body'],
+)
+def test_output_that_ends_before_the_blob_is_read_fails_as_an_early_end_not_a_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, reply_format: str
+) -> None:
+    monkeypatch.setenv(
+        'PATH',
+        path_with_git_replaced_on(
+            tmp_path / 'bin', 'cat-file', f'read line; printf \'{reply_format}\' "$line"; exit 0'
+        ),
+    )
+    sha = 'a' * 40
+
+    with pytest.raises(GitError) as caught, blob_reader(tmp_path) as read:
+        read(sha)
+
+    assert caught.value.subcommand == 'cat-file'
+    assert f'output ended before object {sha} was read' in caught.value.reason
 
 
 @pytest.mark.parametrize('commit', ['--output=x', 'HEAD', 'a' * 39, 'A' * 40, f'{"a" * 40}\n'])
