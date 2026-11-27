@@ -872,7 +872,8 @@ def resources_summary(legs: Iterable[Leg]) -> dict[str, Any]:
     """CPU-seconds and peak memory over the clean legs captured at exit.
 
     Every clean leg is counted under exactly one capture state, ``unrecorded``
-    (no record: it predates task 6355) or ``malformed``, so the counts
+    (no record: it predates task 6355, or is a remote run, which carries none
+    until PRD leaf 5) or ``malformed``, so the counts
     reconcile with the overall ``n``. Timed-out and failed legs are left out,
     as ``summarise_legs`` leaves them out of the durations.
     """
@@ -1309,8 +1310,9 @@ def _format_cost(cost: dict[str, Any]) -> list[str]:
         f"  CPU-seconds    {_format_series(cost['cpu_secs'])}",
         f"  peak GiB       {_format_series(_in_gib(cost['memory_peak_bytes']), digits=1)}",
         f"  captures       {captures or 'none'}",
-        f'  NOTE: {UNRECORDED} = the record predates task 6355; unavailable = the '
-        'capture degraded. Both are "not measured", NOT zero.',
+        f'  NOTE: {UNRECORDED} = no C4 record (predates task 6355, or a remote run '
+        'until leaf 5 carries it back); unavailable = the capture degraded. Both are '
+        '"not measured", NOT zero.',
     ]
 
 

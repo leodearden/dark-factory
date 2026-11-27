@@ -255,6 +255,7 @@ class TestTheTextReport:
             assert token in captures, captures
         note = ' '.join(section)
         assert 'NOT zero' in note, section
+        assert 'remote run' in note, section
 
     def test_an_unmeasured_series_prints_dashes_not_zero(self, tmp_path, capsys):
         write_corpus(tmp_path, command_entry())

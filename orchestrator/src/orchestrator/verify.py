@@ -3266,7 +3266,10 @@ def _build_summary_payload(
     None: not recorded.
 
     ``resources`` (task 6355) is the command's C4 record, which the budget
-    census reads; ``.get`` serves hand-built remote runs, which read None.
+    census reads. ``None`` there means the leg was segmented (each executed
+    segment carries its own record), or the run was hand-built by the remote
+    path, which carries no record until PRD leaf 5 brings it back; ``.get``
+    serves those hand-built runs.
 
     A NEGATIVE rc is not a quiet outcome — it is asyncio reporting that the
     process was terminated by signal ``-rc`` and never got to exit at all, so
@@ -5158,7 +5161,10 @@ class CheckRun:
         marks a leg whose timing belongs to the attempt's first pass.
 
         ``resources`` (task 6355) is emitted unconditionally: absent means the
-        run predates the C4 record, ``None`` means no single command ran.
+        run predates the C4 record, ``None`` means no single command ran
+        (skipped, or segmented: each segment's record is in ``segments``). A
+        summary also reads ``None`` for a remote run, which builds no CheckRun
+        (``_build_summary_payload``).
         """
         return {
             'label': self.label,
