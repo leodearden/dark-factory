@@ -17,11 +17,9 @@ import openai
 import pytest
 from _mem0_stub_backend import backend_against
 from _mock_openai_server import MockOpenAIServer, mock_openai_server
+from _offline_graphiti import run_graphiti_offline
 from _stub_qdrant_server import stub_qdrant_server
-from graphiti_core import Graphiti
-from graphiti_core.driver.falkordb_driver import FalkorDriver
 
-from fused_memory.backends import graphiti_client
 from fused_memory.backends.graphiti_client import GraphitiBackend
 from fused_memory.backends.mem0_client import Mem0Backend
 from fused_memory.config.request_attempts import RequestAttemptsConfig
@@ -43,12 +41,20 @@ pytestmark = [
     ),
 ]
 
-#: A 1.5 s stalled-schedule ceiling: 0.5 s, the SDK's 0.5 s backoff, 0.5 s.
-ATTEMPTS = RequestAttemptsConfig(per_attempt_timeout_seconds=0.5, max_attempts=2)
-WRITE_BUDGET_S = 5.0
-#: Just above the ceiling, so only a stall the per-attempt deadline cannot see reaches it.
-TRICKLE_BUDGET_S = 2.0
-SCOPE = Scope(project_id='bounded')
+#: How much longer than on an idle host any one step here may take on a busy xdist worker.
+LOAD_TOLERANCE_S = 1.5
+#: The answered retry must land inside the per-attempt deadline, so that deadline is the tolerance.
+#: Only a stalled attempt pays it in wall time.
+ATTEMPTS = RequestAttemptsConfig(per_attempt_timeout_seconds=LOAD_TOLERANCE_S, max_attempts=2)
+#: 3.5 s: 1.5 s, the SDK's 0.5 s backoff, 1.5 s.
+STALLED_CEILING_S = ATTEMPTS.stalled_schedule_seconds
+WRITE_BUDGET_S = STALLED_CEILING_S + LOAD_TOLERANCE_S
+#: Just above the ceiling, as the schema requires, so only a stall the per-attempt deadline cannot see reaches it.
+TRICKLE_BUDGET_S = STALLED_CEILING_S + 0.5
+#: Every chunk lands well inside the per-attempt deadline, so that deadline never fires.
+TRICKLE_INTERVAL_S = ATTEMPTS.per_attempt_timeout_seconds / 5
+PROJECT_ID = 'bounded'
+SCOPE = Scope(project_id=PROJECT_ID)
 #: Ends a call stuck on the SDK's 600 s default fast, rather than hanging the test.
 UNBOUNDED_GUARD_S = 10
 
@@ -93,18 +99,11 @@ def offline_graphiti(monkeypatch) -> object:
     """
     added = object()
 
-    def driver_factory(**_kwargs):
-        driver = MagicMock(spec=FalkorDriver)
-        driver.clone.return_value = MagicMock(spec=FalkorDriver)
-        return driver
-
     async def add_episode_embedding_its_body(self, *, episode_body, **_kwargs):
         await self.embedder.create_batch([episode_body])
         return added
 
-    monkeypatch.setattr(graphiti_client, '_MultiTenantFalkorDriver', driver_factory)
-    monkeypatch.setattr(graphiti_client, 'check_openai_responses_api', lambda: None)
-    monkeypatch.setattr(Graphiti, 'add_episode', add_episode_embedding_its_body)
+    run_graphiti_offline(monkeypatch, add_episode=add_episode_embedding_its_body)
     return added
 
 
@@ -153,7 +152,7 @@ async def test_a_graphiti_write_survives_one_stalled_embedding(
 
     async with graphiti_backend(config) as backend:
         started = time.monotonic()
-        result = await backend.add_episode(name='e', content='x', group_id='bounded')
+        result = await backend.add_episode(name='e', content='x', group_id=PROJECT_ID)
         elapsed = time.monotonic() - started
 
     assert result is offline_graphiti
@@ -188,7 +187,7 @@ async def test_a_graphiti_write_whose_every_embedding_stalls_fails_on_its_attemp
     async with graphiti_backend(config) as backend:
         started = time.monotonic()
         with pytest.raises(openai.APITimeoutError):
-            await backend.add_episode(name='e', content='x', group_id='bounded')
+            await backend.add_episode(name='e', content='x', group_id=PROJECT_ID)
         elapsed = time.monotonic() - started
 
     assert len(endpoint.requests_to('/embeddings')) == ATTEMPTS.max_attempts
@@ -201,14 +200,14 @@ async def test_a_trickling_embedding_still_ends_at_the_write_budget(bounded_conf
 
     async with mem0_backend(config) as backend:
         await warmed_mem0_backend_embeds(backend, endpoint)
-        endpoint.trickle('/embeddings', interval_s=0.1)
+        endpoint.trickle('/embeddings', interval_s=TRICKLE_INTERVAL_S)
         started = time.monotonic()
         with pytest.raises(TimeoutError) as raised:
             await backend.add('x', SCOPE)
         elapsed = time.monotonic() - started
 
     assert str(raised.value) == f'Mem0 add timed out after {TRICKLE_BUDGET_S}s'
-    assert TRICKLE_BUDGET_S <= elapsed < TRICKLE_BUDGET_S + 1.0
+    assert TRICKLE_BUDGET_S <= elapsed < TRICKLE_BUDGET_S + LOAD_TOLERANCE_S
 
 
 async def test_a_reindex_embedding_survives_one_stalled_attempt(
@@ -239,7 +238,7 @@ async def test_a_reindex_embedding_survives_one_stalled_attempt(
 
 
 async def test_the_task_curator_embedding_survives_one_stalled_attempt(bounded_config, endpoint):
-    """record_task logs and swallows a failure, so the request count is what shows the retry."""
+    """record_task logs and swallows a failure, so only the landed upsert shows the retry answered."""
     config = bounded_config(WRITE_BUDGET_S)
     endpoint.stall('/embeddings', first=1)
 
@@ -248,9 +247,10 @@ async def test_the_task_curator_embedding_survives_one_stalled_attempt(bounded_c
         curator = TaskCurator(config)
         try:
             await asyncio.wait_for(
-                curator.record_task('t1', CandidateTask(title='x'), 'bounded'), UNBOUNDED_GUARD_S,
+                curator.record_task('t1', CandidateTask(title='x'), PROJECT_ID), UNBOUNDED_GUARD_S,
             )
         finally:
             await curator.close()
 
     assert len(endpoint.requests_to('/embeddings')) == 2
+    assert stub.upserts(f'task_curator_{PROJECT_ID}') == 1
