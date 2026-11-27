@@ -61,7 +61,7 @@ from fused_memory.embedder.endpoint_probe import EmbedderEndpointProbe
 from fused_memory.embedder.status import embedder_identity_status
 from fused_memory.mcp_tools.scheduler_state import (
     read_scheduler_events,
-    read_scheduler_state,
+    served_scheduler_state,
 )
 from fused_memory.memory_metadata import (
     SUPERSEDED_BY_METADATA_KEY,
@@ -11552,11 +11552,12 @@ def create_mcp_server(
     async def get_scheduler_state(
         project_root: str,
     ) -> dict[str, Any]:
-        """Return the latest in-memory scheduler state snapshot.
+        """Return the latest scheduler state snapshot, its pause verdict cross-checked.
 
         The snapshot is written atomically by the orchestrator after every
-        ``acquire_next`` tick.  This tool reads the JSON file from disk;
-        it never touches the live scheduler process.
+        ``acquire_next`` tick and at pause, resume, restore and shutdown.
+        This tool reads the JSON file and the runs.db ``scheduler_state``
+        pause row from disk; it never touches the live scheduler process.
 
         Read-only.  Does NOT emit an audit add_memory call.
 
@@ -11564,15 +11565,19 @@ def create_mcp_server(
             project_root: Absolute path to project root.
 
         Returns:
-            Every SchedulerStateSnapshot field. ``snapshot_at`` is
-            null when no orchestrator has written a snapshot yet.
+            Every SchedulerStateSnapshot field plus ``snapshot_age_s``,
+            ``pause_row`` and ``pause_disagreement``. ``is_paused``,
+            ``pause_reason`` and ``pause_class`` are the runs.db row's verdict
+            when that row is readable and disagrees with the snapshot (or the
+            snapshot is unreadable). ``snapshot_at`` is null when no
+            orchestrator has written a snapshot yet.
         """
         _normalized = _normalize_project_root(project_root)
         if isinstance(_normalized, dict):
             return _normalized
         project_root = _normalized
-        snapshot = await asyncio.to_thread(read_scheduler_state, Path(project_root))
-        return snapshot.to_json()
+        served = await asyncio.to_thread(served_scheduler_state, Path(project_root))
+        return served.to_json()
 
     @mcp.tool()
     @mcp_tool_errors()

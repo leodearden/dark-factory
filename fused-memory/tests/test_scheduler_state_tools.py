@@ -15,6 +15,7 @@ import statistics
 import threading
 import time
 from collections.abc import Callable
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock
 
@@ -22,14 +23,16 @@ import pytest
 from orchestrator.config import OrchestratorConfig
 from orchestrator.pause_policy import PauseClass
 from orchestrator.pin_reservation import PinOrder
+from orchestrator.run_store import RunStore
 from orchestrator.scheduler import Scheduler
 from shared.project_layout import scheduler_state_json
-from shared.scheduler_state import SchedulerStateSnapshot
+from shared.scheduler_state import CheckedSchedulerState, SchedulerStateSnapshot
 
 from fused_memory.mcp_tools.scheduler_state import (
     SchedulerStateUnreadable,
     read_scheduler_state,
     read_scheduler_state_strict,
+    served_scheduler_state,
 )
 from fused_memory.server.tools import create_mcp_server
 
@@ -94,7 +97,12 @@ _COLD_START = {
     'pause_class': None,
     'requeue_cooldowns': {},
     'snapshot_at': None,
+    'snapshot_age_s': None,
+    'pause_row': None,
+    'pause_disagreement': False,
 }
+
+_READER_FIELDS = {'snapshot_age_s', 'pause_row', 'pause_disagreement'}
 
 _REQUEUE_COOLDOWN_FIELDS = {
     'armed_secs', 'envelope_secs', 'transient', 'transient_count', 'armed_at', 'expires_at',
@@ -146,6 +154,21 @@ def _runs_db_path(project_root: Path) -> Path:
     return project_root / 'data' / 'orchestrator' / 'runs.db'
 
 
+def _save_pause_row(project_root: Path, reason: str, pause_class: PauseClass) -> str:
+    """Persist a runs.db pause row the way the orchestrator does; returns its pause_at."""
+    db_path = _runs_db_path(project_root)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    pause_at = datetime.now(UTC).isoformat()
+    RunStore(db_path).save_scheduler_pause(
+        project_id='dark_factory',
+        reason=reason,
+        pause_at_iso=pause_at,
+        set_by_run_id='run-1',
+        pause_class=pause_class,
+    )
+    return pause_at
+
+
 _SNAPSHOT_READ_BUDGET_MS = 50
 
 
@@ -191,7 +214,12 @@ class TestGetSchedulerStateTool:
         _write_snapshot(tmp_path, synthetic)
 
         result = await _get_scheduler_state(mcp_server, tmp_path)
-        assert result == {**_COLD_START, **synthetic}
+        age = result.pop('snapshot_age_s')
+        assert isinstance(age, float)
+        assert age > 0
+        expected = {**_COLD_START, **synthetic}
+        del expected['snapshot_age_s']
+        assert result == expected
 
     @pytest.mark.asyncio
     async def test_cold_start_returns_every_key_and_a_null_snapshot_at(
@@ -218,7 +246,9 @@ class TestGetSchedulerStateTool:
 
         result = await _get_scheduler_state(mcp_server, tmp_path)
 
-        assert result == json.loads(scheduler_state_json(tmp_path).read_text())
+        written = json.loads(scheduler_state_json(tmp_path).read_text())
+        assert {key: result[key] for key in written} == written
+        assert set(result) == set(written) | _READER_FIELDS
         assert result['lock_depth'] == 3
         assert 'P' in result['pin_reservations']
         assert set(result['requeue_cooldowns']['T1']) == _REQUEUE_COOLDOWN_FIELDS
@@ -256,13 +286,53 @@ class TestGetSchedulerStateTool:
         self, tmp_path, mcp_server, caplog, body
     ):
         _write_snapshot_text(tmp_path, body)
-        with caplog.at_level(logging.WARNING, logger='fused_memory.mcp_tools.scheduler_state'):
+        with caplog.at_level(logging.WARNING, logger='shared.scheduler_state'):
             result = await _get_scheduler_state(mcp_server, tmp_path)
         assert result == _COLD_START
         assert any(
-            r.levelno == logging.WARNING and r.name == 'fused_memory.mcp_tools.scheduler_state'
+            r.levelno == logging.WARNING and r.name == 'shared.scheduler_state'
             for r in caplog.records
         ), [r.getMessage() for r in caplog.records]
+
+    @pytest.mark.asyncio
+    async def test_a_flushed_pause_and_its_row_agree(self, tmp_path, mcp_server):
+        """PRD boundary row 3: pause, flush, persist the row; the reply agrees and is fresh."""
+        scheduler = Scheduler(OrchestratorConfig(project_root=tmp_path, max_per_module=1))
+        scheduler.finish_startup()
+        before = datetime.now(UTC)
+        scheduler.pause('cost_ceiling_orch_exceeded', PauseClass.COST_CEILING)
+        await scheduler.flush_state_snapshot()
+        pause_at = _save_pause_row(tmp_path, 'cost_ceiling_orch_exceeded', PauseClass.COST_CEILING)
+
+        result = await _get_scheduler_state(mcp_server, tmp_path)
+
+        assert result['is_paused'] is True
+        assert result['pause_disagreement'] is False
+        assert datetime.fromisoformat(result['snapshot_at']) >= before
+        assert result['snapshot_age_s'] is not None
+        assert result['pause_row'] == {
+            'reason': 'cost_ceiling_orch_exceeded',
+            'pause_at': pause_at,
+            'pause_class': 'cost_ceiling',
+        }
+
+    @pytest.mark.asyncio
+    async def test_a_stale_running_snapshot_over_a_pause_row_serves_the_row(
+        self, tmp_path, mcp_server
+    ):
+        """PRD boundary row 4: the snapshot says running, the runs.db row says paused."""
+        _write_snapshot(
+            tmp_path,
+            SchedulerStateSnapshot(is_paused=False, snapshot_at=datetime.now(UTC)).to_json(),
+        )
+        _save_pause_row(tmp_path, 'cost_ceiling_orch_exceeded', PauseClass.COST_CEILING)
+
+        result = await _get_scheduler_state(mcp_server, tmp_path)
+
+        assert result['is_paused'] is True
+        assert result['pause_reason'] == 'cost_ceiling_orch_exceeded'
+        assert result['pause_class'] == 'cost_ceiling'
+        assert result['pause_disagreement'] is True
 
     @pytest.mark.asyncio
     async def test_invalid_project_root_returns_validation_error(
@@ -307,6 +377,20 @@ class TestGetSchedulerStateTool:
         assert result['park_stacks'] == _PARK_STACKS_FIXTURE, (
             f'Expected park_stacks surfaced end-to-end, got {result.get("park_stacks")!r}'
         )
+
+
+class TestServedSchedulerState:
+    def test_is_paused_follows_the_pause_row(self, tmp_path):
+        _write_snapshot(
+            tmp_path,
+            {'is_paused': False, 'snapshot_at': (datetime.now(UTC) - timedelta(hours=1)).isoformat()},
+        )
+        _save_pause_row(tmp_path, 'operator halt', PauseClass.OPERATOR)
+
+        served = served_scheduler_state(tmp_path)
+
+        assert isinstance(served, CheckedSchedulerState)
+        assert served.is_paused is True
 
 
 class TestReadSchedulerStateStrict:
@@ -727,4 +811,19 @@ class TestSnapshotPerformance:
         assert median_ms < _SNAPSHOT_READ_BUDGET_MS, (
             f'Median thread-CPU {median_ms:.1f}ms exceeds the '
             f'{_SNAPSHOT_READ_BUDGET_MS}ms snapshot-read budget (task 1230)'
+        )
+
+        # served_scheduler_state is the helper the get_scheduler_state tool runs in
+        # asyncio.to_thread, so it carries the same budget. The seeded pause row
+        # makes the timed read open runs.db and SELECT it, not stop at a missing file.
+        _save_pause_row(tmp_path, 'cost_ceiling_orch_exceeded', PauseClass.COST_CEILING)
+        served = served_scheduler_state(tmp_path)
+        assert len(served.skip_counts) == n
+        assert served.pause_row is not None
+        served_median_ms = _median_thread_cpu_ms(
+            lambda: served_scheduler_state(tmp_path), warmup=2, samples=20,
+        )
+        assert served_median_ms < _SNAPSHOT_READ_BUDGET_MS, (
+            f'Median thread-CPU {served_median_ms:.1f}ms of served_scheduler_state exceeds '
+            f'the {_SNAPSHOT_READ_BUDGET_MS}ms snapshot-read budget (task 1230)'
         )

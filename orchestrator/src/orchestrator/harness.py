@@ -3249,6 +3249,8 @@ class Harness:
                 except Exception as e:
                     logger.warning(f'Failed to finalize run metrics: {e}')
 
+            await self._flush_scheduler_snapshot()
+
             # Checkpoint all SQLite WAL files while the event loop is still
             # healthy — truncates the WAL so a subsequent crash cannot leave
             # the stores in a half-written state.  Best-effort: failures are
@@ -18877,6 +18879,8 @@ class Harness:
         4. Logs a WARNING so the operator sees it.
         5. Files an auto-resumable scheduler-pause L1 — unless ``file_escalation``
            is False.
+        6. Flushes scheduler_state.json (``_flush_scheduler_snapshot``) last,
+           after the runs.db row, so steps 1-5 run without yielding.
 
         ``file_escalation`` defaults True for every automatic trip (park-stop,
         cost-ceiling, EWA, watcher) so an AFK operator is notified.  A *deliberate*
@@ -18933,6 +18937,8 @@ class Harness:
         if file_escalation:
             self._file_scheduler_pause_escalation(reason)
 
+        await self._flush_scheduler_snapshot()
+
     async def resume_scheduler(self) -> None:
         """Clear the scheduler pause so acquire_next() resumes dispatching.
 
@@ -18947,6 +18953,8 @@ class Harness:
            signals that the situation is under control — a clean reset is less
            surprising than watching the EWA trip instantly again.
         5. Logs INFO.
+        6. Flushes scheduler_state.json (``_flush_scheduler_snapshot``) last,
+           after the runs.db clear, so steps 1-5 run without yielding.
         """
         # Snapshot the class BEFORE resume() clears it.
         prior_class = self.scheduler.pause_class
@@ -18972,6 +18980,19 @@ class Harness:
                 EventType.scheduler_resumed,
                 data={'pause_class': prior_class.value if prior_class else None},
             )
+
+        await self._flush_scheduler_snapshot()
+
+    async def _flush_scheduler_snapshot(self) -> None:
+        """Force a best-effort scheduler_state.json write; never raises.
+
+        A paused scheduler never ticks, so pause, resume, restore and shutdown
+        call this (plans/instruments-honesty-prd.md decision 5).
+        """
+        try:
+            await self.scheduler.flush_state_snapshot()
+        except Exception:
+            logger.warning('failed to flush the scheduler state snapshot', exc_info=True)
 
     async def _load_persisted_scheduler_pause(self) -> None:
         """Restore scheduler pause state from runs.db on restart.
@@ -19088,6 +19109,7 @@ class Harness:
                 '_load_persisted_scheduler_pause: failed to read pause state',
                 exc_info=True,
             )
+        await self._flush_scheduler_snapshot()
 
     def _reassert_restored_pause(
         self, reason: str, pause_class: PauseClass,

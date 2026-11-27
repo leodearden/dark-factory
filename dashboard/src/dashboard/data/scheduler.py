@@ -39,10 +39,14 @@ Shape contract (returned by collect_scheduler_state):
 
     offline_projects: list[str]  — project labels that failed to respond
 
-    paused_projects: list[dict]  — projects whose scheduler is park-stop paused.
-        Each entry: {'project': str, 'reason': str | None}
-        Empty list when no project is paused or snapshots lack the is_paused key
-        (safe degradation for pre-upgrade on-disk snapshots).
+    paused_projects: list[dict]  — projects whose scheduler is paused, in root order.
+        Each entry: {'project': str, 'reason': str | None,
+        'pause_class': str | None, 'snapshot_at': str | None (ISO),
+        'snapshot_age_s': float | None, 'pause_disagreement': bool}.
+        Read from each configured root's local files by
+        ``shared.scheduler_state.read_scheduler_state_checked``, so the runs.db
+        pause row corrects a stale snapshot, independent of fused-memory
+        reachability. Empty when no root's files say paused.
 
     recovery_events: dict[str, list[dict]]  — sweep events that are NOT
         ``task_skipped``, keyed by project label.  Each row is the raw event
@@ -77,14 +81,17 @@ import logging
 import os
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 import httpx
 from shared.locking import files_to_modules, modules_conflict
 from shared.scheduler_state import (
+    CheckedSchedulerState,
     MalformedSnapshotError,
     OverrideRecord,
     SchedulerStateSnapshot,
+    read_scheduler_state_checked,
 )
 
 from dashboard.config import DashboardConfig
@@ -96,6 +103,7 @@ from dashboard.data.memory import mcp_tool_call
 from dashboard.data.served_read import ServedRead
 from dashboard.data.task_snapshot import SnapshotHealth, classify
 from dashboard.data.utils import resolve_now
+from dashboard.project_labels import ProjectLabels
 
 logger = logging.getLogger(__name__)
 
@@ -774,10 +782,9 @@ async def collect_scheduler_state(
         pin_queue:        Pin-queue list from snapshot.
         events_by_task:   ``{task_id: sparkline_dict}``; empty when no history.
         offline_projects: Project labels that failed to respond.
-        paused_projects:  List of ``{'project': label, 'reason': str|None}`` dicts
-                          for projects whose scheduler is park-stop paused.
-                          Empty list when no project is paused or the snapshot
-                          lacks ``is_paused`` (pre-upgrade on-disk degradation).
+        paused_projects:  One dict per paused root, in root order, read from
+                          every configured root's local files whether or not
+                          fused-memory answers (see module docstring).
         recovery_events:  ``{project_label: [event_row, ...]}`` for every sweep
                           event that is NOT ``task_skipped``.  Present-with-``[]``
                           means the project answered and had no sweeps; ABSENT
@@ -919,7 +926,6 @@ async def collect_scheduler_state(
     # multi-project dashboards).  The React lookup in tab_scheduler.jsx uses
     # `${row.project}/${row.task_id}` to match this key.
     all_events_by_task: dict[str, dict] = {}
-    all_paused_projects: list[dict] = []
     # Keyed by project label; see the shape contract in the module docstring —
     # present-with-[] means "read succeeded, no sweeps", absent means offline.
     all_recovery_events: dict[str, list[dict]] = {}
@@ -939,12 +945,6 @@ async def collect_scheduler_state(
         if snapshot is None:
             offline_projects.append(label)
             continue
-
-        if snapshot.is_paused:
-            all_paused_projects.append({
-                'project': label,
-                'reason': snapshot.pause_reason,
-            })
 
         # This root's shaped rows come from its own unit.
         project_active = rows_by_label.get(label)
@@ -1077,16 +1077,51 @@ async def collect_scheduler_state(
                 task_events, since=since, until=effective_now
             )
 
+    paused_projects = await _paused_projects(config.all_project_roots, labels, now=effective_now)
+
     return (
         all_rows,
         all_modules,
         all_pin_queue,
         all_events_by_task,
         offline_projects,
-        all_paused_projects,
+        paused_projects,
         all_recovery_events,
         degraded_projects,
     )
+
+
+async def _paused_projects(
+    roots: Sequence[Path], labels: ProjectLabels, *, now: datetime,
+) -> list[dict]:
+    """Every paused root's entry, in root order, from its local files.
+
+    A root whose read raises is logged and skipped, so collect_scheduler_state
+    still never raises.
+    """
+    results = await asyncio.gather(
+        *(asyncio.to_thread(read_scheduler_state_checked, Path(root), now=now) for root in roots),
+        return_exceptions=True,
+    )
+    entries: list[dict] = []
+    for root, result in zip(roots, results, strict=True):
+        if isinstance(result, BaseException):
+            logger.warning('reading the scheduler state of %s raised: %r', root, result)
+            continue
+        if result.is_paused:
+            entries.append(_paused_entry(labels.of(root), result))
+    return entries
+
+
+def _paused_entry(label: str, state: CheckedSchedulerState) -> dict:
+    return {
+        'project': label,
+        'reason': state.pause_reason,
+        'pause_class': state.pause_class,
+        'snapshot_at': state.snapshot_at.isoformat() if state.snapshot_at is not None else None,
+        'snapshot_age_s': state.snapshot_age_s,
+        'pause_disagreement': state.pause_disagreement,
+    }
 
 
 def _merge_module_lists(
