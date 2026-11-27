@@ -9,6 +9,7 @@ from typing import Any
 import pytest
 
 from orchestrator.agents.token_pricing import FALLBACK_PRICE, TokenUsage, price_tokens
+from orchestrator.config import ModelsConfig
 from orchestrator.evals.metrics import (
     DispatchRecord,
     EndpointKind,
@@ -652,21 +653,28 @@ class TestBlendComposite:
 # Task 8499: the persisted per-role dispatch record and the off-pin accessor.
 # ---------------------------------------------------------------------------
 
+_SEATED_SONNET = ModelsConfig(implementer='sonnet', judge='sonnet')
+_CAPACITY_EXHAUSTED = 'config:model-capacity-exhausted'
+
+
 def _dispatched(
     role: str, model: str, source_layer: str, rule_id: str | None, served: str | None,
+    *, rejected: tuple[str, ...] = (),
 ) -> DispatchedRoute:
     decision = RoutingDecision(
         model=model, effort='high', budget_usd=5.0, max_turns=80,
-        source_layer=source_layer, rule_id=rule_id,
+        source_layer=source_layer, rule_id=rule_id, rejected=rejected,
     )
     return DispatchedRoute(role, decision, served)
 
 
 def _record(
     model: str, served: str | None, source_layer: str, rule_id: str | None,
+    *, configured_model: str | None, rejected: list[str] | None = None,
 ) -> DispatchRecord:
     return DispatchRecord(
         model=model, served_model_id=served, source_layer=source_layer, rule_id=rule_id,
+        configured_model=configured_model, rejected=rejected or [],
     )
 
 
@@ -681,16 +689,42 @@ class TestDispatchedModels:
             _dispatched('implementer', 'opus', 'policy_rule', 'retry-tier-up', 'claude-opus-5-5'),
         ]
 
-        assert dispatched_models(routes) == {
+        assert dispatched_models(routes, _SEATED_SONNET) == {
             'implementer': [
-                _record('sonnet', 'claude-sonnet-5-5', 'config', 'large-plan-steps'),
-                _record('opus', 'claude-opus-5-5', 'policy_rule', 'retry-tier-up'),
+                _record(
+                    'sonnet', 'claude-sonnet-5-5', 'config', 'large-plan-steps',
+                    configured_model='sonnet',
+                ),
+                _record(
+                    'opus', 'claude-opus-5-5', 'policy_rule', 'retry-tier-up',
+                    configured_model='sonnet',
+                ),
             ],
-            'judge': [_record('sonnet', 'claude-sonnet-5-5', 'config', None)],
+            'judge': [_record('sonnet', 'claude-sonnet-5-5', 'config', None, configured_model='sonnet')],
         }
 
     def test_no_routes_is_an_empty_mapping(self):
-        assert dispatched_models([]) == {}
+        assert dispatched_models([], _SEATED_SONNET) == {}
+
+    def test_a_decision_rejection_persists_as_a_list(self):
+        routes = [
+            _dispatched('implementer', 'opus', 'role_default', None, None, rejected=(_CAPACITY_EXHAUSTED,)),
+        ]
+
+        [record] = dispatched_models(routes, _SEATED_SONNET)['implementer']
+
+        assert record['rejected'] == [_CAPACITY_EXHAUSTED]
+
+    def test_configured_model_is_read_from_the_role_seat(self):
+        routes = [
+            _dispatched('reviewer_comprehensive', 'haiku', 'config', None, None),
+            _dispatched('resettled_adjudicator', 'opus', 'role_default', None, None),
+        ]
+
+        dispatched = dispatched_models(routes, ModelsConfig(reviewer='haiku'))
+
+        assert dispatched['reviewer_comprehensive'][0]['configured_model'] == 'haiku'
+        assert dispatched['resettled_adjudicator'][0]['configured_model'] is None
 
     def test_off_pin_roles_reads_none_as_not_recorded(self):
         assert off_pin_roles(None) is None
@@ -698,23 +732,50 @@ class TestDispatchedModels:
     def test_off_pin_roles_of_an_empty_mapping_is_empty(self):
         assert off_pin_roles({}) == []
 
-    @pytest.mark.parametrize('off_pin_layer', ['policy_rule', 'role_default'])
-    def test_off_pin_roles_names_a_role_that_left_the_config_layer(self, off_pin_layer: str):
+    @pytest.mark.parametrize(
+        ('source_layer', 'rejected'),
+        [
+            ('policy_rule', []),
+            ('metadata_override', []),
+            ('role_default', [_CAPACITY_EXHAUSTED]),
+        ],
+    )
+    def test_a_seated_role_that_ran_another_model_is_off_pin(
+        self, source_layer: str, rejected: list[str],
+    ):
         dispatched = {
             'implementer': [
-                _record('sonnet', 'claude-sonnet-5-5', 'config', None),
-                _record('opus', 'claude-opus-5-5', off_pin_layer, None),
+                _record('sonnet', 'claude-sonnet-5-5', 'config', None, configured_model='sonnet'),
+                _record(
+                    'opus', 'claude-opus-5-5', source_layer, None,
+                    configured_model='sonnet', rejected=rejected,
+                ),
             ],
-            'judge': [_record('sonnet', 'claude-sonnet-5-5', 'config', None)],
+            'judge': [_record('sonnet', 'claude-sonnet-5-5', 'config', None, configured_model='sonnet')],
         }
 
         assert off_pin_roles(dispatched) == ['implementer']
 
+    def test_a_role_without_a_seat_is_never_off_pin(self):
+        dispatched = {
+            'implementer': [_record('sonnet', None, 'config', None, configured_model='sonnet')],
+            'resettled_adjudicator': [_record('opus', None, 'role_default', None, configured_model=None)],
+        }
+
+        assert off_pin_roles(dispatched) == []
+
+    def test_running_the_seated_model_is_on_pin_whatever_the_layer(self):
+        dispatched = {
+            'implementer': [_record('sonnet', None, 'metadata_override', None, configured_model='sonnet')],
+        }
+
+        assert off_pin_roles(dispatched) == []
+
     def test_several_off_pin_roles_come_back_sorted(self):
         dispatched = {
-            'implementer': [_record('sonnet', None, 'role_default', None)],
-            'architect': [_record('opus', None, 'config', None)],
-            'debugger': [_record('opus', None, 'policy_rule', 'large-plan-steps')],
+            'implementer': [_record('opus', None, 'role_default', None, configured_model='sonnet')],
+            'architect': [_record('opus', None, 'config', None, configured_model='opus')],
+            'debugger': [_record('opus', None, 'policy_rule', 'large-plan-steps', configured_model='sonnet')],
         }
 
         assert off_pin_roles(dispatched) == ['debugger', 'implementer']
@@ -724,8 +785,17 @@ class TestDispatchedModels:
 
     def test_dispatched_models_survive_a_json_round_trip(self):
         m = EvalMetrics(dispatched_models={
-            'implementer': [_record('sonnet', 'claude-sonnet-5-5', 'config', 'large-plan-steps')],
-            'judge': [_record('sonnet', None, 'config', None)],
+            'implementer': [
+                _record(
+                    'sonnet', 'claude-sonnet-5-5', 'config', 'large-plan-steps',
+                    configured_model='sonnet',
+                ),
+                _record(
+                    'opus', None, 'role_default', None,
+                    configured_model='sonnet', rejected=[_CAPACITY_EXHAUSTED],
+                ),
+            ],
+            'judge': [_record('sonnet', None, 'config', None, configured_model='sonnet')],
         })
 
         assert EvalMetrics.from_dict(json.loads(json.dumps(m.to_dict()))) == m

@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from _eval_diff_repo import repo_with_commit
 
-from orchestrator.config import PriceEntry
+from orchestrator.config import ModelsConfig, PriceEntry
 from orchestrator.evals.cell_sandbox import CellSandbox
 from orchestrator.evals.metrics import EndpointKind, EvalMetrics, RoleUnderTest
 from orchestrator.evals.runner import collect_metrics
@@ -253,23 +253,40 @@ class TestFalseGreenAtTheEnforcedCap:
 
 def _dispatched(
     role: str, model: str, source_layer: str, rule_id: str | None, served: str,
+    *, rejected: tuple[str, ...] = (),
 ) -> DispatchedRoute:
     decision = RoutingDecision(
         model=model, effort='high', budget_usd=5.0, max_turns=120,
-        source_layer=source_layer, rule_id=rule_id,
+        source_layer=source_layer, rule_id=rule_id, rejected=rejected,
     )
     return DispatchedRoute(role, decision, served)
 
 
+_CAPACITY_EXHAUSTED = 'config:model-capacity-exhausted'
+
 _PINNED_SONNET = {
     'model': 'sonnet', 'served_model_id': 'claude-sonnet-5-5',
     'source_layer': 'config', 'rule_id': 'large-plan-steps',
+    'configured_model': 'sonnet', 'rejected': [],
+}
+
+_PINNED_JUDGE = {
+    'model': 'sonnet', 'served_model_id': 'claude-sonnet-5-5',
+    'source_layer': 'config', 'rule_id': None,
+    'configured_model': 'sonnet', 'rejected': [],
 }
 
 
 def _clean_routes() -> list[DispatchedRoute]:
     sonnet = _dispatched('implementer', 'sonnet', 'config', 'large-plan-steps', 'claude-sonnet-5-5')
     return [sonnet, _dispatched('judge', 'sonnet', 'config', None, 'claude-sonnet-5-5'), sonnet]
+
+
+def _seated_workflow(routes: list[DispatchedRoute]) -> MagicMock:
+    wf = _workflow()
+    wf.config.models = ModelsConfig(implementer='sonnet', judge='sonnet')
+    wf.metrics.dispatched_routes = routes
+    return wf
 
 
 @pytest.mark.asyncio
@@ -281,30 +298,42 @@ class TestCollectMetricsRecordsDispatchedModels:
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
     ) -> None:
         repo, base = repo_with_commit(tmp_path / 'repo', {})
-        wf = _workflow()
-        wf.metrics.dispatched_routes = _clean_routes()
+        wf = _seated_workflow(_clean_routes())
 
         with caplog.at_level(logging.WARNING, logger=_RUNNER_LOGGER):
             m = await _collect(repo, base, workflow=wf)
 
-        assert m.dispatched_models == {
-            'implementer': [_PINNED_SONNET],
-            'judge': [{
-                'model': 'sonnet', 'served_model_id': 'claude-sonnet-5-5',
-                'source_layer': 'config', 'rule_id': None,
-            }],
-        }
+        assert m.dispatched_models == {'implementer': [_PINNED_SONNET], 'judge': [_PINNED_JUDGE]}
+        assert not _runner_warnings(caplog)
+
+    async def test_a_role_without_a_seat_on_its_default_does_not_warn(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        repo, base = repo_with_commit(tmp_path / 'repo', {})
+        wf = _seated_workflow([
+            *_clean_routes(),
+            _dispatched('resettled_adjudicator', 'opus', 'role_default', None, 'claude-opus-5-5'),
+        ])
+
+        with caplog.at_level(logging.WARNING, logger=_RUNNER_LOGGER):
+            m = await _collect(repo, base, workflow=wf)
+
+        assert m.dispatched_models is not None
+        assert m.dispatched_models['resettled_adjudicator'] == [{
+            'model': 'opus', 'served_model_id': 'claude-opus-5-5',
+            'source_layer': 'role_default', 'rule_id': None,
+            'configured_model': None, 'rejected': [],
+        }]
         assert not _runner_warnings(caplog)
 
     async def test_an_off_pin_cell_is_recorded_and_warned_once(
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
     ) -> None:
         repo, base = repo_with_commit(tmp_path / 'repo', {})
-        wf = _workflow()
-        wf.metrics.dispatched_routes = [
+        wf = _seated_workflow([
             *_clean_routes(),
             _dispatched('implementer', 'opus', 'policy_rule', 'large-plan-steps', 'claude-opus-5-5'),
-        ]
+        ])
 
         with caplog.at_level(logging.WARNING, logger=_RUNNER_LOGGER):
             m = await _collect(repo, base, workflow=wf, task_id='df_task_8499')
@@ -315,11 +344,31 @@ class TestCollectMetricsRecordsDispatchedModels:
             {
                 'model': 'opus', 'served_model_id': 'claude-opus-5-5',
                 'source_layer': 'policy_rule', 'rule_id': 'large-plan-steps',
+                'configured_model': 'sonnet', 'rejected': [],
             },
         ]
         [warning] = [w for w in _runner_warnings(caplog) if 'df_task_8499' in w]
         assert 'implementer' in warning
         assert 'opus' in warning
+        assert 'judge' not in warning
+
+    async def test_a_capacity_fallback_to_the_role_default_warns_with_its_rejection(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        repo, base = repo_with_commit(tmp_path / 'repo', {})
+        wf = _seated_workflow([
+            _dispatched(
+                'implementer', 'opus', 'role_default', None, 'claude-opus-5-5',
+                rejected=(_CAPACITY_EXHAUSTED,),
+            ),
+        ])
+
+        with caplog.at_level(logging.WARNING, logger=_RUNNER_LOGGER):
+            await _collect(repo, base, workflow=wf, task_id='df_task_8499')
+
+        [warning] = [w for w in _runner_warnings(caplog) if 'df_task_8499' in w]
+        assert 'implementer' in warning
+        assert _CAPACITY_EXHAUSTED in warning
 
     async def test_a_workflow_with_no_recorded_routes_records_an_empty_mapping(
         self, tmp_path: Path,

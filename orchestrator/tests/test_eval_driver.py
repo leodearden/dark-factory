@@ -47,9 +47,9 @@ from _campaign_gate_helpers import (
 )
 
 from orchestrator.evals.configs import EvalConfig
-from orchestrator.evals.metrics import EvalMetrics, RoleUnderTest
+from orchestrator.evals.metrics import EvalMetrics, RoleUnderTest, dispatched_models, off_pin_roles
 from orchestrator.evals.results import EvalResult, ResultStore
-from orchestrator.routing import PlanShape
+from orchestrator.routing import DispatchedRoute, PlanShape
 from orchestrator.workflow import WorkflowOutcome
 
 
@@ -318,6 +318,18 @@ class TestCellRoutingPinsEveryRoleModel:
             assert rule.set.model_dump(exclude={'model'}) == (
                 base_by_id[rule.id].set.model_dump(exclude={'model'})
             )
+
+    def test_a_role_without_a_seat_on_its_default_is_not_off_pin(self, tmp_path: Path):
+        from orchestrator.evals.runner import build_eval_orch_config
+
+        cfg = build_eval_orch_config(_impl_cfg(), {}, _base_config(tmp_path))
+        names = ('implementer', 'reviewer_comprehensive', 'resettled_adjudicator')
+        decisions = {name: _route(cfg, name, plan_shape=_LARGE_BY_STEPS) for name in names}
+
+        assert decisions['resettled_adjudicator'].source_layer == 'role_default'
+        assert decisions['resettled_adjudicator'].rejected == ()
+        routes = [DispatchedRoute(name, decision, None) for name, decision in decisions.items()]
+        assert off_pin_roles(dispatched_models(routes, cfg.models)) == []
 
 
 # ---------------------------------------------------------------------------
