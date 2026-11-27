@@ -1611,6 +1611,8 @@ class Scheduler:
         self._backfill_scan_cache: _BackfillScanCache | None = None
         self._mcp_session = mcp_session
         self._dispatched: set[str] = set()
+        # The live early-start claim of each dependent, from its claim until release(dependent).
+        self._early_start_claims: dict[str, EarlyStartClaim] = {}
         # Tasks whose locks are a hold restore_hold took and no dispatch has
         # superseded since; _claim and release end the mark, so it never returns.
         self._restored_holds: set[str] = set()
@@ -8650,6 +8652,7 @@ class Scheduler:
                 tier=tier,
                 task=pair.dependent_row.task,
             )
+            self._early_start_claims[dependent] = claim
             return EarlyStartSelection(claim=claim, refusals=tuple(refusals))
         return EarlyStartSelection(claim=None, refusals=tuple(refusals))
 
@@ -8715,17 +8718,20 @@ class Scheduler:
         return reasons + holds.reasons()
 
     def release_early_start_claim(self, claim: EarlyStartClaim) -> bool:
-        """The release path for a claim whose launch fails (PRD section 5.4 (d)); False when it is not the live claim.
+        """The release path for a claim whose launch fails (PRD section 5.4 (d)).
 
-        Goes through :meth:`release`, which drops the keys, the relation and
-        the started mark, emits ``lock_released`` and arms no cooldown:
-        :meth:`_unclaim` is for a hold no ``lock_acquired`` announced, and
-        leaves a successor relation in force.
+        False when *claim* is not the scheduler's live claim for its
+        dependent: never made, already released, or superseded by a later
+        claim or an ordinary release.  A claim whose predecessor has since
+        released is still live, and is released.
+
+        Goes through :meth:`release`, which drops the keys, any relation still
+        in force and the started mark, emits ``lock_released`` and arms no
+        cooldown: :meth:`_unclaim` is for a hold no ``lock_acquired``
+        announced, and leaves a successor relation in force.
         """
-        relation = self.lock_table.successor_relation(claim.dependent)
         if (
-            relation is None
-            or (relation.successor, relation.predecessor) != (claim.dependent, claim.predecessor)
+            self._early_start_claims.get(claim.dependent) is not claim
             or claim.dependent not in self._dispatched
         ):
             return False
@@ -9050,6 +9056,7 @@ class Scheduler:
         it would strand this task's module locks.
         """
         self._dispatched.discard(task_id)
+        self._early_start_claims.pop(task_id, None)
         self._dispatched_priority.pop(task_id, None)
         self._restored_holds.discard(task_id)
         # Consume this task's pending transient-cooldown stamp (task 3317 /
