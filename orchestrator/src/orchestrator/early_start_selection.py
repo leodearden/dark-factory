@@ -13,7 +13,9 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
 
+from orchestrator.delivered_checks import ChecksAtCommit
 from orchestrator.dependency_verdict import DepsVerdict, deps_verdict
+from orchestrator.dispatch_row import FreshRow
 from orchestrator.id_tie_break import id_tie_break
 from orchestrator.task_picture import TaskPicture
 from orchestrator.task_priority import TaskPriority, tier_order
@@ -114,6 +116,85 @@ class EarlyStartShortlist:
     """Step (a)'s answer: the candidates in rank order, and the refused pairs."""
 
     candidates: tuple[EarlyStartCandidate, ...]
+    refusals: tuple[EarlyStartRefusal, ...]
+
+
+class DependentBranch(StrEnum):
+    """What step (b) found of the dependent's task branch."""
+
+    ABSENT = 'absent'
+    STACKED = 'stacked'
+    UNSTACKED = 'unstacked'
+    UNREADABLE = 'unreadable'
+
+
+@dataclass(frozen=True)
+class PairReads:
+    """Step (b)'s reads for one pair, made by the caller before the claim.
+
+    ``dependent_row`` is the dependent's store row and its dependency statuses, re-read through
+    ``orchestrator/src/orchestrator/dispatch_row.py::refresh_dispatch_row`` as every dispatch does.
+    """
+
+    predecessor: str
+    predecessor_tip: str
+    predecessor_checks: ChecksAtCommit
+    dependent_branch: DependentBranch
+    dependent_row: FreshRow
+
+    def __post_init__(self) -> None:
+        if not self.predecessor:
+            raise ValueError(f'reads name no predecessor, got {self.predecessor!r}')
+        if not isinstance(self.predecessor_tip, str) or not self.predecessor_tip:
+            raise ValueError(
+                f'reads for predecessor {self.predecessor!r} carry no tip, got {self.predecessor_tip!r}'
+            )
+
+
+@dataclass(frozen=True)
+class StepReads:
+    """Step (b)'s live statuses and its reads per pair, keyed by dependent."""
+
+    statuses: Mapping[str, str]
+    pairs: Mapping[str, PairReads]
+
+    def __post_init__(self) -> None:
+        for dependent, pair in self.pairs.items():
+            row_id = str(pair.dependent_row.task.get('id'))
+            if row_id != dependent:
+                raise ValueError(f'reads keyed by {dependent!r} carry the row of {row_id!r}')
+
+
+@dataclass(frozen=True)
+class EarlyStartHolds:
+    """The system holds the harness owns, every one stated by the caller."""
+
+    review_checkpoint: bool
+    merge_queue_halted: bool
+    usage_paused: bool
+    cost_ceiling_breached: bool
+
+
+@dataclass(frozen=True)
+class EarlyStartClaim:
+    """A dependent started on its predecessor's branch: its keys, the commit it stacks on, its tier and row.
+
+    ``task`` is the store row step (b) re-read, so the launch acts on it as an ordinary start does.
+    """
+
+    dependent: str
+    predecessor: str
+    keys: tuple[str, ...]
+    stacked_commit: str
+    tier: str
+    task: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class EarlyStartSelection:
+    """Step (c)'s answer: the claim, if any, and every refused pair or hold."""
+
+    claim: EarlyStartClaim | None
     refusals: tuple[EarlyStartRefusal, ...]
 
 

@@ -99,9 +99,13 @@ from orchestrator.deploy_state import awaits_scheduled_restart
 from orchestrator.dispatch_row import FreshRow, refresh_dispatch_row
 from orchestrator.early_start_selection import (
     EarlyStartCandidate,
+    EarlyStartClaim,
+    EarlyStartHolds,
     EarlyStartRefusal,
     EarlyStartRefusalReason,
+    EarlyStartSelection,
     EarlyStartShortlist,
+    StepReads,
     picture_deps_verdict,
 )
 from orchestrator.eligibility_clock import EligibilityClock, EligibilityClockStore
@@ -8539,6 +8543,108 @@ class Scheduler:
                 ))
         candidates.sort(key=lambda candidate: candidate.rank_key)
         return EarlyStartShortlist(candidates=tuple(candidates), refusals=tuple(refusals))
+
+    async def select_early_start(
+        self,
+        picture: TaskPicture,
+        reads: StepReads,
+        waiting_predecessors: Collection[str],
+        holds: EarlyStartHolds,
+    ) -> EarlyStartSelection:
+        """Step (c) of the early-start selection: claim the first qualifying pair, then its bookkeeping.
+
+        ``plans/early-start-on-predecessor-branch-prd.md`` section 5.4 (c).
+        The claim is one synchronous step (invariant 11); only a claim is
+        followed by the ordinary start's bookkeeping.  The lock event was
+        emitted by the acquire, and the store row was re-read in step (b).
+        """
+        selection = self._select_and_claim_early_start(picture, reads, waiting_predecessors, holds)
+        claim = selection.claim
+        if claim is not None:
+            await self._settle_dispatch(
+                claim.dependent, list(claim.keys),
+                tier=claim.tier, signal=self._dispatch_cooldown_signal(claim.task),
+            )
+            await self._write_snapshot_best_effort()
+        return selection
+
+    def _select_and_claim_early_start(
+        self,
+        picture: TaskPicture,
+        reads: StepReads,
+        waiting_predecessors: Collection[str],
+        holds: EarlyStartHolds,
+    ) -> EarlyStartSelection:
+        """Re-derive the candidates against the live lock table and the reads, and claim the first that passes.
+
+        Synchronous: nothing can start a task between the checks and the claim.
+        Each read dependent is judged on its store row against fresh
+        dependency statuses; a candidate step (b) did not read is skipped.
+        """
+        statuses = dict(reads.statuses)
+        for pair in reads.pairs.values():
+            statuses.update(pair.dependent_row.dep_statuses)
+        rows = {dependent: pair.dependent_row.task for dependent, pair in reads.pairs.items()}
+        shortlist = self._early_start_candidates(picture, statuses, waiting_predecessors, rows)
+        refusals = list(shortlist.refusals)
+        for index, candidate in enumerate(shortlist.candidates):
+            dependent, predecessor = candidate.dependent, candidate.predecessor
+            pair = reads.pairs.get(dependent)
+            if pair is None or pair.predecessor != predecessor or not self.lock_table.is_held(predecessor):
+                continue
+            if dependent in self._dispatched or self.lock_table.is_held(dependent):
+                refusals.append(EarlyStartRefusal(
+                    EarlyStartRefusalReason.NOT_ELIGIBLE, dependent=dependent, predecessor=predecessor,
+                ))
+                continue
+            keys = list(candidate.keys)
+            tier = candidate.priority.base_tier or coerce_tier(candidate.task.get('priority'))
+            if not self.acquire_as_successor(dependent, keys, predecessor=predecessor, priority=tier):
+                reason = (
+                    EarlyStartRefusalReason.KEY_RESERVED
+                    if self.lock_table.park_owners_blocking(dependent, keys)
+                    else EarlyStartRefusalReason.KEY_UNAVAILABLE
+                )
+                refusals.append(EarlyStartRefusal(reason, dependent=dependent, predecessor=predecessor))
+                continue
+            self._dispatched.add(dependent)
+            self._restored_holds.discard(dependent)
+            refusals.extend(
+                EarlyStartRefusal(
+                    EarlyStartRefusalReason.PREDECESSOR_HAS_DEPENDENT,
+                    dependent=other.dependent, predecessor=predecessor,
+                )
+                for other in shortlist.candidates[index + 1:]
+                if other.predecessor == predecessor
+            )
+            claim = EarlyStartClaim(
+                dependent=dependent,
+                predecessor=predecessor,
+                keys=candidate.keys,
+                stacked_commit=pair.predecessor_tip,
+                tier=tier,
+                task=pair.dependent_row.task,
+            )
+            return EarlyStartSelection(claim=claim, refusals=tuple(refusals))
+        return EarlyStartSelection(claim=None, refusals=tuple(refusals))
+
+    def release_early_start_claim(self, claim: EarlyStartClaim) -> bool:
+        """The release path for a claim whose launch fails (PRD section 5.4 (d)); False when it is not the live claim.
+
+        Goes through :meth:`release`, which drops the keys, the relation and
+        the started mark, emits ``lock_released`` and arms no cooldown:
+        :meth:`_unclaim` is for a hold no ``lock_acquired`` announced, and
+        leaves a successor relation in force.
+        """
+        relation = self.lock_table.successor_relation(claim.dependent)
+        if (
+            relation is None
+            or (relation.successor, relation.predecessor) != (claim.dependent, claim.predecessor)
+            or claim.dependent not in self._dispatched
+        ):
+            return False
+        self.release(claim.dependent)
+        return True
 
     def _early_start_refusal_of(
         self,
