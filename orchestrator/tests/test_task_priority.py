@@ -35,8 +35,10 @@ from orchestrator.task_priority import (
     anchor_from_epoch,
     gate_rank,
     order_key,
+    outranks,
     read_task_priority,
     task_age,
+    tier_order,
 )
 
 _ANCHOR = datetime(2026, 11, 1, 12, 0, tzinfo=UTC)
@@ -460,6 +462,52 @@ class TestOrderKey:
         naive = datetime(2026, 11, 1, 12, 0)
 
         assert _key(TaskPriority(tier='low'), fallback=naive) == (gate_rank('low'), 0, 0.0)
+
+
+class TestTierOrder:
+    """The one tier order: gate rank, then pin order; age never counts."""
+
+    def test_a_pin_outranks_critical(self) -> None:
+        pin = TaskPriority(tier=PINNED, pinned=True, pin_order=5)
+        critical = TaskPriority(tier='critical', pinned=False)
+
+        assert outranks(pin, critical)
+        assert not outranks(critical, pin)
+
+    def test_the_lower_pin_order_outranks_between_pins(self) -> None:
+        first = TaskPriority(tier=PINNED, pinned=True, pin_order=1)
+        second = TaskPriority(tier=PINNED, pinned=True, pin_order=2)
+
+        assert outranks(first, second)
+        assert not outranks(second, first)
+
+    def test_equal_tiers_do_not_outrank_each_other(self) -> None:
+        a = TaskPriority(tier='high', pinned=False, age_anchor=_ANCHOR)
+        b = TaskPriority(tier='high', pinned=False)
+
+        assert not outranks(a, b)
+        assert not outranks(b, a)
+
+    def test_an_unknown_tier_ranks_as_medium(self) -> None:
+        unknown = TaskPriority(tier=None)
+
+        assert tier_order(unknown) == tier_order(TaskPriority(tier='medium'))
+        assert outranks(TaskPriority(tier='high'), unknown)
+        assert not outranks(TaskPriority(tier='medium'), unknown)
+        assert not outranks(unknown, TaskPriority(tier='medium'))
+
+    def test_the_order_is_rank_then_pin_order(self) -> None:
+        assert tier_order(TaskPriority(tier=PINNED, pin_order=3)) == (gate_rank(PINNED), 3)
+        assert tier_order(TaskPriority(tier='low')) == (gate_rank('low'), 0)
+
+    @pytest.mark.parametrize('p', [
+        TaskPriority(tier=PINNED, pin_order=2),
+        TaskPriority(tier='polish'),
+        TaskPriority(tier=None),
+        TaskPriority(tier='low', age_anchor=_ANCHOR),
+    ])
+    def test_order_key_builds_on_it_without_promotion(self, p: TaskPriority) -> None:
+        assert _key(p, waited=10 * _PERIOD, period=None)[:2] == tier_order(p)
 
 
 class TestTaskAge:

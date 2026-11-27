@@ -60,6 +60,7 @@ from shared.status_paging import (
     walk_status_pages,
 )
 from shared.task_claimant import has_live_claimant, is_stranded_blocked
+from shared.task_fields import dependency_ids
 from shared.task_metadata import Milestone
 from shared.task_metadata_wire import coerce_task_metadata
 from shared.task_read import (
@@ -93,9 +94,32 @@ from orchestrator.config import (
 )
 from orchestrator.delivered_check_owner import derive_check_owner
 from orchestrator.delivered_checks import DeliveredCheckResult, run_delivered_check
-from orchestrator.dependency_verdict import DepKind, DepState, deps_verdict, task_external_deps
+from orchestrator.dependency_verdict import (
+    DepKind,
+    DepState,
+    DepsVerdict,
+    deps_verdict,
+    task_external_deps,
+)
 from orchestrator.deploy_state import awaits_scheduled_restart
 from orchestrator.dispatch_row import FreshRow, refresh_dispatch_row
+from orchestrator.early_start_selection import (
+    Competitor,
+    EarlyStartCandidate,
+    EarlyStartClaim,
+    EarlyStartHolds,
+    EarlyStartRefusal,
+    EarlyStartRefusalReason,
+    EarlyStartSelection,
+    EarlyStartShortlist,
+    PairReads,
+    StepReads,
+    branch_admits,
+    check_refusal,
+    higher_tier_blocker,
+    judged_row,
+    picture_deps_verdict,
+)
 from orchestrator.eligibility_clock import EligibilityClock, EligibilityClockStore
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.fm_retry import fm_retry_backoffs
@@ -1396,6 +1420,11 @@ def _park_records(parks_by_owner: Mapping[str, Mapping[str, Any]]) -> dict[str, 
     return {owner: ParkRecord.model_validate(rec) for owner, rec in parks_by_owner.items()}
 
 
+def _fallback_modules(task_id: str) -> list[str]:
+    """The lock key of a task whose files derive none: one generic key named for the task."""
+    return [f'task-{task_id or "unknown"}']
+
+
 def _psi_degradations(sample: PsiSample, cfg: PsiAdmissionConfig) -> dict[str, str]:
     """Map each degraded load component whose loss disables a LIVE gate arm
     to the operator-facing description of that loss.
@@ -1593,6 +1622,8 @@ class Scheduler:
         self._backfill_scan_cache: _BackfillScanCache | None = None
         self._mcp_session = mcp_session
         self._dispatched: set[str] = set()
+        # The live early-start claim of each dependent, from its claim until release(dependent).
+        self._early_start_claims: dict[str, EarlyStartClaim] = {}
         # Tasks whose locks are a hold restore_hold took and no dispatch has
         # superseded since; _claim and release end the mark, so it never returns.
         self._restored_holds: set[str] = set()
@@ -4391,20 +4422,26 @@ class Scheduler:
         delivered_check_cache: dict[str, bool] | None = None,
         terminal_dep_records: dict[str, dict] | None = None,
         deferred_terminal_deps: Collection[str] = frozenset(),
+        set_aside: str | None = None,
     ) -> bool:
         """The boolean view of ``dependency_verdict.py::deps_verdict``: True iff SATISFIED.
 
         Dispatch reads this view, so an UNKNOWN dependency waits exactly as an
-        UNSATISFIED one does.
+        UNSATISFIED one does.  With *set_aside*, a waiting predecessor, True iff
+        it is the one unfinished dependency (``DepsVerdict.waiting_on``).
         """
-        return deps_verdict(
+        verdict = deps_verdict(
             task, status_map, tasks_by_id,
             external_status_cache=external_status_cache,
             external_resolver_failed=external_resolver_failed,
             delivered_check_cache=delivered_check_cache,
             terminal_dep_records=terminal_dep_records,
             deferred_terminal_deps=deferred_terminal_deps,
-        ).satisfied
+            waiting_predecessors=frozenset() if set_aside is None else frozenset({set_aside}),
+        )
+        if set_aside is None:
+            return verdict.satisfied
+        return verdict.waiting_predecessor == set_aside
 
     def _dispatch_cooldown_signal(self, task: dict) -> str | None:
         """Return the signal label if *task* carries a dispatch-cooldown signal.
@@ -4725,6 +4762,7 @@ class Scheduler:
         delivered_check_cache: dict[str, bool] | None = None,
         terminal_dep_records: dict[str, dict] | None = None,
         deferred_terminal_deps: Collection[str] = frozenset(),
+        set_aside: str | None = None,
     ) -> tuple[bool, str | None]:
         """Whether *task* is a dispatch candidate: not started, and through :meth:`_passes_dispatch_gates`.
 
@@ -4742,6 +4780,7 @@ class Scheduler:
             delivered_check_cache=delivered_check_cache,
             terminal_dep_records=terminal_dep_records,
             deferred_terminal_deps=deferred_terminal_deps,
+            set_aside=set_aside,
         )
 
     def _passes_dispatch_gates(
@@ -4756,6 +4795,7 @@ class Scheduler:
         delivered_check_cache: dict[str, bool] | None = None,
         terminal_dep_records: dict[str, dict] | None = None,
         deferred_terminal_deps: Collection[str] = frozenset(),
+        set_aside: str | None = None,
     ) -> tuple[bool, str | None]:
         """Check whether *task* passes every dispatch gate but the started check.
 
@@ -4796,6 +4836,11 @@ class Scheduler:
         Park GC evaluates the same three caches through
         ``dependency_verdict.py::deps_verdict`` (task 6518), so it and
         dispatch read one dependency predicate.
+
+        *set_aside* names a waiting predecessor for the early-start selection
+        and is forwarded to :meth:`_deps_satisfied`, whose gate then passes
+        exactly when that predecessor is the one unfinished dependency.
+        ``None`` (every ordinary caller) keeps the ordinary dependency gate.
 
         Returns ``(True, signal_label)`` when all gates pass.
         Returns ``(False, None)`` when any gate fails.  ``signal_label`` is
@@ -4839,6 +4884,7 @@ class Scheduler:
             delivered_check_cache=delivered_check_cache,
             terminal_dep_records=terminal_dep_records,
             deferred_terminal_deps=deferred_terminal_deps,
+            set_aside=set_aside,
         ):
             return False, None
         signal_label = self._dispatch_cooldown_signal(task)
@@ -7072,16 +7118,22 @@ class Scheduler:
         if cfg_psi.enabled:
             psi_sample = self._read_psi_sample()
             self._warn_psi_degradations(_psi_degradations(psi_sample, cfg_psi))
-            in_flight = len(self._dispatched)
-            if psi_sample.saturated(cfg_psi) and in_flight >= cfg_psi.min_inflight_floor:
-                hold = PsiHold(
-                    metric=psi_sample.tripping_metric(cfg_psi),
-                    sample=psi_sample,
-                    in_flight=in_flight,
-                    floor=cfg_psi.min_inflight_floor,
-                )
+            hold = self._psi_hold(psi_sample)
         ctx.psi_hold = hold
         return _CONTINUE
+
+    def _psi_hold(self, sample: PsiSample) -> PsiHold | None:
+        """The admission hold *sample* imposes: saturated, with in-flight at or above the floor. A READ."""
+        cfg_psi = self.config.psi_admission
+        in_flight = len(self._dispatched)
+        if not (sample.saturated(cfg_psi) and in_flight >= cfg_psi.min_inflight_floor):
+            return None
+        return PsiHold(
+            metric=sample.tripping_metric(cfg_psi),
+            sample=sample,
+            in_flight=in_flight,
+            floor=cfg_psi.min_inflight_floor,
+        )
 
     def _warn_psi_degradations(self, degraded: Mapping[str, str]) -> None:
         """WARN once, naming every degraded component, when any of them is
@@ -8470,6 +8522,272 @@ class Scheduler:
         )
         return True
 
+    def early_start_shortlist(
+        self, picture: TaskPicture, waiting_predecessors: Collection[str],
+    ) -> EarlyStartShortlist:
+        """Step (a) of the early-start selection: the dependents that qualify on a waiting predecessor.
+
+        ``plans/early-start-on-predecessor-branch-prd.md`` section 5.4 (a).
+        Judged on the picture and the live lock table; writes nothing.
+        """
+        return self._early_start_candidates(picture, {}, waiting_predecessors)
+
+    def _early_start_candidates(
+        self,
+        picture: TaskPicture,
+        statuses: Mapping[str, str],
+        waiting_predecessors: Collection[str],
+        rows: Mapping[str, dict] | None = None,
+    ) -> EarlyStartShortlist:
+        """Every pending dependent still waiting on a waiting predecessor, as a candidate in rank order or a refusal.
+
+        *statuses* overlay the picture's status map.  A task is judged on its
+        row in *rows* when it has one, else on the picture's row with its
+        overlaid status.  A dependent whose dependencies the overlay reports
+        all satisfied (its predecessor finished since the picture) waits on
+        nothing, so it is neither.  Synchronous, and writes nothing.
+        """
+        status_map = {**picture.status_map, **statuses}
+        candidates: list[EarlyStartCandidate] = []
+        refusals: list[EarlyStartRefusal] = []
+        for predecessor in sorted(waiting_predecessors, key=id_tie_break):
+            for picture_row in picture.tasks:
+                tid = str(picture_row.get('id', ''))
+                if status_map.get(tid) != 'pending':
+                    continue
+                row = judged_row(picture_row, status_map, rows or {})
+                if predecessor not in dependency_ids(row):
+                    continue
+                verdict = picture_deps_verdict(
+                    row, picture, status_map, waiting_predecessors=frozenset({predecessor}),
+                )
+                if verdict.satisfied:
+                    continue
+                reason = self._early_start_qualification_refusal(
+                    row, tid, predecessor, verdict, picture, status_map,
+                )
+                if reason is not None:
+                    refusals.append(EarlyStartRefusal(reason, dependent=tid, predecessor=predecessor))
+                    continue
+                candidates.append(EarlyStartCandidate(
+                    dependent=tid,
+                    predecessor=predecessor,
+                    task=row,
+                    keys=tuple(self._peek_modules(row)),
+                    priority=picture.priority_of(tid),
+                ))
+        candidates.sort(key=lambda candidate: candidate.rank_key)
+        return EarlyStartShortlist(candidates=tuple(candidates), refusals=tuple(refusals))
+
+    async def select_early_start(
+        self,
+        picture: TaskPicture,
+        reads: StepReads,
+        waiting_predecessors: Collection[str],
+        holds: EarlyStartHolds,
+    ) -> EarlyStartSelection:
+        """Step (c) of the early-start selection: claim the first qualifying pair, then its bookkeeping.
+
+        ``plans/early-start-on-predecessor-branch-prd.md`` section 5.4 (c).
+        The claim is one synchronous step (invariant 11); only a claim is
+        followed by the ordinary start's bookkeeping.  The lock event was
+        emitted by the acquire, and the store row was re-read in step (b).
+        A claim whose bookkeeping raises or is cancelled is released before
+        the exception propagates, since its caller never receives it.
+        """
+        selection = self._select_and_claim_early_start(picture, reads, waiting_predecessors, holds)
+        claim = selection.claim
+        if claim is None:
+            return selection
+        try:
+            await self._settle_dispatch(
+                claim.dependent, list(claim.keys),
+                tier=claim.tier, signal=self._dispatch_cooldown_signal(claim.task),
+            )
+            await self._write_snapshot_best_effort()
+        except BaseException:
+            self.release_early_start_claim(claim)
+            raise
+        return selection
+
+    def _select_and_claim_early_start(
+        self,
+        picture: TaskPicture,
+        reads: StepReads,
+        waiting_predecessors: Collection[str],
+        holds: EarlyStartHolds,
+    ) -> EarlyStartSelection:
+        """Re-derive the candidates against the live lock table and the reads, and claim the first that passes.
+
+        Synchronous: nothing can start a task between the checks and the claim.
+        The system holds are read before any candidate (invariant 13).  Each
+        read dependent is judged on its store row against fresh dependency
+        statuses; a candidate step (b) did not read is skipped.  The tier
+        condition is weighed before the acquire, so a refused pair takes no key.
+        """
+        held = self._early_start_hold_reasons(holds)
+        if held:
+            return EarlyStartSelection(
+                claim=None, refusals=tuple(EarlyStartRefusal(reason) for reason in held),
+            )
+        statuses = dict(reads.statuses)
+        for pair in reads.pairs.values():
+            statuses.update(pair.dependent_row.dep_statuses)
+        rows = {dependent: pair.dependent_row.task for dependent, pair in reads.pairs.items()}
+        shortlist = self._early_start_candidates(picture, statuses, waiting_predecessors, rows)
+        competitors = self._early_start_competitors(picture, statuses, rows)
+        refusals = list(shortlist.refusals)
+        for index, candidate in enumerate(shortlist.candidates):
+            dependent, predecessor = candidate.dependent, candidate.predecessor
+            pair = reads.pairs.get(dependent)
+            if pair is None or pair.predecessor != predecessor or not self.lock_table.is_held(predecessor):
+                continue
+            refusal = self._early_start_reads_refusal(candidate, pair, picture, statuses, competitors)
+            if refusal is not None:
+                refusals.append(refusal)
+                continue
+            keys = list(candidate.keys)
+            tier = candidate.priority.base_tier or coerce_tier(candidate.task.get('priority'))
+            if not self.acquire_as_successor(dependent, keys, predecessor=predecessor, priority=tier):
+                reason = (
+                    EarlyStartRefusalReason.KEY_RESERVED
+                    if self.lock_table.park_owners_blocking(dependent, keys)
+                    else EarlyStartRefusalReason.KEY_UNAVAILABLE
+                )
+                refusals.append(EarlyStartRefusal(reason, dependent=dependent, predecessor=predecessor))
+                continue
+            self._dispatched.add(dependent)
+            self._restored_holds.discard(dependent)
+            refusals.extend(
+                EarlyStartRefusal(
+                    EarlyStartRefusalReason.PREDECESSOR_HAS_DEPENDENT,
+                    dependent=other.dependent, predecessor=predecessor,
+                )
+                for other in shortlist.candidates[index + 1:]
+                if other.predecessor == predecessor
+            )
+            claim = EarlyStartClaim(
+                dependent=dependent,
+                predecessor=predecessor,
+                keys=candidate.keys,
+                stacked_commit=pair.predecessor_tip,
+                tier=tier,
+                task=pair.dependent_row.task,
+            )
+            self._early_start_claims[dependent] = claim
+            return EarlyStartSelection(claim=claim, refusals=tuple(refusals))
+        return EarlyStartSelection(claim=None, refusals=tuple(refusals))
+
+    def _early_start_competitors(
+        self, picture: TaskPicture, statuses: Mapping[str, str], rows: Mapping[str, dict],
+    ) -> tuple[Competitor, ...]:
+        """The tasks the tier condition weighs: pending in the overlaid statuses and not started."""
+        status_map = {**picture.status_map, **statuses}
+        competitors: list[Competitor] = []
+        for picture_row in picture.tasks:
+            tid = str(picture_row.get('id', ''))
+            if status_map.get(tid) != 'pending' or tid in self._dispatched:
+                continue
+            row = judged_row(picture_row, status_map, rows)
+            competitors.append(Competitor(
+                task_id=tid, task=row, keys=tuple(self._peek_modules(row)),
+                priority=picture.priority_of(tid),
+            ))
+        return tuple(competitors)
+
+    def _early_start_reads_refusal(
+        self,
+        candidate: EarlyStartCandidate,
+        pair: PairReads,
+        picture: TaskPicture,
+        statuses: Mapping[str, str],
+        competitors: tuple[Competitor, ...],
+    ) -> EarlyStartRefusal | None:
+        """Step (c)'s check of a qualified candidate: why step (b)'s reads, the started set or a higher tier refuse it; None when it may be claimed."""
+        dependent, predecessor = candidate.dependent, candidate.predecessor
+        reason = check_refusal(pair.predecessor_checks)
+        if reason is None and not branch_admits(pair.dependent_row.task, predecessor, pair.dependent_branch):
+            reason = EarlyStartRefusalReason.HAS_BRANCH
+        if reason is None and (dependent in self._dispatched or self.lock_table.is_held(dependent)):
+            reason = EarlyStartRefusalReason.NOT_ELIGIBLE
+        if reason is not None:
+            return EarlyStartRefusal(reason, dependent=dependent, predecessor=predecessor)
+        blocking = higher_tier_blocker(
+            candidate, competitors, picture=picture, statuses=statuses, lock_table=self.lock_table,
+        )
+        if blocking is None:
+            return None
+        return EarlyStartRefusal(
+            EarlyStartRefusalReason.HIGHER_TIER_WAITING,
+            dependent=dependent, predecessor=predecessor, blocking_task=blocking,
+        )
+
+    def _early_start_hold_reasons(self, holds: EarlyStartHolds) -> list[EarlyStartRefusalReason]:
+        """Every system hold on early starts: the scheduler's own, then the harness's in *holds*.
+
+        Reads only: the host-load gate is read without its degradation warning
+        and touches no state (invariant 12).
+        """
+        reasons: list[EarlyStartRefusalReason] = []
+        if not self.config.early_start.enabled:
+            reasons.append(EarlyStartRefusalReason.DISABLED)
+        if self.config.psi_admission.enabled and self._psi_hold(self._read_psi_sample()) is not None:
+            reasons.append(EarlyStartRefusalReason.HOST_LOAD)
+        if self._paused:
+            reasons.append(EarlyStartRefusalReason.SCHEDULER_PAUSED)
+        if self._warm_base_hard_down:
+            reasons.append(EarlyStartRefusalReason.WARM_BASE_DOWN)
+        return reasons + holds.reasons()
+
+    def release_early_start_claim(self, claim: EarlyStartClaim) -> bool:
+        """The release path for a claim whose launch fails (PRD section 5.4 (d)).
+
+        False when *claim* is not the scheduler's live claim for its
+        dependent: never made, already released, or superseded by a later
+        claim or an ordinary release.  A claim whose predecessor has since
+        released is still live, and is released.
+
+        Goes through :meth:`release`, which drops the keys, any relation still
+        in force and the started mark, emits ``lock_released`` and arms no
+        cooldown: :meth:`_unclaim` is for a hold no ``lock_acquired``
+        announced, and leaves a successor relation in force.
+        """
+        if (
+            self._early_start_claims.get(claim.dependent) is not claim
+            or claim.dependent not in self._dispatched
+        ):
+            return False
+        self.release(claim.dependent)
+        return True
+
+    def _early_start_qualification_refusal(
+        self,
+        row: dict,
+        tid: str,
+        predecessor: str,
+        verdict: DepsVerdict,
+        picture: TaskPicture,
+        status_map: dict[str, str],
+    ) -> EarlyStartRefusalReason | None:
+        """Step (a)'s qualification: why *row* may not start early on *predecessor*'s branch, in the PRD's check order; None when it may.
+
+        *verdict* is *row*'s dependency verdict with *predecessor* set aside.
+        """
+        if self.lock_table.successor_relation(predecessor) is not None:
+            return EarlyStartRefusalReason.PREDECESSOR_HAS_DEPENDENT
+        if self.is_deterministic(row):
+            return EarlyStartRefusalReason.NOT_CODE_TASK
+        if (row.get('metadata') or {}).get('milestone'):
+            return EarlyStartRefusalReason.HAS_MILESTONE
+        if verdict.waiting_predecessor != predecessor:
+            return EarlyStartRefusalReason.NOT_ONLY_DEPENDENCY
+        eligible, _signal = self._eligible_for_dispatch(
+            row, tid, status_map, **picture.dependency_inputs(), set_aside=predecessor,
+        )
+        if not eligible:
+            return EarlyStartRefusalReason.NOT_ELIGIBLE
+        return None
+
     async def handle_blast_radius_expansion(
         self,
         task_id: str,
@@ -8755,6 +9073,7 @@ class Scheduler:
         it would strand this task's module locks.
         """
         self._dispatched.discard(task_id)
+        self._early_start_claims.pop(task_id, None)
         self._dispatched_priority.pop(task_id, None)
         self._restored_holds.discard(task_id)
         # Consume this task's pending transient-cooldown stamp (task 3317 /
@@ -9769,18 +10088,12 @@ class Scheduler:
             return []
 
         task_id = str(task.get('id', ''))
-        depth = self.config.lock_depth
         # Check in-memory cache first (survives metadata update failures)
         if task_id in self._module_cache:
             return self._module_cache[task_id]
-        metadata = task.get('metadata') or {}
-        if isinstance(metadata, dict):
-            files = metadata.get('files', [])
-            if isinstance(files, list) and files:
-                derived = derive_modules(files, depth, task_id=task_id)
-                if derived:
-                    return self._write_module_cache(task_id, derived)
-        # Fallback: use a generic module name based on task id
+        derived = self._modules_from_files(task)
+        if derived:
+            return self._write_module_cache(task_id, derived)
         if task_id not in self._fallback_warned:
             logger.warning(
                 'Task %s: no module metadata found — using fallback lock task-%s',
@@ -9788,7 +10101,30 @@ class Scheduler:
                 task_id or 'unknown',
             )
             self._fallback_warned.add(task_id)
-        return [f'task-{task_id or "unknown"}']
+        return _fallback_modules(task_id)
+
+    def _peek_modules(self, task: dict) -> list[str]:
+        """:meth:`_get_modules`'s answer, writing neither its memo nor its fallback warning.
+
+        For the early-start selection, which writes nothing but its claim (PRD
+        invariant 12): a memo written for a task the ordinary pass never
+        derived would fix its keys against a later ``metadata.files`` change.
+        """
+        if self.is_deterministic(task):
+            return []
+        task_id = str(task.get('id', ''))
+        if task_id in self._module_cache:
+            return self._module_cache[task_id]
+        return self._modules_from_files(task) or _fallback_modules(task_id)
+
+    def _modules_from_files(self, task: dict) -> list[str]:
+        """*task*'s lock keys derived from ``metadata.files``; empty when it lists none that derive."""
+        metadata = task.get('metadata') or {}
+        files = metadata.get('files', []) if isinstance(metadata, dict) else []
+        if not isinstance(files, list) or not files:
+            return []
+        task_id = str(task.get('id', ''))
+        return derive_modules(files, self.config.lock_depth, task_id=task_id)
 
     def seed_modules(self, task_id: str, files: list[str]) -> list[str]:
         """Public entry point for the harness module-tagger.

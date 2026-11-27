@@ -12,6 +12,7 @@ from orchestrator.overrides import OverrideRow, OverrideSource, OverrideStore
 from orchestrator.scheduler_priority_lookup import (
     PAUSED_PIN_REFRESH_SECS,
     LookupPins,
+    combine_priority,
     last_written_tiers,
     pin_orders,
 )
@@ -94,6 +95,34 @@ class TestPinOrders:
         }
 
         assert pin_orders(rows) == {'P': 3, 'Q': 0}
+
+
+class TestCombinePriority:
+    """The one function that combines a base tier with pins."""
+
+    def test_a_task_with_a_pin_reads_pinned_with_its_order(self) -> None:
+        assert combine_priority('P', 'low', {'P': 3}) == TaskPriority(
+            tier=PINNED, pinned=True, base_tier='low', pin_order=3,
+        )
+
+    def test_a_task_without_a_pin_keeps_its_base_tier(self) -> None:
+        assert combine_priority('U', 'high', {'P': 3}) == TaskPriority(
+            tier='high', pinned=False, base_tier='high',
+        )
+
+    def test_unknown_pins_leave_pinned_unknown(self) -> None:
+        assert combine_priority('U', 'high', None) == TaskPriority(
+            tier='high', pinned=None, base_tier='high',
+        )
+
+    def test_lookup_pins_answers_as_combine_priority_over_its_pin_map(self, tmp_path: Path) -> None:
+        store = OverrideStore(tmp_path / 'overrides.db')
+        pins = LookupPins(lambda: store, str(tmp_path), clock=lambda: 0.0)
+        rows = {'P': _row(pinned=True, pin_order=2), 'U': _row(pinned=False)}
+        pins.adopt(rows)
+
+        for task_id, base in (('P', 'low'), ('U', 'high'), ('X', None)):
+            assert pins.priority(task_id, base) == combine_priority(task_id, base, pin_orders(rows))
 
 
 class TestLookupPins:

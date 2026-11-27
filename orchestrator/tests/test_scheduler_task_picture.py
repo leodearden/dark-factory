@@ -30,7 +30,10 @@ from _scheduler_pass_scenario import (
     record_passes,
 )
 
+from orchestrator.overrides import OverrideRow, OverrideSource
 from orchestrator.task_picture import TaskPicture
+from orchestrator.task_priority import PINNED as PINNED_TIER
+from orchestrator.task_priority import TaskPriority
 
 pytestmark = [pytest.mark.usefixtures('code_default_config'), pytest.mark.asyncio]
 
@@ -159,3 +162,43 @@ class TestWritesNothing:
         assert a.decisions == b.decisions
         assert a.get_task_calls == b.get_task_calls
         assert a.script_runs == b.script_runs
+
+
+def _bare_picture(*, overrides: dict[str, OverrideRow], effective_priorities: dict[str, str]) -> TaskPicture:
+    return TaskPicture(
+        built_at=0.0, tasks=(), status_map={}, tasks_by_id={}, max_id=0,
+        terminal_dep_records={}, deferred_terminal_deps=frozenset(), external_statuses={},
+        external_resolver_failed=False, delivered_check_cache=None, overrides=overrides,
+        effective_priorities=effective_priorities, transitive_counts={},
+    )
+
+
+class TestPriorityOf:
+    """A task's priority in the picture: its base tier combined with the pins in force."""
+
+    async def test_a_pinned_task_reads_pinned_with_its_order_and_base_tier(self, tmp_path):
+        picture = await _picture(build_scenario(tmp_path))
+
+        assert picture.priority_of(PINNED) == TaskPriority(
+            tier=PINNED_TIER, pinned=True,
+            base_tier=picture.effective_priorities[PINNED],
+            pin_order=picture.overrides[PINNED].pin_order or 0,
+        )
+
+    async def test_a_boosted_task_reads_its_boosted_tier_unpinned(self, tmp_path):
+        picture = await _picture(build_scenario(tmp_path))
+
+        assert picture.priority_of(BOOSTED) == TaskPriority(
+            tier='high', pinned=False, base_tier='high',
+        )
+
+    async def test_a_watchdog_pin_reads_pinned(self):
+        watchdog_row = OverrideRow(
+            boost_tier=None, pinned=True, pin_order=4, reserve_now=False,
+            ttl_until=None, source=OverrideSource.STARVATION_WATCHDOG,
+        )
+        picture = _bare_picture(overrides={'T': watchdog_row}, effective_priorities={'T': 'low'})
+
+        assert picture.priority_of('T') == TaskPriority(
+            tier=PINNED_TIER, pinned=True, base_tier='low', pin_order=4,
+        )
