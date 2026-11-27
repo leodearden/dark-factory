@@ -11,11 +11,11 @@ from __future__ import annotations
 
 import json
 import sqlite3
-import subprocess
 from collections.abc import Sequence
 from pathlib import Path
 
 from _orch_helpers import assert_isolated_git_repo, git_env_with_ceiling
+from shared.testing_own_time import run_on_own_time
 
 from orchestrator.event_store import EventStore
 
@@ -23,6 +23,7 @@ _IDENTITY = (
     '-c', 'user.email=t@e', '-c', 'user.name=t',
     '-c', 'commit.gpgsign=false', '-c', 'core.hooksPath=/dev/null',
 )
+_GIT_BUDGET_S = 30.0  # own time; each call is an empty commit, checkout or rev-parse
 
 
 class LandingRepo:
@@ -37,10 +38,10 @@ class LandingRepo:
         self.fast_forward('seed')
 
     def _git(self, *args: str) -> str:
-        completed = subprocess.run(
-            ['git', *_IDENTITY, *args], cwd=str(self.root), env=self._env,
-            check=True, capture_output=True, text=True, timeout=30,
+        completed = run_on_own_time(
+            ['git', *_IDENTITY, *args], cwd=self.root, env=self._env, budget=_GIT_BUDGET_S,
         )
+        completed.check_returncode()
         return completed.stdout.strip()
 
     def fast_forward(self, message: str) -> str:

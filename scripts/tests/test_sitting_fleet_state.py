@@ -850,8 +850,7 @@ class TestActivity:
     def test_activity_is_derived_from_the_measurements_of_a_frozen_state(self, tmp_path):
         state = _measure(_quiet_root(tmp_path), 'inactive')
 
-        with pytest.raises(dataclasses.FrozenInstanceError):
-            state.unit_active = state.unit_active  # type: ignore[misc]
+        pytest.raises(dataclasses.FrozenInstanceError, setattr, state, 'unit_active', state.unit_active)
         revived = dataclasses.replace(state, unit_active=dataclasses.replace(state.unit_active, value=True))
         assert (state.active, revived.active) == (False, True)
         assert revived.inactive_reason is None
