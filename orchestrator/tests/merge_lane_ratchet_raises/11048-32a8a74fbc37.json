@@ -1,0 +1,42 @@
+{
+  "task_id": "11048",
+  "reason": "\u03b11 (plans/merge-pool-batches-prd.md): the tested tree on each in-flight entry \u2014 tested_tree.py, the frontier's live trees, the main-containment read before the chain build, link tips in build_chain, and the snapshot's tree",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/git_read.py",
+      "baseline": 2,
+      "current": 4
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/types.py",
+      "baseline": 97,
+      "current": 99
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/verify_dispatch.py",
+      "baseline": 38,
+      "current": 45
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+      "baseline": 1479,
+      "current": 1483
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker::snapshot",
+      "baseline": 42,
+      "current": 44
+    },
+    {
+      "measure": "total:cognitive",
+      "key": "<cluster>",
+      "baseline": 5358,
+      "current": 5396
+    }
+  ]
+}
