@@ -831,6 +831,15 @@ class TestHandoverPerProject:
         assert 'the reify cockpit' in probe.evidence
         assert 'dark-factory watcher' not in probe.evidence
 
+    def test_the_first_scanned_root_of_a_folded_project_supplies_its_handover(self, env):
+        twin = env.tmp / 'elsewhere' / 'dark_factory'
+        df_handover = _write_handover(env.df, '# handover\n\nthe subject root\n')
+        _write_handover(twin, '# handover\n\nthe twin root\n')
+
+        sources = _sources(env, [env.df, twin])
+
+        assert sources.handovers['dark_factory'] == df_handover
+
     def test_an_override_replaces_only_its_projects_handover(self, env, reify, elsewhere):
         probes = _handover_probes(env, [env.df, reify], mod.HandoverOverride('reify', elsewhere))
 
