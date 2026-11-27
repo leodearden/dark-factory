@@ -38,7 +38,7 @@ try:
     from orchestrator.event_store import EventStore  # type: ignore[reportMissingImports]
     from orchestrator.harness import Harness  # type: ignore[reportMissingImports]
     from orchestrator.run_store import RunStore  # type: ignore[reportMissingImports]
-    from orchestrator.verify_host_roster_file import (  # type: ignore[reportMissingImports]
+    from orchestrator.verify_host_roster_file import (
         ROSTER_FILE_ENV,
         roster_file_path,
     )
