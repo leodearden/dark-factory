@@ -60,6 +60,7 @@ from shared.status_paging import (
     walk_status_pages,
 )
 from shared.task_claimant import has_live_claimant, is_stranded_blocked
+from shared.task_fields import dependency_ids
 from shared.task_metadata import Milestone
 from shared.task_metadata_wire import coerce_task_metadata
 from shared.task_read import (
@@ -96,6 +97,13 @@ from orchestrator.delivered_checks import DeliveredCheckResult, run_delivered_ch
 from orchestrator.dependency_verdict import DepKind, DepState, deps_verdict, task_external_deps
 from orchestrator.deploy_state import awaits_scheduled_restart
 from orchestrator.dispatch_row import FreshRow, refresh_dispatch_row
+from orchestrator.early_start_selection import (
+    EarlyStartCandidate,
+    EarlyStartRefusal,
+    EarlyStartRefusalReason,
+    EarlyStartShortlist,
+    picture_deps_verdict,
+)
 from orchestrator.eligibility_clock import EligibilityClock, EligibilityClockStore
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.fm_retry import fm_retry_backoffs
@@ -4725,6 +4733,7 @@ class Scheduler:
         delivered_check_cache: dict[str, bool] | None = None,
         terminal_dep_records: dict[str, dict] | None = None,
         deferred_terminal_deps: Collection[str] = frozenset(),
+        set_aside: str | None = None,
     ) -> tuple[bool, str | None]:
         """Whether *task* is a dispatch candidate: not started, and through :meth:`_passes_dispatch_gates`.
 
@@ -4742,6 +4751,7 @@ class Scheduler:
             delivered_check_cache=delivered_check_cache,
             terminal_dep_records=terminal_dep_records,
             deferred_terminal_deps=deferred_terminal_deps,
+            set_aside=set_aside,
         )
 
     def _passes_dispatch_gates(
@@ -4756,6 +4766,7 @@ class Scheduler:
         delivered_check_cache: dict[str, bool] | None = None,
         terminal_dep_records: dict[str, dict] | None = None,
         deferred_terminal_deps: Collection[str] = frozenset(),
+        set_aside: str | None = None,
     ) -> tuple[bool, str | None]:
         """Check whether *task* passes every dispatch gate but the started check.
 
@@ -4797,6 +4808,12 @@ class Scheduler:
         ``dependency_verdict.py::deps_verdict`` (task 6518), so it and
         dispatch read one dependency predicate.
 
+        *set_aside* names a waiting predecessor for the early-start selection:
+        the dependency gate then passes exactly when that predecessor is the
+        one unfinished dependency and every other arm passes
+        (``dependency_verdict.py::DepsVerdict.waiting_on``).  ``None`` (every
+        ordinary caller) keeps the ordinary dependency gate.
+
         Returns ``(True, signal_label)`` when all gates pass.
         Returns ``(False, None)`` when any gate fails.  ``signal_label`` is
         the dispatch-cooldown signal for the task (or None), forwarded so the
@@ -4832,14 +4849,19 @@ class Scheduler:
         cooldown_deadline = self._requeue_until.get(tid)
         if cooldown_deadline is not None and self._time_source() < cooldown_deadline:
             return False, None
-        if not self._deps_satisfied(
-            task, status_map, tasks_by_id,
+        dep_kwargs = dict(
             external_status_cache=external_status_cache,
             external_resolver_failed=external_resolver_failed,
             delivered_check_cache=delivered_check_cache,
             terminal_dep_records=terminal_dep_records,
             deferred_terminal_deps=deferred_terminal_deps,
-        ):
+        )
+        if set_aside is None:
+            if not self._deps_satisfied(task, status_map, tasks_by_id, **dep_kwargs):
+                return False, None
+        elif deps_verdict(
+            task, status_map, tasks_by_id, waiting_predecessors={set_aside}, **dep_kwargs,
+        ).waiting_predecessor != set_aside:
             return False, None
         signal_label = self._dispatch_cooldown_signal(task)
         if self._dispatch_cooldown_active(tid, signal_label):
@@ -8469,6 +8491,87 @@ class Scheduler:
             priority=priority,
         )
         return True
+
+    def early_start_shortlist(
+        self, picture: TaskPicture, waiting_predecessors: Collection[str],
+    ) -> EarlyStartShortlist:
+        """Step (a) of the early-start selection: the dependents that qualify on a waiting predecessor.
+
+        ``plans/early-start-on-predecessor-branch-prd.md`` section 5.4 (a).
+        Judged on the picture and the live lock table; writes nothing.
+        """
+        return self._early_start_candidates(picture, {}, waiting_predecessors)
+
+    def _early_start_candidates(
+        self,
+        picture: TaskPicture,
+        statuses: Mapping[str, str],
+        waiting_predecessors: Collection[str],
+        rows: Mapping[str, dict] | None = None,
+    ) -> EarlyStartShortlist:
+        """Every pending dependent of a waiting predecessor, as a candidate in rank order or a refusal.
+
+        *statuses* overlay the picture's status map.  A task is judged on its
+        row in *rows* when it has one, else on the picture's row with its
+        overlaid status.  Synchronous, and writes nothing.
+        """
+        status_map = {**picture.status_map, **statuses}
+        candidates: list[EarlyStartCandidate] = []
+        refusals: list[EarlyStartRefusal] = []
+        for predecessor in sorted(waiting_predecessors, key=id_tie_break):
+            for picture_row in picture.tasks:
+                tid = str(picture_row.get('id', ''))
+                if status_map.get(tid) != 'pending':
+                    continue
+                row = (rows or {}).get(tid) or {**picture_row, 'status': status_map[tid]}
+                if predecessor not in dependency_ids(row):
+                    continue
+                reason = self._early_start_refusal_of(row, tid, predecessor, picture, status_map)
+                if reason is not None:
+                    refusals.append(EarlyStartRefusal(reason, dependent=tid, predecessor=predecessor))
+                    continue
+                candidates.append(EarlyStartCandidate(
+                    dependent=tid,
+                    predecessor=predecessor,
+                    task=row,
+                    keys=tuple(self._get_modules(row)),
+                    priority=picture.priority_of(tid),
+                ))
+        candidates.sort(key=lambda candidate: candidate.rank_key)
+        return EarlyStartShortlist(candidates=tuple(candidates), refusals=tuple(refusals))
+
+    def _early_start_refusal_of(
+        self,
+        row: dict,
+        tid: str,
+        predecessor: str,
+        picture: TaskPicture,
+        status_map: dict[str, str],
+    ) -> EarlyStartRefusalReason | None:
+        """Why *row* may not start early on *predecessor*'s branch, in the PRD's check order; None when it may."""
+        if self.lock_table.successor_relation(predecessor) is not None:
+            return EarlyStartRefusalReason.PREDECESSOR_HAS_DEPENDENT
+        if self.is_deterministic(row):
+            return EarlyStartRefusalReason.NOT_CODE_TASK
+        if (row.get('metadata') or {}).get('milestone'):
+            return EarlyStartRefusalReason.HAS_MILESTONE
+        verdict = picture_deps_verdict(
+            row, picture, status_map, waiting_predecessors=frozenset({predecessor}),
+        )
+        if verdict.waiting_predecessor != predecessor:
+            return EarlyStartRefusalReason.NOT_ONLY_DEPENDENCY
+        eligible, _signal = self._eligible_for_dispatch(
+            row, tid, status_map, picture.tasks_by_id,
+            external_status_cache=picture.external_statuses,
+            external_resolver_failed=picture.external_resolver_failed,
+            delivered_check_cache=picture.delivered_check_cache,
+            terminal_dep_records=picture.terminal_dep_records,
+            deferred_terminal_deps=picture.deferred_terminal_deps,
+            set_aside=predecessor,
+        )
+        if not eligible:
+            return EarlyStartRefusalReason.NOT_ELIGIBLE
+        return None
 
     async def handle_blast_radius_expansion(
         self,
