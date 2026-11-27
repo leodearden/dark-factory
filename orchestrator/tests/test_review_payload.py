@@ -18,7 +18,7 @@ from _defect_ruling_fixtures import (
     parse_ref_message,
 )
 from escalation.disposition import ReviewerDisposition
-from shared.defects import RulingSubject
+from shared.defects import IssueKind, IssueKindFlag, RulingSubject, issue_kind_of
 
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.evals import compare
@@ -27,6 +27,7 @@ from orchestrator.evals.results import EvalResult
 from orchestrator.evals.scoring import quality_from_review_artifact
 from orchestrator.mcp import verdict_tools as _verdict_tools
 from orchestrator.review_payload import (
+    KIND_FLAG_KEY,
     DefectRuling,
     NoteDisposition,
     ReviewPayload,
@@ -39,9 +40,9 @@ from orchestrator.review_payload import (
 
 _REVIEWER = 'reviewer_comprehensive'
 
-_BLOCKING = {'severity': 'blocking', 'description': 'b1', 'location': 'm/x.py:1'}
-_SUGGESTION_1 = {'severity': 'suggestion', 'description': 's1', 'location': 'm/x.py:2'}
-_SUGGESTION_2 = {'severity': 'suggestion', 'description': 's2', 'location': 'm/x.py:3'}
+_BLOCKING = {'kind': 'defect', 'severity': 'blocking', 'description': 'b1', 'location': 'm/x.py:1'}
+_SUGGESTION_1 = {'kind': 'defect', 'severity': 'suggestion', 'description': 's1', 'location': 'm/x.py:2'}
+_SUGGESTION_2 = {'kind': 'defect', 'severity': 'suggestion', 'description': 's2', 'location': 'm/x.py:3'}
 
 
 def _payload(verdict: str = 'ISSUES_FOUND', issues: list | None = None) -> dict:
@@ -83,8 +84,8 @@ class TestNormalizeReview:
         assert normalize_review(envelope) == normalize_review(payload)
 
     def test_every_non_blocking_issue_is_a_suggestion(self):
-        nit = {'severity': 'nit', 'description': 'n'}
-        unrated = {'description': 'u'}
+        nit = {'kind': 'defect', 'severity': 'nit', 'description': 'n'}
+        unrated = {'kind': 'defect', 'description': 'u'}
         payload = normalize_review(
             _payload(issues=[dict(_BLOCKING), dict(_SUGGESTION_1), nit, unrated]),
         )
@@ -163,6 +164,40 @@ class TestNormalizeReview:
         artifact['issues'][0]['severity'] = 'suggestion'
 
         assert payload.issues[0] == _BLOCKING
+
+
+def _sole_issue(issue: dict) -> dict:
+    (normalised,) = normalize_review(_payload(issues=[issue])).issues
+    return normalised
+
+
+class TestIssueKind:
+    def test_a_legacy_issue_without_kind_normalises_to_a_flagged_defect(self):
+        issue = _sole_issue({'severity': 'blocking', 'description': 'd'})
+
+        reading = issue_kind_of(issue)
+
+        assert reading.kind is IssueKind.DEFECT
+        assert reading.flag is IssueKindFlag.MISSING
+        assert issue[KIND_FLAG_KEY] == IssueKindFlag.MISSING.value
+
+    def test_an_unrecognised_kind_is_flagged_as_unrecognised(self):
+        issue = _sole_issue({'severity': 'blocking', 'kind': 'bug'})
+
+        assert issue[KIND_FLAG_KEY] == IssueKindFlag.UNRECOGNISED.value
+        assert issue_kind_of(issue).kind is IssueKind.DEFECT
+
+    @pytest.mark.parametrize('kind', list(IssueKind))
+    def test_a_recognised_kind_is_left_unflagged(self, kind: IssueKind):
+        issue = _sole_issue({'severity': 'blocking', 'kind': kind.value})
+
+        assert KIND_FLAG_KEY not in issue
+        assert issue_kind_of(issue).kind is kind
+
+    def test_a_received_kind_flag_gives_way_to_the_normalisers_reading(self):
+        issue = _sole_issue({'severity': 'blocking', 'kind': 'defect', KIND_FLAG_KEY: 'missing'})
+
+        assert KIND_FLAG_KEY not in issue
 
 
 class TestReviewPayload:
@@ -475,3 +510,14 @@ def test_b4_envelope_and_legacy_payload_agree_in_production_and_evals(
     _task_artifacts(tmp_path / 'wt_envelope').write_verdict(_REVIEWER, envelope)
     assert _eval_score(tmp_path / 'wt_legacy') == score
     assert _eval_score(tmp_path / 'wt_envelope') == score
+
+
+def test_an_aggregated_legacy_issue_without_kind_reads_as_a_flagged_defect(tmp_path: Path):
+    legacy = {'severity': 'blocking', 'description': 'b1', 'location': 'm/x.py:1'}
+    artifacts = _task_artifacts(tmp_path)
+    artifacts.write_review(_REVIEWER, _payload(issues=[legacy]))
+
+    (issue,) = artifacts.aggregate_reviews().blocking_issues
+
+    assert issue[KIND_FLAG_KEY] == IssueKindFlag.MISSING.value
+    assert issue_kind_of(issue).kind is IssueKind.DEFECT
