@@ -73,8 +73,12 @@ The rules are in `orchestrator/src/orchestrator/narrow_gate_class.py`:
   - a new `.py` file, or a `.py` file that is not UTF-8 on either side;
   - an empty or unreadable delta.
 
-YAML, TOML, JSON, shell scripts and prompt files are not docs. They take the
-full gate because tests read them.
+YAML, TOML, JSON, shell scripts and prompt files are not docs, wherever they
+sit. They take the full gate because tests read them. `docs/` holds
+machine-read yaml and json too (`docs/legibility/legibility.yaml`,
+`docs/legibility/census-state.json`), so dark-factory's allowlist admits only
+`docs/**/*.md` there, and `tests/scripts/test_narrow_merge_gate_policy.py`
+pins that boundary.
 
 ## What the narrow gate runs
 
@@ -83,10 +87,11 @@ the command set. For each registered module it runs one FILE_SCOPED pytest run,
 over two sets of tests:
 
 - the module's whole-tree guard family. Its single home is
-  `shared/src/shared/whole_tree_guard_family.py`, and the census in
-  `shared/src/shared/testing_repo_wide_tests.py` keeps it complete: that census
-  fails any test module that reads the repository beyond its imports but is
-  not a member;
+  `shared/src/shared/whole_tree_guard_family.py`. The census in
+  `shared/src/shared/testing_repo_wide_tests.py` fails any test module that
+  reads the repository beyond its imports but is not a member. The census is a
+  floor, not a proof of completeness: it sees only the reads a module spells
+  itself (see Accepted residual risk);
 - the consumer tests of every touched behavioural artifact, from
   `orchestrator/src/orchestrator/verify_artifact_consumers.py::BEHAVIOURAL_ARTIFACTS`.
   An artifact whose consumer is a whole suite gives that module its full suite.
@@ -129,12 +134,20 @@ set look non-empty.
   `scripts/merge_screen.yaml`) still runs at the merger site before the
   in-flight verify, for narrow items too. The narrow gate replaces only the
   in-flight verify's command set, never the screen.
-- **The event.** Every decision taken while the gate is on emits
-  `EventType.merge_gate_resolution`, carrying:
-  - the resolution;
+- **The event.** Every decision taken while the gate is on whose verify
+  reaches a final verdict emits `EventType.merge_gate_resolution`. A verify
+  that raises instead (a remote's `RunnerUnavailable`, a cancellation) lands
+  nothing and emits none. The event carries:
+  - `resolution`, the gate the verdict actually ran;
+  - `decided`, the gate the decision chose. The two differ when the narrow
+    plan never reached execution, for example on a project with
+    `merge_verify_workspace: true`, whose workspace-forced verify runs the full
+    gate;
   - the miss reason and path;
   - the changed paths;
-  - the executed commands;
+  - `commands`, the narrow verdict's commands
+    (`narrow_gate_plan.py::planned_commands`), or null on the full gate. The
+    verify-result cache may replay a unit rather than run its command;
   - whether it passed;
   - `base_sha` and `merge_sha`.
 
@@ -154,7 +167,7 @@ set look non-empty.
   gate, with `FORCED_FULL_GATE`.
 - **Any classifier miss**, and **an empty command set**.
 - **Any fault.** `narrow_merge_gate_decision` never raises. An unexpected
-  error degrades to the full gate.
+  error degrades to the full gate with `DECISION_FAULT`.
 
 ## A narrow pass is not whole-tree evidence
 
@@ -162,9 +175,10 @@ set look non-empty.
 for a narrow one. Every pass-tail consumer reads that one predicate:
 
 - **The 2823 red-main withholding**
-  (`post_merge_verify.py::_PostMergeVerify._withheld_trivial_pass`). A narrow
+  (`post_merge_verify.py::_PostMergeVerify._withheld_partial_pass`). A narrow
   pass over a known-red main is withheld. Its reason keeps
-  `TRIVIAL_PASS_MAIN_RED_REASON_PREFIX` and names the resolution.
+  `TRIVIAL_PASS_MAIN_RED_REASON_PREFIX` and names the resolution, from
+  `verify.py::VerifyResult.partial_evidence_label`.
 - **The remote cross-check** (`::_PostMergeVerify._cross_check_remote`). There
   is no full suite to cross-check.
 - **Baseline seeding** (`::_PostMergeVerify._seed_main_baseline`). A partial run
@@ -176,13 +190,20 @@ for a narrow one. Every pass-tail consumer reads that one predicate:
 ## Trains and queue order
 
 Docs and comments items never join a train, which would make them pay the full
-gate they were routed away from.
-`orchestrator/src/orchestrator/merge_lane/train_selection.py::select_train_members`
-takes `excluded=`. That parameter is the rule's one home: an excluded anchor
-forms no train, and an excluded candidate is skipped. Both formers fill it from
-`narrow_gate_delta.py::train_exclusions`, which reads no git while the gate is
-off. The two formers are the worker's coalesce pass and the workflow's train
-former.
+gate they were routed away from. `narrow_gate_delta.py::train_exclusions` is
+the rule's one home, and it reads no git while the gate is off. Both train
+formers take their ids from it:
+
+- **The workflow's train former.** Its anchor is the forming task itself, so it
+  passes the ids to
+  `orchestrator/src/orchestrator/merge_lane/train_selection.py::select_train_members`
+  as `excluded=`. An excluded anchor forms no train, and an excluded candidate
+  is skipped.
+- **The worker's coalesce pass.** Its anchor is only the head of its buffer.
+  The pass drops narrow items in its audited exclusion split, with reason
+  `merge_lane/worker.py::COALESCE_EXCLUDED_NARROW_MERGE_GATE`, before it picks
+  an anchor. A docs-only head therefore still lets the code singles behind it
+  form a train.
 
 Queue order is unchanged: the docs lane is task 10996. That lane classifies a
 request before its verify with `narrow_gate_delta.py::classify_branch_change`
@@ -200,6 +221,11 @@ backstops are:
 - the whole-tree guard family in the narrow set;
 - the main-tip sweep;
 - the shadow's cold leg over map-less lands.
+
+The guard family itself is only as complete as its census. A repo-reading test
+that reaches the tree through a helper imported from elsewhere is invisible to
+`shared/src/shared/testing_repo_wide_tests.py`, so it can stay out of the
+family and out of the narrow set. The same backstops apply.
 
 ## Kill switch
 

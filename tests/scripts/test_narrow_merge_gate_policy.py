@@ -3,9 +3,10 @@
 Task 5411; the rationale is docs/narrow-merge-gate.md. The gate is on, and its
 docs allowlist keeps the ruled boundary. That boundary is R4 (2026-09-11) as
 amended on 2026-10-09 and 2026-11-02: prose is docs, while yaml, toml, json,
-shell scripts and prompts are not, because tests read them. The one admitted
-yaml is the stamped capability-manifest sidecar. The allowlist must also never
-shadow a task-2838 full-gate glob.
+shell scripts and prompts are not, because tests read them, wherever they sit;
+docs/ holds machine-read yaml and json too. The one admitted yaml is the stamped
+capability-manifest sidecar. The allowlist must also never shadow a task-2838
+full-gate glob.
 
 The classification goes through the production classifier,
 orchestrator/src/orchestrator/narrow_gate_class.py::classify_docs_change, so this
@@ -41,6 +42,8 @@ NOT_PROSE = (
     'skills/spawn/spawn-claude.sh',
     'fused-memory/src/fused_memory/reconciliation/prompts/stage1.md',
     'orchestrator/src/orchestrator/defaults.yaml',
+    'docs/legibility/legibility.yaml',
+    'docs/legibility/census-state.json',
     'pyproject.toml',
     'uv.lock',
     'package.json',

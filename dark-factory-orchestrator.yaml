@@ -1871,7 +1871,7 @@ narrow_merge_gate:
   enabled: true
   docs_paths:
     - "*.md"
-    - "docs/**"
+    - "docs/**/*.md"
     - "plans/*.md"
     - "README*"
     - "plans/*.capability-manifest.yaml"
