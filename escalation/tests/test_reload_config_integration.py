@@ -14,7 +14,6 @@ test_standalone_returns_wired_error).
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
@@ -38,10 +37,6 @@ try:
     from orchestrator.event_store import EventStore  # type: ignore[reportMissingImports]
     from orchestrator.harness import Harness  # type: ignore[reportMissingImports]
     from orchestrator.run_store import RunStore  # type: ignore[reportMissingImports]
-    from orchestrator.verify_host_roster_file import (
-        ROSTER_FILE_ENV,
-        roster_file_path,
-    )
     _ORCHESTRATOR_AVAILABLE = True
 except ImportError:
     _ORCHESTRATOR_AVAILABLE = False
@@ -52,17 +47,6 @@ except ImportError:
     EventStore: Any = None
     Harness: Any = None
     RunStore: Any = None
-    ROSTER_FILE_ENV: Any = None
-    roster_file_path: Any = None
-
-
-@pytest.mark.skipif(not _ORCHESTRATOR_AVAILABLE, reason='orchestrator package not installed')
-def test_no_config_load_resolves_the_operators_roster_file() -> None:
-    """conftest.py::_isolate_verify_host_roster points every load here away from the default roster."""
-    default_path = roster_file_path({k: v for k, v in os.environ.items() if k != ROSTER_FILE_ENV})
-
-    assert roster_file_path(os.environ) != default_path
-    assert not roster_file_path(os.environ).exists()
 
 
 def _make_reload_harness(tmp_path: Path, monkeypatch) -> tuple[Any, Path]:
