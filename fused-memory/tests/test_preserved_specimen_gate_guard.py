@@ -30,11 +30,12 @@ from _preserved_specimen_fixtures import (
     reset_gate_title,
     specimen_memory,
 )
+from shared.testing_virtual_clock import virtual_clock_test
 
 _RESET_TITLE = reset_gate_title()
 _RESET_DESCRIPTION = reset_gate_description()
 
-_PROJECT_ROOT = '/home/leo/src/dark-factory'
+_DARK_FACTORY_ROOT = '/home/leo/src/dark-factory'
 _RECON_AGENT = 'recon-stage-task_knowledge_sync'
 _GUARD_LOGGER = 'fused_memory.middleware.preserved_specimen_gate_guard'
 
@@ -72,7 +73,7 @@ async def _guard(
     return await preserved_specimen_gate_error(
         metadata,
         agent_id,
-        _PROJECT_ROOT,
+        _DARK_FACTORY_ROOT,
         title=title,
         description=description,
         memory_service=memory,
@@ -207,7 +208,7 @@ class TestPreservedSpecimenRefused:
         assert err['gate_subject'] == '3105'
         assert err['preservation_citation'] == SPECIMEN_MEMORY_ID
         memory.get_memories_by_metadata.assert_awaited_once_with(
-            project_id=resolve_project_id(_PROJECT_ROOT),
+            project_id=resolve_project_id(_DARK_FACTORY_ROOT),
             filters=preservation_mem0_filters('3105'),
         )
 
@@ -283,7 +284,7 @@ class TestFailsOpen:
         assert result is None
         assert _warned_proceeding(caplog, '3105')
 
-    @pytest.mark.asyncio
+    @virtual_clock_test
     async def test_timeout_fails_open_with_a_warning(self, caplog):
         never = asyncio.Event()
 
@@ -295,10 +296,7 @@ class TestFailsOpen:
         memory.get_memories_by_metadata.side_effect = _hang
 
         with caplog.at_level(logging.WARNING, logger=_GUARD_LOGGER):
-            result = await asyncio.wait_for(
-                _guard(_reset_gate_metadata(), memory, timeout_seconds=0.05),
-                5,
-            )
+            result = await _guard(_reset_gate_metadata(), memory)
 
         assert result is None
         assert _warned_proceeding(caplog, '3105')
