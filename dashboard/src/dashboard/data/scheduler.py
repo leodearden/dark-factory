@@ -1094,22 +1094,34 @@ async def collect_scheduler_state(
 async def _paused_projects(
     roots: Sequence[Path], labels: ProjectLabels, *, now: datetime,
 ) -> list[dict]:
-    """Every paused root's entry, in root order, from its local files."""
-    states: list[CheckedSchedulerState] = await asyncio.gather(*(
-        asyncio.to_thread(read_scheduler_state_checked, Path(root), now=now) for root in roots
-    ))
-    return [
-        {
-            'project': labels.of(root),
-            'reason': state.pause_reason,
-            'pause_class': state.pause_class,
-            'snapshot_at': state.snapshot_at.isoformat() if state.snapshot_at is not None else None,
-            'snapshot_age_s': state.snapshot_age_s,
-            'pause_disagreement': state.pause_disagreement,
-        }
-        for root, state in zip(roots, states, strict=True)
-        if state.is_paused
-    ]
+    """Every paused root's entry, in root order, from its local files.
+
+    A root whose read raises is logged and skipped, so collect_scheduler_state
+    still never raises.
+    """
+    results = await asyncio.gather(
+        *(asyncio.to_thread(read_scheduler_state_checked, Path(root), now=now) for root in roots),
+        return_exceptions=True,
+    )
+    entries: list[dict] = []
+    for root, result in zip(roots, results, strict=True):
+        if isinstance(result, BaseException):
+            logger.warning('reading the scheduler state of %s raised: %r', root, result)
+            continue
+        if result.is_paused:
+            entries.append(_paused_entry(labels.of(root), result))
+    return entries
+
+
+def _paused_entry(label: str, state: CheckedSchedulerState) -> dict:
+    return {
+        'project': label,
+        'reason': state.pause_reason,
+        'pause_class': state.pause_class,
+        'snapshot_at': state.snapshot_at.isoformat() if state.snapshot_at is not None else None,
+        'snapshot_age_s': state.snapshot_age_s,
+        'pause_disagreement': state.pause_disagreement,
+    }
 
 
 def _merge_module_lists(

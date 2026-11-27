@@ -10,6 +10,7 @@ mocked to say "not paused", so only the local read can list a project.
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -19,7 +20,7 @@ import httpx
 import pytest
 from _task_units import units_by_label
 from shared.project_layout import runs_db, scheduler_state_json
-from shared.scheduler_state import SchedulerStateSnapshot
+from shared.scheduler_state import SchedulerStateSnapshot, read_scheduler_state_checked
 
 from dashboard.config import DashboardConfig
 from dashboard.data.scheduler import clear_scheduler_state, collect_scheduler_state
@@ -169,3 +170,28 @@ async def test_a_root_offline_to_fused_memory_is_still_listed_from_its_files(tmp
     listed = await _paused_projects(config, offline=(label,))
 
     assert [(entry['project'], entry['reason']) for entry in listed] == [(label, _ROW_REASON)]
+
+
+async def test_a_root_whose_read_raises_is_skipped_and_the_others_are_listed(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    broken, paused = _roots(tmp_path, 'p1', 'p2')
+    _seed_pause_row(paused)
+    config = _config([broken, paused])
+
+    def raising_for_the_broken_root(root: Path, *, now: datetime):
+        if root == broken:
+            raise RecursionError('maximum recursion depth exceeded while decoding a JSON array')
+        return read_scheduler_state_checked(root, now=now)
+
+    with (
+        patch('dashboard.data.scheduler.read_scheduler_state_checked', raising_for_the_broken_root),
+        caplog.at_level(logging.WARNING, logger='dashboard.data.scheduler'),
+    ):
+        listed = await _paused_projects(config)
+
+    assert [entry['project'] for entry in listed] == [config.project_labels.of(paused)]
+    assert any(
+        record.levelno == logging.WARNING and str(broken) in record.getMessage()
+        for record in caplog.records
+    )
