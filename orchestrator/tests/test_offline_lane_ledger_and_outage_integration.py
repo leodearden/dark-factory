@@ -66,7 +66,7 @@ from orchestrator.offline_lane_escalations import (
     sentinel_task_id,
 )
 from orchestrator.offline_lane_ledger import NUMERIC_UNNAMED_CLEAR
-from orchestrator.offline_lane_records import PassRecord, ProbeKind
+from orchestrator.offline_lane_records import PassRecord, ProbeKind, ProbeResult
 
 pytestmark = [pytest.mark.usefixtures('code_default_config')]
 
@@ -689,7 +689,7 @@ PROBE_STARTS = {'starting at once': '', 'starting after its timeout': f'sleep {P
 HANGING_PROBE = 'exec sleep 30'
 
 
-def assert_confirmed_as_if_no_probe_under_one_broken_record(lane: RedPathLane, record: PassRecord) -> None:
+def assert_confirmed_as_if_no_probe_under_one_broken_record(lane: RedPathLane, record: PassRecord) -> ProbeResult:
     assert record.outcome == {
         'arm': 'confirmed', 'mode': 'narrowed', 'reproduced': [A], 'cleared': [], 'inconclusive': [],
     }
@@ -702,6 +702,7 @@ def assert_confirmed_as_if_no_probe_under_one_broken_record(lane: RedPathLane, r
     assert episode.counted_passes == (record.pass_id,)
     [broken] = lane.pending(PROBE_BROKEN_CATEGORY)
     assert broken.level == 1
+    return record.detect.probe
 
 
 @pytest.mark.asyncio
@@ -721,6 +722,7 @@ async def test_scenario_38_a_broken_probe_is_confirmed_as_if_none_were_declared_
 
 @pytest.mark.asyncio
 @pytest.mark.timeout(lane_test_timeout(drives=1))
+@pytest.mark.timing(reason='the outage probe timeout is the behaviour under test')
 @pytest.mark.parametrize('start', PROBE_STARTS.values(), ids=list(PROBE_STARTS))
 async def test_scenario_38_a_probe_past_its_timeout_is_confirmed_as_if_none_were_declared_under_one_record(
     tmp_path, monkeypatch, start,
@@ -732,10 +734,9 @@ async def test_scenario_38_a_probe_past_its_timeout_is_confirmed_as_if_none_were
 
     record = await lane.advance(RED_A, RED_A)
 
-    assert_confirmed_as_if_no_probe_under_one_broken_record(lane, record)
-    assert record.detect is not None
-    assert record.detect.probe is not None
-    assert (record.detect.probe.result, record.detect.probe.returncode) == (ProbeKind.BROKEN, None)
+    probe = assert_confirmed_as_if_no_probe_under_one_broken_record(lane, record)
+    assert (probe.result, probe.returncode) == (ProbeKind.BROKEN, None)
+    assert probe.duration >= PROBE_TIMEOUT_SECS
 
 
 @pytest.mark.asyncio
