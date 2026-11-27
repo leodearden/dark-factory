@@ -1086,6 +1086,10 @@ _SSH_PROBE_OPTS = (
 # its ssh commands do instead of riding ~/.ssh/config (task 6565).
 GIT_PUSH_SSH_CONFIG = ('-c', f'core.sshCommand=ssh {" ".join(_SSH_BASE_OPTS)}')
 
+# Every tag of the project checkout, to the same name on the runner's git_remote
+# (task 11840, RemoteRunner._mirror_tags).
+_TAG_MIRROR_REFSPEC = 'refs/tags/*:refs/tags/*'
+
 # Exit status ssh reserves for its OWN errors rather than the remote command's:
 # "ssh exits with the exit status of the remote command or with 255 if an error
 # occurred" (ssh(1), EXIT STATUS).  A sleeping host, a refused connection, a
@@ -1246,8 +1250,9 @@ async def env_probe_local_run(
 #: reused descriptor.
 HEARTBEAT_STOP_JOIN_SECS: float = 5.0
 
-#: Pause before ``RemoteRunner.publish_sha``'s one retry of a refused publish.
-_PUBLISH_RETRY_DELAY_SECS: float = 1.0
+#: Pause before the one plain retry of a refused push that may have lost a ref
+#: lock race to another role (``RemoteRunner.publish_sha``, ``RemoteRunner._mirror_tags``).
+_REFUSED_PUSH_RETRY_DELAY_SECS: float = 1.0
 
 
 async def _default_ssh_heartbeat_run(
@@ -1511,6 +1516,10 @@ def _task_pass_summary_payload(
     }
 
 
+# What a runner_synced event says was brought current (event_store.py::EventType.runner_synced).
+_SyncedKind = Literal['gate_checkout', 'project_main_mirror', 'project_tag_mirror']
+
+
 class RemoteRunner:
     """Runs a verify on a remote host via git push + ssh, in a gate built from this process's sha.
 
@@ -1527,8 +1536,10 @@ class RemoteRunner:
     other parseable VerifyResult is returned unchanged, even passed=False or
     timed_out=True (PRD §A Invariant 5).
 
-    The pushed ref ``refs/merge-verify/<request_id>`` is pruned best-effort on
-    return (step-10).
+    Every dispatch mirrors the project's tags to its git remote
+    (:meth:`_mirror_tags`) before pushing the verified sha as
+    ``refs/merge-verify/<request_id>``, which is pruned best-effort on return
+    (step-10).
     """
 
     is_local: ClassVar[bool] = False
@@ -1686,7 +1697,7 @@ class RemoteRunner:
                 'RemoteRunner %r: publish of gate sha %s refused, retrying once: %s',
                 self.name, sha, exc,
             )
-            await asyncio.sleep(_PUBLISH_RETRY_DELAY_SECS)
+            await asyncio.sleep(_REFUSED_PUSH_RETRY_DELAY_SECS)
             await self._push(target, refspec, cwd=self._code_checkout)
 
     async def reap_idle_gates(self) -> None:
@@ -1797,9 +1808,21 @@ class RemoteRunner:
         event_store.emit(EventType.runner_stale, task_id=task_id, data={
             'runner': self.name, 'local_head': sha, 'remote_head': self._ensured_sha,
         })
+        self._announce_synced(
+            event_store, task_id,
+            kind='gate_checkout', from_head=self._ensured_sha, to_head=sha, forced=False,
+        )
+
+    def _announce_synced(
+        self, event_store: Any, task_id: str | None, *,
+        kind: _SyncedKind, from_head: str | None, to_head: str | None, forced: bool,
+    ) -> None:
+        """Emit runner_synced to the None-safe *event_store*: the remote was brought current with this dispatcher."""
+        if event_store is None:
+            return
         event_store.emit(EventType.runner_synced, task_id=task_id, data={
-            'runner': self.name, 'kind': 'gate_checkout',
-            'from_head': self._ensured_sha, 'to_head': sha, 'forced': False,
+            'runner': self.name, 'kind': kind,
+            'from_head': from_head, 'to_head': to_head, 'forced': forced,
         })
 
     def _gate_command(self, args: Sequence[str]) -> str:
@@ -1962,7 +1985,8 @@ class RemoteRunner:
     ) -> VerifyResult:
         """Run a task-role verify of ``spec.tip_sha`` on the remote host (PRD §5.2).
 
-        ``_dispatch('verify-task')``, with no main-mirror push.  With
+        ``_dispatch('verify-task')``, whose tag mirror runs as for a merge;
+        there is no main-mirror push.  With
         *archive_root*, a red archives the remote stderr, the
         ``attempt-<spec.attempt_id>.remote-<name>.{test,lint,type}-<stamp>.log``
         streams and their ``.summary-<stamp>.json`` (role 'task'); a green archives
@@ -2060,14 +2084,11 @@ class RemoteRunner:
         prior_main_sha = self._last_pushed_main_sha
         if resolved_main_sha is not None:
             self._last_pushed_main_sha = resolved_main_sha
-        if forced and event_store is not None:
-            event_store.emit(EventType.runner_synced, task_id=task_id, data={
-                'runner': self.name,
-                'kind': 'project_main_mirror',
-                'from_head': prior_main_sha,
-                'to_head': resolved_main_sha,
-                'forced': True,
-            })
+        if forced:
+            self._announce_synced(
+                event_store, task_id, kind='project_main_mirror',
+                from_head=prior_main_sha, to_head=resolved_main_sha, forced=True,
+            )
 
     async def _local_branch_sha(self, branch: str) -> str | None:
         """*branch*'s local tip by a network-free ``git rev-parse``, or None when unreadable."""
@@ -2076,6 +2097,74 @@ class RemoteRunner:
         except OSError:
             return None
         return (stdout.strip() or None) if rc == 0 else None
+
+    async def _local_tag_refs(self) -> tuple[str, ...] | None:
+        """The local ``<object> <refname>`` tag lines by a network-free ``git for-each-ref``, or None when unreadable."""
+        try:
+            rc, stdout, _ = await self._run(
+                ['git', 'for-each-ref', '--format=%(objectname) %(refname)', 'refs/tags'],
+                cwd=self._cwd,
+            )
+        except OSError:
+            return None
+        if rc != 0:
+            return None
+        return tuple(line for line in stdout.splitlines() if line.strip())
+
+    async def _mirror_tags(self, *, task_id: str | None, event_store: Any) -> None:
+        """Push every local tag of the project checkout to the remote before a verify.
+
+        Unlike main's freshness, the tag set is an INPUT to the verdict (a test
+        may gate on a release tag), so it is pushed before EVERY verify, with no
+        dedup against an earlier mirror the remote may since have lost, and a
+        failed push raises RunnerUnavailable so the verify does not run.  An
+        unreadable listing is this dispatcher's fault, not the host's, so it is
+        logged and skipped; an empty one is skipped because a glob refspec
+        matching nothing makes git push exit 1.
+
+        INV-2 mirror semantics (task 2884, PRD §3.1), as for main: a refused
+        push (typically a remote tag pointing elsewhere) is forced once, and a
+        forced success emits runner_synced(kind='project_tag_mirror').  Before
+        forcing, the plain push is retried once after a pause, as publish_sha
+        does: two roles creating one new tag collide on its ref lock, and a
+        force there would announce a divergence that never was.  A transport
+        failure is re-raised unforced: the host was not reached.
+        """
+        tags = await self._local_tag_refs()
+        if tags is None:
+            logger.warning(
+                'RemoteRunner %r: local tags of %s unreadable, so its tag set was not mirrored',
+                self.name, self._cwd,
+            )
+            return
+        if not tags:
+            return
+        refused = await self._refused_tag_push()
+        if refused is None:
+            return
+        logger.info('RemoteRunner %r: tag mirror push refused, retrying once: %s', self.name, refused)
+        await asyncio.sleep(_REFUSED_PUSH_RETRY_DELAY_SECS)
+        refused = await self._refused_tag_push()
+        if refused is None:
+            return
+        logger.warning(
+            'RemoteRunner %r: tag mirror push refused twice (%s), force-mirroring tags',
+            self.name, refused,
+        )
+        await self._push(self._git_remote, f'+{_TAG_MIRROR_REFSPEC}', cwd=self._cwd)
+        self._announce_synced(
+            event_store, task_id, kind='project_tag_mirror', from_head=None, to_head=None, forced=True,
+        )
+
+    async def _refused_tag_push(self) -> RunnerUnavailable | None:
+        """The plain tag push's refusal by a reached host, or None once pushed; a transport failure raises."""
+        try:
+            await self._push(self._git_remote, _TAG_MIRROR_REFSPEC, cwd=self._cwd)
+        except RunnerUnavailable as refused:
+            if refused.kind == 'transport':
+                raise
+            return refused
+        return None
 
     async def _dispatch(
         self,
@@ -2088,14 +2177,15 @@ class RemoteRunner:
         event_store: Any = None,
         task_id: str | None = None,
     ) -> _DispatchOutcome:
-        """Ensure the gate, push *sha* to ``refs/merge-verify/<request_id>``, run *subcommand* over ssh, parse the verdict.
+        """Ensure the gate, mirror the project's tags, push *sha* to ``refs/merge-verify/<request_id>``, run *subcommand* over ssh, parse the verdict.
 
         The one transport every remote verify shares (PRD §4.3).  It claims the
         runner's single in-flight slot synchronously, before its first await,
         and clears it on unwind; a claim while another is live breaks the
         exclusive-use invariant and raises ConcurrentDispatchError, leaving
         the live claim untouched.  :meth:`ensure_gate` runs on every call, so
-        every verify runs the deployed sha's gate.  After a successful push the
+        every verify runs the deployed sha's gate, and :meth:`_mirror_tags`
+        then gives the remote the project's tag set.  After a successful push the
         ref is deleted best-effort on every exit.  A :meth:`cancel_verify`
         before the verify ssh starts makes it raise RunnerUnavailable
         ('transport') instead of starting the verify.
@@ -2113,6 +2203,7 @@ class RemoteRunner:
         ref = f'refs/merge-verify/{request_id}'
         try:
             await self.ensure_gate(event_store=event_store, task_id=task_id)
+            await self._mirror_tags(task_id=task_id, event_store=event_store)
             await self._push(self._git_remote, f'{sha}:{ref}', cwd=self._cwd)
             try:
                 outcome = await self._run_gate_verify(sha, subcommand, spec_json, request_id)
