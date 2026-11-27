@@ -15,22 +15,20 @@ _SESSION_PREFIX = CONFIG_DIR_PREFIX + 'legibility-session-'
 
 
 def test_every_test_gets_a_private_empty_tempdir_outside_tmp_path(
-    private_tempdir, tmp_path, tmp_path_factory,
+    tmp_path, tmp_path_factory,
 ):
-    assert Path(tempfile.gettempdir()) == private_tempdir, (
-        f'tempfile.gettempdir() is {tempfile.gettempdir()}, not this test\'s '
-        f'private tempdir {private_tempdir}'
+    tempdir = Path(tempfile.gettempdir())
+    assert tempdir.is_relative_to(tmp_path_factory.getbasetemp()), (
+        f'tempfile.gettempdir() is {tempdir}, outside pytest\'s basetemp '
+        f'{tmp_path_factory.getbasetemp()}, in a test that never asks for '
+        f'private_tempdir: the fixture is no longer autouse'
     )
-    assert private_tempdir.is_relative_to(tmp_path_factory.getbasetemp()), (
-        f'{private_tempdir} lies outside pytest\'s basetemp '
-        f'{tmp_path_factory.getbasetemp()}'
+    assert not tempdir.is_relative_to(tmp_path), (
+        f'{tempdir} lies inside tmp_path {tmp_path}, adding an entry to every '
+        f'test\'s tmp_path'
     )
-    assert not private_tempdir.is_relative_to(tmp_path), (
-        f'{private_tempdir} lies inside tmp_path {tmp_path}, adding an entry '
-        f'to every test\'s tmp_path'
-    )
-    assert list(private_tempdir.iterdir()) == [], (
-        f'{private_tempdir} is not empty: {sorted(private_tempdir.iterdir())}'
+    assert list(tempdir.iterdir()) == [], (
+        f'{tempdir} is not empty: {sorted(tempdir.iterdir())}'
     )
 
 
