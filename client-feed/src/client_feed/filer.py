@@ -48,9 +48,16 @@ from client_feed.policy import FilerPolicy, Policy
 
 logger = logging.getLogger(__name__)
 
-FALLBACK_AFTER_ATTEMPTS: Final = 5
+FALLBACK_AFTER_RESTATEMENTS: Final = 5
 MAX_BACKOFF_SECONDS: Final = 300
 
+_UNCONVERGED_LINE: Final = '%s not converged: %s refused (%s, %s), %s after %d attempts'
+_STALLED_LINE: Final = (
+    '%s stalled: %d attempts refused, the last by %s (%s); this pass %s refused (%s, %s), %s;'
+    ' it is retried every pass and needs an operator'
+)
+
+_COUNTED: Final = frozenset({Disposition.FALLBACK, Disposition.RETRY_THEN_FALLBACK})
 _DEFERRED: Final = TaskStatus.DEFERRED
 _TERMINAL: Final = frozenset({TaskStatus.DONE, TaskStatus.CANCELLED})
 _CANCELLABLE_FIX: Final = frozenset({TaskStatus.PENDING, TaskStatus.DEFERRED})
@@ -60,7 +67,7 @@ _WITHDRAWABLE: Final = frozenset(
 
 
 class Unconverged(BaseModel):
-    """A ref the pass could not bring to its final state, and the refusal that stopped it."""
+    """A ref the pass could not bring to its final state, the refusal that stopped it, and its record's attempts, the step and code that last counted one, and whether they reached the stall bound."""
 
     model_config = ConfigDict(frozen=True, extra='forbid')
 
@@ -70,6 +77,9 @@ class Unconverged(BaseModel):
     code: str
     disposition: Disposition
     attempts: int
+    last_tool: str | None
+    last_code: str | None
+    stalled: bool
 
 
 class PassReport(BaseModel):
@@ -102,7 +112,7 @@ class _Outcome:
 
 
 class _RefusedWithRecord(Exception):
-    """A refusal that leaves a ref unconverged, with the record the cursor keeps for the ref after it."""
+    """A refusal that leaves a ref unconverged, with the record this refusal leaves the ref."""
 
     def __init__(self, refused: ToolRefused, record: RefRecord | None) -> None:
         self.refused = refused
@@ -110,12 +120,23 @@ class _RefusedWithRecord(Exception):
         super().__init__(str(refused))
 
 
+def _counted(record: RefRecord | None, refused: ToolRefused) -> RefRecord | None:
+    """The record a refusal leaves: for one a retry alone will not clear, one more attempt naming the step and code that refused it; else unchanged."""
+    if refused.disposition not in _COUNTED:
+        return record
+    if record is None:
+        return RefRecord(attempts=1, last_tool=refused.tool, last_code=refused.code)
+    return record.model_copy(
+        update={'attempts': record.attempts + 1, 'last_tool': refused.tool, 'last_code': refused.code}
+    )
+
+
 @contextmanager
-def _keeping_record(record: RefRecord | None) -> Iterator[None]:
+def _counting(record: RefRecord | None) -> Iterator[None]:
     try:
         yield
     except ToolRefused as refused:
-        raise _RefusedWithRecord(refused, record) from None
+        raise _RefusedWithRecord(refused, _counted(record, refused)) from None
 
 
 @dataclass(frozen=True)
@@ -233,21 +254,21 @@ def _gate_and_commit(
     tools.commit_planning(still_deferred)
 
 
-def _after_refusal(record: RefRecord | None, refused: ToolRefused) -> RefRecord | None:
-    """The record a refused restated fix leaves: a counted attempt, and the fallback once one applies."""
-    if refused.disposition not in (Disposition.FALLBACK, Disposition.RETRY_THEN_FALLBACK):
+def _restated(record: RefRecord | None, refused: ToolRefused) -> RefRecord | None:
+    """The counted record a refused restatement leaves: one more restatement, with the typed-facts fallback once its refusal says so."""
+    if record is None or refused.disposition not in _COUNTED:
         return record
-    attempts = 1 if record is None else record.attempts + 1
-    falls_back = refused.disposition is Disposition.FALLBACK or attempts >= FALLBACK_AFTER_ATTEMPTS
-    fallback = FilerFallback(kind=refused.kind, code=refused.code) if falls_back else None
-    return RefRecord(attempts=attempts, last_code=refused.code, fallback=fallback)
+    restatements = record.restatements + 1
+    falls_back = refused.disposition is Disposition.FALLBACK or restatements >= FALLBACK_AFTER_RESTATEMENTS
+    fallback = FilerFallback(kind=refused.kind, code=refused.code) if falls_back else record.fallback
+    return record.model_copy(update={'restatements': restatements, 'fallback': fallback})
 
 
 def _submitted(
     tools: ClosedTools, report: DefectReported, ref: str, filer: FilerPolicy, record: RefRecord | None
 ) -> _Filed:
     fallback = None if record is None else record.fallback
-    with _keeping_record(record):
+    with _counting(record):
         submission = fix_submission(report, ref=ref, priority=filer.fix_priority, fallback=fallback)
         task_id = tools.submit_planned(submission)
     return _Filed(_just_submitted(task_id), facts_of(report, fallback), record)
@@ -262,7 +283,7 @@ def _submit_fix(
     try:
         return _submitted(tools, report, ref, filer, record)
     except _RefusedWithRecord as refusal:
-        record = _after_refusal(record, refusal.refused)
+        record = _restated(refusal.record, refusal.refused)
         if record is None or record.fallback is None:
             raise _RefusedWithRecord(refusal.refused, record) from None
     return _submitted(tools, report, ref, filer, record)
@@ -272,7 +293,7 @@ def _filed_fix(
     tools: ClosedTools, report: DefectReported, ref: str, policy: Policy, record: RefRecord | None
 ) -> _Filed | None:
     """The ref's filer fix, submitted if the store holds none; None when the ref was filed by hand."""
-    with _keeping_record(record):
+    with _counting(record):
         lookup = tools.lookup_defect_ref(ref)
         carriers = [tools.get_task(carrier.task_id) for carrier in lookup.carriers]
         mine = [view for view in carriers if view.source == FILER_IDENTITY]
@@ -292,11 +313,15 @@ def converge_filing(
     try:
         filed = _filed_fix(tools, report, ref, policy, record)
         if filed is not None:
-            with _keeping_record(filed.record):
+            with _counting(filed.record):
                 _gate_and_commit(tools, report, ref, policy, filer, filed.fix, filed.facts)
     except _RefusedWithRecord as refusal:
-        return _Outcome(refused=_unconverged(ref, refusal.refused, refusal.record), record=refusal.record)
+        return _stopped(ref, refusal)
     return _Outcome()
+
+
+def _stopped(ref: str, refusal: _RefusedWithRecord) -> _Outcome:
+    return _Outcome(refused=_unconverged(ref, refusal.refused, refusal.record), record=refusal.record)
 
 
 def _unconverged(ref: str, refused: ToolRefused, record: RefRecord | None) -> Unconverged:
@@ -307,6 +332,9 @@ def _unconverged(ref: str, refused: ToolRefused, record: RefRecord | None) -> Un
         code=refused.code,
         disposition=refused.disposition,
         attempts=0 if record is None else record.attempts,
+        last_tool=None if record is None else record.last_tool,
+        last_code=None if record is None else record.last_code,
+        stalled=record is not None and record.stalled,
     )
 
 
@@ -357,12 +385,13 @@ def _withdraw_and_cancel_fix(tools: ClosedTools, ref: str, project_id: str) -> N
 def converge_ruling(tools: ClosedTools, ref: str, project_id: str, record: RefRecord | None) -> _Outcome:
     """Carry Leo's portal ruling to the filer's own fix and gate: withdraw and cancel the fix first, since a cancelled gate releases it."""
     try:
-        _withdraw_and_cancel_fix(tools, ref, project_id)
-        for gate in _filer_tasks(tools, tools.find_gates(ref)):
-            if gate.status not in _TERMINAL:
-                tools.cancel(gate.task_id)
-    except ToolRefused as refused:
-        return _Outcome(refused=_unconverged(ref, refused, record), record=record)
+        with _counting(record):
+            _withdraw_and_cancel_fix(tools, ref, project_id)
+            for gate in _filer_tasks(tools, tools.find_gates(ref)):
+                if gate.status not in _TERMINAL:
+                    tools.cancel(gate.task_id)
+    except _RefusedWithRecord as refusal:
+        return _stopped(ref, refusal)
     return _Outcome()
 
 
@@ -375,6 +404,18 @@ def _read(policy: Policy, offset: int) -> tuple[InboxRead, int]:
             raise
         logger.warning('inbox of %s was replaced (%s); reading it from its start', policy.project_id, exc.detail)
         return read_inbox(policy.in_dir, offset=0), 0
+
+
+def _log_rejected(project_id: str, read: InboxRead) -> None:
+    """The lines failing the inbox contract, by offset only: their detail can echo raw client text."""
+    if read.rejected:
+        offsets = ', '.join(str(line.offset) for line in read.rejected)
+        logger.warning(
+            'inbox of %s: rejected %d lines that fail the inbox contract (offsets %s)',
+            project_id,
+            len(read.rejected),
+            offsets,
+        )
 
 
 def run_pass(policy: Policy, tools: ClosedTools, cursor: FilerCursor) -> tuple[PassReport, FilerCursor]:
@@ -397,6 +438,7 @@ def run_pass(policy: Policy, tools: ClosedTools, cursor: FilerCursor) -> tuple[P
             inbox_problem=str(exc.problem),
         )
         return unusable, cursor
+    _log_rejected(policy.project_id, read)
     outcomes: dict[str, _Outcome] = {}
     for ref, state in _ref_states(read, policy.project_id).items():
         record = cursor.refs.get(ref)
@@ -418,16 +460,13 @@ def run_pass(policy: Policy, tools: ClosedTools, cursor: FilerCursor) -> tuple[P
 
 
 def _log_unconverged(report: PassReport) -> None:
+    """One line per unconverged ref each pass: a WARNING, or once the ref is stalled an ERROR naming an operator and the counted refusal that stalled it."""
     for item in report.unconverged:
-        logger.warning(
-            '%s not filed: %s refused (%s, %s), %s after %d attempts',
-            item.ref,
-            item.tool,
-            item.kind,
-            item.code,
-            item.disposition,
-            item.attempts,
-        )
+        refusal = (item.tool, item.kind, item.code, item.disposition)
+        if item.stalled:
+            logger.error(_STALLED_LINE, item.ref, item.attempts, item.last_tool, item.last_code, *refusal)
+        else:
+            logger.warning(_UNCONVERGED_LINE, item.ref, *refusal, item.attempts)
 
 
 def file_once(policy: Policy, *, open_tools: OpenTools) -> PassReport:
@@ -496,7 +535,7 @@ class CheckedCall(BaseModel):
 
 
 class CheckReport(BaseModel):
-    """σ4's install check: the closed tools the server lacks, the check ref's standing, and the calls one pass would make."""
+    """σ4's install check: the closed tools the server lacks, the check ref's standing, the calls one pass would make, and the stored cursor's stalled refs."""
 
     model_config = ConfigDict(frozen=True, extra='forbid')
 
@@ -506,6 +545,7 @@ class CheckReport(BaseModel):
     check_ref_live: bool | None
     calls: tuple[CheckedCall, ...]
     problem: str | None
+    stalled: dict[str, RefRecord]
 
 
 def _pass_problem(report: PassReport) -> str | None:
@@ -517,19 +557,23 @@ def _pass_problem(report: PassReport) -> str | None:
 
 def _check_report(
     ref: str,
+    cursor: FilerCursor,
     missing: tuple[str, ...],
     live: bool | None,
     withheld: WithheldWrites | None,
     problem: str | None,
 ) -> CheckReport:
+    """The report, naming every ref the stored cursor holds stalled: --check withholds writes, so that record is its only sight of a write refusal."""
     calls = () if withheld is None else withheld.calls
+    stalled = {stalled_ref: record for stalled_ref, record in cursor.refs.items() if record.stalled}
     return CheckReport(
-        ok=not missing and problem is None,
+        ok=not missing and problem is None and not stalled,
         missing_tools=missing,
         check_ref=ref,
         check_ref_live=live,
         calls=tuple(CheckedCall(tool=call.tool, arguments=dict(call.arguments), withheld=call.withheld) for call in calls),
         problem=problem,
+        stalled=stalled,
     )
 
 
@@ -537,14 +581,14 @@ def _checked(policy: Policy, session: ListingCaller, cursor: FilerCursor, ref: s
     try:
         missing = missing_tools(session)
     except ToolRefused as refused:
-        return _check_report(ref, (), None, None, str(refused))
+        return _check_report(ref, cursor, (), None, None, str(refused))
     try:
         live = bool(ClosedTools(session, policy.project_root).lookup_defect_ref(ref).carriers)
     except ToolRefused as refused:
-        return _check_report(ref, missing, None, None, str(refused))
+        return _check_report(ref, cursor, missing, None, None, str(refused))
     withheld = WithheldWrites(session)
     report, _ = run_pass(policy, ClosedTools(withheld, policy.project_root), cursor)
-    return _check_report(ref, missing, live, withheld, _pass_problem(report))
+    return _check_report(ref, cursor, missing, live, withheld, _pass_problem(report))
 
 
 def check(policy: Policy, *, open_session: OpenSession) -> CheckReport:
@@ -556,4 +600,4 @@ def check(policy: Policy, *, open_session: OpenSession) -> CheckReport:
             with opened(policy, open_session) as session:
                 return _checked(policy, session, cursor, ref)
         except SessionUnavailable as exc:
-            return _check_report(ref, (), None, None, str(exc))
+            return _check_report(ref, cursor, (), None, None, str(exc))

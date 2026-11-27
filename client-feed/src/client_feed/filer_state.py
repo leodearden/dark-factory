@@ -22,18 +22,26 @@ logger = logging.getLogger(__name__)
 
 LOCK_NAME: Final = 'filer.lock'
 CURSOR_NAME: Final = 'cursor.json'
+STALLED_AFTER_ATTEMPTS: Final = 5
 _STATE_DIR_MODE: Final = 0o700
 _LOCK_MODE: Final = 0o600
 
 
 class RefRecord(BaseModel):
-    """An unconverged ref's failed attempts at its fix submission, and the fallback once one applies."""
+    """An unconverged ref's refused attempts at converging, how many of those refused its fix's restatement, the step and code that last refused it, and the fallback its fix submission took once one applies."""
 
     model_config = ConfigDict(frozen=True, extra='forbid')
 
     attempts: PositiveInt
+    restatements: NonNegativeInt = 0
+    last_tool: Token | None = None
     last_code: Token
     fallback: FilerFallback | None = None
+
+    @property
+    def stalled(self) -> bool:
+        """Refused often enough that retrying alone will not converge it: an operator must look."""
+        return self.attempts >= STALLED_AFTER_ATTEMPTS
 
 
 class FilerCursor(BaseModel):
