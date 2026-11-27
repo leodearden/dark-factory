@@ -201,18 +201,23 @@ def in_memory_corpus_curator(
     config: FusedMemoryConfig | None = None,
     *,
     taskmaster: TaskBackendProtocol | None = None,
+    qdrant_client: AsyncQdrantClient | None = None,
 ) -> TaskCurator:
     """A real TaskCurator over an in-memory Qdrant corpus embedded by *embedder*.
 
     Its corpus also reads *taskmaster*'s store when one is given. It never
-    calls the LLM. The caller awaits ``curator.close()``.
+    calls the LLM. *qdrant_client* replaces the fresh in-memory client, for a
+    test that records or refuses corpus writes. The caller awaits
+    ``curator.close()``.
     """
     return TaskCurator(
         config=config or make_config(),
         taskmaster=taskmaster,
         invoke=must_not_invoke(),
         embedder=embedder,
-        qdrant_client=AsyncQdrantClient(location=':memory:'),
+        qdrant_client=(
+            AsyncQdrantClient(location=':memory:') if qdrant_client is None else qdrant_client
+        ),
     )
 
 

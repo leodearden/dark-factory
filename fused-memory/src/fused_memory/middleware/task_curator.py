@@ -151,7 +151,7 @@ from fused_memory.services.provider_billing import billing_source_of
 
 if TYPE_CHECKING:
     from qdrant_client import AsyncQdrantClient
-    from qdrant_client.models import ExtendedPointId
+    from qdrant_client.models import ExtendedPointId, PointStruct
     from shared.cost_store import CostStore
     from shared.usage_gate import UsageGate
 
@@ -364,6 +364,19 @@ class BackfillResult:
     upserted: int = 0
     skipped: int = 0
     errors: int = 0
+
+
+BACKFILL_UPSERT_BATCH_SIZE = 128
+"""Most points one backfill upsert request carries, far under Qdrant's 32 MiB request limit."""
+
+BACKFILL_DEFAULT_CONCURRENCY = 10
+"""Most embedding calls a backfill keeps in flight unless told otherwise."""
+
+BACKFILL_UPSERT_ATTEMPTS = 3
+"""Most times a backfill sends one batch's upsert before writing its points off."""
+
+BACKFILL_MAX_CONSECUTIVE_FAILED_BATCHES = 3
+"""Batches in a row landing no point after which a backfill stops embedding the rest."""
 
 
 @dataclass
@@ -1921,29 +1934,16 @@ class TaskCurator:
                 candidate.title, candidate.description, candidate.files_to_modify,
             )
             embedding = await embedder.create(text)
-
-            from qdrant_client.models import PointStruct
-
-            point_id = self._point_id(project_id, task_id)
-            client = await self._get_qdrant()
-            await client.upsert(
-                collection_name=collection,
-                points=[
-                    PointStruct(
-                        id=point_id,
-                        vector=embedding,
-                        payload={
-                            'task_id': task_id,
-                            'title': candidate.title,
-                            'description': candidate.description[:1000],
-                            'files_to_modify': candidate.files_to_modify or [],
-                            'priority': candidate.priority or DEFAULT_PRIORITY,
-                            'project_id': project_id,
-                            'updated_at': datetime.now(UTC).isoformat(),
-                        },
-                    ),
-                ],
+            point = self._corpus_point(
+                project_id, task_id,
+                title=candidate.title,
+                description=candidate.description,
+                files=candidate.files_to_modify,
+                priority=candidate.priority,
+                vector=embedding,
             )
+            client = await self._get_qdrant()
+            await client.upsert(collection_name=collection, points=[point])
         except Exception:
             logger.warning(
                 'task_curator: record_task failed for %s', task_id, exc_info=True,
@@ -1992,9 +1992,44 @@ class TaskCurator:
     def _point_id(project_id: str, task_id: str) -> str:
         """Deterministic UUID5 point ID for a task in a project.
 
-        Shared by record_task() and backfill_corpus() to ensure idempotent overlap.
+        Every corpus point gets its id here (via _corpus_point, which
+        record_task() and backfill_corpus() share), so the two writers overlap
+        idempotently.
         """
         return str(uuid_mod.uuid5(uuid_mod.NAMESPACE_URL, f'{project_id}/{task_id}'))
+
+    @classmethod
+    def _corpus_point(
+        cls,
+        project_id: str,
+        task_id: str,
+        *,
+        title: str,
+        description: str,
+        files: list[str] | None,
+        priority: str | None,
+        vector: list[float],
+    ) -> PointStruct:
+        """The corpus point for one task, in the one payload shape the corpus holds.
+
+        record_task() and backfill_corpus() both write through it, and
+        search_corpus() reads its payload keys.
+        """
+        from qdrant_client.models import PointStruct
+
+        return PointStruct(
+            id=cls._point_id(project_id, task_id),
+            vector=vector,
+            payload={
+                'task_id': task_id,
+                'title': title,
+                'description': description[:1000],
+                'files_to_modify': files or [],
+                'priority': priority or DEFAULT_PRIORITY,
+                'project_id': project_id,
+                'updated_at': datetime.now(UTC).isoformat(),
+            },
+        )
 
     async def corpus_count(self, project_id: str) -> int:
         """Return the number of points in the curator corpus for a project.
@@ -2085,82 +2120,155 @@ class TaskCurator:
         self,
         tasks: list[dict],
         project_id: str,
+        *,
+        concurrency: int = BACKFILL_DEFAULT_CONCURRENCY,
+        batch_size: int = BACKFILL_UPSERT_BATCH_SIZE,
     ) -> BackfillResult:
         """Upsert embeddings for a flat list of existing task dicts.
 
-        Idempotent: uses the same deterministic UUID5 point-ID scheme as
-        record_task(). Re-running just re-upserts the same points.
+        The corpus is written in batches of at most *batch_size* points: each
+        slice of tasks is embedded, then upserted, before the next slice is
+        embedded. A batch's upsert is sent up to ``BACKFILL_UPSERT_ATTEMPTS``
+        times with its embeddings in hand; a batch it never lands is logged,
+        its points are counted in ``errors``, and the run continues with the
+        next slice. After ``BACKFILL_MAX_CONSECUTIVE_FAILED_BATCHES`` batches
+        in a row land no point, whether every upsert attempt was refused or
+        every embed failed, the run logs one ERROR and stops: the tasks left
+        are counted in ``errors`` without being embedded. Idempotent: uses the
+        same deterministic UUID5 point-ID scheme as record_task(), so a rerun
+        re-upserts the same points, including a failed batch's.
 
         Args:
             tasks: Flat list of task dicts (as returned by flatten_task_tree).
             project_id: Project identifier used for the collection name and point IDs.
+            concurrency: Most embedding calls in flight at once; at least 1.
+            batch_size: Most points one upsert request carries; at least 1.
 
         Returns:
             BackfillResult with counts of upserted, skipped, and error tasks.
+
+        Raises:
+            ValueError: *concurrency* or *batch_size* is below 1, raised before
+                any embed or Qdrant call. ``asyncio.Semaphore(0)`` would
+                otherwise block the run forever without an error.
         """
+        for knob, value in (('concurrency', concurrency), ('batch_size', batch_size)):
+            if value < 1:
+                raise ValueError(f'backfill_corpus: {knob} must be >= 1, got {value}')
         if not tasks:
             return BackfillResult()
 
-        result = BackfillResult()
+        titled = [task for task in tasks if _task_title(task)]
+        result = BackfillResult(skipped=len(tasks) - len(titled))
         collection = await self._ensure_collection(project_id)
         embedder = await self._get_embedder()
         client = await self._get_qdrant()
+        embed_slots = asyncio.Semaphore(concurrency)
+        batches = [titled[start:start + batch_size] for start in range(0, len(titled), batch_size)]
 
-        from qdrant_client.models import PointStruct
-
-        # Embed all tasks with bounded concurrency.
-        sem = asyncio.Semaphore(10)
-        points: list[PointStruct] = []
-
-        async def _embed_one(task: dict) -> None:
-            task_id = str(task.get('id', '') or '')
-            title = str(task.get('title', '') or '').strip()
-            if not title:
-                result.skipped += 1
-                return
-
-            description = str(task.get('description', '') or '')
-            files = _task_files(task)
-            text = embedding_text(title, description, files)
-
-            try:
-                async with sem:
-                    embedding = await embedder.create(text)
-            except Exception:
-                logger.warning(
-                    'task_curator: backfill embed failed for task %s', task_id, exc_info=True,
+        failed_in_a_row = 0
+        for number, batch in enumerate(batches, start=1):
+            if failed_in_a_row == BACKFILL_MAX_CONSECUTIVE_FAILED_BATCHES:
+                unattempted = sum(len(rest) for rest in batches[number - 1:])
+                result.errors += unattempted
+                logger.error(
+                    'task_curator: backfill_corpus project=%s stopped before batch %d/%d: '
+                    '%d batches in a row landed no point; %d tasks not attempted, '
+                    'counted as errors',
+                    project_id, number, len(batches), failed_in_a_row, unattempted,
                 )
-                result.errors += 1
-                return
-
-            point_id = self._point_id(project_id, task_id)
-            points.append(
-                PointStruct(
-                    id=point_id,
-                    vector=embedding,
-                    payload={
-                        'task_id': task_id,
-                        'title': title,
-                        'description': description[:1000],
-                        'files_to_modify': files,
-                        'priority': task.get('priority') or DEFAULT_PRIORITY,
-                        'project_id': project_id,
-                        'updated_at': datetime.now(UTC).isoformat(),
-                    },
-                )
+                break
+            embedded = await asyncio.gather(*(
+                self._backfill_point(task, project_id, embedder, embed_slots) for task in batch
+            ))
+            points = [point for point in embedded if point is not None]
+            landed = await self._upsert_backfill_batch(
+                client, collection, points,
+                project_id=project_id, number=number, total=len(batches),
             )
-
-        await asyncio.gather(*[_embed_one(t) for t in tasks])
-
-        if points:
-            await client.upsert(collection_name=collection, points=points)
-            result.upserted = len(points)
+            result.upserted += landed
+            result.errors += len(batch) - landed
+            failed_in_a_row = 0 if landed else failed_in_a_row + 1
+            if landed:
+                logger.info(
+                    'task_curator: backfill_corpus project=%s batch %d/%d upserted, '
+                    '%d points so far',
+                    project_id, number, len(batches), result.upserted,
+                )
 
         logger.info(
             'task_curator: backfill_corpus complete project=%s upserted=%d skipped=%d errors=%d',
             project_id, result.upserted, result.skipped, result.errors,
         )
         return result
+
+    @staticmethod
+    async def _upsert_backfill_batch(
+        client: AsyncQdrantClient,
+        collection: str,
+        points: list[PointStruct],
+        *,
+        project_id: str,
+        number: int,
+        total: int,
+    ) -> int:
+        """Upsert one backfill batch; how many of *points* landed: all of them, or 0 (logged).
+
+        A failed attempt is retried at once, up to ``BACKFILL_UPSERT_ATTEMPTS``
+        attempts in all. Resending is safe: point ids are deterministic, so an
+        attempt that landed server-side but failed client-side is overwritten
+        with the same points.
+        """
+        if not points:
+            return 0
+        for attempt in range(1, BACKFILL_UPSERT_ATTEMPTS + 1):
+            try:
+                await client.upsert(collection_name=collection, points=points)
+            except Exception as exc:
+                if attempt == BACKFILL_UPSERT_ATTEMPTS:
+                    logger.warning(
+                        'task_curator: backfill_corpus project=%s batch %d/%d of %d points '
+                        'failed to upsert after %d attempts',
+                        project_id, number, total, len(points), attempt, exc_info=True,
+                    )
+                else:
+                    logger.info(
+                        'task_curator: backfill_corpus project=%s batch %d/%d upsert '
+                        'attempt %d/%d failed, retrying: %r',
+                        project_id, number, total, attempt, BACKFILL_UPSERT_ATTEMPTS, exc,
+                    )
+            else:
+                return len(points)
+        return 0
+
+    async def _backfill_point(
+        self,
+        task: dict,
+        project_id: str,
+        embedder: CorpusEmbedder,
+        embed_slots: asyncio.Semaphore,
+    ) -> PointStruct | None:
+        """The corpus point for titled *task*, or None when its embed fails (logged)."""
+        task_id = str(task.get('id', '') or '')
+        title = _task_title(task)
+        description = str(task.get('description', '') or '')
+        files = _task_files(task)
+        try:
+            async with embed_slots:
+                embedding = await embedder.create(embedding_text(title, description, files))
+        except Exception:
+            logger.warning(
+                'task_curator: backfill embed failed for task %s', task_id, exc_info=True,
+            )
+            return None
+        return self._corpus_point(
+            project_id, task_id,
+            title=title,
+            description=description,
+            files=files,
+            priority=task.get('priority'),
+            vector=embedding,
+        )
 
     async def prune_orphans(self, project_id: str, live_task_ids) -> PruneResult:
         """Health-gated reconciliation sweep: delete corpus points for tasks
@@ -3300,6 +3408,11 @@ def _count_absent(task_ids: Iterable[str], admitted: set[str]) -> int:
     moment each cap fires reports entries that end up present.
     """
     return len({tid for tid in task_ids if tid and tid not in admitted})
+
+
+def _task_title(task: dict) -> str:
+    """The stripped title of a raw taskmaster task dict; '' when it has none."""
+    return str(task.get('title', '') or '').strip()
 
 
 def _task_files(task: dict) -> list[str]:
