@@ -8,28 +8,43 @@ docstring; this module reuses that module's corroboration primitive and
 stranded-claim discriminator rather than restating either.
 
 WHY THIS CHOKEPOINT.  Stage 1's ``filter_preservation_specimen_flags`` sits on
-Stage 1's flag chain only.  Stage 2's own stranded-task detection files the
-gate directly: tasks 5080 and 5104 asked a human to reset specimen 3105, and
-mem0 6abfe67f asks whether Stage 2's detection is the generator.  Every filing
+Stage 1's flag chain only, and Stage 2's own stranded-task detection files the
+gate directly, as tasks 5080 and 5104 did for specimen 3105.  Every filing
 path ends in ``submit_task``, so that is where this layer sits.
 
 A SUBJECT IS REQUIRED.  A reset gate must name the task it asks to move,
-through ``recurring_gate_guard``'s incoming subject keys.  None of the five
-historical stranded-reset gates (3463, 3944, 3965, 5080, 5104) declared one,
-so a layer that let a subject-less filing through would have caught none of
-them.  Such a filing is refused with no I/O and a hint naming the key.
+through ``recurring_gate_guard``'s incoming subject keys, as a bare task id;
+several are comma-joined, and each is corroborated.  A filing that names
+none, or names one in a spelling the store cannot key on (``'#3105'``,
+``'task-3105'``), is refused with no I/O and a hint asking for the bare id.
+Letting either through would exempt the commonest shape: a subject-less
+filing passes trivially, and an unkeyable one reads back as "not preserved".
 
-THE DISCRIMINATOR.  A submission requests a reset when ``flag_asserts_stranded``
-answers True for its title read as ``suggested_action`` and its description
-read as ``description``.  No ``flag_type`` is passed: a title is not a flag
-type, and reading it as one fires on gates that ask for no reset.
+THE DISCRIMINATOR.  A submission requests a reset when two readings agree.
+Stage 1's ``flag_asserts_stranded``, over the title read as
+``suggested_action`` and the description read as ``description``, bounds the
+class, so the vocabulary has one home; no ``flag_type`` is passed, because a
+title is not a flag type.  Inside that bound this layer also requires
+:data:`_MOVE_OUT_OF_IN_PROGRESS`: an un-negated stranded-action verb that
+moves a task, naming a destination status, naming ``in-progress`` as the
+move's source, or taking the task as its whole object.  Stage 1's one-field
+conjunction alone fires on a PROTECTIVE gate ("reopen the escalation pinning
+task 3105 so it is not reset out of in-progress"), the twin specimen's loss
+mode; at this layer a false positive is not a dropped flag but a gate no
+human ever sees.
 
 ESCALATING GATES ONLY.  The scope is whatever ``inject_operational_routing``
-stamps ``always_escalates=True``, at admission.  Two named residuals are not
-covered here: a recon filing that does not become an escalating gate, and an
-``update_task`` amendment of an already-open carrier, the route the
-recurring-gate dedupe steers a recon stage to, which can reword a reset carrier
-minted before this guard with no preserved-specimen check.
+stamps ``always_escalates=True``, at admission.  Three named residuals are not
+covered here:
+
+1. a recon filing that does not become an escalating gate;
+2. an ``update_task`` amendment of an already-open carrier, the route the
+   recurring-gate dedupe steers a recon stage to, which can reword a reset
+   carrier minted before this guard with no preserved-specimen check;
+3. a request worded outside Stage 1's verb family: "move ... to pending",
+   "set ... to pending" and "cancel" are not read as a reset.  The recon
+   prompt tells the stage a refused gate must not be re-filed in other
+   words; nothing here enforces it.
 
 FAILS OPEN.  A degraded read, a timeout or any other failure logs a WARNING and
 lets the submission through.  Refusing on a backend blip would block every
@@ -40,16 +55,20 @@ WARNINGs; the gate it admits still lands in front of a human.
 
 IMPORT CONTRACT.  This module imports ``recurring_gate_guard``'s public subject
 readers, ``operational_routing_guard.inject_operational_routing``,
-``preservation_specimen_guard``'s public primitive and discriminator, and
-``models.scope.resolve_project_id``.  It never imports ``task_interceptor`` or
-``server/`` at module level.
+``preservation_specimen_guard``'s public primitive, discriminator and action
+vocabulary, ``flag_identity.parse_flag_subject``,
+``shared.task_statuses.TaskStatus`` and ``models.scope.resolve_project_id``.
+It never imports ``task_interceptor`` or ``server/`` at module level.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from typing import Any
+
+from shared.task_statuses import TaskStatus
 
 from fused_memory.middleware.operational_routing_guard import inject_operational_routing
 from fused_memory.middleware.recurring_gate_guard import (
@@ -58,7 +77,11 @@ from fused_memory.middleware.recurring_gate_guard import (
     extract_gate_subject,
 )
 from fused_memory.models.scope import resolve_project_id
+from fused_memory.reconciliation.flag_identity import parse_flag_subject
 from fused_memory.reconciliation.preservation_specimen_guard import (
+    STRANDED_ACTION_TARGET_FAMILY,
+    STRANDED_ACTION_VERB_FAMILY,
+    PreservationCorroboration,
     corroborate_preservation,
     flag_asserts_stranded,
 )
@@ -78,38 +101,110 @@ logger = logging.getLogger(__name__)
 PRESERVED_SPECIMEN_GATE_TIMEOUT_SECONDS: float = 15.0
 
 
+def _alternation(members: tuple[str, ...]) -> str:
+    return '|'.join(map(re.escape, members))
+
+
+#: Longest first, so no member can shadow a longer one in an alternation.
+_STATUSES_OUT_OF_IN_PROGRESS: tuple[str, ...] = tuple(
+    sorted((s.value for s in TaskStatus if s is not TaskStatus.IN_PROGRESS), key=len, reverse=True)
+)
+
+_QUOTE = "['\"`]?"
+_IN_PROGRESS = rf'{_QUOTE}(?:{_alternation(STRANDED_ACTION_TARGET_FAMILY)})'
+_DESTINATION = rf'{_QUOTE}(?:{_alternation(_STATUSES_OUT_OF_IN_PROGRESS)})\b'
+_TASK_OBJECT = r'\s+(?:it|(?:the\s+)?(?:[\w-]+\s+)?tasks?(?:\s+#?\d+)?)'
+_MOVE = (
+    rf'\s+(?:back\s+)?to\s+{_DESTINATION}'
+    rf'|\s+(?:out\s+of|from)\s+{_IN_PROGRESS}'
+    rf'|\s+{_IN_PROGRESS}{_QUOTE}\s*(?:→|->|=>|\bto\b)\s*{_DESTINATION}'
+)
+
+#: A stranded-action verb, in any inflection, that moves a task out of
+#: ``in-progress``: an optional object ("it", or "task" with at most one word
+#: before it and an optional id) followed by a destination status or by
+#: ``in-progress`` named as the source, or the object alone ending the clause.
+#: "reset stranded task 3105 out of in-progress", "resetting in-progress →
+#: pending" and "reset to pending" match; "reset it to open so task 3105 stays
+#: in-progress" does not.
+_MOVE_OUT_OF_IN_PROGRESS: re.Pattern[str] = re.compile(
+    rf'\b(?:{_alternation(STRANDED_ACTION_VERB_FAMILY)})\w*'
+    rf'(?:(?:{_TASK_OBJECT})?(?:{_MOVE})|{_TASK_OBJECT}(?=\s*(?:[.;:!?)]|$)))',
+    re.IGNORECASE,
+)
+
+#: Text ending in a negation, so the verb after it requests nothing:
+#: "so it is not reset", "must never be redispatched", "without resetting".
+_NEGATED_VERB_PREFIX: re.Pattern[str] = re.compile(
+    r"(?:\b(?:not|never|without|instead\s+of|rather\s+than)|n['’]t)"
+    r'\s+(?:(?:be|been|being|get|got|getting)\s+)?$',
+    re.IGNORECASE,
+)
+
+#: A component the corroboration reads can key on: a task id, or a subtask id.
+_TASK_ID: re.Pattern[str] = re.compile(r'[1-9][0-9]*(?:\.[1-9][0-9]*)?')
+
+
 def files_an_escalating_gate(metadata: str | dict[str, Any] | None) -> bool:
     """True when routing turns *metadata* into an ``always_escalates`` gate.
 
     Asks the routing itself rather than copying its coerced-class set:
     ``recurring_gate_guard.is_gate_submission`` answers False for
     operational+``llm`` and for ``decision``, and routing escalates both.
-    Pure apart from the routing's lazy import.
+    Pure, sync, no I/O.
     """
     routed = inject_operational_routing(metadata)
     return isinstance(routed, dict) and routed.get('always_escalates') is True
 
 
+def _moves_a_task_out_of_in_progress(text: str | None) -> bool:
+    if not isinstance(text, str):
+        return False
+    return any(
+        not _NEGATED_VERB_PREFIX.search(text, 0, match.start())
+        for match in _MOVE_OUT_OF_IN_PROGRESS.finditer(text)
+    )
+
+
 def submission_requests_reset(title: str | None, description: str | None) -> bool:
     """True when the submission asks for a task to be moved out of ``in-progress``.
 
-    Total over ``None``.  Pure, sync, no I/O.
+    The module docstring's DISCRIMINATOR paragraph states the rule.  Total
+    over ``None``.  Pure, sync, no I/O.
     """
-    return flag_asserts_stranded({'suggested_action': title, 'description': description})
+    return flag_asserts_stranded(
+        {'suggested_action': title, 'description': description}
+    ) and any(_moves_a_task_out_of_in_progress(text) for text in (title, description))
 
 
-def reset_gate_subject_required_error() -> dict[str, Any]:
-    """The structured refusal for a recon reset gate that names no subject."""
+def _reset_gate_task_ids(subject: str | None) -> tuple[str, ...]:
+    """The task ids *subject* names, or ``()`` unless every component is one.
+
+    Decomposed by ``flag_identity.parse_flag_subject``, the parser Stage 1
+    decomposes a flag's task_id with.  One unkeyable component empties the
+    answer: corroborating only the rest would check fewer tasks than the gate
+    asks to move.
+    """
+    components = parse_flag_subject(subject).components
+    if components and all(_TASK_ID.fullmatch(c) for c in components):
+        return components
+    return ()
+
+
+def reset_gate_subject_required_error(subject: str | None) -> dict[str, Any]:
+    """The structured refusal for a recon reset gate naming no task id it can be checked by."""
+    named = 'names none' if subject is None else f'names {subject!r}, which is not a task id'
     return {
         'error': (
             'a recon-filed gate asking for a task to be moved out of in-progress '
             'must name that task, so it can be checked against the preserved '
-            'specimens; this submission names none.'
+            f'specimens; this submission {named}.'
         ),
         'error_type': 'ResetGateSubjectRequired',
         'hint': (
-            f'Re-file with metadata.{GATE_SUBJECT_KEY} set to the id of the task '
-            f'this gate asks to move.'
+            f'Re-file with metadata.{GATE_SUBJECT_KEY} set to the bare id of the '
+            f"task this gate asks to move, such as '3105'; comma-join the ids if "
+            f'it asks to move several.'
         ),
     }
 
@@ -140,6 +235,18 @@ def preserved_specimen_reset_error(subject: str, citation: str) -> dict[str, Any
     }
 
 
+async def _corroborate_each(
+    memory_service: Any,
+    project_id: str,
+    task_ids: tuple[str, ...],
+    log: logging.Logger,
+) -> dict[str, PreservationCorroboration]:
+    return {
+        task_id: await corroborate_preservation(memory_service, project_id, task_id, log=log)
+        for task_id in task_ids
+    }
+
+
 async def preserved_specimen_gate_error(
     metadata: str | dict[str, Any] | None,
     agent_id: str | None,
@@ -151,7 +258,7 @@ async def preserved_specimen_gate_error(
     timeout_seconds: float = PRESERVED_SPECIMEN_GATE_TIMEOUT_SECONDS,
     log: logging.Logger = logger,
 ) -> dict[str, Any] | None:
-    """Refuse a recon reset gate that names no subject or names a preserved specimen.
+    """Refuse a recon reset gate that names no task id or names a preserved specimen.
 
     Gates run cheapest-first, so a non-recon caller costs one ``startswith``
     and memory is read only on the narrow recon reset-gate path.  Returns
@@ -166,47 +273,51 @@ async def preserved_specimen_gate_error(
         return None
 
     subject = extract_gate_subject(metadata, aliases=GATE_SUBJECT_SUBMISSION_ALIASES)
-    if subject is None:
+    task_ids = _reset_gate_task_ids(subject)
+    if not task_ids:
         log.warning(
             'preserved_specimen_gate_guard: refusing recon reset gate from %s — '
-            'it declares no %s',
-            agent_id, GATE_SUBJECT_KEY,
+            'its %s %r names no task id',
+            agent_id, GATE_SUBJECT_KEY, subject,
         )
-        return reset_gate_subject_required_error()
+        return reset_gate_subject_required_error(subject)
 
     project_id = resolve_project_id(project_root)
+    subjects = ','.join(task_ids)
     try:
-        verdict = await asyncio.wait_for(
-            corroborate_preservation(memory_service, project_id, subject, log=log),
+        verdicts = await asyncio.wait_for(
+            _corroborate_each(memory_service, project_id, task_ids, log),
             timeout=timeout_seconds,
         )
     except TimeoutError:
         log.warning(
             'preserved_specimen_gate_guard: corroboration of gate_subject=%s in '
             'project %s timed out after %.2fs — unresolved, submission proceeds',
-            subject, project_id, timeout_seconds,
+            subjects, project_id, timeout_seconds,
         )
         return None
     except Exception:
         log.warning(
             'preserved_specimen_gate_guard: corroboration of gate_subject=%s in '
             'project %s failed — unresolved, submission proceeds',
-            subject, project_id, exc_info=True,
+            subjects, project_id, exc_info=True,
         )
         return None
 
-    if verdict.citation is not None:
-        log.warning(
-            'preserved_specimen_gate_guard: refusing recon reset gate for '
-            'gate_subject=%s in project %s — preserved specimen cited by %s',
-            subject, project_id, verdict.citation,
-        )
-        return preserved_specimen_reset_error(subject, verdict.citation)
+    for task_id, verdict in verdicts.items():
+        if verdict.citation is not None:
+            log.warning(
+                'preserved_specimen_gate_guard: refusing recon reset gate for '
+                'gate_subject=%s in project %s — preserved specimen cited by %s',
+                task_id, project_id, verdict.citation,
+            )
+            return preserved_specimen_reset_error(task_id, verdict.citation)
 
-    if verdict.degraded:
+    unresolved = [task_id for task_id, verdict in verdicts.items() if verdict.degraded]
+    if unresolved:
         log.warning(
             'preserved_specimen_gate_guard: corroboration of gate_subject=%s in '
             'project %s unresolved, submission proceeds',
-            subject, project_id,
+            ','.join(unresolved), project_id,
         )
     return None

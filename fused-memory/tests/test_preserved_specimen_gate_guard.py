@@ -130,6 +130,28 @@ class TestExemptions:
                 id='reset-verb-aimed-elsewhere-beside-status',
             ),
             pytest.param(None, None, id='no-title-no-description'),
+            pytest.param(
+                'Human action needed: reopen the escalation pinning task 3105 so it '
+                'is not reset out of in-progress',
+                _RESET_DESCRIPTION,
+                id='negated-verb-beside-status-in-title',
+            ),
+            pytest.param(
+                'Human action needed: reopen the pinning escalation for task 3105',
+                'The pinning escalation was closed by the reaper; reset it to open '
+                'so task 3105 stays in-progress.',
+                id='verb-aimed-at-the-escalation-beside-status-in-description',
+            ),
+            pytest.param(
+                'Human action needed: do not reset task 3105.',
+                _RESET_DESCRIPTION,
+                id='negated-verb-aimed-at-the-task-across-fields',
+            ),
+            pytest.param(
+                'Human gate: keep task 3105 in-progress without resetting it to pending',
+                None,
+                id='verb-after-without',
+            ),
         ],
     )
     async def test_gate_that_does_not_request_a_reset_is_not_enforced(
@@ -168,6 +190,19 @@ class TestSubjectRequired:
         assert 'gate_subject' in err['error'] + err['hint']
         assert corroboration_reads(memory) == 0
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('subject', ['#3105', 'task-3105', 'Task 3105', '3105,task-5080', '0'])
+    async def test_subject_the_store_cannot_key_on_is_refused_without_io(self, subject):
+        memory = specimen_memory()
+
+        err = await _guard(_reset_gate_metadata(gate_subject=subject), memory)
+
+        assert err is not None
+        assert err['error_type'] == 'ResetGateSubjectRequired'
+        assert repr(subject) in err['error']
+        assert "'3105'" in err['hint']
+        assert corroboration_reads(memory) == 0
+
 
 class TestPreservedSpecimenRefused:
     """A reset gate whose subject corroborates as a preserved specimen is refused."""
@@ -191,6 +226,42 @@ class TestPreservedSpecimenRefused:
         assert err['error_type'] == 'PreservedSpecimenResetViolation'
         assert memory.get_memories_by_metadata.await_count == 1
         assert memory.get_entity.await_count == 0
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('title', 'description'),
+        [
+            pytest.param(
+                'OPERATOR GATE — confirm no live process holds task 3105 before '
+                'resetting in-progress → pending',
+                None,
+                id='source-and-destination-3944',
+            ),
+            pytest.param(
+                'Human action needed: reset task 3105',
+                _RESET_DESCRIPTION,
+                id='verb-aimed-at-the-task-across-fields',
+            ),
+            pytest.param(
+                'Human gate: task 3105 stranded in-progress — resolve its re-dispatch gap',
+                'An operator should re-drive it (reset to pending) once no live '
+                'process holds it.',
+                id='destination-in-description-3463',
+            ),
+            pytest.param(
+                'Task 3105 is stuck in-progress; reset it.',
+                None,
+                id='pronoun-object-ends-the-clause',
+            ),
+        ],
+    )
+    async def test_destructive_phrasings_are_enforced(self, title, description):
+        memory = specimen_memory()
+
+        err = await _guard(_reset_gate_metadata(), memory, title=title, description=description)
+
+        assert err is not None
+        assert err['error_type'] == 'PreservedSpecimenResetViolation'
 
     @pytest.mark.asyncio
     async def test_mem0_citation_is_named_and_read_is_scoped(self):
@@ -244,6 +315,31 @@ class TestPreservedSpecimenRefused:
         assert err['preservation_citation'] == SPECIMEN_EDGE_UUID
         assert memory.get_memories_by_metadata.await_count == 1
         assert memory.get_entity.await_count == 1
+
+
+class TestCompositeSubject:
+    """A comma-joined subject names several tasks, and every one is corroborated."""
+
+    @pytest.mark.asyncio
+    async def test_specimen_inside_a_composite_is_refused(self):
+        memory = specimen_memory()
+
+        err = await _guard(_reset_gate_metadata(gate_subject='5080, 3105'), memory)
+
+        assert err is not None
+        assert err['error_type'] == 'PreservedSpecimenResetViolation'
+        assert err['gate_subject'] == '3105'
+        assert err['preservation_citation'] == SPECIMEN_MEMORY_ID
+
+    @pytest.mark.asyncio
+    async def test_composite_of_ordinary_tasks_passes_after_reading_each(self):
+        memory = specimen_memory()
+
+        result = await _guard(_reset_gate_metadata(gate_subject='3560,3561'), memory)
+
+        assert result is None
+        assert memory.get_memories_by_metadata.await_count == 2
+        assert memory.get_entity.await_count == 2
 
 
 class TestOrdinarySubjectPasses:
@@ -300,3 +396,4 @@ class TestFailsOpen:
 
         assert result is None
         assert _warned_proceeding(caplog, '3105')
+
