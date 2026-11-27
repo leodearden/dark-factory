@@ -1147,6 +1147,7 @@ async def run_server():
         # unconditionally pre-initialized to None near the top of
         # run_server(), so it's always bound here — no locals() guard needed.
         recon_ledger=recon_ledger,
+        invocations_store=invocations_store,
     )
     if _checkpoint_targets:
         from fused_memory.services.journal_growth_alarm import JournalGrowthAlarm
