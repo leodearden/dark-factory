@@ -35,7 +35,7 @@ import asyncio
 import logging
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
-from enum import Enum
+from enum import Enum, StrEnum
 from pathlib import Path
 from typing import Any, Literal, cast
 
@@ -64,9 +64,11 @@ git_ops_module = git_ops
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    'ChecksAtCommit',
     'DeliveredCheckResult',
     'DeliveredChecksBlock',
     'DeliveredChecksVerdict',
+    'evaluate_delivered_checks_at',
     'gate_mark_done_on_delivered_checks',
     'run_delivered_check',
     'verify_delivered_checks_on_main',
@@ -274,6 +276,31 @@ async def _run_script_check(
     return DeliveredCheckResult.DELIVERED if rc == 0 else DeliveredCheckResult.FAILED
 
 
+async def _run_bounded(
+    check: dict[str, Any],
+    *,
+    project_root: str | Path,
+    ref: str,
+    timeout_secs: float,
+    runner: _Runner,
+) -> DeliveredCheckResult:
+    """:func:`run_delivered_check` bounded by *timeout_secs*; a hung check is ERRORED. Never raises."""
+    try:
+        return await asyncio.wait_for(
+            run_delivered_check(check, project_root=project_root, ref=ref, runner=runner),
+            timeout=timeout_secs,
+        )
+    except TimeoutError:
+        logger.warning(
+            'delivered check %r exceeded check_timeout_secs=%s at %s — treating as ERRORED '
+            '(fail-safe)',
+            check.get('name') if isinstance(check, dict) else check,
+            timeout_secs,
+            ref,
+        )
+        return DeliveredCheckResult.ERRORED
+
+
 async def verify_delivered_checks_on_main(
     checks: list[dict[str, Any]],
     *,
@@ -364,25 +391,10 @@ async def verify_delivered_checks_on_main(
     async def _run_one(
         check: dict[str, Any],
     ) -> tuple[dict[str, Any], DeliveredCheckResult]:
-        try:
-            result = await asyncio.wait_for(
-                run_delivered_check(
-                    check, project_root=project_root, ref=main_sha, runner=runner
-                ),
-                timeout=check_timeout_secs,
-            )
-        except TimeoutError:
-            # Fail-safe (mirror scheduler.py 3116-3129): a hung check maps to
-            # ERRORED — same downstream handling as a runner error.
-            logger.warning(
-                'verify_delivered_checks_on_main: check %r exceeded '
-                'check_timeout_secs=%s at main@%s — treating as ERRORED '
-                '(fail-safe)',
-                check.get('name') if isinstance(check, dict) else check,
-                check_timeout_secs,
-                main_sha,
-            )
-            result = DeliveredCheckResult.ERRORED
+        result = await _run_bounded(
+            check, project_root=project_root, ref=main_sha,
+            timeout_secs=check_timeout_secs, runner=runner,
+        )
         return (check, result)
 
     # Evaluate the checks CONCURRENTLY: they are independent and this reconcile
@@ -411,6 +423,50 @@ async def verify_delivered_checks_on_main(
 
     # Some ERRORED and none FAILED (or no checks ran at all) — fail-safe wait.
     return DeliveredChecksVerdict(outcome='errored', main_sha=main_sha)
+
+
+class ChecksAtCommit(StrEnum):
+    """A predecessor's delivered checks at its branch tip (early-start PRD §5.1, choice 1).
+
+    FAILED covers a definitive failure, an errored check, a timeout and an unreadable entry:
+    an error never reads as passed. SCRIPT_KIND means a script check is declared, which runs
+    against the working checkout and so cannot be evaluated at a commit; nothing was run.
+    """
+
+    PASSED = 'passed'
+    SCRIPT_KIND = 'script_kind'
+    FAILED = 'failed'
+
+
+async def evaluate_delivered_checks_at(
+    metadata: Mapping[str, Any] | None,
+    *,
+    commit: str,
+    project_root: str | Path,
+    check_timeout_secs: float,
+    runner: _Runner = git_ops._run,
+) -> ChecksAtCommit:
+    """The declared checks of *metadata* read against *commit*'s tree. Never raises.
+
+    Reads the commit's tree only, and caches and counts nothing (early-start invariant 12).
+    """
+    declared = declared_checks(metadata)
+    if declared.is_empty:
+        return ChecksAtCommit.PASSED
+    if any(check.get('kind') == 'script' for check in declared.checks):
+        return ChecksAtCommit.SCRIPT_KIND
+    if declared.unreadable:
+        return ChecksAtCommit.FAILED
+    results = await asyncio.gather(*(
+        _run_bounded(
+            check, project_root=project_root, ref=commit,
+            timeout_secs=check_timeout_secs, runner=runner,
+        )
+        for check in declared.checks
+    ))
+    if all(result is DeliveredCheckResult.DELIVERED for result in results):
+        return ChecksAtCommit.PASSED
+    return ChecksAtCommit.FAILED
 
 
 @dataclass(frozen=True)
