@@ -8055,6 +8055,16 @@ class TestRemoteRunnerEnvProbeRun:
     REMOTE_TOOL_PATH_PRELUDE (task 7097) so the non-login ssh shell finds
     ~/.local/bin tools the way RemoteRunner's own `uv sync` does."""
 
+    @staticmethod
+    def _runner_over(run):
+        return gated_remote_runner(
+            name='laptop',
+            ssh_host='laptop.local',
+            git_remote='origin',
+            cwd='/repo',
+            run=run,
+        )
+
     def _make_runner(self, *, responses=None, open_reply=None):
         calls = []
         queue = list(responses or [])
@@ -8067,14 +8077,7 @@ class TestRemoteRunnerEnvProbeRun:
                 return queue.pop(0)
             return (0, 'ok\n', '')
 
-        runner = gated_remote_runner(
-            name='laptop',
-            ssh_host='laptop.local',
-            git_remote='origin',
-            cwd='/repo',
-            run=fake_run,
-        )
-        return runner, calls
+        return self._runner_over(fake_run), calls
 
     @staticmethod
     def _probe_opts():
@@ -8130,14 +8133,7 @@ class TestRemoteRunnerEnvProbeRun:
             await asyncio.sleep(0.6)
             return (0, 'uv 0.11.6\n', '')
 
-        runner = gated_remote_runner(
-            name='laptop',
-            ssh_host='laptop.local',
-            git_remote='origin',
-            cwd='/repo',
-            run=slow_ssh,
-        )
-        adapter = await runner.env_probe_run()
+        adapter = await self._runner_over(slow_ssh).env_probe_run()
 
         assert await adapter(['uv', '--version']) == (0, 'uv 0.11.6\n', '')
 
