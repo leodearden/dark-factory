@@ -15,6 +15,7 @@ from _mock_openai_server import MockOpenAIServer, mock_openai_server, responses_
 from graphiti_core.llm_client.config import LLMConfig as GraphitiLLMConfig
 from graphiti_core.llm_client.openai_client import OpenAIClient
 from graphiti_core.prompts.models import Message
+from openai.types.shared import ReasoningEffort
 from pydantic import BaseModel
 
 from fused_memory.backends.llm_clients import ExplicitEffortOpenAIClient
@@ -61,7 +62,7 @@ class TestTheWireCarriesExactlyTheChosenEffort:
     @pytest.mark.asyncio
     @pytest.mark.parametrize('effort', ['low', 'medium'])
     async def test_a_structured_call_sends_the_effort_and_no_other_sampling_control(
-        self, server: MockOpenAIServer, effort: str,
+        self, server: MockOpenAIServer, effort: ReasoningEffort,
     ) -> None:
         client = ExplicitEffortOpenAIClient(_built(server), effort)
 
@@ -80,7 +81,7 @@ class TestTheWireCarriesExactlyTheChosenEffort:
         assert [message['role'] for message in body['input']] == ['system', 'user']
 
     @pytest.mark.parametrize('effort', ['low', 'medium'])
-    def test_it_declares_the_effort_it_sends(self, server: MockOpenAIServer, effort: str) -> None:
+    def test_it_declares_the_effort_it_sends(self, server: MockOpenAIServer, effort: ReasoningEffort) -> None:
         assert ExplicitEffortOpenAIClient(_built(server), effort).reasoning_effort == effort
 
     @pytest.mark.asyncio
