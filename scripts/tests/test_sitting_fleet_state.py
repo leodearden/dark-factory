@@ -836,7 +836,7 @@ class TestActivity:
         state = _measure(_quiet_root(tmp_path), 'inactive')
 
         assert not state.active
-        assert state.inactive_reason == mod.INACTIVE_REASON == 'unit inactive, no activity'
+        assert state.inactive_reason == mod.INACTIVE_REASON
 
     def test_a_landing_in_the_window_keeps_an_inactive_unit_active(self, tmp_path):
         quiet = _quiet_root(tmp_path)

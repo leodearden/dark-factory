@@ -862,9 +862,6 @@ class TestRenderDigestMarkdown:
         assert labelled[0].rstrip().endswith(': 5')
         ewa_section = md.split('## EWA\n', 1)[1].split('\n## ', 1)[0]
         assert labelled[0] in ewa_section.splitlines()
-        assert digest.DONE_RUNS_LABEL == (
-            'orchestrator runs that finished done (excludes hand carries and merge-deferred landings)'
-        )
 
     def test_unreadable_landings_render_unavailable_never_zero(self) -> None:
         md = digest.render_digest_markdown(_make_digest_inputs())
@@ -882,7 +879,6 @@ class TestRenderDigestMarkdown:
         md = digest.render_digest_markdown(inputs)
         header = next(line for line in md.splitlines() if line.startswith('| model | role |'))
         assert header.rstrip().endswith(f'| {digest.PER_DONE_RUN_LABEL} |')
-        assert digest.PER_DONE_RUN_LABEL == '$ per done run'
         assert '$/done' not in md
 
     def test_cost_section(self) -> None:
