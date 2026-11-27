@@ -48,6 +48,7 @@ from orchestrator.evals.reviewer_trial.variants import (
     ReviewerSpec,
     VariantConfig,
     build_trial_reviewer_role,
+    panel_budgets,
     trial_reviewer_max_turns,
 )
 from orchestrator.mcp_lifecycle import verdict_tools_mcp_server
@@ -107,6 +108,7 @@ class PanelRunKey:
     gated: bool
     diff_cap_chars: int
     max_turns: int
+    reviewer_budgets_usd: tuple[float, ...]   # each reviewer's USD budget, in panel order
 
     @classmethod
     def of(
@@ -116,6 +118,7 @@ class PanelRunKey:
         usage_gate: UsageGate | None,
         diff_cap_chars: int,
         max_turns: int,
+        reviewer_budgets_usd: Sequence[float],
     ) -> PanelRunKey:
         prices_sha256 = None if prices is None else hashlib.sha256(
             json.dumps(prices, sort_keys=True, default=str).encode(),
@@ -125,6 +128,7 @@ class PanelRunKey:
             gated=usage_gate is not None,
             diff_cap_chars=diff_cap_chars,
             max_turns=max_turns,
+            reviewer_budgets_usd=tuple(reviewer_budgets_usd),
         )
 
     @classmethod
@@ -134,6 +138,7 @@ class PanelRunKey:
             gated=data['gated'],
             diff_cap_chars=data['diff_cap_chars'],
             max_turns=data['max_turns'],
+            reviewer_budgets_usd=tuple(data['reviewer_budgets_usd']),
         )
 
 
@@ -435,6 +440,7 @@ async def run_panel(
     usage_gate: UsageGate | None = None,
     diff_cap_chars: int = DIFF_CAP_CHARS,
     max_turns: int | None = None,
+    production_budget: float | None = None,
 ) -> PanelRunResult:
     """Run one panel variant against one corpus diff, in a scratch clone of its reviewed tree.
 
@@ -442,6 +448,8 @@ async def run_panel(
 
     *prices* (default-off) is threaded to each reviewer's ``invoke_agent``
     call so non-native-cost backends (codex/gemini) price their cost from it.
+    Each reviewer runs at its spec's pinned budget, or at production's unless
+    *production_budget* overrides it; the stamped key holds each budget dispatched.
 
     Raises FixtureNotMaterialisable when the clone cannot be built, or when a
     context-complete panel's change is not committed in it.
@@ -453,7 +461,10 @@ async def run_panel(
     turns = trial_reviewer_max_turns(max_turns)
 
     async with fixture_checkout(corpus_diff) as checkout:
-        roles = [build_trial_reviewer_role(spec, variant.briefing, turns) for spec in variant.reviewers]
+        roles = [
+            build_trial_reviewer_role(spec, variant.briefing, turns, production_budget=production_budget)
+            for spec in variant.reviewers
+        ]
         prompts = await _panel_prompts(variant, roles, corpus_diff, checkout, diff_cap_chars)
         tasks: list[asyncio.Task] = []
         for i, (spec, role, prompt) in enumerate(zip(variant.reviewers, roles, prompts, strict=True)):
@@ -492,6 +503,7 @@ async def run_panel(
         errors=errors,
         run_key=PanelRunKey.of(
             prices=prices, usage_gate=usage_gate, diff_cap_chars=diff_cap_chars, max_turns=turns,
+            reviewer_budgets_usd=tuple(role.default_budget for role in roles),
         ),
     )
 
@@ -554,12 +566,15 @@ async def run_panel_cached(
     usage_gate: UsageGate | None = None,
     diff_cap_chars: int = DIFF_CAP_CHARS,
     max_turns: int | None = None,
+    production_budget: float | None = None,
 ) -> PanelRunResult:
     """*variant*'s panel on *diff*, reused from *results_dir* only when stored under an equal PanelRunKey.
 
-    Each key has its own file. A keyless entry written before the key existed
-    is reused only at the 30-turn cap every such panel ran at, and only when
-    the key's own file is absent. Why, and how to re-measure one:
+    The key holds each reviewer's budget, so an unpinned panel re-runs when
+    *production_budget* (or production's own) changes. Each key has its own
+    file. A keyless entry written before the key existed is reused only at
+    the 30-turn cap every such panel ran at, and only when the key's own file
+    is absent. Why, and how to re-measure one:
     docs/plan-scoring-and-judge.md, "Reviewer-trial panel cache and score
     loop (task 6741)".
 
@@ -568,7 +583,10 @@ async def run_panel_cached(
     out_dir = results_dir or _RESULTS_DIR
     out_dir.mkdir(parents=True, exist_ok=True)
     turns = trial_reviewer_max_turns(max_turns)
-    wanted = PanelRunKey.of(prices=prices, usage_gate=usage_gate, diff_cap_chars=diff_cap_chars, max_turns=turns)
+    wanted = PanelRunKey.of(
+        prices=prices, usage_gate=usage_gate, diff_cap_chars=diff_cap_chars, max_turns=turns,
+        reviewer_budgets_usd=panel_budgets(variant, production_budget),
+    )
     path = out_dir / _slot_filename(variant.name, diff.diff_id, wanted)
 
     cached = _load_entry(path, PanelRunResult.from_dict, variant.name, diff.diff_id)
@@ -584,7 +602,7 @@ async def run_panel_cached(
     logger.info('Running %s against %s', variant.name, diff.diff_id)
     result = await run_panel(
         variant, diff, stagger_secs=stagger_secs, prices=prices, usage_gate=usage_gate,
-        diff_cap_chars=diff_cap_chars, max_turns=turns,
+        diff_cap_chars=diff_cap_chars, max_turns=turns, production_budget=production_budget,
     )
     atomic_write_text(path, json.dumps(asdict(result), indent=2))
     logger.info(
