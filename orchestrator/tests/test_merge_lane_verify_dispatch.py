@@ -365,8 +365,11 @@ def _local_lease() -> HostLease:
 
 async def _verify(
     dispatcher: VerifyDispatcher, item: RealMergeItem, lease: HostLease,
+    probe_base: str | None = None,
 ) -> InflightVerifyResult:
-    return await asyncio.wait_for(dispatcher.run_inflight_verify(item, lease), timeout=30.0)
+    return await asyncio.wait_for(
+        dispatcher.run_inflight_verify(item, lease, probe_base=probe_base), timeout=30.0,
+    )
 
 
 @pytest.mark.asyncio
@@ -576,9 +579,7 @@ class TestNarrowGateBase:
         item = await scene.merged_item()
         probe_base = 'e' * 40
 
-        await asyncio.wait_for(
-            dispatcher.run_inflight_verify(item, _local_lease(), probe_base=probe_base), timeout=30.0,
-        )
+        await _verify(dispatcher, item, _local_lease(), probe_base=probe_base)
 
         [call] = calls
         assert (call['narrow_gate_base'], call['main_sha']) == (item.base_sha, probe_base)
