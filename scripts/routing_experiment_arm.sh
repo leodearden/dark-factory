@@ -33,7 +33,8 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
 PY="$ROOT/.venv/bin/python3"; [ -x "$PY" ] || PY=python3
 
-# The experiment's units, <project_root>:<escalation_port>, whitespace-separated.
+# The experiment's units, <project_root>:<escalation_port> with an absolute
+# project_root, whitespace-separated.
 # Step 2's A/A reads exactly their roots and step 3 reloads exactly them. The
 # default is the whole fleet; ROUTING_EXPERIMENT_UNITS names a subset.
 UNITS="${ROUTING_EXPERIMENT_UNITS:-\
@@ -50,17 +51,19 @@ UNITS="${ROUTING_EXPERIMENT_UNITS:-\
 IFS=$' \t\n' read -r -d '' -a UNIT_LIST <<< "$UNITS" || true
 [ "${#UNIT_LIST[@]}" -gt 0 ] \
   || die "ROUTING_EXPERIMENT_UNITS names no unit; an experiment needs at least one <project_root>:<port>"
-ROOTS=()
+ROOTS=(); ROOT_PORT_PAIRS=()
 for unit in "${UNIT_LIST[@]}"; do
-  [[ "$unit" =~ ^(.+):([0-9]+)$ ]] || die "unit '${unit}' is not <project_root>:<port>"
+  [[ "$unit" =~ ^(/[^,]+):([0-9]+)$ ]] \
+    || die "unit '${unit}' is not <project_root>:<port> with an absolute, comma-free project_root"
   ROOTS+=("${BASH_REMATCH[1]}")
+  ROOT_PORT_PAIRS+=("${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}")
 done
 ROOTS_CSV="$(IFS=,; printf '%s' "${ROOTS[*]}")"
 
 # 1. The rule ids must be on main's defaults.yaml (the editable install every unit reads).
 RULES_FILE=orchestrator/src/orchestrator/defaults.yaml
 RULES_TEXT="$(git -C "$ROOT" show "main:${RULES_FILE}")" \
-  || die "cannot read ${RULES_FILE} from main (git's message is above); land gamma before arming"
+  || die "cannot read ${RULES_FILE} from main (git's message is above)"
 IFS=',' read -r -a RULE_IDS <<< "$RULES"
 for rid in "${RULE_IDS[@]}"; do
   grep -q -- "id: ${rid}\$" <<< "$RULES_TEXT" \
@@ -75,9 +78,9 @@ done
   || { rc=$?; die "the readout's A/A check did not pass for salt '$SALT' (exit $rc: 1 = skewed, 3 = no ledger read, 4 = unproven; its own message above says which); do not arm"; }
 
 # 3. Reload every reachable unit; 4. record the flip.
-"$PY" - "$HERE" "$SALT" "$RULES" "$ROOT/data/orchestrator/routing_experiments.jsonl" "${UNIT_LIST[@]}" <<'PYEOF'
+"$PY" - "$HERE" "$SALT" "$RULES" "$ROOT/data/orchestrator/routing_experiments.jsonl" "${ROOT_PORT_PAIRS[@]}" <<'PYEOF'
 import json, sys, datetime, pathlib
-here, salt, rules, ledger, *units = sys.argv[1:]
+here, salt, rules, ledger, *root_port_pairs = sys.argv[1:]
 sys.path.insert(0, here)
 import _config_reload_gate as gate
 
@@ -87,8 +90,7 @@ record = {
     "units": [],
 }
 failed = False
-for unit in units:
-    root, port = unit.rsplit(":", 1)
+for root, port in zip(root_port_pairs[0::2], root_port_pairs[1::2]):
     try:
         report = gate.fetch_reload_report(port, committed_as=f"routing split {salt}", config_path=None)
         applied = report.get("applied")
