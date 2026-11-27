@@ -256,13 +256,7 @@ def build_llm_client(
     it cannot build (_build_extraction_route).
     """
     routed = _extraction_route_categories(cfg)
-    provider = cfg.llm.providers.openai
-    default_http_client = (
-        gated_http_client_for(provider.api_url)
-        if gated_http_client_for is not None and cfg.llm.provider == 'openai'
-        and provider is not None and provider.api_key else None
-    )
-    llm_client = _construct_llm_client(cfg, http_client=default_http_client)
+    llm_client = _construct_llm_client(cfg, gated_http_client_for=gated_http_client_for)
     if llm_client is None:
         return None
     llm_client.token_tracker = AttributingTokenUsageTracker(model=cfg.llm.model)
@@ -353,7 +347,7 @@ def build_embedder(cfg: FusedMemoryConfig) -> OpenAIEmbedder | None:
 
 
 def _construct_llm_client(
-    cfg: FusedMemoryConfig, *, http_client: httpx.AsyncClient | None,
+    cfg: FusedMemoryConfig, *, gated_http_client_for: Callable[[str], httpx.AsyncClient | None] | None,
 ) -> LLMClient | None:
     # LLMConfig rejects this at load; a config mutated afterwards is not re-validated.
     if cfg.llm.structured_output_mode != 'auto' and cfg.llm.client_class != 'openai_generic':
@@ -377,6 +371,10 @@ def _construct_llm_client(
                 temperature=cfg.llm.temperature or 0.0,
                 max_tokens=cfg.llm.max_tokens,
                 base_url=cfg.llm.providers.openai.api_url,
+            )
+            http_client = (
+                gated_http_client_for(cfg.llm.providers.openai.api_url)
+                if gated_http_client_for is not None else None
             )
             sdk_client = (
                 AsyncOpenAI(api_key=api_key, base_url=llm_config.base_url, http_client=http_client)
