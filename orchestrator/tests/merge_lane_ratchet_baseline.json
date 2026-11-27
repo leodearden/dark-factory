@@ -131,7 +131,7 @@
     "orchestrator/src/orchestrator/merge_lane/shadow.py": {"cognitive": 135, "function_local_imports": 0, "lines": 1829, "prose_lines": 1046, "reexport_names": 0},
     "orchestrator/src/orchestrator/merge_lane/skew_tripwire.py": {"cognitive": 31, "function_local_imports": 1, "lines": 422, "prose_lines": 197, "reexport_names": 0},
     "orchestrator/src/orchestrator/merge_lane/speculation_controller.py": {"cognitive": 34, "function_local_imports": 0, "lines": 664, "prose_lines": 415, "reexport_names": 0},
-    "orchestrator/src/orchestrator/merge_lane/tested_tree.py": {"cognitive": 23, "function_local_imports": 0, "lines": 173, "prose_lines": 26, "reexport_names": 0},
+    "orchestrator/src/orchestrator/merge_lane/tested_tree.py": {"cognitive": 23, "function_local_imports": 0, "lines": 169, "prose_lines": 25, "reexport_names": 0},
     "orchestrator/src/orchestrator/merge_lane/tip_relation.py": {"cognitive": 24, "function_local_imports": 0, "lines": 335, "prose_lines": 212, "reexport_names": 0},
     "orchestrator/src/orchestrator/merge_lane/train_selection.py": {"cognitive": 22, "function_local_imports": 0, "lines": 75, "prose_lines": 32, "reexport_names": 0},
     "orchestrator/src/orchestrator/merge_lane/types.py": {"cognitive": 99, "function_local_imports": 0, "lines": 2515, "prose_lines": 1192, "reexport_names": 0},
