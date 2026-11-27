@@ -26,8 +26,9 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from _eval_refusal import answered, refused_agent_result
 from _orch_helpers import build_usage_gate
-from shared.cli_invoke import AgentResult
+from shared.cli_invoke import BUDGET_EXHAUSTED_SUBTYPE, AgentResult
 from shared.config_models import AccountConfig
+from shared.cost_store import CapReason
 from shared.usage_gate import UsageGate
 from test_reviewer_trial_checkout import _CHANGE_AT_BASE, _commit, _git, _Source
 
@@ -141,17 +142,24 @@ def _make_review(name: str = 'test', verdict: str = 'PASS') -> dict:
     }
 
 
-def _make_result(output: str = '', structured: dict | None = None, success: bool = True):
-    """Build a mock AgentResult."""
-    from types import SimpleNamespace
-    return SimpleNamespace(
+def _make_result(
+    output: str = '',
+    structured: dict | None = None,
+    success: bool = True,
+    *,
+    subtype: str | None = None,
+    cost_usd: float = 0.50,
+) -> AgentResult:
+    """An AgentResult whose CLI subtype is *subtype*, else 'success' or 'error' by *success*."""
+    return AgentResult(
         success=success,
         output=output,
-        cost_usd=0.50,
+        cost_usd=cost_usd,
         duration_ms=5000,
         turns=5,
         session_id='mock-session',
         structured_output=structured,
+        subtype=subtype if subtype is not None else ('success' if success else 'error'),
         stderr='',
     )
 
@@ -205,6 +213,20 @@ def _make_verdict_writing_invoke(
     return _invoke
 
 
+def _ceiling_killed_then_pass_invoke(kills: int, subtype: str = BUDGET_EXHAUSTED_SUBTYPE):
+    """An ``invoke_agent`` side effect whose first *kills* attempts a ceiling ends verdict-less, then a PASS."""
+    calls = {'n': 0}
+    with_verdict = _make_verdict_writing_invoke(verdict='PASS')
+
+    async def _invoke(**kwargs):
+        calls['n'] += 1
+        if calls['n'] <= kills:
+            return _make_result(success=False, subtype=subtype, cost_usd=12.0)
+        return await with_verdict(**kwargs)
+
+    return _invoke
+
+
 def _make_retry_then_succeed_invoke():
     """Build an ``invoke_agent`` side effect that, on its FIRST call, invokes
     successfully but writes NO verdict (forcing a retry), then on the second
@@ -255,6 +277,7 @@ def _full_panel_result(run_key: PanelRunKey | None) -> PanelRunResult:
         wall_clock_ms=4321,
         errors=['r3: no result'],
         run_key=run_key,
+        ceiling_kills={'r3': [CapReason.BUDGET]},
     )
 
 
@@ -270,10 +293,21 @@ class TestPanelRunResultFromDict:
         result = _full_panel_result(run_key)
         assert PanelRunResult.from_dict(asdict(result)) == result
 
+    def test_round_trips_through_json_with_its_ceilings_as_cap_reasons(self) -> None:
+        result = _full_panel_result(PanelRunKey.of(
+            prices=None, usage_gate=None, diff_cap_chars=0, max_turns=90, reviewer_budgets_usd=(12.0,),
+        ))
+
+        loaded = PanelRunResult.from_dict(json.loads(json.dumps(asdict(result))))
+
+        assert loaded == result
+        assert [type(reason) for reason in loaded.ceiling_kills['r3']] == [CapReason]
+
     def test_a_legacy_record_loads_with_defaults_and_no_key(self) -> None:
         loaded = PanelRunResult.from_dict({'variant_name': 'v1', 'diff_id': 'd1'})
         assert loaded == PanelRunResult(variant_name='v1', diff_id='d1')
         assert loaded.run_key is None
+        assert loaded.ceiling_kills == {}
 
     @pytest.mark.parametrize('missing', ['variant_name', 'diff_id'])
     def test_a_record_missing_its_identity_raises(self, missing: str) -> None:
@@ -607,6 +641,35 @@ class TestRunPanel:
         assert mock_invoke.call_args.kwargs['max_budget_usd'] == 12.0
         assert result.run_key is not None
         assert result.run_key.reviewer_budgets_usd == (12.0,)
+
+    @pytest.mark.parametrize(('kills', 'subtype', 'verdict', 'ceilings'), [
+        pytest.param(2, BUDGET_EXHAUSTED_SUBTYPE, 'ERROR', [CapReason.BUDGET, CapReason.BUDGET], id='budget-every-attempt'),
+        pytest.param(1, BUDGET_EXHAUSTED_SUBTYPE, 'PASS', [CapReason.BUDGET], id='budget-then-pass'),
+        pytest.param(2, 'error_max_turns', 'ERROR', [CapReason.TURNS, CapReason.TURNS], id='turns-every-attempt'),
+    ])
+    @pytest.mark.asyncio
+    async def test_it_records_the_ceiling_that_ended_each_attempt(
+        self, source: _Source, kills: int, subtype: str, verdict: str, ceilings: list[CapReason],
+    ) -> None:
+        with patch(
+            'orchestrator.evals.reviewer_trial.runner.invoke_agent',
+            side_effect=_ceiling_killed_then_pass_invoke(kills, subtype),
+        ):
+            result = await run_panel(_one_reviewer(), _diff_in(source), stagger_secs=0)
+
+        assert result.reviews['r1']['verdict'] == verdict
+        assert result.ceiling_kills == {'r1': ceilings}
+
+    @pytest.mark.asyncio
+    async def test_a_panel_no_ceiling_ended_records_none(self, source: _Source) -> None:
+        with patch(
+            'orchestrator.evals.reviewer_trial.runner.invoke_agent',
+            side_effect=_make_verdict_writing_invoke(verdict='PASS'),
+        ):
+            result = await run_panel(_one_reviewer(), _diff_in(source), stagger_secs=0)
+
+        assert result.reviews['r1']['verdict'] == 'PASS'
+        assert result.ceiling_kills == {}
 
     @pytest.mark.asyncio
     async def test_multiple_reviewers(self, source: _Source) -> None:
