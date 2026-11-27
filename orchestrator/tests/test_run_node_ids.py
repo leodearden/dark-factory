@@ -6,12 +6,11 @@ import asyncio
 import json
 import os
 import signal
-import sys
 from collections.abc import Callable
 from pathlib import Path
 
 import pytest
-from _orch_helpers import VERIFY_CLI_PER_TEST_TIMEOUT
+from _orch_helpers import VERIFY_CLI_PER_TEST_TIMEOUT, env_resolving_running_interpreter
 from _poll_responsive import poll_responsive
 
 from orchestrator.config import GitConfig, ModuleConfig, OrchestratorConfig
@@ -136,9 +135,7 @@ def _make_config(tree: Path) -> OrchestratorConfig:
         merge_verify_breadth='full',
         verify_admission_enabled=False,
         verify_cold_preprovision_command='',
-        verify_env={
-            'PATH': f'{Path(sys.executable).parent}{os.pathsep}{os.environ["PATH"]}',
-        },
+        verify_env={'PATH': env_resolving_running_interpreter(os.environ)['PATH']},
     )
 
 
