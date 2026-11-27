@@ -601,6 +601,40 @@ class TestReleasePath:
         assert rig.scheduler.release_early_start_claim(claim) is False
         assert rig.events() == events
 
+    async def test_a_claim_whose_predecessor_released_is_still_released(self, tmp_path, monkeypatch):
+        rig, claim = await self._claimed(tmp_path, monkeypatch)
+        rig.scheduler.release('P')
+        assert rig.scheduler.lock_table.successor_relation('D') is None
+        assert rig.scheduler.lock_table.held_modules('D') == set(D_FILES)
+
+        assert rig.scheduler.release_early_start_claim(claim) is True
+
+        rig.assert_untouched('D')
+        released = [e for e in rig.store.fetch_events_by_type(EventType.lock_released) if e['task_id'] == 'D']
+        assert len(released) == 1
+
+    async def test_a_claim_an_ordinary_release_ended_reads_as_stale(self, tmp_path, monkeypatch):
+        rig, claim = await self._claimed(tmp_path, monkeypatch)
+        rig.scheduler.release('D')
+        events = rig.events()
+
+        assert rig.scheduler.release_early_start_claim(claim) is False
+
+        assert rig.events() == events
+
+    async def test_an_earlier_claim_does_not_release_a_later_one(self, tmp_path, monkeypatch):
+        rig, claim1 = await self._claimed(tmp_path, monkeypatch)
+        assert rig.scheduler.release_early_start_claim(claim1) is True
+        picture = await rig.picture(p_running(), task('D', deps=('P',)))
+        claim2 = (await rig.select(picture, reads_for(picture))).claim
+        assert claim2 is not None
+
+        assert rig.scheduler.release_early_start_claim(claim1) is False
+        assert rig.scheduler.is_dispatched('D')
+        assert rig.scheduler.lock_table.held_modules('D') == set(D_FILES)
+
+        assert rig.scheduler.release_early_start_claim(claim2) is True
+
 
 class TestRow34NeverStartedTwice:
     async def test_a_claimed_dependent_is_not_started_again_by_the_ordinary_pass(
