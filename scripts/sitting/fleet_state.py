@@ -312,13 +312,13 @@ class OrchestratorUnits:
 
 
 def unit_active(root: Path | str, units: OrchestratorUnits, *, now: datetime) -> Measurement[bool]:
-    """Whether an orchestrator unit running *root* is in ``ACTIVE_UNIT_STATES``; a unit that cannot be read is named."""
+    """Whether an orchestrator unit running *root* is in ``ACTIVE_UNIT_STATES``; a unit that cannot be read is named.
+
+    A scan problem may hide a unit naming the root, so it makes a False unreadable.
+    """
     stamp = _stamp(now)
     resolved = Path(root).resolve()
     names = units.scan.roots.get(resolved, ())
-    if not names:
-        problems = tuple(Shortfall('orchestrator_units', '', problem) for problem in units.scan.problems)
-        return Measurement(False, stamp, f'no orchestrator unit names {resolved}', 'ok', problems)
     states: list[str] = []
     failures: list[Shortfall] = []
     for name in names:
@@ -326,10 +326,11 @@ def unit_active(root: Path | str, units: OrchestratorUnits, *, now: datetime) ->
             states.append(units.active_state(name))
         except (subprocess.SubprocessError, OSError) as exc:
             failures.append(Shortfall('orchestrator_unit', name, f'{type(exc).__name__}: {exc}'))
-    source = f'systemctl --user show {", ".join(names)}'
+    source = f'systemctl --user show {", ".join(names)}' if names else f'no orchestrator unit names {resolved}'
     if any(state in ACTIVE_UNIT_STATES for state in states):
         return Measurement(True, stamp, source, 'ok', tuple(failures))
-    return Measurement(False, stamp, source, 'unreadable' if failures else 'ok', tuple(failures))
+    shortfalls = (*failures, *(Shortfall('orchestrator_units', '', problem) for problem in units.scan.problems))
+    return Measurement(False, stamp, source, 'unreadable' if shortfalls else 'ok', shortfalls)
 
 
 def scheduler_pause(runs_db: Path | str, *, now: datetime) -> Measurement[str | None]:
