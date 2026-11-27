@@ -46,7 +46,7 @@ from orchestrator.agents.landlock import (
     _reset_probe as _landlock_reset_probe,
 )
 from orchestrator.agents.landlock import build_landlock_command, is_landlock_available
-from orchestrator.agents.write_set import compute_write_set
+from orchestrator.agents.write_set import compute_write_set, ensure_sandbox_dirs
 
 # subprocess timeout for each sandboxed inner command — comfortably under
 # this suite's 60s per-test pytest-timeout even accounting for scaffold
@@ -192,6 +192,8 @@ class _Scaffold:
     plan_target: Path
     uv_cache: Path
     uv_data: Path
+    tree_sitter_cache: Path
+    cache_sibling: Path
     claude_fleet: Path
     settings_json: Path
 
@@ -200,18 +202,21 @@ def _run_sandboxed(
     scaffold: _Scaffold, inner_cmd: list[str], *, cwd: Path | None = None,
     declared_files: list[str] | None = None,
 ) -> subprocess.CompletedProcess:
-    """Run ``inner_cmd`` landlock-sandboxed, mirroring
-    ``orchestrator/src/orchestrator/workflow.py::TaskWorkflow._invoke``
-    exactly: derive the write-set from the scaffold's worktree/home (and the
-    task's *declared_files*) via the real ``compute_write_set()``, feed its
-    ``writable_paths()`` into ``build_landlock_command()`` as
-    ``writable_extras`` (never a hand-rolled path list — INV-5), and run with
-    ``HOME`` redirected to the scaffold's hermetic fake home.
+    """Run ``inner_cmd`` landlock-sandboxed, through the same write-set steps
+    as ``orchestrator/src/orchestrator/workflow.py::TaskWorkflow._invoke``:
+    derive the write-set from the scaffold's worktree/home (and the task's
+    *declared_files*) via the real ``compute_write_set()``, pre-create its
+    must-pre-exist carve-outs OUTSIDE the sandbox via the real
+    ``ensure_sandbox_dirs()``, feed its ``writable_paths()`` into
+    ``build_landlock_command()`` as ``writable_extras`` (never a hand-rolled
+    path list — INV-5), and run with ``HOME`` redirected to the scaffold's
+    hermetic fake home.
     """
     write_set = compute_write_set(
         scaffold.worktree, task_id=scaffold.task_id, home=scaffold.home,
         declared_files=declared_files,
     )
+    assert ensure_sandbox_dirs(write_set) == []
     cmd = build_landlock_command(
         inner_cmd, scaffold.worktree, [],
         writable_extras=[str(p) for p in write_set.writable_paths()],
@@ -273,9 +278,12 @@ def landlock_matrix_scaffold():
     real production symlink shape); ``~/.local/share/uv/`` pre-created
     as an empty, non-writable-by-contract sibling of the (writable)
     ``~/.cache/uv/``, so row 8's denial is a true EACCES rather than ENOENT;
-    ``~/.claude/fleet/`` pre-created so the ``claude_fleet`` carve-out is
-    grantable at wrap time (row 10 — an absent fleet/ dir would make
-    landlock_exec's ``_add_path`` skip the grant and wrongly deny); and
+    ``~/.cache/other-tool/`` (a non-writable-by-contract ``~/.cache`` peer of
+    the tree-sitter carve-out) pre-created so row 8b's denial is a true
+    EACCES; the ``tree_sitter_cache`` and ``claude_fleet`` carve-outs
+    deliberately left ABSENT, as on a fresh host, so rows 8b and 10 prove
+    ``_run_sandboxed``'s ``ensure_sandbox_dirs`` call creates them in time
+    for landlock to grant them; and
     ``~/.claude/settings.json`` seeded with known JSON content (row 9 — a
     file directly under ``~/.claude/`` rather than under the ``fleet/``
     carve-out, so the write is denied and the seed content lets the test
@@ -343,16 +351,26 @@ def landlock_matrix_scaffold():
         uv_data = home / '.local' / 'share' / 'uv'
         uv_data.mkdir(parents=True)
 
-        # Row 10: ~/.claude/fleet/ must already EXIST at wrap time — landlock_
-        # exec's _add_path skips granting a non-existent writable dir, which
-        # would silently turn this happy-path row into a wrongful denial.
+        # Rows 08b and 10: the tree-sitter and fleet carve-outs are left
+        # absent, as on a fresh host. landlock_exec's _add_path skips a
+        # nonexistent writable dir, so those rows pass only if
+        # _run_sandboxed's ensure_sandbox_dirs call creates them before the
+        # wrap. cache_sibling, by contrast, must exist, or row 08b's denied
+        # half would be vacuous (ENOENT rather than a true EACCES): it is a
+        # second ~/.cache/<tool> peer that must stay read-only, proving the
+        # grant is scoped to the tree-sitter subdir and was not widened to the
+        # whole ~/.cache parent.
+        tree_sitter_cache = home / '.cache' / 'tree-sitter'
+        cache_sibling = home / '.cache' / 'other-tool'
+        cache_sibling.mkdir(parents=True)
         claude_fleet = home / '.claude' / 'fleet'
-        claude_fleet.mkdir(parents=True)
+
         # Row 9: ~/.claude/settings.json is a file directly under ~/.claude/
         # (NOT under the fleet/ carve-out), so it is outside the write set —
         # seeded with known content so the test can assert it stays
         # byte-unchanged after the denied write.
         settings_json = home / '.claude' / 'settings.json'
+        settings_json.parent.mkdir(parents=True)
         settings_json.write_text(json.dumps({'orig': True}))
 
         # One staged change so a row's `git commit` has something to
@@ -380,6 +398,7 @@ def landlock_matrix_scaffold():
             other_task_root=other_task_root,
             plan_symlink=plan_symlink, plan_target=plan_target,
             uv_cache=uv_cache, uv_data=uv_data,
+            tree_sitter_cache=tree_sitter_cache, cache_sibling=cache_sibling,
             claude_fleet=claude_fleet, settings_json=settings_json,
         )
     finally:
@@ -539,6 +558,43 @@ class TestSandboxEnforcementMatrix:
         assert 'data_denied' in result.stdout, result.stdout
         assert not data_marker.exists()
 
+    def test_row08b_tree_sitter_cache_writable_cache_sibling_ro(
+        self, landlock_matrix_scaffold,
+    ):
+        # Task 3382: ~/.cache/tree-sitter is granted so sandboxed roles can
+        # populate tree-sitter's grammar cache instead of hitting EACCES. Not
+        # one of the PRD's frozen twelve — an extension of the uv-cache group,
+        # same $HOME/.cache boundary shape (hence the 08b suffix).
+        # The derivation-level boundary pin, which runs on every host, is
+        # test_write_set.py::TestComputeWriteSetHappyPath::
+        # test_tree_sitter_grant_covers_no_other_cache_peer.
+        scaffold = landlock_matrix_scaffold
+        # A fresh host: the grant must survive because _run_sandboxed
+        # pre-creates the dir outside the sandbox, as _invoke does.
+        assert not scaffold.tree_sitter_cache.exists()
+
+        probe = uuid.uuid4().hex
+        ts_marker = scaffold.tree_sitter_cache / probe
+        sibling_marker = scaffold.cache_sibling / probe
+        inner = [
+            '/bin/sh', '-c',
+            (
+                f'(touch {ts_marker} 2>/dev/null && echo ts_cache_ok || echo ts_cache_denied) && '
+                f'(touch {sibling_marker} 2>/dev/null && echo sibling_ok || echo sibling_denied) && '
+                'echo end'
+            ),
+        ]
+        result = _run_sandboxed(scaffold, inner)
+        assert result.returncode == 0, result.stderr
+        assert 'end' in result.stdout
+        assert 'ts_cache_ok' in result.stdout, result.stdout
+        assert ts_marker.exists()
+        # The load-bearing half: a second ~/.cache/<tool> peer must stay
+        # read-only, proving the fix granted the tree-sitter SUBDIR and did
+        # not silently hand sandboxed roles every other tool cache.
+        assert 'sibling_denied' in result.stdout, result.stdout
+        assert not sibling_marker.exists()
+
     # -- Group 5: ~/.claude narrowing (rows 9/10) -------------------------
 
     def test_row09_claude_settings_denied(self, landlock_matrix_scaffold):
@@ -554,6 +610,8 @@ class TestSandboxEnforcementMatrix:
 
     def test_row10_claude_fleet_allowed(self, landlock_matrix_scaffold):
         scaffold = landlock_matrix_scaffold
+        # A fresh host, as in row 08b: _run_sandboxed must pre-create fleet/.
+        assert not scaffold.claude_fleet.exists()
         target = scaffold.claude_fleet / 'sessions' / 'x'
         result = _run_sandboxed(
             scaffold,
