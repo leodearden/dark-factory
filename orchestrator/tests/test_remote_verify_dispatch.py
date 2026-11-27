@@ -21,7 +21,19 @@ from collections.abc import Awaitable, Callable, Iterator
 from pathlib import Path
 
 import pytest
-from _gate_fixtures import gate_argv, gated_remote_runner
+from _gate_fixtures import (
+    TEST_CODE_CHECKOUT,
+    TEST_DEPLOYED_SHA,
+    TEST_DF_REMOTE,
+    TEST_GATE_ROOT,
+    ensure_reply,
+    gate_argv,
+    gated_remote_runner,
+    is_ensure,
+    is_gate_publish,
+    is_tag_listing,
+    without_push_ssh_config,
+)
 from _xdist_crash_fixtures import XDIST_IN_FLIGHT_NODEID, XDIST_SESSION_ABORTED_OUTPUT
 
 from orchestrator import verify
@@ -897,3 +909,168 @@ class TestParkedMergeSlotProbesItsOwnRequest:
             assert allocator.is_parked('laptop') is True
         finally:
             _stop(own)
+
+
+# ---------------------------------------------------------------------------
+# RemoteRunner tag mirror (task 11840)
+# ---------------------------------------------------------------------------
+
+_TAG = 'v0.2-alpha'
+
+
+def _git(repo: Path, *args: str) -> str:
+    return subprocess.run(
+        ['git', '-C', str(repo), *args], capture_output=True, text=True, check=True,
+    ).stdout.strip()
+
+
+def _commit(repo: Path, name: str) -> str:
+    (repo / name).write_text(name)
+    _git(repo, 'add', '-A')
+    _git(repo, '-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-q', '-m', name)
+    return _git(repo, 'rev-parse', 'HEAD')
+
+
+def _annotated_tag(repo: Path, name: str) -> None:
+    _git(repo, '-c', 'user.name=t', '-c', 'user.email=t@t', 'tag', '-a', name, '-m', 'rel')
+
+
+def _tag_refspec(argv: list[str]) -> str | None:
+    """The refspec of a ``git push`` that pushes tags, else None."""
+    plain = without_push_ssh_config(argv)
+    if plain[:2] != ['git', 'push']:
+        return None
+    return next((word for word in plain[3:] if 'refs/tags/' in word), None)
+
+
+Run = Callable[..., Awaitable[tuple[int, str, str]]]
+
+
+class _TagScene:
+    """A dispatcher checkout and a bare project repo standing in for the laptop's.
+
+    The runner pushes with real git from the dispatcher to the bare repo; only
+    the gate publish and ensure are answered.  Its verify ssh records whether
+    ``watched_tag`` resolves on the bare repo at the moment the verify starts.
+    """
+
+    def __init__(self, root: Path) -> None:
+        self.dispatcher = root / 'dispatcher'
+        self.dispatcher.mkdir()
+        _git(self.dispatcher, 'init', '-q')
+        self.first = _commit(self.dispatcher, 'first')
+        self.remote = root / 'project.git'
+        _git(root, 'init', '-q', '--bare', str(self.remote))
+        self.watched_tag = _TAG
+        self.argvs: list[list[str]] = []
+        self.seen: list[tuple[int, str]] = []
+
+    @property
+    def head(self) -> str:
+        return _git(self.dispatcher, 'rev-parse', 'HEAD')
+
+    def seed_remote_main(self) -> None:
+        """The remote holds the dispatcher's main and none of its tags."""
+        _git(self.dispatcher, 'push', '-q', str(self.remote), 'HEAD:refs/heads/main')
+
+    def tag_object(self, repo: Path, tag: str) -> str:
+        return _git(repo, 'rev-parse', f'refs/tags/{tag}')
+
+    def tag_pushes(self) -> list[str]:
+        return [spec for spec in map(_tag_refspec, self.argvs) if spec is not None]
+
+    async def run(self, argv: list[str], *, cwd: object = None) -> tuple[int, str, str]:
+        self.argvs.append(list(argv))
+        if is_gate_publish(argv):
+            return (0, '', '')
+        if is_ensure(argv):
+            return (0, ensure_reply(), '')
+        assert argv[0] == 'git', argv
+        done = await asyncio.to_thread(subprocess.run, argv, cwd=cwd, capture_output=True, text=True)
+        return done.returncode, done.stdout.strip(), done.stderr.strip()
+
+    async def ssh_run(self, argv: list[str], *, cwd: object = None) -> tuple[int, str, str]:
+        done = subprocess.run(
+            ['git', '-C', str(self.remote), 'rev-parse', '-q', '--verify',
+             f'refs/tags/{self.watched_tag}^{{commit}}'],
+            capture_output=True, text=True,
+        )
+        self.seen.append((done.returncode, done.stdout.strip()))
+        return (0, result_to_json(_green()), '')
+
+    def runner(
+        self, *, run: Run | None = None, id_factory: Callable[[], str] | None = None,
+    ) -> RemoteRunner:
+        return RemoteRunner(
+            'laptop', 'laptop.local', str(self.remote), str(self.dispatcher),
+            df_remote_checkout=TEST_DF_REMOTE,
+            gate_checkouts_path=TEST_GATE_ROOT,
+            deployed_sha=TEST_DEPLOYED_SHA,
+            code_checkout=TEST_CODE_CHECKOUT,
+            run=run or self.run,
+            ssh_run=self.ssh_run,
+            id_factory=id_factory or (lambda: 'fixed-id'),
+        )
+
+
+@pytest.fixture
+def tag_scene(tmp_path: Path) -> _TagScene:
+    return _TagScene(tmp_path)
+
+
+async def _verify_as(role: str, runner: RemoteRunner, sha: str) -> VerifyResult:
+    if role == 'merge':
+        return await runner.run_merge_verify(sha, _merge_spec())
+    return await runner.run_task_verify(
+        _task_spec(tip_sha=sha, task_id='6667'), task_id='6667', archive_root=None,
+    )
+
+
+@pytest.mark.asyncio
+class TestTagMirror:
+    @pytest.mark.parametrize('role', ['merge', 'task'])
+    async def test_a_local_tag_absent_on_the_remote_is_there_when_the_verify_starts(
+        self, tag_scene: _TagScene, role: str,
+    ):
+        """esc-9646-6: a test gating on a release tag saw it locally and not on the laptop."""
+        _annotated_tag(tag_scene.dispatcher, _TAG)
+        tag_scene.seed_remote_main()
+
+        result = await _verify_as(role, tag_scene.runner(), tag_scene.head)
+
+        assert result == _green()
+        assert tag_scene.seen == [(0, _git(tag_scene.dispatcher, 'rev-parse', f'{_TAG}^{{commit}}'))]
+        assert tag_scene.tag_object(tag_scene.remote, _TAG) == tag_scene.tag_object(
+            tag_scene.dispatcher, _TAG,
+        )
+
+    async def test_a_dispatcher_with_no_tags_dispatches_and_pushes_no_tags(
+        self, tag_scene: _TagScene,
+    ):
+        """A tag glob matching nothing makes git push exit 1, so none may be issued."""
+        tag_scene.seed_remote_main()
+
+        result = await tag_scene.runner().run_merge_verify(tag_scene.head, _merge_spec())
+
+        assert result == _green()
+        assert tag_scene.tag_pushes() == []
+
+    async def test_an_unreadable_local_tag_listing_is_skipped_not_fatal(
+        self, tag_scene: _TagScene,
+    ):
+        argvs: list[list[str]] = []
+
+        async def run(argv: list[str], *, cwd: object = None) -> tuple[int, str, str]:
+            argvs.append(list(argv))
+            if is_gate_publish(argv):
+                return (0, '', '')
+            if is_ensure(argv):
+                return (0, ensure_reply(), '')
+            if is_tag_listing(argv):
+                return (128, '', 'fatal: not a git repository')
+            return (0, '', '')
+
+        result = await tag_scene.runner(run=run).run_merge_verify('abc123', _merge_spec())
+
+        assert result == _green()
+        assert [spec for spec in map(_tag_refspec, argvs) if spec is not None] == []
