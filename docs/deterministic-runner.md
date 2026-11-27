@@ -571,3 +571,16 @@ owned by a different subsystem — `curator_action` / `curator_justification` /
 curator would invite a reader of the Tier-A list, or a census consumer
 grouping by prefix, to conflate two unrelated actors.  The `human_curator_`
 prefix pairs the stamp unambiguously with its marker.
+
+UPSTREAM HALF (task 3346): rung (ii) acts only at dispatch, after a close.
+To stop the close itself, every curator-gate record is filed with the
+declared pin `task-<id>-human-curator-gate` that
+`deterministic_runner.py::curator_gate_pin` builds. That covers the gate that
+`build_gate_escalation_fields` builds, for both the runner's filing and the
+harness strand re-file, and the `curator_adjudication_missing` re-ask.
+`resolve_issue` therefore refuses any non-park close from any caller,
+header-less connections included, unless `acknowledge_declared_pins` names
+the record. Acknowledge it only once the review is done and stamped, or when
+cancelling the gate. Rung (ii) remains the dispatch-time backstop, including
+for closes that bypass `resolve_issue`. Records filed before task 3346 are
+unpinned.

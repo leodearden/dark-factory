@@ -135,9 +135,11 @@ Declared-dependency marker (default-empty; task 4377):
   being CLOSED.  This marker is protection AT RESOLUTION TIME, driven by
   an explicit declaration; the two are deliberately separate seams.
 
-  SOLE WRITER: `queue.declare_pin`.  Enforcement:
-  `escalation/declared_pins.py::blocking_pin_declarations` consulted by
-  `escalation/server.py::resolve_issue`.
+  WRITERS: a filer may construct a record already declared
+  (`orchestrator/src/orchestrator/deterministic_runner.py::curator_gate_pin`,
+  task 3346); after filing, `queue.declare_pin` is the only writer.
+  Enforcement: `escalation/declared_pins.py::blocking_pin_declarations`
+  consulted by `escalation/server.py::resolve_issue`.
 """
 
 from __future__ import annotations
@@ -827,8 +829,10 @@ class Escalation:
     # why and is NOT itself a marker (a reason without a declarer blocks
     # nothing).
     #
-    # SOLE WRITER: `queue.declare_pin` (append-order, de-duplicating, blanks
-    # dropped).  Zero migration, same pattern as members / evidence /
+    # WRITERS: a filer may construct the record already declared
+    # (`orchestrator/src/orchestrator/deterministic_runner.py::curator_gate_pin`,
+    # task 3346); after filing, `queue.declare_pin` is the only writer
+    # (append-order, de-duplicating, blanks dropped).  Zero migration, same pattern as members / evidence /
     # train_state / the triage quad / granted_files / filing_claimant_run_id /
     # amendments / root_cause_variants above: legacy JSON without these keys
     # deserialises to []/'' via the from_dict __dataclass_fields__ filter

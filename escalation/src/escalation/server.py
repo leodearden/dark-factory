@@ -3471,10 +3471,13 @@ def create_server(
         rotation as a writer is deliberately OUT OF SCOPE here — this task holds
         no lock on the orchestrator package — so until that follow-up lands, a
         watcher that spots a candidate pin REPORTS it (its skill says so) and a
-        human or steward runs this tool.  Consequence worth naming: the refusal
-        gate can only fire for records a human has actually marked, so the
-        surviving sibling pin esc-3105-3 stays protected by prose until someone
-        declares it.
+        human or steward runs this tool.  Consequence worth naming: apart from
+        human-curator-gate records, which the deterministic runner files
+        already pinned
+        (``orchestrator/src/orchestrator/deterministic_runner.py::curator_gate_pin``,
+        task 3346), the refusal gate can only fire for records a human has
+        actually marked, so the surviving sibling pin esc-3105-3 stays protected
+        by prose until someone declares it.
 
         Two deliberate departures from ``stamp_triage``, its structural twin:
 

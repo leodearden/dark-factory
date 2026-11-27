@@ -367,7 +367,15 @@ For each gate with real work, in this order:
    `update_task`'s append semantics resend the whole field, and a transcription
    slip silently loses text.
 3. **Close the gate by RESOLVING ITS ESCALATION — never by `set_task_status`**:
-   `resolve_issue(escalation_id=<gate esc>, action='resume', ...)`. Measured
+   first stamp the content-adjudication proof,
+   `update_task(id=<gate>, metadata={'human_curator_adjudicated_at': '<ISO-8601 now>'}, metadata_mode='merge')`;
+   without it the runner re-blocks the gate with `curator_adjudication_missing`
+   on resume (task 3341). Then
+   `resolve_issue(escalation_id=<gate esc>, action='resume', acknowledge_declared_pins=[<gate esc>], resolution_class='actionable', ...)`:
+   a curator gate's escalation is filed with a declared pin (task 3346), so a
+   resume that does not name it is refused with `declared_pin_refused`. A record
+   filed before task 3346 carries no pin, and acknowledging it is a harmless
+   no-op. Measured
    2026-09-03: `set_task_status(id=<gate>, status='done')` REFUSES with
    `error=done_provenance_required` (`reconciliation.require_done_provenance` is
    enabled), and the hint offers only `merged` / `found_on_main` — both false for
