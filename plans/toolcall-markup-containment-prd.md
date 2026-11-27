@@ -386,14 +386,17 @@ journal gaps (task 11978).** The specimen is 3382's `design_decisions[1].decisio
   before the γ2 guard was registered (`37eed69c97`, task 4457). §2.4 and D8 already counted it among the live plans
   with hard damage.
 - **Today's boundary holds.** Replayed in-process through today's plan-tools, the call is refused
-  `mcp_markup_unrepairable` and journalled as one `markup_detected` line. That rules out all four candidates: an
-  uncovered tool, an uncovered parameter, another server instance, and a pattern variant.
-- **Gap 1, closed here: the read-time path had no journal channel.** On 2026-11-26T15:27:19Z the re-dispatched
-  implementer's first `mark_step_done` ran ε's read-time repair, which repaired two trailing `\x3c/rationale>`
-  mis-closes and classified the decision unrepairable (its recovered set collides with the supplied set). That verdict
-  reached only that response's `markup_repairs` key and a stdio subprocess's stderr. Task 11978 journals every
-  disclosed stored fact to `plan-tools.jsonl` as a `stored_markup_detected` line
-  (`orchestrator/src/orchestrator/mcp/stored_markup_journal.py`).
+  `mcp_markup_unrepairable` and journalled as one `markup_detected` line. The replay rules out an uncovered tool, an
+  uncovered parameter and a pattern variant. The pre-guard origin above is what makes the fourth candidate, another
+  server instance, moot: no instance had a guard on 2026-08-01.
+- **Gap 1, closed here for unsandboxed roles: the read-time path had no journal channel.** On
+  2026-11-26T15:27:19Z the re-dispatched implementer's first `mark_step_done` ran ε's read-time repair, which repaired
+  two trailing `\x3c/rationale>` mis-closes and classified the decision unrepairable (its recovered set collides with
+  the supplied set). That verdict reached only that response's `markup_repairs` key and a stdio subprocess's stderr.
+  Task 11978 journals every disclosed stored fact to `plan-tools.jsonl` as a `stored_markup_detected` line
+  (`orchestrator/src/orchestrator/mcp/stored_markup_journal.py`). That holds only where the host can reach the
+  journal: 3382's own read came from a landlocked implementer, so the same read today still leaves no line until
+  Gap 2 closes.
 - **Gap 2, open: sandboxed roles cannot reach the journal.** That session was a landlocked implementer, and the write
   set grants nothing under the main checkout's `data/` (EACCES on append, probed 2026-11-27). Nine
   `record_step_deviation` refusals from 2026-10-31 to 2026-11-26 are in their plans' `_markup_rejections` stamps but

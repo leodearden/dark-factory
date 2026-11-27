@@ -416,7 +416,8 @@ def repair_plan_fields(
 #: is the payload: one line, one fact, ``json.loads``-able; never a value a
 #: consumer has to regex out of prose. The log is a per-process stderr, so the
 #: durable record of a disclosed fact is plan-tools' journal line, written by
-#: ``orchestrator/src/orchestrator/mcp/stored_markup_journal.py``.
+#: ``orchestrator/src/orchestrator/mcp/stored_markup_journal.py`` from hosts that
+#: can reach the journal; a sandboxed role's facts get no line (task 11978 Gap 2).
 MARKUP_FACT_EVENT = 'plan_markup_repaired'
 
 #: The one response key a host discloses this module's reportable facts under.
