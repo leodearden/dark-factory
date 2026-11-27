@@ -9,8 +9,8 @@ import os
 import posixpath
 import re
 import stat
-from collections.abc import Sequence
-from dataclasses import dataclass
+from collections.abc import Mapping, Sequence
+from dataclasses import asdict, dataclass
 from itertools import pairwise
 from pathlib import Path, PurePosixPath
 from types import UnionType
@@ -63,6 +63,7 @@ from orchestrator.shadow_types import ShadowShape
 from orchestrator.task_priority import PRIORITY_TIERS
 from orchestrator.verify_admission_gate import AdmissionOrder
 from orchestrator.verify_cache.modes import CacheMode, VerifyRole, forced_off, most_conservative
+from orchestrator.verify_host_roster_file import load_roster, roster_file_path
 
 logger = logging.getLogger(__name__)
 
@@ -6896,6 +6897,15 @@ def config_unknown_keys_signature(census: list[ConfigUnknownKey]) -> str:
     return hashlib.sha256(joined.encode('utf-8')).hexdigest()[:16]
 
 
+def _roster_verify_runners(
+    config: OrchestratorConfig, env: Mapping[str, str],
+) -> list[VerifyRunnerConfig]:
+    """This project's runners from the private roster file (SETUP.md §12, PRD verify-host-roster §6.3)."""
+    roster = load_roster(roster_file_path(env))
+    runners = roster.runners_for_project(config.fused_memory.project_id)
+    return [VerifyRunnerConfig.model_validate(asdict(runner)) for runner in runners]
+
+
 def load_config(config_path: Path | None = None) -> OrchestratorConfig:
     """Load configuration from an explicit YAML file.
 
@@ -6935,6 +6945,9 @@ def load_config(config_path: Path | None = None) -> OrchestratorConfig:
 
     os.environ['ORCH_CONFIG_PATH'] = str(config_path)
     config = OrchestratorConfig()
+    roster_runners = _roster_verify_runners(config, os.environ)
+    if roster_runners:
+        config.verify_runners = roster_runners
     # κ: fold the shared sccache backend into verify_env so the LOCAL merge-verify
     # path (run_scoped_verification in verify.py reads config.verify_env) points at
     # the shared backend without requiring verify.py changes.  The assignment is
