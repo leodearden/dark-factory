@@ -9,6 +9,7 @@ import os
 import posixpath
 import re
 import stat
+from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
 from itertools import pairwise
@@ -3431,9 +3432,9 @@ class RemoteGatePaths(NamedTuple):
 LOCAL_VERIFY_HOST_NAME = 'local'
 
 
-def require_distinct_runner_names(names: Sequence[str]) -> None:
+def require_unique_unreserved_runner_names(names: Sequence[str]) -> None:
     """Raise ValueError unless every name is unique and none is the local slot's."""
-    duplicated = sorted({name for name in names if names.count(name) > 1})
+    duplicated = sorted(name for name, count in Counter(names).items() if count > 1)
     reserved = LOCAL_VERIFY_HOST_NAME in names
     if not duplicated and not reserved:
         return
@@ -6196,10 +6197,10 @@ class OrchestratorConfig(BaseSettings):
 
     @field_validator('verify_runners', mode='after')
     @classmethod
-    def _require_distinct_runner_names(
+    def _require_unique_unreserved_runner_names(
         cls, v: list[VerifyRunnerConfig],
     ) -> list[VerifyRunnerConfig]:
-        require_distinct_runner_names([runner.name for runner in v])
+        require_unique_unreserved_runner_names([runner.name for runner in v])
         return v
 
     @field_validator('verify_env_probes', mode='after')
@@ -6910,7 +6911,7 @@ def _roster_verify_runners(
     runners = load_roster(roster_path).runners_for_project(project_id)
     try:
         roster_runners = [VerifyRunnerConfig.model_validate(asdict(runner)) for runner in runners]
-        require_distinct_runner_names([runner.name for runner in roster_runners])
+        require_unique_unreserved_runner_names([runner.name for runner in roster_runners])
     except ValueError as exc:
         raise RosterFileError(f'{roster_path}: project {project_id!r}: {exc}') from exc
     if roster_runners and config.verify_runners:
