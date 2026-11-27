@@ -67,6 +67,7 @@ from orchestrator.offline_lane_escalations import (
     sentinel_task_id,
 )
 from orchestrator.offline_lane_ledger import NUMERIC_UNNAMED_CLEAR
+from orchestrator.offline_lane_records import PassRecord
 
 pytestmark = [pytest.mark.usefixtures('code_default_config')]
 
@@ -682,8 +683,21 @@ BROKEN_PROBES = {
     'killed': (ProbeAnswer(signal=signal.SIGKILL), None),
     'another exit code': (ProbeAnswer(exit=3), None),
     'the outage exit printing nothing': (ProbeAnswer(exit=OUTAGE_EXIT_STATUS, stdout=''), None),
-    'past its timeout': (ProbeAnswer(sleep_secs=5), 1),
 }
+PROBE_TIMEOUT_SECS = 1
+PROBE_STARTS = {'starting at once': '', 'starting after its timeout': f'sleep {PROBE_TIMEOUT_SECS + 1}; '}
+
+
+def assert_confirmed_as_if_no_probe_under_one_broken_record(lane: RedPathLane, record: PassRecord) -> None:
+    assert record.outcome == {
+        'arm': 'confirmed', 'mode': 'narrowed', 'reproduced': [A], 'cleared': [], 'inconclusive': [],
+    }
+    assert len(lane.stub.invocations()) == 2
+    episode = lane.episode(A)
+    assert episode is not None
+    assert episode.counted_passes == (record.pass_id,)
+    [broken] = lane.pending(PROBE_BROKEN_CATEGORY)
+    assert broken.level == 1
 
 
 @pytest.mark.asyncio
@@ -697,16 +711,26 @@ async def test_scenario_38_a_broken_probe_is_confirmed_as_if_none_were_declared_
 
     record = await lane.advance(RED_A, RED_A)
 
-    assert record.outcome == {
-        'arm': 'confirmed', 'mode': 'narrowed', 'reproduced': [A], 'cleared': [], 'inconclusive': [],
-    }
-    assert len(lane.stub.invocations()) == 2
+    assert_confirmed_as_if_no_probe_under_one_broken_record(lane, record)
     assert len(lane.stub.probe_invocations()) == 1
-    episode = lane.episode(A)
-    assert episode is not None
-    assert episode.counted_passes == (record.pass_id,)
-    [broken] = lane.pending(PROBE_BROKEN_CATEGORY)
-    assert broken.level == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(lane_test_timeout(drives=1))
+@pytest.mark.parametrize('start', PROBE_STARTS.values(), ids=list(PROBE_STARTS))
+async def test_scenario_38_a_probe_past_its_timeout_is_confirmed_as_if_none_were_declared_under_one_record(
+    tmp_path, monkeypatch, start,
+):
+    command = PROBED_COMMAND.model_copy(
+        update={'outage_probe': f'{start}exec lane-probe', 'outage_probe_timeout_secs': PROBE_TIMEOUT_SECS},
+    )
+    lane = await RedPathLane.open(tmp_path, monkeypatch, command=command)
+    lane.stub.probe(ProbeAnswer(sleep_secs=5))
+
+    record = await lane.advance(RED_A, RED_A)
+
+    assert_confirmed_as_if_no_probe_under_one_broken_record(lane, record)
+    assert len(lane.stub.probe_invocations()) == 1
 
 
 @pytest.mark.asyncio
