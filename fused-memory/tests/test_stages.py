@@ -1123,8 +1123,8 @@ class TestStage1LedgerPresenceWiring:
         )
 
     def test_stage1_prompt_checks_ledger_for_stage2_summary(self):
-        """The actionable Stage-2-summary reconstruct-trigger decision must be keyed
-        to stage='task_knowledge_sync' (the summary Stage 2 writes).
+        """The actionable Stage-2-summary presence decision must be keyed to
+        stage='task_knowledge_sync' (the summary Stage 2 writes).
 
         Asserts the semantic stage-key token rather than the full multi-line call
         signature, so harmless prompt rewording (whitespace, argument order,
@@ -1136,13 +1136,14 @@ class TestStage1LedgerPresenceWiring:
 
         assert "stage='task_knowledge_sync'" in STAGE1_SYSTEM_PROMPT, (
             "Stage 1 must key a presence check on stage='task_knowledge_sync' "
-            'for the Stage-2-summary reconstruct-trigger decision.'
+            'for the Stage-2-summary presence decision.'
         )
 
     def test_stage1_prompt_checks_ledger_for_own_prior_run_summary(self):
         """Stage 1 also audits its OWN prior-run summary (written deterministically
-        by write_stage1_cycle_summary, never LLM-reconstructed) via
-        stage='memory_consolidator' — a presence audit, not a reconstruction trigger.
+        by write_stage1_cycle_summary, never LLM-authored) via
+        stage='memory_consolidator' — a presence audit that only informs the cycle
+        report and never raises a finding.
 
         Asserts the semantic stage-key token rather than the full call signature
         (see test_stage1_prompt_checks_ledger_for_stage2_summary); the two distinct
