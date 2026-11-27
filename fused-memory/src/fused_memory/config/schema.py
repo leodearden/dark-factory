@@ -597,6 +597,7 @@ class QueueConfig(BaseModel):
         'ConnectionResetError',
         'ServerDisconnectedError',
         'OperationalError',
+        'APITimeoutError',
     ])
     write_timeout_seconds: float = Field(default=120.0)
     backend_read_timeout_seconds: float = Field(default=30.0)

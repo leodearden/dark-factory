@@ -93,12 +93,18 @@ _DELETE_DEAD_BATCH_SIZE = 500
 # the extended budget. Nothing makes such a write terminal before its budget
 # runs out. Task 3586's payload-identity rule did until task 6369 removed it:
 # after task 3561 no producer's payload carried the uuid its write creates.
+#
+# 'APITimeoutError' (task 10241): an embedder stall now surfaces as the openai
+# SDK's APITimeoutError once its bounded attempts run out, rather than as
+# await_within's TimeoutError. Its MRO matches no other name here, so this
+# entry is what keeps that stall class's extended budget.
 DEFAULT_TRANSIENT_ERROR_NAMES = frozenset({
     'TimeoutError',
     'ConnectionError',
     'ConnectionResetError',
     'ServerDisconnectedError',
     'OperationalError',
+    'APITimeoutError',
 })
 
 # -- Schema ------------------------------------------------------------------

@@ -170,6 +170,7 @@ queue:
     - ConnectionResetError
     - ServerDisconnectedError
     - OperationalError
+    - APITimeoutError
 
 # ── Project isolation (task 1143) ────────────────────────────────────────────
 # The reconciliation harness hard-binds project_root per project_id via a
