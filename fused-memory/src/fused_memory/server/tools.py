@@ -13,6 +13,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Literal
 
 import aiosqlite
@@ -254,7 +255,11 @@ from fused_memory.services.consolidation_ops import (
     read_topic_closure,
 )
 from fused_memory.services.id_resolver import IdResolver, is_uuid_prefix
-from fused_memory.services.memory_service import MemoryService, metadata_row_text
+from fused_memory.services.memory_service import (
+    MemoryService,
+    memory_not_found,
+    metadata_row_text,
+)
 from fused_memory.services.read_telemetry import (
     fallback_search_summary,
     summarize_search_query,
@@ -1433,6 +1438,37 @@ def _pagination_meta(
     return meta
 
 
+@dataclass(frozen=True)
+class _CitationSnapshot:
+    """One task-tree read's live citers, bucketed per requested memory id.
+
+    *scan_error* is set when the read itself failed: every covered id's
+    citation state is then unknown, and the gate fails closed on each.
+
+    One snapshot is shared by several gate calls, so *citers_by_id* and each
+    citer are stored as read-only views: ``frozen=True`` alone stops only
+    rebinding the field, not writes through it.
+    """
+
+    citers_by_id: Mapping[str, tuple[Mapping[str, Any], ...]]
+    scan_error: Exception | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, 'citers_by_id', MappingProxyType({
+            memory_id: tuple(MappingProxyType(dict(citer)) for citer in citers)
+            for memory_id, citers in self.citers_by_id.items()
+        }))
+
+    def citers_of(self, memory_id: str) -> list[dict[str, Any]]:
+        if memory_id not in self.citers_by_id:
+            raise ValueError(
+                f'citation snapshot was not read for {memory_id!r}; it covers '
+                f'{sorted(self.citers_by_id)}. A gate may only consult a '
+                'snapshot read for the id it is deciding.'
+            )
+        return [dict(citer) for citer in self.citers_by_id[memory_id]]
+
+
 def create_mcp_server(
     memory_service: MemoryService,
     task_interceptor: TaskInterceptor | None = None,
@@ -1868,8 +1904,9 @@ def create_mcp_server(
           'escape there strands exactly the live pointers this gate exists to '
           'protect.'
     )
-    # (task 3624) Appended to whichever refusal a caller gets when they DID send
-    # allow_dangling_citations but not as a literal boolean True. Without it the
+    # (task 3624) Appended when a caller DID send allow_dangling_citations but
+    # not as a literal boolean True, and the refusal they got is one the
+    # override clears (_dangling_override_is_the_remedy). Without it the
     # strictness degrades silently into a dead end: the value is dropped, the
     # ordinary refusal comes back, and its hint instructs them to pass the very
     # flag they believe they just passed — a retry loop for an LLM caller.
@@ -1880,6 +1917,23 @@ def create_mcp_server(
         "allow_mcp_markup) — a truthy 'yes', 1 or 'true' must not unlock an "
         'irreversible delete. Resend it as JSON true if you meant to override.'
     )
+    # (task 4859) The same report for every OTHER refusal. The ignored value is
+    # still named, but a resend is not advertised: the override either cannot
+    # clear this refusal or would strand citers the caller has a survivor for.
+    _IGNORED_DANGLING_OVERRIDE_NOT_A_REMEDY_HINT = (
+        'NOTE: allow_dangling_citations was supplied but its value is not the '
+        'literal boolean True, so it was IGNORED. The override is not the way '
+        'past THIS refusal in any case: fix what the refusal above names.'
+    )
+    # (task 4859) The refusals the allow_dangling_citations override exists to
+    # clear. The one home for that policy: both the ignored-override note and
+    # the cascade hint derive their advice from it.
+    _DANGLING_OVERRIDE_REMEDIES = frozenset({'CitationRepointRequired'})
+
+    def _dangling_override_is_the_remedy(rejection: Mapping[str, Any]) -> bool:
+        if rejection.get('error_type') == 'CascadeCitationGateRejected':
+            return rejection.get('escape_offered') is True
+        return rejection.get('error_type') in _DANGLING_OVERRIDE_REMEDIES
     _CITATION_REPLACEMENT_NOT_FOUND_HINT = (
         'replacement_memory_id is well-formed but resolves to nothing, so '
         'repointing to it would rewrite every live citation to address a '
@@ -1908,7 +1962,10 @@ def create_mcp_server(
     # names escapes that apply to the whole subtree — and one that does not
     # require an escape at all. Same vocabulary as the _CITATION_*_HINT
     # constants above, so a caller reading either refusal learns the same
-    # remedies by the same names.
+    # remedies by the same names. The allow_dangling_citations sentence is
+    # CONDITIONAL (task 4859): _cascade_gate_rejection attaches this hint only
+    # when every blocked[] record is one the override clears, and
+    # _CASCADE_GATE_NO_ESCAPE_HINT below otherwise.
     _CASCADE_GATE_HINT = (
         'nothing was deleted and nothing was repointed. Every record listed in '
         'blocked[] carries its own error_type and citing_tasks, so fix them in '
@@ -1919,6 +1976,15 @@ def create_mcp_server(
         'listed citation deliberately. If neither fits, delete or reparent the '
         'named descendants individually first — each then pays its own gate — '
         'and retry the cascade once they are clear.'
+    )
+    _CASCADE_GATE_NO_ESCAPE_HINT = (
+        'nothing was deleted and nothing was repointed. Every record listed in '
+        'blocked[] carries its own error_type and hint, so fix them in one '
+        'pass rather than one refusal at a time. replacement_memory_id is '
+        'applied to the WHOLE cascade set, not just the target, so a wrong one '
+        'is wrong for every record: correct it. If that does not fit, delete '
+        'or reparent the named descendants individually first — each then pays '
+        'its own gate — and retry the cascade once they are clear.'
     )
     # (task 3197) The scan-incomplete refusals need their OWN hint. Reusing
     # _CASCADE_GATE_HINT above told the caller to read blocked[] — a key that
@@ -2380,6 +2446,24 @@ def create_mcp_server(
         """
         return store == 'mem0' and _taskmaster_configured and project_id in _kp
 
+    async def _missing_target_refusal(
+        memory_id: str, store: str, project_id: str
+    ) -> dict[str, Any] | None:
+        """The service's ``MemoryNotFound`` refusal, asked BEFORE any citation pass.
+
+        The service checks existence itself, but only after this layer's
+        repoint pass has rewritten task metadata and its override arm has
+        logged citations as dangled. A cascade aimed at a missing parent
+        would otherwise repoint and tombstone the citers of its SURVIVING
+        children, then delete nothing. Same envelope builder as the service,
+        so the caller cannot tell which layer refused.
+        """
+        if await memory_service.memory_exists(
+            memory_id, store=SourceStore(store), project_id=project_id
+        ):
+            return None
+        return memory_not_found(store, memory_id, project_id, nothing_was='deleted')
+
     async def _citation_repoint_gate(
         memory_id: str,
         store: str,
@@ -2390,6 +2474,7 @@ def create_mcp_server(
         *,
         scan_only: bool = False,
         replacement_cache: dict[tuple[str, str], Any] | None = None,
+        citation_snapshot: _CitationSnapshot | None = None,
     ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
         """Repoint live task-metadata citations BEFORE an irreversible delete.
 
@@ -2499,33 +2584,29 @@ def create_mcp_server(
         write by this operation can change the answer mid-invocation. A
         RAISED lookup is not cached, so the fail-closed arm keeps re-probing
         rather than remembering a failure.
+
+        ``citation_snapshot`` lets the cascade pre-flight answer for a whole
+        set from ONE task-tree read (task 4859). It is accepted in
+        ``scan_only`` mode ONLY: the mutating pass's own live read is the
+        fail-closed guarantee, so supplying a snapshot there raises.
         """
         if not _citation_gate_applies(store, project_id):
             return None, None
+        if citation_snapshot is not None and not scan_only:
+            raise ValueError(
+                'citation_snapshot is accepted in scan_only mode only: the '
+                'mutating pass must read the task tree live before it repoints '
+                'or deletes.'
+            )
 
         project_root = _kp[project_id]
-        try:
-            citers = await _scan_task_citations(project_root, memory_id)
-        except (KeyboardInterrupt, SystemExit):
-            raise
-        except Exception as exc:
-            logger.warning(
-                'citation gate: task scan failed for %s; failing closed',
-                memory_id,
-                exc_info=True,
-            )
-            return {
-                'error': (
-                    'Could not determine whether any task still cites '
-                    f'{memory_id}; refusing an irreversible delete on an '
-                    'unknown citation state.'
-                ),
-                'error_type': 'CitationScanFailed',
-                'memory_id': memory_id,
-                'scan_error': str(exc),
-                'scan_error_type': type(exc).__name__,
-                'hint': _CITATION_SCAN_FAILED_HINT,
-            }, None
+        snapshot = (
+            citation_snapshot if citation_snapshot is not None
+            else await _scan_task_citations(project_root, (memory_id,))
+        )
+        if snapshot.scan_error is not None:
+            return _citation_scan_failed(memory_id, snapshot.scan_error), None
+        citers = snapshot.citers_of(memory_id)
 
         live_citers = [c for c in citers if not c['terminal']]
         if not live_citers:
@@ -2783,6 +2864,21 @@ def create_mcp_server(
 
         return None, {'citation_repoint': stats}
 
+    def _citation_scan_failed(memory_id: str, scan_error: Exception) -> dict[str, Any]:
+        """The fail-closed refusal for an id whose citation state is unknown."""
+        return {
+            'error': (
+                'Could not determine whether any task still cites '
+                f'{memory_id}; refusing an irreversible delete on an '
+                'unknown citation state.'
+            ),
+            'error_type': 'CitationScanFailed',
+            'memory_id': memory_id,
+            'scan_error': str(scan_error),
+            'scan_error_type': type(scan_error).__name__,
+            'hint': _CITATION_SCAN_FAILED_HINT,
+        }
+
     async def _cascade_enumerate(
         memory_id: str, project_id: str
     ) -> tuple[dict[str, Any] | None, list[str]]:
@@ -2939,33 +3035,30 @@ def create_mcp_server(
            re-derive the enumeration by hand — the step that found 3 of 8 in
            the incident."
 
-        COST, stated honestly. Every record in the set is scanned against
-        the whole task tree TWICE — once here, once again in
-        ``_cascade_citation_repoint_pass`` — and each
-        ``_citation_repoint_gate`` call runs its own ``_scan_task_citations``,
-        which is one ``task_interceptor.get_tasks`` plus an
-        O(tasks x metadata-nodes) walk. So a cascade of N records costs 2N
-        full task-DB reads and 2N deep metadata walks, not the "one extra
-        read per id" an earlier revision of this docstring claimed.
+        COST. This pass reads the task tree ONCE for the whole set (task
+        4859): one ``_scan_task_citations`` snapshot, bucketed per id through
+        the one ``find_live_citation_occurrences`` definition, handed to every
+        per-id ``scan_only`` gate call. The mutating pass,
+        ``_cascade_citation_repoint_pass``, still costs one LIVE read per id,
+        plus each repoint sweep's own. So a cascade of N records costs N+1
+        task-DB reads, and 2N in-memory metadata walks, because a multi-id
+        walker would be a second implementation of the match rules.
 
-        That is accepted rather than optimised, and the two halves are
-        accepted for DIFFERENT reasons, so neither should be traded away on
-        the other's argument:
+        The two passes are treated differently for DIFFERENT reasons, so
+        neither should be traded away on the other's argument:
 
         * The mutating pass's per-id re-read is the fail-closed guarantee
           itself, for the reason ``_scan_task_citations`` already documents:
           a snapshot cache trades that guarantee for a race on the one
-          operation whose harm motivated the gate. It must stay live.
-        * This pass's per-id read is NOT load-bearing for freshness — the
-          mutating pass re-reads anyway — so it could in principle collapse
-          to a single bucketing walk over the whole id set. It does not,
-          because that means a second implementation of "which tasks cite
-          this id", drifting from the gate's own (tombstone-excluding
-          ``find_live_citation_occurrences``, fail-closed-on-scan-error, and
-          all three ``replacement_memory_id`` preconditions). ``scan_only``
-          is a MODE on the one gate precisely so every rule keeps one home
-          (INV-5); N redundant reads is the price of that, and it is paid
-          only on the ``cascade=True`` path.
+          operation whose harm motivated the gate. It must stay live, which
+          the gate enforces by refusing a snapshot outside ``scan_only``.
+        * This pass's read is NOT load-bearing for freshness — the mutating
+          pass re-reads anyway — so one shared snapshot answers for every id.
+          Only the READ is shared: each id is still decided by the one gate
+          (fail-closed-on-scan-error, the live-citer check, the override arm
+          and all three ``replacement_memory_id`` preconditions), so every
+          rule keeps one home (INV-5). One failed read leaves every id's
+          state unknown, so each is refused as ``CitationScanFailed``.
         * The ``replacement_memory_id`` existence probe IS shared across
           both passes (``replacement_cache``), and is the only read that
           is. It asks the same question of the same id every time, and
@@ -2977,6 +3070,9 @@ def create_mcp_server(
         *cascade_ids* is descendants-first with the target LAST, mirroring
         the children-before-parent order the cascade actually deletes in.
         """
+        if not _citation_gate_applies(store, project_id):
+            return None
+        snapshot = await _scan_task_citations(_kp[project_id], cascade_ids)
         blocked: list[dict[str, Any]] = []
         for target in cascade_ids:
             rejection, _ = await _citation_repoint_gate(
@@ -2988,6 +3084,7 @@ def create_mcp_server(
                 allow_dangling_citations=allow_dangling_citations,
                 scan_only=True,
                 replacement_cache=replacement_cache,
+                citation_snapshot=snapshot,
             )
             if rejection:
                 # Verbatim: the per-id envelope already names the citers,
@@ -3025,14 +3122,24 @@ def create_mcp_server(
         would force every cascade error handler to handle both shapes
         anyway. ``blocked[0]`` still carries the verbatim per-id rejection,
         so nothing the single-record envelope reported is lost.
+
+        The hint is DERIVED from *blocked*, never passed in: it offers the
+        allow_dangling_citations escape only when every blocked record is one
+        the override is meant to clear. ``escape_offered`` carries that same
+        decision as data, and is what ``_dangling_override_is_the_remedy``
+        reads for a cascade refusal.
         """
+        escape_offered = bool(blocked) and all(
+            _dangling_override_is_the_remedy(b) for b in blocked
+        )
         return {
             'error': error,
             'error_type': 'CascadeCitationGateRejected',
             'memory_id': memory_id,
             'cascade_size': cascade_size,
             'blocked': blocked,
-            'hint': _CASCADE_GATE_HINT,
+            'escape_offered': escape_offered,
+            'hint': _CASCADE_GATE_HINT if escape_offered else _CASCADE_GATE_NO_ESCAPE_HINT,
             **extra,
         }
 
@@ -3128,9 +3235,14 @@ def create_mcp_server(
         return None, ({'cascade_citation_repoint': per_id} if per_id else None)
 
     async def _scan_task_citations(
-        project_root: str, memory_id: str
-    ) -> list[dict[str, Any]]:
-        """Return one record per task whose metadata LIVE-cites *memory_id*.
+        project_root: str, memory_ids: Sequence[str]
+    ) -> _CitationSnapshot:
+        """ONE task-tree read, bucketing each task that LIVE-cites each id.
+
+        Every requested id is a key of the snapshot, citers or not. A failed
+        read is caught HERE and carried as ``scan_error`` (logged once at
+        WARNING), so the gate stays the one place a ``CitationScanFailed``
+        refusal is built; a ``BaseException`` such as cancellation propagates.
 
         A read-only pre-pass over the same snapshot semantics
         ``repoint_task_citations`` uses, so the gate can decide whether a
@@ -3159,38 +3271,54 @@ def create_mcp_server(
         the gate. The cost is made OBSERVABLE instead: each scan reports its
         task count and duration at DEBUG, so a project large enough for this to
         matter surfaces as a measurement rather than as a hunch.
+
+        A multi-id snapshot is shared only by the cascade pre-flight's
+        ``scan_only`` gate calls, which mutate nothing; the gate refuses one
+        anywhere else, so the read before a repoint or delete stays live.
         """
+        ids = tuple(dict.fromkeys(memory_ids))
         started = time.perf_counter()
-        tasks_data = await task_interceptor.get_tasks(project_root)  # type: ignore[union-attr]
+        try:
+            tasks_data = await task_interceptor.get_tasks(project_root)  # type: ignore[union-attr]
+        except Exception as exc:
+            logger.warning(
+                'citation gate: task scan failed for %s; failing closed',
+                ', '.join(ids),
+                exc_info=True,
+            )
+            return _CitationSnapshot(citers_by_id={mid: () for mid in ids}, scan_error=exc)
         tasks = (tasks_data or {}).get('tasks') or []
-        found: list[dict[str, Any]] = []
         if not isinstance(tasks, list):
-            return found
+            tasks = []
+        found: dict[str, list[dict[str, Any]]] = {mid: [] for mid in ids}
         for task in tasks:
             if not isinstance(task, dict):
                 continue
-            paths = find_live_citation_occurrences(task.get('metadata'), memory_id)
-            if not paths:
-                continue
             status = task.get('status')
-            found.append({
-                'task_id': str(task.get('id')),
-                'status': status,
-                'paths': paths,
-                'terminal': status in INACTIVE_TASK_STATUSES,
-            })
+            for mid in ids:
+                paths = find_live_citation_occurrences(task.get('metadata'), mid)
+                if paths:
+                    found[mid].append({
+                        'task_id': str(task.get('id')),
+                        'status': status,
+                        'paths': paths,
+                        'terminal': status in INACTIVE_TASK_STATUSES,
+                    })
         # DEBUG, not INFO: this now runs on EVERY mem0 delete, so it is the
         # common path and must not be chatty by default. It is the only place
         # the broadened gate's per-delete cost is measurable.
         logger.debug(
-            'citation gate: scanned %d task(s) for citations of %s in %.1f ms '
-            '(%d citer(s) found)',
+            'citation gate: scanned %d task(s) for citations of %d id(s) (%s) in '
+            '%.1f ms (%d citer(s) found)',
             len(tasks),
-            memory_id,
+            len(ids),
+            ', '.join(ids),
             (time.perf_counter() - started) * 1000,
-            len(found),
+            sum(len(citers) for citers in found.values()),
         )
-        return found
+        return _CitationSnapshot(
+            citers_by_id={mid: tuple(citers) for mid, citers in found.items()},
+        )
 
     @mcp.tool()
     @mcp_tool_errors()
@@ -5589,7 +5717,9 @@ def create_mcp_server(
 
         Accepts either *memory_id* (canonical) or *id* (alias matching the key
         search results and this tool's own response return). Exactly one must
-        be provided; supplying both with conflicting values is an error.
+        be provided; supplying both with conflicting values is an error. A
+        well-formed id that resolves to nothing returns ``MemoryNotFound`` and
+        deletes nothing.
 
         **Every ``store='mem0'`` delete** passes through the citation-repoint
         gate, whoever issues it (task 3624): task metadata still citing the
@@ -5793,9 +5923,11 @@ def create_mcp_server(
             # destroy them in, so the set that is gated and the sequence that
             # runs are read the same way. A set that cannot be fully
             # enumerated refuses here and never reaches the pre-flight.
-            rejection, cascade_ids = await _cascade_enumerate(
-                resolved_id, project_id
-            )
+            rejection = await _missing_target_refusal(resolved_id, store, project_id)
+            if rejection is None:
+                rejection, cascade_ids = await _cascade_enumerate(
+                    resolved_id, project_id
+                )
             if rejection is None:
                 rejection = _cascade_replacement_outside_set(
                     cascade_ids, resolved_id, replacement_memory_id,
@@ -5831,20 +5963,37 @@ def create_mcp_server(
             #
             # Charged only where the gate has something to lose: the mutating
             # arm needs a replacement_memory_id, and the override arm logs a
-            # WARNING naming citations it claims to have dangled on a delete
-            # that then never happened. A plain uncited delete — the common
-            # path, and every one of the six in-repo recon callers — pays
-            # nothing extra.
-            if _citation_gate_applies(store, project_id) and (
+            # WARNING naming citations it claims to have dangled. Either would
+            # misfire on a delete the service then refuses, for children or
+            # for a missing target, so both refusals are asked first, in the
+            # service's own order. A plain uncited delete — the common path,
+            # and every one of the six in-repo recon callers — pays nothing
+            # extra.
+            gate_can_mutate = _citation_gate_applies(store, project_id) and (
                 replacement_memory_id is not None or allow_dangling_citations
-            ):
-                await memory_service.refuse_if_children(
-                    resolved_id, project_id=project_id
-                )
-            rejection, repoint_stats = await _citation_repoint_gate(
-                resolved_id, store, project_id, agent_id, replacement_memory_id,
-                allow_dangling_citations=allow_dangling_citations,
             )
+            if gate_can_mutate:
+                rejection = await _missing_target_refusal(
+                    resolved_id, store, project_id
+                )
+                if rejection is None:
+                    await memory_service.refuse_if_children(
+                        resolved_id, project_id=project_id
+                    )
+            if rejection is None:
+                rejection, repoint_stats = await _citation_repoint_gate(
+                    resolved_id, store, project_id, agent_id, replacement_memory_id,
+                    allow_dangling_citations=allow_dangling_citations,
+                )
+                # A plain delete the gate refused advertises the escapes, and
+                # for a target that does not exist every one of them retries
+                # into MemoryNotFound. So that refusal is given first; the
+                # probe runs on this refusal path only.
+                if rejection is not None and not gate_can_mutate:
+                    rejection = (
+                        await _missing_target_refusal(resolved_id, store, project_id)
+                        or rejection
+                    )
         if rejection:
             # The `is True` strictness above is right, but dropping a
             # non-conforming value in SILENCE is not: the caller would get back
@@ -5852,14 +6001,22 @@ def create_mcp_server(
             # just passed, and would retry into the same wall. Name the value
             # that was ignored instead (loud-over-silent-degradation). A literal
             # False is a deliberate "no", not a malformed yes, so it is honoured
-            # without comment — this fires only for a non-boolean value.
+            # without comment — this fires only for a non-boolean value. The
+            # resend is advertised only where the override is the remedy.
             if override_supplied and not isinstance(raw_override, bool):
+                is_remedy = _dangling_override_is_the_remedy(rejection)
+                note = (
+                    _IGNORED_DANGLING_OVERRIDE_HINT
+                    if is_remedy
+                    else _IGNORED_DANGLING_OVERRIDE_NOT_A_REMEDY_HINT
+                )
                 rejection = {
                     **rejection,
-                    'ignored_override': {'allow_dangling_citations': raw_override},
-                    'hint': ' '.join(
-                        p for p in (rejection.get('hint'), _IGNORED_DANGLING_OVERRIDE_HINT) if p
-                    ),
+                    'ignored_override': {
+                        'allow_dangling_citations': raw_override,
+                        'is_remedy': is_remedy,
+                    },
+                    'hint': ' '.join(p for p in (rejection.get('hint'), note) if p),
                 }
             return rejection
         result = await memory_service.delete_memory(

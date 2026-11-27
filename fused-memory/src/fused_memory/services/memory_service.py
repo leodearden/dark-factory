@@ -17,6 +17,7 @@ from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar, assert_never, cast
 
 import httpx
+from graphiti_core.errors import EdgeNotFoundError
 from graphiti_core.nodes import EpisodeType
 from shared.streak import KeyedStreaks
 
@@ -1428,6 +1429,21 @@ def _apply_cycle_summary_metadata_tagging(
 
 class MemoryNotFoundError(Exception):
     """Raised when a mem0 memory id is not found."""
+
+
+def memory_not_found(
+    store: str, memory_id: str, project_id: str, *, nothing_was: str
+) -> dict:
+    """The RETURNED refusal for a mutation whose target id resolves to nothing."""
+    return {
+        'error': (
+            f'Memory {memory_id!r} does not exist in {store} for project '
+            f'{project_id!r}; nothing was {nothing_was}.'
+        ),
+        'error_type': 'MemoryNotFound',
+        'store': store,
+        'id': memory_id,
+    }
 
 
 def _serialize_temporal(
@@ -9380,9 +9396,13 @@ class MemoryService:
                 # The child's OWN subtree went first, so its ids precede it
                 # here — the same deepest-first order the deletes actually
                 # ran in. Dropping this frame's return value would report
-                # A→B→C as having destroyed only B.
-                deleted.extend(child_result.get('cascaded_child_ids') or [])
-                deleted.append(child_id)
+                # A→B→C as having destroyed only B. A child that vanished
+                # before its own delete (MemoryNotFound) was not destroyed by
+                # this cascade, so it is not reported; one that genuinely
+                # survived is still caught by the re-count below.
+                if child_result.get('status') == 'deleted':
+                    deleted.extend(child_result.get('cascaded_child_ids') or [])
+                    deleted.append(child_id)
 
         if await self._count_children(memory_id, project_id=project_id):
             survivors = [
@@ -9398,6 +9418,27 @@ class MemoryService:
                 )
 
         return deleted
+
+    async def memory_exists(
+        self, memory_id: str, *, store: SourceStore, project_id: str
+    ) -> bool:
+        """Whether *memory_id* resolves in *store*; a read failure propagates.
+
+        Only a definite miss answers False, so an unknown (a ``TimeoutError``
+        included) is never mistaken for an absent record.
+
+        PUBLIC and side-effect-free for the reason :meth:`refuse_if_children`
+        is: the MCP tool layer settles the target's existence BEFORE its
+        citation passes mutate task metadata, since the refusal below in
+        :meth:`delete_memory` fires only after them.
+        """
+        if store == SourceStore.mem0:
+            return await self.get_memory_by_id(project_id, memory_id) is not None
+        try:
+            await self.graphiti.get_edge_text(memory_id, group_id=project_id)
+        except EdgeNotFoundError:
+            return False
+        return True
 
     async def delete_memory(
         self,
@@ -9460,20 +9501,24 @@ class MemoryService:
         ``success=True`` journal entry and a ``memory_deleted`` event while
         nothing was removed.
 
-        EXISTENCE IS NOT CHECKED, and the difference is user-visible: a
-        well-formed UUID that no longer resolves — a stale id copied out of an
-        old report, a survivor id from an earlier consolidation — still reports
-        ``deleted``, for exactly the same backend reason. Closing that half
-        needs a per-store existence read: ``update_memory`` below already does
-        it for its Qdrant arm (see the §5(c) read-leg comment there), while the
-        Graphiti arm additionally needs a ``remove_edge`` that distinguishes
-        not-found from already-deleted. Deliberately out of scope here — task
-        3132 closes the malformed-shape half only.
+        EXISTENCE IS CHECKED next, in both stores, for the same backend reason:
+        a well-formed UUID that resolves to nothing (a stale id from an old
+        report, a survivor of an earlier consolidation) RETURNS
+        ``MemoryNotFound`` and leaves no backend call, journal row or event. It
+        returns rather than raises because every internal and script caller
+        treats "did not raise" as success, and some delete one id twice by
+        design. A raised read propagates, because an unknown is not a miss.
+        ``GraphitiBackend.remove_edge`` stays idempotent for its other callers;
+        the Graphiti read is ``get_edge_text``. In the mem0 arm the read runs
+        before the child gate, so a ``cascade=True`` aimed at a missing parent
+        destroys NOTHING: children still carrying its dead ``parent_id`` are
+        not swept up. They are live records and the correct referents of
+        whatever cites them; deleting them is a separate, explicit call.
 
-        The guard sits above the store branch so ONE check covers both the
+        Both guards sit above the store branch so ONE check covers both the
         Graphiti and Mem0 paths, and above the journal write and event emission
-        so a rejected delete leaves no false audit trail. It sits BELOW
-        ``SourceStore(store)`` so a call that is wrong in both ways reports the
+        so a rejected delete leaves no false audit trail. The shape guard sits
+        BELOW ``SourceStore(store)`` so a call that is wrong in both ways reports the
         bad store first — the same store-then-shape precedence the MCP boundary
         gives agents, rather than the inverse for internal callers.
 
@@ -9507,6 +9552,8 @@ class MemoryService:
                 'cascade if a plain delete of this record is what was meant.'
             )
         require_full_uuid(memory_id, field_name='memory_id')
+        if not await self.memory_exists(memory_id, store=source, project_id=project_id):
+            return memory_not_found(store, memory_id, project_id, nothing_was='deleted')
 
         write_op_id = str(uuid_mod.uuid4())
         cascaded_child_ids: list[str] = []
@@ -9796,15 +9843,7 @@ class MemoryService:
         # distinction away at the one layer that still has it.
         existing = await self.get_memory_by_id(project_id=project_id, memory_id=memory_id)
         if existing is None:
-            return {
-                'error': (
-                    f'Memory {memory_id!r} does not exist in mem0 for project '
-                    f'{project_id!r}; nothing was updated.'
-                ),
-                'error_type': 'MemoryNotFound',
-                'store': 'mem0',
-                'id': memory_id,
-            }
+            return memory_not_found('mem0', memory_id, project_id, nothing_was='updated')
 
         # The FULL raw Qdrant payload — mem0-owned keys and custom provenance
         # keys alike. Copied so the arms below can compute a delta against it
