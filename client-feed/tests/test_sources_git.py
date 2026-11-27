@@ -9,6 +9,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
+from _audit_hook import recording
 from _git_repo import (
     Repo,
     make_repo,
@@ -212,6 +213,20 @@ def test_blob_reader_reads_committed_bytes_in_one_session(repo: Repo) -> None:
         assert read(shas['b.bin']) == b'\x00\x01\nbeta'
         assert read(shas['empty']) == b''
         assert read(shas['a.txt']) == b'alpha\n'
+
+
+def test_a_blob_reader_session_starts_no_thread_however_many_blobs_it_reads(repo: Repo) -> None:
+    committed = {f'{i:02}.txt': f'{i}\n'.encode() for i in range(20)}
+    for path, content in committed.items():
+        repo.write(path, content)
+    commit = repo.commit('many', when=T0)
+    entries = tree_entries(repo.root, commit)
+
+    with recording() as record, blob_reader(repo.root) as read:
+        contents = {entry.path: read(entry.object_sha) for entry in entries}
+
+    assert contents == committed
+    assert record.thread_starts == ()
 
 
 def test_an_unknown_commit_raises_a_typed_error_without_a_path(repo: Repo) -> None:
