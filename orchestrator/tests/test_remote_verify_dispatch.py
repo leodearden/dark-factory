@@ -19,6 +19,7 @@ import sys
 import uuid
 from collections.abc import Awaitable, Callable, Iterator
 from pathlib import Path
+from typing import Any
 
 import pytest
 from _gate_fixtures import (
@@ -38,6 +39,7 @@ from _xdist_crash_fixtures import XDIST_IN_FLIGHT_NODEID, XDIST_SESSION_ABORTED_
 
 from orchestrator import verify
 from orchestrator.config import OrchestratorConfig
+from orchestrator.event_store import EventType
 from orchestrator.task_verify_spec import TaskVerifySpec, task_spec_from_json, task_spec_to_json
 from orchestrator.verify import (
     SIGNAL_KILL_SUMMARY_MARKER,
@@ -946,6 +948,17 @@ def _tag_refspec(argv: list[str]) -> str | None:
 Run = Callable[..., Awaitable[tuple[int, str, str]]]
 
 
+class _RecordingEvents:
+    def __init__(self) -> None:
+        self.events: list[tuple[Any, dict[str, Any]]] = []
+
+    def emit(self, event_type: Any, *, data: dict[str, Any] | None = None, **_: Any) -> None:
+        self.events.append((event_type, dict(data or {})))
+
+    def of(self, event_type: Any) -> list[dict[str, Any]]:
+        return [data for kind, data in self.events if kind == event_type]
+
+
 class _TagScene:
     """A dispatcher checkout and a bare project repo standing in for the laptop's.
 
@@ -1074,3 +1087,86 @@ class TestTagMirror:
 
         assert result == _green()
         assert [spec for spec in map(_tag_refspec, argvs) if spec is not None] == []
+
+    async def test_a_remote_tag_pointing_elsewhere_is_force_mirrored_and_announced(
+        self, tag_scene: _TagScene,
+    ):
+        """INV-2 mirror semantics: the dispatcher's tag set is the source of truth."""
+        second = _commit(tag_scene.dispatcher, 'second')
+        _annotated_tag(tag_scene.dispatcher, _TAG)
+        tag_scene.seed_remote_main()
+        _git(tag_scene.remote, 'update-ref', f'refs/tags/{_TAG}', tag_scene.first)
+        store = _RecordingEvents()
+
+        result = await tag_scene.runner().run_merge_verify(
+            tag_scene.head, _merge_spec(), event_store=store,
+        )
+
+        assert result == _green()
+        assert tag_scene.seen == [(0, second)]
+        assert tag_scene.tag_object(tag_scene.remote, _TAG) == tag_scene.tag_object(
+            tag_scene.dispatcher, _TAG,
+        )
+        assert tag_scene.tag_pushes() == ['refs/tags/*:refs/tags/*', '+refs/tags/*:refs/tags/*']
+        mirrored = [
+            data for data in store.of(EventType.runner_synced)
+            if data['kind'] == 'project_tag_mirror'
+        ]
+        assert mirrored == [{
+            'runner': 'laptop', 'kind': 'project_tag_mirror',
+            'from_head': None, 'to_head': None, 'forced': True,
+        }]
+
+    async def test_a_remote_that_refuses_tags_benches_the_runner_before_any_verify(
+        self, tag_scene: _TagScene,
+    ):
+        """Synced before dispatch, or the runner is benched: no verify on a lagging tag set."""
+        _annotated_tag(tag_scene.dispatcher, _TAG)
+        tag_scene.seed_remote_main()
+        hook = tag_scene.remote / 'hooks' / 'pre-receive'
+        hook.write_text(
+            '#!/bin/sh\n'
+            'while read old new ref; do\n'
+            '  case "$ref" in refs/tags/*) echo "tags refused" >&2; exit 1;; esac\n'
+            'done\n'
+        )
+        hook.chmod(0o755)
+
+        with pytest.raises(RunnerUnavailable) as excinfo:
+            await tag_scene.runner().run_merge_verify(tag_scene.head, _merge_spec())
+
+        assert excinfo.value.kind == 'gate'
+        assert tag_scene.seen == []
+        assert _git(tag_scene.remote, 'for-each-ref', 'refs/merge-verify') == ''
+
+    async def test_a_tag_push_transport_failure_is_transport_with_no_force_retry(
+        self, tag_scene: _TagScene,
+    ):
+        """The host was not reached, so forcing cannot help (publish_sha's rule)."""
+        argvs: list[list[str]] = []
+
+        async def run(argv: list[str], *, cwd: object = None) -> tuple[int, str, str]:
+            argvs.append(list(argv))
+            if is_gate_publish(argv):
+                return (0, '', '')
+            if is_ensure(argv):
+                return (0, ensure_reply(), '')
+            if is_tag_listing(argv):
+                return (0, f'{"a" * 40} refs/tags/v1', '')
+            if _tag_refspec(argv) is not None:
+                return (
+                    128, '',
+                    'ssh: connect to host laptop.local port 22: Connection timed out\n'
+                    'fatal: Could not read from remote repository.',
+                )
+            return (0, '', '')
+
+        with pytest.raises(RunnerUnavailable) as excinfo:
+            await tag_scene.runner(run=run).run_merge_verify('abc123', _merge_spec())
+
+        assert excinfo.value.kind == 'transport'
+        assert [spec for spec in map(_tag_refspec, argvs) if spec is not None] == [
+            'refs/tags/*:refs/tags/*',
+        ]
+        assert not any(':refs/merge-verify/' in ' '.join(argv) for argv in argvs)
+        assert tag_scene.seen == []
