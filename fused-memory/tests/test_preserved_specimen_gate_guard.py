@@ -397,3 +397,18 @@ class TestFailsOpen:
         assert result is None
         assert _warned_proceeding(caplog, '3105')
 
+
+class TestTaughtToTheFilingStage:
+    """The filing stage is told the refusal exists, so it does not reword past it."""
+
+    def test_source_completion_names_the_refusal(self):
+        from fused_memory.middleware.preserved_specimen_gate_guard import (
+            preserved_specimen_reset_error,
+        )
+        from fused_memory.reconciliation.recon_self_model import (
+            render_source_completion_section,
+        )
+
+        refusal = preserved_specimen_reset_error('3105', SPECIMEN_MEMORY_ID)
+
+        assert refusal['error_type'] in render_source_completion_section(can_file_tasks=True)
