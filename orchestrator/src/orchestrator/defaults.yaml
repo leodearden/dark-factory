@@ -797,9 +797,14 @@ unblock_auto:
 # api.z.ai/api/anthropic, Kimi kimi-for-coding, MiniMax, DeepSeek
 # api.deepseek.com/anthropic). A role NOT listed here receives NO endpoint
 # env from this map — forwarding is opt-in per role, not a global broadcast.
-# In particular the judge is safe by omission: naming it here re-exposes the
-# vLLM ServerDisconnectedError burn (commit 3cd380a079) unless the target
-# endpoint is confirmed to handle the judge's tool-use pattern.
+# In particular, giving the judge ENDPOINT env here (ANTHROPIC_BASE_URL /
+# ANTHROPIC_AUTH_TOKEN) re-exposes the vLLM ServerDisconnectedError burn
+# (commit 3cd380a079) unless the target endpoint is confirmed to handle the
+# judge's tool-use pattern. A judge entry holding only non-routing keys (e.g.
+# CARGO_HOME, npm_config_cache) is safe: the global env_overrides is merged
+# only for implementer/debugger, so a judge entry contributes only its own
+# literal keys (see
+# orchestrator/src/orchestrator/workflow.py::TaskWorkflow._build_agent_env).
 #
 # Restart-only: like the global env_overrides above, this field is NOT in
 # RELOADABLE_FIELDS -- a change here takes effect only on orchestrator
