@@ -39,7 +39,10 @@ fact and outcome are
 ``orchestrator/src/orchestrator/mcp/markup_sink.py::MARKUP_RECORD_LOST_FACT``
 and ``::MARKUP_RECORD_LOST_OUTCOME``: one line for each record the queue could
 not take, naming why and the payload's size. They are
-payload-free like every other line, so the rule above is unchanged.
+payload-free like every other line, so the rule above is unchanged. So are
+plan-tools' stored-markup facts, fact
+``orchestrator/src/orchestrator/mcp/stored_markup_journal.py::STORED_MARKUP_FACT``:
+damage already in ``plan.json`` that a read found, journalled as disclosed.
 
 Shape inherited from ``markup_sink.make_escalation_sink``: never raises, does
 its blocking work under ``asyncio.to_thread``, memoizes successes only, returns
