@@ -11,6 +11,8 @@ from pathlib import Path
 from unittest.mock import AsyncMock
 
 import aiosqlite
+import httpx
+import openai
 import pytest
 import pytest_asyncio
 from _fm_held_writes import HeldWrites
@@ -1768,6 +1770,35 @@ class TestNotFoundFamilyIsNotTransient:
                 f'got {dead[0]["attempts"]}.'
             )
             assert 'ConnectionResetError' in dead[0]['error']
+        finally:
+            await q.close()
+
+
+class TestEmbedderStallIsTransient:
+    """Task 10241: an embedder stall reaches the queue as the SDK's APITimeoutError.
+
+    It used to arrive as await_within's TimeoutError, which is transient; the
+    SDK error's MRO (APIConnectionError, APIError, OpenAIError) matches no
+    other default name, so only its own entry keeps the stall's budget.
+    """
+
+    @pytest.mark.asyncio
+    async def test_an_exhausted_embedding_schedule_gets_the_extended_budget(self, tmp_path):
+        request = httpx.Request('POST', 'http://127.0.0.1/v1/embeddings')
+        execute = AsyncMock(side_effect=openai.APITimeoutError(request=request))
+        q = make_retry_budget_queue(tmp_path, execute)
+        await q.initialize()
+        try:
+            await q.enqueue(queued('add_episode', {'content': 'test', 'group_id': 'proj1', 'name': 'ep'}, group_id='proj1'))
+            await poll_until_dead(q, group_id='proj1', expected_dead=1)
+
+            dead = await q.get_dead_items()
+            assert len(dead) == 1
+            assert dead[0]['attempts'] == 12, (
+                'APITimeoutError must keep the extended transient budget (12); '
+                f'got {dead[0]["attempts"]}.'
+            )
+            assert 'APITimeoutError' in dead[0]['error']
         finally:
             await q.close()
 
