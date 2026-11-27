@@ -290,14 +290,14 @@ def _roots_source(command_line_roots: Sequence[str] | None) -> str:
 
 
 def _measured_roots(configured: Sequence[str], source: str, queues_scanned: Sequence[str]) -> RootsStatement:
-    """Each root holding a scanned queue in scan order, then each configured root holding none, deduped by path.
+    """Every root ``inventory.queue_project_roots`` finds holding a scanned queue, then each configured root holding none.
 
-    Deduping by path, not by project token, keeps a second root folding to a
-    measured project in the list, so ``measure_projects`` states it as a fold
-    collision rather than one silently replacing the other.
+    Every root a project folds from is kept, deduped by path, so
+    ``measure_projects`` states a second root folding to a measured project as
+    a fold collision rather than one silently replacing the other.
     """
     queue_roots = dict.fromkeys(
-        root for queue in queues_scanned if (root := inventory.queue_project_root(queue)) is not None
+        root for roots in inventory.queue_project_roots(queues_scanned).values() for root in roots
     )
     configured_only: dict[Path, str] = {}
     for root in configured:

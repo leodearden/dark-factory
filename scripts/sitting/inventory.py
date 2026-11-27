@@ -209,13 +209,19 @@ def queue_project(queue_dir: str) -> str:
     return fold_project_token(root.name) if root is not None else ''
 
 
-def queue_project_roots(queue_dirs: Iterable[str]) -> Mapping[str, Path]:
-    """Each queue's canonical project and the root holding it; a queue of no known shape names none."""
-    return MappingProxyType({
-        queue_project(q): root
-        for q in queue_dirs
-        if (root := queue_project_root(q)) is not None
-    })
+def queue_project_roots(queue_dirs: Iterable[str]) -> Mapping[str, tuple[Path, ...]]:
+    """Each canonical project and the distinct roots holding its queues, in scan order; a queue of no known shape names none.
+
+    The first root is the one whose queue scanned first (a configured root's
+    queues scan before registry-only ones, per ``escalation_queue_dirs``). More
+    than one root is a fold collision, which this helper reports and does not judge.
+    """
+    by_project: dict[str, dict[Path, None]] = {}
+    for queue_dir in queue_dirs:
+        root = queue_project_root(queue_dir)
+        if root is not None:
+            by_project.setdefault(queue_project(queue_dir), {}).setdefault(root, None)
+    return MappingProxyType({project: tuple(roots) for project, roots in by_project.items()})
 
 
 def escalation_queue_dirs(
@@ -341,11 +347,11 @@ def gloss(
     for project, task_ids in task_scoped.items():
         if not task_ids:
             continue
-        root = roots.get(project)
-        if root is None:
+        project_roots = roots.get(project, ())
+        if not project_roots:
             shortfalls.append(Shortfall('tasks_db', '', f'no queue in the index names a root for {project!r}'))
             continue
-        titles, problem = _task_titles(root, task_ids)
+        titles, problem = _task_titles(project_roots[0], task_ids)
         if problem is not None:
             shortfalls.append(problem)
         else:

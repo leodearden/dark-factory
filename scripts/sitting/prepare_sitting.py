@@ -378,13 +378,14 @@ def _queueless(roots: Iterable[str]) -> list[Shortfall]:
     ]
 
 
-def _task_rows(roots: Mapping[str, Path]) -> Mapping[str, TaskRows]:
-    return MappingProxyType({project: ownership.load_task_rows(root) for project, root in roots.items()})
+def _task_rows(roots: Mapping[str, tuple[Path, ...]]) -> Mapping[str, TaskRows]:
+    return MappingProxyType({project: ownership.load_task_rows(project_roots[0])
+                             for project, project_roots in roots.items()})
 
 
-def _handovers(roots: Mapping[str, Path], override: HandoverOverride | None) -> Mapping[str, Path]:
-    found = {project: path for project, root in roots.items()
-             if (path := ownership.resolve_handover_path(root)) is not None}
+def _handovers(roots: Mapping[str, tuple[Path, ...]], override: HandoverOverride | None) -> Mapping[str, Path]:
+    found = {project: path for project, project_roots in roots.items()
+             if (path := ownership.resolve_handover_path(project_roots[0])) is not None}
     if override is not None:
         found[override.project] = override.path
     return MappingProxyType(found)
