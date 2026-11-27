@@ -228,15 +228,16 @@ async def test_collect_targets_omits_recon_ledger_when_none_or_no_checkpoint():
     assert 'recon_ledger' not in {name for name, _ in targets_no_checkpoint}
 
 
-def _collect_with_memory_service(memory_service) -> list[tuple[str, object]]:
-    return server_main._collect_checkpoint_targets(
-        taskmaster=None,
-        recon_journal=None,
-        event_buffer=None,
-        ticket_store=None,
-        write_journal=None,
-        memory_service=memory_service,
-    )
+def _collect_targets(**overrides) -> list[tuple[str, object]]:
+    stores: dict[str, object] = {
+        'taskmaster': None,
+        'recon_journal': None,
+        'event_buffer': None,
+        'ticket_store': None,
+        'write_journal': None,
+        'memory_service': SimpleNamespace(),
+    }
+    return server_main._collect_checkpoint_targets(**(stores | overrides))
 
 
 @pytest.mark.asyncio
@@ -245,7 +246,7 @@ async def test_collect_targets_checkpoints_the_overreach_shadow_sidecar(tmp_path
     await store.record(episode=judged_episode(), judgements=[judged_edge('e1', 'overreach')])
     shadow = non_judging_shadow(store)
     try:
-        targets = _collect_with_memory_service(SimpleNamespace(overreach_shadow=shadow))
+        targets = _collect_targets(memory_service=SimpleNamespace(overreach_shadow=shadow))
         assert 'overreach_shadow' in {name for name, _ in targets}
 
         await server_main._run_checkpoint_cycle(targets)
@@ -257,20 +258,8 @@ async def test_collect_targets_checkpoints_the_overreach_shadow_sidecar(tmp_path
 
 
 def test_collect_targets_omits_an_absent_overreach_shadow() -> None:
-    targets = _collect_with_memory_service(SimpleNamespace(overreach_shadow=None))
+    targets = _collect_targets(memory_service=SimpleNamespace(overreach_shadow=None))
     assert 'overreach_shadow' not in {name for name, _ in targets}
-
-
-def _collect_with_invocations_store(**keywords) -> list[tuple[str, object]]:
-    return server_main._collect_checkpoint_targets(
-        taskmaster=None,
-        recon_journal=None,
-        event_buffer=None,
-        ticket_store=None,
-        write_journal=None,
-        memory_service=SimpleNamespace(),
-        **keywords,
-    )
 
 
 @pytest.mark.asyncio
@@ -299,7 +288,7 @@ async def test_collect_targets_checkpoints_the_invocations_ledger(tmp_path: Path
         )
         assert wal_path.stat().st_size > 0
 
-        targets = _collect_with_invocations_store(invocations_store=store)
+        targets = _collect_targets(invocations_store=store)
         assert 'invocations_ledger' in {name for name, _ in targets}
 
         await server_main._run_checkpoint_cycle(targets)
@@ -311,8 +300,8 @@ async def test_collect_targets_checkpoints_the_invocations_ledger(tmp_path: Path
 
 
 def test_collect_targets_omits_an_absent_invocations_ledger() -> None:
-    explicit_none = _collect_with_invocations_store(invocations_store=None)
-    omitted = _collect_with_invocations_store()
+    explicit_none = _collect_targets(invocations_store=None)
+    omitted = _collect_targets()
     assert 'invocations_ledger' not in {name for name, _ in explicit_none}
     assert 'invocations_ledger' not in {name for name, _ in omitted}
 
