@@ -387,6 +387,7 @@ class SummedVerifyHours:
 
     completed: float
     cancelled: float
+    n_missing: int
     per_landing: float | None
 
     @property
@@ -394,9 +395,10 @@ class SummedVerifyHours:
         return self.completed + self.cancelled
 
 
-def _summed_hours(events: Sequence[Event], duration_key: str) -> float:
-    durations = (_number(_data(e).get(duration_key)) for e in events)
-    return sum(millis for millis in durations if millis is not None) / 3_600_000.0
+def _summed_hours(events: Sequence[Event], duration_key: str) -> tuple[float, int]:
+    """Hours summed over *events*' ``duration_key``, and how many events lack one."""
+    durations = [millis for e in events if (millis := _number(_data(e).get(duration_key))) is not None]
+    return sum(durations) / 3_600_000.0, len(events) - len(durations)
 
 
 def verify_hours_per_landing(
@@ -404,11 +406,16 @@ def verify_hours_per_landing(
 ) -> SummedVerifyHours:
     """Host-hours of every completed and cancelled merge verify passed in, per landing.
 
-    A sum (cost), not a union (occupancy); the caller passes the window's rows.
+    A sum (cost), not a union (occupancy); the caller passes the window's rows. A row without
+    a duration would lower the sum toward passing, so any such row leaves the figure unmeasured.
     """
-    completed, aborted = _summed_hours(verify, 'duration_ms'), _summed_hours(cancelled, 'elapsed_ms')
+    (completed, completed_missing), (aborted, aborted_missing) = (
+        _summed_hours(verify, 'duration_ms'), _summed_hours(cancelled, 'elapsed_ms'),
+    )
+    n_missing = completed_missing + aborted_missing
     return SummedVerifyHours(
-        completed=completed, cancelled=aborted, per_landing=_share(completed + aborted, len(ledger)),
+        completed=completed, cancelled=aborted, n_missing=n_missing,
+        per_landing=None if n_missing else _share(completed + aborted, len(ledger)),
     )
 
 

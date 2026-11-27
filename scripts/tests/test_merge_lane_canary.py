@@ -295,7 +295,6 @@ def test_verify_hours_per_landing_sums_every_hosts_completed_and_cancelled_time(
     verify = [
         completed(120, 'local', 60),    # [60, 120]
         completed(150, 'laptop', 60),   # [90, 150], overlaps: a union would be 1.5 h
-        ev(160, 'x', runner='local'),   # no duration_ms: skipped
     ]
     cancelled = [cancelled_verify(200, 'laptop', 30)]
 
@@ -304,7 +303,19 @@ def test_verify_hours_per_landing_sums_every_hosts_completed_and_cancelled_time(
     assert result.completed == pytest.approx(2.0)
     assert result.cancelled == pytest.approx(0.5)
     assert result.total == pytest.approx(2.5)
+    assert result.n_missing == 0
     assert result.per_landing == pytest.approx(1.25)
+
+
+def test_a_verify_row_without_a_duration_is_counted_and_leaves_hours_per_landing_unmeasured():
+    verify = [completed(120, 'local', 60), ev(160, 'x', runner='local')]
+    cancelled = [cancelled_verify(200, 'laptop', 30), ev(210, 'c', host='laptop', cause='void')]
+
+    result = canary.verify_hours_per_landing(verify, cancelled, two_landings())
+
+    assert (result.completed, result.cancelled) == (pytest.approx(1.0), pytest.approx(0.5))
+    assert result.n_missing == 2
+    assert result.per_landing is None
 
 
 def test_verify_hours_per_landing_is_unmeasured_without_a_landing():

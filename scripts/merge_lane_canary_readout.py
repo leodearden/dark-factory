@@ -439,7 +439,8 @@ def _landings_section(r: Readout) -> list[str]:
         f'- landings: {len(r.ledger)} (merge_finalized done ∪ train_merged members); '
         f'landed via a chain: {sum(row.via_chain for row in r.ledger)}',
         f'- merge-verify host-hours, all hosts: {_num(v.completed)} h completed + {_num(v.cancelled)} h '
-        f'cancelled = {_num(v.total)} h; per landing: {_num(v.per_landing)} h (a sum over hosts, not a union)',
+        f'cancelled = {_num(v.total)} h; per landing: {_num(v.per_landing)} h (a sum over hosts, not a union; '
+        f'rows without a duration: {v.n_missing})',
         f'- local merge-verify hours: {_num(r.local_hours.hours)} h in the window, '
         f'{_num(r.local_hours.per_week)} h/week (union of completed and cancelled intervals) (information only)',
         f'- union-busy hours, all hosts: {_num(r.union_busy_hours)} h (union of completed merge-verify '
