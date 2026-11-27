@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Literal
 
 import pytest
+from shared.testing_virtual_clock import virtual_clock_test
 
 _TEST_CMD = 'uv run pytest tests/ -q'
 _LINT_CMD = 'uv run ruff check src/'
@@ -660,7 +661,7 @@ class TestASegmentedLegCarriesOneRecordPerSegment:
             assert record['leg'] == 'test'
             _assert_iso_ordered(record)
 
-    @pytest.mark.asyncio
+    @virtual_clock_test
     async def test_a_segment_that_never_ran_has_no_record(self, tmp_path):
         import asyncio
 

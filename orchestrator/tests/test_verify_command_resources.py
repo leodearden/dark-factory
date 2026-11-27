@@ -53,6 +53,9 @@ from orchestrator.verify_command_resources import (
     resources_from_reading,
 )
 
+UNREACHED_COMMAND_TIMEOUT_SECS = 120
+SYSTEMD_CALL_TIMEOUT_SECS = 60
+
 LAUNCHED = 'df-verify-proj-0123abcd-0123456789ab.scope'
 LAUNCH_CGROUP = f'/user.slice/user-1000.slice/user@1000.service/df.slice/{LAUNCHED}'
 
@@ -590,7 +593,7 @@ def _run_payload(cmd: str) -> tuple[subprocess.CompletedProcess[str], bool]:
                 capture_output=True,
                 text=True,
                 check=False,
-                timeout=30,
+                timeout=UNREACHED_COMMAND_TIMEOUT_SECS,
             )
         finally:
             handshake.release_writer()
@@ -698,7 +701,7 @@ def real_user_scopes() -> None:
         probe = subprocess.run(
             ['systemd-run', '--user', '--scope', '--quiet', '--collect', '/bin/true'],
             capture_output=True,
-            timeout=10,
+            timeout=SYSTEMD_CALL_TIMEOUT_SECS,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         pytest.skip(f'no working systemd-run --user --scope: {exc}')
@@ -712,7 +715,11 @@ def inner_unit() -> Iterator[str]:
     unit = f'df6355reloc{uuid.uuid4().hex[:10]}.scope'
     yield unit
     with contextlib.suppress(Exception):
-        subprocess.run(['systemctl', '--user', 'stop', unit], capture_output=True, timeout=15)
+        subprocess.run(
+            ['systemctl', '--user', 'stop', unit],
+            capture_output=True,
+            timeout=SYSTEMD_CALL_TIMEOUT_SECS,
+        )
 
 
 async def _scoped(
@@ -781,6 +788,7 @@ class TestRunCmdCapturesInItsRealScope:
 
     @pytest.mark.asyncio
     @pytest.mark.timeout(60)
+    @pytest.mark.timing(reason='the command must outlive its verify timeout to reach the kill path')
     async def test_capture_on_timeout_is_read_before_the_kill(
         self, tmp_path, real_project_slice: RealProjectSlice
     ):
@@ -816,6 +824,7 @@ class TestRunCmdCapturesInItsRealScope:
 
     @pytest.mark.asyncio
     @pytest.mark.timeout(60)
+    @pytest.mark.timing(reason='the command must outlive its verify timeout to reach the kill path')
     async def test_a_relocating_command_that_is_killed_reads_relocated(
         self, tmp_path, inner_unit, real_project_slice: RealProjectSlice
     ):
@@ -839,9 +848,9 @@ class TestRunCmdWithoutAScope:
     async def test_scope_off_runs_unchanged_and_reads_unavailable(self, tmp_path):
         cmd = 'echo out; echo err >&2; exit 4'
         with allocate_command_capture() as capture:
-            captured = await _run_cmd(cmd, tmp_path, timeout=30, capture=capture)
+            captured = await _run_cmd(cmd, tmp_path, timeout=UNREACHED_COMMAND_TIMEOUT_SECS, capture=capture)
             record = capture.record(**IDENTITY)
-        bare = await _run_cmd(cmd, tmp_path, timeout=30)
+        bare = await _run_cmd(cmd, tmp_path, timeout=UNREACHED_COMMAND_TIMEOUT_SECS)
 
         assert captured == bare
         assert record.capture is Capture.UNAVAILABLE
@@ -857,13 +866,13 @@ class TestRunCmdWithoutAScope:
             captured = await _run_cmd(
                 cmd,
                 tmp_path,
-                timeout=30,
+                timeout=UNREACHED_COMMAND_TIMEOUT_SECS,
                 use_cgroup_scope=True,
                 scope_tag=scope_tag_for(tmp_path),
                 capture=capture,
             )
             record = capture.record(**IDENTITY)
-        bare = await _run_cmd(cmd, tmp_path, timeout=30)
+        bare = await _run_cmd(cmd, tmp_path, timeout=UNREACHED_COMMAND_TIMEOUT_SECS)
 
         assert captured == bare
         assert record.capture is Capture.UNAVAILABLE
@@ -876,7 +885,11 @@ class TestRunCmdDefaultSpawn:
         cmd = 'echo hello; exit 0'
 
         rc, output, _ = await _run_cmd(
-            cmd, tmp_path, timeout=30, use_cgroup_scope=True, scope_tag=scope_tag_for(tmp_path)
+            cmd,
+            tmp_path,
+            timeout=UNREACHED_COMMAND_TIMEOUT_SECS,
+            use_cgroup_scope=True,
+            scope_tag=scope_tag_for(tmp_path),
         )
 
         assert (rc, output) == (0, 'hello\n')
