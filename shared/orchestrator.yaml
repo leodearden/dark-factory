@@ -47,7 +47,23 @@ type_check_command: "uv run --directory shared pyright --threads 8 src/ tests/"
 # here and fell HARD through to the repo-root whole-fleet ceiling — see the
 # cascade note below.
 #
-# (1) MEASUREMENT PROVENANCE. RE-MEASURED by task 5131 on base main
+# (1) MEASUREMENT PROVENANCE. W is an ARCHIVE figure since task 11824: the
+# worst GREEN run of the VERBATIM test_command above in the main checkout's
+# verify archive, read on 2026-11-26 by
+# `scripts/timeout_headroom_selfcheck.py --dry-run --project-root <main
+# checkout>` (slot timeout-headroom:leg_budget:shared:1500). Like
+# fused-memory's, it is a PRODUCTION figure, not a hand sweep. RE-MEASURE by
+# repeating that dry-run, never by scaling. Archive records age out, so a W
+# that DROPS between two dry-runs means records left the window, not that the
+# suite got faster.
+#
+#   1060.15s green  ARCHIVE: task 8254 attempt 1, merge role, verbatim
+#                   test_command; summary, in the main checkout:
+#                   data/verify-logs/8254/attempt-1.shared.summary-20261122T184308_965973Z.json
+#                                                               <- WORST; W
+#
+# SUPERSEDED SWEEP, kept for history and no longer sized against since task
+# 11824. RE-MEASURED by task 5131 on base main
 # 1b3c50e98f63b08beec2f4b10e4e4d7b02e2596b (2026-09-05): TEN runs of the
 # VERBATIM test_command above, copied byte-for-byte — five by the task's
 # architect, five by its pre-1. All rc=0, reporting either 4779 passed / 14
@@ -61,8 +77,8 @@ type_check_command: "uv run --directory shared pyright --threads 8 src/ tests/"
 # Runs 2-10 below ran under a REAL NINE-WAY GATHER — the eight other
 # registered module test_commands running concurrently, reproducing
 # verify.run_full_verification's asyncio.gather over module_configs.values()
-# — which is the standard paragraph (1a) below prescribes for a re-measure;
-# run 1 predates the wave.
+# — the standard paragraph (1a) below then set for a hand re-measure,
+# superseded for shared by (1)'s dry-run; run 1 predates the wave.
 #
 #    141.81s wall / 129.51s pytest  architect run 1; rc=0, 4779p/14s/9d;
 #                                   loadavg  73.42 ->  81.93
@@ -75,7 +91,7 @@ type_check_command: "uv run --directory shared pyright --threads 8 src/ tests/"
 #    211.50s wall / 200.34s pytest  architect run 5; rc=0, 4781p/12s/9d;
 #                                   loadavg 165.93 -> 357.09
 #    296.88s wall / 271.59s pytest  pre-1 run 1; rc=0, 4781p/12s/9d;
-#                                   loadavg 119.12 -> 179.03   <- WORST; W
+#                                   loadavg 119.12 -> 179.03   <- the sweep's WORST
 #    253.45s wall / 238.09s pytest  pre-1 run 2; rc=0, 4781p/12s/9d;
 #                                   loadavg 179.03 -> 289.04
 #    197.82s wall / 183.23s pytest  pre-1 run 3; rc=0, 4781p/12s/9d;
@@ -86,7 +102,7 @@ type_check_command: "uv run --directory shared pyright --threads 8 src/ tests/"
 #                                   loadavg 105.74 ->  90.92
 #
 # The ten-run MEAN is 225.41s, which would derive only a 400s floor and round
-# to ~600 at 2.6x — the budget this module ALREADY has, and already below the
+# to ~600 at 2.6x — the budget this module then had, and already below the
 # family's convention band. Sizing against the mean would have looked "fine"
 # while leaving this module no safer than today; the rule is the worst RUN,
 # never the mean, for exactly this reason.
@@ -106,16 +122,21 @@ type_check_command: "uv run --directory shared pyright --threads 8 src/ tests/"
 #
 # (1a) BE PRECISE ABOUT WHAT THAT GATHER IS. This paragraph is the full
 # statement; the other five module yamls this task closed carry a one-line
-# pointer here rather than a sixth copy of it.
+# pointer here rather than a sixth copy of it. For shared itself it is HISTORY
+# of the superseded task-5131 sweep since task 11824: an archive W comes from
+# a production verify run, so no gather is reproduced by hand, and (1)'s
+# dry-run is shared's only re-measure. It stays the full statement for the
+# siblings whose W is still a hand sweep.
 #   CORRECTED IN PLACE (task 5131): this paragraph used to open "it is a
 #   LOWER BOUND on the production shape, not a reproduction of it", reasoning
-#   from "the six-way wave measured above". Paragraph (1)'s ten runs are no
-#   longer that six-way wave — runs 2-10 ran under a REAL NINE-WAY gather,
-#   the eight other registered module configs launched concurrently exactly
-#   as verify.run_full_verification's asyncio.gather does — so W now reflects
-#   the full gather this paragraph calls for, rather than an extrapolation
-#   from a smaller one. The two mechanisms below still bound the residual gap
-#   to a true production run and are otherwise unaffected by this change.
+#   from "the six-way wave measured above". The superseded sweep's ten runs
+#   were no longer that six-way wave — runs 2-10 ran under a REAL NINE-WAY
+#   gather, the eight other registered module configs launched concurrently
+#   exactly as verify.run_full_verification's asyncio.gather does — so the
+#   sweep's W then reflected the full gather this paragraph calls for, rather
+#   than an extrapolation from a smaller one. The two mechanisms below still
+#   bound the residual gap to a true production run and are otherwise
+#   unaffected by this change.
 #
 # verify.run_full_verification asyncio.gathers over module_configs.values(),
 # which is NINE registered configs today — the six this task closed plus
@@ -147,25 +168,30 @@ type_check_command: "uv run --directory shared pyright --threads 8 src/ tests/"
 #       have contributed to esc-4502-1's starvation. Not measured; this
 #       corrects only the stale default-1 premise.
 #
-# What remains after those is what the 2.6x multiple absorbs. That is an
-# ASSUMPTION with an error bar, not a measurement, and false infra_timeout on
-# the honest green path is precisely the defect these blocks exist to avoid —
-# so if this suite ever does time out under a full nine-way gather,
-# RE-MEASURE with all nine in flight rather than assuming the multiple still
-# covers it. Task 5131 is the worked example of doing exactly that.
+# For a sibling still sized from a hand sweep, what remains after those is what
+# the 2.6x multiple absorbs. That is an ASSUMPTION with an error bar, not a
+# measurement, and false infra_timeout on the honest green path is precisely
+# the defect these blocks exist to avoid — so if such a suite ever does time
+# out under a full nine-way gather, RE-MEASURE with all nine in flight rather
+# than assuming the multiple still covers it. Task 5131 is the worked example
+# of doing exactly that, and HISTORY for shared: its budget no longer rests on
+# the multiple (see (3)), and its re-measure is (1)'s dry-run.
 #
-# (2) SIZING (task 5131 re-measurement). W = 296.88s, the WORST run across
-#     all TEN VERBATIM runs on record, never the mean.
-#     B ~= 2.6 x W = 771.9 -> rounded up to 800, the 2.6x-convention figure.
-#     The declared budget is now the higher FAMILY-CEILING FLOOR (1500s, task
-#     8402), stated in the paragraph just above the key.
+# (2) SIZING (task 11824). W is the archive figure of (1), the worst GREEN
+#     verbatim run on record, never the mean. The key declares the larger of
+#     the two gated floors (see (7)); at this W that is
+#     min_leg_budget_for_family(W), the FAMILY-CEILING FLOOR stated just above
+#     the key.
+#     HISTORY (task 5131 re-measurement): W = 296.88s, the WORST of the ten
+#     verbatim runs then on record; B ~= 2.6 x W = 771.9 -> rounded up to 800,
+#     the 2.6x-convention figure, until task 8402's FAMILY-CEILING FLOOR.
 # Max-not-mean is forced by recorded evidence, not preference:
 # scripts/orchestrator.yaml logs a ~3x spread (310.33s -> 914.61s) for a
 # BYTE-IDENTICAL command on a BYTE-IDENTICAL tree, which is host load at
-# measurement time rather than suite variance. This sweep reproduced the
-# effect again — the ten runs in (1) span 141.81s -> 296.88s, ~2.09x. The
+# measurement time rather than suite variance. Task 5131's sweep reproduced the
+# effect again — its ten runs in (1) span 141.81s -> 296.88s, ~2.09x. The
 # ten-run MEAN (225.41s) would derive only a 400s floor and round to ~600 at
-# 2.6x — the budget this module already has, and already below the family's
+# 2.6x — the budget this module then had, and already below the family's
 # convention band (see (3)). The worst run, not the mean, is what makes this
 # a real raise rather than a relabelling.
 #
@@ -182,9 +208,12 @@ type_check_command: "uv run --directory shared pyright --threads 8 src/ tests/"
 # 1000/354.56 = 2.82x. shared's convention B/W = 800/296.88 = 2.69x sat inside
 # that band (as tests/scripts' 1000/397.47 = 2.52x did), against the then-
 # declared 600/296.88 = 2.02x — already the family's thinnest before task 5131,
-# and thinner still once W moved from 219.08 to 296.88. Both shared
-# (1500/296.88 = 5.05x) and tests/scripts now sit ABOVE the band, because
-# the FAMILY-CEILING FLOOR binds over the convention (task 8402).
+# and thinner still once W moved from 219.08 to 296.88. Task 8402's
+# FAMILY-CEILING FLOOR then lifted shared well ABOVE the band. Since task
+# 11824's archive W, the budget below over W sits BELOW the band: 2.6 x W
+# would ask for more than the floor the key declares. The convention is a
+# sizing habit, not a gate; min_leg_budget_for_family(W) and min_budget(W)
+# are the gated floors (see (8) and the paragraph above the key).
 #
 # The claim that "600s is ... the absolute floor this task [3473] applies
 # underneath the arithmetic" is UNCHANGED as a statement about task 3473's
@@ -193,14 +222,15 @@ type_check_command: "uv run --directory shared pyright --threads 8 src/ tests/"
 # sentence that followed it, which was specific to shared: "For shared the
 # two agree: 2.6 x W rounds to exactly 600, so the floor is not doing the
 # work here." That coincidence is gone — shared's declared budget is now
-# derived (1500, the FAMILY-CEILING FLOOR; 800 under the 2.6x convention), not
-# the ~600 that once happened to satisfy both the floor and the multiple at
-# once.
+# derived from W (the larger gated floor, see (7)), not the ~600 that once
+# happened to satisfy both the floor and the multiple at once.
 #
-# (4) WHAT THIS ACTUALLY BUYS, stated plainly rather than oversold: 3600s ->
-# 1500s, a 2.40x narrowing (was 4.5x at 800s and 6x at 600s, both now
-# superseded; task 8402 widened it to the FAMILY-CEILING FLOOR). It does NOT
-# make the suite faster and does not detect suite growth — see the GATED-BY
+# (4) WHAT THIS ACTUALLY BUYS, stated plainly rather than oversold: a
+# narrowing from the repo-root warm ceiling
+# (dark-factory-orchestrator.yaml::verify_command_timeout_secs) to the budget
+# below, by their ratio. The ratios once quoted here (2.40x at 1500s, 4.5x at
+# 800s, 6x at 600s) were all against a 3600s ceiling and are superseded. It
+# does NOT make the suite faster and does not detect suite growth — see the GATED-BY
 # guard's own scope note. That gap is precisely why this re-measurement
 # needed to be a TASK (5131): the suite grew 3243 -> 4802 collected (+48%)
 # with no mechanism to notice, until esc-4502-1 surfaced it as a false
@@ -215,39 +245,41 @@ type_check_command: "uv run --directory shared pyright --threads 8 src/ tests/"
 # defaults.yaml) and dark-factory-orchestrator.yaml does NOT override it, and
 # verify.py's attempt loop re-runs a PURE TIMEOUT failure — it breaks only on
 # `attempt.passed or not attempt.pure_timeout_failure or retries >=
-# max_retries`. So on the TASK path a genuine hang burns up to 3 x 1500s = ~75
-# minutes before it surfaces, not ~25. Before task 3473's declaration it
+# max_retries`. So on the TASK path a genuine hang burns up to 3 x the budget
+# below before it surfaces, not 1 x. Before task 3473's declaration it
 # burned up to 3 x 3600s = ~3 hours, not ~60 minutes.
 #
-# The 2.40x RATIO (4.5x at 800s and 6x at 600s, both superseded) is what the
-# narrowing buys and is unaffected by the multiplier — it divides out. The absolute
+# The narrowing RATIO of (4) is what the narrowing buys and is unaffected by
+# the multiplier — it divides out. The absolute
 # minutes are 3x larger than the budget alone suggests, and are written down
 # here because a block that promises to state things "plainly rather than
 # oversold" cannot quietly be 3x optimistic about the one number an operator
 # would act on.
 #
 # The MERGE-verify and background-sweep paths pass max_retries=0 explicitly,
-# so on those the bound is a single 1500s.
+# so on those the bound is the budget below, once.
 #
 # (5) verify_command_timeout_secs is a PER-COMMAND budget, so this bounds the
-# TEST leg on its own — NOT test + lint + type summed. Each leg gets its own
-# 1500s.
+# TEST leg on its own — NOT test + lint + type summed. Each leg gets the whole
+# budget below.
 #
 # (6) verify_cold_command_timeout_secs is DELIBERATELY LEFT UNSET: shared has
 # no build step whose cold cost would justify a separate cold budget. Note what
 # that actually means, because the cascade is counter-intuitive and reads the
 # opposite way at a glance. Per verify._resolve_verify_timeout, an unset module
-# cold knob does NOT inherit the 1500 below — it falls through to the repo-root
-# verify_cold_command_timeout_secs (5400), and on a MERGE-cold verify falls
-# through first to config.merge_verify_cold_command_timeout_secs (7200, shipped
-# by the package-bundled orchestrator/src/orchestrator/defaults.yaml and not
+# cold knob does NOT inherit the budget below — it falls through to
+# dark-factory-orchestrator.yaml::verify_cold_command_timeout_secs, and on a
+# MERGE-cold verify falls through first to
+# config.merge_verify_cold_command_timeout_secs (shipped by the
+# package-bundled orchestrator/src/orchestrator/defaults.yaml and not
 # overridden by the root yaml). A reader who assumes warm covers cold would
-# conclude this module is bounded at 1500 on a cold run when it is bounded at
-# 5400/7200. Gated by assertion (f) of the guard named below.
+# conclude this module is bounded by the budget below on a cold run when it
+# is bounded by those two cold keys. Gated by assertion (f) of the guard
+# named below.
 #
-# (7) RAISE THEM TOGETHER. If this suite grows enough to approach 800s (the
-# 2.6x-convention figure of (2); the declared 1500s is the FAMILY-CEILING FLOOR),
-# RE-MEASURE and raise BOTH this value and
+# (7) RAISE THEM TOGETHER. Whenever the re-measure of (1) moves W, raise BOTH
+# this value, to the larger of the two gated floors of (8),
+# max(min_leg_budget_for_family(W), min_budget(W)), and
 # MEASURED_MODULE_SUITE_WORST_SECS['shared'] in
 # tests/scripts/test_module_verify_budgets.py — never quietly widen one. That
 # exact pair has already rotted once undetected between the two sibling configs
@@ -313,12 +345,16 @@ type_check_command: "uv run --directory shared pyright --threads 8 src/ tests/"
 #         run-to-run spread on the verbatim command alone (141.81s-296.88s
 #         across ten runs) — so the recovery leg could plausibly manufacture
 #         a false infra_timeout even though the verbatim leg had 2.69x
-#         (800/296.88). Task 8402's raise to 1500s grows that headroom to
-#         1500/646.13 = ~2.32x as a side effect, not as a fix.
+#         (800/296.88). The raises of tasks 8402 and 11824 grow that
+#         headroom (the budget below over 646.13) as a side effect, not as
+#         a fix.
 #         Filed as a follow-up (tkt_0RTA9VTCQ7W92QZBK2QB94XJJN)
 #         rather than fixed here: treating 646.13s as a second sizing input,
 #         or giving the recovery path its own bound, is a design change
 #         beyond this task's re-measurement scope.
+#
+#   IT FIRED AGAIN (task 11824): the archive W of (1), 1060.15s, moved
+#   MEASURED_MODULE_SUITE_WORST_SECS['shared'] and the key below in one change.
 #
 # (8) GATED BY tests/scripts/test_module_verify_budgets.py::
 # test_module_carries_its_own_measured_verify_budget[shared].
@@ -327,8 +363,9 @@ type_check_command: "uv run --directory shared pyright --threads 8 src/ tests/"
 # members, whose per-test ceiling is
 # shared/src/shared/whole_tree_guard_family.py::WHOLE_TREE_SCAN_TEST_TIMEOUT.
 # A budget below W + that ceiling kills the leg before a member's backstop
-# fires, turning an attributable hang into a retried infra_timeout. So the
-# binding floor is min_leg_budget_for_family(W), above the 2.6x-convention
-# figure of (2), and the key below declares exactly that floor. Gated by
+# fires, turning an attributable hang into a retried infra_timeout. min_budget(W)
+# is ~2W and this floor ~W + that ceiling, so this floor binds only while W
+# stays below about that ceiling; the key below declares the larger of the two,
+# which at today's W is this one. Gated by
 # tests/scripts/test_module_verify_budgets.py::test_every_leg_running_the_family_outlasts_its_ceiling.
-verify_command_timeout_secs: 1500
+verify_command_timeout_secs: 2300
