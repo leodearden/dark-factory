@@ -5,7 +5,8 @@
 # and every reachable unit reloaded; non-zero = the caller escalates born-at-L2.
 #
 # 1. Confirms main carries the experiment's rule ids (gamma landed), so a reload
-#    cannot silently arm an older table.
+#    cannot silently arm an older table. Main's copy is read once and each id is
+#    tested against it.
 # 2. Runs scripts/routing_experiment_readout.py --aa (leaf beta) over the trailing
 #    window with the experiment salt: the A/A check that seat N showed is required
 #    before any split is read (task-id parity skew, drift). Non-zero there stops here.
@@ -44,10 +45,13 @@ UNITS="${ROUTING_EXPERIMENT_UNITS:-\
 /home/leo/src/autopilot-video:8101}"
 
 # 1. The rule ids must be on main's defaults.yaml (the editable install every unit reads).
+RULES_FILE=orchestrator/src/orchestrator/defaults.yaml
+RULES_TEXT="$(git -C "$ROOT" show "main:${RULES_FILE}")" \
+  || die "cannot read ${RULES_FILE} from main (git's message is above); land gamma before arming"
 IFS=',' read -r -a RULE_IDS <<< "$RULES"
 for rid in "${RULE_IDS[@]}"; do
-  git -C "$ROOT" show main:orchestrator/src/orchestrator/defaults.yaml | grep -q "id: ${rid}\$" \
-    || die "rule id '${rid}' is not in main's defaults.yaml; land gamma before arming"
+  grep -q -- "id: ${rid}\$" <<< "$RULES_TEXT" \
+    || die "rule id '${rid}' is not in main's ${RULES_FILE}; land gamma before arming"
 done
 
 # 2. A/A check on an unchanged window.
