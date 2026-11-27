@@ -660,6 +660,28 @@ class TestRunPanel:
         assert result.reviews['r1']['verdict'] == verdict
         assert result.ceiling_kills == {'r1': ceilings}
 
+    @pytest.mark.parametrize(('backend', 'cost_usd', 'max_turns', 'ceiling_kills'), [
+        pytest.param('claude', 3.0, 90, {'r1': [CapReason.BUDGET, CapReason.BUDGET]}, id='claude-at-its-pinned-budget'),
+        pytest.param('claude', 1.0, 5, {'r1': [CapReason.TURNS, CapReason.TURNS]}, id='claude-at-its-turn-cap'),
+        pytest.param('codex', 3.0, 5, {}, id='codex-enforces-neither-ceiling'),
+    ])
+    @pytest.mark.asyncio
+    async def test_an_inconclusive_failure_is_judged_against_the_reviewer_s_own_ceilings_and_backend(
+        self, source: _Source, backend: str, cost_usd: float, max_turns: int, ceiling_kills: dict,
+    ) -> None:
+        variant = VariantConfig(
+            name='inconclusive', description='Test',
+            reviewers=[ReviewerSpec(name='r1', model='opus', specialization='S.', budget=3.0, backend=backend)],
+        )
+        inconclusive = _make_result(success=False, subtype='error', cost_usd=cost_usd)
+        assert inconclusive.turns == 5
+
+        with patch('orchestrator.evals.reviewer_trial.runner.invoke_agent', new=AsyncMock(return_value=inconclusive)):
+            result = await run_panel(variant, _diff_in(source), stagger_secs=0, max_turns=max_turns)
+
+        assert result.reviews['r1']['verdict'] == 'ERROR'
+        assert result.ceiling_kills == ceiling_kills
+
     @pytest.mark.asyncio
     async def test_a_panel_no_ceiling_ended_records_none(self, source: _Source) -> None:
         with patch(
