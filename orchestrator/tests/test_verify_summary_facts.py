@@ -156,6 +156,26 @@ class TestTheSummaryCarriesTheRole:
         assert _read_archived_summary(archive_root)['role'] == role
 
 
+class TestTheWhitelistCarriesTheResourcesRecord:
+    """C4 (task 6355) rides ``commands[].resources``; the whitelist must not drop it."""
+
+    def test_each_command_carries_its_own_record(self):
+        from orchestrator.verify import _build_summary_payload
+
+        record = {'capture': 'exit', 'cpu_usec': 7}
+        hand_built = _run('lint')
+
+        payload = _build_summary_payload(
+            [_run('test', resources=record), hand_built], 'clean', '', role='merge',
+        )
+
+        assert 'resources' not in hand_built
+        by_label = {entry['label']: entry for entry in payload['commands']}
+        assert by_label['test']['resources'] == record
+        assert 'resources' in by_label['lint']
+        assert by_label['lint']['resources'] is None
+
+
 class TestTheTopLevelNamesItsCommand:
     """The top-level rc/cmd/... copy ONE run's fields; 'label' says which.
 
