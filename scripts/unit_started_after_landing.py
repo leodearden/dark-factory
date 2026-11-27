@@ -25,15 +25,13 @@ import sys
 from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import NoReturn
 
 import _checkout as _checkout
+from _predicate_exit import EXIT_ERROR, EXIT_NOT_YET, PredicateParser
 from git_env import scrubbed_git_env
 from shared.merge_subject import MergeSubject, merge_subject_pattern, parse_merge_subject
 
 EXIT_STARTED_AFTER = 0
-EXIT_NOT_YET = os.EX_TEMPFAIL
-EXIT_ERROR = 1
 
 MAIN_BRANCH = 'main'
 TASK_BRANCH_PREFIX = 'task/'
@@ -111,16 +109,8 @@ def landing_commit_time(repo: Path, task_id: int) -> datetime | None:
     return None
 
 
-class _PredicateParser(argparse.ArgumentParser):
-    """A parser whose usage error exits 1: a predicate waits only by exiting 75."""
-
-    def error(self, message: str) -> NoReturn:
-        self.print_usage(sys.stderr)
-        self.exit(EXIT_ERROR, f'{self.prog}: error: {message}\n')
-
-
-def _parser() -> _PredicateParser:
-    parser = _PredicateParser(
+def _parser() -> PredicateParser:
+    parser = PredicateParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument('unit', help='a systemd user unit, e.g. fused-memory.service')

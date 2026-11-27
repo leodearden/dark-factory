@@ -44,9 +44,9 @@ from collections.abc import Callable, Sequence
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from enum import Enum
-from typing import NoReturn
 
 import _checkout as _checkout
+from _predicate_exit import EXIT_ERROR, EXIT_NOT_YET, PredicateParser
 from routing_experiment_readout import throughput_options
 from routing_throughput import (
     IntervalSide,
@@ -75,20 +75,12 @@ _EXIT = {
     LookVerdict.GAIN: 0,
     LookVerdict.LOSS: 0,
     LookVerdict.NO_DIFFERENCE_AT_CAP: 0,
-    LookVerdict.UNDECIDED: 75,
-    LookVerdict.NOT_DUE: 75,
-    LookVerdict.COMPLIANCE_FAILURE: 1,
-    LookVerdict.ERROR: 1,
+    LookVerdict.UNDECIDED: EXIT_NOT_YET,
+    LookVerdict.NOT_DUE: EXIT_NOT_YET,
+    LookVerdict.COMPLIANCE_FAILURE: EXIT_ERROR,
+    LookVerdict.ERROR: EXIT_ERROR,
 }
 _DECIDED = frozenset(verdict for verdict, status in _EXIT.items() if status == 0)
-
-
-class _LookParser(argparse.ArgumentParser):
-    """A parser whose usage error exits 1: a predicate waits only by exiting 75."""
-
-    def error(self, message: str) -> NoReturn:
-        self.print_usage(sys.stderr)
-        self.exit(_EXIT[LookVerdict.ERROR], f'{self.prog}: error: {message}\n')
 
 
 def _non_negative_int(text: str) -> int:
@@ -105,8 +97,8 @@ def _look_week(text: str) -> int:
     return value
 
 
-def _parser() -> _LookParser:
-    parser = _LookParser(
+def _parser() -> PredicateParser:
+    parser = PredicateParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
         allow_abbrev=False,
     )
