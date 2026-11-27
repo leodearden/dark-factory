@@ -99,9 +99,10 @@ from fused_memory.utils.store_mutation_preflight import (
     assert_store_mutation_allowed,
 )
 from fused_memory.utils.validation import is_full_uuid
+from shared.human_curator_gate import is_human_curator_gate
 from shared.project_id import project_id_for_root
 from shared.project_layout import CheckoutRootError, default_project_root, escalation_queue_dir
-from shared.task_metadata import HUMAN_CURATOR_ADJUDICATED_AT_KEY, HUMAN_CURATOR_GATE_KEY
+from shared.task_metadata import HUMAN_CURATOR_ADJUDICATED_AT_KEY
 from shared.task_statuses import ACTIVE
 from shared.tasks_db_readonly import TaskDbUnreadable, connect_ro
 
@@ -588,7 +589,7 @@ async def gate_closure(ctx: RunContext, gate: OpenGate, topic: str) -> ClosureVe
 def _with_next_calls(ctx: RunContext, gate: OpenGate, report: GateReport) -> GateReport:
     """PRD D9: a human-curator gate is stamped first, or its runner re-blocks it on resume; its pin is acknowledged after the stamp."""
     calls: list[ToolCall] = []
-    curator = gate.metadata.get(HUMAN_CURATOR_GATE_KEY) is True
+    curator = is_human_curator_gate(gate.metadata)
     if curator:
         calls.append(ToolCall('update_task', {
             'id': gate.task_id,

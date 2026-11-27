@@ -38,6 +38,7 @@ from shared.before_done_paths import (
     require_runnable_script,
     resolve_before_done_paths,
 )
+from shared.human_curator_gate import curator_gate_declarer, is_human_curator_gate
 from shared.milestone_rearm import rearmed_milestone
 from shared.repo_paths import DARK_FACTORY_ROOT_ENV, resolve_dark_factory_root
 from shared.task_fields import dependency_ids
@@ -478,26 +479,6 @@ def _is_operational_llm_gate(metadata: dict) -> bool:
     return metadata.get(OPERATIONAL_LLM_GATE_MARKER_KEY) is True
 
 
-def _is_human_curator_gate(metadata: dict) -> bool:
-    """Return True iff *metadata* marks a gate needing human CONTENT adjudication.
-
-    Task 3341.  Keys on ``HUMAN_CURATOR_GATE_KEY`` via plain TRUTHINESS —
-    a DELIBERATE divergence from ``_is_operational_llm_gate`` directly above,
-    which uses a strict ``is True``.  The two markers have opposite failure
-    costs, so they get opposite postures:
-
-    * ``_is_operational_llm_gate`` is a ROUTING hint. A false positive
-      misroutes a human-handling lane, so failing open (``is True``) is right.
-    * This is a SAFETY gate. A false NEGATIVE silently reproduces the task-3181
-      phantom-done — the exact failure this predicate exists to prevent. So a
-      truthy-but-not-``True`` value (e.g. the string ``'true'`` from a hand
-      edit or a JSON round-trip) must fail CLOSED: the guard still applies.
-
-    Pinned by ``test_string_truthy_curator_gate_marker_still_trips_the_guard``.
-    """
-    return bool(metadata.get(HUMAN_CURATOR_GATE_KEY))
-
-
 def _curator_adjudication_confirmed(metadata: dict) -> bool:
     """Return True iff *metadata* carries positive proof the content review happened.
 
@@ -713,10 +694,10 @@ def curator_gate_pin(task_id: str, metadata: dict) -> GatePin:
     Why the record carries it: docs/deterministic-runner.md
     "Human-curator gate contract".
     """
-    if not _is_human_curator_gate(metadata):
+    if not is_human_curator_gate(metadata):
         return GatePin()
     return GatePin(
-        declared_by=(f'task-{task_id}-human-curator-gate',),
+        declared_by=(curator_gate_declarer(task_id),),
         reason=(
             f'Task {task_id} carries `metadata.{HUMAN_CURATOR_GATE_KEY}`: it closes '
             'only on human CONTENT adjudication of every entry it names. '
@@ -3018,7 +2999,7 @@ class DeterministicRunner:
         # would delete the signal in exactly the configurations where it is the
         # last one standing.
         # Pinned by test_curator_marker_on_a_non_pure_gate_is_loud.
-        if before_done is not None and _is_human_curator_gate(metadata):
+        if before_done is not None and is_human_curator_gate(metadata):
             logger.warning(
                 'DeterministicRunner: task %s carries metadata.%s but ALSO a '
                 'before_done action. A curator gate is a pure gate by '
@@ -3170,7 +3151,7 @@ class DeterministicRunner:
                     # CONTENT work a curator gate asks for. Task 3181 is where
                     # the two diverged. Fail closed.
                     if (
-                        _is_human_curator_gate(metadata)
+                        is_human_curator_gate(metadata)
                         and not _curator_adjudication_confirmed(metadata)
                     ):
                         logger.warning(
@@ -3206,7 +3187,7 @@ class DeterministicRunner:
                             note='resumed after gate resolution',
                         ),
                     )
-                elif _is_human_curator_gate(metadata):
+                elif is_human_curator_gate(metadata):
                     # Curator gate closing legitimately (task 3341).  Reaching
                     # here means BOTH rungs of the proof ladder held: a closed
                     # own-role escalation record exists (rung one, task 2954)

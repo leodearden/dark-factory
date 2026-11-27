@@ -617,6 +617,21 @@ class TestExecuteWrites:
         assert stamp['metadata_mode'] == 'merge'
         assert gate['next'][1]['arguments']['acknowledge_declared_pins'] == [escalation_id]
 
+    def test_a_string_marked_curator_gate_is_stamped_as_its_runner_reads_it(
+        self, root, fake, seed_tasks, capsys,
+    ):
+        row = gate_row(86, TOPIC, observed=fake.seed_many(3))
+        row['metadata']['human_curator_gate'] = 'true'
+        seed_tasks([row])
+        escalation_id = seed_gate_escalation(root, 86)
+
+        code, payload = drive(root, fake, capsys, '--execute', '--claim', f'{TOPIC}={CLAIM}')
+
+        assert code == 0
+        gate = gate_of(payload, 86)
+        assert tools_of(gate) == ['update_task', 'resolve_issue']
+        assert gate['next'][1]['arguments']['acknowledge_declared_pins'] == [escalation_id]
+
     def test_a_closed_gate_with_no_pending_escalation_says_so(
         self, root, fake, seed_tasks, capsys,
     ):
