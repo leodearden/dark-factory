@@ -141,6 +141,7 @@ from orchestrator.verify_cmd import (
 from orchestrator.verify_command_resources import (
     CommandCapture,
     CommandResources,
+    allocate_command_capture,
     watch_relocations,
 )
 from orchestrator.verify_event_channel import VerifyEventChannel, allocate_verify_event_log
@@ -8162,6 +8163,23 @@ async def run_verification(
             infix = ''
         return verify_dir / f'attempt-{current_attempt}{infix}.{label}.log'
 
+    def _command_resources(
+        capture: CommandCapture, *, label: LegSlot, segment: str | None, started_at: str,
+    ) -> CommandResources:
+        """One command's C4 record, stamped with this verify's identity."""
+        return capture.record(
+            project=config.fused_memory.project_id,
+            role=role,
+            task_id=task_id,
+            attempt=attempt_id,
+            module=module_prefix,
+            leg=label.value,
+            segment=segment,
+            plan_id=None if admission_request is None else admission_request.plan_id,
+            started_at=started_at,
+            ended_at=datetime.now(UTC).isoformat(),
+        )
+
     async def _run_leg_command(
         leg_cmd: str,
         *,
@@ -8375,9 +8393,11 @@ async def run_verification(
                     len(chain_segments),
                 )
             if chain_segments is not None:
-                # Each segment's own xdist facts (task 5671), keyed by label and
-                # attached to its segment dict once _run_segmented returns.
+                # Each segment's own xdist facts (task 5671) and C4 record (task
+                # 6355), keyed by label and attached to its segment dict once
+                # _run_segmented returns.
                 segment_xdist: dict[str, dict] = {}
+                segment_resources: dict[str, dict] = {}
 
                 async def _run_one_segment(
                     segment_cmd: str,
@@ -8446,18 +8466,26 @@ async def run_verification(
                             governed = (
                                 f'{shlex.join(seg_prefix)} /bin/bash -c {shlex.quote(governed)}'
                             )
-                    return await _run_cmd(
-                        governed,
-                        segment_cwd,
-                        segment_timeout,
-                        env=leg_env or None,
-                        log_path=_stream_log_path(
-                            f'{label}.{segment_label}', current_attempt,
-                        ),
-                        **_scope_kw,
-                        **_clock_kw,
-                        **segment_plugin_kw,
-                    )
+                    segment_started_at = datetime.now(UTC).isoformat()
+                    with allocate_command_capture() as capture:
+                        segment_outcome = await _run_cmd(
+                            governed,
+                            segment_cwd,
+                            segment_timeout,
+                            env=leg_env or None,
+                            log_path=_stream_log_path(
+                                f'{label}.{segment_label}', current_attempt,
+                            ),
+                            **_scope_kw,
+                            **_clock_kw,
+                            **segment_plugin_kw,
+                            capture=capture,
+                        )
+                        segment_resources[segment_label] = _command_resources(
+                            capture, label=label, segment=segment_label,
+                            started_at=segment_started_at,
+                        ).to_dict()
+                    return segment_outcome
 
                 rc, out, timed_out_flag, segment_dicts = await _run_segmented(
                     chain_segments,
@@ -8470,24 +8498,34 @@ async def run_verification(
                 )
                 # A not_run segment was never rendered, so it ran with nothing.
                 segment_dicts = [
-                    {**seg, 'xdist': segment_xdist.get(seg['label'])}
+                    {
+                        **seg,
+                        'xdist': segment_xdist.get(seg['label']),
+                        'resources': segment_resources.get(seg['label']),
+                    }
                     for seg in segment_dicts
                 ]
                 scope_launch_refused = _segments_red_only_from_scope_launch_refusal(
                     segment_dicts,
                 )
+                resources = None
             else:
                 segment_dicts = None
-                outcome = await _run_cmd(
-                    cmd,
-                    worktree,
-                    timeout,
-                    env=leg_env or None,
-                    log_path=_stream_log_path(label, current_attempt),
-                    **_scope_kw,
-                    **_clock_kw,
-                    **_plugin_kw,
-                )
+                with allocate_command_capture() as capture:
+                    outcome = await _run_cmd(
+                        cmd,
+                        worktree,
+                        timeout,
+                        env=leg_env or None,
+                        log_path=_stream_log_path(label, current_attempt),
+                        **_scope_kw,
+                        **_clock_kw,
+                        **_plugin_kw,
+                        capture=capture,
+                    )
+                    resources = _command_resources(
+                        capture, label=label, segment=None, started_at=started_at,
+                    )
                 rc, out, timed_out_flag = outcome
                 scope_launch_refused = isinstance(outcome, ScopeLaunchRefused)
             # Both branches converge here, still INSIDE the slot and one
@@ -8609,6 +8647,7 @@ async def run_verification(
                 rc=rc, timed_out=timed_out_flag,
             ),
             scope_launch_refused=scope_launch_refused,
+            resources=resources,
         )
 
     async def _run_or_skip_timed(

@@ -621,15 +621,28 @@ class TestEveryCommandCarriesItsResourcesRecord:
 _SEGMENTED_TEST_CMD = 'cd a && uv run pytest tests/ -q && cd ../b && uv run pytest tests/ -q'
 
 
+def _segmented_module_config(timeout_secs: float | None = None):
+    from orchestrator.config import ModuleConfig
+
+    return ModuleConfig(
+        prefix='__fallback__',
+        test_command=_SEGMENTED_TEST_CMD,
+        lint_command=_LINT_CMD,
+        type_check_command=None,
+        verify_command_timeout_secs=timeout_secs,
+        verify_cold_command_timeout_secs=timeout_secs,
+    )
+
+
 class TestASegmentedLegCarriesOneRecordPerSegment:
     @staticmethod
-    async def _run(tmp_path: Path, run_cmd) -> dict:
+    async def _run(tmp_path: Path, run_cmd, timeout_secs: float | None = None) -> dict:
         for sub in ('a', 'b'):
             (tmp_path / sub).mkdir(parents=True, exist_ok=True)
         await _run_task_verification(
             tmp_path,
             run_cmd=run_cmd,
-            module_config=_module_config(test_command=_SEGMENTED_TEST_CMD),
+            module_config=_segmented_module_config(timeout_secs),
             segment_chained_test=True,
         )
         return _entry(_read_worktree_summary(tmp_path), 'test')
@@ -649,7 +662,17 @@ class TestASegmentedLegCarriesOneRecordPerSegment:
 
     @pytest.mark.asyncio
     async def test_a_segment_that_never_ran_has_no_record(self, tmp_path):
-        test = await self._run(tmp_path, _capturing(test_rc=1))
+        import asyncio
+
+        capturing = _capturing()
+
+        async def first_segment_spends_the_budget(cmd, cwd, timeout, *args, **kwargs):
+            outcome = await capturing(cmd, cwd, timeout, *args, **kwargs)
+            if 'pytest' in cmd:
+                await asyncio.sleep(1.5)
+            return outcome
+
+        test = await self._run(tmp_path, first_segment_spends_the_budget, timeout_secs=1)
 
         first, second = test['segments']
         assert first['resources']['capture'] == 'exit'

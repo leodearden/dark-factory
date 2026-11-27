@@ -54,10 +54,14 @@ def recorded_scope_spawns(argv_dir: Path) -> list[list[str]]:
 
 
 def scope_payload_command(record: list[str]) -> str:
-    """The leg command a recorded spawn's bash payload runs, i.e. the ``-c``
-    string after verify's launch-handshake line."""
-    _handshake, newline, command = record[-1].partition('\n')
+    """The leg command a recorded spawn's bash payload runs: the ``-c`` string
+    after verify's launch-handshake line, inside the C4 capture wrapper
+    (orchestrator/src/orchestrator/verify_command_resources.py::CommandCapture.wrap)."""
+    _handshake, newline, wrapped = record[-1].partition('\n')
     assert newline, f'no launch-handshake line in the payload: {record!r}'
+    _record_cgroup, opened, rest = wrapped.partition('; ( ')
+    command, closed, _copy_counters = rest.rpartition('\n)\n__df_rc=$?\n')
+    assert opened and closed, f'no capture wrapper around the command: {wrapped!r}'
     return command
 
 
