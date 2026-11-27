@@ -22,6 +22,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from _mock_openai_server import MockOpenAIServer, mock_openai_server, responses_body
+from _recording_llm_client import (
+    PLAN_KEY,
+    ROUTE_MODEL,
+    decisions_routed_to,
+    scrub_ambient_openai_base_url,
+)
 from graphiti_core.llm_client import OpenAIClient
 from graphiti_core.llm_client.config import LLMConfig as GraphitiLLMConfig
 from graphiti_core.llm_client.openai_generic_client import OpenAIGenericClient
@@ -38,12 +44,7 @@ from fused_memory.backends.llm_clients import (
 )
 from fused_memory.backends.llm_token_usage import LlmTokenUsage, measure_llm_tokens
 from fused_memory.backends.sdk_client_lifecycle import close_wrapped_sdk_clients
-from fused_memory.config.schema import (
-    AnthropicProviderConfig,
-    ExtractionRouteConfig,
-    FusedMemoryConfig,
-    PlanRouteConfig,
-)
+from fused_memory.config.schema import AnthropicProviderConfig, FusedMemoryConfig, PlanRouteConfig
 from fused_memory.models.enums import MemoryCategory
 from fused_memory.services.plan_route import PlanRoute, PlanRouteSite
 
@@ -824,8 +825,6 @@ class TestBuildLLMClientBranchPreservation:
 # --------------------------------------------------------------------------- #
 
 _DECISIONS = MemoryCategory.decisions_and_rationale
-_ROUTE_MODEL = 'gpt-6.1-sol'
-_PLAN_KEY = 'plan-key'
 
 
 class _Item(BaseModel):
@@ -854,13 +853,12 @@ class _RouteRig:
 
     def nothing_carried_the_route_model(self) -> bool:
         bodies = [r['json_body'] or {} for r in (*self.proxy.requests, *self.api.requests)]
-        return all(body.get('model') != _ROUTE_MODEL for body in bodies)
+        return all(body.get('model') != ROUTE_MODEL for body in bodies)
 
 
 @pytest.fixture
 def rig(mock_config, monkeypatch) -> Iterator[_RouteRig]:
-    for name in ('OPENAI_BASE_URL', 'OPENAI_API_BASE', 'OPENAI_API_URL'):
-        monkeypatch.delenv(name, raising=False)
+    scrub_ambient_openai_base_url(monkeypatch)
     with mock_openai_server() as proxy, mock_openai_server() as api:
         for server, tokens in ((proxy, (30, 10)), (api, (5, 1))):
             server.set_response(
@@ -868,11 +866,7 @@ def rig(mock_config, monkeypatch) -> Iterator[_RouteRig]:
             )
         mock_config.llm.model = 'gpt-4o-mini'
         mock_config.llm.providers.openai.api_url = api.base_url
-        mock_config.llm.extraction_routes = {
-            'decisions_and_rationale': ExtractionRouteConfig(
-                model=_ROUTE_MODEL, reasoning_effort='low', api_url=proxy.base_url, api_key=_PLAN_KEY,
-            ),
-        }
+        mock_config.llm.extraction_routes = decisions_routed_to(proxy.base_url)
         yield _RouteRig(mock_config, proxy, api, PlanRoute(PlanRouteConfig(proxy_url=proxy.base_url)))
 
 
@@ -903,7 +897,7 @@ class TestAnExtractionRouteIsBuiltOnTheGatedPlanProxy:
             route = client.routes[_DECISIONS]
             assert isinstance(route, ExplicitEffortOpenAIClient)
             assert (route.reasoning_effort, route.model, route.max_tokens) == (
-                'low', _ROUTE_MODEL, rig.cfg.llm.max_tokens,
+                'low', ROUTE_MODEL, rig.cfg.llm.max_tokens,
             )
             assert type(client.default) is OpenAIClient
             assert client.default.model == 'gpt-4o-mini'
@@ -918,10 +912,10 @@ class TestAnExtractionRouteIsBuiltOnTheGatedPlanProxy:
 
         [sent] = rig.proxy.requests_to('/responses')
         body = sent['json_body']
-        assert body['model'] == _ROUTE_MODEL
+        assert body['model'] == ROUTE_MODEL
         assert body['reasoning'] == {'effort': 'low'}
         assert 'temperature' not in body
-        assert _authorization(sent) == f'Bearer {_PLAN_KEY}'
+        assert _authorization(sent) == f'Bearer {PLAN_KEY}'
         assert rig.api.requests_to('/responses') == []
 
     @pytest.mark.asyncio
@@ -954,10 +948,10 @@ class TestAnExtractionRouteIsBuiltOnTheGatedPlanProxy:
             r.getMessage() for r in caplog.records
             if r.getMessage().startswith('Graphiti LLM:') and 'decisions_and_rationale' in r.getMessage()
         ]
-        assert _ROUTE_MODEL in line
+        assert ROUTE_MODEL in line
         assert 'effort low' in line
         assert rig.proxy.base_url in line
-        assert _PLAN_KEY not in line
+        assert PLAN_KEY not in line
 
     @pytest.mark.asyncio
     async def test_each_clients_tokens_are_credited_to_its_model(self, rig: _RouteRig) -> None:
@@ -968,7 +962,7 @@ class TestAnExtractionRouteIsBuiltOnTheGatedPlanProxy:
 
         assert m.by_model == {
             'gpt-4o-mini': LlmTokenUsage(5, 1, 1),
-            _ROUTE_MODEL: LlmTokenUsage(30, 10, 1),
+            ROUTE_MODEL: LlmTokenUsage(30, 10, 1),
         }
 
 

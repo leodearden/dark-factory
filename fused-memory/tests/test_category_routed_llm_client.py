@@ -7,11 +7,9 @@ nothing inside it is mocked.
 from __future__ import annotations
 
 import asyncio
-from typing import Any
 
 import pytest
-from graphiti_core.llm_client.client import LLMClient
-from graphiti_core.llm_client.config import LLMConfig as GraphitiLLMConfig
+from _recording_llm_client import RecordingLLMClient
 from graphiti_core.llm_client.config import ModelSize
 from graphiti_core.prompts.models import Message
 from graphiti_core.tracer import NoOpTracer
@@ -46,51 +44,18 @@ class _Answer(BaseModel):
     name: str
 
 
-class _RecordingClient(LLMClient):
-    """Answers with its own name and records every call it receives."""
-
-    def __init__(self, name: str) -> None:
-        super().__init__(GraphitiLLMConfig(model=f'{name}-model'))
-        self.name = name
-        self.calls: list[dict[str, Any]] = []
-        self.tracers: list[Any] = []
-
-    def set_tracer(self, tracer: Any) -> None:
-        self.tracers.append(tracer)
-        super().set_tracer(tracer)
-
-    async def generate_response(
-        self,
-        messages: list[Message],
-        response_model: type[BaseModel] | None = None,
-        max_tokens: int | None = None,
-        model_size: ModelSize = ModelSize.medium,
-        group_id: str | None = None,
-        prompt_name: str | None = None,
-    ) -> dict[str, Any]:
-        await asyncio.sleep(0)
-        self.calls.append({
-            'messages': messages, 'response_model': response_model, 'max_tokens': max_tokens,
-            'model_size': model_size, 'group_id': group_id, 'prompt_name': prompt_name,
-        })
-        return {'client': self.name}
-
-    async def _generate_response(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
-        raise AssertionError('generate_response is overridden')
+@pytest.fixture
+def default() -> RecordingLLMClient:
+    return RecordingLLMClient('default')
 
 
 @pytest.fixture
-def default() -> _RecordingClient:
-    return _RecordingClient('default')
+def route() -> RecordingLLMClient:
+    return RecordingLLMClient('route')
 
 
 @pytest.fixture
-def route() -> _RecordingClient:
-    return _RecordingClient('route')
-
-
-@pytest.fixture
-def router(default: _RecordingClient, route: _RecordingClient) -> CategoryRoutedLLMClient:
+def router(default: RecordingLLMClient, route: RecordingLLMClient) -> CategoryRoutedLLMClient:
     return CategoryRoutedLLMClient(default, {MemoryCategory.decisions_and_rationale: route})
 
 
@@ -105,7 +70,7 @@ class TestAScopedExtractionPromptRidesItsCategorysRoute:
     @pytest.mark.asyncio
     @pytest.mark.parametrize('prompt_name', _EXTRACTION)
     async def test_an_extraction_prompt_reaches_the_route(
-        self, router: CategoryRoutedLLMClient, route: _RecordingClient, prompt_name: str,
+        self, router: CategoryRoutedLLMClient, route: RecordingLLMClient, prompt_name: str,
     ) -> None:
         messages = [Message(role='user', content='the record')]
         with extraction_category_scope(MemoryCategory.decisions_and_rationale):
@@ -167,7 +132,7 @@ class TestTheScope:
 
 class TestTheRoutersSurface:
     def test_set_tracer_reaches_every_inner_client(
-        self, router: CategoryRoutedLLMClient, default: _RecordingClient, route: _RecordingClient,
+        self, router: CategoryRoutedLLMClient, default: RecordingLLMClient, route: RecordingLLMClient,
     ) -> None:
         tracer = NoOpTracer()
 
@@ -177,13 +142,13 @@ class TestTheRoutersSurface:
         assert route.tracers == [tracer]
 
     def test_wrapped_clients_are_the_default_then_its_routes(
-        self, router: CategoryRoutedLLMClient, default: _RecordingClient, route: _RecordingClient,
+        self, router: CategoryRoutedLLMClient, default: RecordingLLMClient, route: RecordingLLMClient,
     ) -> None:
         assert wrapped_llm_clients(router) == (default, route)
         assert wrapped_llm_clients(default) == (default,)
 
     def test_it_presents_the_defaults_model_and_tracker(
-        self, router: CategoryRoutedLLMClient, default: _RecordingClient,
+        self, router: CategoryRoutedLLMClient, default: RecordingLLMClient,
     ) -> None:
         assert router.model == default.model
         assert router.token_tracker is default.token_tracker

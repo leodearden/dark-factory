@@ -20,9 +20,14 @@ import pytest
 from _fm_helpers import mock_memory_backends
 from _fm_polling import poll_until
 from _mock_openai_server import mock_openai_server, responses_body
+from _recording_llm_client import (
+    PLAN_KEY,
+    ROUTE_MODEL,
+    RecordingLLMClient,
+    decisions_routed_to,
+    scrub_ambient_openai_base_url,
+)
 from graphiti_core.llm_client.client import LLMClient
-from graphiti_core.llm_client.config import LLMConfig as GraphitiLLMConfig
-from graphiti_core.llm_client.config import ModelSize
 from graphiti_core.prompts.models import Message
 from pydantic import BaseModel
 
@@ -34,44 +39,11 @@ from fused_memory.backends.llm_clients import (
     wrapped_llm_clients,
 )
 from fused_memory.backends.sdk_client_lifecycle import close_wrapped_sdk_clients
-from fused_memory.config.schema import ExtractionRouteConfig, FusedMemoryConfig, PlanRouteConfig
+from fused_memory.config.schema import FusedMemoryConfig, PlanRouteConfig
 from fused_memory.models.enums import MemoryCategory
 from fused_memory.services.memory_service import MemoryService
 
 _DECISIONS = MemoryCategory.decisions_and_rationale
-
-
-class _RecordingSdk:
-    def __init__(self) -> None:
-        self.closed = False
-
-    async def close(self) -> None:
-        self.closed = True
-
-
-class _RecordingClient(LLMClient):
-    """Answers with its own name; holds a recording SDK client."""
-
-    def __init__(self, name: str) -> None:
-        super().__init__(GraphitiLLMConfig(model=f'{name}-model'))
-        self.name = name
-        self.client = _RecordingSdk()
-        self.prompt_names: list[str | None] = []
-
-    async def generate_response(
-        self,
-        messages: list[Message],
-        response_model: type[BaseModel] | None = None,
-        max_tokens: int | None = None,
-        model_size: ModelSize = ModelSize.medium,
-        group_id: str | None = None,
-        prompt_name: str | None = None,
-    ) -> dict[str, Any]:
-        self.prompt_names.append(prompt_name)
-        return {'client': self.name}
-
-    async def _generate_response(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
-        raise AssertionError('generate_response is overridden')
 
 
 class _ExtractingGraphiti:
@@ -88,8 +60,8 @@ class _ExtractingGraphiti:
 
 
 @pytest.fixture
-def clients() -> tuple[_RecordingClient, _RecordingClient, CategoryRoutedLLMClient]:
-    default, route = _RecordingClient('default'), _RecordingClient('route')
+def clients() -> tuple[RecordingLLMClient, RecordingLLMClient, CategoryRoutedLLMClient]:
+    default, route = RecordingLLMClient('default'), RecordingLLMClient('route')
     return default, route, CategoryRoutedLLMClient(default, {_DECISIONS: route})
 
 
@@ -207,11 +179,7 @@ class _Edge(BaseModel):
 
 def _route_decisions_through(config: FusedMemoryConfig, proxy_url: str) -> None:
     config.plan_route = PlanRouteConfig(proxy_url=proxy_url)
-    config.llm.extraction_routes = {
-        'decisions_and_rationale': ExtractionRouteConfig(
-            model='gpt-6.1-sol', reasoning_effort='low', api_url=proxy_url, api_key='plan-key',
-        ),
-    }
+    config.llm.extraction_routes = decisions_routed_to(proxy_url)
 
 
 class TestInitializeBuildsTheGatedRoute:
@@ -219,8 +187,7 @@ class TestInitializeBuildsTheGatedRoute:
     async def test_the_injected_client_routes_decisions_to_the_plan_proxy(
         self, mock_config, tmp_path: Path, monkeypatch,
     ) -> None:
-        for name in ('OPENAI_BASE_URL', 'OPENAI_API_BASE', 'OPENAI_API_URL'):
-            monkeypatch.delenv(name, raising=False)
+        scrub_ambient_openai_base_url(monkeypatch)
         with mock_openai_server() as proxy:
             proxy.set_response('/responses', responses_body(json.dumps({'fact': 'f'})))
             _route_decisions_through(mock_config, proxy.base_url)
@@ -235,14 +202,13 @@ class TestInitializeBuildsTheGatedRoute:
                     )
 
             [sent] = proxy.requests_to('/responses')
-            assert sent['json_body']['model'] == 'gpt-6.1-sol'
+            assert sent['json_body']['model'] == ROUTE_MODEL
 
     @pytest.mark.asyncio
     async def test_startup_logs_the_active_route_once_and_nothing_off(
         self, mock_config, tmp_path: Path, monkeypatch, caplog,
     ) -> None:
-        for name in ('OPENAI_BASE_URL', 'OPENAI_API_BASE', 'OPENAI_API_URL'):
-            monkeypatch.delenv(name, raising=False)
+        scrub_ambient_openai_base_url(monkeypatch)
         with mock_openai_server() as proxy:
             _route_decisions_through(mock_config, proxy.base_url)
 
@@ -256,9 +222,9 @@ class TestInitializeBuildsTheGatedRoute:
             if message.startswith('Graphiti LLM:') and 'decisions_and_rationale' in message
         ]
         assert level == logging.INFO
-        assert 'gpt-6.1-sol' in line
+        assert ROUTE_MODEL in line
         assert 'effort low' in line
         assert proxy.base_url in line
-        assert 'plan-key' not in line
+        assert PLAN_KEY not in line
         assert [m for lv, m in messages if lv >= logging.WARNING and 'decisions_and_rationale' in m] == []
         assert [m for _, m in messages if 'is OFF' in m] == []
