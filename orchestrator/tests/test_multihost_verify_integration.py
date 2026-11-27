@@ -63,6 +63,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from _gate_fixtures import gated_remote_runner
+from _git_fixtures import seed_repo
 from _merge_lane_fakes import (
     FakeVerifier,
     VerifyScript,
@@ -1186,22 +1187,9 @@ _LANE_STOP_TIMEOUT = 30.0
 HOST_CAPSTONE_TEST_TIMEOUT = 600
 
 
-async def _setup_repo(repo: Path) -> None:
-    """Initialise a git repo with a single commit (README.md) on main."""
-    await _run(['git', 'init', '-b', 'main'], cwd=repo)
-    await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=repo)
-    await _run(['git', 'config', 'user.name', 'Test'], cwd=repo)
-    (repo / 'README.md').write_text('# Test\n')
-    await _run(['git', 'add', '-A'], cwd=repo)
-    await _run(['git', 'commit', '-m', 'Initial commit'], cwd=repo)
-
-
 @pytest.fixture
 def host_repo(tmp_path: Path) -> Path:
-    repo = tmp_path / 'repo'
-    repo.mkdir()
-    asyncio.run(_setup_repo(repo))
-    return repo
+    return seed_repo(tmp_path / 'repo')
 
 
 @pytest.fixture
