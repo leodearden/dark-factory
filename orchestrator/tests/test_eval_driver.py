@@ -49,6 +49,7 @@ from _campaign_gate_helpers import (
 from orchestrator.evals.configs import EvalConfig
 from orchestrator.evals.metrics import EvalMetrics, RoleUnderTest
 from orchestrator.evals.results import EvalResult, ResultStore
+from orchestrator.routing import PlanShape
 from orchestrator.workflow import WorkflowOutcome
 
 
@@ -165,7 +166,7 @@ def _off_allowlist_judge_cfg() -> EvalConfig:
     return EvalConfig('judge-fable', 'claude', 'claude-fable-5', 'medium', role=RoleUnderTest.JUDGE)
 
 
-def _route(cfg, role_name: str):
+def _route(cfg, role_name: str, *, plan_shape: PlanShape | None = None, routing_tier: int = 0):
     from orchestrator.routing import RoleDefaults, RouteInputs, resolve_route
 
     return resolve_route(
@@ -173,8 +174,8 @@ def _route(cfg, role_name: str):
             role_name=role_name,
             task_id='shadow_1_a',
             task_metadata={},
-            plan_shape=None,
-            routing_tier=0,
+            plan_shape=plan_shape,
+            routing_tier=routing_tier,
             dispatch_count=0,
             role_defaults=RoleDefaults('sonnet', 'high', 5.0, 50),
         ),
@@ -229,6 +230,94 @@ class TestBuildEvalOrchConfigAdmitsCandidateModel:
         cfg = build_eval_orch_config(codex, {}, base)
 
         assert cfg.routing.allowed_models == base.routing.allowed_models
+
+
+# ---------------------------------------------------------------------------
+# task 8499 — the cell's routing pins every role's model against the policy
+# rules it inherits from the base (large-plan-steps, the large-plan-modules
+# split pair, retry-tier-up), while the same rule still matches and still
+# supplies its non-model set fields.
+# ---------------------------------------------------------------------------
+
+_LARGE_BY_STEPS = PlanShape(20, ('pkg/a.py',))
+_LARGE_BY_MODULES = PlanShape(3, ('a/x.py', 'b/y.py', 'c/z.py', 'd/w.py'))
+
+
+def _assert_pinned_against_base_rule(base, cfg, role_name: str, **route_inputs) -> None:
+    base_decision = _route(base, role_name, **route_inputs)
+    model_setting_rules = {r.id for r in base.routing.rules if r.set.model is not None}
+    assert base_decision.rule_id in model_setting_rules
+
+    decision = _route(cfg, role_name, **route_inputs)
+    assert decision.model == getattr(cfg.models, role_name)
+    assert decision.source_layer == 'config'
+    assert decision.rejected == ()
+    assert decision.rule_id == base_decision.rule_id
+    assert decision.max_turns == base_decision.max_turns
+
+
+class TestCellRoutingPinsEveryRoleModel:
+    @pytest.mark.parametrize('role_name', ['implementer', 'debugger'])
+    @pytest.mark.parametrize(
+        'plan_shape', [_LARGE_BY_STEPS, _LARGE_BY_MODULES], ids=['by-steps', 'by-modules'],
+    )
+    def test_large_plan_rule_keeps_the_candidate_model(
+        self, tmp_path: Path, plan_shape: PlanShape, role_name: str,
+    ):
+        from orchestrator.evals.runner import build_eval_orch_config
+
+        base = _base_config(tmp_path)
+        cfg = build_eval_orch_config(_impl_cfg(), {}, base)
+
+        assert _route(base, role_name, plan_shape=plan_shape).model == 'opus'
+        _assert_pinned_against_base_rule(base, cfg, role_name, plan_shape=plan_shape)
+
+    @pytest.mark.parametrize(
+        ('role_name', 'build_kwargs'),
+        [
+            ('implementer', lambda: {'config': _impl_cfg()}),
+            ('implementer', lambda: {'config': _endpoint_impl_cfg()}),
+            ('architect', lambda: {'config': _impl_cfg(), 'architect_config': _arch_cfg()}),
+        ],
+        ids=['implementer', 'off-ladder-implementer', 'architect'],
+    )
+    def test_retry_tier_rule_keeps_the_candidate_model(
+        self, tmp_path: Path, role_name: str, build_kwargs,
+    ):
+        from orchestrator.evals.runner import build_eval_orch_config
+
+        base = _base_config(tmp_path)
+        cfg = build_eval_orch_config(task={}, base_config=base, **build_kwargs())
+
+        _assert_pinned_against_base_rule(base, cfg, role_name, routing_tier=1)
+
+    def test_non_claude_candidate_on_a_large_plan_keeps_its_model(self, tmp_path: Path):
+        from orchestrator.evals.configs import get_config_by_name
+        from orchestrator.evals.runner import build_eval_orch_config
+
+        codex = get_config_by_name('codex-gpt6-astra')
+        assert codex is not None and codex.backend != 'claude'
+        cfg = build_eval_orch_config(codex, {}, _base_config(tmp_path))
+
+        decision = _route(cfg, 'implementer', plan_shape=_LARGE_BY_STEPS)
+        assert decision.model == codex.model
+        assert decision.model != 'opus'
+
+    def test_building_a_cell_leaves_base_and_rule_table_intact(self, tmp_path: Path):
+        from orchestrator.evals.runner import build_eval_orch_config
+
+        base = _base_config(tmp_path)
+        cfg = build_eval_orch_config(_impl_cfg(), {}, base)
+
+        base_by_id = {r.id: r for r in base.routing.rules}
+        assert base_by_id['large-plan-steps'].set.model == 'opus'
+        assert [r.id for r in cfg.routing.rules] == [r.id for r in base.routing.rules]
+        assert [r.match for r in cfg.routing.rules] == [r.match for r in base.routing.rules]
+        for rule in cfg.routing.rules:
+            assert rule.set.model is None
+            assert rule.set.model_dump(exclude={'model'}) == (
+                base_by_id[rule.id].set.model_dump(exclude={'model'})
+            )
 
 
 # ---------------------------------------------------------------------------
