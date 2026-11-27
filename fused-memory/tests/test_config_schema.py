@@ -333,7 +333,7 @@ class TestLLMConfigExtractionRoutes:
         assert LLMConfig().extraction_routes == {}
 
     def test_a_route_parses_into_its_leaf(self):
-        cfg = LLMConfig(extraction_routes={'decisions_and_rationale': self.ROUTE})
+        cfg = LLMConfig.model_validate({'extraction_routes': {'decisions_and_rationale': self.ROUTE}})
         route = cfg.extraction_routes['decisions_and_rationale']
         assert isinstance(route, ExtractionRouteConfig)
         assert (route.model, route.reasoning_effort, route.api_url, route.api_key) == (
@@ -344,13 +344,13 @@ class TestLLMConfigExtractionRoutes:
     def test_a_route_without_model_or_effort_is_refused(self, missing):
         route = {k: v for k, v in self.ROUTE.items() if k != missing}
         with pytest.raises(ValidationError):
-            LLMConfig(extraction_routes={'decisions_and_rationale': route})
+            LLMConfig.model_validate({'extraction_routes': {'decisions_and_rationale': route}})
 
     def test_an_unknown_effort_is_refused(self):
         with pytest.raises(ValidationError):
-            LLMConfig(extraction_routes={
+            LLMConfig.model_validate({'extraction_routes': {
                 'decisions_and_rationale': self.ROUTE | {'reasoning_effort': 'extreme'},
-            })
+            }})
 
     @pytest.mark.parametrize('blank', ['', '   '])
     def test_a_blank_url_or_key_reads_as_unset(self, blank):
