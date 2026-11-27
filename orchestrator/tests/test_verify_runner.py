@@ -1487,11 +1487,30 @@ class TestLocalRunnerNarrowGate:
         assert result is still_red
         run_unscoped.assert_not_awaited()
 
+    async def test_a_full_stamped_verdict_still_meets_the_unscoped_gate(self):
+        full_stamped = _make_pass_result()
+        full_stamped.narrow_gate = MergeGateResolution.FULL
+        run_scoped = AsyncMock(return_value=full_stamped)
+        run_unscoped = AsyncMock(return_value=MagicMock(broken=False, timed_out=False))
+        runner = _narrow_local_runner(run_scoped, run_unscoped, narrow_gate=_DOCS_DECISION)
+
+        await runner.run_merge_verify('abc123', _make_spec())
+
+        run_unscoped.assert_awaited_once()
+
 
 def test_a_narrow_verdict_round_trips_the_wire_codec():
     decoded = result_from_json(result_to_json(_make_pass_result(narrow_gate=MergeGateResolution.COMMENTS)))
 
     assert decoded.narrow_gate is MergeGateResolution.COMMENTS
+
+
+def test_a_full_gate_stamp_is_refused_at_decode():
+    payload = json.loads(result_to_json(_make_pass_result()))
+    payload['narrow_gate'] = 'full_gate'
+
+    with pytest.raises(ValueError, match='full_gate'):
+        result_from_json(json.dumps(payload))
 
 
 # ---------------------------------------------------------------------------

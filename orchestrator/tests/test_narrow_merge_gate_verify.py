@@ -283,3 +283,20 @@ class TestWholeTreeEvidence:
     @pytest.mark.parametrize('resolution', [MergeGateResolution.DOCS, MergeGateResolution.COMMENTS])
     def test_a_narrow_gate_pass_is_not(self, resolution: MergeGateResolution) -> None:
         assert _passed(narrow_gate=resolution).is_whole_tree_evidence is False
+
+
+class TestNarrowGateInvariant:
+
+    @pytest.mark.parametrize('value', ['full_gate', MergeGateResolution.FULL])
+    def test_a_full_resolution_is_refused_at_construction(self, value: object) -> None:
+        with pytest.raises(ValueError, match='full_gate') as excinfo:
+            _passed(narrow_gate=value)
+        assert 'narrow_gate' in str(excinfo.value)
+
+    def test_a_wire_string_decodes_to_its_member(self) -> None:
+        assert _passed(narrow_gate='docs_gate').narrow_gate is MergeGateResolution.DOCS
+
+    def test_a_full_stamp_after_construction_is_still_whole_tree_evidence(self) -> None:
+        result = _passed()
+        result.narrow_gate = MergeGateResolution.FULL
+        assert result.is_whole_tree_evidence is True
