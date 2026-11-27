@@ -7,30 +7,18 @@ once at server bootstrap, right after ``ReconReportState`` is constructed
 (see ``server/main.py``), and wired into
 ``TaskInterceptor.set_lifecycle_reset_filer``.
 
-Best-effort: when no Stage-2 (``task_knowledge_sync``) run is currently
-active for the finding's project, there is nowhere sanctioned to land the
-finding — this is a logged no-op, not a raise, matching
-``guarded_recon_task_write``'s never-break-the-write contract (the
-before/after write it is guarding has already succeeded by the time this
-runs).
+The drop policy for a finding with no active Stage-2 run lives in
+``server/recon_stage2_finding.py::file_stage2_finding``.
 """
 
 from __future__ import annotations
-
-import logging
 
 from fused_memory.middleware.live_task_write_guard import (
     FileFindingFn,
     LifecycleResetFinding,
 )
 from fused_memory.server.recon_report import ReconReportState
-
-logger = logging.getLogger(__name__)
-
-# Stage-2's stage name in ReconReportState — the only stage this filer ever
-# resolves against, since the guard it backs only wraps Stage-2 recon-stage
-# task writes (agent_id.startswith('recon-stage-')).
-_STAGE2_STAGE = 'task_knowledge_sync'
+from fused_memory.server.recon_stage2_finding import file_stage2_finding
 
 _SUGGESTED_ACTION = (
     'Investigate a concurrent write racing this recon-stage write on the '
@@ -52,25 +40,13 @@ def build_lifecycle_reset_filer(recon_report_state: ReconReportState) -> FileFin
     """Build the async ``file_finding`` callback for ``set_lifecycle_reset_filer``."""
 
     async def _file(finding: LifecycleResetFinding) -> None:
-        run_id = recon_report_state.active_run_for_stage(_STAGE2_STAGE, finding.project_id)
-        if run_id is None:
-            logger.info(
-                'recon_lifecycle_filer: no active %s run for project_id=%r; '
-                'dropping task_lifecycle_reset_detected finding for task_id=%r',
-                _STAGE2_STAGE,
-                finding.project_id,
-                finding.task_id,
-            )
-            return
-        recon_report_state.add_finding(
-            run_id=run_id,
-            severity='serious',
-            category='task_memory_mismatch',
-            description=_describe(finding),
-            suggested_action=_SUGGESTED_ACTION,
-            actionable=True,
+        file_stage2_finding(
+            recon_report_state,
+            project_id=finding.project_id,
             task_id=finding.task_id,
             flag_type=finding.flag_type,
+            description=_describe(finding),
+            suggested_action=_SUGGESTED_ACTION,
         )
 
     return _file

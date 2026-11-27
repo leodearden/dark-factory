@@ -1,16 +1,14 @@
 """Adapter: ``TextWriteUnconfirmedFinding`` -> ``ReconReportState.add_finding`` (task 4650).
 
 Wired at bootstrap into ``TaskInterceptor.set_text_write_unconfirmed_filer``.
-With no active Stage-2 run for the finding's project it drops the finding with
-a warning.
+The drop policy for a finding with no active Stage-2 run lives in
+``server/recon_stage2_finding.py::file_stage2_finding``.
 Exceptions are not swallowed here:
 ``middleware/task_text_write_guard.py::verify_text_write_landed`` owns the
 never-break-the-write contract.
 """
 
 from __future__ import annotations
-
-import logging
 
 from fused_memory.middleware.task_text_write_guard import (
     TASK_TEXT_FP_KEY,
@@ -20,10 +18,7 @@ from fused_memory.middleware.task_text_write_guard import (
     TextWriteUnconfirmedFinding,
 )
 from fused_memory.server.recon_report import ReconReportState
-
-logger = logging.getLogger(__name__)
-
-_STAGE2_STAGE = 'task_knowledge_sync'
+from fused_memory.server.recon_stage2_finding import file_stage2_finding
 
 _SUGGESTED_ACTION = (
     'Do not count this amendment as applied. Re-read the task with get_task, '
@@ -53,26 +48,13 @@ def build_text_write_unconfirmed_filer(
     recon_report_state: ReconReportState,
 ) -> FileTextFindingFn:
     async def _file(finding: TextWriteUnconfirmedFinding) -> None:
-        run_id = recon_report_state.active_run_for_stage(_STAGE2_STAGE, finding.project_id)
-        if run_id is None:
-            logger.warning(
-                'recon_text_write_filer: no active %s run for project_id=%r; '
-                'dropping %s finding for task_id=%r',
-                _STAGE2_STAGE,
-                finding.project_id,
-                finding.flag_type,
-                finding.task_id,
-            )
-            return
-        recon_report_state.add_finding(
-            run_id=run_id,
-            severity='serious',
-            category='task_memory_mismatch',
-            description=_describe(finding),
-            suggested_action=_SUGGESTED_ACTION,
-            actionable=True,
+        file_stage2_finding(
+            recon_report_state,
+            project_id=finding.project_id,
             task_id=finding.task_id,
             flag_type=finding.flag_type,
+            description=_describe(finding),
+            suggested_action=_SUGGESTED_ACTION,
         )
 
     return _file
