@@ -53,6 +53,7 @@ from orchestrator.evals.reviewer_trial.__main__ import cli as reviewer_trial_cli
 from orchestrator.flake_ledger import ledger_db_path
 from orchestrator.harness import Harness, _acquire_project_lock
 from orchestrator.mcp import markup_sink
+from orchestrator.verify_host_roster_file import ROSTER_FILE_ENV
 
 
 @pytest.fixture
@@ -77,7 +78,7 @@ def unreachable_main_checkout(monkeypatch, tmp_path) -> None:
 
 
 def _load(monkeypatch, root: Path, body: dict) -> OrchestratorConfig:
-    for key in [k for k in os.environ if k.startswith('ORCH_')]:
+    for key in [k for k in os.environ if k.startswith('ORCH_') and k != ROSTER_FILE_ENV]:
         monkeypatch.delenv(key)
     root.mkdir(parents=True, exist_ok=True)
     config_path = root / 'dark-factory-orchestrator.yaml'

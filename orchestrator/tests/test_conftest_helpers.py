@@ -46,7 +46,8 @@ and are NOT already covered by other tests:
 8. **The shared mock-derived stray-dir guard is bound** — see
    ``TestTheMockDerivedStrayDirGuardIsWired``.
 
-9. **No real roster file** — ``_isolate_orch_config`` pins ``ORCH_VERIFY_HOSTS_FILE`` absent, so no load reads the operator's ``verify-hosts.yaml``.
+9. **No real roster file** — ``_isolate_orch_config`` pins ``ORCH_VERIFY_HOSTS_FILE`` absent, and refuses any load
+   that would still resolve the session's default ``verify-hosts.yaml`` (one that stripped the pin).
 
 Tests of plain attribute defaults (e.g. ``mock.usage_cap.enabled is False``)
 are deliberately omitted — they would just duplicate literals from
@@ -353,7 +354,7 @@ def test_no_test_inherits_a_cold_preprovision_command(tmp_path, monkeypatch):
     assert OrchestratorConfig().verify_cold_preprovision_command == ''
 
 
-def test_no_config_load_reads_the_operators_roster_file(tmp_path, monkeypatch):
+def test_the_autouse_pin_hides_a_roster_at_the_default_path(tmp_path, monkeypatch):
     """A roster at the default path never reaches load_config.
 
     The roster names the yaml's project, and ORCH_VERIFY_RUNNERS stays at the
@@ -376,6 +377,18 @@ def test_no_config_load_reads_the_operators_roster_file(tmp_path, monkeypatch):
 
     assert load_config(yaml_path).verify_runners == []
     assert roster_file_path(os.environ) != default_roster
+
+
+def test_a_load_that_strips_the_pin_fails_rather_than_reading_the_operators_roster(
+    tmp_path, monkeypatch,
+):
+    """A test that rebuilds its environment without ORCH_VERIFY_HOSTS_FILE is refused."""
+    monkeypatch.delenv('ORCH_VERIFY_HOSTS_FILE')
+    yaml_path = tmp_path / 'orch.yaml'
+    yaml_path.write_text('fused_memory: {project_id: p}\n')
+
+    with pytest.raises(AssertionError, match="operator's roster file"):
+        load_config(yaml_path)
 
 
 def test_an_explicit_preprovision_command_still_wins():
