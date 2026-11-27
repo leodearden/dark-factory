@@ -1389,6 +1389,7 @@ dependencies = [
 
 [package.dev-dependencies]
 dev = [
+    { name = "client-feed" },
     { name = "pyright" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
@@ -1420,6 +1421,7 @@ requires-dist = [
 
 [package.metadata.requires-dev]
 dev = [
+    { name = "client-feed", editable = "client-feed" },
     { name = "pyright", specifier = ">=1.1.404" },
     { name = "pytest", specifier = ">=8.0.0" },
     { name = "pytest-asyncio", specifier = ">=0.21.0" },

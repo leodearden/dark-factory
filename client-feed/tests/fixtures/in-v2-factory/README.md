@@ -4,8 +4,8 @@
 §14.3: a restated and a quarantined `defect_reported` line between two
 `reveal_requested` lines, in the compact JSON the portal writes.
 
-It stands in until σ3 vendors the portal's `in-v2` fixture, byte for byte,
-beside it.
+The portal's vendored writer output now sits beside it, in `../in-v2`, and the
+same tests run over both.
 
-`test_in_v2_factory_fixture.py` validates each line and derives B23's
-rejection cases by mutating copies of them. No test edits this file in place.
+`test_in_v2_fixtures.py` validates each line and derives B23's rejection cases
+by mutating copies of them. No test edits this file in place.
