@@ -745,8 +745,12 @@ def render_source_completion_section(*, can_file_tasks: bool) -> str:
             "`gate_subject='3105'`. If the task is a deliberately preserved "
             'specimen, the gate is REFUSED with '
             '`PreservedSpecimenResetViolation`, and that refusal is the answer: '
-            'do not re-file it in other words. Moving it to pending, setting '
-            'it to pending and cancelling it all ask for the same destruction.'
+            'do not re-file the reset request in other words. Moving it to '
+            'pending, setting it to pending and cancelling it all ask for the '
+            'same destruction. A gate asking only to keep the task in-progress, '
+            'such as one asking for its pinning record to be restored, is not a '
+            'reset request: say so plainly ("so it is not reset"), and it is '
+            'admitted.'
         )
     else:
         residual_clause = (

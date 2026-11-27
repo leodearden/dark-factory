@@ -157,6 +157,42 @@ class TestExemptions:
                 None,
                 id='verb-after-without',
             ),
+            pytest.param(
+                'Human action needed: reopen the escalation pinning task 3105 so it '
+                'is not accidentally reset out of in-progress',
+                _RESET_DESCRIPTION,
+                id='adverb-between-negation-and-verb',
+            ),
+            pytest.param(
+                'Human action needed: re-pin task 3105 so it is never again reset '
+                'out of in-progress',
+                _RESET_DESCRIPTION,
+                id='never-again',
+            ),
+            pytest.param(
+                'Human action needed: re-pin task 3105 to prevent a reset out of '
+                'in-progress',
+                _RESET_DESCRIPTION,
+                id='preventive-lead-in-before-nominal-verb',
+            ),
+            pytest.param(
+                'Human action needed: re-pin task 3105 to avoid resetting it out of '
+                'in-progress',
+                _RESET_DESCRIPTION,
+                id='avoid-lead-in',
+            ),
+            pytest.param(
+                'Human action needed: re-pin task 3105; otherwise recon will reset '
+                'task 3105 out of in-progress',
+                _RESET_DESCRIPTION,
+                id='otherwise-lead-in',
+            ),
+            pytest.param(
+                'Human action needed: the pinning escalation for task 3105 closed, '
+                'and a reset out of in-progress would destroy the specimen',
+                _RESET_DESCRIPTION,
+                id='nominal-verb-after-article',
+            ),
         ],
     )
     async def test_gate_that_does_not_request_a_reset_is_not_enforced(
@@ -257,6 +293,23 @@ class TestPreservedSpecimenRefused:
                 'Task 3105 is stuck in-progress; reset it.',
                 None,
                 id='pronoun-object-ends-the-clause',
+            ),
+            pytest.param(
+                'Human action needed: stop the stale worker and reset task 3105 out '
+                'of in-progress',
+                _RESET_DESCRIPTION,
+                id='stop-lead-in-does-not-reach-past-a-conjunction',
+            ),
+            pytest.param(
+                'Human action needed: prevent further drift. Reset task 3105 out of '
+                'in-progress',
+                _RESET_DESCRIPTION,
+                id='preventive-lead-in-does-not-reach-past-a-sentence',
+            ),
+            pytest.param(
+                'Human action needed: urgently reset task 3105 out of in-progress',
+                _RESET_DESCRIPTION,
+                id='adverb-without-negation',
             ),
         ],
     )

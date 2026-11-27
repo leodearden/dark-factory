@@ -25,9 +25,11 @@ Stage 1's ``flag_asserts_stranded``, over the title read as
 ``suggested_action`` and the description read as ``description``, bounds the
 class, so the vocabulary has one home; no ``flag_type`` is passed, because a
 title is not a flag type.  Inside that bound this layer also requires
-:data:`_MOVE_OUT_OF_IN_PROGRESS`: an un-negated stranded-action verb that
+:data:`_MOVE_OUT_OF_IN_PROGRESS`: a stranded-action verb that
 moves a task, naming a destination status, naming ``in-progress`` as the
-move's source, or taking the task as its whole object.  Stage 1's one-field
+move's source, or taking the task as its whole object.  A verb that is
+negated, used as a noun, or under a preventive lead-in requests nothing
+(:data:`_NON_REQUEST_PREFIX`).  Stage 1's one-field
 conjunction alone fires on a PROTECTIVE gate ("reopen the escalation pinning
 task 3105 so it is not reset out of in-progress"), the twin specimen's loss
 mode; at this layer a false positive is not a dropped flag but a gate no
@@ -138,11 +140,23 @@ _MOVE_OUT_OF_IN_PROGRESS: re.Pattern[str] = re.compile(
     re.IGNORECASE,
 )
 
-#: Text ending in a negation, so the verb after it requests nothing:
-#: "so it is not reset", "must never be redispatched", "without resetting".
-_NEGATED_VERB_PREFIX: re.Pattern[str] = re.compile(
-    r"(?:\b(?:not|never|without|instead\s+of|rather\s+than)|n['’]t)"
-    r'\s+(?:(?:be|been|being|get|got|getting)\s+)?$',
+_NEGATION = r"(?:\b(?:not|never|without|instead\s+of|rather\s+than)|n['’]t)"
+_AUXILIARY_OR_ADVERB = r'(?:be|been|being|get|got|getting|again|ever|\w+ly)'
+_PREVENTIVE = r'\b(?:prevent|avoid|stop|lest|otherwise|or\s+else)\w*'
+_CLAUSE_WORD = r"(?!(?:and|then|but|or|so|also)\b)[\w'’-]+"
+
+#: Text ending where the verb after it requests nothing: a negation, perhaps
+#: with auxiliaries and adverbs between ("so it is not accidentally reset",
+#: "never again reset", "without resetting"); an article making the verb a
+#: noun ("a reset"); or a preventive or counterfactual lead-in a few words
+#: back in the same clause ("to prevent a reset", "to avoid resetting it",
+#: "otherwise recon will reset").  A false positive refuses a gate no human
+#: then sees, so this reading leans protective.
+_NON_REQUEST_PREFIX: re.Pattern[str] = re.compile(
+    rf'(?:{_NEGATION}(?:\s+{_AUXILIARY_OR_ADVERB}){{0,3}}'
+    r'|\b(?:a|an|the|any|another)'
+    rf'|{_PREVENTIVE}(?:\s+{_CLAUSE_WORD}){{0,4}})'
+    r'\s+$',
     re.IGNORECASE,
 )
 
@@ -166,7 +180,7 @@ def _moves_a_task_out_of_in_progress(text: str | None) -> bool:
     if not isinstance(text, str):
         return False
     return any(
-        not _NEGATED_VERB_PREFIX.search(text, 0, match.start())
+        not _NON_REQUEST_PREFIX.search(text, 0, match.start())
         for match in _MOVE_OUT_OF_IN_PROGRESS.finditer(text)
     )
 
