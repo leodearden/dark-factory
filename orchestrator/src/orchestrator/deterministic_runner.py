@@ -1522,7 +1522,7 @@ class DeterministicRunner:
         return WorkflowOutcome.BLOCKED
 
     async def _file_curator_adjudication_missing_and_block(
-        self, task_id: str, task: dict,
+        self, task_id: str, task: dict, metadata: dict,
     ) -> WorkflowOutcome:
         """File a born-at-L2 ``curator_adjudication_missing`` escalation and block.
 
@@ -1603,6 +1603,7 @@ class DeterministicRunner:
         # the identical pending query and only reaches here when it came back
         # empty, so any filter written here would be unreachable by
         # construction.
+        pin = curator_gate_pin(task_id, metadata)
         esc = Escalation(
             id=self.escalation_queue.make_id(task_id),
             task_id=task_id,
@@ -1612,6 +1613,8 @@ class DeterministicRunner:
             summary=summary[:200],
             detail=detail,
             level=2,
+            pin_declared_by=list(pin.declared_by),
+            pin_declared_reason=pin.reason,
         )
         self.escalation_queue.submit(esc)
         logger.info(
@@ -2072,6 +2075,8 @@ class DeterministicRunner:
                 options=list(fields.options),
                 level=2,
                 review_due=fields.review_due,
+                pin_declared_by=list(fields.pin.declared_by),
+                pin_declared_reason=fields.pin.reason,
             )
             self.escalation_queue.submit(esc)
             logger.info(
@@ -3182,7 +3187,7 @@ class DeterministicRunner:
                             HUMAN_CURATOR_ADJUDICATED_AT_KEY,
                         )
                         return await self._file_curator_adjudication_missing_and_block(
-                            task_id, task,
+                            task_id, task, metadata,
                         )
                 logger.info(
                     'DeterministicRunner: task %s gate resolved — setting done',
