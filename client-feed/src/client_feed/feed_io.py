@@ -68,6 +68,7 @@ class Cursor(BaseModel):
     added_line_counts: AddedLineCounts | None = None
     defect_scan_offset: NonNegativeInt = 0
     pending_reports: dict[str, UtcTimestamp] = {}
+    deferred_gate_reports: dict[str, UtcTimestamp] = {}
 
 
 class FeedIoProblem(StrEnum):

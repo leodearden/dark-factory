@@ -200,6 +200,15 @@ class TasksDb:
         ]
         _write(self.path, [task, *dependencies])
 
+    def set_status(self, task_id: int, status: str, *, updated_at: str, tag: str = 'master') -> None:
+        _write(
+            self.path,
+            [(
+                'UPDATE tasks SET status = ?, updated_at = ? WHERE tag = ? AND id = ?',
+                (status, updated_at, tag, task_id),
+            )],
+        )
+
 
 @dataclass(frozen=True)
 class EscalationQueueDir:

@@ -472,7 +472,15 @@ def defect_carrier(ref: str = 'portal:acme:2:1', *, task_id: int = 6, gated: boo
 
 def filed(carrier: DefectCarrier, seq: int, *, when: datetime = NOW) -> DefectFiled:
     return DefectFiled(
-        seq=seq, at=when, project_id=PROJECT, feed_version=FEED_VERSION, **asdict(carrier)
+        seq=seq,
+        at=when,
+        project_id=PROJECT,
+        feed_version=FEED_VERSION,
+        ref=carrier.ref,
+        block=carrier.block,
+        report=carrier.report,
+        task_id=carrier.task_id,
+        gated=carrier.gated,
     )
 
 

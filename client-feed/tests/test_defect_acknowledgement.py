@@ -1,4 +1,4 @@
-"""B32-B34: a publisher pass acknowledges each client defect report it reads on the inbox (plans/client-feed-prd.md §14.2 decisions 8 and 14)."""
+"""B32-B34 and B41: a publisher pass acknowledges each client defect report it reads on the inbox, and names a filed one held behind a deferred gate (plans/client-feed-prd.md §14.2 decisions 8 and 14, §14.6 B41)."""
 
 from __future__ import annotations
 
@@ -42,6 +42,9 @@ GRACE: Final = 600
 FIX: Final = 'portal:acme:2:1'
 UNFILED: Final = Degradation(
     source=Source.FILER, reason=f'1 defect report(s) unfiled past 600s: {FIX}'
+)
+HELD: Final = Degradation(
+    source=Source.FILER, reason=f'1 defect report(s) waiting on a deferred gate past 600s: {FIX}'
 )
 
 
@@ -225,6 +228,113 @@ class TestAnUnfiledReportIsLoud:
 
         assert root.cursor().pending_reports == {}
         assert Source.FILER not in sources(root.run(seconds(GRACE + 1)))
+
+
+def hold_behind_a_deferred_gate(root: Root, *, carrier_status: str = 'pending') -> None:
+    """The fix released and its gate left deferred, as a commit_planning refused for the gate leaves them."""
+    root.tasks.add(5, status='deferred', updated_at=UPDATED, metadata=gate_for(FIX))
+    root.tasks.add(
+        6, status=carrier_status, updated_at=UPDATED, metadata=carrying(FIX), depends_on=(5,)
+    )
+
+
+class TestAReportBehindADeferredGateIsLoud:
+    def test_it_is_filed_gated_held_from_the_first_pass_and_named_past_the_grace(
+        self, root: Root
+    ) -> None:
+        hold_behind_a_deferred_gate(root)
+
+        first = root.run(T)
+
+        assert [(f.ref, f.task_id, f.gated) for f in root.filed()] == [(FIX, 6, True)]
+        assert Source.FILER not in sources(first)
+        assert root.cursor().deferred_gate_reports == {FIX: T}
+
+        overdue = root.run(seconds(GRACE + 1))
+
+        assert HELD in overdue.degraded
+        assert HELD in root.last_heartbeat().degraded
+        assert UNFILED not in overdue.degraded
+        assert len(root.filed()) == 1
+
+    def test_it_clears_once_the_gate_is_released(self, root: Root) -> None:
+        hold_behind_a_deferred_gate(root)
+        root.run(T)
+        assert HELD in root.run(seconds(GRACE + 1)).degraded
+        root.tasks.set_status(5, 'pending', updated_at=LATER)
+
+        report = root.run(seconds(GRACE + 2))
+
+        assert Source.FILER not in sources(report)
+        assert root.cursor().deferred_gate_reports == {}
+
+    def test_it_is_still_named_while_the_carriers_cannot_be_read(self, root: Root) -> None:
+        hold_behind_a_deferred_gate(root)
+        root.run(T)
+        tasks_db(root.policy.project_root).unlink()
+
+        report = root.run(seconds(GRACE + 1))
+
+        assert Source.TASKS in sources(report)
+        assert HELD in report.degraded
+        assert root.cursor().deferred_gate_reports == {FIX: T}
+
+    @pytest.mark.parametrize('carrier_status', ['done', 'cancelled'])
+    def test_a_finished_fix_behind_a_deferred_gate_is_never_named(
+        self, root: Root, carrier_status: str
+    ) -> None:
+        hold_behind_a_deferred_gate(root, carrier_status=carrier_status)
+
+        root.run(T)
+        report = root.run(seconds(GRACE + 1))
+
+        assert Source.FILER not in sources(report)
+        assert root.cursor().deferred_gate_reports == {}
+
+    def test_an_unfiled_report_filed_behind_a_deferred_gate_is_held_from_that_pass(
+        self, root: Root
+    ) -> None:
+        append_inbox(root.in_dir, reported(2, 1, at=T))
+        assert UNFILED in root.run(seconds(GRACE + 1)).degraded
+        hold_behind_a_deferred_gate(root)
+
+        filed = root.run(seconds(GRACE + 2))
+
+        assert Source.FILER not in sources(filed)
+        cursor = root.cursor()
+        assert cursor.pending_reports == {}
+        assert cursor.deferred_gate_reports == {FIX: seconds(GRACE + 2)}
+        assert HELD in root.run(seconds(2 * GRACE + 3)).degraded
+
+    def test_one_heartbeat_names_both_filer_reasons_and_the_feed_stays_valid(
+        self, root: Root
+    ) -> None:
+        unfiled_elsewhere = Degradation(
+            source=Source.FILER, reason='1 defect report(s) unfiled past 600s: portal:acme:3:4'
+        )
+        append_inbox(root.in_dir, reported(3, 4, at=T))
+        hold_behind_a_deferred_gate(root)
+        root.run(T)
+
+        report = root.run(seconds(GRACE + 1))
+
+        assert unfiled_elsewhere in report.degraded
+        assert HELD in report.degraded
+        heartbeat = root.last_heartbeat()
+        assert unfiled_elsewhere in heartbeat.degraded
+        assert HELD in heartbeat.degraded
+        assert validate_out_dir(root.out_dir).ok
+
+    def test_a_gate_held_again_after_its_release_is_named(self, root: Root) -> None:
+        root.tasks.add(5, updated_at=UPDATED, metadata=gate_for(FIX))
+        root.tasks.add(6, updated_at=UPDATED, metadata=carrying(FIX), depends_on=(5,))
+        assert Source.FILER not in sources(root.run(T))
+        root.tasks.set_status(5, 'deferred', updated_at=LATER)
+
+        root.run(seconds(60))
+
+        assert root.cursor().deferred_gate_reports == {FIX: seconds(60)}
+        assert HELD in root.run(seconds(GRACE + 61)).degraded
 
 
 def test_with_reveals_disabled_from_the_start_the_defect_scan_still_reaches_the_inbox_end(

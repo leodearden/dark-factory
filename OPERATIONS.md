@@ -964,7 +964,13 @@ What a degraded source holds back is stated in `plans/client-feed-prd.md`
   non-deferred carrier. The reason names each such ref, and the report waits
   in `cursor.json`'s `pending_reports` until its carrier appears or a
   `defect_ruled` line rules it. It is raised while the engagement is unusable,
-  and while `tasks` is degraded, too.
+  and while `tasks` is degraded, too. A second reason, `… waiting on a deferred
+  gate past …`, names a filed report whose unfinished fix depends on its gate
+  while that gate is still `deferred`, so the gate is never dispatched to Leo's
+  L2 queue. Such a ref waits in `cursor.json`'s `deferred_gate_reports` from
+  the first pass that saw it so, until the gate leaves `deferred` or the fix
+  finishes. It too is kept while `tasks` is degraded (PRD §12, 2026-11-26,
+  task 11885).
 - `git`: a merge commit git cannot read holds the landing batch (γ entry (f)).
   Unparseable git output and a timed-out `git cat-file --batch` read degrade
   `git` too (task 7484 entry (c)).
@@ -974,18 +980,18 @@ What a degraded source holds back is stated in `plans/client-feed-prd.md`
 
 The same failures are WARNING lines in the unit's journal.
 
-#### Rolling back to feed 1.0
+#### Rolling back the publisher
 
 1.0 code refuses a 1.1 `cursor.json`, because `Cursor` is `extra='forbid'`
 (`client-feed/src/client_feed/feed_io.py::Cursor`), and then restarts every
 source from the beginning. So before starting 1.0 code, stop the instance and
-delete the `defect_scan_offset` and `pending_reports` keys from
-`out/cursor.json`, keeping the file 0640. Rewriting it in place keeps its mode
-and owner:
+delete the `defect_scan_offset`, `pending_reports` and `deferred_gate_reports`
+keys from `out/cursor.json`, keeping the file 0640. Rewriting it in place keeps
+its mode and owner:
 
 ```bash
 systemctl --user stop client-feed@<name>.service
-python3 -c 'import json, sys; p = sys.argv[1]; c = json.load(open(p)); c.pop("defect_scan_offset", None); c.pop("pending_reports", None); open(p, "w").write(json.dumps(c))' <out>/cursor.json
+python3 -c 'import json, sys; p = sys.argv[1]; c = json.load(open(p)); c.pop("defect_scan_offset", None); c.pop("pending_reports", None); c.pop("deferred_gate_reports", None); open(p, "w").write(json.dumps(c))' <out>/cursor.json
 ```
 
 1.0 code refolds the `state.json` a 1.1 publisher wrote from the feed. A
@@ -994,6 +1000,18 @@ python3 -c 'import json, sys; p = sys.argv[1]; c = json.load(open(p)); c.pop("de
 code refuses to open a feed holding one, with a contract violation at that
 line. Roll back only while `grep -c '"source":"filer"' <out>/feed.jsonl`
 prints 0; once a heartbeat has named `filer`, fix forward instead.
+
+Rolling back to a feed 1.1 build from before task 11885 needs the same stop and
+one key popped. Every cursor a later build writes carries
+`deferred_gate_reports`, as `{}` when nothing is held, and the earlier build's
+`Cursor` refuses that key whatever it holds. The other two keys are 1.1 keys,
+so they stay. The `filer` caveat above does not apply: `filer` is a `Source` in
+every 1.1 build.
+
+```bash
+systemctl --user stop client-feed@<name>.service
+python3 -c 'import json, sys; p = sys.argv[1]; c = json.load(open(p)); c.pop("deferred_gate_reports", None); open(p, "w").write(json.dumps(c))' <out>/cursor.json
+```
 
 #### The isolation check
 

@@ -353,14 +353,22 @@ def carriers_of(root: Path) -> tuple[DefectCarrier, ...]:
     return read_defect_carriers(root, project_id=PROJECT)
 
 
-def carrier(task_id: int, *, ref: str = FIX, gated: bool = False) -> DefectCarrier:
-    return carrier_for(ref, project_id=PROJECT, task_id=task_id, gated=gated)
+def carrier(
+    task_id: int, *, ref: str = FIX, gated: bool = False, waits_on_deferred_gate: bool = False
+) -> DefectCarrier:
+    return carrier_for(
+        ref,
+        project_id=PROJECT,
+        task_id=task_id,
+        gated=gated,
+        waits_on_deferred_gate=waits_on_deferred_gate,
+    )
 
 
 class TestDefectCarriers:
     def test_a_carrier_carries_exactly_the_acknowledged_fields(self) -> None:
         assert {field.name for field in dataclasses.fields(DefectCarrier)} == {
-            'ref', 'block', 'report', 'task_id', 'gated',
+            'ref', 'block', 'report', 'task_id', 'gated', 'waits_on_deferred_gate',
         }
 
     def test_a_pending_task_holding_a_portal_ref_reads_as_its_carrier(
@@ -376,7 +384,11 @@ class TestDefectCarriers:
 
         read = carriers_of(root)
 
-        assert read == (DefectCarrier(ref=FIX, block=2, report=1, task_id=6, gated=False),)
+        assert read == (
+            DefectCarrier(
+                ref=FIX, block=2, report=1, task_id=6, gated=False, waits_on_deferred_gate=False
+            ),
+        )
         assert 'SECRET-' not in repr(read)
 
     def test_carriers_come_sorted_by_ref(self, root: Path, tasks: TasksDb) -> None:
@@ -410,7 +422,50 @@ class TestDefectCarriers:
         tasks.add(5, status=gate_status, updated_at=LATE, metadata=gate_for(FIX))
         tasks.add(6, updated_at=LATE, metadata=carrying(FIX), depends_on=(5,))
 
+        assert carriers_of(root) == (
+            carrier(6, gated=True, waits_on_deferred_gate=(gate_status == 'deferred')),
+        )
+
+    @pytest.mark.parametrize(
+        'status',
+        [
+            s
+            for s in TaskStatus
+            if s not in {TaskStatus.DEFERRED, TaskStatus.DONE, TaskStatus.CANCELLED}
+        ],
+    )
+    def test_an_unfinished_carrier_behind_a_deferred_gate_for_its_ref_waits_on_it(
+        self, root: Path, tasks: TasksDb, status: TaskStatus
+    ) -> None:
+        tasks.add(5, status='deferred', updated_at=LATE, metadata=gate_for(FIX))
+        tasks.add(6, status=status, updated_at=LATE, metadata=carrying(FIX), depends_on=(5,))
+
+        assert carriers_of(root) == (carrier(6, gated=True, waits_on_deferred_gate=True),)
+
+    @pytest.mark.parametrize('status', ['done', 'cancelled'])
+    def test_a_finished_carrier_behind_a_deferred_gate_waits_on_nothing(
+        self, root: Path, tasks: TasksDb, status: str
+    ) -> None:
+        tasks.add(5, status='deferred', updated_at=LATE, metadata=gate_for(FIX))
+        tasks.add(6, status=status, updated_at=LATE, metadata=carrying(FIX), depends_on=(5,))
+
         assert carriers_of(root) == (carrier(6, gated=True),)
+
+    def test_a_deferred_gate_for_another_ref_is_not_waited_on(
+        self, root: Path, tasks: TasksDb
+    ) -> None:
+        tasks.add(5, status='deferred', updated_at=LATE, metadata=gate_for('portal:acme:2:9'))
+        tasks.add(6, updated_at=LATE, metadata=carrying(FIX), depends_on=(5,))
+
+        assert carriers_of(root) == (carrier(6),)
+
+    def test_a_deferred_task_that_is_no_gate_is_not_waited_on(
+        self, root: Path, tasks: TasksDb
+    ) -> None:
+        tasks.add(4, status='deferred', updated_at=LATE, metadata={'source': 'client-defect-filer'})
+        tasks.add(6, updated_at=LATE, metadata=carrying(FIX), depends_on=(4,))
+
+        assert carriers_of(root) == (carrier(6),)
 
     def test_a_gate_for_another_ref_does_not_gate(self, root: Path, tasks: TasksDb) -> None:
         tasks.add(5, updated_at=LATE, metadata=gate_for('portal:acme:2:9'))

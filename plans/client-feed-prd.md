@@ -803,6 +803,38 @@ escalation text (never shown). A second feed transport. Per-person links. Failin
     redaction of invented titles, stays covered by `client-feed/tests/test_publisher.py` and
     `client-feed/tests/test_dump_sources.py`.
 
+- 2026-11-26, from task 11885 (spawned from task 11881). The publisher's deferred-gate check (B41):
+  - (a) A carrier waits on a deferred gate when two things hold
+    (`client-feed/src/client_feed/sources/tasks.py::DefectCarrier`): it is unfinished, so neither
+    `done` nor `cancelled`; and it depends on a gate for its own ref
+    (`x_client_defect_gate_for == ref`) whose status is `deferred`. Its ref is then held in
+    `cursor.json.deferred_gate_reports: {ref: first_seen}`
+    (`client-feed/src/client_feed/filer_checks.py::still_behind_deferred_gates`). The time is the
+    publisher's own clock on the pass that first saw it so, not a line's `at`, so it restarts if the
+    cursor is lost. The entry is dropped once the carrier no longer waits, and a gate held again after
+    its release starts a new one. While any entry is older than `filer_grace_seconds`, the heartbeat
+    names `filer` with the reason
+    `N defect report(s) waiting on a deferred gate past <filer_grace_seconds>s: <ref>, …`
+    (`client-feed/src/client_feed/filer_checks.py::deferred_gate_degradation`). With the carriers
+    unreadable, the map stands, as `pending_reports` does.
+  - (b) Why. Decision 4 says nothing is left `deferred`, and decision 7's end state has no task left
+    `deferred`. That end state breaks when the filer's one `commit_planning([fix, gate])` releases the
+    fix and refuses the gate with `not_planning_hold`
+    (`fused-memory/src/fused_memory/middleware/deferral_gate.py::_not_planning_refusal`). The
+    feed then says `gated: true`, while the gate stays `deferred`, is never dispatched, and never
+    reaches Leo's L2 queue. Before this check, only the filer's journal and `--check` said so.
+  - (c) Unchanged: decision 8's carrier rule, `defect_filed` and its `gated`, B33, and the unfiled
+    reason. A report behind a deferred gate has a carrier, so it is filed and never reads as unfiled.
+    The two reasons name two states, each on its own clock.
+  - (d) The reader now also reads each gate's `status`, a column already in §4 decision 6's
+    allowlist. The ref reader's two fields of §14.3 do not grow, and the reason carries refs and
+    the state phrase only.
+  - (e) Rolling back across this change means deleting `deferred_gate_reports` from `cursor.json`
+    too. Code from before it refuses the key, because `Cursor` is `extra='forbid'`.
+  - (f) The portal needs nothing. It renders each `filer` reason verbatim
+    (`scoping_intake/defect_report_pages.py::leos_reports_html`), and a `degraded` holding two
+    `filer` entries with different reasons is already legal.
+
 ## 13. Open questions (tactical)
 
 1. **Tree-snapshot cost on large repos.** Suggested: snapshot only on head change; blob line counts
@@ -861,6 +893,8 @@ What an operator sees:
 - `get_task` on that carrier shows `metadata.defects[0]` with `origin: client`.
 - A report not filed within `filer_grace_seconds` makes the publisher's heartbeat name `filer` in
   `degraded`, with the ref.
+- So does a filed report whose fix has waited `filer_grace_seconds` on a gate left `deferred`
+  (§12, 2026-11-26, task 11885).
 
 | Mechanism | Consumer |
 |---|---|
@@ -982,6 +1016,10 @@ What an operator sees:
      Rolling back means deleting `defect_scan_offset` and `pending_reports` first.
    - The heartbeat names `filer` in `degraded`, with the refs, while any entry is older than
      `filer_grace_seconds`.
+   - A filed report whose unfinished carrier waits on a `deferred` gate for its ref is held in
+     `cursor.json.deferred_gate_reports` and named under `filer` too, with its own reason. The
+     carrier rule above is unchanged, and rolling back deletes that key as well (§12, 2026-11-26,
+     task 11885).
    - The filer writes nothing under O, I or R, which keeps one writer per directory (§4.1). A dead
      filer is distinct from "no reports" (INV-6, INV-13).
 9. **The filer is narrow in code shape and in process.**
@@ -1119,7 +1157,10 @@ A line that fails the contract is rejected and counted under `inbox` (§12, 2026
 
 - `state.json` gains `defects_filed: {ref: {block, report, task_id, gated}}`. Natural key: `ref`.
 - `Source` gains `filer`. `heartbeat.degraded` names it with the reason
-  `N defect report(s) unfiled past <filer_grace_seconds>s: <ref>, …`.
+  `N defect report(s) unfiled past <filer_grace_seconds>s: <ref>, …`. For a filed report whose
+  carrier waits on a `deferred` gate, the reason is
+  `N defect report(s) waiting on a deferred gate past <filer_grace_seconds>s: <ref>, …`
+  (§12, 2026-11-26, task 11885).
 - **Compatibility.** A new type and a new state key are minor changes: the portal ignores both until
   it reads them. A new `Source` member is not minor for a reader that validates `Source` as a closed
   enum, and the portal's `scoping_intake/feed.py::FeedSource` does. P1a therefore adds `filer` to
@@ -1244,6 +1285,7 @@ For a filer configured with policy P (root R, inbox directory I, state directory
 | B38 | Ruled before filing | a `defect_reported` line and its `defect_ruled` line read in one pass; the same two lines read in two passes with the filer restarted between | nothing is filed for the ref in the first case; in the second the fix and gate the first pass filed are withdrawn and cancelled by the second, fix before gate; one `defect_filed` was emitted and `task_upserted` shows both cancelled |
 | B39 | Bounded, idempotent, convergent | the ruled ref's fix `pending` with its gate; the same inbox run twice; the filer killed after the withdrawal, after the fix's cancel, and before the gate's cancel; a ruled ref whose fix is `in-progress`, and one whose fix is `done` | the end state (withdrawn, fix cancelled, gate cancelled) is reached from each crash point; the recording fake sees writes only on the two tasks whose `metadata.source` is `client-defect-filer` and whose ref matches; the `in-progress` and `done` fixes are withdrawn but not cancelled; B30's tool-name set is the amended closed set, and `set_task_status` is seen with `cancelled` only |
 | B40 | Decision 7's order on a terminal fix | a ruled ref whose fix is `done` | no defect write is attempted on it (none is allowed on a terminal task); the refusal is recorded as converged and not retried; the gate, if still pending, is cancelled |
+| B41 | Held behind a deferred gate (§12, 2026-11-26, task 11885) | a `pending` fix depending on its gate, the gate left `deferred`; then the gate released; again with the task store made unreadable; a `done` or `cancelled` fix behind a deferred gate; a report unfiled past the grace, then filed behind a deferred gate; a released gate held again | one `defect_filed` with `gated: true`; the ref is held in `deferred_gate_reports` from the first pass that saw it so, and once the grace passes the heartbeat names `filer` with the deferred-gate reason, never the unfiled one; it clears once the gate is released; it stays held and named while `tasks` is degraded; a finished fix is never named; the unfiled report leaves `pending_reports` and is held from the pass that files it; a gate held again is held from the pass that sees it so |
 
 B3 is extended with a task carrying a `review:` ref and a foreign project's `portal:` ref: neither
 reaches O.
@@ -1365,6 +1407,7 @@ G7, design-time notes:
   - A restater failure is a quarantine.
   - A validation refusal is a gated fallback.
   - An unfiled report is `degraded: filer`.
+  - A filed report behind a deferred gate is `degraded: filer` (B41).
   - A rejected line is counted under `inbox`.
   - A kept report with no line is named on the admin page.
 - `holds-owned-and-bounded`: the gate is owned by Leo through the L2 ladder; `deferred` appears only
