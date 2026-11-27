@@ -67,6 +67,7 @@ from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps
 from orchestrator.merge_lane.intake import MERGE_LANES
 from orchestrator.merge_lane.types import InflightEntry, MergeOutcome, MergeRequest, QueuedBranch
+from orchestrator.narrow_gate_config import NarrowMergeGateConfig
 
 # ---------------------------------------------------------------------------
 # Fixtures + helpers (per-file duplication convention — see
@@ -96,10 +97,15 @@ def git_ops(git_config: GitConfig, git_repo: Path) -> GitOps:
     return GitOps(git_config, git_repo)
 
 
+# These scenes pace dispatch against sub-second liveness budgets, so the narrow merge gate's
+# pre-dispatch decision, on in the repo yaml the suite loads, is held off; its own tests cover it.
+_GATE_OFF = NarrowMergeGateConfig()
+
+
 @pytest.fixture
 def config(git_repo: Path, git_config: GitConfig) -> OrchestratorConfig:
-    """Single-host (no verify_runners) OrchestratorConfig."""
-    return lane_scene_config(git_repo, git_config)
+    """Single-host (no verify_runners) OrchestratorConfig, narrow merge gate off."""
+    return lane_scene_config(git_repo, git_config, narrow_merge_gate=_GATE_OFF)
 
 
 # ── Warm-lane variants (task 3003, pre-1) ──────────────────────────────────
@@ -134,8 +140,8 @@ def warm_git_ops(warm_git_config: GitConfig, git_repo: Path) -> GitOps:
 
 @pytest.fixture
 def warm_config(git_repo: Path, warm_git_config: GitConfig) -> OrchestratorConfig:
-    """Single-host OrchestratorConfig with the warm merge-verify lane ON."""
-    return lane_scene_config(git_repo, warm_git_config)
+    """Single-host OrchestratorConfig with the warm merge-verify lane ON, narrow merge gate off."""
+    return lane_scene_config(git_repo, warm_git_config, narrow_merge_gate=_GATE_OFF)
 
 
 def _make_request(

@@ -9,6 +9,7 @@ This module pins the factory's own surface.
 from __future__ import annotations
 
 import dataclasses
+from typing import Any
 
 import pytest
 from _verify_result_doubles import fake_verify_result, real_verify_result
@@ -86,6 +87,23 @@ class TestFakeVerifyResultFidelity:
                 f'{getattr(fake, field.name)!r}, expected '
                 f'{getattr(real, field.name)!r}.'
             )
+
+    @pytest.mark.parametrize('overrides', [{}, {'trivial': True}])
+    def test_derived_properties_answer_from_the_doubles_own_fields(self, overrides: dict[str, Any]) -> None:
+        """A VerifyResult property read on the double gives what the real class gives for the
+        same fields, never a truthy auto-mock: a mocked ``ran_narrow_gate`` once made the
+        LocalRunner skip the unscoped type-check gate and land a red tip (task 5411)."""
+        real = dataclasses.replace(real_verify_result(True), **overrides)
+        fake = fake_verify_result(passed=True, **overrides)
+
+        for name in ('ran_narrow_gate', 'is_whole_tree_evidence', 'partial_evidence_label'):
+            assert getattr(fake, name) == getattr(real, name), name
+
+    def test_derived_property_follows_a_field_set_after_construction(self) -> None:
+        fake = fake_verify_result(passed=True)
+        fake.trivial = True
+
+        assert fake.is_whole_tree_evidence is False
 
     def test_override_replaces_the_seeded_value(self) -> None:
         fake = fake_verify_result(passed=False, summary='x', category='lint_failure')
