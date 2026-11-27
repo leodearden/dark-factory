@@ -74,17 +74,17 @@ class TestPauseAndResumeFlush:
     @pytest.mark.asyncio
     async def test_a_pause_reaches_the_file_without_a_tick(self, tmp_path: Path) -> None:
         harness = _harness(_config(tmp_path))
+        before = datetime.now(UTC)
 
         await harness.pause_scheduler(_COST_REASON, PauseClass.COST_CEILING, file_escalation=False)
 
         written = _file(tmp_path)
         assert written['is_paused'] is True
         assert written['pause_class'] == 'cost_ceiling'
+        assert datetime.fromisoformat(written['snapshot_at']) >= before
         view = _read(tmp_path)
         assert view.is_paused is True
         assert view.pause_disagreement is False
-        assert view.snapshot_age_s is not None
-        assert view.snapshot_age_s < 60
         assert view.pause_row is not None
         assert view.pause_row.pause_class == 'cost_ceiling'
 
@@ -99,6 +99,29 @@ class TestPauseAndResumeFlush:
         view = _read(tmp_path)
         assert view.pause_row is None
         assert view.pause_disagreement is False
+
+    @pytest.mark.asyncio
+    async def test_pause_and_resume_record_their_events_before_they_flush(self, tmp_path: Path) -> None:
+        harness = _harness(_config(tmp_path))
+        order: list[str] = []
+        emit = harness.event_store.emit
+        flush = harness.scheduler.flush_state_snapshot
+
+        def recording_emit(event_type: Any, *args: Any, **kwargs: Any) -> Any:
+            order.append(str(event_type.value))
+            return emit(event_type, *args, **kwargs)
+
+        async def recording_flush() -> None:
+            order.append('flush')
+            await flush()
+
+        harness.event_store.emit = recording_emit  # type: ignore[method-assign]
+        harness.scheduler.flush_state_snapshot = recording_flush  # type: ignore[method-assign]
+
+        await harness.pause_scheduler(_COST_REASON, PauseClass.COST_CEILING, file_escalation=False)
+        await harness.resume_scheduler()
+
+        assert order == ['scheduler_paused', 'flush', 'scheduler_resumed', 'flush']
 
 
 class TestRestoreFlush:

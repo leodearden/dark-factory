@@ -18874,12 +18874,13 @@ class Harness:
            stored scalar tracks the decaying statistic.  For every other class
            the snapshot written here is the forensic record and is never
            overwritten.
-        2a. Flushes scheduler_state.json (``_flush_scheduler_snapshot``).
         3. Emits ``EventType.scheduler_paused`` with the reason and class
            (best-effort).
         4. Logs a WARNING so the operator sees it.
         5. Files an auto-resumable scheduler-pause L1 — unless ``file_escalation``
            is False.
+        6. Flushes scheduler_state.json (``_flush_scheduler_snapshot``) last,
+           after the runs.db row, so steps 1-5 run without yielding.
 
         ``file_escalation`` defaults True for every automatic trip (park-stop,
         cost-ceiling, EWA, watcher) so an AFK operator is notified.  A *deliberate*
@@ -18919,8 +18920,6 @@ class Harness:
             except Exception:
                 logger.warning('pause_scheduler: failed to persist pause state', exc_info=True)
 
-        await self._flush_scheduler_snapshot()
-
         if self.event_store:
             self.event_store.emit(
                 EventType.scheduler_paused,
@@ -18938,12 +18937,13 @@ class Harness:
         if file_escalation:
             self._file_scheduler_pause_escalation(reason)
 
+        await self._flush_scheduler_snapshot()
+
     async def resume_scheduler(self) -> None:
         """Clear the scheduler pause so acquire_next() resumes dispatching.
 
         1. Delegates to ``scheduler.resume()`` (idempotent).
         2. Clears persistence via ``RunStore.clear_scheduler_pause`` (best-effort).
-        2a. Flushes scheduler_state.json (``_flush_scheduler_snapshot``).
         3. Emits ``EventType.scheduler_resumed`` (best-effort).
         4. If the cleared hold's stored EWA was its predicate
            (``STORED_EWA_PREDICATE_CLASSES``), resets
@@ -18953,6 +18953,8 @@ class Harness:
            signals that the situation is under control — a clean reset is less
            surprising than watching the EWA trip instantly again.
         5. Logs INFO.
+        6. Flushes scheduler_state.json (``_flush_scheduler_snapshot``) last,
+           after the runs.db clear, so steps 1-5 run without yielding.
         """
         # Snapshot the class BEFORE resume() clears it.
         prior_class = self.scheduler.pause_class
@@ -18973,18 +18975,19 @@ class Harness:
             except Exception:
                 logger.warning('resume_scheduler: failed to clear persisted pause', exc_info=True)
 
-        await self._flush_scheduler_snapshot()
-
         if self.event_store:
             self.event_store.emit(
                 EventType.scheduler_resumed,
                 data={'pause_class': prior_class.value if prior_class else None},
             )
 
-    async def _flush_scheduler_snapshot(self) -> None:
-        """A paused scheduler never ticks, so a pause change reaches scheduler_state.json only here.
+        await self._flush_scheduler_snapshot()
 
-        Best-effort, never raises: plans/instruments-honesty-prd.md decision 5.
+    async def _flush_scheduler_snapshot(self) -> None:
+        """Force a best-effort scheduler_state.json write; never raises.
+
+        A paused scheduler never ticks, so pause, resume, restore and shutdown
+        call this (plans/instruments-honesty-prd.md decision 5).
         """
         try:
             await self.scheduler.flush_state_snapshot()
