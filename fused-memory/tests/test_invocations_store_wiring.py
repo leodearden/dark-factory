@@ -1,12 +1,14 @@
-"""run_server hands its invocations store to recon, so recon's LLM calls land rows (task 10414).
+"""run_server hands its invocations store to every consumer: recon and the WAL checkpoint loop.
 
-Every owner below run_server is pinned by behaviour: the stages, the judge and
-the harness (test_stages.py, test_judge.py, test_harness.py) and the targeted
-reconciler (test_targeted.py). ``run_server`` binds two uvicorn ports and
-constructs every store, so it cannot be driven from a unit test. That it passes
-the store to the harness and to the targeted reconciler is a structural check
-over its PARSED body, as in test_recurrence_remint_wiring.py. The store's name
-is derived from the assignment target, never spelled out.
+Recon's LLM calls land rows in the store (task 10414), and the periodic WAL
+checkpoint loop truncates its WAL (task 11880). Every owner below run_server is
+pinned by behaviour: the stages, the judge and the harness (test_stages.py,
+test_judge.py, test_harness.py), the targeted reconciler (test_targeted.py) and
+checkpoint-target collection (test_periodic_checkpoint.py). ``run_server`` binds
+two uvicorn ports and constructs every store, so it cannot be driven from a unit
+test. That it passes the store to each consumer is a structural check over its
+PARSED body, as in test_recurrence_remint_wiring.py. The store's name is
+derived from the assignment target, never spelled out.
 """
 
 from __future__ import annotations
@@ -45,16 +47,23 @@ def _invocations_store_name(run_server: ast.AsyncFunctionDef) -> str:
     return store.id
 
 
-@pytest.mark.parametrize('owner', ['ReconciliationHarness', 'TargetedReconciler'])
-def test_run_server_hands_the_recon_owner_its_invocations_store(owner: str):
+@pytest.mark.parametrize(
+    ('callee', 'keyword'),
+    [
+        ('ReconciliationHarness', 'cost_store'),
+        ('TargetedReconciler', 'cost_store'),
+        ('_collect_checkpoint_targets', 'invocations_store'),
+    ],
+)
+def test_run_server_hands_each_consumer_its_invocations_store(callee: str, keyword: str):
     run_server = _run_server()
     store = _invocations_store_name(run_server)
 
-    (construction,) = calls_named(run_server, owner)
+    (call,) = calls_named(run_server, callee)
 
-    cost_stores = [kw.value for kw in construction.keywords if kw.arg == 'cost_store']
-    assert len(cost_stores) == 1, f'{owner}(...) in run_server passes no cost_store'
-    (cost_store,) = cost_stores
-    assert isinstance(cost_store, ast.Name) and cost_store.id == store, (
-        f'{owner}(...) in run_server must be given {store}, the invocations store'
+    values = [kw.value for kw in call.keywords if kw.arg == keyword]
+    assert len(values) == 1, f'{callee}(...) in run_server passes no {keyword}'
+    (value,) = values
+    assert isinstance(value, ast.Name) and value.id == store, (
+        f'{callee}(...) in run_server must be given {keyword}={store}, the invocations store'
     )
