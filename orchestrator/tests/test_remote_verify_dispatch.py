@@ -1170,3 +1170,23 @@ class TestTagMirror:
         ]
         assert not any(':refs/merge-verify/' in ' '.join(argv) for argv in argvs)
         assert tag_scene.seen == []
+
+    async def test_an_unchanged_tag_set_is_mirrored_once_per_runner_and_a_new_tag_is_mirrored_next(
+        self, tag_scene: _TagScene,
+    ):
+        """The merge worker caches its runners, so an unchanged tag set costs no round trip."""
+        _annotated_tag(tag_scene.dispatcher, _TAG)
+        tag_scene.seed_remote_main()
+        runner = tag_scene.runner(id_factory=iter(('rid-1', 'rid-2', 'rid-3')).__next__)
+
+        await runner.run_merge_verify(tag_scene.head, _merge_spec())
+        await runner.run_merge_verify(tag_scene.head, _merge_spec())
+
+        assert tag_scene.tag_pushes() == ['refs/tags/*:refs/tags/*']
+
+        _annotated_tag(tag_scene.dispatcher, 'v0.3-alpha')
+        tag_scene.watched_tag = 'v0.3-alpha'
+        await runner.run_merge_verify(tag_scene.head, _merge_spec())
+
+        assert tag_scene.tag_pushes() == ['refs/tags/*:refs/tags/*'] * 2
+        assert tag_scene.seen[-1] == (0, tag_scene.head)
