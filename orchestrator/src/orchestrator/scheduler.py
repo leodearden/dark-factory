@@ -8592,15 +8592,22 @@ class Scheduler:
         The claim is one synchronous step (invariant 11); only a claim is
         followed by the ordinary start's bookkeeping.  The lock event was
         emitted by the acquire, and the store row was re-read in step (b).
+        A claim whose bookkeeping raises or is cancelled is released before
+        the exception propagates, since its caller never receives it.
         """
         selection = self._select_and_claim_early_start(picture, reads, waiting_predecessors, holds)
         claim = selection.claim
-        if claim is not None:
+        if claim is None:
+            return selection
+        try:
             await self._settle_dispatch(
                 claim.dependent, list(claim.keys),
                 tier=claim.tier, signal=self._dispatch_cooldown_signal(claim.task),
             )
             await self._write_snapshot_best_effort()
+        except BaseException:
+            self.release_early_start_claim(claim)
+            raise
         return selection
 
     def _select_and_claim_early_start(

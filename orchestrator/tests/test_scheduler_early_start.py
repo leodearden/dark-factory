@@ -11,6 +11,7 @@ the operational yaml's own ``module_overrides`` into the test's holder limits.
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -40,11 +41,13 @@ from orchestrator.early_start_selection import (
     PairReads,
     StepReads,
 )
+from orchestrator.eligibility_clock import EligibilityClockStore
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.overrides import OverrideStore
 from orchestrator.pause_policy import PauseClass
 from orchestrator.pin_reservation import Blocker, BlockerKind
 from orchestrator.scheduler import Scheduler, SchedulerCallbacks
+from orchestrator.starvation_state import StarvationStateStore
 from orchestrator.task_picture import TaskPicture
 
 pytestmark = [pytest.mark.usefixtures('code_default_config'), pytest.mark.asyncio]
@@ -126,7 +129,9 @@ def _rig(
     early_start: EarlyStartConfig | None = None,
     psi_admission: PsiAdmissionConfig | None = None,
     warm_base_hard_down: WarmBaseHardDownConfig | None = None,
+    announced_starving: tuple[str, ...] = (),
 ) -> _Rig:
+    """*announced_starving* are tasks a previous process announced to the starvation watchdog."""
     config = OrchestratorConfig(
         max_per_module=1, lock_depth=12, module_overrides={'two.py': 2},
         early_start=EarlyStartConfig(enabled=True) if early_start is None else early_start,
@@ -139,6 +144,9 @@ def _rig(
     store = EventStore(tmp_path / 'runs.db', 'run-1')
     overrides = OverrideStore(tmp_path / 'overrides.db')
     session = _RecordingSession()
+    clock_store = EligibilityClockStore(tmp_path / 'eligibility.db') if announced_starving else None
+    for tid in announced_starving:
+        StarvationStateStore(tmp_path / 'eligibility.db').announce(str(config.project_root), tid)
     scheduler = Scheduler(
         config,
         store,
@@ -148,6 +156,7 @@ def _rig(
         state_snapshot_path=tmp_path / 'scheduler_state.json',
         branch_work_reader=dict,
         callbacks=callbacks,
+        eligibility_clock_store=clock_store,
     )
     scheduler.finish_startup()
     status = AsyncMock()
@@ -667,6 +676,30 @@ class TestReleasePath:
         assert rig.scheduler.lock_table.held_modules('D') == set(D_FILES)
 
         assert rig.scheduler.release_early_start_claim(claim2) is True
+
+
+class TestTheClaimsBookkeeping:
+    """The claim is followed by awaited bookkeeping; a claim whose bookkeeping escapes is not kept."""
+
+    async def test_a_claim_whose_bookkeeping_is_cancelled_is_released(self, tmp_path, monkeypatch):
+        resolve = AsyncMock()
+        rig = _rig(
+            tmp_path, monkeypatch, callbacks=SchedulerCallbacks(on_starvation_resolve=resolve),
+            announced_starving=('D',),
+        )
+        rig.offer(task('P', files=P_FILES), task('D', deps=('P',)))
+        assert await rig.acquire() == 'P'
+        resolve.side_effect = asyncio.CancelledError
+        picture = await rig.picture(p_running(), task('D', deps=('P',)))
+
+        with pytest.raises(asyncio.CancelledError):
+            await rig.select(picture, reads_for(picture))
+
+        resolve.assert_awaited_once_with('D')
+        rig.assert_untouched('D')
+        assert rig.scheduler.lock_table.held_modules('P') == set(P_FILES)
+        released = [e for e in rig.store.fetch_events_by_type(EventType.lock_released) if e['task_id'] == 'D']
+        assert len(released) == 1
 
 
 class TestRow34NeverStartedTwice:
