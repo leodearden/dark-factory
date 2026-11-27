@@ -8,20 +8,27 @@ producer writes exactly these keys and every reader parses them.
 from __future__ import annotations
 
 import json
+import logging
+import sqlite3
 import sys
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 import pytest
 from pydantic import ValidationError
 
+from shared.project_layout import runs_db, scheduler_state_json
 from shared.scheduler_state import (
+    CheckedSchedulerState,
     MalformedSnapshotError,
     OverrideRecord,
     ParkRecord,
+    PauseRow,
     PinQueueEntry,
     RequeueCooldown,
     SchedulerStateSnapshot,
+    read_scheduler_state_checked,
 )
 
 _SNAPSHOT_KEYS = {
@@ -333,3 +340,218 @@ class TestFrozen:
         snap = SchedulerStateSnapshot.empty()
         with pytest.raises(ValidationError):
             snap.is_paused = True
+
+
+_NOW = datetime(2026, 11, 27, 12, 0, tzinfo=UTC)
+_SNAPSHOT_AT = _NOW - timedelta(seconds=90)
+_ROW_PAUSE_AT = '2026-11-27T11:58:00+00:00'
+
+# A minimal transcription of the scheduler_state table in
+# orchestrator/src/orchestrator/run_store.py (shared cannot import orchestrator).
+_SCHEDULER_STATE_DDL = (
+    'CREATE TABLE scheduler_state ('
+    ' project_id TEXT PRIMARY KEY,'
+    ' pause_reason TEXT NOT NULL,'
+    ' pause_at TEXT NOT NULL,'
+    ' set_by_run_id TEXT NOT NULL,'
+    ' pause_class TEXT)'
+)
+
+
+def _write_snapshot(root: Path, snapshot: SchedulerStateSnapshot) -> None:
+    path = scheduler_state_json(root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(snapshot.to_json()))
+
+
+def _write_snapshot_body(root: Path, body: str) -> None:
+    path = scheduler_state_json(root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(body)
+
+
+def _seed_runs_db(root: Path, *rows: tuple[str, str, str, str | None], with_table: bool = True) -> None:
+    """Create runs.db; each row is (project_id, pause_reason, pause_at, pause_class)."""
+    path = runs_db(root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(path)
+    try:
+        if with_table:
+            conn.execute(_SCHEDULER_STATE_DDL)
+            conn.executemany(
+                'INSERT INTO scheduler_state '
+                '(project_id, pause_reason, pause_at, set_by_run_id, pause_class) '
+                'VALUES (?, ?, ?, ?, ?)',
+                [(pid, reason, at, 'run-1', cls) for pid, reason, at, cls in rows],
+            )
+        else:
+            conn.execute('CREATE TABLE unrelated (x INTEGER)')
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _paused_snapshot(reason: str = 'snapshot reason', pause_class: str = 'operator') -> SchedulerStateSnapshot:
+    return SchedulerStateSnapshot(
+        is_paused=True,
+        pause_reason=reason,
+        pause_class=pause_class,
+        snapshot_at=_SNAPSHOT_AT,
+    )
+
+
+def _running_snapshot() -> SchedulerStateSnapshot:
+    return SchedulerStateSnapshot(snapshot_at=_SNAPSHOT_AT)
+
+
+class TestFromBytes:
+    def test_valid_bytes_parse_as_from_json_of_the_same_dict(self) -> None:
+        wire = _populated().to_json()
+        parsed = SchedulerStateSnapshot.from_bytes(json.dumps(wire).encode())
+        assert parsed == SchedulerStateSnapshot.from_json(wire)
+
+    @pytest.mark.parametrize(
+        'raw', [b'', b'{not json', b'\xff\xfe', b'[]', b'{"lock_depth": true}'],
+    )
+    def test_bytes_that_are_not_a_snapshot_raise_malformed(self, raw: bytes) -> None:
+        with pytest.raises(MalformedSnapshotError):
+            SchedulerStateSnapshot.from_bytes(raw)
+
+    def test_the_checked_view_parses_as_itself(self) -> None:
+        parsed = CheckedSchedulerState.from_bytes(json.dumps(_populated().to_json()).encode())
+        assert isinstance(parsed, CheckedSchedulerState)
+
+
+class TestCheckedReaderTruthTable:
+    def test_no_files_reads_as_running_and_unaged(self, tmp_path: Path) -> None:
+        view = read_scheduler_state_checked(tmp_path, now=_NOW)
+        assert view.is_paused is False
+        assert view.snapshot_age_s is None
+        assert view.pause_row is None
+        assert view.pause_disagreement is False
+
+    def test_a_paused_snapshot_without_runs_db_serves_the_snapshot(self, tmp_path: Path) -> None:
+        _write_snapshot(tmp_path, _paused_snapshot('halted', 'cost_ceiling'))
+        view = read_scheduler_state_checked(tmp_path, now=_NOW)
+        assert (view.is_paused, view.pause_reason, view.pause_class) == (True, 'halted', 'cost_ceiling')
+        assert view.snapshot_age_s == (_NOW - _SNAPSHOT_AT).total_seconds()
+        assert view.pause_row is None
+        assert view.pause_disagreement is False
+
+    def test_both_paused_with_different_reasons_agree_and_serve_the_snapshot(self, tmp_path: Path) -> None:
+        _write_snapshot(tmp_path, _paused_snapshot('first pause', 'operator'))
+        _seed_runs_db(tmp_path, ('dark_factory', 'later pause', _ROW_PAUSE_AT, 'cost_ceiling'))
+        view = read_scheduler_state_checked(tmp_path, now=_NOW)
+        assert view.is_paused is True
+        assert view.pause_reason == 'first pause'
+        assert view.pause_class == 'operator'
+        assert view.pause_row == PauseRow(
+            reason='later pause', pause_at=_ROW_PAUSE_AT, pause_class='cost_ceiling',
+        )
+        assert view.pause_disagreement is False
+
+    def test_a_running_snapshot_over_a_pause_row_serves_the_row(self, tmp_path: Path) -> None:
+        _write_snapshot(tmp_path, _running_snapshot())
+        _seed_runs_db(tmp_path, ('dark_factory', 'cost_ceiling_orch_exceeded', _ROW_PAUSE_AT, 'cost_ceiling'))
+        view = read_scheduler_state_checked(tmp_path, now=_NOW)
+        assert view.is_paused is True
+        assert view.pause_reason == 'cost_ceiling_orch_exceeded'
+        assert view.pause_class == 'cost_ceiling'
+        assert view.pause_disagreement is True
+
+    def test_a_paused_snapshot_over_an_empty_table_serves_running(self, tmp_path: Path) -> None:
+        _write_snapshot(tmp_path, _paused_snapshot())
+        _seed_runs_db(tmp_path)
+        view = read_scheduler_state_checked(tmp_path, now=_NOW)
+        assert (view.is_paused, view.pause_reason, view.pause_class) == (False, None, None)
+        assert view.pause_row is None
+        assert view.pause_disagreement is True
+
+    def test_a_row_without_a_snapshot_file_serves_the_row(self, tmp_path: Path) -> None:
+        _seed_runs_db(tmp_path, ('dark_factory', 'halted', _ROW_PAUSE_AT, 'cost_ceiling'))
+        view = read_scheduler_state_checked(tmp_path, now=_NOW)
+        assert (view.is_paused, view.pause_reason, view.pause_class) == (True, 'halted', 'cost_ceiling')
+        assert view.snapshot_age_s is None
+        assert view.pause_disagreement is False
+
+    def test_runs_db_without_the_table_serves_the_snapshot(self, tmp_path: Path) -> None:
+        _write_snapshot(tmp_path, _paused_snapshot('halted', 'operator'))
+        _seed_runs_db(tmp_path, with_table=False)
+        view = read_scheduler_state_checked(tmp_path, now=_NOW)
+        assert (view.is_paused, view.pause_reason, view.pause_class) == (True, 'halted', 'operator')
+        assert view.pause_row is None
+        assert view.pause_disagreement is False
+
+
+class TestCheckedReaderRow:
+    def test_a_null_pause_class_is_served_raw(self, tmp_path: Path) -> None:
+        _seed_runs_db(tmp_path, ('dark_factory', 'legacy halt', _ROW_PAUSE_AT, None))
+        view = read_scheduler_state_checked(tmp_path, now=_NOW)
+        assert view.pause_row is not None
+        assert view.pause_row.pause_class is None
+        assert view.pause_class is None
+
+    def test_the_latest_row_is_served(self, tmp_path: Path) -> None:
+        _seed_runs_db(
+            tmp_path,
+            ('a', 'older', '2026-11-27T10:00:00+00:00', 'operator'),
+            ('b', 'newer', '2026-11-27T11:00:00+00:00', 'cost_ceiling'),
+        )
+        view = read_scheduler_state_checked(tmp_path, now=_NOW)
+        assert view.pause_row == PauseRow(
+            reason='newer', pause_at='2026-11-27T11:00:00+00:00', pause_class='cost_ceiling',
+        )
+
+    def test_the_reader_never_creates_runs_db(self, tmp_path: Path) -> None:
+        _write_snapshot(tmp_path, _paused_snapshot())
+        read_scheduler_state_checked(tmp_path, now=_NOW)
+        assert not runs_db(tmp_path).exists()
+
+
+class TestCheckedReaderMalformedSnapshot:
+    @pytest.mark.parametrize('body', ['{not json', '[]'])
+    def test_a_malformed_body_reads_as_unreadable_and_warns(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture, body: str,
+    ) -> None:
+        _write_snapshot_body(tmp_path, body)
+        with caplog.at_level(logging.WARNING, logger='shared.scheduler_state'):
+            view = read_scheduler_state_checked(tmp_path, now=_NOW)
+        assert view == CheckedSchedulerState()
+        assert any(
+            record.name == 'shared.scheduler_state' and record.levelno == logging.WARNING
+            for record in caplog.records
+        )
+
+    def test_a_malformed_body_over_a_row_serves_the_row(self, tmp_path: Path) -> None:
+        _write_snapshot_body(tmp_path, '{not json')
+        _seed_runs_db(tmp_path, ('dark_factory', 'halted', _ROW_PAUSE_AT, 'cost_ceiling'))
+        view = read_scheduler_state_checked(tmp_path, now=_NOW)
+        assert view.is_paused is True
+        assert view.pause_disagreement is False
+
+
+class TestCheckedReaderClock:
+    def test_a_naive_now_is_refused(self, tmp_path: Path) -> None:
+        with pytest.raises(ValueError, match='timezone-aware'):
+            read_scheduler_state_checked(tmp_path, now=datetime(2026, 11, 27, 12, 0))
+
+
+class TestCheckedWireForm:
+    def _view(self, tmp_path: Path) -> CheckedSchedulerState:
+        _write_snapshot(tmp_path, _running_snapshot())
+        _seed_runs_db(tmp_path, ('dark_factory', 'halted', _ROW_PAUSE_AT, 'cost_ceiling'))
+        return read_scheduler_state_checked(tmp_path, now=_NOW)
+
+    def test_wire_form_adds_exactly_the_reader_keys(self, tmp_path: Path) -> None:
+        assert set(self._view(tmp_path).to_json()) == _SNAPSHOT_KEYS | {
+            'snapshot_age_s', 'pause_row', 'pause_disagreement',
+        }
+
+    def test_pause_row_serialises_as_its_raw_strings(self, tmp_path: Path) -> None:
+        assert self._view(tmp_path).to_json()['pause_row'] == {
+            'reason': 'halted', 'pause_at': _ROW_PAUSE_AT, 'pause_class': 'cost_ceiling',
+        }
+
+    def test_from_json_of_to_json_is_identity(self, tmp_path: Path) -> None:
+        view = self._view(tmp_path)
+        assert CheckedSchedulerState.from_json(view.to_json()) == view
