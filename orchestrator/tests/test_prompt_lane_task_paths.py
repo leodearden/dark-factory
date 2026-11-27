@@ -19,7 +19,7 @@ from orchestrator.artifacts import LANE_SYMLINKED_ARTIFACTS, TaskArtifacts
 
 _LANE_PATH = re.compile(r'\.task/[A-Za-z0-9_.-]*[A-Za-z0-9_]')
 _LINKED_PATHS = tuple(f'.task/{name}' for name in LANE_SYMLINKED_ARTIFACTS)
-_LANE_LAYOUT_ROLES = ('implementer', 'debugger', 'merger', 'steward', 'simple_task')
+_UNLINKED_TASK_STATE = ('metadata.json', 'reviews/', 'verdicts/')
 
 
 def build_dual_root_lane(tmp_path: Path) -> tuple[Path, TaskArtifacts]:
@@ -69,18 +69,26 @@ def test_lane_task_dir_exposes_only_the_linked_artifacts(tmp_path):
     )
 
 
-@pytest.mark.parametrize('name', _LANE_LAYOUT_ROLES)
-def test_lane_layout_roles_name_the_linked_artifacts_and_metadata_json(name):
+def _names_a_lane_link(role: AgentRole) -> bool:
+    return any(path in role.system_prompt for path in _LINKED_PATHS)
+
+
+_LANE_LINK_ROLES = tuple(sorted(name for name, role in ROLES.items() if _names_a_lane_link(role)))
+
+
+def test_some_role_names_a_lane_link():
+    assert _LANE_LINK_ROLES, f'no role names any of {_LINKED_PATHS}, so the layout test checks nothing'
+
+
+@pytest.mark.parametrize('name', _LANE_LINK_ROLES)
+def test_lane_link_roles_name_the_linked_and_the_unlinked_task_state(name):
     prompt = ROLES[name].system_prompt
     for path in _LINKED_PATHS:
         assert path in prompt, f'{name} does not name {path}'
-    assert 'metadata.json' in prompt, (
-        f'{name} describes the .task/ layout without saying metadata.json is not exposed there'
-    )
-
-
-def _names_a_lane_link(role: AgentRole) -> bool:
-    return any(path in role.system_prompt for path in _LINKED_PATHS)
+    for unlinked in _UNLINKED_TASK_STATE:
+        assert unlinked in prompt, (
+            f'{name} describes the .task/ links without saying {unlinked} is not exposed there'
+        )
 
 
 def test_every_role_naming_a_lane_link_carries_the_link_section_once():
