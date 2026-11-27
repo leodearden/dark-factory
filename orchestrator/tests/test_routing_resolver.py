@@ -40,6 +40,7 @@ from orchestrator.routing import (
     RoleDefaults,
     RouteInputs,
     RoutingDecision,
+    configured_model,
     resolve_route,
 )
 
@@ -988,3 +989,20 @@ class TestScopeCapacityFallback:
         assert decision.model == 'sonnet'
         assert decision.source_layer == 'config'
         assert 'metadata_override:model-capacity-exhausted' in decision.rejected
+
+
+class TestConfiguredModel:
+    """``configured_model`` names the model a config's layer-3 seat holds for
+    a role -- the one seat lookup resolve_route and the eval off-pin check
+    share -- or None when ModelsConfig seats no model for it."""
+
+    def test_role_with_its_own_seat(self):
+        assert configured_model('implementer', ModelsConfig(implementer='haiku')) == 'haiku'
+
+    def test_reviewer_variants_share_the_reviewer_seat(self):
+        assert configured_model('reviewer_comprehensive', ModelsConfig(reviewer='haiku')) == 'haiku'
+
+    def test_role_without_a_seat_is_none(self):
+        """workflow.py::_RESETTLED_ADJUDICATOR is dispatched through
+        TaskWorkflow._invoke but ModelsConfig has no field for it."""
+        assert configured_model('resettled_adjudicator', ModelsConfig()) is None
