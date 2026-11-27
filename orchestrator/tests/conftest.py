@@ -108,6 +108,7 @@ from orchestrator.config import (  # noqa: E402
     SandboxConfig,
 )
 from orchestrator.merge_lane import worker  # noqa: E402
+from orchestrator.verify_host_roster_file import ROSTER_FILE_ENV  # noqa: E402
 
 # Belt-and-braces direct assignment: defeats any import-order race where
 # orchestrator.merge_lane.worker was imported (by another conftest/plugin) before
@@ -338,6 +339,10 @@ def briefing(tmp_path: Path) -> BriefingAssembler:
     return BriefingAssembler(config)
 
 
+#: Guaranteed-absent roster path; fixed for the same reason as _ABSENT_WARM_LANE_SCRIPT_DIR below.
+_ABSENT_VERIFY_HOSTS_FILE = "/nonexistent/df-verify-hosts.yaml"
+
+
 @pytest.fixture(autouse=True)
 def _isolate_orch_config(monkeypatch, tmp_path):
     """Isolate OrchestratorConfig from the real project tree for every test.
@@ -359,9 +364,10 @@ def _isolate_orch_config(monkeypatch, tmp_path):
 
     Precedence keeps this safe: explicit kwargs still win over the env, which overrides
     only ``project_root`` and the host-reaching knobs: laptop runner, ``prefer_remote``
-    (task 5053), ``verify_use_cgroup_scope`` (task 5206) and
-    ``verify_cold_preprovision_command`` (task 6917), so a bare config never ssh's the
-    laptop, spawns a real systemd scope or runs a real ``uv sync``; all else loads from
+    (task 5053), ``verify_use_cgroup_scope`` (task 5206),
+    ``verify_cold_preprovision_command`` (task 6917) and the verify-host roster file
+    (task 11734), so a bare config never ssh's the laptop, spawns a real systemd scope,
+    runs a real ``uv sync`` or reads the operator's roster; all else loads from
     yaml/defaults.
     Config-loading tests already use ``tmp_path`` as their project_root, so the
     env value agrees with the YAML they write.  The opt-in
@@ -375,6 +381,7 @@ def _isolate_orch_config(monkeypatch, tmp_path):
     monkeypatch.setenv("ORCH_CONFIG_PATH", str(REPO_ROOT / "dark-factory-orchestrator.yaml"))
     monkeypatch.setenv("ORCH_PROJECT_ROOT", str(tmp_path))
     monkeypatch.setenv("ORCH_VERIFY_RUNNERS", "[]")
+    monkeypatch.setenv(ROSTER_FILE_ENV, _ABSENT_VERIFY_HOSTS_FILE)
     monkeypatch.setenv("ORCH_VERIFY_HOST_POLICY", "prefer_local")
     monkeypatch.setenv("ORCH_VERIFY_USE_CGROUP_SCOPE", "false")
     monkeypatch.setenv("ORCH_VERIFY_COLD_PREPROVISION_COMMAND", "")
