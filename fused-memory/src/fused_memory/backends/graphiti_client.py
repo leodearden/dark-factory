@@ -74,6 +74,7 @@ from fused_memory.backends.graph_access import (
 from fused_memory.backends.llm_clients import (
     ForceJsonObjectOpenAIGenericClient,
     TokenRecordingOpenAIGenericClient,
+    wrapped_llm_clients,
 )
 from fused_memory.backends.llm_token_usage import (
     AttributingTokenUsageTracker,
@@ -5656,8 +5657,11 @@ class GraphitiBackend:
         """
         graphitis = [g for g in (self.client, *self._group_clients.values()) if g is not None]
         return [
-            self._llm_client,
+            *wrapped_llm_clients(self._llm_client),
             self._embedder,
             self._cross_encoder,
-            *(sub for g in graphitis for sub in (g.llm_client, g.embedder, g.cross_encoder)),
+            *(
+                sub for g in graphitis
+                for sub in (*wrapped_llm_clients(g.llm_client), g.embedder, g.cross_encoder)
+            ),
         ]

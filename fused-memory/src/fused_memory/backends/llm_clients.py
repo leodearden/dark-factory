@@ -4,10 +4,14 @@ Kept out of the already-large ``graphiti_client.py``, following the
 ``backends/falkor_fulltext.py`` convention for focused helpers.
 """
 
+import contextlib
 import json
+from collections.abc import Iterator, Mapping
 from contextvars import ContextVar
+from types import MappingProxyType
 from typing import Any
 
+from graphiti_core.llm_client.client import LLMClient
 from graphiti_core.llm_client.config import DEFAULT_MAX_TOKENS, ModelSize
 from graphiti_core.llm_client.openai_client import OpenAIClient
 from graphiti_core.llm_client.openai_generic_client import OpenAIGenericClient
@@ -17,6 +21,8 @@ from openai.types.responses import EasyInputMessageParam, ResponseInputParam
 from openai.types.shared import ReasoningEffort
 from openai.types.shared_params import Reasoning
 from pydantic import BaseModel
+
+from fused_memory.models.enums import MemoryCategory
 
 # Prefixed to the inlined schema. Phrased as an instruction rather than a bare
 # schema dump because the model is being asked to honour it without any
@@ -293,3 +299,91 @@ class ExplicitEffortOpenAIClient(OpenAIClient):
         raise NotImplementedError(
             'a JSON-mode chat completion cannot carry reasoning.effort, so it is never sent without it',
         )
+
+
+EXTRACTION_PROMPT_NAMES: frozenset[str] = frozenset({
+    'extract_nodes.extract_message',
+    'extract_nodes.extract_text',
+    'extract_nodes.extract_json',
+    'extract_edges.edge',
+})
+"""graphiti_core 0.28.2's node_operations.py::_call_extraction_llm and edge_operations.py::extract_edges prompts."""
+
+_EXTRACTION_CATEGORY: ContextVar[MemoryCategory | None] = ContextVar('extraction_category', default=None)
+
+
+@contextlib.contextmanager
+def extraction_category_scope(category: MemoryCategory | None) -> Iterator[None]:
+    """Route the extraction calls made inside this scope, and in tasks it spawns, by *category*."""
+    reset_token = _EXTRACTION_CATEGORY.set(category)
+    try:
+        yield
+    finally:
+        _EXTRACTION_CATEGORY.reset(reset_token)
+
+
+class CategoryRoutedLLMClient(LLMClient):
+    """Sends a scoped category's extraction prompts to that category's route, everything else to the default.
+
+    The category is the one extraction_category_scope set for the calling
+    context. The default's token tracker is the router's, so a measured window
+    over the router credits every inner client whose tracker attributes.
+    """
+
+    def __init__(self, default: LLMClient, routes: Mapping[MemoryCategory, LLMClient]) -> None:
+        super().__init__(config=default.config)
+        self.token_tracker = default.token_tracker
+        self._default = default
+        self._routes: Mapping[MemoryCategory, LLMClient] = MappingProxyType(dict(routes))
+
+    @property
+    def default(self) -> LLMClient:
+        return self._default
+
+    @property
+    def routes(self) -> Mapping[MemoryCategory, LLMClient]:
+        return self._routes
+
+    def client_for(self, prompt_name: str | None) -> LLMClient:
+        if prompt_name in EXTRACTION_PROMPT_NAMES and (category := _EXTRACTION_CATEGORY.get()) is not None:
+            return self._routes.get(category, self._default)
+        return self._default
+
+    async def generate_response(
+        self,
+        messages: list[Message],
+        response_model: type[BaseModel] | None = None,
+        max_tokens: int | None = None,
+        model_size: ModelSize = ModelSize.medium,
+        group_id: str | None = None,
+        prompt_name: str | None = None,
+    ) -> dict[str, Any]:
+        return await self.client_for(prompt_name).generate_response(
+            messages,
+            response_model=response_model,
+            max_tokens=max_tokens,
+            model_size=model_size,
+            group_id=group_id,
+            prompt_name=prompt_name,
+        )
+
+    async def _generate_response(
+        self,
+        messages: list[Message],
+        response_model: type[BaseModel] | None = None,
+        max_tokens: int = DEFAULT_MAX_TOKENS,
+        model_size: ModelSize = ModelSize.medium,
+    ) -> dict[str, Any]:
+        raise NotImplementedError('generate_response delegates whole calls to an inner client')
+
+    def set_tracer(self, tracer: Any) -> None:
+        super().set_tracer(tracer)
+        for client in (self._default, *self._routes.values()):
+            client.set_tracer(tracer)
+
+
+def wrapped_llm_clients(client: LLMClient | None) -> tuple[LLMClient | None, ...]:
+    """The clients that actually send *client*'s calls: a router's default then its routes, else *client*."""
+    if isinstance(client, CategoryRoutedLLMClient):
+        return (client.default, *client.routes.values())
+    return (client,)
