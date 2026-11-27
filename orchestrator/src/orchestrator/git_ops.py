@@ -6179,29 +6179,38 @@ class GitOps:
         location (or a subdirectory layout) is one edit instead of two that
         must be kept in lockstep.
 
+        The order is project first, unless ``name`` is listed in
+        ``git.warm_lane_df_preferred_scripts`` (PRD D3 as amended by task
+        7864), which puts dark-factory's copy first. The list is read on every
+        call, so a config reload applies from the next one. A listed name
+        whose dark-factory copy is absent still falls through to the project
+        copy.
+
         Args:
             name: Bare script filename, e.g. ``'warm-lane-gc.sh'``.
 
         Returns:
             ``((path, origin), ...)`` in preference order.
         """
-        return (
-            (self.project_root / 'scripts' / name, 'project'),
-            (_df_warm_lane_script_dir() / name, 'dark-factory'),
-        )
+        project = (self.project_root / 'scripts' / name, 'project')
+        dark_factory = (_df_warm_lane_script_dir() / name, 'dark-factory')
+        if name in self.config.warm_lane_df_preferred_scripts:
+            return (dark_factory, project)
+        return (project, dark_factory)
 
     def _resolve_warm_lane_script(self, name: str) -> tuple[Path, str] | None:
-        """Locate warm-lane script ``name``, project override first.
+        """Locate warm-lane script ``name`` in :meth:`_warm_lane_script_candidates` order.
 
         Walks :meth:`_warm_lane_script_candidates` and returns the first entry
         that exists.  Resolution order (PRD
         ``warm-lane-infra-repatriation-prd.md`` design decision D3):
 
-        1. ``<project_root>/scripts/<name>`` — the PROJECT OVERRIDE. A project
-           that has invested in its own warm-lane tooling keeps it;
-           dark-factory's copy is the floor, not the ceiling. This is also
-           what makes leaf α a behavioural no-op for reify, whose own copies
-           still win at every call site.
+        1. ``<project_root>/scripts/<name>`` — the PROJECT OVERRIDE, unless
+           ``name`` is listed in ``git.warm_lane_df_preferred_scripts``, which
+           swaps steps 1 and 2. A project that has invested in its own
+           warm-lane tooling keeps it; dark-factory's copy is the floor, not
+           the ceiling. This is also what makes leaf α a behavioural no-op for
+           reify, whose own copies win wherever it lists nothing.
         2. :func:`_df_warm_lane_script_dir` ``/ <name>`` — dark-factory's own
            relocated copy under ``orchestrator/scripts/warm-lane/``.
         3. Neither → ``None``, so the caller emits a WARNING naming BOTH tried
@@ -6286,12 +6295,11 @@ class GitOps:
     async def _run_warm_lane_disk_guard(self) -> int:
         """Invoke ``warm-lane-disk-guard.sh check``.
 
-        Located via :meth:`_resolve_warm_lane_script`:
-        ``<project_root>/scripts/warm-lane-disk-guard.sh`` first, then
-        dark-factory's own copy under ``orchestrator/scripts/warm-lane/``. A
-        project that carries its own warm-lane tooling keeps it (PRD
-        ``warm-lane-infra-repatriation-prd.md`` D3); dark-factory's copy is
-        the floor, not the ceiling.
+        Located via :meth:`_resolve_warm_lane_script`, searching
+        ``<project_root>/scripts/warm-lane-disk-guard.sh`` and dark-factory's
+        own copy under ``orchestrator/scripts/warm-lane/`` in
+        :meth:`_warm_lane_script_candidates` order (PRD
+        ``warm-lane-infra-repatriation-prd.md`` D3).
 
         Mirrors the ``_seed_warm_lane``/``refresh_warm_base`` fail-soft helper
         pattern: no implementation at either location → 127 sentinel; any
@@ -6343,8 +6351,8 @@ class GitOps:
     async def _run_warm_lane_soft_guard(self) -> int:
         """Invoke ``warm-lane-disk-guard.sh check --soft``.
 
-        Located via :meth:`_resolve_warm_lane_script` — project override
-        first, then dark-factory's own copy (PRD D3); see
+        Located via :meth:`_resolve_warm_lane_script` in
+        :meth:`_warm_lane_script_candidates` order (PRD D3); see
         :meth:`_run_warm_lane_disk_guard`.
 
         θ (task 2443, §9.5): the proactive soft-floor counterpart to
@@ -6404,8 +6412,8 @@ class GitOps:
     async def _run_warm_lane_audit(self) -> str | None:
         """Invoke ``warm-lane-audit.sh --mount <worktree_base>``.
 
-        Located via :meth:`_resolve_warm_lane_script` — project override
-        first, then dark-factory's own copy (PRD D3); see
+        Located via :meth:`_resolve_warm_lane_script` in
+        :meth:`_warm_lane_script_candidates` order (PRD D3); see
         :meth:`_run_warm_lane_disk_guard`.
 
         α (task 2443, §9.5 inv.12): OBSERVABILITY-ONLY. This wrapper never
@@ -6505,8 +6513,8 @@ class GitOps:
     async def _run_warm_lane_gc_reclaim(self) -> int:
         """Invoke ``warm-lane-gc.sh reclaim``.
 
-        Located via :meth:`_resolve_warm_lane_script` — project override
-        first, then dark-factory's own copy (PRD D3); see
+        Located via :meth:`_resolve_warm_lane_script` in
+        :meth:`_warm_lane_script_candidates` order (PRD D3); see
         :meth:`_run_warm_lane_disk_guard`.
 
         **Seed-primitive passthrough (task 3072).** Passes ``--seed-script
@@ -6648,8 +6656,8 @@ class GitOps:
     async def warm_lane_ref_is_degenerate(self, task_id: str) -> bool:
         """Invoke ``warm-lane-degenerate-ref-check.sh`` for one task's ref.
 
-        Located via :meth:`_resolve_warm_lane_script` — project override
-        first, then dark-factory's own copy (PRD D3); see
+        Located via :meth:`_resolve_warm_lane_script` in
+        :meth:`_warm_lane_script_candidates` order (PRD D3); see
         :meth:`_run_warm_lane_disk_guard`.
 
         Task 2112: wraps reify's read-only classifier primitive (contract in
@@ -6707,8 +6715,8 @@ class GitOps:
     async def thin_warm_lane(self, lane_dir: Path) -> int:
         """Invoke ``thin-warm-lane.sh <lane_dir>``.
 
-        Located via :meth:`_resolve_warm_lane_script` — project override
-        first, then dark-factory's own copy (PRD D3); see
+        Located via :meth:`_resolve_warm_lane_script` in
+        :meth:`_warm_lane_script_candidates` order (PRD D3); see
         :meth:`_run_warm_lane_disk_guard`.
 
         Task 2442 (§9.5 η): fail-soft, never-raise wrapper around reify δ's

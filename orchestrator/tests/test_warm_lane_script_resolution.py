@@ -981,7 +981,7 @@ class TestDarkFactoryPreferredScripts:
 
         await GC_WRAPPER.invoke(git_ops)
         flip = apply_reload(live, OrchestratorConfig(
-            git=GitConfig(warm_lane_df_preferred_scripts=[GC_WRAPPER.script]),
+            git=GitConfig(warm_lane_df_preferred_scripts=['warm-lane-gc.sh']),
         ))
         await GC_WRAPPER.invoke(git_ops)
         revert = apply_reload(live, OrchestratorConfig())
