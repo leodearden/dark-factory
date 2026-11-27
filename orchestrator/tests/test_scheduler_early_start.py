@@ -22,7 +22,12 @@ from _orch_helpers import HermeticMcpSession
 from _park_test_helpers import make_task
 from shared.psi import PsiSample
 
-from orchestrator.config import OrchestratorConfig
+from orchestrator.config import (
+    EarlyStartConfig,
+    OrchestratorConfig,
+    PsiAdmissionConfig,
+    WarmBaseHardDownConfig,
+)
 from orchestrator.delivered_checks import ChecksAtCommit
 from orchestrator.dispatch_row import FreshRow
 from orchestrator.early_start_selection import (
@@ -80,6 +85,12 @@ class _Rig:
         assert picture is not None
         return picture
 
+    async def acquire(self) -> str:
+        """The task the ordinary pass starts next; it must start one."""
+        assignment = await self.scheduler.acquire_next()
+        assert assignment is not None
+        return assignment.task_id
+
     async def dispatch(self, task: dict) -> None:
         """Dispatch *task* through the ordinary pass, so it really holds its keys."""
         self.offer(task)
@@ -111,13 +122,20 @@ class _Rig:
 
 def _rig(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *,
-    callbacks: SchedulerCallbacks | None = None, **config_overrides: object,
+    callbacks: SchedulerCallbacks | None = None,
+    early_start: EarlyStartConfig | None = None,
+    psi_admission: PsiAdmissionConfig | None = None,
+    warm_base_hard_down: WarmBaseHardDownConfig | None = None,
 ) -> _Rig:
-    settings: dict[str, object] = {
-        'max_per_module': 1, 'lock_depth': 12, 'module_overrides': {'two.py': 2},
-        'early_start': {'enabled': True}, 'project_root': tmp_path, **config_overrides,
-    }
-    config = OrchestratorConfig(**settings)
+    config = OrchestratorConfig(
+        max_per_module=1, lock_depth=12, module_overrides={'two.py': 2},
+        early_start=EarlyStartConfig(enabled=True) if early_start is None else early_start,
+        psi_admission=PsiAdmissionConfig() if psi_admission is None else psi_admission,
+        warm_base_hard_down=(
+            WarmBaseHardDownConfig() if warm_base_hard_down is None else warm_base_hard_down
+        ),
+        project_root=tmp_path,
+    )
     store = EventStore(tmp_path / 'runs.db', 'run-1')
     overrides = OverrideStore(tmp_path / 'overrides.db')
     session = _RecordingSession()
@@ -484,7 +502,7 @@ class TestRow7Keys:
         rig = _rig(tmp_path, monkeypatch)
         await rig.dispatch(task('P', files=['two.py']))
         rig.offer(task('P', files=['two.py'], status='in-progress'), task('U', files=['two.py']))
-        assert (await rig.scheduler.acquire_next()).task_id == 'U'
+        assert await rig.acquire() == 'U'
         picture = await rig.picture(
             task('P', files=['two.py'], status='in-progress'),
             task('U', files=['two.py'], status='in-progress'),
@@ -601,7 +619,7 @@ class TestRow34NeverStartedTwice:
     async def test_a_dependent_the_ordinary_pass_started_is_not_claimed(self, tmp_path, monkeypatch):
         rig = await _with_p_running(tmp_path, monkeypatch)
         rig.offer(task('P', files=P_FILES, status='done'), task('D', files=['c.py'], deps=('P',)))
-        assert (await rig.scheduler.acquire_next()).task_id == 'D'
+        assert await rig.acquire() == 'D'
         picture = await rig.picture(p_running(), task('D', files=['c.py'], deps=('P',)))
 
         selection = await rig.select(picture, reads_for(picture))
@@ -633,6 +651,13 @@ class TestRow8PredecessorChecks:
         rig.assert_untouched('D')
 
 
+def _marked_dependent(mark: str | None) -> dict:
+    row = task('D', deps=('P',))
+    if mark is not None:
+        row['metadata']['early_start'] = {'predecessor': mark}
+    return row
+
+
 class TestRow44TheBranchRule:
     @pytest.mark.parametrize(('branch', 'mark'), [
         (DependentBranch.UNSTACKED, None),
@@ -645,8 +670,7 @@ class TestRow44TheBranchRule:
         self, tmp_path, monkeypatch, branch, mark,
     ):
         rig = await _with_p_running(tmp_path, monkeypatch)
-        metadata = {} if mark is None else {'early_start': {'predecessor': mark}}
-        picture = await rig.picture(p_running(), task('D', deps=('P',), **metadata))
+        picture = await rig.picture(p_running(), _marked_dependent(mark))
 
         selection = await rig.select(picture, reads_for(picture, branch=branch))
 
@@ -661,8 +685,7 @@ class TestRow44TheBranchRule:
         self, tmp_path, monkeypatch, branch, mark,
     ):
         rig = await _with_p_running(tmp_path, monkeypatch)
-        metadata = {} if mark is None else {'early_start': {'predecessor': mark}}
-        picture = await rig.picture(p_running(), task('D', deps=('P',), **metadata))
+        picture = await rig.picture(p_running(), _marked_dependent(mark))
 
         selection = await rig.select(picture, reads_for(picture, branch=branch))
 
@@ -685,12 +708,12 @@ def _saturated() -> PsiSample:
 
 
 async def _held_by_the_switch(tmp_path, monkeypatch):
-    return await _with_p_running(tmp_path, monkeypatch, early_start={'enabled': False}), clear_holds()
+    return await _with_p_running(tmp_path, monkeypatch, early_start=EarlyStartConfig(enabled=False)), clear_holds()
 
 
 async def _held_by_host_load(tmp_path, monkeypatch):
     rig = await _with_p_running(
-        tmp_path, monkeypatch, psi_admission={'enabled': True, 'min_inflight_floor': 1},
+        tmp_path, monkeypatch, psi_admission=PsiAdmissionConfig(enabled=True, min_inflight_floor=1),
     )
     assert rig.scheduler.is_dispatched('P')
     rig.scheduler._read_psi_sample = _saturated
@@ -707,7 +730,7 @@ async def _held_by_the_warm_base(tmp_path, monkeypatch):
     probe = AsyncMock(return_value='ok')
     rig = await _with_p_running(
         tmp_path, monkeypatch, callbacks=SchedulerCallbacks(warm_base_health_probe=probe),
-        warm_base_hard_down={'enabled': True},
+        warm_base_hard_down=WarmBaseHardDownConfig(enabled=True),
     )
     probe.return_value = 'absent'
     assert await rig.scheduler.acquire_next() is None
@@ -802,7 +825,7 @@ class TestTierCondition:
     ):
         rig = await _with_p_running(tmp_path, monkeypatch)
         rig.offer(p_running(), task('U', files=['u.py']))
-        assert (await rig.scheduler.acquire_next()).task_id == 'U'
+        assert await rig.acquire() == 'U'
 
         selection = await self._select(
             rig, task('U', files=['u.py'], status='in-progress'),
@@ -876,7 +899,7 @@ class TestTierCondition:
     async def test_a_higher_tier_already_started_does_not_count(self, tmp_path, monkeypatch):
         rig = await _with_p_running(tmp_path, monkeypatch)
         rig.offer(p_running(), task('T', 'high', ['two.py']))
-        assert (await rig.scheduler.acquire_next()).task_id == 'T'
+        assert await rig.acquire() == 'T'
 
         selection = await self._select(
             rig, task('T', 'high', ['two.py']), d=task('D', files=['a.py', 'two.py'], deps=('P',)),

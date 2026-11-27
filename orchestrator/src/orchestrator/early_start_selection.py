@@ -8,19 +8,24 @@ lock table's read views; the entry is ``Scheduler.early_start_shortlist`` and
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from shared.early_start_mark import early_start_predecessor
+from shared.locking import modules_conflict
 
 from orchestrator.delivered_checks import ChecksAtCommit
-from orchestrator.dependency_verdict import DepsVerdict, deps_verdict
+from orchestrator.dependency_verdict import DepState, DepsVerdict, deps_verdict
 from orchestrator.dispatch_row import FreshRow
 from orchestrator.id_tie_break import id_tie_break
+from orchestrator.pin_reservation import BlockerKind
 from orchestrator.task_picture import TaskPicture
-from orchestrator.task_priority import TaskPriority, tier_order
+from orchestrator.task_priority import TaskPriority, outranks, tier_order
+
+if TYPE_CHECKING:
+    from orchestrator.lock_table import ModuleLockTable
 
 
 class EarlyStartRefusalReason(StrEnum):
@@ -111,6 +116,20 @@ class EarlyStartCandidate:
     @property
     def rank_key(self) -> RankKey:
         return rank_key(self.priority, self.dependent)
+
+
+@dataclass(frozen=True)
+class Competitor:
+    """A pending task not yet started, weighed by the tier condition against a candidate."""
+
+    task_id: str
+    task: Mapping[str, Any]
+    keys: tuple[str, ...]
+    priority: TaskPriority
+
+    @property
+    def rank_key(self) -> RankKey:
+        return rank_key(self.priority, self.task_id)
 
 
 @dataclass(frozen=True)
@@ -248,3 +267,64 @@ _CHECK_REFUSALS = {
     ChecksAtCommit.SCRIPT_KIND: EarlyStartRefusalReason.DELIVERED_CHECK_SCRIPT,
     ChecksAtCommit.FAILED: EarlyStartRefusalReason.DELIVERED_CHECK_FAILED,
 }
+
+
+def judged_row(picture_row: Mapping[str, Any], status_map: Mapping[str, str], rows: Mapping[str, dict]) -> dict:
+    """The row a task is judged on: its store row re-read in step (b), else the picture's with its overlaid status."""
+    tid = str(picture_row.get('id', ''))
+    return rows.get(tid) or {**picture_row, 'status': status_map.get(tid)}
+
+
+def higher_tier_blocker(
+    candidate: EarlyStartCandidate,
+    competitors: Iterable[Competitor],
+    *,
+    picture: TaskPicture,
+    statuses: Mapping[str, str],
+    lock_table: ModuleLockTable,
+) -> str | None:
+    """The highest-ranked competitor of a higher tier the early start would keep off a key, or None.
+
+    PRD §5.1 "About the rest of the queue": such a task counts when it could
+    start once the predecessor lands.  *statuses* overlay the picture's status
+    map.  Reads only its arguments and the lock table's read views.
+    """
+    landed = {**picture.status_map, **statuses, candidate.predecessor: 'done'}
+    higher = sorted(
+        (
+            competitor for competitor in competitors
+            if competitor.task_id != candidate.dependent
+            and outranks(competitor.priority, candidate.priority)
+        ),
+        key=lambda competitor: competitor.rank_key,
+    )
+    for competitor in higher:
+        if _shares_a_key(competitor.keys, candidate.keys) and _could_start_once_landed(
+            competitor, candidate.predecessor, picture, landed, lock_table,
+        ):
+            return competitor.task_id
+    return None
+
+
+def _shares_a_key(a: tuple[str, ...], b: tuple[str, ...]) -> bool:
+    return any(modules_conflict(key, other) for key in a for other in b)
+
+
+def _could_start_once_landed(
+    competitor: Competitor,
+    predecessor: str,
+    picture: TaskPicture,
+    landed: dict[str, str],
+    lock_table: ModuleLockTable,
+) -> bool:
+    """No dependency known unsatisfied with *predecessor* done, and nothing but *predecessor* holding its keys.
+
+    An unknown dependency counts as startable, failing safe toward the higher
+    tier; a foreign holder or another task's reservation means it could not start.
+    """
+    if picture_deps_verdict(competitor.task, picture, landed).state is DepState.UNSATISFIED:
+        return False
+    return all(
+        blocker.kind is BlockerKind.HELD and blocker.owner == predecessor
+        for blocker in lock_table.blockers(competitor.task_id, list(competitor.keys))
+    )

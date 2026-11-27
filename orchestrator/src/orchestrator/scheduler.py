@@ -98,6 +98,7 @@ from orchestrator.dependency_verdict import DepKind, DepState, deps_verdict, tas
 from orchestrator.deploy_state import awaits_scheduled_restart
 from orchestrator.dispatch_row import FreshRow, refresh_dispatch_row
 from orchestrator.early_start_selection import (
+    Competitor,
     EarlyStartCandidate,
     EarlyStartClaim,
     EarlyStartHolds,
@@ -105,9 +106,12 @@ from orchestrator.early_start_selection import (
     EarlyStartRefusalReason,
     EarlyStartSelection,
     EarlyStartShortlist,
+    PairReads,
     StepReads,
     branch_admits,
     check_refusal,
+    higher_tier_blocker,
+    judged_row,
     picture_deps_verdict,
 )
 from orchestrator.eligibility_clock import EligibilityClock, EligibilityClockStore
@@ -4855,18 +4859,24 @@ class Scheduler:
         cooldown_deadline = self._requeue_until.get(tid)
         if cooldown_deadline is not None and self._time_source() < cooldown_deadline:
             return False, None
-        dep_kwargs = dict(
+        if set_aside is None:
+            if not self._deps_satisfied(
+                task, status_map, tasks_by_id,
+                external_status_cache=external_status_cache,
+                external_resolver_failed=external_resolver_failed,
+                delivered_check_cache=delivered_check_cache,
+                terminal_dep_records=terminal_dep_records,
+                deferred_terminal_deps=deferred_terminal_deps,
+            ):
+                return False, None
+        elif deps_verdict(
+            task, status_map, tasks_by_id,
             external_status_cache=external_status_cache,
             external_resolver_failed=external_resolver_failed,
             delivered_check_cache=delivered_check_cache,
             terminal_dep_records=terminal_dep_records,
             deferred_terminal_deps=deferred_terminal_deps,
-        )
-        if set_aside is None:
-            if not self._deps_satisfied(task, status_map, tasks_by_id, **dep_kwargs):
-                return False, None
-        elif deps_verdict(
-            task, status_map, tasks_by_id, waiting_predecessors={set_aside}, **dep_kwargs,
+            waiting_predecessors={set_aside},
         ).waiting_predecessor != set_aside:
             return False, None
         signal_label = self._dispatch_cooldown_signal(task)
@@ -8535,7 +8545,7 @@ class Scheduler:
                 tid = str(picture_row.get('id', ''))
                 if status_map.get(tid) != 'pending':
                     continue
-                row = (rows or {}).get(tid) or {**picture_row, 'status': status_map[tid]}
+                row = judged_row(picture_row, status_map, rows or {})
                 if predecessor not in dependency_ids(row):
                     continue
                 reason = self._early_start_refusal_of(row, tid, predecessor, picture, status_map)
@@ -8588,7 +8598,8 @@ class Scheduler:
         Synchronous: nothing can start a task between the checks and the claim.
         The system holds are read before any candidate (invariant 13).  Each
         read dependent is judged on its store row against fresh dependency
-        statuses; a candidate step (b) did not read is skipped.
+        statuses; a candidate step (b) did not read is skipped.  The tier
+        condition is weighed before the acquire, so a refused pair takes no key.
         """
         held = self._early_start_hold_reasons(holds)
         if held:
@@ -8600,19 +8611,16 @@ class Scheduler:
             statuses.update(pair.dependent_row.dep_statuses)
         rows = {dependent: pair.dependent_row.task for dependent, pair in reads.pairs.items()}
         shortlist = self._early_start_candidates(picture, statuses, waiting_predecessors, rows)
+        competitors = self._early_start_competitors(picture, statuses, rows)
         refusals = list(shortlist.refusals)
         for index, candidate in enumerate(shortlist.candidates):
             dependent, predecessor = candidate.dependent, candidate.predecessor
             pair = reads.pairs.get(dependent)
             if pair is None or pair.predecessor != predecessor or not self.lock_table.is_held(predecessor):
                 continue
-            reason = check_refusal(pair.predecessor_checks)
-            if reason is None and not branch_admits(pair.dependent_row.task, predecessor, pair.dependent_branch):
-                reason = EarlyStartRefusalReason.HAS_BRANCH
-            if reason is None and (dependent in self._dispatched or self.lock_table.is_held(dependent)):
-                reason = EarlyStartRefusalReason.NOT_ELIGIBLE
-            if reason is not None:
-                refusals.append(EarlyStartRefusal(reason, dependent=dependent, predecessor=predecessor))
+            refusal = self._early_start_pair_refusal(candidate, pair, picture, statuses, competitors)
+            if refusal is not None:
+                refusals.append(refusal)
                 continue
             keys = list(candidate.keys)
             tier = candidate.priority.base_tier or coerce_tier(candidate.task.get('priority'))
@@ -8644,6 +8652,50 @@ class Scheduler:
             )
             return EarlyStartSelection(claim=claim, refusals=tuple(refusals))
         return EarlyStartSelection(claim=None, refusals=tuple(refusals))
+
+    def _early_start_competitors(
+        self, picture: TaskPicture, statuses: Mapping[str, str], rows: Mapping[str, dict],
+    ) -> tuple[Competitor, ...]:
+        """The tasks the tier condition weighs: pending in the overlaid statuses and not started."""
+        status_map = {**picture.status_map, **statuses}
+        competitors: list[Competitor] = []
+        for picture_row in picture.tasks:
+            tid = str(picture_row.get('id', ''))
+            if status_map.get(tid) != 'pending' or tid in self._dispatched:
+                continue
+            row = judged_row(picture_row, status_map, rows)
+            competitors.append(Competitor(
+                task_id=tid, task=row, keys=tuple(self._get_modules(row)),
+                priority=picture.priority_of(tid),
+            ))
+        return tuple(competitors)
+
+    def _early_start_pair_refusal(
+        self,
+        candidate: EarlyStartCandidate,
+        pair: PairReads,
+        picture: TaskPicture,
+        statuses: Mapping[str, str],
+        competitors: tuple[Competitor, ...],
+    ) -> EarlyStartRefusal | None:
+        """Why step (b)'s reads, the started set or a higher tier refuse *candidate*; None when it may be claimed."""
+        dependent, predecessor = candidate.dependent, candidate.predecessor
+        reason = check_refusal(pair.predecessor_checks)
+        if reason is None and not branch_admits(pair.dependent_row.task, predecessor, pair.dependent_branch):
+            reason = EarlyStartRefusalReason.HAS_BRANCH
+        if reason is None and (dependent in self._dispatched or self.lock_table.is_held(dependent)):
+            reason = EarlyStartRefusalReason.NOT_ELIGIBLE
+        if reason is not None:
+            return EarlyStartRefusal(reason, dependent=dependent, predecessor=predecessor)
+        blocking = higher_tier_blocker(
+            candidate, competitors, picture=picture, statuses=statuses, lock_table=self.lock_table,
+        )
+        if blocking is None:
+            return None
+        return EarlyStartRefusal(
+            EarlyStartRefusalReason.HIGHER_TIER_WAITING,
+            dependent=dependent, predecessor=predecessor, blocking_task=blocking,
+        )
 
     def _early_start_hold_reasons(self, holds: EarlyStartHolds) -> list[EarlyStartRefusalReason]:
         """Every system hold on early starts: the scheduler's own, then the harness's in *holds*.
