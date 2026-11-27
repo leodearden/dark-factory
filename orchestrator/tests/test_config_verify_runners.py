@@ -174,6 +174,13 @@ class TestRosterFileIsRead:
 
         assert config.verify_runners == [VerifyRunnerConfig.model_validate(runner) for runner in INLINE_LAPTOP]
 
+    def test_a_roster_that_cannot_be_located_fails_the_load(self, tmp_path, monkeypatch):
+        for name in (ROSTER_FILE_ENV, 'XDG_CONFIG_HOME', 'HOME'):
+            monkeypatch.delenv(name, raising=False)
+
+        with pytest.raises(RosterFileError, match='cannot locate the verify-host roster'):
+            load_config(_write_yaml(tmp_path, 'bare.yaml'))
+
     def test_an_empty_environment_list_lets_the_roster_supply_the_runners(self, tmp_path, monkeypatch):
         monkeypatch.setenv('ORCH_VERIFY_RUNNERS', '[]')
         _write_roster(tmp_path, monkeypatch, ROSTER)

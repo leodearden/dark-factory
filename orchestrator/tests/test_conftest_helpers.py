@@ -379,6 +379,10 @@ def test_the_autouse_pin_hides_a_roster_at_the_default_path(tmp_path, monkeypatc
     assert roster_file_path(os.environ) != default_roster
 
 
+@pytest.mark.skipif(
+    not (os.environ.get('XDG_CONFIG_HOME') or os.environ.get('HOME')),
+    reason='the session locates no operator roster, so the guard has none to refuse',
+)
 def test_a_load_that_strips_the_pin_fails_rather_than_reading_the_operators_roster(
     tmp_path, monkeypatch,
 ):
