@@ -81,6 +81,11 @@ async def _guard(
     )
 
 
+async def _hang(*_: Any, **__: Any) -> Any:
+    """A corroboration read that never answers."""
+    await asyncio.Event().wait()
+
+
 def _warned_proceeding(caplog: pytest.LogCaptureFixture, subject: str) -> bool:
     return any(
         record.levelno == logging.WARNING
@@ -341,6 +346,48 @@ class TestCompositeSubject:
         assert memory.get_memories_by_metadata.await_count == 2
         assert memory.get_entity.await_count == 2
 
+    @virtual_clock_test
+    async def test_citation_survives_a_later_component_hanging(self):
+        memory = specimen_memory()
+        memory.get_entity.side_effect = _hang
+
+        err = await _guard(_reset_gate_metadata(gate_subject='3105,3843'), memory)
+
+        assert err is not None
+        assert err['error_type'] == 'PreservedSpecimenResetViolation'
+        assert err['gate_subject'] == '3105'
+        assert err['preservation_citation'] == SPECIMEN_MEMORY_ID
+        assert memory.get_entity.await_count == 0
+
+    @virtual_clock_test
+    async def test_an_earlier_hanging_component_does_not_starve_the_specimen(self):
+        memory = specimen_memory()
+        memory.get_entity.side_effect = _hang
+
+        err = await _guard(_reset_gate_metadata(gate_subject='3843,3105'), memory)
+
+        assert err is not None
+        assert err['error_type'] == 'PreservedSpecimenResetViolation'
+        assert err['gate_subject'] == '3105'
+        assert err['preservation_citation'] == SPECIMEN_MEMORY_ID
+
+    @virtual_clock_test
+    async def test_every_component_hanging_fails_open_within_the_one_ceiling(self, caplog):
+        memory = corroboration_memory()
+        memory.get_entity.side_effect = _hang
+        loop = asyncio.get_running_loop()
+        start = loop.time()
+
+        with caplog.at_level(logging.WARNING, logger=_GUARD_LOGGER):
+            result = await _guard(
+                _reset_gate_metadata(gate_subject='3560,3561'), memory, timeout_seconds=2.0
+            )
+
+        assert result is None
+        assert loop.time() - start <= 2.0 + 1e-6
+        assert _warned_proceeding(caplog, '3560')
+        assert _warned_proceeding(caplog, '3561')
+
 
 class TestOrdinarySubjectPasses:
     """A reset gate for a task nobody preserved reaches the interceptor."""
@@ -382,12 +429,6 @@ class TestFailsOpen:
 
     @virtual_clock_test
     async def test_timeout_fails_open_with_a_warning(self, caplog):
-        never = asyncio.Event()
-
-        async def _hang(**_: Any) -> list[dict[str, Any]]:
-            await never.wait()
-            return []
-
         memory = corroboration_memory()
         memory.get_memories_by_metadata.side_effect = _hang
 
