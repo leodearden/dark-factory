@@ -374,9 +374,6 @@ class RoutingDecision:
     rejected: tuple[str, ...] = ()
 
 
-CONFIG_SOURCE_LAYER: str = 'config'
-
-
 @dataclass(frozen=True)
 class DispatchedRoute:
     """The route one returned invocation ran on, plus the model id the CLI
@@ -635,7 +632,7 @@ def resolve_route(inputs: RouteInputs, config: OrchestratorConfig) -> RoutingDec
         )
         if reason is None:
             model = candidate
-            source_layer = CONFIG_SOURCE_LAYER
+            source_layer = 'config'
         else:
             rejected.append(f'config:{reason}')
     if hasattr(config.budgets, key):

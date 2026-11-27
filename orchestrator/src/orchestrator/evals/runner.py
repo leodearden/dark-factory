@@ -180,11 +180,11 @@ def _cell_routing(
     Every claude-backend role's model is admitted into ``allowed_models``, and
     every policy rule loses its ``set.model``. A rule keeps its id, match, list
     position and other set fields, so the cell resolves effort, budget and
-    max_turns exactly as production does (a large plan still gets max_turns
-    120), first-match-wins picks the same rule, and ``rule_id`` still records
-    it. A rule-set model would make the cell measure a model its label does
-    not name (large-plan-steps, large-plan-modules, retry-tier-up), and a
-    non-claude backend would receive the rule's literal unvalidated. See
+    max_turns exactly as production does (a large plan keeps its rule's
+    max_turns), first-match-wins picks the same rule, and ``rule_id`` still
+    records it. A rule-set model would make the cell measure a model its label
+    does not name, and a non-claude backend would receive the rule's literal
+    unvalidated. See
     ``orchestrator/tests/test_eval_driver.py::TestCellRoutingPinsEveryRoleModel``.
     """
     return routing.model_copy(update={
