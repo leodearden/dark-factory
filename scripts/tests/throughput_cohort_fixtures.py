@@ -16,11 +16,11 @@ from __future__ import annotations
 import hashlib
 import os
 import subprocess
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 import _checkout as _checkout
 from git_env import scrubbed_git_env
@@ -32,6 +32,7 @@ __all__ = [
     'CONTROL_EFFORT',
     'CohortTask',
     'Dispatch',
+    'RunsDbSeeder',
     'TREATED_BUCKET',
     'TREATED_EFFORT',
     'TREATED_RULE_ID',
@@ -87,6 +88,27 @@ class CohortTask:
     merge_attempts: Sequence[tuple[datetime, Mapping[str, Any]]] = ()
 
 
+class RunsDbSeeder(Protocol):
+    """The slice of the conftest ``SeedingConnection`` these builders and their tests write through."""
+
+    def execute(self, sql: str, /) -> object: ...
+
+    def seed_event(
+        self, timestamp: str, event_type: str, *,
+        task_id: str | None = None, role: str | None = None, data: Mapping[str, Any] | None = None,
+    ) -> None: ...
+
+    def seed_invocation(
+        self, *, model: str, role: str, started_at: str, completed_at: str,
+        task_id: str | None = None, cost_usd: float = 0.0,
+    ) -> None: ...
+
+    def seed_task_result(
+        self, *, task_id: str, outcome: str, completed_at: str,
+        run_id: str = 'run-1', review_cycles: int = 0, verify_attempts: int = 0,
+    ) -> None: ...
+
+
 def _iso(at: datetime) -> str:
     if at.tzinfo is None:
         raise ValueError(f'fixture timestamps are aware, got naive {at!r}')
@@ -115,7 +137,7 @@ def arm_task_ids(
     return treated, control
 
 
-def seed_tasks(conn: Any, tasks: Iterable[CohortTask]) -> None:
+def seed_tasks(conn: RunsDbSeeder, tasks: Iterable[CohortTask]) -> None:
     """Write every row of *tasks* through *conn*, a conftest ``SeedingConnection``."""
     for task in tasks:
         task_id = str(task.task_id)
@@ -145,18 +167,27 @@ def seed_tasks(conn: Any, tasks: Iterable[CohortTask]) -> None:
             )
 
 
-def build_cohort_root(root: Path, seeding_runs_db: Any, tasks: Iterable[CohortTask], *, git: bool = True):
+def build_cohort_root(
+    root: Path, seeding_runs_db: Callable[[Path], RunsDbSeeder], tasks: Iterable[CohortTask], *,
+    git: bool = True,
+) -> RunsDbSeeder:
     """Lay a project root: ``<root>/data/orchestrator/runs.db`` seeded with *tasks*.
 
     *seeding_runs_db* is the conftest ``make_seeding_runs_db`` factory. With
     *git*, *root* is also a repo whose ``main`` holds one empty commit. Returns
     the open seeding connection, so a test can add rows after the cohort.
+
+    Every seed_* commits its row, and a synthetic ledger needs no crash
+    durability, so the connection runs ``PRAGMA synchronous = OFF``: without
+    it, each commit's fsync makes seeding the slowest part of a test on a
+    loaded host. Readers on other connections see every committed row either way.
     """
     directory = runs_db(root).parent
     directory.mkdir(parents=True, exist_ok=True)
     if git:
         init_main_repo(root)
     conn = seeding_runs_db(directory)
+    conn.execute('PRAGMA synchronous = OFF')
     seed_tasks(conn, tasks)
     return conn
 
