@@ -15,7 +15,7 @@ import sys
 import time
 import uuid
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from enum import Enum, StrEnum
 from functools import partial
@@ -231,6 +231,7 @@ from orchestrator.reviewer_failure import (
     triage_reviewer_errors,
 )
 from orchestrator.routing import (
+    DispatchedRoute,
     PlanShape,
     RoleDefaults,
     RouteInputs,
@@ -1246,6 +1247,8 @@ class WorkflowMetrics:
     judge_invocations: int = 0
     judge_cost_usd: float = 0.0
     judge_early_exits: int = 0
+    # One entry per returned invocation; read by evals/runner.py::collect_metrics.
+    dispatched_routes: list[DispatchedRoute] = field(default_factory=list)
 
 
 class _PriorImplStatus(NamedTuple):
@@ -15657,6 +15660,9 @@ class TaskWorkflow:
         self.metrics.total_cost_usd += result.cost_usd
         self.metrics.total_duration_ms += result.duration_ms
         self.metrics.agent_invocations += 1
+        self.metrics.dispatched_routes.append(
+            DispatchedRoute(role.name, decision, result.model_id),
+        )
         self.metrics.total_turns += result.turns
         self.metrics.total_input_tokens += result.input_tokens or 0
         self.metrics.total_output_tokens += result.output_tokens or 0

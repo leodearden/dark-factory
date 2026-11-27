@@ -374,6 +374,19 @@ class RoutingDecision:
     rejected: tuple[str, ...] = ()
 
 
+CONFIG_SOURCE_LAYER: str = 'config'
+
+
+@dataclass(frozen=True)
+class DispatchedRoute:
+    """The route one returned invocation ran on, plus the model id the CLI
+    reported serving (None: not reported)."""
+
+    role_name: str
+    decision: RoutingDecision
+    served_model_id: str | None
+
+
 def _config_key(role_name: str) -> str:
     """Collapse any ``reviewer*`` variant to the shared ``'reviewer'`` config key.
 
@@ -616,7 +629,7 @@ def resolve_route(inputs: RouteInputs, config: OrchestratorConfig) -> RoutingDec
         )
         if reason is None:
             model = candidate
-            source_layer = 'config'
+            source_layer = CONFIG_SOURCE_LAYER
         else:
             rejected.append(f'config:{reason}')
     if hasattr(config.budgets, key):
