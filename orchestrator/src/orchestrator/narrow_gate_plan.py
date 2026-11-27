@@ -5,7 +5,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 
 from orchestrator.config import ModuleConfig
-from orchestrator.narrow_gate_class import GateMiss, MergeGateResolution
+from orchestrator.narrow_gate_class import GateClassification, GateMiss, MergeGateResolution
 from orchestrator.verify_artifact_consumers import (
     BEHAVIOURAL_ARTIFACTS,
     ConsumerDemand,
@@ -29,28 +29,28 @@ PkgTestLister = Callable[[str], list[str]]
 
 @dataclass(frozen=True)
 class NarrowGateDecision:
-    """A merge verify's gate: a narrow one carries the plan it runs, the full one the miss that sent it there."""
+    """A merge verify's gate: its classification, and the plan a narrow one runs."""
 
-    resolution: MergeGateResolution
-    miss: GateMiss | None
+    classification: GateClassification
     plan: VerifyPlan | None
     changed_paths: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
-        if self.resolution.is_narrow != (self.plan is not None and self.miss is None):
-            raise ValueError(
-                f'a {self.resolution.value} decision is narrow iff it has a plan and no miss; '
-                f'got plan={self.plan!r}, miss={self.miss!r}',
-            )
-        if not self.resolution.is_narrow and (self.miss is None or self.plan is not None):
-            raise ValueError(
-                f'a {self.resolution.value} decision carries a miss and no plan; got plan={self.plan!r}, miss={self.miss!r}',
-            )
+        if self.resolution.is_narrow != (self.plan is not None):
+            raise ValueError(f'a {self.resolution.value} decision carries a plan iff it is narrow; got plan={self.plan!r}')
+
+    @property
+    def resolution(self) -> MergeGateResolution:
+        return self.classification.resolution
+
+    @property
+    def miss(self) -> GateMiss | None:
+        return self.classification.miss
 
     @classmethod
     def full(cls, miss: GateMiss, changed_paths: Sequence[str] = ()) -> NarrowGateDecision:
         """The full-gate decision for *miss*."""
-        return cls(MergeGateResolution.FULL, miss, None, tuple(changed_paths))
+        return cls(GateClassification(MergeGateResolution.FULL, miss), None, tuple(changed_paths))
 
 
 def narrow_gate_plan(
@@ -89,8 +89,8 @@ def narrow_gate_plan(
     return VerifyPlan(runs)
 
 
-def executed_commands(plan: VerifyPlan) -> tuple[str, ...]:
-    """The rendered command of every run *plan* executes, in plan order."""
+def planned_commands(plan: VerifyPlan) -> tuple[str, ...]:
+    """The rendered command of every run *plan* prescribes, in plan order; the verify cache may replay one rather than run it."""
     return tuple(render(run.cmd) for run in plan.runs if run.cmd is not None)
 
 

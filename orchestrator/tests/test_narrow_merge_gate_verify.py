@@ -15,6 +15,7 @@ from _narrow_gate_fixtures import SOURCE as _SOURCE
 from orchestrator.config import OrchestratorConfig, load_config
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.narrow_gate_class import GateMiss, MergeGateResolution, MissReason
+from orchestrator.narrow_gate_config import NarrowMergeGateConfig
 from orchestrator.narrow_gate_plan import NarrowGateDecision
 from orchestrator.verify import VerifyResult, narrow_merge_gate_decision, run_scoped_verification
 from orchestrator.verify_cmd import VerifyCmd, parse_config_command
@@ -180,6 +181,15 @@ class TestNarrowMergeGateDecision:
         )
 
         assert decision.resolution is MergeGateResolution.FULL
+
+    async def test_a_fault_while_deciding_is_the_full_gate_naming_the_fault(self, scene: _Scene) -> None:
+        worktree, base, merge_sha = scene.merge({'docs/x.md': 'x\n'})
+        unvalidated = NarrowMergeGateConfig.model_construct(enabled=True, docs_paths=[None])
+        config = scene.config().model_copy(update={'narrow_merge_gate': unvalidated})
+
+        decision = await narrow_merge_gate_decision(worktree, config, base_sha=base, merge_sha=merge_sha)
+
+        assert _outcome(decision) == _full(MissReason.DECISION_FAULT)
 
 
 class _Execution:

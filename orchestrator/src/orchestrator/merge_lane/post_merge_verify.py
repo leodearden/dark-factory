@@ -42,7 +42,8 @@ from orchestrator.merge_lane.verify_failure_outcome import (
     verify_hit_enospc,
 )
 from orchestrator.merge_verify_facts import MergeVerifyDispatchFacts
-from orchestrator.narrow_gate_plan import NarrowGateDecision, executed_commands
+from orchestrator.narrow_gate_class import MergeGateResolution
+from orchestrator.narrow_gate_plan import NarrowGateDecision, planned_commands
 from orchestrator.verify import (
     VerifyResult,
     _derive_task_files_from_git,
@@ -748,17 +749,23 @@ class _PostMergeVerify:
         )
 
     def _record_gate_resolution(self, verify: VerifyResult) -> None:
-        """Record which merge gate this verify took and what it ran, once its verdict is final."""
+        """Record the gate this verify decided, the gate its final verdict ran, and a narrow verdict's commands.
+
+        The two differ when the narrow plan never reached execution (a workspace-forced merge verify,
+        or a plan the registry runs nothing of): the full gate ran, so no narrow command is recorded.
+        """
         decision = self.gate_decision
         if decision is None or self.event_store is None:
             return
         miss = decision.miss
+        ran_plan = decision.plan if verify.ran_narrow_gate else None
         self.event_store.emit(EventType.merge_gate_resolution, task_id=self.task_id, data={
-            'resolution': decision.resolution.value,
+            'resolution': (MergeGateResolution.FULL if verify.narrow_gate is None else verify.narrow_gate).value,
+            'decided': decision.resolution.value,
             'miss_reason': None if miss is None else miss.reason.value,
             'miss_path': None if miss is None else miss.path,
             'changed_paths': list(decision.changed_paths),
-            'commands': None if decision.plan is None else list(executed_commands(decision.plan)),
+            'commands': None if ran_plan is None else list(planned_commands(ran_plan)),
             'passed': verify.passed,
             'base_sha': self.narrow_gate_base,
             'merge_sha': self.merge_sha,
@@ -778,13 +785,13 @@ class _PostMergeVerify:
         )
 
     async def _pass_outcome(self, verify: VerifyResult) -> MergeOutcome | None:
-        withheld = await self._withheld_trivial_pass(verify)
+        withheld = await self._withheld_partial_pass(verify)
         if withheld is not None:
             return withheld
         self._seed_main_baseline(verify)
         return None
 
-    async def _withheld_trivial_pass(self, verify: VerifyResult) -> MergeOutcome | None:
+    async def _withheld_partial_pass(self, verify: VerifyResult) -> MergeOutcome | None:
         """Refuse to CAS-advance a pass that is no whole-tree evidence over a KNOWN-red main tip (task 2823).
 
         A config-only merge short-circuits to verify._trivial_pass WITHOUT
@@ -793,9 +800,9 @@ class _PostMergeVerify:
         incident).  A whole-tree pass legitimately heals a red main.
         CACHE-ONLY peek, failing OPEN when nothing is known red.
         """
-        if verify.is_whole_tree_evidence:
+        resolution = verify.partial_evidence_label
+        if resolution is None:
             return None
-        resolution = verify.narrow_gate or 'trivial'
         try:
             _pass_main_sha = await self.git_ops.get_main_sha()
         except Exception:

@@ -463,21 +463,31 @@ class TestCoreFormation:
 
 @pytest.mark.asyncio
 class TestNarrowGateExclusion:
-    """A waiting single the narrow merge gate would verify narrowly stays solo."""
+    """A waiting single the narrow merge gate would verify narrowly stays solo, audited like any exclusion.
 
-    @pytest.mark.parametrize(('gate_enabled', 'members'), [
-        (True, ['t1', 't3']),
-        (False, ['t1', 't2', 't3']),
-    ])
+    The docs-only single is dropped before the anchor is chosen, so it heading the buffer
+    still lets the code singles behind it form a train.
+    """
+
+    _FILES = {'t1': ('file_a.py', 'a = 1\n'), 't2': ('NOTES.md', 'notes\n'), 't3': ('file_c.py', 'c = 3\n')}
+
+    @pytest.mark.parametrize(('gate_enabled', 'order', 'members'), [
+        (True, ('t1', 't2', 't3'), ['t1', 't3']),
+        (True, ('t2', 't1', 't3'), ['t1', 't3']),
+        (False, ('t1', 't2', 't3'), ['t1', 't2', 't3']),
+    ], ids=['docs-behind-the-anchor', 'docs-as-the-anchor', 'gate-off'])
     async def test_a_docs_only_single_stays_solo_while_the_gate_is_on(
         self,
         git_ops: GitOps,
         git_repo: Path,
         git_config,
+        tmp_path: Path,
         gate_enabled: bool,
+        order: tuple[str, ...],
         members: list[str],
     ):
         from orchestrator.config import MergeDeepConfig
+        from orchestrator.event_store import EventStore
         from orchestrator.merge_lane.types import TrainCallbacks
         from orchestrator.merge_lane.worker import GroupMergeRequest, SpeculativeMergeWorker
         from orchestrator.narrow_gate_config import NarrowMergeGateConfig
@@ -488,21 +498,21 @@ class TestNarrowGateExclusion:
             merge_deep=MergeDeepConfig(chain_cap=0),
             narrow_merge_gate=NarrowMergeGateConfig(enabled=gate_enabled, docs_paths=['*.md']),
         )
-        reqs = [
-            _make_req(task_id, f'task/{task_id}', await _make_branch_with_file(git_ops, task_id, name, body), config)
-            for task_id, name, body in (
-                ('t1', 'file_a.py', 'a = 1\n'),
-                ('t2', 'NOTES.md', 'notes\n'),
-                ('t3', 'file_c.py', 'c = 3\n'),
+        reqs = {
+            task_id: _make_req(
+                task_id, f'task/{task_id}', await _make_branch_with_file(git_ops, task_id, *self._FILES[task_id]), config,
             )
-        ]
+            for task_id in order
+        }
+        db_path = tmp_path / 'es_narrow.db'
         worker = SpeculativeMergeWorker(
             git_ops, asyncio.Queue(),
+            event_store=EventStore(db_path=db_path, run_id='run-narrow-gate'),
             train_callback_factory=lambda _train_id: TrainCallbacks(
                 status_check=AsyncMock(return_value={}), mark_member_done=AsyncMock(),
             ),
         )
-        worker._intake.replace_lane('normal', reqs)
+        worker._intake.replace_lane('normal', list(reqs.values()))
 
         assert await worker._maybe_coalesce_waiting_singles() is True
 
@@ -511,6 +521,10 @@ class TestNarrowGateExclusion:
         assert [t.member_task_ids for t in trains] == [members]
         solo = [r.task_id for r in buffered if not isinstance(r, GroupMergeRequest)]
         assert solo == ([] if 't2' in members else ['t2'])
+        [event] = _events_of_type(db_path, 'train_coalesced')
+        assert event['data']['exclusions'] == (
+            [] if 't2' in members else [{'request_id': reqs['t2'].request_id, 'reason': 'narrow_merge_gate'}]
+        )
 
 
 # ─── Step 7 ─────────────────────────────────────────────────────────────────

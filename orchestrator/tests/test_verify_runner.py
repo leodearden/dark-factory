@@ -35,7 +35,7 @@ from _verify_cache_fixtures import (
 from orchestrator.config import GitConfig, ModuleConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.merge_lane.gates import PostMergePyrightResult
-from orchestrator.narrow_gate_class import MergeGateResolution
+from orchestrator.narrow_gate_class import GateClassification, MergeGateResolution
 from orchestrator.narrow_gate_plan import NarrowGateDecision
 from orchestrator.verify import VerifyResult, run_scoped_verification
 from orchestrator.verify_cache.registry import registry_db_path
@@ -1426,7 +1426,7 @@ class TestLocalRunnerThreadsEventStore:
         assert run_scoped.await_args[1]['event_store'] is None
 
 
-_DOCS_DECISION = NarrowGateDecision(MergeGateResolution.DOCS, None, VerifyPlan(runs=()), ('docs/x.md',))
+_DOCS_DECISION = NarrowGateDecision(GateClassification(MergeGateResolution.DOCS), VerifyPlan(runs=()), ('docs/x.md',))
 
 
 def _narrow_local_runner(run_scoped: Any, run_unscoped: Any, **narrow: Any) -> LocalRunner:

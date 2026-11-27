@@ -1,0 +1,12 @@
+{
+  "task_id": "5411",
+  "reason": "Net-additive review amendment (task 5411, the narrow merge gate). _PostMergeVerify._record_gate_resolution cognitive 2 -> 3: the merge_gate_resolution event now records the gate the final verdict actually RAN (resolution, and commands only when a narrow plan ran) beside the gate the decision chose (decided), so a workspace-forced verify or a refused plan no longer reports narrow commands that never ran. The +1 is that one conditional, ran_plan = decision.plan if verify.ran_narrow_gate else None. The file and cluster totals hold: _withheld_trivial_pass, renamed _withheld_partial_pass, lost its 'or' fallback to VerifyResult.partial_evidence_label, and the worker coalesce pass's narrow exclusion moved into its audited exclusion split without raising worker.py.",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/post_merge_verify.py::_PostMergeVerify::_record_gate_resolution",
+      "baseline": 2,
+      "current": 3
+    }
+  ]
+}

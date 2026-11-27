@@ -4459,7 +4459,7 @@ async def narrow_merge_gate_decision(
         return await _narrow_merge_gate_decision_body(worktree, config, base_sha, merge_sha)
     except Exception:
         logger.warning('narrow_merge_gate_decision: unexpected error for %s; full gate', worktree, exc_info=True)
-        return NarrowGateDecision.full(GateMiss(MissReason.DELTA_UNREADABLE))
+        return NarrowGateDecision.full(GateMiss(MissReason.DECISION_FAULT))
 
 
 async def _narrow_merge_gate_decision_body(
@@ -4492,7 +4492,7 @@ async def _narrow_merge_gate_decision_body(
     )
     if plan is None:
         return NarrowGateDecision.full(GateMiss(MissReason.EMPTY_COMMAND_SET), changed)
-    return NarrowGateDecision(classification.resolution, None, plan, changed)
+    return NarrowGateDecision(classification, plan, changed)
 
 
 async def _narrow_gate_evidence_miss(
@@ -5490,6 +5490,13 @@ class VerifyResult:
     def is_whole_tree_evidence(self) -> bool:
         """Whether this verdict ran a gate over the whole tree: not a trivial pass, nor a narrow gate's."""
         return not self.trivial and not self.ran_narrow_gate
+
+    @property
+    def partial_evidence_label(self) -> str | None:
+        """What this verdict ran short of the whole tree, its narrow gate or 'trivial'; None for whole-tree evidence."""
+        if self.is_whole_tree_evidence:
+            return None
+        return self.narrow_gate.value if self.narrow_gate is not None else 'trivial'
 
     @property
     def plan_hash(self) -> str | None:

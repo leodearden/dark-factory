@@ -7,7 +7,12 @@ import pytest
 from _serial_recovery_helpers import ORCH_SHAPED_PYPROJECT
 
 from orchestrator.config import ModuleConfig
-from orchestrator.narrow_gate_class import GateMiss, MergeGateResolution, MissReason
+from orchestrator.narrow_gate_class import (
+    GateClassification,
+    GateMiss,
+    MergeGateResolution,
+    MissReason,
+)
 from orchestrator.narrow_gate_plan import NarrowGateDecision, module_test_lister, narrow_gate_plan
 from orchestrator.verify_artifact_consumers import BEHAVIOURAL_ARTIFACTS
 from orchestrator.verify_cmd import parse_config_command
@@ -242,7 +247,7 @@ class TestNarrowGateDecision:
         plan = _plan(MergeGateResolution.DOCS, ['README.md'], [ORCH])
         assert plan is not None
 
-        decision = NarrowGateDecision(MergeGateResolution.DOCS, None, plan, ('README.md',))
+        decision = NarrowGateDecision(GateClassification(MergeGateResolution.DOCS), plan, ('README.md',))
 
         assert decision.plan is plan
 
@@ -258,7 +263,7 @@ class TestNarrowGateDecision:
         plan = _plan(MergeGateResolution.DOCS, ['README.md'], [ORCH]) if with_plan else None
 
         with pytest.raises(ValueError, match=resolution.value):
-            NarrowGateDecision(resolution, miss, plan)
+            NarrowGateDecision(GateClassification(resolution, miss), plan)
 
 
 class TestModuleTestLister:

@@ -281,18 +281,22 @@ class _RecordingEventStore:
 
 
 class _ScopedRecorder:
-    """A scoped verify that records the narrow decision it was handed and answers as the executor would."""
+    """A scoped verify that records the narrow decision it was handed and answers as the executor would.
+
+    A workspace-forced verify runs the full gate before any narrow plan is reached.
+    """
 
     def __init__(self) -> None:
         self.decisions: list[NarrowGateDecision | None] = []
+        self.trivial = False
 
     async def __call__(self, *_args: Any, **options: Any) -> VerifyResult:
         decision = options.get('narrow_gate')
         self.decisions.append(decision)
+        ran = None if decision is None or options.get('force_workspace') else decision.resolution
         return VerifyResult(
             passed=True, test_output='', lint_output='', type_output='', summary='ok',
-            failing_test_ids=[], skipped_test_ids=[],
-            narrow_gate=None if decision is None else decision.resolution,
+            failing_test_ids=[], skipped_test_ids=[], trivial=self.trivial, narrow_gate=ran,
         )
 
 
@@ -309,7 +313,7 @@ class _NarrowLane:
         self.recorder = _ScopedRecorder()
         self.results: list[VerifyResult] = []
 
-    def config(self, *, enabled: bool) -> OrchestratorConfig:
+    def config(self, *, enabled: bool, workspace: bool = False) -> OrchestratorConfig:
         path = self.tmp_path / 'dark-factory-orchestrator.yaml'
         path.write_text(yaml.safe_dump({
             'project_root': str(self.repo),
@@ -318,14 +322,17 @@ class _NarrowLane:
             }),
             'escalate_preexisting_main_break': False,
             'verify_cross_check_remote_green': True,
+            'merge_verify_workspace': workspace,
             'narrow_merge_gate': {'enabled': enabled, 'docs_paths': ['docs/**']},
         }))
         return load_config(path)
 
-    async def merge(self, files: dict[str, str], *, enabled: bool = True) -> tuple[_Scene, str]:
+    async def merge(
+        self, files: dict[str, str], *, enabled: bool = True, workspace: bool = False,
+    ) -> tuple[_Scene, str]:
         """The merged scene and the main sha it was built on."""
         base = await GitOps(_git_config(), self.repo).get_main_sha()
-        return await _merged_scene(self.repo, self.config(enabled=enabled), files), base
+        return await _merged_scene(self.repo, self.config(enabled=enabled, workspace=workspace), files), base
 
     async def verify(self, scene: _Scene, **options: Any) -> MergeOutcome | None:
         return await scene.verify(
@@ -383,11 +390,19 @@ class TestNarrowMergeGate:
         [decision] = lane.recorder.decisions
         assert _rendered(decision)
         assert {key: event[key] for key in (
-            'resolution', 'changed_paths', 'commands', 'passed', 'base_sha', 'merge_sha',
+            'resolution', 'decided', 'changed_paths', 'commands', 'passed', 'base_sha', 'merge_sha',
         )} == {
-            'resolution': 'docs_gate', 'changed_paths': ['docs/x.md'], 'commands': _rendered(decision),
-            'passed': True, 'base_sha': base, 'merge_sha': scene.merge_sha,
+            'resolution': 'docs_gate', 'decided': 'docs_gate', 'changed_paths': ['docs/x.md'],
+            'commands': _rendered(decision), 'passed': True, 'base_sha': base, 'merge_sha': scene.merge_sha,
         }
+
+    async def test_a_workspace_forced_verify_records_the_full_gate_it_ran(self, lane: _NarrowLane) -> None:
+        scene, base = await lane.merge(_DOCS, workspace=True)
+
+        await lane.verify(scene, narrow_gate_base=base)
+
+        [event] = lane.resolutions()
+        assert (event['resolution'], event['decided'], event['commands']) == ('full_gate', 'docs_gate', None)
 
     async def test_a_narrow_pass_neither_feeds_the_shadow_nor_seeds_the_baseline(self, lane: _NarrowLane) -> None:
         scene, base = await lane.merge(_DOCS)
@@ -414,9 +429,16 @@ class TestNarrowMergeGate:
         assert remote.calls == [scene.merge_sha]
         assert lane.recorder.decisions == [None]
         [event] = lane.resolutions()
-        assert (event['resolution'], event['miss_reason'], event['commands']) == (
-            'full_gate', MissReason.CODE_CHANGED, None,
+        assert (event['resolution'], event['decided'], event['miss_reason'], event['commands']) == (
+            'full_gate', 'full_gate', MissReason.CODE_CHANGED, None,
         )
+
+    async def test_a_trivial_pass_never_feeds_the_shadow(self, lane: _NarrowLane) -> None:
+        scene, _base = await lane.merge({'pyproject.toml': '[project]\nname = "x"\n'})
+        lane.recorder.trivial = True
+
+        assert await lane.verify(scene) is None
+        assert lane.results == []
 
     async def test_without_a_base_the_lane_is_unchanged(self, lane: _NarrowLane) -> None:
         scene, _base = await lane.merge(_DOCS)

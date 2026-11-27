@@ -137,6 +137,18 @@ class TestClassifyTreeDelta:
 
         assert await classify_tree_delta(repo.root, base, head, DOCS_PATHS) == _full(MissReason.UNDECODABLE, _PY)
 
+    async def test_a_binary_beside_a_comment_only_py_is_the_miss_it_names(self, repo: LandingRepo) -> None:
+        image = repo.root / 'zz' / 'logo.png'
+        image.parent.mkdir()
+        image.write_bytes(b'\x89PNG\r\n\x1a\n\xff\x00')
+        base = repo.commit('image', {})
+        image.write_bytes(b'\x89PNG\r\n\x1a\n\xfe\x01')
+        head = repo.commit('comment and image', {_PY: '"""Module."""\nx = 1  # why\n'})
+
+        assert await classify_tree_delta(repo.root, base, head, DOCS_PATHS) == _full(
+            MissReason.NO_COMMENT_PREDICATE, 'zz/logo.png',
+        )
+
     async def test_an_unreadable_range_takes_the_full_gate(self, repo: LandingRepo) -> None:
         classification = await classify_tree_delta(repo.root, '0' * 40, repo.sha('HEAD'), DOCS_PATHS)
 

@@ -48,6 +48,7 @@ class MissReason(StrEnum):
     EVIDENCE_ABSENT = 'evidence_absent'
     FORCED_FULL_GATE = 'forced_full_gate'
     EMPTY_COMMAND_SET = 'empty_command_set'
+    DECISION_FAULT = 'decision_fault'
 
 
 @dataclass(frozen=True)
@@ -191,6 +192,11 @@ def _starts_with_docstring(body: Sequence[ast.stmt]) -> bool:
 
 
 _COMMENT_PREDICATES: Mapping[str, CommentPredicate] = {'.py': python_comments_only}
+
+
+def has_comment_predicate(path: str) -> bool:
+    """Whether *path*'s suffix has a comments-only predicate, so its two sides are worth reading."""
+    return PurePosixPath(path).suffix in _COMMENT_PREDICATES
 
 
 def classify_change(changes: Sequence[ChangedPath], docs_paths: Sequence[str], read_pair: ReadPair) -> GateClassification:
