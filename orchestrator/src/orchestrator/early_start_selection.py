@@ -238,13 +238,7 @@ def picture_deps_verdict(
 ) -> DepsVerdict:
     """The dependency predicate for *task* over *status_map* and the picture's dependency caches."""
     return deps_verdict(
-        dict(task), status_map, picture.tasks_by_id,
-        external_status_cache=picture.external_statuses,
-        external_resolver_failed=picture.external_resolver_failed,
-        delivered_check_cache=picture.delivered_check_cache,
-        terminal_dep_records=picture.terminal_dep_records,
-        deferred_terminal_deps=picture.deferred_terminal_deps,
-        waiting_predecessors=waiting_predecessors,
+        dict(task), status_map, **picture.dependency_inputs(), waiting_predecessors=waiting_predecessors,
     )
 
 

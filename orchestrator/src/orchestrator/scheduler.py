@@ -4411,20 +4411,26 @@ class Scheduler:
         delivered_check_cache: dict[str, bool] | None = None,
         terminal_dep_records: dict[str, dict] | None = None,
         deferred_terminal_deps: Collection[str] = frozenset(),
+        set_aside: str | None = None,
     ) -> bool:
         """The boolean view of ``dependency_verdict.py::deps_verdict``: True iff SATISFIED.
 
         Dispatch reads this view, so an UNKNOWN dependency waits exactly as an
-        UNSATISFIED one does.
+        UNSATISFIED one does.  With *set_aside*, a waiting predecessor, True iff
+        it is the one unfinished dependency (``DepsVerdict.waiting_on``).
         """
-        return deps_verdict(
+        verdict = deps_verdict(
             task, status_map, tasks_by_id,
             external_status_cache=external_status_cache,
             external_resolver_failed=external_resolver_failed,
             delivered_check_cache=delivered_check_cache,
             terminal_dep_records=terminal_dep_records,
             deferred_terminal_deps=deferred_terminal_deps,
-        ).satisfied
+            waiting_predecessors=frozenset() if set_aside is None else frozenset({set_aside}),
+        )
+        if set_aside is None:
+            return verdict.satisfied
+        return verdict.waiting_predecessor == set_aside
 
     def _dispatch_cooldown_signal(self, task: dict) -> str | None:
         """Return the signal label if *task* carries a dispatch-cooldown signal.
@@ -4820,11 +4826,10 @@ class Scheduler:
         ``dependency_verdict.py::deps_verdict`` (task 6518), so it and
         dispatch read one dependency predicate.
 
-        *set_aside* names a waiting predecessor for the early-start selection:
-        the dependency gate then passes exactly when that predecessor is the
-        one unfinished dependency and every other arm passes
-        (``dependency_verdict.py::DepsVerdict.waiting_on``).  ``None`` (every
-        ordinary caller) keeps the ordinary dependency gate.
+        *set_aside* names a waiting predecessor for the early-start selection
+        and is forwarded to :meth:`_deps_satisfied`, whose gate then passes
+        exactly when that predecessor is the one unfinished dependency.
+        ``None`` (every ordinary caller) keeps the ordinary dependency gate.
 
         Returns ``(True, signal_label)`` when all gates pass.
         Returns ``(False, None)`` when any gate fails.  ``signal_label`` is
@@ -4861,25 +4866,15 @@ class Scheduler:
         cooldown_deadline = self._requeue_until.get(tid)
         if cooldown_deadline is not None and self._time_source() < cooldown_deadline:
             return False, None
-        if set_aside is None:
-            if not self._deps_satisfied(
-                task, status_map, tasks_by_id,
-                external_status_cache=external_status_cache,
-                external_resolver_failed=external_resolver_failed,
-                delivered_check_cache=delivered_check_cache,
-                terminal_dep_records=terminal_dep_records,
-                deferred_terminal_deps=deferred_terminal_deps,
-            ):
-                return False, None
-        elif deps_verdict(
+        if not self._deps_satisfied(
             task, status_map, tasks_by_id,
             external_status_cache=external_status_cache,
             external_resolver_failed=external_resolver_failed,
             delivered_check_cache=delivered_check_cache,
             terminal_dep_records=terminal_dep_records,
             deferred_terminal_deps=deferred_terminal_deps,
-            waiting_predecessors={set_aside},
-        ).waiting_predecessor != set_aside:
+            set_aside=set_aside,
+        ):
             return False, None
         signal_label = self._dispatch_cooldown_signal(task)
         if self._dispatch_cooldown_active(tid, signal_label):
@@ -8759,13 +8754,7 @@ class Scheduler:
         if verdict.waiting_predecessor != predecessor:
             return EarlyStartRefusalReason.NOT_ONLY_DEPENDENCY
         eligible, _signal = self._eligible_for_dispatch(
-            row, tid, status_map, picture.tasks_by_id,
-            external_status_cache=picture.external_statuses,
-            external_resolver_failed=picture.external_resolver_failed,
-            delivered_check_cache=picture.delivered_check_cache,
-            terminal_dep_records=picture.terminal_dep_records,
-            deferred_terminal_deps=picture.deferred_terminal_deps,
-            set_aside=predecessor,
+            row, tid, status_map, **picture.dependency_inputs(), set_aside=predecessor,
         )
         if not eligible:
             return EarlyStartRefusalReason.NOT_ELIGIBLE
