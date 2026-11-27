@@ -3,7 +3,7 @@
 A test module is a MEMBER iff its module-level ``pytestmark`` carries
 ``pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)``, bare or dotted.  Task-role
 verify runs the touched tests plus this family
-(``orchestrator/src/orchestrator/verify_plan.py::_whole_tree_guard_family``), so
+(``orchestrator/src/orchestrator/verify_plan.py::whole_tree_guard_family``), so
 the one mark both sizes a tree-sweeping test's ceiling and enrols it in the run.
 
 Pure stdlib plus ``shared.pytest_mark_grammar``, which owns the reading of

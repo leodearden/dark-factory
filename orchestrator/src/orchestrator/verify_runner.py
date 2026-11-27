@@ -67,6 +67,7 @@ from orchestrator.config import EnvProbeConfig, ModuleConfig, VerifyCacheConfig,
 from orchestrator.deployed_sha import DeployedSha, resolve_code_checkout
 from orchestrator.event_store import EventType
 from orchestrator.merge_verify_facts import MergeVerifyDispatchFacts, RunnerReason
+from orchestrator.narrow_gate_plan import NarrowGateDecision
 from orchestrator.remote_gate import (
     ENSURE_CLIENT_TIMEOUT_SECS,
     SHIM_REMEDY,
@@ -859,6 +860,7 @@ class LocalRunner:
     ``run_merge_verify`` runs the combined scoped + unscoped bundle: scoped first,
     unscoped only if scoped passed (short-circuit), unscoped-gate-broken outcomes
     encoded as a sentinel-category VerifyResult so callers can branch byte-identically.
+    A narrow verdict skips the unscoped gate: its command set already type-checked what changed.
     """
 
     name: str = 'local'
@@ -877,6 +879,7 @@ class LocalRunner:
         archive_root: Path | None = None,
         event_store: EventStore | None = None,
         verify_cache: CacheAccess | None = None,
+        narrow_gate: NarrowGateDecision | None = None,
     ) -> None:
         """Initialise LocalRunner.
 
@@ -904,6 +907,8 @@ class LocalRunner:
 
         *verify_cache* joins the scoped verify to the verify-result cache
         (``run_scoped_verification``'s parameter); None leaves it outside.
+
+        *narrow_gate* is this verify's merge gate decision, handed to ``run_scoped`` (docs/narrow-merge-gate.md).
         """
         self._merge_wt = merge_wt
         self._config = config
@@ -915,6 +920,7 @@ class LocalRunner:
         self._archive_root = archive_root
         self._event_store = event_store
         self._verify_cache = verify_cache
+        self._narrow_gate = narrow_gate
 
     async def health(self) -> bool:
         return True
@@ -938,6 +944,7 @@ class LocalRunner:
         the spec via ``spec_to_json(spec)`` and ships it as the ``--spec``
         argument to ``orchestrator verify-merge`` over ssh.
         """
+        narrowing = {} if self._narrow_gate is None else {'narrow_gate': self._narrow_gate}
         scoped = await self._run_scoped(
             self._merge_wt,
             self._config,
@@ -957,6 +964,7 @@ class LocalRunner:
             # None-safe by construction, mirroring merge-flake suppression.
             event_store=self._event_store,
             verify_cache=self._verify_cache,
+            **narrowing,
         )
         if not scoped.passed:
             # PRD task α: single flake-retry gate. Re-run the named failing tests
@@ -982,6 +990,8 @@ class LocalRunner:
             )
             if not scoped.passed:
                 return scoped
+        if scoped.ran_narrow_gate:
+            return scoped
 
         gate = await self._run_unscoped(
             self._merge_wt,

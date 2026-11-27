@@ -91,7 +91,7 @@ def test_wire_fingerprint_is_pinned_for_todays_wire_classes():
     change re-pins only this vector.
     """
     assert wire_fingerprint(wire_classes()) == (
-        '817ad4d80d1f101b92bdfb8d1b9c87487b04889df2bc3e1706d02397c6dbd641'
+        'eedc342fea9f30c4e467f37fd2a52b471777547f75df302c1a8eb6696d090260'
     )
 
 

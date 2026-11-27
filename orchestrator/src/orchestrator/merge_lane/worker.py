@@ -268,6 +268,7 @@ from orchestrator.merge_lane.verify_failure_outcome import (
 from orchestrator.merge_verify_facts import (
     ChainDepthReason,
 )
+from orchestrator.narrow_gate_delta import train_exclusions
 from orchestrator.scheduler import StaleEvidenceRejection
 from orchestrator.task_priority import TaskPriorityLookup
 from orchestrator.task_status import WORKFLOW_PRESERVE_STATUSES
@@ -967,6 +968,41 @@ def _train_cancel_refusal(
     return None
 
 
+def _split_coalesce_exclusions(
+    candidates: Sequence[MergeRequest],
+    reason_of: Callable[[MergeRequest], str | None],
+    exclusions: list[dict[str, str]],
+) -> list[MergeRequest]:
+    """The *candidates* *reason_of* leaves eligible; each excluded one is logged and appended to *exclusions*."""
+    eligible: list[MergeRequest] = []
+    for candidate in candidates:
+        reason = reason_of(candidate)
+        if not reason:
+            eligible.append(candidate)
+            continue
+        exclusions.append({'request_id': candidate.request_id, 'reason': reason})
+        logger.info(
+            'Coalesce exclusion: request_id=%s task_id=%s branch=%s reason=%s',
+            candidate.request_id, candidate.task_id, candidate.branch.bare_id, reason,
+        )
+    return eligible
+
+
+def _coalesce_suppressed(eligible: Sequence[MergeRequest], exclusions: list[dict[str, str]]) -> bool:
+    """Log a near-train the *exclusions* cut below two members, auditable without an event; always False.
+
+    The pass starts from at least two candidates, so only an exclusion can leave fewer.
+    """
+    logger.info(
+        'Coalesce near-train suppressed: exclusion gate left only %d '
+        'eligible candidate(s) (need ≥2); tasks will merge solo. '
+        'exclusions=%r',
+        len(eligible),
+        exclusions,
+    )
+    return False
+
+
 _MERGE_CANCEL_RETIRE_REASON = 'merge_cancel_retire'
 """Reason string for the C1 worktree removal driven by ``merge_cancel``
 retirement (task ε) — distinguishes a cancel-retirement reap from the C3
@@ -1223,6 +1259,11 @@ _COALESCE_RISKY_TERMINAL_STATES: frozenset[str] = frozenset({'blocked', 'error'}
 # Exclusion reason for a waiting single no TaskWorkflow awaits (task 4953):
 # nothing would park it merge-deferred, so a train holding it could never land.
 COALESCE_EXCLUDED_NO_AWAITING_WORKFLOW = 'no_awaiting_workflow'
+
+# Exclusion reason for a waiting single the narrow merge gate would verify
+# narrowly (task 5411, docs/narrow-merge-gate.md): a train would make it pay the
+# full gate it was routed away from.
+COALESCE_EXCLUDED_NARROW_MERGE_GATE = 'narrow_merge_gate'
 
 # How long a per-task marker (task 5352's one-strike derail, task 11047's
 # un-chained mark) is remembered: a generous outer bound on a task's merge-queue
@@ -10708,36 +10749,26 @@ class SpeculativeMergeWorker:
         # signature (keyed on the structural waiting set) so risk signals —
         # which are monotonic within a process — only re-evaluate when the
         # structural set changes, avoiding per-tick event-store reads.
-        eligible: list[MergeRequest] = []
         exclusions: list[dict[str, str]] = []
-        for _c in candidates:
-            _reason = self._coalesce_exclusion_reason(_c)
-            if _reason:
-                exclusions.append({'request_id': _c.request_id, 'reason': _reason})
-                logger.info(
-                    'Coalesce exclusion: request_id=%s task_id=%s branch=%s reason=%s',
-                    _c.request_id, _c.task_id, _c.branch.bare_id, _reason,
-                )
-            else:
-                eligible.append(_c)
-        candidates = eligible
+        candidates = _split_coalesce_exclusions(candidates, self._coalesce_exclusion_reason, exclusions)
         if len(candidates) < 2:
-            # The exclusion gate reduced eligible candidates below the 2-member
-            # minimum needed to form a train.  Log so the decision is auditable
-            # even though no event is emitted (a train_coalesced event only fires
-            # when a train actually forms).  The excluded tasks will merge solo.
-            if exclusions:
-                logger.info(
-                    'Coalesce near-train suppressed: exclusion gate left only %d '
-                    'eligible candidate(s) (need ≥2); tasks will merge solo. '
-                    'exclusions=%r',
-                    len(candidates),
-                    exclusions,
-                )
-            return False
+            return _coalesce_suppressed(candidates, exclusions)
 
+        # The narrow-gate signal reads git, so it runs while _coalescing_ids
+        # guards the eligible set, and drops its items before any anchor is chosen.
         self._coalescing_ids = frozenset(c.request_id for c in candidates)
         try:
+            narrow = await train_exclusions(
+                orch_config.narrow_merge_gate, self._git_ops.project_root, self._git_ops.config.main_branch,
+                {c.task_id: c.branch.full_name for c in candidates},
+            )
+            narrow_reasons = dict.fromkeys(narrow, COALESCE_EXCLUDED_NARROW_MERGE_GATE)
+            candidates = _split_coalesce_exclusions(
+                candidates, lambda c: narrow_reasons.get(c.task_id), exclusions,
+            )
+            if len(candidates) < 2:
+                return _coalesce_suppressed(candidates, exclusions)
+            self._coalescing_ids = frozenset(c.request_id for c in candidates)
             return await self._stack_coalesce_train(candidates, exclusions, orch_config)
         finally:
             self._coalescing_ids = frozenset()
@@ -10767,7 +10798,6 @@ class SpeculativeMergeWorker:
         ranges_by_id: dict[str, dict] = {
             tid: r for tid, r in zip(all_ids, range_results, strict=True)
         }
-
         selected = select_train_members(
             anchor.task_id, other_ids, ranges_by_id,
             orch_config.merge_train_max_members,

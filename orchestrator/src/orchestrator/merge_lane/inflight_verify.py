@@ -388,6 +388,7 @@ class InflightVerifyRun:
             merge_base_sha=verify_base.merge_base_sha,
             main_sha=verify_base.main_sha,
             dispatch_facts=self._dispatch_facts,
+            narrow_gate_base=self._item.base_sha,
         )
 
     def _progress_probe_secs(self) -> float:

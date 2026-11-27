@@ -35,9 +35,12 @@ from _verify_cache_fixtures import (
 from orchestrator.config import GitConfig, ModuleConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.merge_lane.gates import PostMergePyrightResult
+from orchestrator.narrow_gate_class import GateClassification, MergeGateResolution
+from orchestrator.narrow_gate_plan import NarrowGateDecision
 from orchestrator.verify import VerifyResult, run_scoped_verification
 from orchestrator.verify_cache.registry import registry_db_path
 from orchestrator.verify_evidence import UnitOutcome
+from orchestrator.verify_plan import VerifyPlan
 from orchestrator.verify_runner import (
     CANCEL_PROBE_INTERVAL_SECS,
     GIT_PUSH_SSH_CONFIG,
@@ -1421,6 +1424,93 @@ class TestLocalRunnerThreadsEventStore:
 
         assert run_scoped.await_args is not None
         assert run_scoped.await_args[1]['event_store'] is None
+
+
+_DOCS_DECISION = NarrowGateDecision(GateClassification(MergeGateResolution.DOCS), VerifyPlan(runs=()), ('docs/x.md',))
+
+
+def _narrow_local_runner(run_scoped: Any, run_unscoped: Any, **narrow: Any) -> LocalRunner:
+    config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
+    config.merge_verify_workspace = False
+    return LocalRunner(
+        merge_wt=MagicMock(), config=config, module_configs=[], task_files=('docs/x.md',),
+        run_scoped=run_scoped, run_unscoped=run_unscoped, **narrow,
+    )
+
+
+@pytest.mark.asyncio
+class TestLocalRunnerNarrowGate:
+    """Task 5411: a narrow decision reaches run_scoped, and its verdict skips the unscoped type-check gate."""
+
+    async def test_a_narrow_verdict_is_returned_without_the_unscoped_gate(self):
+        narrow = _make_pass_result(narrow_gate=MergeGateResolution.DOCS)
+        run_scoped = AsyncMock(return_value=narrow)
+        run_unscoped = AsyncMock()
+        runner = _narrow_local_runner(run_scoped, run_unscoped, narrow_gate=_DOCS_DECISION)
+
+        result = await runner.run_merge_verify('abc123', _make_spec())
+
+        assert run_scoped.await_args is not None
+        assert run_scoped.await_args.kwargs['narrow_gate'] is _DOCS_DECISION
+        assert result is narrow
+        run_unscoped.assert_not_awaited()
+
+    async def test_without_a_decision_run_scoped_gets_no_narrow_keyword(self):
+        run_scoped = AsyncMock(return_value=_make_pass_result())
+        run_unscoped = AsyncMock(return_value=MagicMock(broken=False, timed_out=False))
+        runner = _narrow_local_runner(run_scoped, run_unscoped)
+
+        await runner.run_merge_verify('abc123', _make_spec())
+
+        assert run_scoped.await_args is not None
+        assert 'narrow_gate' not in run_scoped.await_args.kwargs
+        run_unscoped.assert_awaited_once()
+
+    async def test_a_red_narrow_verdict_still_meets_the_flake_gate(self):
+        from orchestrator import verify as verify_module
+
+        red = _make_fail_result(narrow_gate=MergeGateResolution.DOCS)
+        still_red = _make_fail_result(narrow_gate=MergeGateResolution.DOCS, summary='still red')
+        seen: list[VerifyResult] = []
+
+        async def suppress(result: VerifyResult, **_kwargs: Any) -> VerifyResult:
+            seen.append(result)
+            return still_red
+
+        run_unscoped = AsyncMock()
+        runner = _narrow_local_runner(AsyncMock(return_value=red), run_unscoped, narrow_gate=_DOCS_DECISION)
+
+        with patch.object(verify_module, 'apply_merge_flake_suppression', suppress):
+            result = await runner.run_merge_verify('abc123', _make_spec())
+
+        assert seen == [red]
+        assert result is still_red
+        run_unscoped.assert_not_awaited()
+
+    async def test_a_full_stamped_verdict_still_meets_the_unscoped_gate(self):
+        full_stamped = _make_pass_result()
+        full_stamped.narrow_gate = MergeGateResolution.FULL
+        run_scoped = AsyncMock(return_value=full_stamped)
+        run_unscoped = AsyncMock(return_value=MagicMock(broken=False, timed_out=False))
+        runner = _narrow_local_runner(run_scoped, run_unscoped, narrow_gate=_DOCS_DECISION)
+
+        await runner.run_merge_verify('abc123', _make_spec())
+
+        run_unscoped.assert_awaited_once()
+
+
+def test_a_narrow_verdict_round_trips_the_wire_codec():
+    decoded = result_from_json(result_to_json(_make_pass_result(narrow_gate=MergeGateResolution.COMMENTS)))
+
+    assert decoded.narrow_gate is MergeGateResolution.COMMENTS
+
+
+def test_a_full_gate_stamp_is_refused_at_decode():
+    payload = json.loads(result_to_json(_make_pass_result()))
+    payload['narrow_gate'] = 'full_gate'
+
+    with pytest.raises(ValueError, match='full_gate'):
+        result_from_json(json.dumps(payload))
 
 
 # ---------------------------------------------------------------------------

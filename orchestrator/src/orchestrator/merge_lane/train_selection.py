@@ -33,6 +33,8 @@ def select_train_members(
     candidate_ids: list[str],
     ranges_by_id: dict[str, dict[str, list[tuple[int, int]]]],
     max_members: int,
+    *,
+    excluded: frozenset[str] = frozenset(),
 ) -> list[str]:
     """Select a mutually-stackable subset of candidates capped at max_members.
 
@@ -40,16 +42,24 @@ def select_train_members(
     deterministic (id-sorted) order, adding each that is line_ranges_stackable
     against ALL already-selected members.  Stops when len(selected) == max_members.
 
+    An id in *excluded* never rides a train: an excluded anchor forms none and
+    an excluded candidate is skipped.  The narrow merge gate's items are
+    excluded so (docs/narrow-merge-gate.md).
+
     Returns [] when the result has fewer than 2 members — the sentinel for
     "no viable train" (a single-member train is meaningless).
 
     The anchor is always first (order-0) in the returned list.
     """
+    if anchor_id in excluded:
+        return []
     selected: list[str] = [anchor_id]
 
     for candidate_id in sorted(candidate_ids):
         if len(selected) >= max_members:
             break
+        if candidate_id in excluded:
+            continue
         candidate_ranges = ranges_by_id.get(candidate_id, {})
         # Must be stackable with every already-selected member (mutual stackability).
         stackable_with_all = all(

@@ -56,6 +56,7 @@ from orchestrator.config_census_ignore import (  # noqa: F401 (re-exported for t
 from orchestrator.defect_tests_config import DefectTestsConfig
 from orchestrator.implementer_brief_variant import ImplementerBriefVariant
 from orchestrator.merge_pool_config import MergePoolConfig
+from orchestrator.narrow_gate_config import NarrowMergeGateConfig
 from orchestrator.routing import DEFAULT_ALLOWED_MODELS, DEFAULT_LADDER
 from orchestrator.shadow_types import ShadowShape
 from orchestrator.task_priority import PRIORITY_TIERS
@@ -5872,6 +5873,9 @@ class OrchestratorConfig(BaseSettings):
     # plans/priority-at-later-gates-prd.md). Nothing reads it yet.
     merge_pool: MergePoolConfig = Field(default_factory=MergePoolConfig)
 
+    # The docs-only and comments-only merge gate (task 5411, docs/narrow-merge-gate.md). Off by default.
+    narrow_merge_gate: NarrowMergeGateConfig = Field(default_factory=NarrowMergeGateConfig)
+
     # Early start on a predecessor's branch (plans/early-start-on-predecessor-branch-prd.md).
     # The defaults live in EarlyStartConfig only, not in defaults.yaml.
     early_start: EarlyStartConfig = Field(default_factory=EarlyStartConfig)
@@ -7124,6 +7128,8 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
     _submodel_leaf_paths('merge_screen', MergeScreenConfig),
     # The merge pool's knobs (task 9933): every leaf hot, as merge_deep's are.
     _submodel_leaf_paths('merge_pool', MergePoolConfig),
+    # The narrow merge gate (task 5411): read per merge verify, so its kill switch applies live.
+    _submodel_leaf_paths('narrow_merge_gate', NarrowMergeGateConfig),
     # Verify-result cache (task 5652): read per verify decision, so green tier;
     # each role's mode is its own leaf, so a task-only edit applies alone.
     _submodel_leaf_paths('verify_cache', VerifyCacheConfig),
