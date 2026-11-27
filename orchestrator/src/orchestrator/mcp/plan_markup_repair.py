@@ -412,11 +412,15 @@ def repair_plan_fields(
     return repaired, facts
 
 
-#: Stable event name for a structured markup fact (INV-2). plan-tools is a bare
-#: stdio subprocess with no event bus reachable, so the log IS the channel — and
-#: for that to be usable the WHOLE message must be the payload. One line, one
-#: fact, ``json.loads``-able; never a value a consumer has to regex out of prose.
+#: Stable event name for a structured markup fact (INV-2). The WHOLE log message
+#: is the payload: one line, one fact, ``json.loads``-able; never a value a
+#: consumer has to regex out of prose. The log is a per-process stderr, so the
+#: durable record of a disclosed fact is plan-tools' journal line, written by
+#: ``orchestrator/src/orchestrator/mcp/stored_markup_journal.py``.
 MARKUP_FACT_EVENT = 'plan_markup_repaired'
+
+#: The one response key a host discloses this module's reportable facts under.
+MARKUP_REPAIRS_KEY = 'markup_repairs'
 
 #: Stable event name for a repair that could not be PERSISTED. Deliberately
 #: distinct from the fact event: the repair itself succeeded and was served, so
