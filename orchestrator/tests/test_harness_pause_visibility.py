@@ -154,6 +154,7 @@ def rig(tmp_path: Path, mock_orch_config) -> _ResolutionRig:
     wire_scheduler_liveness_mock(scheduler)
     scheduler.is_paused = True
     scheduler.pause_reason = PAUSE_REASON
+    scheduler.flush_state_snapshot = AsyncMock()
     harness.scheduler = scheduler
     queue = EscalationQueue(tmp_path / 'esc')
     harness._escalation_queue = queue
