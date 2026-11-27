@@ -382,7 +382,7 @@ def union_busy_hours(verify: Sequence[Event], lo: datetime, hi: datetime) -> flo
 
 
 @dataclass(frozen=True)
-class VerifyHostHours:
+class SummedVerifyHours:
     """Merge-verify host-hours summed over every host, so two hosts verifying at once count twice."""
 
     completed: float
@@ -401,13 +401,13 @@ def _summed_hours(events: Sequence[Event], duration_key: str) -> float:
 
 def verify_hours_per_landing(
     verify: Sequence[Event], cancelled: Sequence[Event], ledger: Sequence[Landing],
-) -> VerifyHostHours:
+) -> SummedVerifyHours:
     """Host-hours of every completed and cancelled merge verify passed in, per landing.
 
     A sum (cost), not a union (occupancy); the caller passes the window's rows.
     """
     completed, aborted = _summed_hours(verify, 'duration_ms'), _summed_hours(cancelled, 'elapsed_ms')
-    return VerifyHostHours(
+    return SummedVerifyHours(
         completed=completed, cancelled=aborted, per_landing=_share(completed + aborted, len(ledger)),
     )
 

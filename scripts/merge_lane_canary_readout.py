@@ -328,7 +328,7 @@ class Readout:
     voids: canary.VoidTally
     conditionals: canary.GateConditionals
     local_hours: canary.HostHours
-    verify_hours: canary.VerifyHostHours
+    summed_verify_hours: canary.SummedVerifyHours
     union_busy_hours: float
     queue: canary.QueueToLand
     chain_items: dict[int, int]
@@ -365,7 +365,7 @@ def compute(
     accounting = canary.accounting_violations(journal.audits)
     conditionals = canary.gate_conditionals(ledger, events.gates, events.queued_lookback)
     local_hours = canary.host_verify_hours(events.verify_lookback, events.cancelled, lo, hi, host=hosts.local)
-    verify_hours = canary.verify_hours_per_landing(events.verify, events.cancelled, ledger)
+    summed_verify_hours = canary.verify_hours_per_landing(events.verify, events.cancelled, ledger)
     queue = canary.queue_to_land(events.finalized)
     voids = canary.voids_per_landing(events.voided, ledger)
     figures = canary.CanaryFigures(
@@ -380,12 +380,12 @@ def compute(
             [row.merge_sha for row in lookback_ledger if row.via_chain and row.merge_sha is not None],
         ),
         queue_to_land_p50_hours=queue.p50_hours,
-        verify_hours_per_landing=verify_hours.per_landing,
+        verify_hours_per_landing=summed_verify_hours.per_landing,
         deep_chain_p90_secs=canary.deep_chain_p90_secs(events.verify),
     )
     return Readout(
         lo=lo, hi=hi, sources=sources, ledger=ledger, predicates=canary.evaluate(figures),
-        voids=voids, conditionals=conditionals, local_hours=local_hours, verify_hours=verify_hours,
+        voids=voids, conditionals=conditionals, local_hours=local_hours, summed_verify_hours=summed_verify_hours,
         union_busy_hours=canary.union_busy_hours(events.verify_lookback, lo, hi),
         queue=queue, chain_items=canary.chain_items_distribution(events.verify),
         depth_reasons=canary.depth_reason_tally(events.verify), starved=canary.depth_starved(events.verify),
@@ -433,7 +433,7 @@ def _predicate_table(rows: Sequence[canary.Predicate]) -> list[str]:
 
 
 def _landings_section(r: Readout) -> list[str]:
-    v = r.verify_hours
+    v = r.summed_verify_hours
     return [
         '## Landings and lane hours', '',
         f'- landings: {len(r.ledger)} (merge_finalized done ∪ train_merged members); '
