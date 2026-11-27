@@ -1563,6 +1563,9 @@ class ChainResult:
     build_ms: int | None = None
     link_request_ids: tuple[str, ...] = ()
     """The ``request_id`` of each link, parallel to ``links``."""
+    link_tips: tuple[str, ...] = ()
+    """The branch tip each link merged, the second parent of its merge commit,
+    parallel to ``links`` (PRD ``plans/merge-pool-batches-prd.md`` §6.1)."""
 
     @property
     def depth(self) -> int:

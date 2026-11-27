@@ -117,6 +117,7 @@ from orchestrator.merge_lane.gates import (
     _reverify_rebased_tree,
     _run_unscoped_typechecks,
 )
+from orchestrator.merge_lane.git_read import second_parents
 from orchestrator.merge_lane.halt import HaltState
 from orchestrator.merge_lane.host_quarantine import HostQuarantine
 from orchestrator.merge_lane.intake import (
@@ -2129,6 +2130,7 @@ async def build_chain(
             links.append((req.task_id, res.merge_commit))
             link_request_ids.append(req.request_id)
             tip = res.merge_commit
+        link_tips = await second_parents(git_ops, [commit for _, commit in links])
     except BaseException as exc:
         # A cancellation mid-build must not strand a pool lane in ASSIGNED
         # (mirrors merge_to_main's except BaseException cleanup).
@@ -2183,6 +2185,7 @@ async def build_chain(
         links=links, tip=tip,
         truncated_at=truncated_at, truncated_reason=truncated_reason,
         lane=lane, lane_warm=warm, link_request_ids=tuple(link_request_ids),
+        link_tips=link_tips,
     )
 
 
