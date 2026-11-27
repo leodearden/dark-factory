@@ -9,6 +9,7 @@ import sqlite3
 import ssl
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -19,6 +20,7 @@ from _audit_hook import (
     Mutated,
     Opened,
     Spawned,
+    ThreadStarted,
     interpreter_roots,
     recording,
     runtime_roots,
@@ -71,6 +73,28 @@ def test_a_subprocess_is_a_spawn() -> None:
         subprocess.run([sys.executable, '-c', 'pass'], check=True)
 
     assert 'subprocess.Popen' in {spawn.event for spawn in rec.spawns}
+
+
+def test_a_thread_start_is_recorded_with_its_target() -> None:
+    def names_this_thread() -> None:
+        pass
+
+    with recording() as rec:
+        thread = threading.Thread(target=names_this_thread)
+        thread.start()
+        thread.join()
+
+    assert len(rec.thread_starts) == 1
+    (started,) = rec.thread_starts
+    assert isinstance(started, ThreadStarted)
+    assert 'names_this_thread' in started.target
+
+
+def test_a_recording_with_no_thread_start_records_none(tmp_path: Path) -> None:
+    with recording() as rec:
+        (tmp_path / 'a').write_text('x')
+
+    assert rec.thread_starts == ()
 
 
 def test_opens_of_the_runtime_and_the_ca_bundle_are_left_out(tmp_path: Path) -> None:
