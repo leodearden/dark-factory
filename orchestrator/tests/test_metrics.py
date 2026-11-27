@@ -10,6 +10,7 @@ import pytest
 
 from orchestrator.agents.token_pricing import FALLBACK_PRICE, TokenUsage, price_tokens
 from orchestrator.evals.metrics import (
+    DispatchRecord,
     EndpointKind,
     EvalMetrics,
     compute_composite,
@@ -663,11 +664,10 @@ def _dispatched(
 
 def _record(
     model: str, served: str | None, source_layer: str, rule_id: str | None,
-) -> dict[str, Any]:
-    return {
-        'model': model, 'served_model_id': served,
-        'source_layer': source_layer, 'rule_id': rule_id,
-    }
+) -> DispatchRecord:
+    return DispatchRecord(
+        model=model, served_model_id=served, source_layer=source_layer, rule_id=rule_id,
+    )
 
 
 class TestDispatchedModels:
