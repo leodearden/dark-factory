@@ -4761,7 +4761,10 @@ class TestWarmLaneDfPreferredScripts:
 
         with pytest.raises(ValidationError) as exc:
             GitConfig.model_validate({'warm_lane_df_preferred_scripts': [name]})
-        assert name in str(exc.value)
+        [err] = exc.value.errors()
+        assert err['type'] == 'literal_error'
+        assert err['loc'] == ('warm_lane_df_preferred_scripts', 0)
+        assert err['input'] == name
 
     def test_the_leaf_is_green_tier_reloadable(self):
         assert 'git.warm_lane_df_preferred_scripts' in RELOADABLE_FIELDS
