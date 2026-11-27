@@ -16348,6 +16348,8 @@ class Harness:
             level=2,
             filing_claimant_run_id=self._filing_claimant_run_id,
             review_due=fields.review_due,
+            pin_declared_by=list(fields.pin.declared_by),
+            pin_declared_reason=fields.pin.reason,
         )
         self._escalation_queue.submit(esc)
         if self.event_store:

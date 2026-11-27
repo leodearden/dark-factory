@@ -758,7 +758,13 @@ it, and the gate slug where one corresponds:
   work is curating memories in place (its text says it is curator-sitting work, edits no
   repository file, and names the memories to amend) is handled under self-execute line 14, with
   every check that line requires, and reported afterwards (Leo, 2026-11-10, scoping_intake
-  esc-866-1; precedent esc-787-1). Any other milestone gate is still asked. **Second exception:**
+  esc-866-1; precedent esc-787-1). A human-curator gate's record carries the runner's declared pin
+  `task-<id>-human-curator-gate`. Acknowledge it (`acknowledge_declared_pins=[<esc id>]`) only
+  after the per-entry content review has actually been performed and `human_curator_adjudicated_at`
+  stamped, by you under line 14 or by a curator sitting under line 9, or on a cancel ruling
+  (`abandon`). A factual finding that does not complete the review goes on the record with
+  `amend_escalation`, never into a resolve (esc-3181-1). Any other milestone gate is still asked.
+  **Second exception:**
   `review_due`, or a `milestone_gate` whose task carries `metadata.trigger_chain.role='human_gate'`
   (an interim gate, filed as milestone_gate by a runner that predates review_due), is handled under
   "`review_due` (born-at-L2, human gate)", which spawns the attended run with no prior ask (D10,
@@ -780,7 +786,8 @@ it, and the gate slug where one corresponds:
   description says. `orchestrator/src/orchestrator/deterministic_runner.py::build_gate_escalation_fields`
   copies that description into the record's `detail`, but the description is the brief Leo ruled,
   and the spawned session owns every scope, spend, config, bypass and host decision in it. The
-  pin-and-HOLD class still asks (`pin_declared_by` set, or a Leo HOLD on the record). It keys on
+  pin-and-HOLD class still asks (`pin_declared_by` set, or a Leo HOLD on the record; the runner's
+  curator-gate pin alone does not count, as that class says). It keys on
   the record's state, not its description, and a later Leo signal outranks the pre-authorisation.
 - Spend or eval launch: dollars, budget, cap raise, calibration, tranche, cells, fable run
   (`spend_or_eval_launch`).
@@ -795,7 +802,10 @@ it, and the gate slug where one corresponds:
   main checkout" says when one may land.
 - Behavioural config: concurrency, timeouts, thresholds, alarm retunes, merge breadth, scheduler.
 - A record whose `pin_declared_by` field is set, that is under a Leo HOLD, or that names Leo's
-  other session or his personal backlog.
+  other session or his personal backlog. The runner's `task-<id>-human-curator-gate` pin
+  (`shared/src/shared/human_curator_gate.py::curator_gate_declarer`) is not a Leo signal and does
+  not by itself put a gate in this class: the milestone-gate bullet above and its exceptions decide
+  whether to ask. Any other declarer beside it does.
 - Priority, pin-queue placement, cross-cluster dependency sequencing.
 - Scope changes: acceptance criteria, cancel-and-refile or re-scope. **Except** cancelling a task
   that a PRD decision Leo ruled has superseded (Leo, 2026-10-22; ratified 2026-10-26), which is

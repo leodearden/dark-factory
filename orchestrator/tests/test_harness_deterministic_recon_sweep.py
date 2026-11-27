@@ -681,8 +681,27 @@ class TestRecoverStrandedDeterministicGate:
         assert task['description'] in esc.detail
         assert esc.options == metadata['gate_options']
         assert esc.task_id == tid
+        assert esc.pin_declared_by == []
         # (b) RE-FILE-NEVER-FLIP: the task is already blocked — no status change.
         h.scheduler.set_task_status.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_refiled_curator_gate_carries_the_runner_pin(self, tmp_path: Path) -> None:
+        """Task 3346: the strand re-file pins a curator gate exactly as the runner does."""
+        h = _make_recon_harness()
+        h.event_store = MagicMock()
+        h.scheduler.set_task_status = AsyncMock()
+        queue = EscalationQueue(tmp_path)
+        h._escalation_queue = queue
+        tid = 'task-2954'
+        task, metadata = self._gate_task(tid)
+        metadata['human_curator_gate'] = True
+
+        await h._recover_stranded_deterministic_gate(tid, task, metadata)
+
+        (esc,) = queue.get_by_task(tid, status='pending')
+        assert esc.pin_declared_by == [f'task-{tid}-human-curator-gate']
+        assert 'human_curator_adjudicated_at' in esc.pin_declared_reason
 
     @pytest.mark.asyncio
     async def test_emits_escalation_created_event(self, tmp_path: Path) -> None:

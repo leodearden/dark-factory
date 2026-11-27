@@ -28,6 +28,7 @@ from orchestrator.deterministic_runner import (
     REVIEW_DUE_CATEGORY,
     DeterministicRunner,
     GateEscalationFields,
+    GatePin,
     build_gate_escalation_fields,
     read_human_gate_facts,
 )
@@ -119,6 +120,7 @@ class TestPlainPureGate:
         assert fields.detail == 'Leo signs off on the feature.\n\nLanded dependencies: 7, 8'
         assert fields.options == ('A: ship', 'B: hold')
         assert fields.review_due is None
+        assert fields.pin == GatePin()
 
     def test_fields_are_frozen(self):
         fields = _build(_plain_gate(), None)
@@ -205,6 +207,34 @@ class TestHumanGate:
         extra = [line for line in fields.detail[len(plain):].splitlines() if line]
         assert len(extra) == 1
         assert 'str' in extra[0]
+
+
+def _curator_gate(marker: object = True) -> dict:
+    task = _plain_gate()
+    task['metadata']['human_curator_gate'] = marker
+    return task
+
+
+class TestCuratorGatePin:
+    """Task 3346: a human-curator gate's escalation is filed with a declared pin."""
+
+    def test_curator_gate_fields_carry_the_gate_pin(self):
+        fields = _build(_curator_gate(), None)
+        assert fields.pin.declared_by == ('task-42-human-curator-gate',)
+        assert 'human_curator_adjudicated_at' in fields.pin.reason
+        assert 'human_curator_gate' in fields.pin.reason
+        assert 'amend_escalation' in fields.pin.reason
+
+    def test_string_truthy_marker_still_pins(self):
+        fields = _build(_curator_gate('true'), None)
+        assert fields.pin.declared_by
+
+    def test_curator_human_gate_filing_review_due_is_pinned_too(self):
+        task = _human_gate_task()
+        task['metadata']['human_curator_gate'] = True
+        fields = _build(task, _facts(None))
+        assert fields.category == 'review_due'
+        assert fields.pin.declared_by == ('task-42-human-curator-gate',)
 
 
 
