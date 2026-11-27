@@ -1422,6 +1422,7 @@ def _collect_checkpoint_targets(
     memory_service,
     known_projects: dict[str, str] | None = None,
     recon_ledger=None,
+    invocations_store: CostStore | None = None,
 ) -> list[tuple[str, object]]:
     """Gather every live SQLite store that exposes a ``checkpoint`` method.
 
@@ -1447,6 +1448,8 @@ def _collect_checkpoint_targets(
         targets.append(('ticket_store', ticket_store.checkpoint))
     if recon_ledger is not None and hasattr(recon_ledger, 'checkpoint'):
         targets.append(('recon_ledger', recon_ledger.checkpoint))
+    if invocations_store is not None and hasattr(invocations_store, 'checkpoint'):
+        targets.append(('invocations_ledger', invocations_store.checkpoint))
     if write_journal is not None and hasattr(write_journal, 'checkpoint'):
         targets.append(('write_journal', write_journal.checkpoint))
     dq = getattr(memory_service, 'durable_queue', None)
