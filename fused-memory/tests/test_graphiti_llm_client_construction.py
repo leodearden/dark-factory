@@ -38,7 +38,12 @@ from fused_memory.backends.llm_clients import (
 )
 from fused_memory.backends.llm_token_usage import LlmTokenUsage, measure_llm_tokens
 from fused_memory.backends.sdk_client_lifecycle import close_wrapped_sdk_clients
-from fused_memory.config.schema import ExtractionRouteConfig, FusedMemoryConfig, PlanRouteConfig
+from fused_memory.config.schema import (
+    AnthropicProviderConfig,
+    ExtractionRouteConfig,
+    FusedMemoryConfig,
+    PlanRouteConfig,
+)
 from fused_memory.models.enums import MemoryCategory
 from fused_memory.services.plan_route import PlanRoute, PlanRouteSite
 
@@ -967,6 +972,13 @@ class TestAnExtractionRouteIsBuiltOnTheGatedPlanProxy:
         }
 
 
+def _route_warnings(caplog) -> list[str]:
+    return [
+        r.getMessage() for r in caplog.records
+        if r.levelno == logging.WARNING and 'decisions_and_rationale' in r.getMessage()
+    ]
+
+
 class TestAnUnbuildableRouteIsOff:
     @staticmethod
     async def _assert_off(rig: _RouteRig, caplog, **kwargs: Any) -> None:
@@ -976,13 +988,24 @@ class TestAnUnbuildableRouteIsOff:
                 with extraction_category_scope(_DECISIONS):
                     await _call(client, 'extract_edges.edge')
 
-        warnings = [
-            r.getMessage() for r in caplog.records
-            if r.levelno == logging.WARNING and 'decisions_and_rationale' in r.getMessage()
-        ]
+        warnings = _route_warnings(caplog)
         assert len(warnings) == 1, warnings
         assert rig.proxy_saw_nothing()
         assert rig.nothing_carried_the_route_model()
+
+    @pytest.mark.asyncio
+    async def test_on_the_anthropic_arm(self, rig: _RouteRig, caplog) -> None:
+        rig.cfg.llm.provider = 'anthropic'
+        rig.cfg.llm.providers.anthropic = AnthropicProviderConfig(api_key='anthropic-test-key')
+
+        with caplog.at_level(logging.WARNING, logger=graphiti_client_module.logger.name):
+            async with _built(rig.cfg, gated_http_client_for=rig.gate()) as client:
+                assert client is not None
+                assert not isinstance(client, CategoryRoutedLLMClient)
+
+        [warning] = _route_warnings(caplog)
+        assert "'anthropic'" in warning
+        assert rig.proxy_saw_nothing()
 
     @pytest.mark.asyncio
     async def test_when_the_gate_does_not_gate_the_routes_url(self, rig: _RouteRig, caplog) -> None:
