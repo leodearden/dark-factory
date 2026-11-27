@@ -15,7 +15,9 @@ from _code_writer_links import assert_writes_c5, subject_task
 from _flag_for_stage2_pool_fake import LiveFlagPool
 from _fm_helpers import complete_paged_read, make_8df8_scenario, pydantic_spec
 from _git_root_helper import make_git_root
+from shared.cli_invoke import AgentResult
 from shared.project_layout import escalation_queue_dir
+from shared.testing import make_gate_mock
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.config.schema import FusedMemoryConfig, ReconciliationConfig
@@ -91,6 +93,7 @@ def make_reconciler(mock_memory_service, mock_taskmaster, journal, config, mock_
     """Build a TargetedReconciler over the shared mocks; *kwargs* reach its
     keyword-only constructor parameters (e.g. ``escalation_queue_factory``)."""
     def _make(**kwargs) -> TargetedReconciler:
+        kwargs.setdefault('usage_gate', None)
         r = TargetedReconciler(
             mock_memory_service, mock_taskmaster, journal, config, mock_event_buffer,
             **kwargs,
@@ -479,6 +482,7 @@ async def test_done_defers_write_during_active_cycle(
     mock_event_buffer.is_full_recon_active = AsyncMock(return_value=True)
     r = TargetedReconciler(
         mock_memory_service, mock_taskmaster, journal, config, mock_event_buffer,
+        usage_gate=None,
     )
     r.verifier = AsyncMock()
 
@@ -521,6 +525,7 @@ async def test_reads_proceed_during_active_cycle(
     mock_event_buffer.is_full_recon_active = AsyncMock(return_value=True)
     r = TargetedReconciler(
         mock_memory_service, mock_taskmaster, journal, config, mock_event_buffer,
+        usage_gate=None,
     )
     r.verifier = AsyncMock()
 
@@ -545,6 +550,7 @@ async def test_blocked_proceeds_during_active_cycle(
     ])
     r = TargetedReconciler(
         mock_memory_service, mock_taskmaster, journal, config, mock_event_buffer,
+        usage_gate=None,
     )
     r.verifier = AsyncMock()
 
@@ -563,7 +569,7 @@ async def test_blocked_proceeds_during_active_cycle(
 @pytest.mark.asyncio
 async def test_no_buffer_writes_normally(mock_memory_service, mock_taskmaster, journal, config):
     """When event_buffer is None, writes proceed without fence check."""
-    r = TargetedReconciler(mock_memory_service, mock_taskmaster, journal, config)
+    r = TargetedReconciler(mock_memory_service, mock_taskmaster, journal, config, usage_gate=None)
     r.verifier = AsyncMock()
 
     task_before = {'id': '1', 'title': 'Test', 'status': 'in-progress'}
@@ -643,6 +649,7 @@ async def test_handler_valueerror_caught_as_exception_not_reraised(
     """
     r = TargetedReconciler(
         mock_memory_service, mock_taskmaster, journal, config, mock_event_buffer,
+        usage_gate=None,
     )
     r.verifier = AsyncMock()
 
@@ -674,6 +681,7 @@ async def test_journal_failure_does_not_mask_validation_error(
     """
     r = TargetedReconciler(
         mock_memory_service, mock_taskmaster, journal, config, mock_event_buffer,
+        usage_gate=None,
     )
     r.verifier = AsyncMock()
 
@@ -1708,7 +1716,7 @@ class TestServerWiringContract:
         mock_journal = MagicMock()
         mock_config = MagicMock(spec_set=pydantic_spec(FusedMemoryConfig))
         targeted = TargetedReconciler(
-            mock_memory_service, mock_taskmaster, mock_journal, mock_config
+            mock_memory_service, mock_taskmaster, mock_journal, mock_config, usage_gate=None,
         )
 
         # Before wiring: registry must be None (the reconciler doesn't auto-wire)
@@ -5223,6 +5231,44 @@ class TestVerificationFailureAudit:
             f'Expected the specific CLI origin to survive into the journal, got '
             f'{rows[0]["detail"]!r}'
         )
+
+    @pytest.mark.asyncio
+    async def test_targeted_verify_draws_its_account_from_the_injected_usage_gate(
+        self, mock_memory_service, mock_taskmaster, journal, mock_event_buffer, tmp_path
+    ):
+        """The verifier dispatches on the gate's pooled account (task 11783).
+
+        Without a gate the CLI authenticated with the ambient ~/.claude login,
+        and every verify row since 2026-11-12 was an 'error' carrying the
+        expired-OAuth text.  A REAL verifier runs; only the process spawn is
+        patched, so invoke_with_cap_retry's gated branch is what is exercised.
+        """
+        cli_config = FusedMemoryConfig(reconciliation=ReconciliationConfig(
+            enabled=True, explore_codebase_root='/tmp/test', agent_llm_provider='claude_cli',
+        ))
+        gate = make_gate_mock(before_invoke=AsyncMock(return_value='pooled-token'))
+        reconciler = TargetedReconciler(
+            mock_memory_service, mock_taskmaster, journal, cli_config, mock_event_buffer,
+            usage_gate=gate,
+        )
+        served = AgentResult(
+            success=True,
+            output='',
+            structured_output={
+                'verdict': 'confirmed', 'confidence': 0.9, 'evidence': [], 'summary': 'x.py defines x',
+            },
+        )
+
+        with patch('shared.cli_invoke.invoke_claude_agent', autospec=True, return_value=served) as mock_agent:
+            await _run_done_transition(
+                reconciler, project_root=str(make_git_root(tmp_path, 'checkout')),
+            )
+
+        mock_agent.assert_called_once()
+        assert mock_agent.call_args.kwargs['oauth_token'] == 'pooled-token'
+        runs = await journal.get_recent_runs('test-project', limit=1)
+        rows = _verify_rows(await journal.get_run_actions(runs[0].id))
+        assert [row['operation'] for row in rows] == ['confirmed']
 
     @pytest.mark.asyncio
     async def test_unresolvable_root_is_audited_and_writes_no_memory(

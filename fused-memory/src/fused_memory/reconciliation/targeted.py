@@ -63,6 +63,7 @@ from fused_memory.utils.validation import InputValidationError, require_project_
 
 if TYPE_CHECKING:
     from shared.cost_store import CostStore
+    from shared.usage_gate import UsageGate
 
     from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
     from fused_memory.middleware.task_interceptor import TaskInterceptor
@@ -229,12 +230,13 @@ class TargetedReconciler:
             INSTALLED_ESCALATION_QUEUE_FACTORY
         ),
         cost_store: 'CostStore | None' = None,
+        usage_gate: 'UsageGate | None',
     ):
         self.memory = memory_service
         self.taskmaster = taskmaster
         self.journal = journal
         self.config = config.reconciliation
-        self.verifier = CodebaseVerifier(config.reconciliation)
+        self.verifier = CodebaseVerifier(config.reconciliation, usage_gate=usage_gate)
         self._cost_store = cost_store
         self.buffer = event_buffer
         self._escalation_queue_factory = escalation_queue_factory

@@ -30,7 +30,7 @@ from fused_memory.backends.falkor_indices import (
     expected_index_set,
     normalize_index_records,
 )
-from fused_memory.config.schema import FusedMemoryConfig
+from fused_memory.config.schema import FusedMemoryConfig, ReconciliationConfig
 from fused_memory.mcp_tools.scheduler_state import read_scheduler_state
 from fused_memory.models.reconciliation import (
     AssembledPayload,
@@ -800,6 +800,11 @@ def _log_dropped_escalation(category: str, run_id: str, summary: str, *, reason:
     )
 
 
+def build_reconciliation_usage_gate(config: ReconciliationConfig) -> UsageGate | None:
+    """The reconciliation subsystem's usage gate; the harness given it owns its shutdown."""
+    return UsageGate(config.usage_cap) if config.usage_cap.enabled else None
+
+
 class ReconciliationHarness:
     """Orchestrates the three-stage reconciliation pipeline."""
 
@@ -939,9 +944,9 @@ class ReconciliationHarness:
 
         # Usage gate (multi-account cap failover): the injected one, else one from config.
         # Either way the harness owns it and shuts it down with itself.
-        self.usage_gate: UsageGate | None = usage_gate
-        if self.usage_gate is None and hasattr(self.config, 'usage_cap') and self.config.usage_cap.enabled:
-            self.usage_gate = UsageGate(self.config.usage_cap)
+        self.usage_gate: UsageGate | None = (
+            usage_gate if usage_gate is not None else build_reconciliation_usage_gate(self.config)
+        )
         self._reserve_step_aside = ReserveStepAside(self.usage_gate)
         # The invocations ledger the stages and judge write their LLM calls to; not the gate's.
         self._cost_store = cost_store

@@ -3,6 +3,7 @@
 import asyncio
 import logging
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from shared.agent_result import extract_agent_verdict
 
@@ -11,6 +12,9 @@ from fused_memory.models.invocation_ledger import InvocationLedger
 from fused_memory.models.reconciliation import VerificationResult, VerificationVerdict
 from fused_memory.reconciliation.agent_loop import AgentLoop, ToolDefinition
 from fused_memory.utils.clip_disclosure import elide_text, truncation_fields
+
+if TYPE_CHECKING:
+    from shared.usage_gate import UsageGate
 
 logger = logging.getLogger(__name__)
 
@@ -189,15 +193,19 @@ Report your findings with these fields:
 class CodebaseVerifier:
     """Spawns an isolated explore agent to verify factual claims against the codebase."""
 
-    def __init__(self, config: ReconciliationConfig):
+    def __init__(
+        self, config: ReconciliationConfig, *, usage_gate: 'UsageGate | None' = None,
+    ):
         # PRD D3 (task 4722): NO codebase root is held here.  Reconciliation is
         # multi-project, and the caller's already-validated ProjectScope is the
         # single root authority (INV-9) — a root cached on the instance would
-        # be correct for at most one project per process.  `config` survives
-        # because it still carries the AGENT settings (model, provider,
-        # timeouts, max steps); `config.explore_codebase_root` is no longer
-        # read on this path at all.
+        # be correct for at most one project per process.  The instance holds
+        # only what is process-wide: the AGENT settings in `config` (model,
+        # provider, timeouts, max steps) and the usage gate that picks the
+        # pooled account; `config.explore_codebase_root` is no longer read on
+        # this path at all.
         self.config = config
+        self._usage_gate = usage_gate
 
     async def verify(
         self,
@@ -480,6 +488,7 @@ Investigate this claim against the codebase and report your findings.
             # root the CLI confines its read tools to, must be that project's.
             cwd=codebase_root,
             ledger=ledger,
+            usage_gate=self._usage_gate,
         )
 
         result = await agent.run(prompt)
