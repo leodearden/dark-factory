@@ -39,6 +39,10 @@ drive the shared session runner end to end. The real UsageGate those fixtures
 drive has its dead-PID probe-dir sweep confined by the plugin
 ``pytest_configure`` arms (task 6275).
 
+And `private_tempdir` (task 11128): an autouse re-base of
+``tempfile.gettempdir()`` onto a fresh per-test dir, so no session runner's
+dead-PID sweep or scratch config dir touches the host /tmp.
+
 And `fake_recorder` / `fake_timer_systemctl` (task 5285): an executable that records
 each call's argv and environment, replacing the private recorder and fake-`uv`
 copies in the flag-marker and reclaim wrapper suites, and a fake `systemctl`
@@ -50,6 +54,7 @@ import json
 import os
 import sqlite3
 import sys
+import tempfile
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -156,6 +161,39 @@ def _isolate_legibility_trickle_state(tmp_path_factory, monkeypatch):
         'DARK_FACTORY_LEGIBILITY_STATE_ROOT',
         str(tmp_path_factory.mktemp('legibility-state')),
     )
+
+
+# ---------------------------------------------------------------------------
+# Private tempdir per test (task 11128).
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(scope='session')
+def _private_tempdir_parent(tmp_path_factory):
+    return tmp_path_factory.mktemp('tempdir')
+
+
+@pytest.fixture(autouse=True)
+def private_tempdir(_private_tempdir_parent, monkeypatch):
+    """Re-base ``tempfile.gettempdir()`` onto a fresh, empty, private dir.
+
+    It keeps a SessionRunner's dead-PID sweep
+    (``scripts/legibility/session_runner.py::_sweep_stale_session_config_dirs_once``)
+    from listing and deleting under the shared host /tmp, which blocked for
+    >300s on a ~300k-entry /tmp in esc-5296-7. It also keeps the runner's and
+    the UsageGate's scratch ``TaskConfigDir`` dirs out of the host /tmp.
+
+    Autouse, so safety never rests on which test first set the sweep's
+    once-per-process mark. It is an in-process patch: a spawned child sweeps
+    whatever ``TMPDIR`` its spawner passes.
+
+    This is decision D15's mechanism in
+    plans/review-all-s20-cli-invocation-and-usage-gate-prd.md; task 9882 owns
+    the suite-wide arm.
+    """
+    root = Path(tempfile.mkdtemp(dir=_private_tempdir_parent))
+    monkeypatch.setattr(tempfile, 'tempdir', str(root))
+    return root
 
 
 # ---------------------------------------------------------------------------
