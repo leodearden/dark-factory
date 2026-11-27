@@ -25,7 +25,8 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, TypeVar
 
-from shared.cli_invoke import invoke_with_cap_retry
+from shared.cli_invoke import classify_cap_kill, invoke_with_cap_retry
+from shared.cost_store import CapReason
 from shared.project_layout import CheckoutRootError
 from shared.safe_io import atomic_write_text
 from shared.usage_gate import UsageGate
@@ -154,6 +155,8 @@ class PanelRunResult:
     wall_clock_ms: int = 0
     errors: list[str] = field(default_factory=list)
     run_key: PanelRunKey | None = None
+    # reviewer name -> the ceiling that ended each attempt one ended; a reviewer no ceiling ended is absent
+    ceiling_kills: dict[str, list[CapReason]] = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> PanelRunResult:
@@ -166,6 +169,10 @@ class PanelRunResult:
             wall_clock_ms=data.get('wall_clock_ms', 0),
             errors=list(data.get('errors', [])),
             run_key=None if run_key is None else PanelRunKey.from_dict(run_key),
+            ceiling_kills={
+                name: [CapReason(reason) for reason in reasons]
+                for name, reasons in data.get('ceiling_kills', {}).items()
+            },
         )
 
 
@@ -243,6 +250,16 @@ async def _dispatch_reviewer(usage_gate: UsageGate | None, label: str, **kwargs)
     )
 
 
+@dataclass(frozen=True)
+class _ReviewerRun:
+    """One reviewer's outcome: its review, its spend summed over attempts, and each ceiling that ended one."""
+
+    name: str
+    review: ReviewPayload | None
+    cost_usd: float
+    ceiling_kills: tuple[CapReason, ...]
+
+
 async def _run_single_reviewer(
     spec: ReviewerSpec,
     diff: CorpusDiff,
@@ -258,10 +275,11 @@ async def _run_single_reviewer(
     """
     role = build_trial_reviewer_role(spec)
     prompt = await _assembler().build_reviewer_prompt(role.name, diff.diff_text, context='')
-    return await _review(
+    run = await _review(
         spec, role, prompt, cwd=diff.source_dir(), diff_id=diff.diff_id,
         max_retries=max_retries, meta_root=meta_root,
     )
+    return run.name, run.review, run.cost_usd
 
 
 def _submitted_review(envelope: dict | None) -> ReviewPayload | None:
@@ -286,7 +304,7 @@ async def _review(
     prices: dict | None = None,
     meta_root: Path | None = None,
     usage_gate: UsageGate | None = None,
-) -> tuple[str, ReviewPayload | None, float]:
+) -> _ReviewerRun:
     """Run one reviewer at *cwd* on *prompt* via the live verdict-tools transport.
 
     Mirrors workflow.TaskWorkflow._run_reviewer's read+fail-safe contract
@@ -307,11 +325,14 @@ async def _review(
     a ``finally`` block; an injected *meta_root* is left untouched for the
     caller to inspect.
 
-    Returns (reviewer_name, ReviewPayload_or_None, cost_usd), where cost_usd is
-    the summed spend across every invocation attempt (not just the last):
-    a verdict-less attempt that triggers a retry still costs money, so
-    run_panel's total_cost_usd rollup would under-report multi-attempt trial
-    spend if only the final attempt's cost were returned (task 2493 amendment).
+    Returns a _ReviewerRun whose cost_usd is the summed spend across every
+    invocation attempt (not just the last): a verdict-less attempt that
+    triggers a retry still costs money, so run_panel's total_cost_usd rollup
+    would under-report multi-attempt trial spend if only the final attempt's
+    cost were returned (task 2493 amendment). Its ceiling_kills holds, in
+    attempt order, the configured ceiling (``shared.cli_invoke.classify_cap_kill``
+    against the role's own budget and turn cap) that ended each attempt one
+    ended, retried successes included.
 
     Threads the spec's cross-family dispatch fields (``backend``,
     ``env_overrides``, and an ``os.environ``-resolved ``oauth_token`` from
@@ -335,6 +356,11 @@ async def _review(
     # verdict-less retries more likely (a reviewer that never calls
     # submit_review_verdict), so accumulate a running total.
     total_cost = 0.0
+    ceilings: list[CapReason] = []
+
+    def _outcome(review: ReviewPayload | None) -> _ReviewerRun:
+        return _ReviewerRun(spec.name, review, total_cost, tuple(ceilings))
+
     try:
         artifacts = TaskArtifacts(cwd, meta_root=root)
         mcp_config = {
@@ -394,16 +420,21 @@ async def _review(
                     )
                     continue
                 logger.error('Reviewer %s failed after %d attempts: %s', spec.name, max_retries, exc)
-                return spec.name, None, total_cost
+                return _outcome(None)
 
             total_cost += result.cost_usd
+            ceiling = classify_cap_kill(
+                result, budget_usd=role.default_budget, max_turns=role.default_max_turns, backend=spec.backend,
+            )
+            if ceiling is not None:
+                ceilings.append(ceiling)
 
             # A submitted verdict is trusted only when the invocation itself
             # also reported success — an invocation failure is untrusted even
             # if it happened to write a verdict before failing.
             review = _submitted_review(artifacts.read_verdict(role.name))
             if result.success and review is not None:
-                return spec.name, review, total_cost
+                return _outcome(review)
 
             if attempt < max_retries:
                 logger.warning(
@@ -415,7 +446,7 @@ async def _review(
                 'Reviewer %s: no/invalid verdict after %d attempts (result.success=%s)',
                 spec.name, max_retries, result.success,
             )
-            return spec.name, ReviewPayload(
+            return _outcome(ReviewPayload(
                 verdict=Verdict.ERROR,
                 issues=(),
                 reviewer=role.name,
@@ -423,10 +454,10 @@ async def _review(
                     f'Reviewer emitted no/invalid verdict after {max_retries} '
                     f'attempt(s) (result.success={result.success}).'
                 ),
-            ), total_cost
+            ))
 
         # Unreachable, but satisfy type checker
-        return spec.name, None, total_cost
+        return _outcome(None)
     finally:
         if owns_root:
             await remove_tree(root, ignore_errors=True)
@@ -458,6 +489,7 @@ async def run_panel(
     start = time.monotonic()
     reviews: dict[str, dict] = {}
     errors: list[str] = []
+    ceiling_kills: dict[str, list[CapReason]] = {}
     total_cost = 0.0
     turns = trial_reviewer_max_turns(max_turns)
 
@@ -486,12 +518,13 @@ async def run_panel(
         if isinstance(r, BaseException):
             errors.append(str(r))
             continue
-        name, review, cost = r
-        total_cost += cost
-        if review is not None:
-            reviews[name] = review.to_record()
+        total_cost += r.cost_usd
+        if r.ceiling_kills:
+            ceiling_kills[r.name] = list(r.ceiling_kills)
+        if r.review is not None:
+            reviews[r.name] = r.review.to_record()
         else:
-            errors.append(f'{name}: no result')
+            errors.append(f'{r.name}: no result')
 
     elapsed_ms = int((time.monotonic() - start) * 1000)
 
@@ -506,6 +539,7 @@ async def run_panel(
             prices=prices, usage_gate=usage_gate, diff_cap_chars=diff_cap_chars, max_turns=turns,
             reviewer_budgets_usd=tuple(role.default_budget for role in roles),
         ),
+        ceiling_kills=ceiling_kills,
     )
 
 
