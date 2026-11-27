@@ -30,7 +30,12 @@ from shared.psi import parse_pressure_totals
 
 __all__ = [
     'CGROUP_ROOT',
+    'CPU_STAT',
+    'MEMORY_CURRENT',
+    'MEMORY_EVENTS',
     'MEMORY_PEAK',
+    'MEMORY_STAT',
+    'SWAP_CURRENT',
     'SWAP_PEAK',
     'CgroupReading',
     'PressureResource',
