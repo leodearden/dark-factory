@@ -7,9 +7,8 @@
 # one operator. Every name below is a placeholder.
 #
 # scripts/deploy/provision_verify_host.sh and scripts/deploy/check_verify_host.py
-# read it today. Until task α2 lands, the orchestrator itself still takes its
-# runner list from the inline verify_runners block of the project yaml or from
-# ORCH_VERIFY_RUNNERS. Setup walkthrough: SETUP.md §12.
+# read it. Each orchestrator reads its own project's entries at start, as its
+# runner list. Setup walkthrough: SETUP.md §12.
 
 hosts:
   example-verify-host:

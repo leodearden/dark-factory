@@ -72,3 +72,13 @@ def _restore_sandbox_backend():
     saved = sandbox_dispatch.get_backend()
     yield
     sandbox_dispatch.set_backend(saved)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_verify_host_roster(monkeypatch):
+    """Root-run tests reach the real load_config through scripts/; none may read the operator's roster file.
+
+    The name is orchestrator/src/orchestrator/verify_host_roster_file.py::ROSTER_FILE_ENV,
+    spelled out because the orchestrator import above is optional.
+    """
+    monkeypatch.setenv('ORCH_VERIFY_HOSTS_FILE', '/nonexistent/df-verify-hosts.yaml')

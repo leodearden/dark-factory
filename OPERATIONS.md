@@ -2128,17 +2128,21 @@ this is the order to run them in. `<host>` is the host's name in the roster.
 1. **Write its roster entry** in `~/.config/orchestrator/verify-hosts.yaml`
    (or the file `ORCH_VERIFY_HOSTS_FILE` names), shaped like
    `config/verify-hosts.example.yaml`. Add the ssh alias first: the scripts
-   reach the host only through it.
+   reach the host only through it. A project's hosts have one home, so before
+   the entry names a project under `projects:`, remove that project's inline
+   `verify_runners` block and any `ORCH_VERIFY_RUNNERS` entry. In the other
+   order every load of its config fails and names both: its orchestrator's
+   start, restart and reload, and the pre-commit hook in each of its
+   checkouts. Removing the inline list first costs at most a restart that
+   verifies locally.
 2. **Provision:** `scripts/deploy/provision_verify_host.sh <host>`. Run it
    with `--dry-run` first to see each step and the parameters it resolved
    without touching the host. A full run ends with the checker and returns
    its exit code.
 3. **Check:** `scripts/deploy/check_verify_host.py <host>` on its own, at any
    later time; `--json` for a record.
-4. **Wire the runner list.** Until task α2 lands, add the host to the
-   project's `verify_runners` block, or to `ORCH_VERIFY_RUNNERS` in the
-   orchestrator unit's environment to keep its name out of a tracked file.
-   Either is restart-tier.
+4. **Restart the project's orchestrator.** The roster entry is its runner
+   list, and the roster is restart-tier.
 5. **Preflight** with `orchestrator verify-host-preflight --runner <host>`
    once task β has landed: it runs the project's full gate on the host
    through the production dispatch path.

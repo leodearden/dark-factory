@@ -338,6 +338,40 @@ def briefing(tmp_path: Path) -> BriefingAssembler:
     return BriefingAssembler(config)
 
 
+#: Guaranteed-absent ORCH_VERIFY_HOSTS_FILE (orchestrator/src/orchestrator/verify_host_roster_file.py::ROSTER_FILE_ENV); fixed like _ABSENT_WARM_LANE_SCRIPT_DIR below.
+_ABSENT_VERIFY_HOSTS_FILE = "/nonexistent/df-verify-hosts.yaml"
+
+#: The roster-locating inputs as the session inherited them, before any test pins them.
+_SESSION_ROSTER_LOCATING_ENV = {
+    name: value for name in ("HOME", "XDG_CONFIG_HOME") if (value := os.environ.get(name)) is not None
+}
+
+
+def _refuse_the_operators_roster_file(monkeypatch) -> None:
+    """Make any config load that would resolve the session's default roster path fail the test.
+
+    The ORCH_VERIFY_HOSTS_FILE pin alone cannot see a test that rebuilds the
+    environment (stripping every ORCH_ variable) before calling load_config.
+    """
+    from orchestrator.verify_host_roster_file import RosterFileError, roster_file_path
+
+    try:
+        operators_roster = roster_file_path(_SESSION_ROSTER_LOCATING_ENV)
+    except RosterFileError:
+        return
+
+    def guarded_roster_file_path(env):
+        resolved = roster_file_path(env)
+        if resolved == operators_roster:
+            raise AssertionError(
+                f"a config load under test resolved the operator's roster file {resolved}; "
+                "keep ORCH_VERIFY_HOSTS_FILE pinned (conftest.py::_isolate_orch_config)"
+            )
+        return resolved
+
+    monkeypatch.setattr("orchestrator.config.roster_file_path", guarded_roster_file_path)
+
+
 @pytest.fixture(autouse=True)
 def _isolate_orch_config(monkeypatch, tmp_path):
     """Isolate OrchestratorConfig from the real project tree for every test.
@@ -359,9 +393,10 @@ def _isolate_orch_config(monkeypatch, tmp_path):
 
     Precedence keeps this safe: explicit kwargs still win over the env, which overrides
     only ``project_root`` and the host-reaching knobs: laptop runner, ``prefer_remote``
-    (task 5053), ``verify_use_cgroup_scope`` (task 5206) and
-    ``verify_cold_preprovision_command`` (task 6917), so a bare config never ssh's the
-    laptop, spawns a real systemd scope or runs a real ``uv sync``; all else loads from
+    (task 5053), ``verify_use_cgroup_scope`` (task 5206),
+    ``verify_cold_preprovision_command`` (task 6917) and the verify-host roster file
+    (task 11734), so a bare config never ssh's the laptop, spawns a real systemd scope,
+    runs a real ``uv sync`` or reads the operator's roster; all else loads from
     yaml/defaults.
     Config-loading tests already use ``tmp_path`` as their project_root, so the
     env value agrees with the YAML they write.  The opt-in
@@ -375,6 +410,8 @@ def _isolate_orch_config(monkeypatch, tmp_path):
     monkeypatch.setenv("ORCH_CONFIG_PATH", str(REPO_ROOT / "dark-factory-orchestrator.yaml"))
     monkeypatch.setenv("ORCH_PROJECT_ROOT", str(tmp_path))
     monkeypatch.setenv("ORCH_VERIFY_RUNNERS", "[]")
+    monkeypatch.setenv("ORCH_VERIFY_HOSTS_FILE", _ABSENT_VERIFY_HOSTS_FILE)
+    _refuse_the_operators_roster_file(monkeypatch)
     monkeypatch.setenv("ORCH_VERIFY_HOST_POLICY", "prefer_local")
     monkeypatch.setenv("ORCH_VERIFY_USE_CGROUP_SCOPE", "false")
     monkeypatch.setenv("ORCH_VERIFY_COLD_PREPROVISION_COMMAND", "")

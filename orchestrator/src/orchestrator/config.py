@@ -9,7 +9,9 @@ import os
 import posixpath
 import re
 import stat
-from dataclasses import dataclass
+from collections import Counter
+from collections.abc import Mapping, Sequence
+from dataclasses import asdict, dataclass
 from itertools import pairwise
 from pathlib import Path, PurePosixPath
 from types import UnionType
@@ -62,6 +64,7 @@ from orchestrator.shadow_types import ShadowShape
 from orchestrator.task_priority import PRIORITY_TIERS
 from orchestrator.verify_admission_gate import AdmissionOrder
 from orchestrator.verify_cache.modes import CacheMode, VerifyRole, forced_off, most_conservative
+from orchestrator.verify_host_roster_file import RosterFileError, load_roster, roster_file_path
 
 logger = logging.getLogger(__name__)
 
@@ -208,6 +211,10 @@ class ConfigRequiredError(Exception):
     (2026-04-06 incident: /orchestrate run from ~/src/reify silently executed
     dark-factory tasks because cwd-based discovery picked dark-factory's own config).
     """
+
+
+class VerifyRunnersDeclaredTwiceError(ValueError):
+    """A project names verify hosts both inline and in the roster file (PRD verify-host-roster decision 7)."""
 
 
 def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
@@ -3420,6 +3427,28 @@ class RemoteGatePaths(NamedTuple):
     root: str
 
 
+# The name the merge lane and the task-side pool give the local slot
+# (verify_runner.py::HostAllocator, verify_hosts.py::HostPool).
+LOCAL_VERIFY_HOST_NAME = 'local'
+
+
+def require_unique_unreserved_runner_names(names: Sequence[str]) -> None:
+    """Raise ValueError unless every name is unique and none is the local slot's."""
+    duplicated = sorted(name for name, count in Counter(names).items() if count > 1)
+    reserved = LOCAL_VERIFY_HOST_NAME in names
+    if not duplicated and not reserved:
+        return
+    found = []
+    if duplicated:
+        found.append(f'duplicated {duplicated}')
+    if reserved:
+        found.append(f'reserved {[LOCAL_VERIFY_HOST_NAME]}')
+    raise ValueError(
+        f'verify_runners: runner names must be unique and none may be '
+        f'{LOCAL_VERIFY_HOST_NAME!r}; {", ".join(found)}'
+    )
+
+
 class VerifyRunnerConfig(BaseModel):
     """Configuration for a single remote verify runner (Lever C).
 
@@ -6166,6 +6195,14 @@ class OrchestratorConfig(BaseSettings):
     def _resolve_project_root(cls, v: Path) -> Path:
         return v.resolve()
 
+    @field_validator('verify_runners', mode='after')
+    @classmethod
+    def _require_unique_unreserved_runner_names(
+        cls, v: list[VerifyRunnerConfig],
+    ) -> list[VerifyRunnerConfig]:
+        require_unique_unreserved_runner_names([runner.name for runner in v])
+        return v
+
     @field_validator('verify_env_probes', mode='after')
     @classmethod
     def _reject_duplicate_env_probe_keys(
@@ -6865,6 +6902,30 @@ def config_unknown_keys_signature(census: list[ConfigUnknownKey]) -> str:
     return hashlib.sha256(joined.encode('utf-8')).hexdigest()[:16]
 
 
+def _roster_verify_runners(
+    config: OrchestratorConfig, env: Mapping[str, str], config_path: Path,
+) -> list[VerifyRunnerConfig]:
+    """This project's runners from the private roster file (SETUP.md §12, PRD verify-host-roster §6.3)."""
+    roster_path = roster_file_path(env)
+    project_id = config.fused_memory.project_id
+    runners = load_roster(roster_path).runners_for_project(project_id)
+    try:
+        roster_runners = [VerifyRunnerConfig.model_validate(asdict(runner)) for runner in runners]
+        require_unique_unreserved_runner_names([runner.name for runner in roster_runners])
+    except ValueError as exc:
+        raise RosterFileError(f'{roster_path}: project {project_id!r}: {exc}') from exc
+    if roster_runners and config.verify_runners:
+        raise VerifyRunnersDeclaredTwiceError(
+            f'project {project_id!r} names its verify hosts twice: inline runners '
+            f'{[runner.name for runner in config.verify_runners]}, declared by {config_path} '
+            f'or by the ORCH_VERIFY_RUNNERS environment variable, which ranks above it; '
+            f'and roster hosts {[runner.name for runner in roster_runners]} in {roster_path}.  '
+            f'Keep the roster file: remove the verify_runners block from {config_path} '
+            f'and any ORCH_VERIFY_RUNNERS entry (SETUP.md §12).'
+        )
+    return roster_runners
+
+
 def load_config(config_path: Path | None = None) -> OrchestratorConfig:
     """Load configuration from an explicit YAML file.
 
@@ -6904,6 +6965,9 @@ def load_config(config_path: Path | None = None) -> OrchestratorConfig:
 
     os.environ['ORCH_CONFIG_PATH'] = str(config_path)
     config = OrchestratorConfig()
+    roster_runners = _roster_verify_runners(config, os.environ, config_path)
+    if roster_runners:
+        config.verify_runners = roster_runners
     # κ: fold the shared sccache backend into verify_env so the LOCAL merge-verify
     # path (run_scoped_verification in verify.py reads config.verify_env) points at
     # the shared backend without requiring verify.py changes.  The assignment is
