@@ -1,9 +1,11 @@
 """The reconciler's escalation-queue seam.
 
-Owns the optional ``escalation`` package import and its installed default
-queue factory, filing one reconciler-authored L1, and deciding which pending
-records pin a task. Every function here is synchronous blocking filesystem
-I/O that coroutine callers run under ``asyncio.to_thread`` (INV-8).
+Holds its guarded import of the optional ``escalation`` package and the
+installed default queue factory that import yields, filing one
+reconciler-authored L1, and deciding which pending records pin a task. Other
+modules, ``reconciliation/harness.py`` among them, keep their own guarded
+imports for the names they use. Every function here is synchronous blocking
+filesystem I/O that coroutine callers run under ``asyncio.to_thread`` (INV-8).
 """
 
 from __future__ import annotations
