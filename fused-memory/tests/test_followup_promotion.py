@@ -8,6 +8,7 @@ interceptor's), and records what the seam emits.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -20,10 +21,12 @@ from _submit_stack import Stack
 from _submit_stack import passthrough_main_checkout as passthrough_main_checkout
 from _submit_stack import stack as stack
 from shared.followup_hold_records import FOLLOWUP_HOLD_METADATA_KEY
+from shared.task_statuses import TaskStatus
 
 from fused_memory.middleware.followup_hold import (
     FollowupHolders,
     PromotionDeferral,
+    backfill,
     hold_at_create,
     promote,
     promote_dependencies_of,
@@ -72,6 +75,11 @@ class _Store:
             title=title, description=f'{title}: one task.', priority='medium',
             dependencies=','.join(str(dependency) for dependency in dependencies),
             metadata={'files': ['src/app/a.py']}, status=status,
+        )
+
+    async def candidate(self, title: str) -> int:
+        return await self._add(
+            title=title, description=f'{title}: one observation.', priority='low', metadata=_FOLLOWUP,
         )
 
     async def _add(self, *, metadata: Mapping[str, Any], **fields: Any) -> int:
@@ -194,9 +202,10 @@ async def test_an_unknown_cause_is_refused(store: _Store) -> None:
 
 
 @pytest.mark.asyncio
-async def test_a_pending_unheld_dependent_promotes_its_held_dependency(store: _Store) -> None:
+@pytest.mark.parametrize('status', ['pending', 'in-progress', 'blocked', 'review', 'merge-deferred', 'infra-hold'])
+async def test_a_waiting_unheld_dependent_promotes_its_held_dependency(store: _Store, status: str) -> None:
     held = await store.held('The retry loop swallows the timeout')
-    dependent = await store.plain('Ship the retry budget', dependencies=[held])
+    dependent = await store.plain('Ship the retry budget', dependencies=[held], status=status)
 
     promoted = await promote_dependencies_of(store.stack.backend, store.stack.root, dependent, emit=store.emit)
 
@@ -208,7 +217,7 @@ async def test_a_pending_unheld_dependent_promotes_its_held_dependency(store: _S
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('shape', ['held', 'deferred', 'in-progress'])
+@pytest.mark.parametrize('shape', ['held', 'deferred', 'done', 'cancelled'])
 async def test_a_dependent_that_is_not_waiting_unheld_promotes_nothing(store: _Store, shape: str) -> None:
     held = await store.held('The retry loop swallows the timeout')
     if shape == 'held':
@@ -221,6 +230,28 @@ async def test_a_dependent_that_is_not_waiting_unheld_promotes_nothing(store: _S
     assert promoted == ()
     await _assert_held(store, held)
     assert store.emitted == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('status', list(TaskStatus), ids=[status.value for status in TaskStatus])
+async def test_the_backfill_holds_exactly_what_a_dependent_in_that_status_would_not_promote(
+    store: _Store, status: TaskStatus,
+) -> None:
+    held = await store.held('The retry loop swallows the timeout')
+    candidate = await store.candidate('The cache key ignores the tenant')
+    dependent = await store.plain('Ship the retry budget', dependencies=[held, candidate], status=status.value)
+    backend, root = store.stack.backend, store.stack.root
+
+    await backfill(
+        backend, root, holders=FollowupHolders(on_minted=_unannounced), write_lock=asyncio.Lock(),
+        emit=store.emit, known_roots=[root],
+    )
+    backfill_held = store.holder in await store.dependencies(candidate)
+    promoted = await promote_dependencies_of(backend, root, dependent, emit=store.emit)
+
+    assert backfill_held is not (held in promoted), (
+        f'a {status.value} dependent: the backfill held={backfill_held}, promotion promoted={promoted}'
+    )
 
 
 @pytest.mark.asyncio

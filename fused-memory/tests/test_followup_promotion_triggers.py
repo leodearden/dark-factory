@@ -1,6 +1,6 @@
 """What promotes a held follow-up, through the public tools (plans/follow-up-filing-shape-prd.md §4.3).
 
-Boundary rows 8-13 and 15: an edge from a pending unheld task, every landing on pending, a
+Boundary rows 8-13 and 15: an edge from a waiting unheld task, every landing on pending, a
 citation, a combine, a human removal or replacement of the holder edge and the explicit release. Every scenario
 files through ``submit_task`` / ``resolve_ticket`` on the real submit stack and reads back through
 ``get_task`` and the journaled events.
@@ -94,6 +94,21 @@ async def test_an_edge_from_a_pending_task_promotes_the_held_task(
 
     await _assert_promoted(stack, held, by='dependent', ref=dependent)
     assert (await stack.metadata(held)).get('pending_since') == pending_since
+    assert await _promoted_events(stack) == [{'task_id': held, 'by': 'dependent', 'ref': dependent}]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('status', ['in-progress', 'blocked'])
+async def test_an_edge_from_an_unheld_task_that_is_not_pending_promotes_the_held_task(
+    stack: Stack, curator_creates: list[PreparedCandidate], status: str,
+) -> None:
+    held = await _file_held(stack, 'The retry loop swallows the timeout')
+    dependent = await stack.seed('Ship the retry budget', {'files': [_FILE]}, status=status)
+
+    _ok(await stack.call('add_dependency', id=dependent, depends_on=held))
+    _ok(await stack.call('set_task_status', id=dependent, status='pending'))
+
+    await _assert_promoted(stack, held, by='dependent', ref=dependent)
     assert await _promoted_events(stack) == [{'task_id': held, 'by': 'dependent', 'ref': dependent}]
 
 
