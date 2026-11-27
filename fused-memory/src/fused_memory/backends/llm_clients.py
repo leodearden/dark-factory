@@ -1,5 +1,9 @@
 """Thin graphiti-core LLM client subclasses owned by fused-memory.
 
+It also holds the category router, CategoryRoutedLLMClient, which sends the
+extraction prompts made inside an extraction_category_scope to that
+category's route.
+
 Kept out of the already-large ``graphiti_client.py``, following the
 ``backends/falkor_fulltext.py`` convention for focused helpers.
 """
