@@ -321,6 +321,74 @@ class TestEnsureFreshCollectionOutlastsAnAbandonedCreate:
 
         assert client.collection_exists.call_count == 1
 
+    def test_a_settle_read_left_unanswered_past_the_client_timeout_reads_as_not_yet(self):
+        from _fm_qdrant_live import ensure_fresh_collection
+        from qdrant_client.http.exceptions import ResponseHandlingException
+        from qdrant_client.models import (
+            CollectionClusterInfo,
+            CountResult,
+            LocalShardInfo,
+            ReplicaState,
+        )
+
+        client = MagicMock()
+        client.collection_exists.return_value = False
+        client.create_collection.side_effect = ResponseHandlingException(httpx.ReadTimeout('timed out'))
+        client.collection_cluster_info.side_effect = [
+            ResponseHandlingException(httpx.ReadTimeout('timed out')),
+            CollectionClusterInfo(
+                peer_id=1,
+                shard_count=1,
+                local_shards=[LocalShardInfo(shard_id=0, points_count=0, state=ReplicaState.ACTIVE)],
+                remote_shards=[],
+                shard_transfers=[],
+            ),
+        ]
+        client.count.return_value = CountResult(count=0)
+
+        ensure_fresh_collection(client, 'c', size=8)
+
+        assert client.create_collection.call_count == 1
+        client.delete_collection.assert_not_called()
+        assert client.collection_cluster_info.call_count == 2
+
+    def test_a_settle_read_never_answered_fails_naming_the_unanswered_read(self):
+        from _fm_qdrant_live import ensure_fresh_collection
+        from qdrant_client.http.exceptions import ResponseHandlingException
+
+        def unanswered(*args, **kwargs):
+            raise ResponseHandlingException(httpx.ReadTimeout('timed out'))
+
+        client = MagicMock()
+        client.collection_exists.return_value = False
+        client.create_collection.side_effect = ResponseHandlingException(httpx.ReadTimeout('timed out'))
+        client.collection_cluster_info.side_effect = unanswered
+
+        with pytest.raises(AssertionError) as excinfo:
+            ensure_fresh_collection(client, 'c', size=8, settle_timeout=0.2)
+
+        assert 'last seen: no answer to the state read (ReadTimeout' in str(excinfo.value)
+        assert "'c'" in str(excinfo.value)
+        assert client.create_collection.call_count == 1
+
+    def test_a_settle_read_that_cannot_reach_the_server_propagates(self):
+        from _fm_qdrant_live import ensure_fresh_collection
+        from qdrant_client.http.exceptions import ResponseHandlingException
+
+        client = MagicMock()
+        client.collection_exists.return_value = False
+        client.create_collection.side_effect = ResponseHandlingException(httpx.ReadTimeout('timed out'))
+        client.collection_cluster_info.side_effect = ResponseHandlingException(
+            httpx.ConnectError('refused'),
+        )
+
+        with pytest.raises(ResponseHandlingException) as excinfo:
+            ensure_fresh_collection(client, 'c', size=8)
+
+        assert isinstance(excinfo.value.source, httpx.ConnectError)
+        assert client.create_collection.call_count == 1
+        client.delete_collection.assert_not_called()
+
 
 class TestEnsureFreshCollectionOutlastsAnAbandonedDelete:
     """A delete the client stops waiting for is judged by whether the collection disappears.
@@ -362,6 +430,24 @@ class TestEnsureFreshCollectionOutlastsAnAbandonedDelete:
             assert 'delete' in str(excinfo.value)
             assert 'last seen: present' in str(excinfo.value)
             assert server.deletes('c') == 1
+
+    def test_a_delete_settle_read_left_unanswered_past_the_client_timeout_reads_as_not_yet(self):
+        from _fm_qdrant_live import ensure_fresh_collection
+        from qdrant_client.http.exceptions import ResponseHandlingException
+
+        client = MagicMock()
+        client.collection_exists.side_effect = [
+            True,
+            ResponseHandlingException(httpx.ReadTimeout('timed out')),
+            False,
+        ]
+        client.delete_collection.side_effect = ResponseHandlingException(httpx.ReadTimeout('timed out'))
+        client.create_collection.return_value = None
+
+        ensure_fresh_collection(client, 'c', size=8)
+
+        assert client.delete_collection.call_count == 1
+        assert client.create_collection.call_count == 1
 
 
 # ---------------------------------------------------------------------------
