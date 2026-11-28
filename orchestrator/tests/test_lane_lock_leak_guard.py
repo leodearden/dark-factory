@@ -68,7 +68,6 @@ from test_merge_verify_lease_guard import (  # fixtures used by name
     _get_merge_commit,
     _git_config,
     _git_ops,
-    _setup_repo,
     git_repo,
     real_git_ops,
 )
@@ -98,7 +97,6 @@ __all__ = [
     '_get_merge_commit',
     '_git_config',
     '_git_ops',
-    '_setup_repo',
     'foreign_lane_lock_holder',
     'git_repo',
     'lane_is_free',

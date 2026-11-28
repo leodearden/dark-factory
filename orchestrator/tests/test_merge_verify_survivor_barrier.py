@@ -39,6 +39,7 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
+from _git_fixtures import seed_repo
 from _orch_helpers import VERIFY_CLI_PER_TEST_TIMEOUT
 from shared.proc_group import scan_process_groups_under_path as _real_scan
 
@@ -109,15 +110,6 @@ def _kill_group(pgid: int) -> None:
         os.killpg(pgid, signal.SIGKILL)
 
 
-async def _setup_repo(repo: Path) -> None:
-    await _run(['git', 'init', '-b', 'main'], cwd=repo)
-    await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=repo)
-    await _run(['git', 'config', 'user.name', 'Test'], cwd=repo)
-    (repo / 'README.md').write_text('# Test\n')
-    await _run(['git', 'add', '-A'], cwd=repo)
-    await _run(['git', 'commit', '-m', 'Initial commit'], cwd=repo)
-
-
 async def _get_merge_commit(git_ops: GitOps, branch_name: str, filename: str) -> str:
     """Create a feature branch, commit a file, merge to main, return merge_commit."""
     wt_info = await git_ops.create_worktree(branch_name)
@@ -131,9 +123,7 @@ async def _get_merge_commit(git_ops: GitOps, branch_name: str, filename: str) ->
 @pytest.fixture
 def git_repo(tmp_path: Path) -> Path:
     """A real temporary git repository with an initial commit."""
-    repo = tmp_path / 'repo'
-    repo.mkdir()
-    asyncio.run(_setup_repo(repo))
+    repo = seed_repo(tmp_path / 'repo')
     return repo
 
 
