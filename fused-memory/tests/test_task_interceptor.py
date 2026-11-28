@@ -14380,7 +14380,7 @@ async def test_dispatch_create_decision_unaffected_by_pure_gate_stamping(
 
     assert 'task_kind' not in stamped_metadata
     assert 'always_escalates' not in stamped_metadata
-    assert stamped_metadata == {'foo': 'bar'}
+    assert stamped_metadata == {'foo': 'bar', 'x_curator_complexity_hint': None}
 
 
 @pytest.mark.asyncio

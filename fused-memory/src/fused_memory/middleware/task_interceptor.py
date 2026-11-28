@@ -86,6 +86,7 @@ from fused_memory.middleware.curation_deferral import (
     dedupe_skipped_marker,
     pool_defer_reason,
 )
+from fused_memory.middleware.curator_complexity_hint import with_complexity_hint
 from fused_memory.middleware.curator_registry import RegistryHealth
 from fused_memory.middleware.curator_types import (
     CandidateTask,
@@ -607,14 +608,14 @@ def _dedupe_skipped_reason(
 ) -> str | None:
     """The ``dedupe_skipped`` marker reason for a create no curator verdict judged, else None.
 
-    Marked: a fail-open create (``degraded``), a curator that produced no
-    decision or could not be had (construction failed, interceptor closed),
-    and a combine or drop that fell through to create. Not marked: a healthy
-    create, ``route_deterministic``, or a curator disabled by config.
+    Marked: a create no :meth:`CuratorDecision.is_usable_create_verdict`
+    stands behind, and one whose curator produced no decision or could not be
+    had (construction failed, interceptor closed). Not marked: a curator
+    disabled by config.
     """
     if curator_unavailable is not None and curator_unavailable.cause is CuratorUnavailableCause.DISABLED:
         return None
-    if decision is None or decision.degraded or decision.action in ('combine', 'drop'):
+    if decision is None or not decision.is_usable_create_verdict():
         return ': '.join(_create_labels(decision, curator_unavailable=curator_unavailable))
     return None
 
@@ -5007,7 +5008,9 @@ class TaskInterceptor:
         The one dispatch chokepoint, reached from the worker's batch path,
         :meth:`_process_add_tickets_batch_prepared`. A create that no curator
         verdict judged is stamped ``metadata.dedupe_skipped`` here
-        (:func:`_dedupe_skipped_reason`).
+        (:func:`_dedupe_skipped_reason`), and a healthy curated create its
+        complexity hint
+        (``curator_complexity_hint.py::with_complexity_hint``).
         """
         if decision is not None and decision.action == 'refuse':
             # Deterministic refusal (cancelled-premise blocklist / recon premise
@@ -5133,6 +5136,7 @@ class TaskInterceptor:
                 **fresh_metadata_copy(metadata, site='dedupe-skipped-marker'),
                 **dedupe_skipped_marker(skipped_reason, at=datetime.now(UTC)),
             }
+        metadata = with_complexity_hint(metadata, title=kwargs.get('title'), decision=decision)
 
         tm = await self._ensure_taskmaster()
 

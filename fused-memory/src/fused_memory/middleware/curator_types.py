@@ -19,6 +19,7 @@ from shared.followup_items import (
     FollowupItem,
     read_items,
 )
+from shared.task_complexity import SIMPLE_COMPLEXITY
 from shared.task_statuses import TaskStatus
 
 from fused_memory.middleware.curation_deferral import DeferReason, deferral_justification
@@ -261,6 +262,13 @@ class CuratorDecision:
     # The corpus streams whose read failed for this candidate: see
     # PoolWithheld.unavailable_streams.
     unavailable_streams: tuple[str, ...] = ()
+    # The curator's fast-path hint for a create (judging the candidate) or a
+    # combine (judging the rewrite). Applied to a created task's metadata by
+    # fused_memory/middleware/curator_complexity_hint.py.
+    complexity_hint: Literal['simple'] | None = None
+    # The drop or combine the LLM chose when POOL STATE vetoed it into this
+    # create, so the curator never judged the candidate as a create.
+    vetoed_action: Literal['drop', 'combine'] | None = None
 
     def __post_init__(self) -> None:
         if (self.action == 'defer') != (self.defer_reason is not None):
@@ -269,6 +277,28 @@ class CuratorDecision:
                 f'action={self.action!r} defer_reason={self.defer_reason!r}'
             )
         _require_pool_streams(self.unavailable_streams, 'CuratorDecision')
+        if self.complexity_hint not in (None, SIMPLE_COMPLEXITY):
+            raise ValueError(
+                f'CuratorDecision.complexity_hint must be None or {SIMPLE_COMPLEXITY!r}, '
+                f'got complexity_hint={self.complexity_hint!r}'
+            )
+        if self.vetoed_action is not None and (
+            self.vetoed_action not in ('drop', 'combine') or self.action != 'create' or self.degraded
+        ):
+            raise ValueError(
+                "CuratorDecision.vetoed_action must be None, or 'drop' or 'combine' on a "
+                f'non-degraded create, got vetoed_action={self.vetoed_action!r} '
+                f'action={self.action!r} degraded={self.degraded!r}'
+            )
+
+    def is_usable_create_verdict(self) -> bool:
+        """True iff a usable verdict, not a fail-open path or a fall-through, decided the candidate be created.
+
+        A create pool state vetoed from a drop or combine counts, as does
+        ``route_deterministic``. A degraded create does not, nor does a drop or
+        combine that fell through to create at dispatch.
+        """
+        return not self.degraded and self.action in ('create', 'route_deterministic')
 
     @classmethod
     def deferred(
@@ -297,6 +327,8 @@ class CuratorDecision:
             'cost_usd': self.cost_usd,
             'defer_reason': self.defer_reason,
             'unavailable_streams': list(self.unavailable_streams),
+            'complexity_hint': self.complexity_hint,
+            'vetoed_action': self.vetoed_action,
         }
 
 

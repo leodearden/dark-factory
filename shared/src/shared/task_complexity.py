@@ -5,9 +5,11 @@ cannot disagree about which ``metadata.complexity`` values mean "simple".
 """
 from __future__ import annotations
 
+from typing import Final
+
 __all__ = ['SIMPLE_COMPLEXITY', 'is_simple_complexity']
 
-SIMPLE_COMPLEXITY = 'simple'
+SIMPLE_COMPLEXITY: Final = 'simple'
 
 
 def is_simple_complexity(value: object) -> bool:
