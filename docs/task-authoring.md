@@ -1093,10 +1093,12 @@ token (`migration`, `architecture`, `integration test`, `design ... new`,
 **Hard escape:** `metadata.force_full_path = true` always forces the full
 architect path regardless of `complexity`.
 
-**Curator complexity hint:** on every healthy curated `create` (not a
-degraded or fall-through create) the curator stamps
-`metadata.x_curator_complexity_hint` (`"simple"` or null) from the criteria
-above. A task is declarable when the hint is `"simple"`, the filer set no
+**Curator complexity hint:** on every `create` the curator judged as one, it
+stamps `metadata.x_curator_complexity_hint` (`"simple"` or null) from the
+criteria above. A degraded or fall-through create is not stamped, and neither
+is a `drop` or `combine` that pool state vetoed into a create
+(`CuratorDecision.vetoed_action`), so a null always means "judged, not simple".
+A task is declarable when the hint is `"simple"`, the filer set no
 `complexity`, and its non-empty `metadata.files` passes the
 `simple_task_files_error` guard. Both arms of a declarable task carry
 `metadata.x_routing_exp2_arm_key`, the `candidate_key` its arm was drawn from

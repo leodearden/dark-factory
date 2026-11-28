@@ -34,6 +34,7 @@ from _submit_stack import stack as stack
 from shared.routing_split import split_bucket
 
 from fused_memory.middleware.candidate_key import compute_candidate_key
+from fused_memory.middleware.curation_deferral import DEDUPE_SKIPPED_KEY
 from fused_memory.middleware.curator_complexity_hint import with_complexity_hint
 from fused_memory.middleware.curator_types import CandidateTask, CuratorDecision
 from fused_memory.middleware.simple_task_files_guard import simple_task_files_error
@@ -161,11 +162,67 @@ class TestTheCuratorParsesTheHint:
             'combine', '7', 'simple',
         )
 
+    @pytest.mark.parametrize(('answer', 'pool', 'vetoed'), [
+        ({'action': 'drop', 'target_id': '99'}, (('7', 'pending'),), 'drop'),
+        ({'action': 'drop', 'target_id': '7'}, (('7', 'unknown'),), 'drop'),
+        (
+            {
+                'action': 'combine',
+                'target_id': '7',
+                'target_fingerprint': 't',
+                'rewritten_task': {'title': 'Fix the guide wording', 'details': '- one bullet'},
+                'complexity_hint': 'simple',
+            },
+            (('7', 'done'),),
+            'combine',
+        ),
+    ], ids=['invalid-target', 'unknown-status-target', 'invalid-combine-target'])
+    async def test_a_pool_vetoed_drop_or_combine_is_a_hintless_create_naming_the_veto(
+        self, tmp_path, answer, pool, vetoed,
+    ):
+        curator = _curator(
+            tmp_path,
+            single=agent_result({**answer, 'justification': 'same concern'}),
+            batch=tripwire('one bundle is a batch of one'),
+        )
+
+        [decision] = await curator.curate_prepared(
+            [_bundle('Fix the wording of the guide', pool=pool)], PROJECT_ID, CURATION_ROOT,
+        )
+
+        assert (
+            decision.action, decision.degraded, decision.vetoed_action, decision.complexity_hint,
+        ) == ('create', False, vetoed, None)
+
 
 @pytest.mark.parametrize('hint', ['complex', 'Simple', ''])
 def test_a_decision_refuses_a_hint_other_than_simple_or_none(hint):
     with pytest.raises(ValueError, match=rf'complexity_hint.*{hint!r}'):
         CuratorDecision(action='create', complexity_hint=hint)
+
+
+@pytest.mark.parametrize('fields', [
+    {'action': 'drop', 'target_id': '7', 'vetoed_action': 'drop'},
+    {'action': 'create', 'degraded': True, 'vetoed_action': 'combine'},
+    {'action': 'create', 'vetoed_action': 'create'},
+], ids=['not-a-create', 'degraded-create', 'neither-drop-nor-combine'])
+def test_a_decision_refuses_a_vetoed_action_outside_a_pool_veto(fields):
+    with pytest.raises(ValueError, match='vetoed_action'):
+        CuratorDecision(**fields)
+
+
+@pytest.mark.parametrize(('decision', 'usable'), [
+    (CuratorDecision(action='create'), True),
+    (CuratorDecision(action='create', vetoed_action='drop'), True),
+    (CuratorDecision(action='route_deterministic'), True),
+    (CuratorDecision(action='create', degraded=True), False),
+    (CuratorDecision(action='drop', target_id='7'), False),
+    (CuratorDecision(action='combine', target_id='7'), False),
+], ids=['create', 'pool-vetoed-create', 'route-deterministic', 'degraded-create', 'drop', 'combine'])
+def test_a_usable_create_verdict_is_a_create_no_fail_open_or_fall_through_reached(
+    decision, usable,
+):
+    assert decision.is_usable_create_verdict() is usable
 
 
 FILES = ['src/app/guide.py']
@@ -257,7 +314,14 @@ class TestOnlyAHealthyCreateIsStamped:
             complexity_hint='simple',
         ),
         CuratorDecision(action='route_deterministic', justification='operational'),
-    ], ids=['no-decision', 'degraded-create', 'drop', 'combine', 'route-deterministic'])
+        CuratorDecision(action='create', justification='invalid-target', vetoed_action='drop'),
+        CuratorDecision(
+            action='create', justification='invalid-combine-target', vetoed_action='combine',
+        ),
+    ], ids=[
+        'no-decision', 'degraded-create', 'drop', 'combine', 'route-deterministic',
+        'pool-vetoed-drop', 'pool-vetoed-combine',
+    ])
     def test_any_other_decision_leaves_the_metadata_unchanged(self, decision):
         metadata = {'files': FILES}
 
@@ -354,6 +418,20 @@ class TestTheSubmitBoundary:
         assert metadata[HINT] is None
         assert 'complexity' not in metadata
         assert ARM_KEY not in metadata
+
+    async def test_a_pool_vetoed_create_is_judged_for_dedupe_but_carries_no_hint(
+        self, stack: Stack, curator_script: CuratorScript,
+    ):
+        curator_script.decisions.append(
+            CuratorDecision(action='create', justification='invalid-target', vetoed_action='drop'),
+        )
+
+        task_id = await stack.file_normal(
+            title=_title_on_arm(1, FILES), description=_DESCRIPTION, metadata={'files': FILES},
+        )
+
+        metadata = await stack.metadata(task_id)
+        assert (DEDUPE_SKIPPED_KEY in metadata, HINT in metadata) == (False, False)
 
     async def test_planning_mode_is_untouched(self, stack: Stack, curator_script: CuratorScript):
         curator_script.decisions.append(SIMPLE_CREATE)

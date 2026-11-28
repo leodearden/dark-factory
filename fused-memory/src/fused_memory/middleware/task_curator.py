@@ -3677,6 +3677,7 @@ def _parse_decision_dict(
                     latency_ms=latency_ms,
                     cost_usd=cost_usd,
                     degraded=False,
+                    vetoed_action=action,
                 )
         # RC3 create-safe guard: never drop/combine against a pool entry whose
         # status is unconfirmable ('unknown' — e.g. a thin fallback entry built
@@ -3697,6 +3698,7 @@ def _parse_decision_dict(
                 latency_ms=latency_ms,
                 cost_usd=cost_usd,
                 degraded=False,
+                vetoed_action=action,
             )
         # combine-only tasks must also be combine_eligible (pending status).
         if action == 'combine' and target_entry is not None and not target_entry.combine_eligible:
@@ -3710,6 +3712,7 @@ def _parse_decision_dict(
                 latency_ms=latency_ms,
                 cost_usd=cost_usd,
                 degraded=False,
+                vetoed_action=action,
             )
 
     rewritten: RewrittenTask | None = None

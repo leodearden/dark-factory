@@ -608,14 +608,14 @@ def _dedupe_skipped_reason(
 ) -> str | None:
     """The ``dedupe_skipped`` marker reason for a create no curator verdict judged, else None.
 
-    Marked: a fail-open create (``degraded``), a curator that produced no
-    decision or could not be had (construction failed, interceptor closed),
-    and a combine or drop that fell through to create. Not marked: a healthy
-    create, ``route_deterministic``, or a curator disabled by config.
+    Marked: a create no :meth:`CuratorDecision.is_usable_create_verdict`
+    stands behind, and one whose curator produced no decision or could not be
+    had (construction failed, interceptor closed). Not marked: a curator
+    disabled by config.
     """
     if curator_unavailable is not None and curator_unavailable.cause is CuratorUnavailableCause.DISABLED:
         return None
-    if decision is None or decision.degraded or decision.action in ('combine', 'drop'):
+    if decision is None or not decision.is_usable_create_verdict():
         return ': '.join(_create_labels(decision, curator_unavailable=curator_unavailable))
     return None
 

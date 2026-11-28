@@ -1,9 +1,10 @@
 """Apply a curated create's complexity hint to the task's metadata under routing experiment 2.
 
-Every healthy create records the curator's hint. A declarable task (hint
-"simple", metadata.files the submit gate accepts, no complexity set by the
-filer) also records the candidate_key its arm is drawn from, and on the
-treated arm declares the SIMPLE_TASK fast path. Contract:
+Every create the curator judged as one records the curator's hint: never a
+fail-open create, a fall-through, or a drop or combine pool state vetoed into a
+create. A declarable task (hint "simple", metadata.files the submit gate
+accepts, no complexity set by the filer) also records the candidate_key its arm
+is drawn from, and on the treated arm declares the SIMPLE_TASK fast path. Contract:
 plans/routing-experiment-substrate-prd.md §"Experiment 2: the curator hint (ε)".
 """
 
@@ -48,10 +49,10 @@ def with_complexity_hint(
 ) -> Any:
     """*metadata* stamped with *decision*'s complexity hint; anything else is returned as is.
 
-    Only a healthy create is stamped, and an unreadable wire value is never
-    rewritten. The input is never mutated.
+    Only a create the curator judged as one is stamped, and an unreadable wire
+    value is never rewritten. The input is never mutated.
     """
-    if not _is_healthy_create(decision):
+    if not _judged_as_create(decision):
         return metadata
     readable = coerce_task_metadata(metadata)
     if readable is None:
@@ -66,8 +67,14 @@ def with_complexity_hint(
     return {**arm_keyed, 'complexity': SIMPLE_COMPLEXITY} if is_treated(key) else arm_keyed
 
 
-def _is_healthy_create(decision: CuratorDecision | None) -> TypeGuard[CuratorDecision]:
-    return decision is not None and decision.action == 'create' and not decision.degraded
+def _judged_as_create(decision: CuratorDecision | None) -> TypeGuard[CuratorDecision]:
+    """True iff a usable create verdict came from the curator choosing create, not a veto or a registry."""
+    return (
+        decision is not None
+        and decision.is_usable_create_verdict()
+        and decision.action == 'create'
+        and decision.vetoed_action is None
+    )
 
 
 def _declarable(readable: Mapping[str, Any], hint: str | None) -> bool:
