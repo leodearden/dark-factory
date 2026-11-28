@@ -11530,9 +11530,10 @@ def create_mcp_server(
         Returns:
             ``{'pin_queue': [{'task_id': ..., 'boost_tier': ..., 'pinned': ...,
             'pin_order': ..., 'reserve_now': ..., 'ttl_until': ...,
-            'source': ...}, ...]}`` where ``source`` is ``'operator'`` or
+            'source': ...}, ...]}`` where ``source`` is ``'operator'``,
             ``'starvation_watchdog'`` (a watchdog auto-pin, which carries a
-            ``ttl_until``).
+            ``ttl_until``) or ``'main_health_fix'`` (a main-health fix pin at
+            the head, armed with ``reserve_now``).
         """
         _normalized = _normalize_project_root(project_root)
         if isinstance(_normalized, dict):
