@@ -26,10 +26,10 @@ from _curator_helpers import (
     prepared,
     tripwire,
 )
-from fused_memory.middleware.curator_complexity_hint import with_complexity_hint
 from shared.routing_split import split_bucket
 
 from fused_memory.middleware.candidate_key import compute_candidate_key
+from fused_memory.middleware.curator_complexity_hint import with_complexity_hint
 from fused_memory.middleware.curator_types import CandidateTask, CuratorDecision
 from fused_memory.middleware.simple_task_files_guard import simple_task_files_error
 from fused_memory.middleware.task_curator import (
