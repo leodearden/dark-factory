@@ -169,10 +169,11 @@ prices:
     input_per_1m: 10.00
     output_per_1m: 50.00
     cached_input_per_1m: 1.00
-  gpt-6.1-sol:
+  gpt-6.2-sol:
     input_per_1m: 2.00
     output_per_1m: 10.00
     cached_input_per_1m: 0.10
+    cache_write_per_1m: 2.50
   gpt-6.1-terra:
     input_per_1m: 1.00
     output_per_1m: 5.00

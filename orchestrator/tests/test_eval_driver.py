@@ -225,7 +225,7 @@ class TestBuildEvalOrchConfigAdmitsCandidateModel:
         from orchestrator.evals.configs import get_config_by_name
         from orchestrator.evals.runner import build_eval_orch_config
 
-        codex = get_config_by_name('codex-gpt6-astra')
+        codex = get_config_by_name('codex-gpt6.2-sol')
         assert codex is not None and codex.backend != 'claude'
         base = _base_config(tmp_path)
         cfg = build_eval_orch_config(codex, {}, base)
@@ -296,7 +296,7 @@ class TestCellRoutingPinsEveryRoleModel:
         from orchestrator.evals.configs import get_config_by_name
         from orchestrator.evals.runner import build_eval_orch_config
 
-        codex = get_config_by_name('codex-gpt6-astra')
+        codex = get_config_by_name('codex-gpt6.2-sol')
         assert codex is not None and codex.backend != 'claude'
         cfg = build_eval_orch_config(codex, {}, _base_config(tmp_path))
 
