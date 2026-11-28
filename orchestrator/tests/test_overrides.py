@@ -919,6 +919,44 @@ class TestMainHealthFixPin:
         assert row.pinned is False
         assert row.pin_order is None
 
+    def test_a_whole_row_clear_of_the_fix_is_granted_again(
+        self, tmp_path: Path
+    ) -> None:
+        from orchestrator.overrides import OverrideStore
+
+        store = OverrideStore(tmp_path / 'scheduler_overrides.db')
+        store.set_override('proj', 'O1', pinned=True)
+        store.pin_main_health_fix('proj', 'H')
+        store.clear_override('proj', 'H')
+
+        assert store.pin_main_health_fix('proj', 'H') == 1
+
+        assert [tid for tid, _ in _queue(store)] == ['H', 'O1']
+
+    def test_a_row_of_an_owner_without_a_rule_raises_and_writes_nothing(
+        self, tmp_path: Path
+    ) -> None:
+        from orchestrator.overrides import OverrideStore
+
+        db_path = tmp_path / 'scheduler_overrides.db'
+        store = OverrideStore(db_path)
+        store.set_override('proj', 'O1', pinned=True)
+        store.set_override('proj', 'H', pinned=True)
+        conn = sqlite3.connect(str(db_path))
+        try:
+            conn.execute(
+                "UPDATE overrides SET source='future_owner' WHERE task_id='H'"
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        before = _rows_without_updated_at(db_path)
+
+        with pytest.raises(ValueError, match="'future_owner'"):
+            store.pin_main_health_fix('proj', 'H')
+
+        assert _rows_without_updated_at(db_path) == before
+
     def test_watchdog_row_is_taken_over_at_the_head_without_ttl(
         self, tmp_path: Path
     ) -> None:

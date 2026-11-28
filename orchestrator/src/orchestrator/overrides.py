@@ -167,17 +167,25 @@ def _write_main_health_fix_pin(
     ).fetchone()
     if existing is not None:
         pinned, pin_order, source = existing
-        if source == OverrideSource.OPERATOR:
-            return None
-        if source == OverrideSource.MAIN_HEALTH_FIX:
-            if not pinned:
+        match source:
+            case OverrideSource.OPERATOR:
                 return None
-            conn.execute(
-                'UPDATE overrides SET reserve_now=1, updated_at=? '
-                'WHERE project_root=? AND task_id=?',
-                (now_iso, project_root, task_id),
-            )
-            return pin_order
+            case OverrideSource.MAIN_HEALTH_FIX:
+                if not pinned:
+                    return None
+                conn.execute(
+                    'UPDATE overrides SET reserve_now=1, updated_at=? '
+                    'WHERE project_root=? AND task_id=?',
+                    (now_iso, project_root, task_id),
+                )
+                return pin_order
+            case OverrideSource.STARVATION_WATCHDOG:
+                pass
+            case _:
+                raise ValueError(
+                    f'pin_main_health_fix has no ownership rule for a row of '
+                    f'source {source!r} (task {task_id})'
+                )
     (head,) = conn.execute(
         'SELECT MIN(1, COALESCE(MIN(pin_order), 1)) FROM overrides '
         'WHERE project_root=? AND pinned=1 AND pin_order IS NOT NULL '
@@ -641,11 +649,15 @@ class OverrideStore:
 
         Returns the fix's ``pin_order``, or None when nothing was written.  An
         operator row is never written, and a row this owner holds that is no
-        longer pinned means an operator unpinned it, so that unpin stands.  A
-        fix this owner already pins keeps its place and only re-arms
-        ``reserve_now``.  Otherwise the fix takes order ``min(1, lowest other
+        longer pinned means an operator unpinned it, so that unpin stands.
+        Only a ``field='pinned'`` clear leaves such a row: a whole-row clear
+        leaves none, so the next grant pins the fix again.  A fix this owner
+        already pins keeps its place and re-arms ``reserve_now``, even one an
+        operator cleared.  Otherwise the fix takes order ``min(1, lowest other
         order)``, every other pin at or after it moves back one place, and a
-        watchdog row is taken over with its TTL dropped.  Rationale:
+        watchdog row is taken over with its TTL dropped.  A row of any other
+        source raises ``ValueError`` and writes nothing, so a new owner must
+        be given its rule here.  Rationale:
         docs/main-health-fix-run-slot-reserve.md (task 10399).
         """
         now_iso = datetime.now(UTC).isoformat()
