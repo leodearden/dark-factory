@@ -19,7 +19,7 @@ import fused_memory.server.main as main
 
 # -I keeps the script's own directory off sys.path; appended, it cannot shadow an installed module.
 sys.path.append(str(Path(__file__).resolve().parent))
-from _embedded_uvicorn_fixtures import ReadySignallingServer  # noqa: E402
+from _embedded_uvicorn_fixtures import ReadySignallingServer
 
 
 def _server() -> ReadySignallingServer:
