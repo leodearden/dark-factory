@@ -215,6 +215,7 @@ from orchestrator.review_defects import (
     declared_refs,
     reports_a_defect,
     review_defect_declarations,
+    review_ruling_events,
     send_defect_events,
     with_live_defect_records,
 )
@@ -9335,6 +9336,7 @@ class TaskWorkflow:
                         api_error_status=triage.api_error_status,
                     )
                 return await self._mark_blocked(triage.reason, detail=triage.detail)
+            await self._apply_review_defect_rulings(reviews, verdict_cycle=review_cycle + 1)
             if not reviews.has_blocking_issues:
                 reviews = await self._scope_review_suggestions(
                     reviews, used_ctx, amendment_round,
@@ -19598,6 +19600,18 @@ class TaskWorkflow:
                 self.task_id, unreadable,
             )
         return with_live_defect_records(self.task, fresh)
+
+    async def _apply_review_defect_rulings(
+        self, reviews: ReviewAggregation, *, verdict_cycle: int,
+    ) -> None:
+        """Record a complete panel's defect rulings as reviewer Rules (PRD B8, B23)."""
+        if not reviews.defect_rulings:
+            return
+        await send_defect_events(
+            self.scheduler.dispatch_tool, project_root=str(self.config.project_root),
+            task_id=self.task_id,
+            events=review_ruling_events(reviews.defect_rulings, verdict_cycle=verdict_cycle),
+        )
 
     async def _declare_review_defects(self, reviews: ReviewAggregation) -> None:
         """Declare the round's blocking ``kind=defect`` issues on the task (PRD decision 16, B6)."""
