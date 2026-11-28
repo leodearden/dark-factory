@@ -42,9 +42,12 @@ from fused_memory.utils import toolcall_xml_leak
 from fused_memory.utils.toolcall_xml_leak import (
     LEAK_TAIL,
     LeakHit,
+    LeakShape,
+    classify_leak_shape,
     detect_leak,
     find_toolcall_xml_leak,
     has_toolcall_xml_leak,
+    repair_leaked_text,
 )
 
 # ---------------------------------------------------------------------------
@@ -394,3 +397,86 @@ class TestSingleSourceOfTruth:
         )
         reimported = importlib.import_module('fused_memory.utils.toolcall_xml_leak')
         assert reimported.LEAK_TAIL is toolcall_xml_leak.LEAK_TAIL
+
+
+# ---------------------------------------------------------------------------
+# (H) The shared repair definition (task 3233): which leak shapes can be
+#     repaired without losing content. Both the Mem0 sweep and the Graphiti
+#     episode sweep classify and repair through these three names.
+# ---------------------------------------------------------------------------
+
+# A leak whose continuation carries a DIFFERENT value than the body: the
+# sibling-argument-loss shape, which only a human can adjudicate.
+MANUAL_SIBLING_LEAK = _MEM0_BODY + _CLOSE_CONTENT + '\n' + _open_param('priority') + 'low'
+
+_SHAPED_TEXTS = {
+    LeakShape.CLEAN: 'A clean body with no tool-call markup at all.',
+    LeakShape.REPAIRABLE_TAIL: MEM0_TAIL_LEAK,
+    LeakShape.REPAIRABLE_DUPLICATE: MEM0_DUPLICATE_LEAK,
+    LeakShape.MANUAL_REVIEW: MANUAL_SIBLING_LEAK,
+}
+
+
+class TestClassifyLeakShape:
+    @pytest.mark.parametrize('value', ['clean prose', '', None, 0, 12, {'data': 'x'}])
+    def test_clean_empty_and_non_str_input_is_clean(self, value: object) -> None:
+        assert classify_leak_shape(value) is LeakShape.CLEAN
+
+    def test_bare_closing_invoke_tail_is_repairable_tail(self) -> None:
+        # The shape of live episodes 4d88a40f/72c293b3/1f588c77 (measured
+        # 2026-11-25): a closing content tag, a newline, a bare closing invoke.
+        assert classify_leak_shape(MEM0_TAIL_LEAK) is LeakShape.REPAIRABLE_TAIL
+
+    def test_trailing_whitespace_after_the_tail_is_still_repairable_tail(self) -> None:
+        assert classify_leak_shape(MEM0_TAIL_LEAK + '\n  ') is LeakShape.REPAIRABLE_TAIL
+
+    def test_verbatim_self_duplicate_is_repairable_duplicate(self) -> None:
+        assert classify_leak_shape(MEM0_DUPLICATE_LEAK) is LeakShape.REPAIRABLE_DUPLICATE
+
+    def test_a_different_continuation_value_is_manual_review(self) -> None:
+        assert classify_leak_shape(MANUAL_SIBLING_LEAK) is LeakShape.MANUAL_REVIEW
+
+    def test_a_leak_at_offset_zero_is_manual_review(self) -> None:
+        # Dropping the fragment would leave nothing: no repair can keep content.
+        assert classify_leak_shape(MEM0_TAIL_FRAGMENT) is LeakShape.MANUAL_REVIEW
+        assert classify_leak_shape(MEM0_DUPLICATE_FRAGMENT) is LeakShape.MANUAL_REVIEW
+
+
+class TestRepairLeakedText:
+    @pytest.mark.parametrize('text', [MEM0_TAIL_LEAK, MEM0_DUPLICATE_LEAK])
+    def test_repairable_shapes_repair_to_exactly_the_body(self, text: str) -> None:
+        assert repair_leaked_text(text) == _MEM0_BODY
+
+    @pytest.mark.parametrize(
+        'text', [MANUAL_SIBLING_LEAK, MEM0_TAIL_FRAGMENT, MEM0_DUPLICATE_FRAGMENT, None],
+    )
+    def test_unvouchable_leaks_and_none_are_refused(self, text: str | None) -> None:
+        assert repair_leaked_text(text) is None
+
+    def test_clean_text_is_returned_unchanged(self) -> None:
+        clean = _SHAPED_TEXTS[LeakShape.CLEAN]
+        assert repair_leaked_text(clean) == clean
+
+    @pytest.mark.parametrize('shape', list(LeakShape))
+    def test_repair_is_idempotent(self, shape: LeakShape) -> None:
+        once = repair_leaked_text(_SHAPED_TEXTS[shape])
+        assert repair_leaked_text(once) == once
+
+    @pytest.mark.parametrize('shape', list(LeakShape))
+    def test_every_repaired_string_is_leak_free(self, shape: LeakShape) -> None:
+        repaired = repair_leaked_text(_SHAPED_TEXTS[shape])
+        if repaired is not None:
+            assert has_toolcall_xml_leak(repaired) is False
+
+
+class TestLeakShapeVocabulary:
+    def test_values_are_the_committed_sweep_artifact_vocabulary(self) -> None:
+        # The committed Mem0 sweep artifacts carry exactly these strings, so the
+        # members' values are part of the persisted contract.
+        assert [shape.value for shape in LeakShape] == [
+            'clean', 'repairable_tail', 'repairable_duplicate', 'manual_review',
+        ]
+
+    def test_members_compare_equal_to_their_strings(self) -> None:
+        assert LeakShape.MANUAL_REVIEW == 'manual_review'
+        assert isinstance(LeakShape.CLEAN, str)

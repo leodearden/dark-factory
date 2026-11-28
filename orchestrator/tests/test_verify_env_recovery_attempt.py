@@ -41,7 +41,7 @@ def _fake_pytest_bin(tmp_path: Path, serial_run: str) -> Path:
 
 
 async def _verify(
-    tmp_path, *, concurrent, lint_command='true', type_command='sleep 1',
+    tmp_path, *, concurrent, lint_command='true', type_command='true',
     serial_run=_SERIAL_PASSES, timeout_secs=None,
 ):
     from orchestrator import verify
@@ -98,7 +98,9 @@ async def test_lint_and_type_are_recorded_as_carried_over(tmp_path, concurrent):
 @pytest.mark.asyncio
 @pytest.mark.parametrize('concurrent', [True, False])
 async def test_the_attempt_wall_time_is_the_recovery_legs_own(tmp_path, concurrent):
-    result, summary = await _verify(tmp_path, concurrent=concurrent)
+    result, summary = await _verify(
+        tmp_path, concurrent=concurrent, type_command='sleep 5',
+    )
 
     test, type_ = _entry(summary, 'test'), _entry(summary, 'type')
     assert type_['duration_secs'] > test['duration_secs'], (
@@ -113,7 +115,7 @@ async def test_a_carried_over_failure_still_fails_and_the_top_level_says_it_is_c
     tmp_path,
 ):
     result, summary = await _verify(
-        tmp_path, concurrent=True, lint_command='false', type_command='true',
+        tmp_path, concurrent=True, lint_command='false',
     )
 
     assert result.passed is False
@@ -133,7 +135,7 @@ async def test_a_green_top_level_names_the_recovery_run(tmp_path):
 @pytest.mark.asyncio
 async def test_a_recovery_run_that_times_out_is_the_timed_out_leg_on_record(tmp_path):
     result, summary = await _verify(
-        tmp_path, concurrent=True, type_command='true',
+        tmp_path, concurrent=True,
         serial_run=_SERIAL_HANGS, timeout_secs=2.0,
     )
 

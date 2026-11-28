@@ -32,13 +32,13 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import dataclasses
+import functools
 import json
 import os
 import shlex
 import subprocess
 import sys
 import threading
-import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -77,7 +77,7 @@ from orchestrator.verify_admission_gate import (
     AdmissionPolicy,
     gate_for,
 )
-from orchestrator.verify_cancel import kill_process_tree, read_worktree_path
+from orchestrator.verify_cancel import kill_process_tree, pgid_file, read_worktree_path
 from orchestrator.verify_hosts import HostPool
 from orchestrator.verify_runner import RemoteRunner, result_to_json
 from orchestrator.workflow import TaskWorkflow, build_workflow
@@ -243,10 +243,11 @@ def child_env() -> dict[str, str]:
 
 
 class ChildCli:
-    """The real CLI as a child process whose stdin stays open; every child is recorded."""
+    """The real CLI as a child process whose stdin stays open; every child is recorded, by request too."""
 
     def __init__(self) -> None:
         self.children: list[asyncio.subprocess.Process] = []
+        self._by_request: dict[str, asyncio.subprocess.Process] = {}
 
     async def invoke(self, args: Sequence[str]) -> tuple[int, str, str]:
         child = await asyncio.create_subprocess_exec(
@@ -255,9 +256,16 @@ class ChildCli:
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
         )
         self.children.append(child)
+        if (request_id := _option(args, '--request-id')) is not None:
+            self._by_request[request_id] = child
         assert child.stdout is not None and child.stderr is not None
         stdout, stderr = await asyncio.gather(child.stdout.read(), child.stderr.read())
         return await child.wait(), stdout.decode(), stderr.decode()
+
+    def returncode_of(self, request_id: str) -> int | None:
+        """The returncode of *request_id*'s child; None while it runs or before it is spawned."""
+        child = self._by_request.get(request_id)
+        return None if child is None else child.returncode
 
     async def close(self) -> None:
         """Kill only the recorded children, by their own pid (each one's pgid after setsid)."""
@@ -392,6 +400,10 @@ class LaptopHost:
     async def _git(self, argv: list[str], cwd: Any) -> tuple[int, str, str]:
         if 'rev-parse' in argv:
             self._log('rev_parse', None, argv)
+            done = subprocess.run(argv, cwd=cwd, capture_output=True, text=True)
+            return done.returncode, done.stdout, done.stderr
+        if 'for-each-ref' in argv:
+            self._log('tag_list', None, argv)
             done = subprocess.run(argv, cwd=cwd, capture_output=True, text=True)
             return done.returncode, done.stdout, done.stderr
         if 'push' in argv:
@@ -606,6 +618,39 @@ async def until(predicate: Callable[[], bool], *, what: str) -> None:
     await wait_responsive(poll(), label=what)
 
 
+class ChildExitedBeforeRecording(AssertionError):
+    """The verify-task child exited before recording a cold worktree beside *pgf*; it never can now."""
+
+    def __init__(self, pgf: Path, returncode: int) -> None:
+        super().__init__(
+            f'verify-task exited rc={returncode} before recording a cold worktree beside {pgf}',
+        )
+        self.pgf = pgf
+        self.returncode = returncode
+
+
+async def await_recorded_cold_worktree(
+    pgf: Path, *, child_returncode: Callable[[], int | None], watching: asyncio.Future[Any],
+) -> Path:
+    """The worktree recorded beside *pgf*, once it holds its cold ``.task/``.
+
+    It reads no clock.  It fails when the child has exited (*child_returncode*
+    gives its returncode, None while it runs) or the *watching* call has ended;
+    a child that lives on without recording is left to the caller's per-test
+    timeout.
+    """
+    while True:
+        recorded = read_worktree_path(pgf)
+        if recorded is not None and (recorded / '.task').is_dir():
+            return recorded
+        if (returncode := child_returncode()) is not None:
+            raise ChildExitedBeforeRecording(pgf, returncode)
+        if watching.done():
+            watching.result()
+            raise AssertionError('the call ended before verify-task recorded its worktree')
+        await asyncio.sleep(0.05)
+
+
 @dataclass
 class Turn:
     """A turn the test holds on one gate, from outside any verify."""
@@ -787,19 +832,14 @@ class Scene:
         await until(predicate, what=what)
 
     async def until_recorded_cold_worktree(
-        self, pgf: Path, *, watching: asyncio.Task[Any], timeout: float = 60.0,
+        self, request_id: str, *, watching: asyncio.Task[Any],
     ) -> Path:
-        """The worktree a verify-task recorded beside *pgf*, once it holds its cold ``.task/``."""
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            recorded = read_worktree_path(pgf)
-            if recorded is not None and (recorded / '.task').is_dir():
-                return recorded
-            if watching.done():
-                watching.result()
-                raise AssertionError('the call ended before verify-task recorded its worktree')
-            await asyncio.sleep(0.05)
-        raise AssertionError(f'verify-task never recorded a cold worktree beside {pgf}')
+        """Wait until *request_id*'s verify-task records its cold worktree, its child exits, or the call ends."""
+        return await await_recorded_cold_worktree(
+            pgid_file(self.laptop_worktree_base, request_id),
+            child_returncode=functools.partial(self.children.returncode_of, request_id),
+            watching=watching,
+        )
 
     def reload(self, **keys: Any) -> dict[str, Any]:
         """Hot-reload *keys* into the live harness config, as ``reload_config`` does; its result."""

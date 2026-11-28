@@ -19,6 +19,7 @@ import fcntl
 import json
 import os
 import shlex
+import shutil
 import signal
 import subprocess
 import time
@@ -29,7 +30,7 @@ from pathlib import Path
 from typing import Any, ClassVar
 
 import pytest
-from _gate_fixtures import without_push_ssh_config
+from _gate_fixtures import RecordingEvents, is_tag_listing, is_tag_push, without_push_ssh_config
 from _task_verify_fixtures import task_verify_spec
 from click.testing import CliRunner
 from df_pytest_isolation import read_leaked_pid
@@ -90,7 +91,7 @@ def test_wire_fingerprint_is_pinned_for_todays_wire_classes():
     change re-pins only this vector.
     """
     assert wire_fingerprint(wire_classes()) == (
-        '4a86a1007bc64cf983d2c25b991b9a0427993c1763c05869aecbde19c3114624'
+        'eedc342fea9f30c4e467f37fd2a52b471777547f75df302c1a8eb6696d090260'
     )
 
 
@@ -355,10 +356,12 @@ def test_gate_identity_cli_fails_without_a_checkout(monkeypatch):
 
 # Fake `uv sync`: "builds" a gate binary that answers gate-identity with its own
 # checkout's HEAD.  $FAKE_UV_LOG counts builds; $FAKE_UV_BROKEN builds a binary
-# that fails; $FAKE_UV_SLEEP widens the race window.
+# that fails; $FAKE_UV_EXIT fails the sync itself with that status;
+# $FAKE_UV_SLEEP widens the race window.
 _FAKE_UV = r'''#!/usr/bin/env bash
 set -eu
 echo "uv $*" >> "$FAKE_UV_LOG"
+[[ -z ${FAKE_UV_EXIT:-} ]] || exit "$FAKE_UV_EXIT"
 sleep "${FAKE_UV_SLEEP:-0}"
 mkdir -p .venv/bin
 if [[ -n ${FAKE_UV_BROKEN:-} ]]; then
@@ -578,6 +581,96 @@ def test_the_build_lock_file_is_left_in_place(remote: _Remote):
     assert (remote.root / f'.build-{remote.sha}.lock').is_file()
 
 
+@pytest.mark.parametrize(('failure_env', 'status'), [
+    pytest.param({'FAKE_UV_BROKEN': '1'}, 70, id='handshake-die'),
+    pytest.param({'FAKE_UV_EXIT': '1'}, 1, id='build-set-e-abort'),
+])
+def test_a_failed_ensure_unlinks_its_build_lock(
+    remote: _Remote, failure_env: dict[str, str], status: int,
+):
+    result = remote.ensure(**failure_env)
+
+    assert result.returncode == status, result.stderr
+    assert remote.gate.exists(), 'the clone runs only under the lock, so this run held it'
+    assert not (remote.root / f'.build-{remote.sha}.lock').exists()
+
+
+def _path_with_fake_flock(bindir: Path, script: str, path: str) -> str:
+    """*path* behind a *bindir* holding a ``flock`` that runs *script*."""
+    bindir.mkdir()
+    (bindir / 'flock').write_text(script)
+    (bindir / 'flock').chmod(0o755)
+    return f'{bindir}:{path}'
+
+
+def test_an_ensure_that_times_out_on_the_build_lock_leaves_it_in_place(
+    remote: _Remote, tmp_path: Path,
+):
+    """Only the run holding the lock unlinks it, never one that failed to take it."""
+    path = _path_with_fake_flock(tmp_path / 'flockbin', '#!/usr/bin/env bash\nexit 1\n', remote.env['PATH'])
+    remote.root.mkdir(parents=True)
+    lock_path = remote.root / f'.build-{remote.sha}.lock'
+    with lock_path.open('w') as held:
+        fcntl.flock(held, fcntl.LOCK_EX)
+
+        result = remote.ensure(PATH=path)
+
+        assert result.returncode == 75, result.stderr
+        assert lock_path.exists()
+        assert os.fstat(held.fileno()).st_ino == lock_path.stat().st_ino
+
+
+def _a_child_flock_waits_on(parent: int, handle: typing.IO[str]) -> bool:
+    """Whether a child of *parent* is blocked in flock on the file *handle* has open.
+
+    A waiter row reads ``<id>: -> FLOCK <mode> <access> <pid> <maj:min:inode> ...``.
+    Its device is the superblock's, which can differ from st_dev, so only the
+    inode is matched; the parent keeps another process's waiter from matching.
+    """
+    inode = f':{os.fstat(handle.fileno()).st_ino}'
+    for line in Path('/proc/locks').read_text().splitlines():
+        match line.split():
+            case [_, '->', 'FLOCK', _, _, pid, file_id, *_] if file_id.endswith(inode):
+                waiter = read_stat_fields(Path('/proc', pid), skip_malformed=True)
+                if waiter is not None and waiter.ppid == parent:
+                    return True
+    return False
+
+
+_ENSURE_EXIT_CEILING_SECS = 60
+
+
+def test_an_ensure_whose_lock_file_is_replaced_while_it_waits_locks_the_new_file(remote: _Remote):
+    """A holder may unlink the lock: winning a file no longer at the lock path is no lock."""
+    remote.root.mkdir(parents=True)
+    lock = remote.root / f'.build-{remote.sha}.lock'
+    handles = [lock.open('w')]
+    fcntl.flock(handles[0], fcntl.LOCK_EX)
+    proc = remote.popen()
+    try:
+        first = handles[0]
+        assert _holds_within(lambda: _a_child_flock_waits_on(proc.pid, first), 30)
+
+        lock.unlink()
+        second = lock.open('w')
+        handles.append(second)
+        fcntl.flock(second, fcntl.LOCK_EX)
+        first.close()
+
+        assert _holds_within(lambda: _a_child_flock_waits_on(proc.pid, second), 10)
+        assert remote.builds() == 0
+
+        second.close()
+        _, stderr = proc.communicate(timeout=_ENSURE_EXIT_CEILING_SECS)
+        assert proc.returncode == 0, stderr
+        assert remote.builds() == 1
+    finally:
+        for handle in handles:
+            handle.close()
+        proc.kill()
+        proc.communicate(timeout=_ENSURE_EXIT_CEILING_SECS)
+
+
 def test_ensure_never_exits_with_the_ssh_transport_status(remote: _Remote):
     """rc 255 means 'the ssh client failed'; a gate failure must not look like one.
 
@@ -748,7 +841,7 @@ async def test_a_dispatch_verifies_in_the_deployed_shas_gate_not_the_checkout_he
     verify through the host shim with ORCH_GATE_BIN.
     """
     scene = gate_scene
-    store = _RecordingEvents()
+    store = RecordingEvents()
 
     result = await scene.runner().run_merge_verify(
         scene.head, _spec(), event_store=store, task_id='t-6565',
@@ -776,7 +869,7 @@ async def test_a_dispatch_verifies_in_the_deployed_shas_gate_not_the_checkout_he
 async def test_a_second_dispatch_reuses_the_gate_silently(gate_scene: _GateScene):
     runner = gate_scene.runner()
     await runner.run_merge_verify(gate_scene.head, _spec())
-    store = _RecordingEvents()
+    store = RecordingEvents()
 
     assert await runner.run_merge_verify(gate_scene.head, _spec(), event_store=store) == _VERDICT
 
@@ -792,17 +885,6 @@ _SHA = 'e' * 40
 _GATE_BIN = f'/gates/{_SHA}/.venv/bin/orchestrator'
 
 
-class _RecordingEvents:
-    def __init__(self) -> None:
-        self.events: list[tuple[Any, dict[str, Any]]] = []
-
-    def emit(self, event_type: Any, *, data: dict[str, Any] | None = None, **_: Any) -> None:
-        self.events.append((event_type, dict(data or {})))
-
-    def of(self, event_type: Any) -> list[dict[str, Any]]:
-        return [data for kind, data in self.events if kind == event_type]
-
-
 _Reply = tuple[int, str, str] | BaseException | Callable[[], Awaitable[tuple[int, str, str]]]
 
 
@@ -814,6 +896,8 @@ class _Scripted:
         self.replies: dict[str, _Reply] = {
             'publish': (0, '', ''),
             'ensure': (0, json.dumps({'built': False, 'identity': identity}), ''),
+            'tag_list': (0, '', ''),
+            'tag_push': (0, '', ''),
             'verify_push': (0, '', ''),
             'delete': (0, '', ''),
             'verify': (0, result_to_json(_VERDICT), ''),
@@ -828,6 +912,10 @@ class _Scripted:
     @staticmethod
     def role(argv: list[str]) -> str:
         plain = without_push_ssh_config(argv)
+        if is_tag_listing(argv):
+            return 'tag_list'
+        if is_tag_push(argv):
+            return 'tag_push'
         if plain[:2] == ['git', 'push']:
             if '--delete' in plain:
                 return 'delete'
@@ -881,19 +969,33 @@ async def test_publish_pushes_the_deployed_sha_by_url_from_the_code_checkout():
 
     await _scripted_runner(transport).run_merge_verify('mergesha', _spec())
 
-    assert transport.roles() == ['publish', 'ensure', 'verify_push', 'verify', 'delete']
+    assert transport.roles() == ['publish', 'ensure', 'tag_list', 'verify_push', 'verify', 'delete']
     _, publish, cwd = transport.calls[0]
     assert publish == [
         'git', *GIT_PUSH_SSH_CONFIG, 'push',
         'leo-laptop:/laptop/dark-factory', f'{_SHA}:refs/gate/{_SHA}',
     ]
     assert cwd == '/dispatcher/checkout'
-    _, verify_push, _ = transport.calls[2]
+    _, verify_push, _ = transport.calls[3]
     assert verify_push[:1 + len(GIT_PUSH_SSH_CONFIG)] == ['git', *GIT_PUSH_SSH_CONFIG]
     ensure = transport.calls[1][1][-1]
     assert ensure.startswith(f'{REMOTE_TOOL_PATH_PRELUDE} env GATE_ROOT=/gates SHA={_SHA} ')
     assert 'SOURCE=/laptop/dark-factory bash -c ' in ensure
-    assert gate_argv_for(transport.calls[3][1][-1])[:3] == ['verify-merge', '--sha', 'mergesha']
+    assert gate_argv_for(transport.calls[4][1][-1])[:3] == ['verify-merge', '--sha', 'mergesha']
+
+
+@pytest.mark.asyncio
+async def test_the_tag_mirror_pushes_to_the_project_remote_on_the_bounded_transport():
+    transport = _Scripted(tag_list=(0, f'{"a" * 40} refs/tags/v1', ''))
+
+    await _scripted_runner(transport).run_merge_verify('mergesha', _spec())
+
+    assert transport.roles() == [
+        'publish', 'ensure', 'tag_list', 'tag_push', 'verify_push', 'verify', 'delete',
+    ]
+    _, tag_push, cwd = transport.calls[3]
+    assert tag_push == ['git', *GIT_PUSH_SSH_CONFIG, 'push', 'leo-laptop', 'refs/tags/*:refs/tags/*']
+    assert cwd == '/project'
 
 
 def gate_argv_for(remote_cmd: str) -> list[str]:
@@ -1219,7 +1321,9 @@ async def test_a_publish_colliding_on_the_gate_ref_is_retried_once():
     result = await _scripted_runner(transport).run_merge_verify('mergesha', _spec())
 
     assert result == _VERDICT
-    assert transport.roles() == ['publish', 'publish', 'ensure', 'verify_push', 'verify', 'delete']
+    assert transport.roles() == [
+        'publish', 'publish', 'ensure', 'tag_list', 'verify_push', 'verify', 'delete',
+    ]
 
 
 @pytest.mark.asyncio
@@ -1404,7 +1508,7 @@ _BROKEN_GATE = (70, '', 'ensure-gate: fresh gate failed its handshake')
 @pytest.mark.asyncio
 async def test_inv2_single_runner_pool_raises_and_takes_no_verdict():
     transport = _Scripted(ensure=_BROKEN_GATE)
-    store = _RecordingEvents()
+    store = RecordingEvents()
     pool = VerifyRunnerPool([_scripted_runner(transport)], event_store=store, task_id='t')
 
     with pytest.raises(RunnerUnavailable) as excinfo:
@@ -1418,7 +1522,7 @@ async def test_inv2_single_runner_pool_raises_and_takes_no_verdict():
 @pytest.mark.asyncio
 async def test_inv2_two_runner_pool_reports_the_bench_and_adopts_local():
     transport = _Scripted(ensure=_BROKEN_GATE)
-    store = _RecordingEvents()
+    store = RecordingEvents()
     benched: list[tuple[str, RunnerUnavailable]] = []
     local = _Local()
     pool = VerifyRunnerPool(
@@ -1438,7 +1542,7 @@ async def test_inv2_two_runner_pool_reports_the_bench_and_adopts_local():
 async def test_inv2_a_built_gate_announces_stale_then_synced_and_its_verdict_is_adopted():
     identity = local_gate_identity(_SHA).to_wire()
     transport = _Scripted(ensure=(0, json.dumps({'built': True, 'identity': identity}), ''))
-    store = _RecordingEvents()
+    store = RecordingEvents()
     pool = VerifyRunnerPool([_scripted_runner(transport), _Local()], event_store=store, task_id='t')
 
     assert await pool.dispatch('mergesha', _spec()) == _VERDICT
@@ -1526,10 +1630,52 @@ def test_the_reaper_leaves_an_unmarked_root_alone(gate_root: Path):
 def test_the_reaper_skips_a_sha_whose_build_lock_is_held(gate_root: Path):
     sha = '4' * 40
     idle = _dir(gate_root, sha, days=30)
-    with open(gate_root / f'.build-{sha}.lock', 'w') as lock:
+    lock_path = gate_root / f'.build-{sha}.lock'
+    with open(lock_path, 'w') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         assert _reap(gate_root).returncode == 0
+        assert lock_path.exists()
+        assert os.fstat(lock.fileno()).st_ino == lock_path.stat().st_ino
     assert idle.exists()
+
+
+def test_a_reaped_sha_leaves_no_build_lock(gate_root: Path):
+    sha = '1' * 40
+    idle = _dir(gate_root, sha, days=8)
+    lock = gate_root / f'.build-{sha}.lock'
+    lock.touch()
+
+    result = _reap(gate_root)
+
+    assert result.returncode == 0, result.stderr
+    assert not idle.exists()
+    assert not lock.exists()
+
+
+# A `flock` that replaces the file on the fd it is handed (its last argument)
+# before locking it: the reaper's open-to-flock window, held open.
+_REPLACING_FLOCK = r"""#!/usr/bin/env bash
+path=$(readlink "/proc/$$/fd/${!#}")
+unlink "$path"
+: > "$path"
+exec "$REAL_FLOCK" "$@"
+"""
+
+
+def test_a_reaper_whose_lock_file_was_replaced_before_it_locked_reaps_nothing(
+    gate_root: Path, tmp_path: Path,
+):
+    sha = '5' * 40
+    idle = _dir(gate_root, sha, days=30)
+    path = _path_with_fake_flock(tmp_path / 'flockbin', _REPLACING_FLOCK, os.environ['PATH'])
+    real_flock = shutil.which('flock')
+    assert real_flock is not None
+
+    result = _reap(gate_root, PATH=path, REAL_FLOCK=real_flock)
+
+    assert result.returncode == 0, result.stderr
+    assert idle.exists()
+    assert (gate_root / f'.build-{sha}.lock').exists()
 
 
 def test_the_reaper_rejects_a_relative_root(gate_root: Path):

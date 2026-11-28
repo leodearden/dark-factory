@@ -2,14 +2,16 @@
 
 :func:`run_post_merge_verify` binds its call once into a
 :class:`_PostMergeVerify` and runs its phases in order: the merge-request
-module boundary, the pre-verify disk guard, task-file derivation and the wire
-spec, the runner pool, dispatch with the ENOSPC and infra-transient retry
+module boundary, the pre-verify disk guard, the merge gate decision (narrow
+or full, docs/narrow-merge-gate.md), task-file derivation and the wire spec,
+the runner pool, dispatch with the ENOSPC and infra-transient retry
 budgets, flake-observation recording, and then exactly one of the land-time
 cross-check of a remote green
 (``orchestrator/src/orchestrator/merge_lane/verify_cross_check.py``), the
 red-verify outcome
 (``orchestrator/src/orchestrator/merge_lane/verify_failure_outcome.py``), or
-the pass tail (the trivial-pass known-red gate and baseline seeding).
+the pass tail (the known-red gate for a verdict that is no whole-tree
+evidence, and baseline seeding).
 """
 from __future__ import annotations
 
@@ -20,7 +22,7 @@ from collections.abc import Callable, Collection
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from orchestrator.event_store import EventStore
+from orchestrator.event_store import EventStore, EventType
 from orchestrator.flake_recorder import record_merge_flake_suppression
 from orchestrator.git_ops import GitOps
 from orchestrator.merge_lane.disposition import MergeFailureDisposition
@@ -40,10 +42,13 @@ from orchestrator.merge_lane.verify_failure_outcome import (
     verify_hit_enospc,
 )
 from orchestrator.merge_verify_facts import MergeVerifyDispatchFacts
+from orchestrator.narrow_gate_class import MergeGateResolution
+from orchestrator.narrow_gate_plan import NarrowGateDecision, planned_commands
 from orchestrator.verify import (
     VerifyResult,
     _derive_task_files_from_git,
     known_failing_ids_on_main,
+    narrow_merge_gate_decision,
     seed_main_baseline,
 )
 from orchestrator.verify_cache.replay import CacheAccess
@@ -74,9 +79,11 @@ main tip whose cached failing-id baseline is known-red (task 2823, gate-hole
 #3/3 of the reify 2026-07-19 red-main incident).
 
 A trivial pass ran NO test suite, so it is no evidence the red cleared; letting
-it CAS-advance main would persist the red. The gate keys strictly on
-``verify.trivial`` — a NON-trivial pass (the full merge suite actually ran on
-the merged tree and passed) legitimately heals a red main and is never blocked.
+it CAS-advance main would persist the red. The gate keys on
+``VerifyResult.is_whole_tree_evidence``, so a narrow gate's pass (task 5411) is
+withheld the same way and its reason names the resolution after this prefix. A
+pass of the full merge suite on the merged tree legitimately heals a red main
+and is never blocked.
 It is a CACHE-ONLY peek (:func:`verify.known_failing_ids_on_main`) that
 never triggers a probe on the critical path (G4, task 2564) and fails OPEN on a
 cold/unknown baseline, matching the task's "known-red" scope. Paired with
@@ -187,6 +194,7 @@ async def run_post_merge_verify(
     main_sha: str | None = None,
     history_leg_command: str | None = None,
     dispatch_facts: MergeVerifyDispatchFacts | None = None,
+    narrow_gate_base: str | None = None,
 ) -> MergeOutcome | None:
     """Run post-merge verification for a single task.
 
@@ -301,6 +309,12 @@ async def run_post_merge_verify(
         dispatch_facts: The ``runner_reason``/``base_relation`` attempt 0's
             ``merge_verify`` row carries; every retry reports it as
             ``retry_held_host`` (``orchestrator/merge_verify_facts.py``).
+        narrow_gate_base: The main sha the merge was built on.  When set and
+            ``narrow_merge_gate`` is enabled, the merge's real tree delta
+            decides its gate (``verify.py::narrow_merge_gate_decision``): a
+            narrow one runs on the local host whatever *runner* is, and the
+            decision is recorded as a ``merge_gate_resolution`` event.
+            ``None`` (default) keeps the full gate and records nothing.
     """
     # THE merge-request boundary resolution (flake-ledger PRD §8.2, task 3787
     # γ), resolved ONCE here so the local runner, the wire spec (and hence the
@@ -326,7 +340,7 @@ async def run_post_merge_verify(
         depth=depth, speculative=speculative, chain_items=chain_items,
         chain_build_ms=chain_build_ms, merge_base_sha=merge_base_sha,
         main_sha=main_sha, history_leg_command=history_leg_command,
-        dispatch_facts=dispatch_facts,
+        dispatch_facts=dispatch_facts, narrow_gate_base=narrow_gate_base,
     ).run()
 
 
@@ -364,6 +378,8 @@ class _PostMergeVerify:
     main_sha: str | None
     history_leg_command: str | None
     dispatch_facts: MergeVerifyDispatchFacts | None
+    narrow_gate_base: str | None
+    gate_decision: NarrowGateDecision | None = None
 
     @property
     def task_id(self) -> str:
@@ -385,6 +401,34 @@ class _PostMergeVerify:
         if disk.reason is not None:
             await self.git_ops.cleanup_merge_worktree(self.merge_wt)
             return MergeOutcome('blocked', reason=disk.reason, verify_skipped=True)
+        return await self._under_gate(await self._merge_gate_decision())._verify()
+
+    async def _merge_gate_decision(self) -> NarrowGateDecision | None:
+        """This merge's gate, decided once; None when the lane asked for none or the gate is off.
+
+        A history-leg re-verify runs only its declared leg, so it is never narrowed.
+        """
+        if (
+            self.narrow_gate_base is None
+            or self.history_leg_command is not None
+            or not self.req.config.narrow_merge_gate.enabled
+        ):
+            return None
+        return await narrow_merge_gate_decision(
+            self.merge_wt, self.req.config, base_sha=self.narrow_gate_base, merge_sha=self.merge_sha,
+        )
+
+    def _under_gate(self, decision: NarrowGateDecision | None) -> _PostMergeVerify:
+        """This verify under *decision*: a narrow gate verifies on the local host, never an injected remote.
+
+        The wire spec carries no narrow plan, so a remote could only run the full gate; and every
+        host-keyed step after dispatch (the lane lease, the retry producer, the cross-check, the red
+        outcome's origin) then sees the verify where it actually ran.
+        """
+        runner = None if _narrow(decision) is not None else self.runner
+        return dataclasses.replace(self, gate_decision=decision, runner=runner)
+
+    async def _verify(self) -> MergeOutcome | None:
         task_files = await self._task_files()
         # Projected from the SAME effective set the LocalRunner receives
         # (INV-5), so the remote's reconstruction of it yields the identical
@@ -399,13 +443,15 @@ class _PostMergeVerify:
         await self._record_observations(attempts)
         # Called with the FINAL VerifyResult (after any retry) so the warm
         # per-test results are always the last-observed verify for this commit.
-        if self.on_result is not None:
+        # A verdict that is no whole-tree evidence leaves the shadow map-less (INV-5).
+        if self.on_result is not None and verify.is_whole_tree_evidence:
             self.on_result(verify)
         remote = self._cross_check_remote(verify)
         if remote is not None:
             verify = await cross_check_remote_green(
                 verify, self._cross_check(spec, task_files, remote),
             )
+        self._record_gate_resolution(verify)
         if not verify.passed:
             await self.git_ops.cleanup_merge_worktree(self.merge_wt)
             return await red_verify_outcome(verify, self._red_verify_context())
@@ -436,17 +482,20 @@ class _PostMergeVerify:
         job).  Both archive under data/verify-logs/<task_id>/ beside the
         task-verify logs for operator triage (task 1920).
 
-        Only the local pool joins the verify-result cache, through the access
-        the verifier holds; the remote arm waits for gamma2 (task 9123).
+        Both join the verify-result cache through the access the verifier
+        holds: the remote ships a view of its registry under the config's
+        modes, and the pool records either's greens (task 9123).
         """
+        access = self.verifier.verify_cache
         if self.runner is not None:
             return VerifyRunnerPool(
                 [self.runner],
                 event_store=self.event_store,
                 task_id=self.task_id,
                 archive_root=self.archive_root,
+                verify_cache_registry=None if access is None else access.registry,
+                verify_cache_modes=None if access is None else self.req.config.verify_cache,
             )
-        access = self.verifier.verify_cache
         return VerifyRunnerPool(
             [self._local_merge_verify_runner(task_files, access)],
             event_store=self.event_store,
@@ -467,13 +516,17 @@ class _PostMergeVerify:
         # emit trivial_pass_escalated.  The merge-flake gate's side-effects are
         # recorded by this call (task ε), off the FlakeSuppression the returned
         # VerifyResult carries.
-        return self._local_runner(task_files, verify_cache=access)
+        return self._local_runner(task_files, verify_cache=access, narrow_gate=_narrow(self.gate_decision))
 
     def _local_runner(
-        self, task_files: tuple[str, ...] | None, *, verify_cache: CacheAccess | None = None,
+        self,
+        task_files: tuple[str, ...] | None,
+        *,
+        verify_cache: CacheAccess | None = None,
+        narrow_gate: NarrowGateDecision | None = None,
     ) -> LocalRunner:
         """The local scoped + unscoped bundle; outside the cache unless given *verify_cache*,
-        so the cross-check's trust anchor always runs."""
+        so the cross-check's trust anchor always runs, and on the full gate unless given *narrow_gate*."""
         return LocalRunner(
             self.merge_wt, self.req.config, self.effective_module_configs, task_files,
             run_scoped=self.verifier.run_scoped,
@@ -482,6 +535,7 @@ class _PostMergeVerify:
             archive_root=self.archive_root,
             event_store=self.event_store,
             verify_cache=verify_cache,
+            narrow_gate=narrow_gate,
         )
 
     def _holds_merge_lane_lease(self) -> bool:
@@ -669,14 +723,14 @@ class _PostMergeVerify:
         """The remote whose green the local trust anchor must re-verify before it lands, if any.
 
         A REMOTE dispatch's REAL-suite green, with
-        verify_cross_check_remote_green on.  A trivial config-only pass ran no
-        suite on either host, so there is nothing to cross-check; it is left
-        to the trivial-pass main-red gate.
+        verify_cross_check_remote_green on.  A verdict that is no whole-tree
+        evidence (a trivial config-only pass, or a narrow gate's) has no full
+        suite to cross-check; it is left to the known-red gate.
         """
         if (
             self.runner is not None
             and verify.passed
-            and not getattr(verify, 'trivial', False)
+            and verify.is_whole_tree_evidence
             and self.req.config.verify_cross_check_remote_green
         ):
             return self.runner
@@ -694,6 +748,29 @@ class _PostMergeVerify:
             record_observation=self._record_observation,
         )
 
+    def _record_gate_resolution(self, verify: VerifyResult) -> None:
+        """Record the gate this verify decided, the gate its final verdict ran, and a narrow verdict's commands.
+
+        The two differ when the narrow plan never reached execution (a workspace-forced merge verify,
+        or a plan the registry runs nothing of): the full gate ran, so no narrow command is recorded.
+        """
+        decision = self.gate_decision
+        if decision is None or self.event_store is None:
+            return
+        miss = decision.miss
+        ran_plan = decision.plan if verify.ran_narrow_gate else None
+        self.event_store.emit(EventType.merge_gate_resolution, task_id=self.task_id, data={
+            'resolution': (MergeGateResolution.FULL if verify.narrow_gate is None else verify.narrow_gate).value,
+            'decided': decision.resolution.value,
+            'miss_reason': None if miss is None else miss.reason.value,
+            'miss_path': None if miss is None else miss.path,
+            'changed_paths': list(decision.changed_paths),
+            'commands': None if ran_plan is None else list(planned_commands(ran_plan)),
+            'passed': verify.passed,
+            'base_sha': self.narrow_gate_base,
+            'merge_sha': self.merge_sha,
+        })
+
     def _red_verify_context(self) -> RedVerifyContext:
         # HOST-AFFINITY (task 2565): recorded, never steered by.  getattr's
         # True default covers a runner-like object that omits is_local.
@@ -708,23 +785,23 @@ class _PostMergeVerify:
         )
 
     async def _pass_outcome(self, verify: VerifyResult) -> MergeOutcome | None:
-        withheld = await self._withheld_trivial_pass(verify)
+        withheld = await self._withheld_partial_pass(verify)
         if withheld is not None:
             return withheld
         self._seed_main_baseline(verify)
         return None
 
-    async def _withheld_trivial_pass(self, verify: VerifyResult) -> MergeOutcome | None:
-        """Refuse to CAS-advance a trivial pass over a KNOWN-red main tip (task 2823).
+    async def _withheld_partial_pass(self, verify: VerifyResult) -> MergeOutcome | None:
+        """Refuse to CAS-advance a pass that is no whole-tree evidence over a KNOWN-red main tip (task 2823).
 
         A config-only merge short-circuits to verify._trivial_pass WITHOUT
-        running any suite, so it is no evidence main is green (the reify
-        2026-07-19 incident).  Keyed strictly on verify.trivial — a NON-trivial
-        pass legitimately heals a red main.  CACHE-ONLY peek, failing OPEN when
-        nothing is known red; getattr's False default treats a result lacking
-        the field as non-trivial (the fail-open direction).
+        running any suite, and a narrow gate (task 5411) runs only its command
+        set, so neither is evidence main is green (the reify 2026-07-19
+        incident).  A whole-tree pass legitimately heals a red main.
+        CACHE-ONLY peek, failing OPEN when nothing is known red.
         """
-        if not getattr(verify, 'trivial', False):
+        resolution = verify.partial_evidence_label
+        if resolution is None:
             return None
         try:
             _pass_main_sha = await self.git_ops.get_main_sha()
@@ -736,13 +813,12 @@ class _PostMergeVerify:
         # A distinct WITHHELD warning, not the ordinary main-red-churn line, so
         # the config-only-fixes-red edge is recognisable (task 2823 amendment).
         logger.warning(
-            'Task %s: trivial-pass main-red gate WITHHELD a config-only '
-            'merge from advancing main %s over a known-red baseline (%d '
-            'failing test(s): %s). A trivial pass runs no suite, so if this '
-            'config-only change is itself the fix it cannot self-heal by '
-            're-dispatch — main must be greened by a code-touching merge or '
-            'operator action first.',
-            self.task_id, _pass_main_sha, len(_known_red_ids),
+            'Task %s: main-red gate WITHHELD a %s pass from advancing main %s '
+            'over a known-red baseline (%d failing test(s): %s). It ran no '
+            'whole-tree suite, so if this change is itself the fix it cannot '
+            'self-heal by re-dispatch — main must be greened by a code-touching '
+            'merge or operator action first.',
+            self.task_id, resolution, _pass_main_sha, len(_known_red_ids),
             ', '.join(sorted(_known_red_ids)[:10]),
         )
         # Any non-None MergeOutcome return owns merge_wt cleanup (the caller
@@ -751,7 +827,7 @@ class _PostMergeVerify:
         return MergeOutcome(
             'blocked',
             reason=(
-                f'{TRIVIAL_PASS_MAIN_RED_REASON_PREFIX} '
+                f'{TRIVIAL_PASS_MAIN_RED_REASON_PREFIX} [{resolution}] '
                 f'(main {_pass_main_sha:.8}, {len(_known_red_ids)} '
                 f'failing test(s)): '
                 + ', '.join(sorted(_known_red_ids)[:10])
@@ -769,7 +845,7 @@ class _PostMergeVerify:
         a rerun plugin's fail-then-pass would otherwise mask a later genuine
         regression of that test — so that anomaly is logged loudly.
         """
-        if not self.merge_sha or verify.failing_test_ids is None:
+        if not self.merge_sha or verify.failing_test_ids is None or not verify.is_whole_tree_evidence:
             return
         if verify.failing_test_ids:
             logger.warning(
@@ -782,6 +858,10 @@ class _PostMergeVerify:
                 ', '.join(sorted(verify.failing_test_ids)), self.merge_sha,
             )
         seed_main_baseline(self.merge_sha, frozenset(), skipped=verify.skipped_test_ids)
+
+
+def _narrow(decision: NarrowGateDecision | None) -> NarrowGateDecision | None:
+    return decision if decision is not None and decision.resolution.is_narrow else None
 
 
 def _infra_transient_red(verify: VerifyResult) -> bool:

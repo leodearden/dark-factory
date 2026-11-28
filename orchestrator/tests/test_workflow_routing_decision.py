@@ -34,11 +34,12 @@ from _orch_helpers import pydantic_spec
 from _recording_event_store import _RecordingEventStore
 from _workflow_helpers import fixed_prompt
 
+import orchestrator.routing
 from orchestrator.agents.invoke import AgentResult
-from orchestrator.agents.roles import IMPLEMENTER
+from orchestrator.agents.roles import ARCHITECT, IMPLEMENTER, AgentRole
 from orchestrator.config import OrchestratorConfig, PriceEntry, RoutingRule, RuleMatch, RuleSet
 from orchestrator.event_store import EventStore, EventType
-from orchestrator.routing import PlanShape, RoutingDecision
+from orchestrator.routing import DispatchedRoute, PlanShape, RoutingDecision
 from orchestrator.workflow import TaskWorkflow
 from orchestrator.workflow_types import WorkflowState
 
@@ -65,7 +66,7 @@ _RUST_RULE = RoutingRule(
 
 def _make_workflow(
     *,
-    event_store: _RecordingEventStore | EventStore,
+    event_store: _RecordingEventStore | EventStore | None,
     cost_store: MagicMock | None = None,
 ) -> TaskWorkflow:
     """Minimal TaskWorkflow instance for ``_invoke`` routing-decision tests.
@@ -73,9 +74,10 @@ def _make_workflow(
     Mirrors ``test_workflow_invocation_end_truthful.py``'s ``_make_workflow``
     (pydantic_spec spec_set MagicMock cfg, patched ``invoke_with_cap_retry`` +
     ``_build_agent_env``), plus concrete cfg.models/budgets/max_turns/effort/
-    timeouts/backends.implementer values — needed here because the
-    routing_decision payload asserts on the actual resolved model/effort/
-    budget_usd/max_turns (a bare MagicMock attribute would satisfy the
+    timeouts/backends values for the implementer, and the same values for the
+    architect (``TestInvokeRecordsPlanShape``'s no-plan case) — needed here
+    because the routing_decision payload asserts on the actual resolved
+    model/effort/budget_usd/max_turns (a bare MagicMock attribute would satisfy the
     precedent test's assertions but not these, and a MagicMock timeout_val
     would blow up the ``'timeout=%.0fs'`` log-format call in ``_invoke``).
     ``scheduler.update_task`` is replaced with an ``AsyncMock`` so the
@@ -116,6 +118,13 @@ def _make_workflow(
     cfg.timeouts.implementer = 1200.0
     cfg.backends.implementer = 'claude'
 
+    cfg.models.architect = 'opus'
+    cfg.budgets.architect = _BUDGET_USD
+    cfg.max_turns.architect = _MAX_TURNS
+    cfg.effort.architect = 'high'
+    cfg.timeouts.architect = 1200.0
+    cfg.backends.architect = 'claude'
+
     cfg.routing.allowed_models = ['haiku', 'sonnet', 'opus']
     cfg.routing.ladder = ['haiku', 'sonnet', 'opus']
     cfg.routing.per_model_daily_ceiling_usd = {}
@@ -155,15 +164,24 @@ def _routing_decision_entries(rec: _RecordingEventStore) -> list[dict]:
     return [entry for (etype, entry) in rec.events if etype == EventType.routing_decision]
 
 
-async def _invoke_implementer(wf: TaskWorkflow, cwd: Path, *, prompt: str = 'x') -> None:
+async def _invoke_role(
+    wf: TaskWorkflow, role: AgentRole, cwd: Path, *, prompt: str = 'x',
+    result: AgentResult | None = None,
+) -> None:
     with (
         patch(
             'orchestrator.workflow.invoke_with_cap_retry',
-            new=AsyncMock(return_value=_stub_agent_result()),
+            new=AsyncMock(return_value=result or _stub_agent_result()),
         ),
         patch.object(wf, '_build_agent_env', return_value=None),
     ):
-        await wf._invoke(IMPLEMENTER, build_prompt=fixed_prompt(prompt), cwd=cwd)
+        await wf._invoke(role, build_prompt=fixed_prompt(prompt), cwd=cwd)
+
+
+async def _invoke_implementer(
+    wf: TaskWorkflow, cwd: Path, *, prompt: str = 'x', result: AgentResult | None = None,
+) -> None:
+    await _invoke_role(wf, IMPLEMENTER, cwd, prompt=prompt, result=result)
 
 
 @pytest.mark.asyncio
@@ -204,6 +222,65 @@ class TestInvokeRecordsRoutingDecisionEvent:
         assert data['model'] == 'opus'
         assert data['source_layer'] == 'policy_rule'
         assert data['rule_id'] == 'rust-large-plan-implementer'
+
+
+def _served_result(model_id: str | None) -> AgentResult:
+    return AgentResult(
+        success=True, output='ok', turns=3, cost_usd=1.0, duration_ms=1_000, model_id=model_id,
+    )
+
+
+@pytest.mark.asyncio
+class TestInvokeRecordsDispatchedRoute:
+    """``_invoke`` records each returned invocation's route on WorkflowMetrics,
+    with no event store (eval cells run without one, task 8499)."""
+
+    async def test_config_route_and_served_model_are_recorded(self, tmp_path: Path) -> None:
+        wf = _make_workflow(event_store=None)
+
+        await _invoke_implementer(wf, tmp_path, result=_served_result('claude-sonnet-5-5'))
+
+        [route] = wf.metrics.dispatched_routes
+        assert isinstance(route, DispatchedRoute)
+        assert route.role_name == 'implementer'
+        assert route.decision.model == 'sonnet'
+        assert route.decision.source_layer == 'config'
+        assert route.decision.rule_id is None
+        assert route.served_model_id == 'claude-sonnet-5-5'
+
+    async def test_record_carries_the_policy_rule_decision_dispatched(
+        self, tmp_path: Path,
+    ) -> None:
+        wf = _make_workflow(event_store=None)
+        wf.modules = ['crates/a', 'crates/b', 'crates/c']
+        wf.plan = {'steps': [{}] * 12}
+
+        await _invoke_implementer(wf, tmp_path, result=_served_result('claude-opus-5-5'))
+
+        [route] = wf.metrics.dispatched_routes
+        assert route.decision.model == 'opus'
+        assert route.decision.source_layer == 'policy_rule'
+        assert route.decision.rule_id == 'rust-large-plan-implementer'
+
+    async def test_invocations_append_in_call_order(self, tmp_path: Path) -> None:
+        wf = _make_workflow(event_store=None)
+
+        await _invoke_implementer(wf, tmp_path, result=_served_result('claude-sonnet-5-5'))
+        await _invoke_role(wf, ARCHITECT, tmp_path, result=_served_result('claude-opus-5-5'))
+
+        assert [(r.role_name, r.decision.model, r.served_model_id)
+                for r in wf.metrics.dispatched_routes] == [
+            ('implementer', 'sonnet', 'claude-sonnet-5-5'),
+            ('architect', 'opus', 'claude-opus-5-5'),
+        ]
+
+    async def test_unreported_served_model_records_none(self, tmp_path: Path) -> None:
+        wf = _make_workflow(event_store=None)
+
+        await _invoke_implementer(wf, tmp_path, result=_served_result(None))
+
+        [route] = wf.metrics.dispatched_routes
+        assert route.served_model_id is None
 
 
 @pytest.mark.asyncio
@@ -567,6 +644,74 @@ class TestRoutingDecisionCarriesWorkflowPhase:
         assert len(ends) == 1, ends
         assert decisions[0]['phase'] == state.value
         assert decisions[0]['phase'] == ends[0]['phase']
+
+
+@pytest.mark.asyncio
+class TestInvokeRecordsPlanShape:
+    """The routing_decision event and the metadata.routing mirror carry the
+    plan shape the resolver saw: step and module counts, null before a plan
+    exists."""
+
+    async def test_implementer_with_a_plan_records_its_shape(self, tmp_path: Path) -> None:
+        rec = _RecordingEventStore()
+        wf = _make_workflow(event_store=rec)
+        wf.plan = {'steps': [{}] * 5}
+        wf.modules = ['a', 'b', 'c']
+
+        await _invoke_implementer(wf, tmp_path)
+
+        (entry,) = _routing_decision_entries(rec)
+        assert (entry['data']['plan_steps'], entry['data']['plan_modules']) == (5, 3)
+        payload = cast(AsyncMock, wf.scheduler.update_task).call_args.args[1]
+        latest = payload['routing']['latest']
+        assert (latest['plan_steps'], latest['plan_modules']) == (5, 3)
+        in_memory = wf.task['metadata']['routing']['latest']
+        assert (in_memory['plan_steps'], in_memory['plan_modules']) == (5, 3)
+
+    async def test_architect_before_a_plan_records_nulls(self, tmp_path: Path) -> None:
+        rec = _RecordingEventStore()
+        wf = _make_workflow(event_store=rec)
+
+        await _invoke_role(wf, ARCHITECT, tmp_path)
+
+        (entry,) = _routing_decision_entries(rec)
+        data = entry['data']
+        assert 'plan_steps' in data and 'plan_modules' in data
+        assert data['plan_steps'] is None
+        assert data['plan_modules'] is None
+
+    async def test_recorded_shape_is_the_one_the_resolver_saw(self, tmp_path: Path) -> None:
+        rec = _RecordingEventStore()
+        wf = _make_workflow(event_store=rec)
+        wf.plan = {'steps': [{}] * 7}
+        wf.modules = ['a', 'b']
+        real_resolve_route = orchestrator.routing.resolve_route
+        seen_shapes: list[PlanShape | None] = []
+
+        def _spy(route_inputs, config):
+            seen_shapes.append(route_inputs.plan_shape)
+            return real_resolve_route(route_inputs, config)
+
+        def _replan_mid_invocation(*_args, **_kwargs) -> AgentResult:
+            wf.plan = {'steps': [{}] * 3}
+            wf.modules = ['c']
+            return _stub_agent_result()
+
+        with (
+            patch('orchestrator.workflow.resolve_route', side_effect=_spy),
+            patch(
+                'orchestrator.workflow.invoke_with_cap_retry',
+                new=AsyncMock(side_effect=_replan_mid_invocation),
+            ),
+            patch.object(wf, '_build_agent_env', return_value=None),
+        ):
+            await wf._invoke(IMPLEMENTER, build_prompt=fixed_prompt('x'), cwd=tmp_path)
+
+        assert seen_shapes == [PlanShape(7, ('a', 'b'))]
+        (entry,) = _routing_decision_entries(rec)
+        assert (entry['data']['plan_steps'], entry['data']['plan_modules']) == (7, 2)
+        latest = wf.task['metadata']['routing']['latest']
+        assert (latest['plan_steps'], latest['plan_modules']) == (7, 2)
 
 
 class TestSelectModelForRoleRetired:

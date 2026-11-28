@@ -31,13 +31,17 @@ from _verify_cache_fixtures import (
     cache_module,
     put_pytest_on_path,
 )
+from shared.testing_virtual_clock import virtual_clock_test
 
 from orchestrator.config import GitConfig, ModuleConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.merge_lane.gates import PostMergePyrightResult
+from orchestrator.narrow_gate_class import GateClassification, MergeGateResolution
+from orchestrator.narrow_gate_plan import NarrowGateDecision
 from orchestrator.verify import VerifyResult, run_scoped_verification
 from orchestrator.verify_cache.registry import registry_db_path
 from orchestrator.verify_evidence import UnitOutcome
+from orchestrator.verify_plan import VerifyPlan
 from orchestrator.verify_runner import (
     CANCEL_PROBE_INTERVAL_SECS,
     GIT_PUSH_SSH_CONFIG,
@@ -110,6 +114,7 @@ class TestVerifyCommand:
             "test_command": "cargo test",
             "lint_command": None,
             "type_check_command": None,
+            "verify_cache": "default",
         }
 
 
@@ -1422,6 +1427,93 @@ class TestLocalRunnerThreadsEventStore:
         assert run_scoped.await_args[1]['event_store'] is None
 
 
+_DOCS_DECISION = NarrowGateDecision(GateClassification(MergeGateResolution.DOCS), VerifyPlan(runs=()), ('docs/x.md',))
+
+
+def _narrow_local_runner(run_scoped: Any, run_unscoped: Any, **narrow: Any) -> LocalRunner:
+    config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
+    config.merge_verify_workspace = False
+    return LocalRunner(
+        merge_wt=MagicMock(), config=config, module_configs=[], task_files=('docs/x.md',),
+        run_scoped=run_scoped, run_unscoped=run_unscoped, **narrow,
+    )
+
+
+@pytest.mark.asyncio
+class TestLocalRunnerNarrowGate:
+    """Task 5411: a narrow decision reaches run_scoped, and its verdict skips the unscoped type-check gate."""
+
+    async def test_a_narrow_verdict_is_returned_without_the_unscoped_gate(self):
+        narrow = _make_pass_result(narrow_gate=MergeGateResolution.DOCS)
+        run_scoped = AsyncMock(return_value=narrow)
+        run_unscoped = AsyncMock()
+        runner = _narrow_local_runner(run_scoped, run_unscoped, narrow_gate=_DOCS_DECISION)
+
+        result = await runner.run_merge_verify('abc123', _make_spec())
+
+        assert run_scoped.await_args is not None
+        assert run_scoped.await_args.kwargs['narrow_gate'] is _DOCS_DECISION
+        assert result is narrow
+        run_unscoped.assert_not_awaited()
+
+    async def test_without_a_decision_run_scoped_gets_no_narrow_keyword(self):
+        run_scoped = AsyncMock(return_value=_make_pass_result())
+        run_unscoped = AsyncMock(return_value=MagicMock(broken=False, timed_out=False))
+        runner = _narrow_local_runner(run_scoped, run_unscoped)
+
+        await runner.run_merge_verify('abc123', _make_spec())
+
+        assert run_scoped.await_args is not None
+        assert 'narrow_gate' not in run_scoped.await_args.kwargs
+        run_unscoped.assert_awaited_once()
+
+    async def test_a_red_narrow_verdict_still_meets_the_flake_gate(self):
+        from orchestrator import verify as verify_module
+
+        red = _make_fail_result(narrow_gate=MergeGateResolution.DOCS)
+        still_red = _make_fail_result(narrow_gate=MergeGateResolution.DOCS, summary='still red')
+        seen: list[VerifyResult] = []
+
+        async def suppress(result: VerifyResult, **_kwargs: Any) -> VerifyResult:
+            seen.append(result)
+            return still_red
+
+        run_unscoped = AsyncMock()
+        runner = _narrow_local_runner(AsyncMock(return_value=red), run_unscoped, narrow_gate=_DOCS_DECISION)
+
+        with patch.object(verify_module, 'apply_merge_flake_suppression', suppress):
+            result = await runner.run_merge_verify('abc123', _make_spec())
+
+        assert seen == [red]
+        assert result is still_red
+        run_unscoped.assert_not_awaited()
+
+    async def test_a_full_stamped_verdict_still_meets_the_unscoped_gate(self):
+        full_stamped = _make_pass_result()
+        full_stamped.narrow_gate = MergeGateResolution.FULL
+        run_scoped = AsyncMock(return_value=full_stamped)
+        run_unscoped = AsyncMock(return_value=MagicMock(broken=False, timed_out=False))
+        runner = _narrow_local_runner(run_scoped, run_unscoped, narrow_gate=_DOCS_DECISION)
+
+        await runner.run_merge_verify('abc123', _make_spec())
+
+        run_unscoped.assert_awaited_once()
+
+
+def test_a_narrow_verdict_round_trips_the_wire_codec():
+    decoded = result_from_json(result_to_json(_make_pass_result(narrow_gate=MergeGateResolution.COMMENTS)))
+
+    assert decoded.narrow_gate is MergeGateResolution.COMMENTS
+
+
+def test_a_full_gate_stamp_is_refused_at_decode():
+    payload = json.loads(result_to_json(_make_pass_result()))
+    payload['narrow_gate'] = 'full_gate'
+
+    with pytest.raises(ValueError, match='full_gate'):
+        result_from_json(json.dumps(payload))
+
+
 # ---------------------------------------------------------------------------
 # Step-5: VerifyRunnerPool.dispatch
 # ---------------------------------------------------------------------------
@@ -2228,6 +2320,8 @@ class TestBuildMergeVerifySpec:
         # attr is non-None and truthy, so it would flag every mock module.
         mc.scope_cargo = scope_cargo
         mc.verify_env = None
+        # Task 9123: VerifyCommand carries (and checks) the module's verify_cache.
+        mc.verify_cache = 'default'
         return mc
 
     def _make_config(
@@ -2617,7 +2711,7 @@ class TestRunMergeVerifyOnWorktree:
             run_scoped=run_scoped, run_unscoped=run_unscoped,
         )
 
-        assert result is pass_result
+        assert result == pass_result
 
     async def test_module_configs_reconstructed_from_spec(self):
         """run_scoped is called with module_configs reconstructed from spec."""
@@ -3436,7 +3530,7 @@ class TestRunMergeVerifyOnWorktreeDefaults:
 
         fake_scoped.assert_awaited_once()
         fake_unscoped.assert_awaited_once()
-        assert result is pass_result
+        assert result == pass_result
 
 
 # ---------------------------------------------------------------------------
@@ -8044,7 +8138,6 @@ async def _open_hangs():
     return (0, '', '')
 
 
-@pytest.mark.asyncio
 class TestRemoteRunnerEnvProbeRun:
     """``await env_probe_run()`` opens (or reuses) a multiplexed ssh master,
     then returns a capture_env_fingerprint-compatible adapter whose probes
@@ -8052,27 +8145,29 @@ class TestRemoteRunnerEnvProbeRun:
     REMOTE_TOOL_PATH_PRELUDE (task 7097) so the non-login ssh shell finds
     ~/.local/bin tools the way RemoteRunner's own `uv sync` does."""
 
-    def _make_runner(self, *, responses=None, delay=0.0, open_reply=None):
+    @staticmethod
+    def _runner_over(run):
+        return gated_remote_runner(
+            name='laptop',
+            ssh_host='laptop.local',
+            git_remote='origin',
+            cwd='/repo',
+            run=run,
+        )
+
+    def _make_runner(self, *, responses=None, open_reply=None):
         calls = []
         queue = list(responses or [])
 
         async def fake_run(argv, *, cwd=None):
             calls.append(argv[:])
-            await asyncio.sleep(delay)
             if argv[-1] == 'true':
                 return await open_reply() if open_reply is not None else (0, '', '')
             if queue:
                 return queue.pop(0)
             return (0, 'ok\n', '')
 
-        runner = gated_remote_runner(
-            name='laptop',
-            ssh_host='laptop.local',
-            git_remote='origin',
-            cwd='/repo',
-            run=fake_run,
-        )
-        return runner, calls
+        return self._runner_over(fake_run), calls
 
     @staticmethod
     def _probe_opts():
@@ -8084,6 +8179,7 @@ class TestRemoteRunnerEnvProbeRun:
             '-o', 'ControlPath=~/.df-env-probe-%C',
         ]
 
+    @pytest.mark.asyncio
     async def test_opens_the_probe_master_then_probes_over_it(self):
         """The probe-only option set is spelled literally; the open is a bare `true`."""
         from orchestrator import verify_runner as vr
@@ -8098,6 +8194,7 @@ class TestRemoteRunnerEnvProbeRun:
             ['ssh', *opts, 'laptop.local', f'{vr.REMOTE_TOOL_PATH_PRELUDE} uv --version'],
         ]
 
+    @pytest.mark.asyncio
     async def test_one_open_serves_every_probe_of_an_adapter(self):
         runner, calls = self._make_runner()
         adapter = await runner.env_probe_run()
@@ -8109,18 +8206,28 @@ class TestRemoteRunnerEnvProbeRun:
         assert remote_cmds[0] == 'true'
         assert len(remote_cmds) == 4
 
+    @pytest.mark.timing(reason='the per-call ssh probe budget is the behaviour under test; the blocking stall is deliberate')
+    @virtual_clock_test
     async def test_master_establishment_does_not_eat_the_first_probes_budget(self, monkeypatch):
-        """Open and first probe are bounded separately: 0.6s + 0.6s under a 1.0s bound
-        each passes, where one shared budget would have timed the probe out.  A sleep
-        never ends early, so only the 0.4s per-call headroom is load-sensitive."""
+        """The open and the first probe each spend 0.6s under their own 1.0s bound,
+        where one shared budget would have timed the probe out.  The blocking sleep
+        inside the open is a host stall, not a slow server."""
         from orchestrator import verify_runner as vr
         monkeypatch.setattr(vr, '_SSH_PROBE_TIMEOUT_SECS', 1.0)
 
-        runner, _ = self._make_runner(responses=[(0, 'uv 0.11.6\n', '')], delay=0.6)
-        adapter = await runner.env_probe_run()
+        async def slow_ssh(argv, *, cwd=None):
+            if argv[-1] == 'true':
+                time.sleep(0.5)
+                await asyncio.sleep(0.6)
+                return (0, '', '')
+            await asyncio.sleep(0.6)
+            return (0, 'uv 0.11.6\n', '')
+
+        adapter = await self._runner_over(slow_ssh).env_probe_run()
 
         assert await adapter(['uv', '--version']) == (0, 'uv 0.11.6\n', '')
 
+    @pytest.mark.asyncio
     async def test_a_hung_open_raises_runner_unavailable_and_issues_no_probe(self, monkeypatch):
         from orchestrator import verify_runner as vr
         monkeypatch.setattr(vr, '_SSH_PROBE_TIMEOUT_SECS', 0.05)
@@ -8139,6 +8246,7 @@ class TestRemoteRunnerEnvProbeRun:
             pytest.param(_open_cannot_spawn_ssh, id='ssh_spawn_oserror'),
         ],
     )
+    @pytest.mark.asyncio
     async def test_open_transport_failures_are_runner_unavailable(self, open_reply):
         from orchestrator.verify_runner import RunnerUnavailable
 
@@ -8147,6 +8255,7 @@ class TestRemoteRunnerEnvProbeRun:
             await runner.env_probe_run()
         assert len(calls) == 1
 
+    @pytest.mark.asyncio
     async def test_remote_command_leads_with_the_unquoted_path_prelude(self):
         """Task 7097: a non-login ssh shell lacks ~/.local/bin, so a bare
         `uv --version` exits 127 on a host where uv IS installed — a false
@@ -8164,12 +8273,14 @@ class TestRemoteRunnerEnvProbeRun:
         assert '$HOME/.local/bin' in remote_cmd
         assert remote_cmd.removeprefix(f'{REMOTE_TOOL_PATH_PRELUDE} ') == "sh -c 'echo a b'"
 
+    @pytest.mark.asyncio
     async def test_returns_run_result_tuple_unchanged(self):
         """(rc, stdout, stderr) passes through — satisfies capture's run contract."""
         runner, _ = self._make_runner(responses=[(0, 'uv 0.10.6\n', 'warn')])
         adapter = await runner.env_probe_run()
         assert await adapter(['uv', '--version']) == (0, 'uv 0.10.6\n', 'warn')
 
+    @pytest.mark.asyncio
     async def test_argv_elements_are_shlex_quoted(self):
         """An argv element needing quoting is quoted into the remote command string."""
         from orchestrator.verify_runner import REMOTE_TOOL_PATH_PRELUDE
@@ -8180,6 +8291,7 @@ class TestRemoteRunnerEnvProbeRun:
 
         assert calls[-1][-1] == f"{REMOTE_TOOL_PATH_PRELUDE} sh -c 'echo a b'"
 
+    @pytest.mark.asyncio
     async def test_capture_env_fingerprint_drives_probes_over_ssh(self):
         """End-to-end: capture_env_fingerprint(adapter) populates extra_probes."""
         from orchestrator.verify_runner import REMOTE_TOOL_PATH_PRELUDE, capture_env_fingerprint
@@ -8203,6 +8315,7 @@ class TestRemoteRunnerEnvProbeRun:
         assert calls[-2][-1] == f'{REMOTE_TOOL_PATH_PRELUDE} npx pyright --version'
         assert calls[-1][-1] == f'{REMOTE_TOOL_PATH_PRELUDE} uv --version'
 
+    @pytest.mark.asyncio
     async def test_check_env_opens_one_master_then_one_ssh_per_declared_probe(self):
         """Through DriftDetector.check_env and a REAL RemoteRunner: the remote
         side costs one handshake, not one per probe."""

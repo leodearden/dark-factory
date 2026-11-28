@@ -7,7 +7,7 @@ constants below, in T3 Code v0.1.6's shapes (``~/src/t3code-v0.1.6``):
 ``packages/contracts/src/project.ts::Project``,
 ``apps/server/src/mcp/toolkits/project/tools.ts`` (``t3_project_list``,
 ``t3_thread_launch``) and ``packages/contracts/src/orchestratorMcp.ts`` (the
-thread list, read and wait results).
+thread list, read and wait results, and ``orchestrator_capabilities``).
 """
 
 from __future__ import annotations
@@ -25,6 +25,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from unittest.mock import ANY
+from urllib.parse import unquote
 
 import pytest
 from _fake_t3_server import (
@@ -122,6 +123,33 @@ THREAD_READ_JSON: dict[str, Any] = {
 """``t3_thread_read``'s ``OrchestratorMcpThreadReadResult``
 (``packages/contracts/src/orchestratorMcp.ts``, the detail abridged); :func:`thread_read` varies it."""
 
+HAIKU_CAPABILITY: dict[str, Any] = {
+    'id': 'claude-haiku-4-5',
+    'options': [{'id': 'effort', 'values': ['low', 'medium', 'high'], 'default': 'high'}],
+}
+
+CAPABILITIES_JSON: dict[str, Any] = {
+    'parentThreadId': None,
+    'inheritedProviderInstanceId': None,
+    'inheritedModel': None,
+    'runtimeMode': 'full-access',
+    'interactionMode': 'default',
+    'providers': [
+        {
+            'providerInstanceId': 'claude-proxy',
+            'driverKind': 'claudeAgent',
+            'displayName': None,
+            'models': [HAIKU_CAPABILITY],
+            'canRunChildTask': True,
+            'canRunCrossProviderChildTask': True,
+            'constraints': [],
+        }
+    ],
+    'features': {'threadManagement': True, 'maxBatchThreads': 8},
+}
+"""``orchestrator_capabilities``' ``OrchestratorMcpCapabilitiesResult`` (features abridged);
+:func:`capabilities_with` varies its one provider's models."""
+
 SERVER_RUNTIME_JSON: dict[str, Any] = {
     'version': 1,
     'pid': 881190,
@@ -142,6 +170,13 @@ def waited(*, timed_out: bool, status: str = 'running') -> ToolSuccess:
 def thread_read(**thread: Any) -> ToolSuccess:
     """``t3_thread_read``'s reply with the thread's ``status``, ``archived`` or ``latestRunId`` overridden."""
     return ToolSuccess({**THREAD_READ_JSON, 'thread': {**THREAD_READ_JSON['thread'], **thread}})
+
+
+def capabilities_with(*models: dict[str, Any]) -> ToolSuccess:
+    """``orchestrator_capabilities``' reply listing *models* on its only provider."""
+    [provider] = CAPABILITIES_JSON['providers']
+    listed = {**provider, 'models': list(models)}
+    return ToolSuccess({**CAPABILITIES_JSON, 'providers': [listed]})
 
 
 def project(root: Path | str, **overrides: Any) -> dict[str, Any]:
@@ -252,6 +287,12 @@ def run_verb(capsys: pytest.CaptureFixture[str], *argv: str) -> str:
     return out.strip()
 
 
+def verdict_tokens(line: str) -> tuple[str, dict[str, str]]:
+    """A verdict line's status word and its decoded ``key=value`` tokens."""
+    word, *tokens = line.split()
+    return word, {key: unquote(value) for key, _, value in (token.partition('=') for token in tokens)}
+
+
 def spawn_record(env: Env, slug: str = 'unblock-df-7489-4242') -> str:
     """A spawn's launching record, with the result file ``_run_launching`` gives every spawn."""
     record_dir = session_records.record_path_for_slug(slug, root=env.fleet).parent
@@ -317,6 +358,16 @@ def launch_line(
 def sent_launch(server: FakeT3Server) -> dict[str, Any]:
     [arguments] = server.tool_calls('t3_thread_launch')
     return arguments
+
+
+def echoing_launch() -> ToolResponder:
+    """``t3_thread_launch`` answering with the ``modelSelection`` it was sent, as v0.1.6 stores and echoes it."""
+
+    def respond(arguments: Mapping[str, Any]) -> ToolSuccess:
+        sent = arguments.get('modelSelection', THREAD_LAUNCH_JSON['modelSelection'])
+        return ToolSuccess({**THREAD_LAUNCH_JSON, 'modelSelection': sent})
+
+    return respond
 
 
 PROXY_SETTINGS: dict[str, Any] = {
@@ -603,6 +654,82 @@ class TestLaunch:
         assert line.startswith('started ')
         assert sent_launch(t3)['modelSelection'] == {'instanceId': 'claude-proxy', 'model': 'fable'}
 
+    @pytest.mark.parametrize('level', ['low', 'medium', 'high', 'xhigh', 'max'])
+    def test_an_effort_rides_in_the_model_selection_as_its_effort_option(
+        self, env: Env, t3: FakeT3Server, tmp_path: Path, capsys: pytest.CaptureFixture[str], level: str
+    ) -> None:
+        write_settings(env, PROXY_SETTINGS)
+        t3.tool_replies['t3_thread_launch'] = echoing_launch()
+
+        line = launch_line(capsys, tmp_path, env.project, '--model', 'fable', '--effort', level)
+
+        assert line.split()[0] == 'started'
+        assert sent_launch(t3)['modelSelection'] == {
+            'instanceId': 'claude-proxy',
+            'model': 'fable',
+            'options': [{'id': 'effort', 'value': level}],
+        }
+
+    def test_an_effort_outside_the_closed_set_is_rejected_by_the_verbs_parser(
+        self, env: Env, t3: FakeT3Server, tmp_path: Path
+    ) -> None:
+        argv = [
+            'launch', '--cwd', str(env.project), '--title', 't', '--prompt-file', prompt_file(tmp_path, 'p'),
+            '--record', '', '--model', 'fable', '--effort', 'turbo',
+        ]
+
+        with pytest.raises(SystemExit) as exited:
+            lane.main(argv)
+
+        assert exited.value.code == 2
+        assert t3.tool_calls('t3_thread_launch') == []
+
+    @pytest.mark.parametrize(
+        ('reply', 'got'),
+        [
+            (
+                ToolSuccess({
+                    **THREAD_LAUNCH_JSON,
+                    'modelSelection': {
+                        'instanceId': 'claude-proxy', 'model': 'fable', 'options': [{'id': 'effort', 'value': 'high'}],
+                    },
+                }),
+                'high',
+            ),
+            (ToolSuccess(THREAD_LAUNCH_JSON), 'none'),
+        ],
+        ids=['another-effort', 'no-options'],
+    )
+    def test_a_thread_launched_without_the_asked_effort_is_effort_unconfirmed_and_still_stamped(
+        self, env: Env, t3: FakeT3Server, tmp_path: Path, capsys: pytest.CaptureFixture[str],
+        reply: ToolSuccess, got: str,
+    ) -> None:
+        write_settings(env, PROXY_SETTINGS)
+        t3.tool_replies['t3_thread_launch'] = reply
+        record_dir = spawn_record(env)
+
+        line = launch_line(capsys, tmp_path, env.project, '--model', 'fable', '--effort', 'xhigh', record=record_dir)
+
+        word, fields = verdict_tokens(line)
+        assert (word, fields['thread_id'], fields['asked'], fields['got']) == (
+            'effort-unconfirmed', THREAD_ID, 'xhigh', got
+        )
+        record = session_records.read_record(Path(record_dir).name, root=env.fleet)
+        assert record.status == session_records.Status.RUNNING
+        assert record.display is not None and record.display.t3_thread_id == THREAD_ID
+
+    def test_a_thread_launched_with_the_asked_effort_is_started(
+        self, env: Env, t3: FakeT3Server, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        write_settings(env, PROXY_SETTINGS)
+        t3.tool_replies['t3_thread_launch'] = echoing_launch()
+
+        line = launch_line(
+            capsys, tmp_path, env.project, '--model', 'fable', '--effort', 'xhigh', record=spawn_record(env)
+        )
+
+        assert line == f'started thread_id={THREAD_ID} project_id={PROJECT_ID} run_id={RUN_ID}'
+
     def test_a_disabled_explicit_instance_is_refused_before_any_start(
         self, env: Env, t3: FakeT3Server, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
@@ -769,6 +896,73 @@ class TestLaunch:
             assert spill.read_text() == big
         finally:
             spill.unlink()
+
+
+class TestEffortVet:
+    """``launch --effort`` checks the level against T3's ``orchestrator_capabilities`` before any thread starts.
+
+    Which catalogue entries name which levels is ``test_spawn_effort.py``'s.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _proxy_host(self, env: Env, t3: FakeT3Server) -> None:
+        write_settings(env, PROXY_SETTINGS)
+        t3.tool_replies['t3_thread_launch'] = echoing_launch()
+        t3.tool_replies['orchestrator_capabilities'] = ToolSuccess(CAPABILITIES_JSON)
+
+    def test_a_level_t3_does_not_offer_for_the_model_is_launch_failed_without_a_launch(
+        self, env: Env, t3: FakeT3Server, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        line = launch_line(capsys, tmp_path, env.project, '--model', 'claude-haiku-4-5', '--effort', 'max')
+
+        word, fields = verdict_tokens(line)
+        assert word == 'launch-failed'
+        assert all(name in fields['detail'] for name in ('low, medium, high', 'claude-haiku-4-5', 'claude-proxy'))
+        assert t3.tool_calls('t3_thread_launch') == []
+        assert [call.get('search') for call in t3.tool_calls('orchestrator_capabilities')] == ['claude-haiku-4-5']
+
+    def test_a_level_t3_offers_for_the_model_is_started(
+        self, env: Env, t3: FakeT3Server, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        line = launch_line(capsys, tmp_path, env.project, '--model', 'claude-haiku-4-5', '--effort', 'high')
+
+        assert line.split()[0] == 'started'
+        assert sent_launch(t3)['modelSelection']['options'] == [{'id': 'effort', 'value': 'high'}]
+
+    @pytest.mark.parametrize(
+        'capabilities',
+        [
+            None,
+            ToolFailure('orchestration_error', 'the provider catalogue is unavailable'),
+            capabilities_with(),
+        ],
+        ids=['not-served', 'tool-failure', 'no-levels-listed'],
+    )
+    def test_an_unverifiable_level_still_launches_with_its_effort_option_and_one_warning(
+        self, env: Env, t3: FakeT3Server, tmp_path: Path, capsys: pytest.CaptureFixture[str],
+        caplog: pytest.LogCaptureFixture, capabilities: ToolSuccess | ToolFailure | None,
+    ) -> None:
+        if capabilities is None:
+            del t3.tool_replies['orchestrator_capabilities']
+        else:
+            t3.tool_replies['orchestrator_capabilities'] = capabilities
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.spawn_t3_lane'):
+            line = launch_line(capsys, tmp_path, env.project, '--model', 'claude-haiku-4-5', '--effort', 'max')
+
+        assert line.split()[0] == 'started'
+        assert sent_launch(t3)['modelSelection']['options'] == [{'id': 'effort', 'value': 'max'}]
+        unverified = [record.getMessage() for record in caplog.records if 'unverified' in record.getMessage()]
+        assert len(unverified) == 1 and unverified[0].startswith('effort max is unverified')
+
+    def test_an_effort_without_a_model_is_refused_without_a_launch(
+        self, env: Env, t3: FakeT3Server, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        line = launch_line(capsys, tmp_path, env.project, '--effort', 'xhigh')
+
+        word, fields = verdict_tokens(line)
+        assert (word, fields['reason']) == ('refused', 'effort-needs-model')
+        assert t3.tool_calls('t3_thread_launch') == []
 
 
 @dataclass

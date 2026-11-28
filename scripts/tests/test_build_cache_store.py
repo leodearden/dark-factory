@@ -13,13 +13,11 @@ user manager, ~/.config, ~/.cache or ports 4226/4227.
 from __future__ import annotations
 
 import base64
-import contextlib
 import http.client
 import json
 import os
 import shlex
 import shutil
-import signal
 import socket
 import subprocess
 import sys
@@ -34,8 +32,16 @@ from typing import Any
 
 import pytest
 from cli_subprocess_timeout import cli_timeout_from_env
+from fake_user_systemctl_state import (
+    calls_log,
+    enabled_marker,
+    kill_all_units,
+    log_file,
+    unit_pid,
+)
 from laptop_battery_guard_fixtures import write_shims
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+from socket_activation import socket_activated
 
 pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
@@ -67,6 +73,16 @@ if [ "${1:-}" = --user ] && [ "${2:-}" = show ]; then
   printf '%s\\n' "${FAKE_RCLONE_PID:-0}"
 fi
 exit "${FAKE_SYSTEMCTL_RC:-0}"
+"""
+
+_SIGHUP_RECORDER = """\
+import os, signal, sys, threading
+signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGHUP})
+threading.Thread(target=lambda: (sys.stdin.read(), os._exit(0)), daemon=True).start()
+os.write(1, b'ready\\n')
+while True:
+    signal.sigwait({signal.SIGHUP})
+    os.write(1, b'hup\\n')
 """
 
 
@@ -155,23 +171,40 @@ def http_request(
         return err.code, b""
 
 
-def wait_for_http(url: str, deadline_secs: float = 15.0) -> None:
+def log_tail(log: Path, lines: int = 20) -> str:
+    return "\n".join(log.read_text(errors="replace").splitlines()[-lines:])
+
+
+def wait_until_serving(
+    server: subprocess.Popen[bytes], url: str, log: Path, deadline_secs: float = 15.0
+) -> None:
+    """Return once anything answers HTTP at url; fail at once if server exits first."""
     deadline = time.monotonic() + deadline_secs
     while time.monotonic() < deadline:
+        if server.poll() is not None:
+            raise AssertionError(
+                f"server exited with code {server.returncode} before answering at {url};"
+                f" {log} ends:\n{log_tail(log)}"
+            )
         try:
             http_request("GET", url)
             return
         except (urllib.error.URLError, ConnectionError, TimeoutError):
             time.sleep(0.1)
-    raise AssertionError(f"nothing answered at {url} within {deadline_secs}s")
+    raise AssertionError(
+        f"nothing answered at {url} within {deadline_secs}s; {log} ends:\n{log_tail(log)}"
+    )
 
 
 @pytest.fixture
 def private_rclone(
     world: PrunerWorld, tmp_path: Path
 ) -> Iterator[tuple[subprocess.Popen[bytes], str, tuple[str, str]]]:
-    """A real rclone serving the pruner world's store on a private loopback port."""
-    port = free_port()
+    """A real rclone serving the pruner world's store on a private loopback port.
+
+    The test binds the port and hands it to rclone as a socket-activated
+    listener, so no other process can take it before rclone serves on it.
+    """
     auth = ("tester", "secret-for-tests")
     env = {
         **os.environ,
@@ -179,21 +212,18 @@ def private_rclone(
         "RCLONE_USER": auth[0],
         "RCLONE_PASS": auth[1],
     }
-    with (tmp_path / "rclone.log").open("wb") as log:
-        proc = subprocess.Popen(
-            ["rclone", "serve", "webdav", str(world.store), "--addr", f"127.0.0.1:{port}"],
+    log_path = tmp_path / "rclone.log"
+    with (
+        log_path.open("wb") as log,
+        socket_activated(
+            lambda port: ["rclone", "serve", "webdav", str(world.store), "--addr", f"127.0.0.1:{port}"],
             env=env,
-            stdout=log,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
-        )
-    try:
+            output=log,
+        ) as (proc, port),
+    ):
         base = f"http://127.0.0.1:{port}"
-        wait_for_http(base + "/")
+        wait_until_serving(proc, base + "/", log_path)
         yield proc, base, auth
-    finally:
-        proc.kill()
-        proc.wait(timeout=10)
 
 
 class TestPrune:
@@ -236,6 +266,16 @@ class TestPrune:
         assert report["skipped_young"] == 1
         assert report["over_cap"] is True
         assert report["remaining_bytes"] == 1000
+
+    def test_min_age_secs_zero_makes_a_minute_old_file_eligible(
+        self, world: PrunerWorld
+    ) -> None:
+        path = put_object(world.store, "abc-fresh", 100, mtime_age=60)
+        code, report = world.prune("--min-age-secs", "0", cap=0)
+        assert code == 0
+        assert not path.exists()
+        assert report["removed"] == 1
+        assert report["skipped_young"] == 0
 
     def test_directories_are_never_removed(self, world: PrunerWorld) -> None:
         emptied = put_object(world.store, "abc-one", 100, mtime_age=DAY).parent
@@ -283,42 +323,24 @@ class TestPrune:
             f"--user show -p MainPID --value {STORE_UNIT}"
         ]
 
-    def test_signals_the_store_units_main_pid_once(
-        self, world: PrunerWorld, tmp_path: Path
-    ) -> None:
-        hups = tmp_path / "hups"
-        ready = tmp_path / "ready"
-        listener = subprocess.Popen(
-            [
-                sys.executable,
-                "-I",
-                "-c",
-                "import signal, sys, time\n"
-                "hups, ready = sys.argv[1], sys.argv[2]\n"
-                "signal.signal(signal.SIGHUP, lambda *_: open(hups, 'a').write('hup\\n'))\n"
-                "open(ready, 'w').close()\n"
-                "time.sleep(60)\n",
-                str(hups),
-                str(ready),
-            ]
-        )
-        try:
-            deadline = time.monotonic() + 10
-            while not ready.exists() and time.monotonic() < deadline:
-                time.sleep(0.05)
-            for key in ("abc-1", "abd-2", "abe-3"):
-                put_object(world.store, key, 100, mtime_age=3 * DAY)
+    def test_signals_the_store_units_main_pid_once(self, world: PrunerWorld) -> None:
+        for key in ("abc-1", "abd-2", "abe-3"):
+            put_object(world.store, key, 100, mtime_age=3 * DAY)
+        with subprocess.Popen(
+            [sys.executable, "-I", "-c", _SIGHUP_RECORDER],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+        ) as listener:
+            assert listener.stdin is not None
+            assert listener.stdout is not None
+            assert listener.stdout.readline() == b"ready\n"
             code, report = world.prune(cap=0, rclone_pid=listener.pid)
-            deadline = time.monotonic() + 5
-            while not hups.exists() and time.monotonic() < deadline:
-                time.sleep(0.05)
-        finally:
-            listener.kill()
-            listener.wait(timeout=10)
-        assert code == 0
-        assert report["removed"] == 3
-        assert report["signalled"] == listener.pid
-        assert hups.read_text() == "hup\n"
+            assert code == 0
+            assert report["removed"] == 3
+            assert report["signalled"] == listener.pid
+            assert listener.stdout.readline() == b"hup\n"
+            listener.stdin.close()
+            assert listener.stdout.read() == b""
 
     def test_systemctl_failure_exits_one_and_removes_nothing(
         self, world: PrunerWorld
@@ -425,6 +447,14 @@ class StoreWorld:
             timeout=2 * CLI_TIMEOUT,
         )
 
+    def install_report(self, proc: subprocess.CompletedProcess[str]) -> str:
+        """The installer's output, then the tail of the store unit's log when it has one."""
+        report = proc.stdout + proc.stderr
+        store_log = log_file(self.state, STORE_UNIT)
+        if store_log.exists():
+            report += f"\n--- {store_log} ends:\n{log_tail(store_log)}"
+        return report
+
     def credentials(self) -> dict[str, str]:
         pairs = (line.partition("=") for line in self.credentials_file.read_text().splitlines())
         return {name: value for name, sep, value in pairs if sep}
@@ -446,7 +476,7 @@ class StoreWorld:
         return shlex.split(lines[0])
 
     def systemctl_calls(self) -> list[list[str]]:
-        log = self.state / "systemctl.log"
+        log = calls_log(self.state)
         if not log.exists():
             return []
         return [json.loads(line) for line in log.read_text().splitlines()]
@@ -457,15 +487,13 @@ class StoreWorld:
         ]
 
     def store_pid(self) -> int:
-        return int((self.state / f"{STORE_UNIT}.pid").read_text())
+        return unit_pid(self.state, STORE_UNIT)
 
     def is_enabled(self, unit: str) -> bool:
-        return (self.state / f"{unit}.enabled").exists()
+        return enabled_marker(self.state, unit).exists()
 
     def kill_services(self) -> None:
-        for pid_file in self.state.glob("*.pid"):
-            with contextlib.suppress(ProcessLookupError, ValueError):
-                os.killpg(int(pid_file.read_text()), signal.SIGKILL)
+        kill_all_units(self.state)
 
 
 TMPFS = Path("/dev/shm")
@@ -474,11 +502,9 @@ TMPFS = Path("/dev/shm")
 def tmpfs_scratch_root() -> Path | None:
     """A fresh directory on a writable, exec-allowed tmpfs, or None.
 
-    An install pre-creates 4,368 store directories. On the loaded workstation's
-    ext4 that one mkdir took 26-36s (measured 2026-11-19, load average ~130),
-    which pushed installs in the full suite past their timeout; tmpfs takes 0.1s.
-    None sends the world back to tmp_path: the landlock agent sandbox, for one,
-    cannot create entries under /dev (task 7711).
+    An install pre-creates 4,368 store directories, which is slow on a loaded
+    disk. None sends the world back to tmp_path: the landlock agent sandbox,
+    for one, cannot create entries under /dev (task 7711).
     """
     try:
         if os.statvfs(TMPFS).f_flag & (os.ST_NOEXEC | os.ST_RDONLY):
@@ -503,7 +529,7 @@ def store_world(tmp_path: Path) -> Iterator[StoreWorld]:
 @pytest.fixture
 def installed(store_world: StoreWorld) -> StoreWorld:
     proc = store_world.install()
-    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.returncode == 0, store_world.install_report(proc)
     return store_world
 
 
@@ -571,7 +597,7 @@ class TestStoreInstall:
 
     def test_check_after_apply_passes(self, installed: StoreWorld) -> None:
         proc = installed.install("--check")
-        assert proc.returncode == 0, proc.stdout + proc.stderr
+        assert proc.returncode == 0, installed.install_report(proc)
 
     def test_reapply_changes_nothing_and_keeps_the_store_running(
         self, installed: StoreWorld
@@ -583,12 +609,38 @@ class TestStoreInstall:
 
         proc = installed.install()
 
-        assert proc.returncode == 0, proc.stdout + proc.stderr
+        assert proc.returncode == 0, installed.install_report(proc)
         assert {unit: installed.unit_text(unit) for unit in STORE_UNITS} == before
         assert installed.credentials_file.read_bytes() == credentials
         assert installed.store_pid() == pid
         rerun_calls = installed.systemctl_calls()[calls_before:]
         assert not [call for call in rerun_calls if "restart" in call]
+
+    @pytest.mark.parametrize(
+        ("drifted", "restarted"),
+        [
+            pytest.param(STORE_UNIT, {STORE_UNIT}, id="store-unit"),
+            pytest.param(PRUNE_SERVICE, set(), id="prune-service"),
+            pytest.param(PRUNE_TIMER, {PRUNE_TIMER}, id="prune-timer"),
+        ],
+    )
+    def test_a_drifted_unit_is_rewritten_and_restarts_only_what_it_runs(
+        self, installed: StoreWorld, drifted: str, restarted: set[str]
+    ) -> None:
+        rendered = installed.unit_text(drifted)
+        with (installed.unit_dir / drifted).open("a") as unit:
+            unit.write("# hand edit\n")
+        calls_before = len(installed.systemctl_calls())
+        pid = installed.store_pid()
+
+        proc = installed.install()
+
+        assert proc.returncode == 0, installed.install_report(proc)
+        assert installed.unit_text(drifted) == rendered
+        rerun_calls = installed.systemctl_calls()[calls_before:]
+        assert {call[2] for call in rerun_calls if call[1:2] == ["restart"]} == restarted
+        if STORE_UNIT not in restarted:
+            assert installed.store_pid() == pid
 
     @pytest.mark.parametrize("change", ["rotate", "recreate"])
     def test_changed_credentials_restart_the_store(
@@ -605,7 +657,7 @@ class TestStoreInstall:
 
         proc = installed.install()
 
-        assert proc.returncode == 0, proc.stdout + proc.stderr
+        assert proc.returncode == 0, installed.install_report(proc)
         new_auth = installed.auth()
         assert new_auth[1] != old_password
         rerun_calls = installed.systemctl_calls()[calls_before:]
@@ -636,7 +688,7 @@ class TestStoreInstall:
 
         proc = installed.install()
 
-        assert proc.returncode == 1, proc.stdout + proc.stderr
+        assert proc.returncode == 1, installed.install_report(proc)
         assert "nothing was restarted" in proc.stderr
         assert installed.store_pid() == pid
         assert not installed.systemctl_calls()[calls_before:]

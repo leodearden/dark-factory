@@ -298,6 +298,7 @@ def _disposition_table() -> dict[type[BaseException], BlockDisposition]:
         MergeParkError,
         MergeVerifyLeaseContended,
         MergeVerifyLeaseHeld,
+        ScreenLaneUnavailable,
         StackRecordUnconfirmed,
         WarmLaneDiskPressure,
         WarmLaneLockContention,
@@ -824,6 +825,19 @@ def _disposition_table() -> dict[type[BaseException], BlockDisposition]:
             requeue_kind=RequeueKind.BLOCK,
             counts_against_requeue_cap=True,
             reason_prefix='Ephemeral probe worktree add failed after retries',
+            block_class=BlockClass.AGENT_FAILURE,
+        ),
+        # BD-2-completeness-only row (task 7919): a merge screen lane's flock
+        # was not won in time. merge_lane/screen.py::MergeScreen catches it at
+        # source and falls back to an ephemeral worktree, so it never reaches
+        # _drive() or classify_failure(). An escape would mean a contended
+        # lane, MergeVerifyLeaseContended's transient shape.
+        ScreenLaneUnavailable: BlockDisposition(
+            category=FailureCategory.NONE,
+            escalate_to_human=False,
+            requeue_kind=RequeueKind.REQUEUE,
+            counts_against_requeue_cap=False,
+            reason_prefix='merge_screen_lane_unavailable',
             block_class=BlockClass.AGENT_FAILURE,
         ),
         # BD-2-completeness-only rows (task 7332), the same category as

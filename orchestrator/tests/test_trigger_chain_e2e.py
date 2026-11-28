@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import json
 import os
-import sys
 from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -22,6 +21,7 @@ import pytest_asyncio
 pytest.importorskip('fused_memory')
 
 from _git_fixtures import seed_repo
+from _orch_helpers import env_resolving_running_interpreter
 from _trigger_chain_doc_shapes import (
     DocShapeError,
     authoring_metadata_exemplars,
@@ -41,7 +41,6 @@ from fused_memory.middleware.deterministic_task_guard import (
 from shared.repo_paths import DARK_FACTORY_ROOT_ENV
 from shared.task_metadata import TASK_METADATA_CAPABILITIES, parse_metadata
 
-import orchestrator.mcp_lifecycle
 from orchestrator.deterministic_runner import DeterministicRunner
 from orchestrator.event_store import EventType
 from orchestrator.workflow import WorkflowOutcome
@@ -65,14 +64,9 @@ def factory_root(repo_root: Path | None, monkeypatch: pytest.MonkeyPatch) -> Pat
 async def rig(
     tmp_path: Path, factory_root: Path, monkeypatch: pytest.MonkeyPatch
 ) -> AsyncIterator[TriggerChainRig]:
-    # A test that ran McpLifecycle.start() under a patched McpSession leaves a mock here,
-    # and mcp_call would route the Scheduler's calls to it instead of the live server.
-    monkeypatch.setattr(orchestrator.mcp_lifecycle, '_session', None)
     async with open_rig(tmp_path, factory_root) as opened:
         monkeypatch.setenv('FUSED_MEMORY_MCP_URL', opened.url)
-        monkeypatch.setenv(
-            'PATH', f'{Path(sys.executable).parent}{os.pathsep}{os.environ.get("PATH", "")}'
-        )
+        monkeypatch.setenv('PATH', env_resolving_running_interpreter(os.environ)['PATH'])
         yield opened
 
 

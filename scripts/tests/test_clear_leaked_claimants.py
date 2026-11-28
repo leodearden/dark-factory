@@ -21,6 +21,7 @@ from pathlib import Path
 import pytest
 from _task_db_scan import UNREADABLE_STORE_ERRORS
 from clear_leaked_claimants import (
+    REPAIRABLE_TIERS,
     REREAD_FAILED_DETAIL,
     STILL_VIOLATING_DETAIL,
     UNVERIFIED_DETAIL,
@@ -28,6 +29,7 @@ from clear_leaked_claimants import (
     Bucket,
     Census,
     ExitCode,
+    RefusalReason,
     Tier,
     apply_repairs,
     emit_report,
@@ -39,6 +41,7 @@ from clear_leaked_claimants import (
     take_census,
 )
 from cli_subprocess_timeout import cli_timeout_from_env
+from shared.project_layout import scheduler_state_json
 
 NOW = datetime(2026, 10, 11, 12, tzinfo=UTC)
 STALE = NOW - timedelta(hours=2)
@@ -664,7 +667,7 @@ class TestUnreadableStoreMidBatch:
 
 
 def _write_scheduler_state(root: str, text: str) -> None:
-    state = Path(root) / 'data' / 'orchestrator' / 'scheduler_state.json'
+    state = scheduler_state_json(root)
     state.parent.mkdir(parents=True, exist_ok=True)
     state.write_text(text)
 
@@ -684,6 +687,8 @@ class TestHolderPreflight:
         report = _apply(census, server)
 
         assert report.refused is True
+        assert report.refusal is RefusalReason.HOLDERS_IN_SELECTION
+        assert report.holder_set_error is None
         assert report.holder_intersection == (4028,)
         assert server.calls == []
         assert _store_rows(root) == before
@@ -724,6 +729,8 @@ class TestHolderPreflight:
         report = _apply(take_census(root, NOW), server)
 
         assert report.refused is False
+        assert report.refusal is None
+        assert report.holder_set_error is None
         assert server.written_ids() == TERMINAL_IDS
 
     def test_holders_are_read_at_apply_time_not_census_time(self, seed_root):
@@ -738,16 +745,61 @@ class TestHolderPreflight:
         assert report.holder_intersection == (5225,)
         assert server.calls == []
 
-    @pytest.mark.parametrize('snapshot', ['[]', '{"current_holders": ["4028"]}'])
-    def test_a_malformed_snapshot_is_treated_as_no_holders(self, seed_root, snapshot):
+    @pytest.mark.parametrize(
+        'snapshot', ['', '{not json', '[]', '{"current_holders": ["4028"]}'],
+        ids=['empty', 'invalid-json', 'non-object', 'malformed-shape'],
+    )
+    def test_an_unreadable_snapshot_refuses_the_whole_project(self, seed_root, snapshot):
         root = seed_root(TIER_TABLE_ROWS)
         _write_scheduler_state(root, snapshot)
+        census = take_census(root, NOW)
+        before = _store_rows(root)
+        server = _FakeClaimantServer()
+
+        report = _apply(census, server)
+
+        assert report.refused is True
+        assert report.refusal is RefusalReason.HOLDER_SET_UNREADABLE
+        assert report.holder_intersection == ()
+        assert report.holder_set_error is not None
+        assert 'scheduler_state.json' in report.holder_set_error
+        assert server.calls == []
+        assert _store_rows(root) == before
+        assert report.outcomes == ()
+        assert report.verification_census is None
+
+    def test_a_snapshot_path_that_cannot_be_read_refuses(self, seed_root):
+        root = seed_root(TIER_TABLE_ROWS)
+        scheduler_state_json(root).mkdir(parents=True)
+        server = _FakeClaimantServer()
+
+        report = _apply(take_census(root, NOW), server)
+
+        assert report.refusal is RefusalReason.HOLDER_SET_UNREADABLE
+        assert server.calls == []
+        assert report.holder_set_error is not None
+        assert 'IsADirectoryError' in report.holder_set_error
+
+    def test_an_unreadable_snapshot_with_nothing_selected_does_not_refuse(self, seed_root):
+        root = seed_root([STALE_PENDING])
+        _write_scheduler_state(root, '{not json')
         server = _FakeClaimantServer()
 
         report = _apply(take_census(root, NOW), server)
 
         assert report.refused is False
-        assert server.written_ids() == TERMINAL_IDS
+        assert report.refusal is None
+        assert server.calls == []
+
+    def test_an_unreadable_snapshot_refuses_a_hygiene_only_selection(self, seed_root):
+        root = seed_root([STALE_PENDING])
+        _write_scheduler_state(root, '{not json')
+        server = _FakeClaimantServer()
+
+        report = _apply(take_census(root, NOW), server, tiers=REPAIRABLE_TIERS)
+
+        assert report.refusal is RefusalReason.HOLDER_SET_UNREADABLE
+        assert server.calls == []
 
 
 def _sweep(roots, client, *, apply=True, tiers=TERMINAL_ONLY, clock=lambda: NOW):
@@ -773,6 +825,8 @@ class TestApplyOutput:
         assert 4028 in {v['task_id'] for v in project['census']['violations']}
         applied = project['apply']
         assert applied['refused'] is False
+        assert applied['refusal_reason'] is None
+        assert applied['holder_set_error'] is None
         assert applied['holder_intersection'] == []
         assert applied['counts'] == {
             'repaired': 3, 'skipped_changed_under_us': 0, 'arrived_during_window': 0, 'failed': 0,
@@ -811,6 +865,40 @@ class TestApplyOutput:
         ]
         fields = {token.split('=', 1)[0] for token in skipped_line.split()}
         assert {'delta.status', 'delta.claimant_run_id'} <= fields
+
+    def test_json_names_an_unreadable_holder_set_as_the_refusal_reason(self, seed_root):
+        root = seed_root(TIER_TABLE_ROWS)
+        _write_scheduler_state(root, '{not json')
+
+        payload = json.loads(render_json(_sweep([root], _FakeClaimantServer())))
+
+        applied = payload['projects'][0]['apply']
+        assert applied['refused'] is True
+        assert applied['refusal_reason'] == 'holder_set_unreadable'
+        assert applied['holder_intersection'] == []
+        assert 'scheduler_state.json' in applied['holder_set_error']
+        assert applied['counts']['repaired'] == 0
+
+    def test_json_names_held_rows_as_the_refusal_reason(self, seed_root):
+        root = seed_root(TIER_TABLE_ROWS)
+        _write_scheduler_state(root, _holders(orchestrator_src='4028'))
+
+        payload = json.loads(render_json(_sweep([root], _FakeClaimantServer())))
+
+        applied = payload['projects'][0]['apply']
+        assert applied['refusal_reason'] == 'holders_in_selection'
+        assert applied['holder_set_error'] is None
+
+    def test_text_says_the_holder_set_could_not_be_read(self, seed_root):
+        root = seed_root(TIER_TABLE_ROWS)
+        _write_scheduler_state(root, '{not json')
+
+        text = render_text(_sweep([root], _FakeClaimantServer()))
+
+        (refused_line,) = [
+            line for line in text.splitlines() if 'refused' in line and 'could not be read' in line
+        ]
+        assert 'scheduler_state.json' in refused_line
 
 
 def _tiers_by_id(census: Census) -> dict[int, Tier]:
@@ -943,6 +1031,40 @@ class TestExitCode:
 
         assert exit_code(result) is ExitCode.REPAIR_FAILED
         assert exit_conditions(result) == (ExitCode.REPAIR_FAILED, ExitCode.HOLDER_REFUSED)
+
+    def test_an_unreadable_holder_set_is_its_own_exit_code(self, seed_root):
+        root = seed_root(TIER_TABLE_ROWS)
+        _write_scheduler_state(root, '{not json')
+
+        result = _sweep([root], _FakeClaimantServer())
+
+        assert exit_code(result) is ExitCode.HOLDER_SET_UNREADABLE
+        assert int(ExitCode.HOLDER_SET_UNREADABLE) == 6
+
+    def test_exit_precedence_is_failure_then_unreadable_then_held(self, seed_root):
+        unreadable = seed_root(TIER_TABLE_ROWS, name='unreadable')
+        refused = seed_root(TIER_TABLE_ROWS, name='refused')
+        failing = seed_root(TIER_TABLE_ROWS, name='failing')
+        _write_scheduler_state(unreadable, '{not json')
+        _write_scheduler_state(refused, _holders(orchestrator_src='4028'))
+
+        result = _sweep([unreadable, refused, failing], _mixed_traffic_server(failing))
+
+        assert exit_conditions(result) == (
+            ExitCode.REPAIR_FAILED, ExitCode.HOLDER_SET_UNREADABLE, ExitCode.HOLDER_REFUSED,
+        )
+
+    def test_stderr_names_an_unreadable_holder_set(self, seed_root, capsys):
+        root = seed_root(TIER_TABLE_ROWS)
+        _write_scheduler_state(root, '{not json')
+        result = _sweep([root], _FakeClaimantServer())
+        capsys.readouterr()
+
+        emit_report(result, as_json=False)
+
+        errors = [line for line in capsys.readouterr().err.splitlines() if line.startswith('error:')]
+        (error,) = errors
+        assert 'scheduler_state.json' in error
 
     def test_stderr_names_every_condition_not_only_the_winning_one(self, seed_root, capsys):
         refused = seed_root(TIER_TABLE_ROWS, name='refused')

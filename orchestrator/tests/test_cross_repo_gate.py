@@ -26,6 +26,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from orchestrator import cross_repo_gate as gate
+from orchestrator.slot_lease import SlotLease
 
 # Sentinel: distinguishes "metadata key absent" from "metadata is None".
 _UNSET = object()
@@ -1609,7 +1610,7 @@ class TestRunSlotCrossRepoGateWiring:
 
         with patch('orchestrator.harness.build_workflow') as MockWorkflow:
             MockWorkflow.return_value = _make_mock_workflow()
-            report = await h._run_slot(assignment, sem)
+            report = await h._run_slot(assignment, SlotLease(assignment.task_id, h.scheduler, sem))
 
         assert not MockWorkflow.called, (
             'TaskWorkflow must NOT be constructed for a foreign-owned task — '
@@ -1636,7 +1637,7 @@ class TestRunSlotCrossRepoGateWiring:
 
         with patch('orchestrator.harness.build_workflow') as MockWorkflow:
             MockWorkflow.return_value = _make_mock_workflow()
-            await h._run_slot(assignment, sem)
+            await h._run_slot(assignment, SlotLease(assignment.task_id, h.scheduler, sem))
 
         h.scheduler.release.assert_called_once()  # type: ignore[attr-defined]
         call_args = h.scheduler.release.call_args  # type: ignore[attr-defined]
@@ -1658,7 +1659,7 @@ class TestRunSlotCrossRepoGateWiring:
         with patch('orchestrator.harness.build_workflow') as MockWorkflow:
             mock_wf = _make_mock_workflow()
             MockWorkflow.return_value = mock_wf
-            await h._run_slot(assignment, sem)
+            await h._run_slot(assignment, SlotLease(assignment.task_id, h.scheduler, sem))
 
         assert MockWorkflow.called
         mock_wf.run.assert_awaited_once()
@@ -1678,7 +1679,7 @@ class TestRunSlotCrossRepoGateWiring:
         with patch('orchestrator.harness.build_workflow') as MockWorkflow:
             mock_wf = _make_mock_workflow()
             MockWorkflow.return_value = mock_wf
-            await h._run_slot(assignment, sem)
+            await h._run_slot(assignment, SlotLease(assignment.task_id, h.scheduler, sem))
 
         gate.assert_not_awaited()
         mock_wf.run.assert_awaited_once()
@@ -1698,7 +1699,7 @@ class TestRunSlotCrossRepoGateWiring:
 
         with patch('orchestrator.harness.build_workflow') as MockWorkflow:
             MockWorkflow.return_value = _make_mock_workflow()
-            report = await h._run_slot(assignment, sem)
+            report = await h._run_slot(assignment, SlotLease(assignment.task_id, h.scheduler, sem))
 
         # The substrate gate builds an ephemeral worktree + runs a checker
         # subprocess; a task the cross-repo gate already blocked must never
@@ -1724,7 +1725,7 @@ class TestRunSlotCrossRepoGateWiring:
 
         with patch('orchestrator.harness.build_workflow') as MockWorkflow:
             MockWorkflow.return_value = _make_mock_workflow()
-            report = await h._run_slot(assignment, sem)
+            report = await h._run_slot(assignment, SlotLease(assignment.task_id, h.scheduler, sem))
 
         cross_repo_gate_mock.assert_not_awaited()
         substrate_gate_mock.assert_awaited_once()
@@ -1750,7 +1751,7 @@ class TestRunSlotCrossRepoGateWiring:
         with patch('orchestrator.harness.build_workflow') as MockWorkflow:
             mock_wf = _make_mock_workflow()
             MockWorkflow.return_value = mock_wf
-            await h._run_slot(assignment, sem)
+            await h._run_slot(assignment, SlotLease(assignment.task_id, h.scheduler, sem))
 
         assert order == ['cross_repo', 'substrate'], (
             f'cross-repo gate must run first; got {order!r}'
@@ -1805,7 +1806,7 @@ class TestCrossRepoAdmissionEndToEnd:
 
         with patch('orchestrator.harness.build_workflow') as MockWorkflow:
             MockWorkflow.return_value = _make_mock_workflow()
-            report = await h._run_slot(assignment, sem)
+            report = await h._run_slot(assignment, SlotLease(assignment.task_id, h.scheduler, sem))
 
         # (1) No architect invocation: no workflow was ever constructed, so no
         #     agent spun up, no worktree was built, and no runs.db row exists.
@@ -1857,7 +1858,7 @@ class TestCrossRepoAdmissionEndToEnd:
         with patch('orchestrator.harness.build_workflow') as MockWorkflow:
             mock_wf = _make_mock_workflow()
             MockWorkflow.return_value = mock_wf
-            report = await h._run_slot(assignment, sem)
+            report = await h._run_slot(assignment, SlotLease(assignment.task_id, h.scheduler, sem))
 
         assert MockWorkflow.called, 'a local task must dispatch normally'
         mock_wf.run.assert_awaited_once()
@@ -1899,7 +1900,7 @@ class TestCrossRepoAdmissionEndToEnd:
 
         with patch('orchestrator.harness.build_workflow') as MockWorkflow:
             MockWorkflow.return_value = _make_mock_workflow()
-            report = await h._run_slot(assignment, sem)
+            report = await h._run_slot(assignment, SlotLease(assignment.task_id, h.scheduler, sem))
 
         assert not MockWorkflow.called
         assert report is not None
@@ -1942,7 +1943,7 @@ class TestCrossRepoAdmissionEndToEnd:
         with patch('orchestrator.harness.build_workflow') as MockWorkflow:
             mock_wf = _make_mock_workflow()
             MockWorkflow.return_value = mock_wf
-            await h._run_slot(assignment, sem)
+            await h._run_slot(assignment, SlotLease(assignment.task_id, h.scheduler, sem))
 
         warnings = [
             r for r in caplog.records
@@ -1978,7 +1979,7 @@ class TestCrossRepoAdmissionEndToEnd:
         with patch('orchestrator.harness.build_workflow') as MockWorkflow:
             mock_wf = _make_mock_workflow()
             MockWorkflow.return_value = mock_wf
-            await h._run_slot(assignment, sem)
+            await h._run_slot(assignment, SlotLease(assignment.task_id, h.scheduler, sem))
 
         assert not [
             r for r in caplog.records if r.name == 'orchestrator.cross_repo_gate'

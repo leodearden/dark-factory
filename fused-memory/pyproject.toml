@@ -23,16 +23,20 @@ dependencies = [
     "anthropic>=0.52.0",
     "aiosqlite>=0.20.0",
     "dark-factory-shared",
+    "escalation",
 ]
 
 [tool.uv.sources]
 dark-factory-shared = { workspace = true }
 escalation = { workspace = true }
+client-feed = { workspace = true }
 
 [tool.pytest.ini_options]
 markers = [
     "integration: live tests requiring real external services/credentials (e.g. OpenAI API / network egress); deselect: -m 'not integration'",
     "reads_git_history: the test reads the checkout's git history (log, merge-base, rev-list, describe), so a byte-identical tree under a new parent can verify differently; re-run alone on the merge gate's same-tree path by merge_gate_history_test_command. Not deselected by default.",
+    "defect(ref): this test reproduces the declared defect <ref>; the binding is read statically by shared/src/shared/defect_enumerator.py (plans/defect-tests-prd.md decision 8). Not deselected by default.",
+    "criterion(id): this test evidences acceptance criterion <id> (plans/client-feed-prd.md §7.7). Not deselected by default.",
     "timing(reason): a deadline, grace period or timeout is the behaviour under test, named by reason=; the timing-dependence lint (fused-memory/scripts/_timing_dependence.py) accepts a real sleep, an elapsed-vs-literal assert or a literal wait deadline only under it. Not deselected by default.",
 ]
 pythonpath = ["src", "../orchestrator/src"]
@@ -73,7 +77,7 @@ timeout_method = "signal"
 include = ["src", "tests", "scripts"]
 # ".." LAST (mirrors tests/conftest.py's sys.path.append): resolves the repo-root
 # df_pytest_isolation module without letting project dirs shadow their own src/.
-extraPaths = ["src", "tests", "scripts", "../shared/src", "../escalation/src", "../orchestrator/src", ".."]
+extraPaths = ["src", "tests", "scripts", "../shared/src", "../escalation/src", "../client-feed/src", "../orchestrator/src", ".."]
 pythonVersion = "3.11"
 typeCheckingMode = "basic"
 # Task 3367 / esc-3359-1: pins pyright's interpreter to THIS worktree's own
@@ -104,13 +108,14 @@ docstring-code-format = true
 
 [dependency-groups]
 dev = [
+    # tests/test_client_defect_bridge_e2e.py drives the real filer and publisher; nothing under src/ imports it.
+    "client-feed",
     "pyright>=1.1.404",
     "pytest>=8.0.0",
     "pytest-asyncio>=0.21.0",
     "pytest-timeout>=2.4.0",
     "pytest-xdist>=3.6.0",
     "ruff>=0.7.1",
-    "escalation",
 ]
 # Eval-only (plans/write-triage-flip-readiness-prd.md ρ1); nothing under src/ imports it.
 reranker = [

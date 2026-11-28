@@ -18,7 +18,7 @@ import pytest
 from _operator_home_fixture import OPERATOR_EMAIL, OPERATOR_IGNORED_FILE, write_operator_home
 from _plan_tools_mcp_fixture import plan_tools_mcp
 from _zcode_fixture import BASE_URL, measured_output
-from shared.cli_invoke import SubprocessResult
+from shared.cli_invoke import SubprocessResult, is_timed_out_with_progress
 from shared.process_cost import ProcessCostBasis
 
 from orchestrator.agents.zcode_backend import (
@@ -331,6 +331,17 @@ class TestParseZCodeOutput:
         assert result.timed_out is timed_out
         if timed_out:
             assert result.success is False
+
+    def test_a_killed_run_reports_its_turn_count_as_unknown(self):
+        cost_of, _ = _recording_cost_of()
+        result = parse_zcode_output(
+            _subprocess_result(stderr='Process killed after 1s timeout (SIGTERM+SIGKILL)',
+                               returncode=1, timed_out=True),
+            cost_of=cost_of,
+        )
+        assert result.transcript_turns is None
+        assert result.turns == 0
+        assert is_timed_out_with_progress(result) is False
 
 
 def _mode(path: Path) -> int:

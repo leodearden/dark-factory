@@ -7,9 +7,7 @@ Served metrics
 ``KNOWN_METRICS`` is the sorted exact names of the sampler groups the
 dashboard serves, a projection of
 ``sampler/src/sampler/metrics.py::METRIC_GROUPS``, so a metric added to a
-served group is served with no edit here (the Host load card's own
-presentation list in ``static/redux/tab_overview.jsx`` still needs an entry
-before it displays the metric).  Keys not in this tuple are
+served group is served with no edit here.  Keys not in this tuple are
 filtered from query results, giving the frontend a fixed shape.  The
 response always contains every key; a known metric with nothing to serve
 returns the placeholder shape

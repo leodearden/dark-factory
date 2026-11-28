@@ -35,7 +35,8 @@ pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 PROJECT_ROOT = '/project'
 PROJECT_ID = 'project'
 DEADLINE_SECONDS = 5.0
-TINY_BACKOFF_SECONDS = 0.001
+# timedelta keeps whole microseconds, so a ticket parked with this backoff is due the instant it is parked.
+SUB_MICROSECOND_BACKOFF_SECONDS = 1e-9
 
 
 class _DeferThenHoldCurator:
@@ -69,8 +70,8 @@ class _DeferThenHoldCurator:
 def config() -> FusedMemoryConfig:
     cfg = FusedMemoryConfig()
     cfg.curator = CuratorConfig(
-        deferral_backoff_base_seconds=TINY_BACKOFF_SECONDS,
-        deferral_backoff_max_seconds=TINY_BACKOFF_SECONDS,
+        deferral_backoff_base_seconds=SUB_MICROSECOND_BACKOFF_SECONDS,
+        deferral_backoff_max_seconds=SUB_MICROSECOND_BACKOFF_SECONDS,
         janitor=TicketJanitorConfig(curation_backlog_escalation_min_attempts=1),
     )
     return cfg
@@ -115,14 +116,22 @@ async def _park_through(interceptor: TaskInterceptor) -> str:
     return ticket_id
 
 
-async def _let_tiny_backoff_pass() -> None:
-    await asyncio.sleep(TINY_BACKOFF_SECONDS * 5)
+async def _await_curation(curator: _DeferThenHoldCurator, store: TicketStore, ticket_id: str) -> None:
+    try:
+        # noqa: wall-clock-deadline — bounds a wait that used to hang to the pytest timeout  # debt: ticket tkt_0RXE77AQ50Z12K8SJ91XQDEB9E
+        await asyncio.wait_for(curator.reached.wait(), timeout=DEADLINE_SECONDS)
+    except TimeoutError:
+        row = await store.get(ticket_id) or {}
+        pytest.fail(
+            f'the janitor did not hand ticket {ticket_id} to the curator within {DEADLINE_SECONDS}s: '
+            f'status={row.get("status")!r} attempts={row.get("attempts")!r} '
+            f'next_attempt_at={row.get("next_attempt_at")!r}'
+        )
 
 
 @pytest.mark.asyncio
 async def test_built_janitor_drains_through_the_interceptor(config, store, make_interceptor):
     ticket_id = await _park_through(make_interceptor(_DeferThenHoldCurator(defer_first=True)))
-    await _let_tiny_backoff_pass()
     curator = _DeferThenHoldCurator(defer_first=False)
     restarted = make_interceptor(curator)
     assert restarted.is_worker_alive(PROJECT_ID) is False
@@ -131,7 +140,7 @@ async def test_built_janitor_drains_through_the_interceptor(config, store, make_
     assert janitor is not None
     await janitor.tick()
 
-    await curator.reached.wait()
+    await _await_curation(curator, store, ticket_id)
     row = await store.get(ticket_id)
     assert row is not None
     assert (row['status'], row['attempts']) == ('pending', 1)

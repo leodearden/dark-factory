@@ -35,6 +35,17 @@ def _followup(**extra: Any) -> dict[str, Any]:
     }
 
 
+def _finding_set(**extra: Any) -> dict[str, Any]:
+    return {
+        'source': 'review-all',
+        'x_finding_key': ['fk-1'],
+        'x_finding_run': 'review-all-proj-20261126',
+        'finding_set_hold': {'ruling': 'Leo 2026-11-12 on fk-1'},
+        'files': [_FILE],
+        **extra,
+    }
+
+
 async def _file_followup(stack: Stack, title: str, *, priority: str = 'low', **metadata: Any) -> str:
     return await stack.file_normal(
         title=title, description=f'{title}: one observation.', priority=priority,
@@ -122,6 +133,57 @@ async def test_a_medium_a_planned_and_a_cited_followup_are_not_held(
 
 
 @pytest.mark.asyncio
+async def test_a_marked_finding_set_is_born_held_on_both_filing_paths(
+    stack: Stack, curator_creates: list[PreparedCandidate],
+) -> None:
+    ticketed = await stack.file_normal(
+        title='Step 1: add the public name', description='Step 1 of the finding set.',
+        priority='low', metadata=_finding_set(),
+    )
+    planned_answer = await stack.call(
+        'submit_task', planning_mode=True,
+        title='Step 2: judge.py imports it', description='Step 2 of the finding set.',
+        priority='low', metadata=_finding_set(),
+    )
+    assert 'error' not in planned_answer, planned_answer
+    planned = str(planned_answer['task_id'])
+
+    [holder] = await stack.holder_ids()
+    assert planned_answer['held_by'] == holder, planned_answer
+    for task_id in (ticketed, planned):
+        assert await stack.dependencies(task_id) == [holder], task_id
+        assert str((await stack.metadata(task_id))[FOLLOWUP_HOLD_METADATA_KEY]['holder']) == holder, task_id
+    held_events = await stack.events(EventType.followup_held)
+    assert {'task_id': ticketed, 'holder_id': holder} in held_events
+    assert {'task_id': planned, 'holder_id': holder} in held_events
+
+
+@pytest.mark.asyncio
+async def test_a_committed_finding_set_with_internal_edges_stays_held(
+    stack: Stack, curator_creates: list[PreparedCandidate],
+) -> None:
+    root = await stack.file_planned(
+        title='Step 1: add the public name', description='Step 1 of the finding set.',
+        priority='low', metadata=_finding_set(),
+    )
+    leaf = await stack.file_planned(
+        title='Step 2: judge.py imports it', description='Step 2 of the finding set.',
+        priority='low', metadata=_finding_set(),
+    )
+    edge = await stack.call('add_dependency', id=leaf, depends_on=root)
+    assert isinstance(edge, dict) and 'error' not in edge, edge
+
+    committed = await stack.call('commit_planning', task_ids=f'{root},{leaf}')
+
+    assert 'error' not in committed, committed
+    [holder] = await stack.holder_ids()
+    for task_id in (root, leaf):
+        assert (await stack.row(task_id))['status'] == 'pending', task_id
+        assert holder in await stack.dependencies(task_id), task_id
+    assert await stack.events(EventType.followup_promoted) == []
+
+
+@pytest.mark.asyncio
 async def test_a_medium_followup_mints_no_holder(
     stack: Stack, curator_creates: list[PreparedCandidate],
 ) -> None:
@@ -162,6 +224,39 @@ async def test_two_live_holders_fail_the_filing_naming_both(
     assert first in resolved['reason'] and second in resolved['reason'], resolved
     assert 'created no task' in resolved['reason'], resolved
     assert await stack.task_count() == count_before
+
+
+@pytest.mark.asyncio
+async def test_two_live_holders_fail_a_planned_finding_set_member_with_an_error_answer(
+    stack: Stack, curator_creates: list[PreparedCandidate],
+) -> None:
+    first = await stack.seed('Follow-up holder (proj)', {FOLLOWUP_HOLDER_METADATA_KEY: _MARKER})
+    second = await stack.seed('Follow-up holder (proj) again', {FOLLOWUP_HOLDER_METADATA_KEY: _MARKER})
+    count_before = await stack.task_count()
+
+    answer = await stack.call(
+        'submit_task', planning_mode=True,
+        title='Step 1: add the public name', description='Step 1 of the finding set.',
+        priority='low', metadata=_finding_set(),
+    )
+
+    assert answer.get('error_type') == 'DuplicateFollowupHolderError', answer
+    assert first in answer['error'] and second in answer['error'], answer
+    assert await stack.task_count() == count_before
+
+
+@pytest.mark.asyncio
+async def test_a_planned_birth_the_rule_does_not_hold_answers_without_held_by(
+    stack: Stack, curator_creates: list[PreparedCandidate],
+) -> None:
+    answer = await stack.call(
+        'submit_task', planning_mode=True,
+        title='PRD leaf: name the retry budget', description='A planning-mode follow-up.',
+        priority='low', metadata=_followup(),
+    )
+
+    assert 'error' not in answer, answer
+    assert 'held_by' not in answer, answer
 
 
 async def _arrange_held(stack: Stack) -> tuple[str, list[str]]:

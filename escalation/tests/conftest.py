@@ -165,6 +165,16 @@ def pytest_configure(config):
     arm_usage_gate_sweep_confinement(config, usage_gate)
 
 
+@pytest.fixture(autouse=True)
+def _isolate_verify_host_roster(monkeypatch):
+    """Escalation tests drive the real load_config (test_reload_config_integration.py); none may read the operator's roster file.
+
+    The name is orchestrator/src/orchestrator/verify_host_roster_file.py::ROSTER_FILE_ENV,
+    spelled out because this conftest must collect without orchestrator installed.
+    """
+    monkeypatch.setenv('ORCH_VERIFY_HOSTS_FILE', '/nonexistent/df-verify-hosts.yaml')
+
+
 # ---------------------------------------------------------------------------
 # serve_escalation_mcp — a REAL escalation MCP server over REAL HTTP (task 3644)
 # ---------------------------------------------------------------------------

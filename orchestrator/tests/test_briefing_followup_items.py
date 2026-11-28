@@ -10,7 +10,6 @@ import re
 from typing import Any
 
 import pytest
-from _briefing_helpers import briefing as briefing
 from shared.followup_items import FOLLOWUP_ITEMS_METADATA_KEY, observed_item
 
 from orchestrator.agents.briefing import BriefingAssembler

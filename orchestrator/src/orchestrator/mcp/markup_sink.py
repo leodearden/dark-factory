@@ -37,13 +37,13 @@ from pathlib import Path
 from typing import Any
 
 from shared.eval_lane import eval_lane_provenance
+from shared.markup_residue_custody import ResidueCall, residue_prose
 from shared.mcp_markup_middleware import (
     MARKUP_BOUNDARY_STORM_CATEGORY,
     MARKUP_RECURRENCE_ROUTING,
     MARKUP_RESIDUE_ERROR_TYPES,
     MARKUP_STORM_ERROR_TYPE,
-    MARKUP_UNRECOVERED_PARAM_ERROR_TYPE,
-    MARKUP_UNREPAIRABLE_ERROR_TYPE,
+    residue_header_lines,
 )
 from shared.project_layout import escalation_queue_dir
 
@@ -131,18 +131,19 @@ class MarkupSinkSpec:
     #: the two anchors below. ``'plan-tools'``, ``'verdict-tools'``.
     server_label: str
 
-    #: Filed-by attribution. Names the GUARD, not the leaking agent: the
-    #: middleware resolves ``agent_id`` from arguments named ``agent_id`` /
-    #: ``project_root`` / ``project_id``, and no tool on either of these
-    #: servers declares any of the three, so that field is structurally
-    #: ``None`` here (it rides in the detail as the null it is — as
-    #: ``agent_id`` on a residue record and as ``crossing_agent_id`` on a
-    #: storm record — rather than being guessed at).
+    #: Filed-by attribution. Names the GUARD, not the leaking agent. The
+    #: leaking caller rides in the detail instead, read off the record: no
+    #: tool on these servers declares ``agent_id`` / ``project_root`` /
+    #: ``project_id``, so the middleware's ``agent_id`` is ``None`` here, and
+    #: so is its role unless the registration site wires host attribution
+    #: (``shared/src/shared/mcp_markup_middleware.py::HostAttribution``). An
+    #: axis nothing resolves is rendered as the null it is — as ``agent_id``
+    #: on a residue record and as ``crossing_agent_id`` on a storm record —
+    #: rather than being guessed at.
     #:
-    #: The axis that DOES resolve on these servers is the SUBJECT, and it does
-    #: not come from the middleware at all: ``make_escalation_sink``'s
-    #: ``subject_task_id`` thunk supplies it per record, and both filers render
-    #: it first. That asymmetry is why the thunk exists.
+    #: The SUBJECT task does not come from the middleware at all:
+    #: ``make_escalation_sink``'s ``subject_task_id`` thunk supplies it per
+    #: record, and both filers render it first. That is why the thunk exists.
     agent_role: str
 
     #: The queue routing key for EVERY residue record — a NON-TASK anchor,
@@ -171,8 +172,8 @@ class MarkupSinkSpec:
     #: What the refusal COST, in one sentence, rendered only into a REFUSED
     #: residue record's body. Server-specific because the loss is: a refused
     #: plan-tools call writes nothing to plan.json, while a refused
-    #: verdict-tools call strands a review gate and destroys a reviewer's
-    #: findings list.
+    #: verdict-tools call leaves a review gate open until the reviewer
+    #: resends.
     refusal_consequence: str
 
     #: What an ACTIVE burst threatens if the guard is disabled, in one
@@ -322,34 +323,22 @@ def open_escalation_channel(project_root: Path) -> tuple[Any, Any] | None:
         return None
 
 
-def _residue_outcome(record: Mapping[str, Any], spec: MarkupSinkSpec) -> str:
-    """What happened to the call, in the record kind's OWN terms."""
-    error_type = record.get('error_type')
-    if error_type == MARKUP_UNREPAIRABLE_ERROR_TYPE:
-        return (
-            f'The {spec.server_label} MCP boundary guard refused this tool call: '
-            'the value below carries raw tool-call envelope markup whose own '
-            'boundary cannot be determined, so no repair was attempted. '
-            + spec.refusal_consequence +
-            ' Guessing would have silently dropped whatever arguments hide in '
-            'the residue.'
-        )
-    if error_type == MARKUP_UNRECOVERED_PARAM_ERROR_TYPE:
-        return (
-            f'The {spec.server_label} MCP boundary guard FORWARDED this tool '
-            'call WITHOUT the field named above. The value below was recovered '
-            'from leaked tool-call envelope markup but could not be typed '
-            "against that parameter's declared schema, so it was dropped rather "
-            'than passed through untyped. This record was filed before the call '
-            'ran, so whether it then succeeded is not known here; if it did, '
-            'whatever it wrote is missing this value.'
-        )
-    return (
-        f'This sink does not recognise the record kind {error_type!r}, so it '
-        "states no outcome for the call. The record's summary and suggested "
-        "action, where the middleware supplied them, are the middleware's own "
-        'account of what happened.'
-    )
+def _residue_account(record: Mapping[str, Any], spec: MarkupSinkSpec) -> list[str]:
+    """Who filed the record, then what happened to the call and its payload.
+
+    The outcome and custody are :func:`shared.markup_residue_custody.residue_prose`'s;
+    only a REFUSED call adds what the refusal cost on this server.
+    """
+    prose = residue_prose(record)
+    consequence = [spec.refusal_consequence, ''] if prose.call is ResidueCall.REFUSED else []
+    return [
+        f'Filed by the {spec.server_label} MCP boundary guard.',
+        '',
+        prose.outcome,
+        '',
+        *consequence,
+        prose.custody,
+    ]
 
 
 def residue_detail(
@@ -357,38 +346,36 @@ def residue_detail(
 ) -> str:
     """The residue record's body — flat fields, then the payload VERBATIM.
 
-    The raw value is rendered last, unquoted and unescaped, because it is the
-    ONLY surviving copy of data the caller may never be able to resend: a
-    refused call wrote none of it, and a forwarded call ran without it.
-    The outcome paragraph between them is the record kind's own
-    (:func:`_residue_outcome`). Everything above it is diagnostic and is
-    written with ``!r`` so an empty or ``None`` field reads as itself rather
-    than as a blank line.
+    The raw value is rendered last, unquoted and unescaped, so it can be
+    recovered byte for byte. Whether anyone else still holds it depends on the
+    kind, and the account between them (:func:`_residue_account`) says
+    which. Everything above it is diagnostic and is written with ``!r``
+    so an empty or ``None`` field reads as itself rather than as a blank line.
 
-    ``subject_task_id`` is rendered here BECAUSE the record's own ``task_id``
-    field is the non-gating anchor — this is the only place a reader learns
-    whose call leaked. ``owner`` is rendered for the same class of reason: the
-    middleware declares it as INV-7's machine-readable owner and
-    :class:`escalation.models.Escalation` has no field for it, so rendering it
-    is what keeps a declared contract field from being silently dropped at the
-    one sink whose whole argument is against silent drops.
+    The header lines are ``residue_header_lines``', the one rendering every
+    residue filer shares, with ``subject_task_id`` overlaid by this site's
+    thunk: the record's own ``task_id`` field is the non-gating anchor, so this
+    is the only place a reader learns whose call leaked. ``owner`` is rendered
+    for the same class of reason: the middleware declares it as INV-7's
+    machine-readable owner and :class:`escalation.models.Escalation` has no
+    field for it, so rendering it is what keeps a declared contract field from
+    being silently dropped at the one sink whose whole argument is against
+    silent drops.
     """
     return '\n'.join([
-        f'{DETAIL_SUBJECT_KEY}{subject_task_id!r}',
+        *residue_header_lines({**record, 'subject_task_id': subject_task_id}),
         f'owner={record.get("owner")!r}',
         f'tool={record.get("tool")!r}',
         f'field={record.get("field")!r}',
         f'matched_pattern={record.get("matched_pattern")!r}',
-        f'agent_id={record.get("agent_id")!r}',
-        f'project={record.get("project")!r}',
         '',
-        _residue_outcome(record, spec),
+        *_residue_account(record, spec),
         '',
         'Recover the payload below for the caller if it is still needed, then '
         'chase the harness serialization leak that produced it and '
         f'{MARKUP_RECURRENCE_ROUTING}.',
         '',
-        'RAW PAYLOAD (verbatim, the only surviving copy):',
+        'RAW PAYLOAD (verbatim):',
         str(record.get('raw_value')),
     ])
 
@@ -483,8 +470,8 @@ def file_residue(
 ) -> str | None:
     """File one residue record. NEVER deduped, and that is the point.
 
-    Each record is the ONLY surviving copy of a DIFFERENT caller payload, so
-    folding two of them into one open escalation would destroy one. The storm
+    Each record holds a DIFFERENT caller's payload, so folding two of them
+    into one open escalation would destroy one. The storm
     anchor's dedup exists because a burst is the same alarm twice; this is the
     opposite case, and the open-record lookup is not even performed.
 
@@ -807,8 +794,8 @@ def make_escalation_sink(
     #: queue open is TRANSIENT by nature (a fork failure under load, an EINTR,
     #: a timeout, an index.lock storm), and caching one would permanently
     #: disable residue preservation for every later refused call on this
-    #: server — losing the only surviving copy of each of their payloads, which
-    #: is the exact data loss this sink exists to prevent.
+    #: server — losing each of their payloads' residue record, which is the
+    #: exact loss this sink exists to prevent.
     project_root: Path | None = None
     channel: tuple[Any, Any] | None = None
 

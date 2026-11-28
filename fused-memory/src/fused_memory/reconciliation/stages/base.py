@@ -12,11 +12,11 @@ from uuid import uuid4
 
 from shared.config_dir import TaskConfigDir
 from shared.escalation_project_scope import escalation_project_headers
-from shared.jcodemunch_launch import jcodemunch_server_config
 from shared.safe_io import load_json_or_warn
 from shared.transcript_archive import archive_task_transcripts
 
 from fused_memory.config.schema import ReconciliationConfig
+from fused_memory.models.invocation_ledger import InvocationLedger, LedgerRole
 from fused_memory.models.reconciliation import (
     ReconciliationEvent,
     StageAgentOutcome,
@@ -41,6 +41,7 @@ from fused_memory.utils.validation import require_project_id, require_run_id
 
 if TYPE_CHECKING:
     from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
+    from shared.cost_store import CostStore
 
     from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
     from fused_memory.models.scope import ProjectScope
@@ -82,6 +83,7 @@ class BaseStage:
         known_projects: dict[str, str] | None = None,
         recon_report_port: int = 8003,
         recon_report_state=None,
+        cost_store: CostStore | None = None,
     ):
         self.stage_id = stage_id
         self.memory = memory_service
@@ -97,6 +99,7 @@ class BaseStage:
         # scope demands.  Empty until the harness sets it per cycle.
         self.known_projects: dict[str, str] = known_projects or {}
         self._usage_gate = usage_gate
+        self._cost_store = cost_store
         self._escalation_url: str | None = None
         self._escalation_queue: EscalationQueue | None = None
         # PRD γ: recon_report channel threading
@@ -287,6 +290,9 @@ class BaseStage:
                 output_schema=effective_output_schema,
                 session_id=session_id,
                 config_dir=config_dir,
+                ledger=InvocationLedger.or_none(
+                    self._cost_store, LedgerRole.for_stage(self.stage_id), run_id, self.project_id,
+                ),
             )
         finally:
             self._archive_stage_transcripts(config_dir, run_id)
@@ -456,6 +462,8 @@ class BaseStage:
             stats=_stats,
             llm_calls=stage_result.llm_calls,
             tokens_used=stage_result.tokens_used,
+            cache_read_tokens=stage_result.cache_read_tokens,
+            cache_create_tokens=stage_result.cache_create_tokens,
             agent_outcome=stage_result.outcome,
         )
 
@@ -551,7 +559,7 @@ class BaseStage:
 
 
 def recon_core_mcp_servers(candidates: list[Path] | None = None) -> dict[str, Mapping[str, object]]:
-    """Recon's core MCP servers: fused-memory (HTTP, or stdio) and jcodemunch.
+    """Recon's core MCP servers: fused-memory (HTTP, or stdio).
 
     A stdio fused-memory entry carries ``OPENAI_API_KEY`` from the process env
     unless its own env sets it; an HTTP entry needs no env, since the server
@@ -565,7 +573,7 @@ def recon_core_mcp_servers(candidates: list[Path] | None = None) -> dict[str, Ma
         if 'OPENAI_API_KEY' not in fm_env:
             fm_env['OPENAI_API_KEY'] = os.environ.get('OPENAI_API_KEY', '')
         fm_entry = {'command': fm_config['command'], 'args': fm_config['args'], 'env': fm_env}
-    return {'fused-memory': fm_entry, 'jcodemunch': jcodemunch_server_config()}
+    return {'fused-memory': fm_entry}
 
 
 def _find_fused_memory_server(candidates: list[Path] | None = None) -> dict:

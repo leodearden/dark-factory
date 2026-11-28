@@ -473,10 +473,13 @@ class AgentResult:
     stop_reason: str | None = None
     retry_aborted: bool = False
     transcript_turns: int | None = None
-    """Number of assistant turns found in the on-disk JSONL transcript, or None
-    when the transcript could not be read or located.  Stamped on both the
-    SIGTERM/SIGKILL timeout path and the normal-exit path, each time derived
-    from that path's single transcript read alongside its other signals."""
+    """Number of assistant turns counted from a record of the session that
+    outlives the process: the claude CLI's on-disk JSONL transcript, or a
+    backend's own session store.  None when the backend keeps no such record
+    or it could not be read or located, which means unknown, never zero.  On
+    the claude path it is stamped on both the SIGTERM/SIGKILL timeout path
+    and the normal-exit path, each time derived from that path's single
+    transcript read alongside its other signals."""
     model_id: str | None = None
     """The exact model id the CLI actually served (e.g. ``claude-opus-5``),
     read from the on-disk transcript via ``detect_transcript_model_id``; None

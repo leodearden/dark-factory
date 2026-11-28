@@ -20,7 +20,7 @@ from _eval_refusal import refused_agent_result
 
 from orchestrator.evals.judge import PlanQualityVerdict
 from orchestrator.evals.measurement import Scored
-from orchestrator.evals.metrics import RoleUnderTest
+from orchestrator.evals.metrics import EndpointKind, RoleUnderTest
 
 # ---------------------------------------------------------------------------
 # Architect cell records the plan judge's spend (step-5/6, eval-revival υ)
@@ -166,7 +166,7 @@ class TestArchitectCellStampsTokenUsageAndProxySignal:
         assert persisted['turns_used'] == 0
         assert result.metrics['tokens_per_second'] == 0.0
 
-    async def test_proxied_candidate_is_flagged_local(self):
+    async def test_proxied_candidate_does_not_trust_the_cli_cost(self):
         """``ANTHROPIC_BASE_URL`` set == a PROXIED endpoint, the signal Invariant
         P5 keys on to stop trusting the CLI's own cost figure."""
         result, mocks = await run_architect_eval_hermetic(
@@ -174,10 +174,10 @@ class TestArchitectCellStampsTokenUsageAndProxySignal:
             produced_plan=well_formed_plan(),
         )
 
-        assert result.metrics['is_local_model'] is True
-        assert mocks['save'].call_args.args[0].metrics['is_local_model'] is True
+        assert result.metrics['cli_cost_untrusted'] is True
+        assert mocks['save'].call_args.args[0].metrics['cli_cost_untrusted'] is True
 
-    async def test_native_candidate_is_not_flagged_local(self):
+    async def test_native_candidate_trusts_the_cli_cost(self):
         """Today's shape (``architect-opus-max`` / ``architect-fable-max``):
         native cloud, no proxy, so the CLI cost stays trustworthy."""
         result, mocks = await run_architect_eval_hermetic(
@@ -185,8 +185,28 @@ class TestArchitectCellStampsTokenUsageAndProxySignal:
             produced_plan=well_formed_plan(),
         )
 
-        assert result.metrics['is_local_model'] is False
-        assert mocks['save'].call_args.args[0].metrics['is_local_model'] is False
+        assert result.metrics['cli_cost_untrusted'] is False
+        assert mocks['save'].call_args.args[0].metrics['cli_cost_untrusted'] is False
+
+    async def test_a_vendor_candidate_persists_its_declared_endpoint_kind(self):
+        result, mocks = await run_architect_eval_hermetic(
+            self._cfg(
+                env_overrides={'ANTHROPIC_BASE_URL': 'https://token-plan-ams.xiaomimimo.com/anthropic'},
+                endpoint_kind=EndpointKind.VENDOR_CLOUD,
+            ),
+            produced_plan=well_formed_plan(),
+        )
+
+        assert result.metrics['endpoint_kind'] == 'vendor_cloud'
+        assert mocks['save'].call_args.args[0].metrics['endpoint_kind'] == 'vendor_cloud'
+
+    async def test_a_native_candidate_persists_a_native_endpoint_kind(self):
+        result, mocks = await run_architect_eval_hermetic(
+            self._cfg(env_overrides={}), produced_plan=well_formed_plan(),
+        )
+
+        assert result.metrics['endpoint_kind'] == 'native_anthropic'
+        assert mocks['save'].call_args.args[0].metrics['endpoint_kind'] == 'native_anthropic'
 
 
 @pytest.mark.asyncio
@@ -219,7 +239,7 @@ class TestArchitectCellResolvesCostProvenance:
 
         ``architect-opus-max`` / ``architect-fable-max`` are native cloud
         (``env_overrides={}``) and unlisted in the price table, so
-        ``resolve_cost_usd`` takes its ``not is_local_model`` branch and returns
+        ``resolve_cost_usd`` takes its ``not cli_cost_untrusted`` branch and returns
         ``(cli_cost_usd, 'cli')`` VERBATIM. Both the figure and the label must
         be byte-identical to today's — the change bites only a PROXIED
         candidate, and turns today's UNVERIFIED 'cli' into a DERIVED one.

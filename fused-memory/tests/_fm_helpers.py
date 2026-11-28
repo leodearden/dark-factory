@@ -164,6 +164,8 @@ class MockEdge:
     # tests can express that signature (task 4714).
     expired_at: Any = None
     created_at: Any = None
+    # EntityEdge.group_id: the graph partition the edge is stored under (= project_id).
+    group_id: str | None = None
 
 
 @dataclass
@@ -947,6 +949,25 @@ def make_insufficient_quota_error(
     return RateLimitError(message, response=response, body=body)
 
 
+PLAN_PROXY_TEST_URL = 'http://127.0.0.1:8317/v1'
+
+
+def make_usage_limit_reached_error(
+    message: str = 'The usage limit has been reached for this ChatGPT plan.',
+    *,
+    base_url: str = PLAN_PROXY_TEST_URL,
+) -> RateLimitError:
+    """Build the openai.RateLimitError a capped ChatGPT plan proxy answers with.
+
+    The request goes to *base_url*'s ``/responses``, and the 429 body names
+    ``usage_limit_reached`` under both ``type`` and ``code``.
+    """
+    request = httpx.Request('POST', f'{base_url.rstrip("/")}/responses')
+    response = httpx.Response(429, request=request)
+    body = {'type': 'usage_limit_reached', 'code': 'usage_limit_reached', 'message': message}
+    return RateLimitError(message, response=response, body=body)
+
+
 def make_transient_rate_limit_error() -> RateLimitError:
     """Build a real openai.RateLimitError for a transient too-many-requests 429."""
     message = 'Rate limit reached for requests'
@@ -979,6 +1000,26 @@ def mock_memory_backends(svc: 'MemoryService') -> 'MemoryService':
     svc.mem0.get_all = AsyncMock(return_value={'results': []})
     svc.mem0.delete = AsyncMock(return_value={'message': 'deleted'})
     svc.mem0.close = AsyncMock()
+    return svc
+
+
+def mock_search_backends(svc: 'MemoryService') -> 'MemoryService':
+    """Stub every backend read ``MemoryService.search`` awaits, each answering empty.
+
+    The shared definition of a MemoryService driven through its public
+    ``search`` seam: a read the search path grows is taught about here once.
+    Callers seed the hits under test (for example ``svc.mem0.search``) after
+    calling it.
+    """
+    svc.graphiti = MagicMock()
+    svc.graphiti.search = AsyncMock(return_value=[])
+    svc.graphiti.search_nodes = AsyncMock(return_value=[])
+    svc.graphiti.get_node_names_by_uuids = AsyncMock(return_value={})
+    install_identity_mocks(svc.graphiti)
+
+    svc.mem0 = MagicMock()
+    svc.mem0.search = AsyncMock(return_value={'results': []})
+    svc.mem0.scroll_by_metadata = AsyncMock(return_value=[])
     return svc
 
 

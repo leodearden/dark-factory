@@ -514,7 +514,11 @@ def _opening_tags(src, tag_name):
 
 
 def _prop_label(opening_tag):
-    m = re.search(r'\blabel=["\']([^"\']*)["\']', opening_tag)
+    return _quoted_prop(opening_tag, 'label')
+
+
+def _quoted_prop(opening_tag, prop):
+    m = re.search(rf'\b{prop}=["\']([^"\']*)["\']', opening_tag)
     return m.group(1) if m else None
 
 
@@ -571,6 +575,13 @@ class TestBurnTabReadsServedDatums:
         body = _burn_tab_body(tabs_jsx_body)
         assert jsx_prop_expr(_burn_tiles(body)['Forecast clear'], 'format') == 'forecastText'
 
+    def test_forecast_tile_hint_says_it_is_backlog_drain_not_landings(self, tabs_jsx_body):
+        """The band projects the close rate; landings are the quality dashboard's series."""
+        hint = _quoted_prop(_burn_tiles(_burn_tab_body(tabs_jsx_body))['Forecast clear'], 'hint')
+        assert hint and 'backlog drain' in hint and 'not landings' in hint, (
+            f"the 'Forecast clear' tile's hint {hint!r} does not say it is backlog drain, not landings"
+        )
+
 
 class TestBurnTileReader:
     """`_burn_tiles` reads each tile's props from its own opening tag only."""
@@ -594,24 +605,28 @@ class TestBurnTileReader:
 
 
 # ---------------------------------------------------------------------------
-# OrchTab "Completed / day" — the server's per-day series, never re-derived
+# OrchTab "Closed / day" — the server's per-day series, never re-derived
 # ---------------------------------------------------------------------------
 #
 # The spark plots the project's served `completed_per_day`
 # (burndown.py::compute_window_completion): one entry per ISO day, the same
 # N-day window its velocity divides by, so the spark and the velocity beside it
-# agree about the same window.
+# agree about the same window. Its caption says "closed", any path, because
+# the count is every close, not the landings the quality dashboard plots.
+
+CLOSED_PER_DAY_CAPTION = 'Closed / day (any path: gates, recon and bulk closes included)'
 
 
 class TestCompletedPerDayIsServerSeries:
     def test_orchtab_spark_plots_the_served_completed_per_day(self, tabs_jsx_body):
         body = strip_js_comments(extract_function_body(tabs_jsx_body, 'OrchTab'))
-        label_at = body.find('Completed / day')
-        assert label_at != -1, "OrchTab no longer labels a 'Completed / day' spark"
+        assert 'Completed / day' not in body, "OrchTab still captions its spark 'Completed / day'"
+        label_at = body.find(CLOSED_PER_DAY_CAPTION)
+        assert label_at != -1, f'OrchTab no longer captions a {CLOSED_PER_DAY_CAPTION!r} spark'
         sparks = _opening_tags(body[label_at:], 'SP')
-        assert sparks, "no <SP> follows OrchTab's 'Completed / day' label"
+        assert sparks, f'no <SP> follows OrchTab\'s {CLOSED_PER_DAY_CAPTION!r} caption'
         values = jsx_prop_expr(sparks[0], 'values')
         assert values and 'BURNDOWN_BY_PROJECT' in values and 'completed_per_day' in values, (
-            f"the 'Completed / day' spark plots {values!r}, not the project's served "
+            f"the 'Closed / day' spark plots {values!r}, not the project's served "
             'completed_per_day series'
         )

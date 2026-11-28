@@ -15,9 +15,9 @@ import sys
 import time
 import uuid
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
-from enum import Enum
+from enum import Enum, StrEnum
 from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, NamedTuple, Protocol, TypeVar, cast
@@ -31,6 +31,7 @@ from escalation.classify import closed_by_non_sweep_resolver
 from escalation.dedupe import submit_or_dedupe
 from escalation.pins import is_queue_handoff, needs_human
 from pydantic import ValidationError
+from shared.branch_names import canonical_queued_branch_name
 from shared.cli_invoke import (
     PROGRESS_TIMEOUT_RESUME_PROMPT,
     AgentFailureKind,
@@ -90,10 +91,18 @@ from orchestrator.agents.roles import (
 from orchestrator.agents.write_set import (
     WriteSet,
     compute_write_set,
-    ensure_claude_fleet_dir,
+    ensure_sandbox_dirs,
+)
+from orchestrator.architect_phase_verdict import (
+    clear_exit_reports,
+    find_plan_exit_conflict,
+    is_confirmed,
+    newly_confirmed,
+    read_exit_reports,
 )
 from orchestrator.artifacts import (
     PLAN_SCHEMA_VERSION,
+    Plan,
     ReviewAggregation,
     ReviewsRootMissing,
     TaskArtifacts,
@@ -112,6 +121,7 @@ from orchestrator.branch_stack import (
 from orchestrator.completion_record import completion_record_metadata
 from orchestrator.config import EscalationConfig, ModuleConfig, OrchestratorConfig
 from orchestrator.curator_submit import SubmitBatchResult, submit_task_batch
+from orchestrator.decision_note import decision_note_fields
 from orchestrator.delivered_checks import (
     DeliveredChecksBlock,
     gate_mark_done_on_delivered_checks,
@@ -144,6 +154,7 @@ from orchestrator.exit_contract import (
 from orchestrator.git_ops import (
     BranchResetError,
     GitOps,
+    GitQueryFailed,
     TrainMembership,
     WarmLaneRequeue,
     WorktreeConflictError,
@@ -172,6 +183,7 @@ from orchestrator.merge_lane.landing_evidence import (
     LandingReason,
     LandingVerdict,
     file_unattributed_landing_escalation,
+    is_valid_sha_40,
     validate_landing_evidence,
     validate_reported_landing,
 )
@@ -184,6 +196,7 @@ from orchestrator.merge_lane.unmeasured_delivery import (
 )
 from orchestrator.merger_failure import merger_failure_report
 from orchestrator.module_charter import derive_modules, sanitize_files_for_persist
+from orchestrator.narrow_gate_delta import train_exclusions
 from orchestrator.plan_descope import (
     DoneStepIntegrityVerdict,
     check_done_step_integrity,
@@ -218,12 +231,14 @@ from orchestrator.reviewer_failure import (
     triage_reviewer_errors,
 )
 from orchestrator.routing import (
+    DispatchedRoute,
     PlanShape,
     RoleDefaults,
     RouteInputs,
     _config_key,
     resolve_route,
 )
+from orchestrator.routing_dispatch import plan_shape_fields
 from orchestrator.scheduler import (
     BlastRadiusResult,
     SetTaskStatusRejected,
@@ -344,6 +359,8 @@ def _inject_plan_tools_mcp(
     The server exposes only ``role.plan_tools_grants``: dispatches run under
     ``bypassPermissions``, where ``allowed_tools`` neither hides nor denies a
     tool, so the grant is enforced by the server registering only these names.
+    ``role.name`` is passed as ``--caller-role``, so the server's markup
+    records name the role they came from (task 5055).
 
     The plan-tools server is launched via the direct-interpreter no-uv hot path
     (task 1776): ``sys.executable -m orchestrator.mcp.plan_tools --worktree <wt>``.
@@ -372,7 +389,7 @@ def _inject_plan_tools_mcp(
     mcp_config.setdefault('mcpServers', {})[PLAN_TOOLS_MCP_SERVER] = plan_tools_mcp_server(
         _ORCH_PROJECT_DIR, cwd, python_executable=sys.executable,
         meta_root=_meta_root_for_worktree(cwd), task_root=task_root,
-        granted_tools=role.plan_tools_grants,
+        granted_tools=role.plan_tools_grants, caller_role=role.name,
     )
     return mcp_config
 
@@ -1230,6 +1247,8 @@ class WorkflowMetrics:
     judge_invocations: int = 0
     judge_cost_usd: float = 0.0
     judge_early_exits: int = 0
+    # One entry per returned invocation; read by evals/runner.py::collect_metrics.
+    dispatched_routes: list[DispatchedRoute] = field(default_factory=list)
 
 
 class _PriorImplStatus(NamedTuple):
@@ -1293,6 +1312,71 @@ def _is_plausible_sha(value: object) -> bool:
         _MIN_ABBREV_SHA_LEN <= len(text) <= 40
         and all(ch in string.hexdigits for ch in text)
     )
+
+
+class _CitationRefusal(StrEnum):
+    """Why a ready_to_merge report's cited commit does not corroborate the tip."""
+
+    NOT_A_SHA = 'not_a_sha'
+    GIT_ERROR = 'git_error'
+    NO_UNIQUE_COMMIT = 'no_unique_commit'
+    OTHER_COMMIT = 'other_commit'
+
+
+@dataclass(frozen=True)
+class _CitationMismatch:
+    summary: str
+    measured: dict[str, str | None]
+
+
+async def _cited_commit_mismatch(
+    git_ops: GitOps, cited: str, tip: str,
+) -> _CitationMismatch | None:
+    """None when *cited* names the commit *tip*; otherwise why it does not.
+
+    Only a hex SHA, full or abbreviated (:func:`_is_plausible_sha`), counts as
+    a citation. A ref name such as ``HEAD`` or the task branch is refused
+    without asking git: it always resolves to the current tip, so it would
+    corroborate nothing about the tip the reporter saw.
+    """
+    def mismatch(
+        reason: _CitationRefusal, summary: str, **facts: str | None,
+    ) -> _CitationMismatch:
+        return _CitationMismatch(
+            summary,
+            {'cited': cited, 'tip': tip, 'reason': reason.value, **facts},
+        )
+
+    if not _is_plausible_sha(cited):
+        return mismatch(
+            _CitationRefusal.NOT_A_SHA,
+            f'cited {cited[:40]!r} is not a hex SHA of at least '
+            f'{_MIN_ABBREV_SHA_LEN} characters (ref names are refused); cite '
+            f"the branch tip's SHA, which is {tip[:12]}",
+        )
+    try:
+        resolved = (await git_ops.commits_named([cited])).get(cited)
+    except GitQueryFailed as exc:
+        return mismatch(
+            _CitationRefusal.GIT_ERROR,
+            f'git could not resolve the cited commit {cited[:12]}',
+            git_error=str(exc),
+        )
+    if resolved is None:
+        return mismatch(
+            _CitationRefusal.NO_UNIQUE_COMMIT,
+            f'cited {cited[:12]} names no unique commit (missing or ambiguous); '
+            f'the branch tip is {tip[:12]}',
+            resolved=None,
+        )
+    if resolved != tip:
+        return mismatch(
+            _CitationRefusal.OTHER_COMMIT,
+            f'cited {cited[:12]} names {resolved[:12]} but the branch tip is '
+            f'{tip[:12]}',
+            resolved=resolved,
+        )
+    return None
 
 
 def _iteration_entry_is_work(entry: dict) -> bool:
@@ -2261,10 +2345,14 @@ class TaskWorkflow:
         ranges_by_id: dict[str, dict[str, list[tuple[int, int]]]] = {
             cid: r for cid, r in zip(_all_range_ids, _range_results, strict=True)
         }
+        excluded = await train_exclusions(
+            self.config.narrow_merge_gate, self.git_ops.project_root, self.git_ops.config.main_branch,
+            {cid: canonical_queued_branch_name(cid, self.git_ops.config.branch_prefix) for cid in _all_range_ids},
+        )
 
         selected = select_train_members(
             self.task_id, candidate_ids, ranges_by_id,
-            self.config.merge_train_max_members,
+            self.config.merge_train_max_members, excluded=excluded,
         )
         if len(selected) < 2:
             # No viable train (no stackable candidates or lone anchor).
@@ -3287,6 +3375,8 @@ class TaskWorkflow:
                 return _r
             # Normal path: EXECUTE + VERIFY + REVIEW loop (with escalation retry)
             while True:
+                if (refused := await self._hand_off_lane_plan()) is not None:
+                    return refused
                 outcome = await self._execute_verify_review_loop()
                 if outcome == WorkflowOutcome.ESCALATED:
                     self._enter_phase(WorkflowState.ESCALATED)
@@ -3411,6 +3501,8 @@ class TaskWorkflow:
                                 'Scope grant',
                             )
 
+                    if (refused := await self._hand_off_lane_plan()) is not None:
+                        return refused
                     # Resume with resolution context
                     logger.info(f'Task {self.task_id}: resuming after escalation resolution')
                     async def build_resume_prompt(
@@ -5850,6 +5942,47 @@ class TaskWorkflow:
         )
         return WorkflowOutcome.PLANNED
 
+    async def _architect_prompt_unless_confirmed(
+        self, build_prompt: PromptBuilder, plan_before_invoke: Plan | None,
+    ) -> str | None:
+        """The architect's prompt, or None once the plan on disk carries a confirmation *plan_before_invoke* did not."""
+        assert self.artifacts is not None
+        plan = self.artifacts.peek_plan_model()
+        if newly_confirmed(plan, plan_before_invoke):
+            logger.warning(
+                'Task %s: the architect confirmed its plan (_finalized_at %s, was %s) '
+                'before its run ended; declining the re-dispatch (task 6814)',
+                self.task_id, plan.lifecycle.confirmed_at,
+                plan_before_invoke.lifecycle.confirmed_at if plan_before_invoke else None,
+            )
+            return None
+        return await build_prompt()
+
+    async def _hold_on_plan_exit_conflict(self, plan_before_phase: Plan | None) -> WorkflowOutcome | None:
+        """Block behind one L1 when this phase both confirmed a plan and wrote exit reports; None when it did not."""
+        assert self.artifacts is not None
+        conflict = find_plan_exit_conflict(
+            self.artifacts.peek_plan_model(), plan_before_phase, read_exit_reports(self.artifacts),
+        )
+        if conflict is None:
+            return None
+        logger.error(
+            'Task %s: the architect phase confirmed a plan and also wrote exit report(s) %s',
+            self.task_id, [report.value for report in conflict.reports],
+        )
+        await self._stop_and_clear_steward()
+        outcome = await self._mark_blocked(
+            conflict.summary(),
+            detail=conflict.detail(),
+            escalate_to_human=True,
+            category='design_concern',
+            dry_run_spawn=DryRunSpawn.NEVER,
+        )
+        # Cleared only once the escalation is filed, so a raising
+        # _mark_blocked leaves the evidence for the next attempt.
+        clear_exit_reports(self.artifacts, conflict.reports)
+        return outcome
+
     async def _run_architect_for_plan(
         self, build_prompt: PromptBuilder,
     ) -> WorkflowOutcome | None:
@@ -5869,12 +6002,20 @@ class TaskWorkflow:
                     self.task_id, status='pending', level=0,
                 )
             }
+        plan_before_phase = self.artifacts.peek_plan_model()
 
         result: AgentResult | None = None
         rebase_retry_used = False
         for _outer_attempt in range(2):  # at most one rebase-retry round-trip
             for attempt in range(2):
-                result = await self._invoke(ARCHITECT, build_prompt, self.worktree)
+                result = await self._invoke(
+                    ARCHITECT,
+                    partial(
+                        self._architect_prompt_unless_confirmed, build_prompt,
+                        self.artifacts.peek_plan_model(),
+                    ),
+                    self.worktree,
+                )
 
                 if not result.success:
                     cls = classify_agent_failure(result)
@@ -5883,15 +6024,14 @@ class TaskWorkflow:
                     # otherwise cut off).  A plan carrying ``_finalized_at`` was
                     # explicitly declared complete, so it is safe to use despite
                     # the run-level failure — the same validation gates below
-                    # still apply.  Without the marker the plan is an unfinished
-                    # partial; block and let the next session's completion pass
-                    # finish it.
-                    salvaged = self.artifacts.read_plan()
-                    if (
-                        salvaged
-                        and salvaged.get('_finalized_at')
-                        and salvaged.get('steps')
-                    ):
+                    # still apply.  A re-dispatch declined by
+                    # _architect_prompt_unless_confirmed lands here too, since
+                    # newly_confirmed implies is_confirmed.  Without the marker
+                    # the plan is an unfinished partial; block and let the next
+                    # session's completion pass finish it.
+                    salvaged_plan = self.artifacts.read_plan_model()
+                    salvaged = salvaged_plan.to_json() if salvaged_plan is not None else {}
+                    if is_confirmed(salvaged_plan):
                         logger.warning(
                             'Task %s: architect run failed (%s) but a finalized '
                             'plan (%d steps) is on disk — salvaging instead of '
@@ -5987,7 +6127,10 @@ class TaskWorkflow:
             # merge submit (less decisive than already_done's clean DONE — the
             # work is on the BRANCH, not main — but more decisive than a
             # re-looping blocking_dependency); blocking_dependency may re-loop
-            # the architect.
+            # the architect.  A plan confirmed in this same phase turns any of
+            # them into a conflict, held for a ruling before routing (task 6814).
+            if outcome := await self._hold_on_plan_exit_conflict(plan_before_phase):
+                return outcome
             verdict = await self._route_task_verdict_report()
             if verdict is not None:
                 return verdict
@@ -7931,10 +8074,12 @@ class TaskWorkflow:
 
         Caller has already verified the artifact exists.
 
-        Validation, in three parts. **Reachability**: ``commit`` must be
-        non-empty and reachable from main — ``git merge-base --is-ancestor``
-        returns false for both unknown SHAs and SHAs not on main, so that
-        single check covers both. **Attribution** (task 4704): reachability
+        Validation, in three parts. **Reachability**: ``commit`` must be a
+        full 40-character lowercase hex sha (``is_valid_sha_40``; anything
+        else is a malformed report and never reaches git) and reachable from
+        main, read through ``GitOps.is_ancestor_checked``. A git error there
+        is reported as reachability left unanswered, never as not-reachable.
+        **Attribution** (task 4704): reachability
         proves only that the commit EXISTS on main, so the report is
         corroborated against the task's own declared ``metadata.files`` /
         ``delivered_checks`` and the commit's effect must survive at main
@@ -7982,17 +8127,35 @@ class TaskWorkflow:
                 detail=json.dumps(report, indent=2)[:2000],
                 merge_phase=merge_phase,
             )
+        if not is_valid_sha_40(commit):
+            return await self._mark_blocked(
+                f'Architect wrote malformed already_done.json (commit '
+                f'{commit[:60]!r} is not a full 40-character lowercase hex '
+                f'commit sha)',
+                detail=json.dumps(report, indent=2)[:2000],
+                merge_phase=merge_phase,
+            )
 
         main_sha = await self.git_ops.get_main_sha()
-        on_main = await self.git_ops.is_ancestor(commit, main_sha)
+        on_main = await self.git_ops.is_ancestor_checked(commit, main_sha)
+        reachability_detail = (
+            f'commit: {commit}\nmain_sha: {main_sha}\nevidence: {evidence}'
+        )[:2000]
+        if on_main is None:
+            return await self._mark_blocked(
+                f'Architect reported task already done at {commit[:12]} '
+                f'but git could not answer whether that commit is reachable '
+                f'from main (merge-base --is-ancestor errored; usually the '
+                f'sha is not a commit in this repository, otherwise a git '
+                f'failure), so reachability was never established',
+                detail=reachability_detail,
+                merge_phase=merge_phase,
+            )
         if not on_main:
             return await self._mark_blocked(
                 f'Architect reported task already done at {commit[:12]} '
                 f'but commit is not reachable from main',
-                detail=(
-                    f'commit: {commit}\nmain_sha: {main_sha}\n'
-                    f'evidence: {evidence}'
-                )[:2000],
+                detail=reachability_detail,
                 merge_phase=merge_phase,
             )
 
@@ -8113,7 +8276,8 @@ class TaskWorkflow:
         The report is NEVER trusted.  Every predicate is re-derived FIRST-HAND
         here (INV-3 corroborate-before-acting):
 
-        1. the cited ``commit`` equals the branch tip we resolve ourselves;
+        1. the cited ``commit``, a hex SHA either full or abbreviated, names the
+           branch tip we resolve ourselves;
         2. clean fast-forward — main is an ancestor of the tip, and the tip is
            NOT already contained in main (that would be ``already_done``);
         3. verify PASSED on this exact tip
@@ -8199,12 +8363,9 @@ class TaskWorkflow:
                 'the task branch does not resolve',
                 {'branch': branch_name, 'main_sha': main_sha, 'cited': commit},
             )
-        if commit != tip:
-            return await _reject(
-                'cited_commit',
-                f'cited {commit[:12]} but the branch tip is {tip[:12]}',
-                {'cited': commit, 'tip': tip},
-            )
+        mismatch = await _cited_commit_mismatch(self.git_ops, commit, tip)
+        if mismatch is not None:
+            return await _reject('cited_commit', mismatch.summary, mismatch.measured)
 
         main_on_branch = await self.git_ops.is_ancestor(main_sha, tip)
         branch_on_main = await self.git_ops.is_ancestor(tip, main_sha)
@@ -8769,9 +8930,7 @@ class TaskWorkflow:
         reason = str(report.get('reason') or '').strip()
         evidence = str(report.get('evidence') or '')
 
-        if self._steward:
-            await self._steward.stop()
-            self._steward = None
+        await self._stop_and_clear_steward()
 
         self.artifacts.clear_unactionable_task()
 
@@ -8821,9 +8980,7 @@ class TaskWorkflow:
         evidence = str(report.get('evidence') or '')
         proposed_resolution = str(report.get('proposed_resolution') or '')
 
-        if self._steward:
-            await self._steward.stop()
-            self._steward = None
+        await self._stop_and_clear_steward()
 
         if not premise:
             result = await self._mark_blocked(
@@ -9840,7 +9997,7 @@ class TaskWorkflow:
                 if self.config.recycle_config_dir_on_zero_output:
                     self._recycle_config_dir()
                 continue  # skip judge on zero-output; increment next iteration
-            elif is_timed_out_with_progress(result):
+            elif is_timed_out_with_progress(result) and self._resumes_killed_sessions(IMPLEMENTER):
                 # γ: a productive implementer iteration was killed at the wall
                 # (transcript_turns > 0 — real work done).  Resume the SAME Claude
                 # session next iteration so the ~20 min of context continues instead
@@ -9899,7 +10056,9 @@ class TaskWorkflow:
                 )
                 continue  # re-dispatch with --resume; skip judge this iteration
             else:
-                # Non-timeout result: reset both consecutive counters.
+                # Neither a wedge nor a resumable progress kill: a non-timeout
+                # result, or a productive kill on a backend that cannot resume,
+                # which re-dispatches fresh. Reset both consecutive counters.
                 consecutive_zero_output = 0
                 consecutive_progress_timeouts = 0
 
@@ -14656,7 +14815,8 @@ class TaskWorkflow:
         parse_spawn_identity) so every orchestrator-launched agent's registry
         record carries an accurate role/project/task and a non-null parent
         (task 2512). Built for EVERY role — unlike _build_agent_env, which
-        returns None for merger/judge/reviewer.
+        returns None by default for merger/judge/reviewer (i.e. absent a
+        role_env_overrides entry).
 
         CLAUDE_SPAWN_PARENT_ID defaults to the workflow-root self.session_id
         (used for the architect itself, and as the fallback for any role
@@ -14840,6 +15000,14 @@ class TaskWorkflow:
                 'resume-outcome sink', self.task_id, exc_info=True,
             )
 
+    def _backend_for(self, role: AgentRole) -> str:
+        """The configured agent backend that runs *role*."""
+        return getattr(self.config.backends, _config_key(role.name), 'claude')
+
+    def _resumes_killed_sessions(self, role: AgentRole) -> bool:
+        """Whether _invoke can continue *role*'s killed session: its resume lifecycle corroborates against a claude transcript."""
+        return self._backend_for(role) == 'claude'
+
     async def _invoke(
         self,
         role: AgentRole,
@@ -14861,7 +15029,6 @@ class TaskWorkflow:
                 f'— check for work before invoking'
             )
         timeouts_cfg = self.config.timeouts
-        backends_cfg = self.config.backends
 
         # Full-name lookup is deliberate (routing alpha, task 2531) — do NOT
         # re-derive a split('_')[0] prefix here. Every routing submodel now
@@ -14873,7 +15040,9 @@ class TaskWorkflow:
         # already resolved config by full role name: module_tagger
         # (harness.py's self.config.models.module_tagger) and deep_reviewer
         # (review_checkpoint.py's getattr(self.config.models, 'deep_reviewer', ...)).
-        role_key = role.name
+        # _config_key only collapses every reviewer* role to the shared
+        # 'reviewer' slot.
+        role_key = _config_key(role.name)
 
         # Route resolution (PRD adaptive-model-routing, task ε): the single
         # layered authority for (model, effort, budget_usd, max_turns),
@@ -14914,16 +15083,11 @@ class TaskWorkflow:
         source_layer = decision.source_layer
         rule_id = decision.rule_id
 
-        timeout_val = getattr(timeouts_cfg, role_key, self.config.invocation_timeout)
-        backend_val = getattr(backends_cfg, role_key, 'claude')
-
         # timeout_val/backend_val are resolver-external (route resolution
         # owns model/effort/budget_usd/max_turns only — see this task's plan
-        # design_decisions) — the reviewer* collapse stays local to _invoke
-        # for just these two fields.
-        if role.name.startswith('reviewer'):
-            timeout_val = timeouts_cfg.reviewer
-            backend_val = backends_cfg.reviewer
+        # design_decisions).
+        timeout_val = getattr(timeouts_cfg, role_key, self.config.invocation_timeout)
+        backend_val = self._backend_for(role)
 
         scope = invocation_scope(self.config, role)
 
@@ -14947,10 +15111,10 @@ class TaskWorkflow:
                     'Task %s: %s granted the main checkout for its docs-only scope: %s',
                     self.task_id, role.name, [str(p) for p in write_set.docs_main_paths],
                 )
-            # Pre-create the load-bearing claude_fleet carve-out OUTSIDE the
-            # sandbox at this single INV-5/D11 write-set consumption point, so it
-            # exists before sandbox_extras (below) is built (task 2996) — see
-            # ensure_claude_fleet_dir for the full backend rationale.
+            # Pre-create the carve-outs ensure_sandbox_dirs owns OUTSIDE the
+            # sandbox at this single INV-5/D11 write-set consumption point, so
+            # they exist before sandbox_extras (below) is built — see
+            # ensure_sandbox_dirs for which ones and the backend rationale.
             self._ensure_sandbox_dirs(write_set)
             sandbox_extras = [str(p) for p in write_set.writable_paths()]
             # Fail-CLOSED (task 2908, PRD D4 / INV-4): refuse to dispatch this
@@ -15303,19 +15467,21 @@ class TaskWorkflow:
                     session_id=session_id_val,
                     resume_session_id=resume_session_id,
                     resume_prompt=resume_prompt,
-                    # Judge is safe by OMISSION from config.role_env_overrides (the
-                    # per-role OPT-IN endpoint-env map, task 2460) — _build_agent_env
-                    # no longer gates roles by a hardcoded allow-list, so the judge
-                    # simply must not be named there.  Opting it in would propagate
-                    # ANTHROPIC_BASE_URL and route it through vLLM, where
-                    # max_model_len causes ServerDisconnectedError after 2 tool-use
-                    # rounds (3cd380a079) — do not add 'judge' to role_env_overrides
-                    # unless that endpoint is confirmed to handle its tool-use
-                    # pattern.  Cap hits on Claude API are handled by UsageGate
-                    # account failover (wired in runner.py for eval mode).
+                    # Judge gets no ENDPOINT env by default: it is absent from
+                    # config.role_env_overrides (the per-role OPT-IN map, task 2460).
+                    # Giving it ANTHROPIC_BASE_URL / ANTHROPIC_AUTH_TOKEN there for a
+                    # vLLM endpoint hits max_model_len, causing
+                    # ServerDisconnectedError after 2 tool-use rounds (3cd380a079)
+                    # — do not give 'judge' endpoint env unless that endpoint is
+                    # confirmed to handle its tool-use pattern.  A judge entry of
+                    # non-routing keys only (e.g. CARGO_HOME, npm_config_cache) is
+                    # safe: _build_agent_env merges the global config.env_overrides
+                    # only for implementer/debugger, so a judge entry contributes
+                    # only its own literal keys.  Cap hits on Claude API are handled
+                    # by UsageGate account failover (wired in runner.py for eval mode).
                     env_overrides=self._build_agent_env(role),
                     # Spawn-identity env for the SessionStart hook (task 2512) —
-                    # independent of env_overrides (which is None for
+                    # independent of env_overrides (None by default for
                     # merger/judge/reviewer); spawn_env is built for every role.
                     spawn_env=self._build_spawn_env(role),
                 )
@@ -15494,6 +15660,9 @@ class TaskWorkflow:
         self.metrics.total_cost_usd += result.cost_usd
         self.metrics.total_duration_ms += result.duration_ms
         self.metrics.agent_invocations += 1
+        self.metrics.dispatched_routes.append(
+            DispatchedRoute(role.name, decision, result.model_id),
+        )
         self.metrics.total_turns += result.turns
         self.metrics.total_input_tokens += result.input_tokens or 0
         self.metrics.total_output_tokens += result.output_tokens or 0
@@ -15577,6 +15746,7 @@ class TaskWorkflow:
             source_layer=source_layer,
             rule_id=rule_id,
             rejected=list(decision.rejected),
+            plan_shape=plan_shape,
         )
 
         if self.cost_store:
@@ -15616,8 +15786,12 @@ class TaskWorkflow:
         source_layer: str,
         rule_id: str | None,
         rejected: list[str] | None = None,
+        plan_shape: PlanShape | None,
     ) -> None:
         """Persist the resolved routing decision for this invocation (PRD γ).
+
+        The record carries ``plan_steps``/``plan_modules`` derived from
+        *plan_shape*, the shape the resolver saw.
 
         Best-effort (never raises) but awaited synchronously inside
         ``_invoke``'s critical path — it is not fire-and-forget in the
@@ -15654,6 +15828,7 @@ class TaskWorkflow:
                 rejected=rejected or [],
                 routing_tier=state.routing_tier,
                 decided_at=datetime.now(UTC).isoformat(),
+                **plan_shape_fields(plan_shape),
             )
         except Exception:
             logger.warning(
@@ -16733,6 +16908,28 @@ class TaskWorkflow:
             note='branch already on main at workflow start (pre-PLAN recovery)',
         )
 
+    async def _hand_off_lane_plan(self) -> WorkflowOutcome | None:
+        """Hand the implementer a lane whose ``.task/plan.json`` reads this task's plan: relink once, else block."""
+        assert self.artifacts is not None
+        fault = self.artifacts.lane_plan_fault()
+        if fault is None:
+            return None
+        logger.warning('Task %s: relinking before the implementer handoff: %s', self.task_id, fault.describe())
+        relink_error: OSError | None = None
+        try:
+            self.artifacts.ensure_lane_symlinks()
+        except OSError as exc:
+            relink_error = exc
+        fault = self.artifacts.lane_plan_fault()
+        if fault is None:
+            return None
+        detail = fault.describe()
+        if relink_error is not None:
+            detail += f'\nRelink failed: {relink_error!r}'
+        return await self._mark_blocked(
+            f'Lane handoff refused: {fault.kind.value} at {fault.lane_path}', detail=detail, category='infra_issue',
+        )
+
     async def _recover_before_execute(self) -> WorkflowOutcome | None:
         """Ghost-loop early exit before EXECUTE (Guard 2, PRD α, MP-1/MP-2).
 
@@ -17183,25 +17380,27 @@ class TaskWorkflow:
         )
 
     def _ensure_sandbox_dirs(self, write_set: WriteSet) -> None:
-        """Pre-create the load-bearing ``claude_fleet`` carve-out OUTSIDE the
-        sandbox before dispatch (task 2996) — see
-        ``orchestrator.agents.write_set.ensure_claude_fleet_dir`` for the full
-        backend rationale (why neither the pure ``compute_write_set`` nor either
-        backend can materialize this carve-out from inside the sandbox).
+        """Pre-create the carve-outs ``orchestrator.agents.write_set.ensure_sandbox_dirs``
+        owns OUTSIDE the sandbox before dispatch — see that helper for which
+        ones and why neither the pure ``compute_write_set`` nor either backend
+        can materialize them from inside the sandbox.
 
         This wrapper owns the operator-facing failure posture: best-effort, so
-        on failure it WARNs LOUDLY (loud-over-silent) with the task_id + path
-        and CONTINUES — a missing fleet dir degrades only fleet session-registry
-        recording, not the agent's task, so aborting the whole dispatch would be
-        a disproportionate fail-closed.
+        for each path that could not be created it WARNs with the task_id and
+        THAT path, then CONTINUES. The backends' own notice of the dropped grant
+        names no task; this is the orchestrator-log signal an operator can
+        triage. A missing carve-out degrades the one capability that writes
+        beneath it, not the agent's task, so aborting the whole dispatch would
+        be a disproportionate fail-closed.
         """
-        if not ensure_claude_fleet_dir(write_set):
+        for failed_path in ensure_sandbox_dirs(write_set):
             logger.warning(
                 'task %s: could not pre-create %s outside the sandbox — both '
-                'backends will skip the claude_fleet carve-out and in-sandbox '
-                'session-registry writes may fail',
+                'backends skip a nonexistent writable path, so this carve-out '
+                'will be dropped from the sandbox and in-sandbox writes beneath '
+                'it will fail with EACCES',
                 self.task_id,
-                write_set.claude_fleet,
+                failed_path,
             )
 
     def _guard_sandbox(self, role_name: str) -> str:
@@ -18675,7 +18874,11 @@ class TaskWorkflow:
             logger.warning(f'Failed to write completion to memory: {e}')
 
     async def _write_decisions_to_memory(self) -> None:
-        """Write plan design decisions to fused-memory."""
+        """Write plan design decisions to fused-memory, each declaring this task.
+
+        The content and declaration come from
+        orchestrator/src/orchestrator/decision_note.py::decision_note_fields.
+        """
         decisions = self.plan.get('design_decisions', [])
         if not decisions:
             return
@@ -18689,7 +18892,7 @@ class TaskWorkflow:
                         self.mcp.url,
                         'add_memory',
                         {
-                            'content': f"Decision: {decision['decision']}\nRationale: {decision['rationale']}",
+                            **decision_note_fields(self.task_id, decision),
                             'category': 'decisions_and_rationale',
                             'project_id': self.config.fused_memory.project_id,
                             'agent_id': f'orchestrator-task-{self.task_id}',
@@ -19068,7 +19271,7 @@ class TaskWorkflow:
         await a cancelled loop that can never publish; it also drops this
         steward's cost from the report ``harness.py::_run_slot`` reads off
         ``workflow._steward``.  A failing ``stop()`` is suppressed: it must not
-        turn a park or a cleared gate into a workflow crash.
+        turn a park, a cleared gate or an L1 block into a workflow crash.
         """
         if self._steward is not None:
             with contextlib.suppress(Exception):

@@ -1160,6 +1160,17 @@ class ModuleLockTable:
         logger.info(f'Task {task_id} released subset: {released}')
         return released
 
+    def withdraw_acquire(self, task_id: str) -> list[str]:
+        """Undo a ``try_acquire`` whose dispatch never happened: drop the task's entry, keyless or not, so ``is_held`` turns False, and leave any successor relation in force.
+
+        Not a release: it is for a hold no ``lock_acquired`` has announced, and a
+        dispatched task's locks go through ``Scheduler.release``
+        (orchestrator/tests/test_lock_release_single_writer_guard.py).
+        """
+        withdrawn = sorted(self._held.pop(task_id, set()))
+        logger.info(f'Task {task_id} withdrew its acquire: {withdrawn}')
+        return withdrawn
+
     def try_acquire_additional(self, task_id: str, additional: list[str]) -> bool:
         """Non-blocking attempt to expand lock set for a task."""
         depth = self._config.lock_depth

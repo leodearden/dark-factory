@@ -21,6 +21,7 @@ import logging
 import socket
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -51,6 +52,7 @@ from legibility import (
     config,
     nightly,
 )
+from shared.config_dir import CONFIG_DIR_PREFIX, reset_sweep_once_state
 
 # WHY `with alarm.own_endpoint():` AROUND EVERY REAL POST BELOW.
 #
@@ -64,6 +66,19 @@ from legibility import (
 
 _RAISED_MESSAGE = 'codebook merge produced an invalid codebook'
 _PROJECT_ID = 'e2e_census_project'
+_SESSION_SWEEP_PREFIX = CONFIG_DIR_PREFIX + 'legibility-session-'
+
+
+@pytest.fixture(autouse=True)
+def private_tempdir(tmp_path, monkeypatch):
+    """The legibility entrypoints these tests drive resolve their dead-PID
+    sweeps and scratch config dirs under `tempfile.gettempdir()`. This points
+    that at a private dir, so no test here scans or deletes from the host /tmp
+    (task 11283)."""
+    root = tmp_path / 'tempdir'
+    root.mkdir()
+    monkeypatch.setattr(tempfile, 'tempdir', str(root))
+    return root
 
 
 def _write_legibility_yaml(project_root, *, escalation_port):
@@ -173,7 +188,7 @@ def test_an_alarm_to_a_down_server_reports_not_landed_without_raising(tmp_path, 
 
 
 def test_census_hard_failure_lands_a_retrievable_escalation(
-    tmp_path, serve_escalation_mcp, monkeypatch,
+    tmp_path, serve_escalation_mcp, monkeypatch, private_tempdir, plant_dead_pid_dir,
 ):
     """A forced census failure exits 1 and leaves its fail-loud boundary's
     alarm in a real queue, retrievable by id."""
@@ -185,6 +200,8 @@ def test_census_hard_failure_lands_a_retrievable_escalation(
         raise RuntimeError(_RAISED_MESSAGE)
 
     monkeypatch.setattr(census_run, 'run_census', _raising_run_census)
+    ghost = plant_dead_pid_dir(private_tempdir, _SESSION_SWEEP_PREFIX)
+    reset_sweep_once_state(_SESSION_SWEEP_PREFIX)
 
     with alarm.own_endpoint():
         exit_code = census.main(['--project-root', str(project_root), '--force'])
@@ -196,6 +213,12 @@ def test_census_hard_failure_lands_a_retrievable_escalation(
         f'legibility census run failed ({_PROJECT_ID}): RuntimeError: {_RAISED_MESSAGE}'
     )
     assert _RAISED_MESSAGE in fetched.detail
+    assert not ghost.exists(), (
+        f'{ghost.name} survived in the private tempdir: either the dead-PID sweep '
+        f'of the census session runner ran outside it (over the host /tmp), or '
+        f'_SESSION_SWEEP_PREFIX no longer matches the prefix that '
+        f'scripts/legibility/session_runner.py sweeps'
+    )
 
 
 def test_nightly_crash_lands_a_retrievable_escalation(tmp_path, serve_escalation_mcp):

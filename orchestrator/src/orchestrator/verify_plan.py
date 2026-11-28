@@ -905,7 +905,7 @@ def _derive_module_runs(
         elif role == 'task' and production_trigger is not None:
             runs.append(_task_role_production_pytest_run(
                 mc.prefix, mc.test_command, production_trigger, collectable_tests,
-                _whole_tree_guard_family(mc.prefix, list_pkg_tests, worktree_reader),
+                whole_tree_guard_family(mc.prefix, list_pkg_tests, worktree_reader),
                 worktree_reader,
             ))
         elif collectable_tests:
@@ -950,7 +950,7 @@ def _derive_module_runs(
     return runs
 
 
-def _whole_tree_guard_family(
+def whole_tree_guard_family(
     prefix: str,
     list_pkg_tests: Callable[[str], list[str]] | None,
     worktree_reader: Callable[[str], str | None],

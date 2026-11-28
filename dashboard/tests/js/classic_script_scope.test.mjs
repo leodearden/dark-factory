@@ -73,6 +73,7 @@ const EXPECTED_WINDOW_GLOBALS = {
   'window_chip.js': 'DF_WINDOW_CHIP',
   'merge_queue.js': 'DF_MERGE_QUEUE',
   'performance_cards.js': 'DF_PERFORMANCE_CARDS',
+  'performance_history.js': 'DF_PERFORMANCE_HISTORY',
   'escalation_views.js': 'DF_ESCALATION_VIEWS',
   'escalation_focus.js': 'DF_ESCALATION_FOCUS',
   'escalation_check_owner.js': 'DF_ESCALATION_CHECK_OWNER',
@@ -86,6 +87,7 @@ const EXPECTED_WINDOW_GLOBALS = {
   'chart_marks.js': 'DF_CHART_MARKS',
   'quality_view.js': 'DF_QUALITY_VIEW',
   'asset_skew.js': 'DF_ASSET_SKEW',
+  'host_load_card.js': 'DF_HOST_LOAD_CARD',
 };
 
 // NOTE — no `document` shim, and that omission is load-bearing rather than an

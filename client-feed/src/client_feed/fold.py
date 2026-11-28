@@ -15,6 +15,7 @@ from client_feed.contract import (
     CriteriaDeclared,
     CriteriaResults,
     Criterion,
+    DefectFiled,
     Degradation,
     EventHeader,
     FactoryState,
@@ -22,6 +23,7 @@ from client_feed.contract import (
     FeedEvent,
     FeedLine,
     FeedState,
+    FiledDefect,
     FileRevealed,
     Heartbeat,
     InFlightTask,
@@ -89,6 +91,7 @@ class _Accumulator:
     revealed: dict[str, RevealedFile]
     criteria: dict[RunKind, CriteriaResults]
     criteria_declared: dict[str, Criterion]
+    defects_filed: dict[str, FiledDefect]
     recent: OrderedDict[_RecentKey, FeedEvent]
 
     @classmethod
@@ -109,6 +112,7 @@ class _Accumulator:
             revealed={file.path: file for file in start.revealed},
             criteria=dict(start.criteria),
             criteria_declared=dict(start.criteria_declared),
+            defects_filed=dict(start.defects_filed),
             recent=OrderedDict((_recent_key(event), event) for event in start.recent),
         )
 
@@ -130,6 +134,7 @@ class _Accumulator:
             revealed=tuple(file for _, file in sorted(self.revealed.items())),
             criteria=dict(sorted(self.criteria.items())),
             criteria_declared=dict(sorted(self.criteria_declared.items())),
+            defects_filed=dict(sorted(self.defects_filed.items())),
             recent=tuple(self.recent.values()),
         )
 
@@ -152,6 +157,7 @@ def _empty_state(project_id: str) -> FeedState:
         revealed=(),
         criteria={},
         criteria_declared={},
+        defects_filed={},
         recent=(),
     )
 
@@ -213,6 +219,12 @@ def _apply_criteria_declared(acc: _Accumulator, event: CriteriaDeclared) -> None
     acc.criteria_declared = {criterion.id: criterion for criterion in event.criteria}
 
 
+def _apply_defect_filed(acc: _Accumulator, event: DefectFiled) -> None:
+    acc.defects_filed[event.ref] = FiledDefect(
+        block=event.block, report=event.report, task_id=event.task_id, gated=event.gated
+    )
+
+
 def _no_state_change(acc: _Accumulator, event: FeedEvent) -> None:
     pass
 
@@ -263,6 +275,7 @@ _HANDLING: Final = _covering_every_event_model([
     _handled(RevealRefused, _no_state_change, in_timeline=True),
     _handled(CriteriaResults, _apply_criteria_results, in_timeline=True),
     _handled(CriteriaDeclared, _apply_criteria_declared, in_timeline=False),
+    _handled(DefectFiled, _apply_defect_filed, in_timeline=True),
 ])
 
 

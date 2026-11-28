@@ -775,7 +775,8 @@ class MemoryMutations:
 # fm/services/memory_metadata_policy.py (ρ) — public functions, today's bodies and sync/async shapes (collaborators passed in):
 #   apply_memory_metadata_validation, normalize_task_id_metadata, infer_recon_pool, apply_cycle_summary_metadata_tagging,
 #   check_canonical_uniqueness, strip_recon_pool_from_non_cycle_summary, stamp_unverified_claim, … (the 883-line block plus infer_recon_pool)
-# fm/services/store_records.py (ρ; υ adds the three Mem0 reads) — MEM0_CONTENT_KEYS, mem0_content, metadata_row_text,
+# fm/services/store_records.py (ρ; υ adds the three Mem0 reads) — metadata_row_text (over
+#   fm/utils/mem0_content_keys.py::mem0_payload_text, the content keys' one home since task 4857),
 #   the record decoders (node_to_dict, edge_to_dict, serialize_temporal, …), the store-error helpers
 #   (degrade_or_reraise, store_failure_diagnostics, …); υ: get_memory_by_id, count_memories_by_metadata, get_memories_by_metadata
 ```
@@ -783,8 +784,9 @@ Invariants: `graph_mutations.py`, `memory_mutations.py`, `memory_metadata_policy
 `journaled_ops.py` import nothing from `memory_service`; `MemoryService` builds `GraphMutations` and
 `MemoryMutations` in `__init__` from its constructor collaborators and keeps one-line public delegates with
 today's signatures; every mutation that wrote a `write_ops` row before the move writes the same row after
-it; `server/grouped_read.py` and `reconciliation/preservation_specimen_guard.py` import public names from
-`store_records`, not privates from `memory_service`.
+it; `server/tools.py` and `reconciliation/preservation_specimen_guard.py` import `metadata_row_text` from
+`store_records`, not from `memory_service`; the Mem0 content keys have one home,
+`utils/mem0_content_keys.py` (task 4857), which `store_records.py` imports and does not restate.
 
 ## Boundary-test sketch
 
@@ -815,7 +817,7 @@ it; `server/grouped_read.py` and `reconciliation/preservation_specimen_guard.py`
 | 18 | schema (ξ) | an edge with `expired_at` set, `invalid_at` NULL | — | `edge_is_active` is True and the Cypher predicate returns it (ruling A preserved) |
 | 19 | grammar (ο) | the existing parametrised precision fixtures | — | unchanged verdicts; `parse_node_name('reify:\n132')` is None; `is_task_vocabulary_qualifier('Task')` is False; `_QUALIFIED_REF_PATTERN` and `_QUALIFIED_NODE_NAME_PATTERN` share one qualifier fragment (identity assert on the fragment, not substring) |
 | 20 | gate (π) | `add_memory` → real SQLite queue → `start()` → typed executor → reconciler under `identity_lock` → journal → response | real `WriteJournal`, `FakeGraphAccess`, fake Mem0 | response per row 4; `write_ops` rows for the enqueue and the terminal outcome under one `write_op_id`; `ReconcileStats` recorded; no private name in the test |
-| 21 | policy (ρ) | the existing metadata-policy and codec tests, importing the public names from `memory_metadata_policy`/`store_records` | — | identical verdicts; `memory_service.py` defines none of the moved names; `grouped_read.py` and `preservation_specimen_guard.py` import no private from `memory_service` |
+| 21 | policy (ρ) | the existing metadata-policy and codec tests, importing the public names from `memory_metadata_policy`/`store_records` | — | identical verdicts; `memory_service.py` defines none of the moved names; `tools.py` and `preservation_specimen_guard.py` import `metadata_row_text` from `store_records`; `store_records.py` restates no content-key tuple |
 | 22 | mutators (τ) | each public graph mutator through `MemoryService` and through a directly built `GraphMutations`, same fakes; `set_event_buffer` before `start()` | fake backend, real `WriteJournal` over `tmp_path` | identical results and `write_ops` rows on both paths; events reach the buffer through the one `EventSink`; `graph_mutations.py` names no `MemoryService` |
 | 23 | mutators (υ) | `delete_memory` with children (refusal, then `cascade=True`) and an `update_memory` content amend, through `MemoryService` and through a directly built `MemoryMutations` | fake Mem0, real `WriteJournal` | identical refusal, rows and storm-escalator calls on both paths; `memory_mutations.py` imports nothing from `memory_service` |
 
@@ -1362,15 +1364,17 @@ upstream stream). Each leaf's `metadata.files` is its Files list.
     precedent); no behaviour changes.
   - Work: C9, D15. `_infer_recon_pool` and the block `_missing_cycle_summary_keys` …
     `_apply_cycle_summary_metadata_tagging` (883 lines at `e634cfe658`) move to `memory_metadata_policy.py` as
-    public functions; `_MEM0_CONTENT_KEYS`, `_mem0_content`, `metadata_row_text` and what remains of
+    public functions; `metadata_row_text` and what remains of
     `_serialize_temporal` … `_store_failure_diagnostics` after α, ε and ξ (552 lines at `e634cfe658`) move to
-    `store_records.py` as public functions; `grouped_read.py`'s private import and `tools.py`'s and
+    `store_records.py` as public functions; `tools.py`'s and
     `preservation_specimen_guard.py`'s `metadata_row_text` imports repoint; tests import the public names.
+    Task 4857 already moved `_MEM0_CONTENT_KEYS` and `_mem0_content` to `utils/mem0_content_keys.py`
+    (`MEM0_CONTENT_KEYS`, `mem0_payload_text`) and repointed `grouped_read.py`; `store_records.py` imports
+    them and restates neither (INV-5).
     Prose moves verbatim (D13); tracked citations of moved symbols are retargeted.
-  - Deletes: the moved definitions from `memory_service.py`; `grouped_read.py`'s
-    `from fused_memory.services.memory_service import _MEM0_CONTENT_KEYS`; ≈150 private test references.
+  - Deletes: the moved definitions from `memory_service.py`; ≈150 private test references.
   - Signal: boundary row 21; `memory_service.py` loses ≈1,400 lines; `_apply_memory_metadata_validation`
-    and `_MEM0_CONTENT_KEYS` absent from `memory_service.py`.
+    and `metadata_row_text` absent from `memory_service.py`.
   - Consumer: υ (imports the policy and codec instead of reaching back into `memory_service.py`); the
     importers named; the next metadata-rule change (one module).
   - Deps: ν (the last in-batch editor before the split, after μ; ν also edits `test_audit_duplicate_memories.py`

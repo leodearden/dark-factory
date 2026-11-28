@@ -10,7 +10,8 @@ under the anchor cannot silence the filer.  Each caller keeps its own
 ``_ANCHOR_TASK_ID`` / ``_AGENT_ROLE`` / ``_CATEGORY`` constants and builds its
 own summary and detail.  :func:`pending_folded_escalations` and
 :func:`resolve_folded_escalations` read and close what a caller filed, for an
-alarm that clears itself, under the same guard.
+alarm that clears itself, and :func:`refresh_folded_escalation` rewrites and
+counts a sustained condition into its one open record, under the same guard.
 
 EVERY FILER'S ANCHOR MUST BE UNIQUE.  Role scoping stops another ROLE's
 record under the anchor from silencing a filer, but a second filer under the
@@ -282,6 +283,40 @@ def _pending_in(
         return []
 
 
+def refresh_folded_escalation(
+    project_root: str | None,
+    *,
+    escalation_id: str,
+    level: int,
+    summary: str,
+    detail: str,
+    logger: logging.Logger,
+    log_label: str,
+) -> bool:
+    """Rewrite the pending record *escalation_id* at *level* and count the repeat.
+
+    Over ``EscalationQueue.refresh_pending``: the id is kept and
+    ``dedupe_count`` rises by one. Returns whether a pending record was
+    refreshed; False for one that is absent, resolved or at another level, or
+    when the queue cannot be opened. NEVER raises.
+    """
+    queue = _open_queue(
+        project_root, logger=logger, log_label=log_label, outcome='nothing refreshed',
+    )
+    if queue is None:
+        return False
+    try:
+        refreshed = queue.refresh_pending(
+            escalation_id, level=level, summary=summary, detail=detail,
+        )
+    except Exception:
+        logger.exception(
+            '%s: failed to refresh %s in project_root=%r', log_label, escalation_id, project_root,
+        )
+        return False
+    return refreshed is not None
+
+
 def resolve_folded_escalations(
     project_root: str | None,
     *,
@@ -309,7 +344,7 @@ def resolve_folded_escalations(
     resolved: list[str] = []
     for esc in pending:
         try:
-            queue.resolve(esc.id, resolution, resolved_by=agent_role)
+            queue.resolve(esc.id, resolution, resolved_by=agent_role, resolution_class='benign')
         except Exception:
             logger.exception('%s: failed to resolve %s', log_label, esc.id)
             continue

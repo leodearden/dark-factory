@@ -272,11 +272,11 @@ project that has none, and it will not add the flake tables to a
 `runs.db` that lacks them — it prints `NO LEDGER` / `NO FLAKE TABLES`
 and exits 0 instead. On a ledger that predates the due list, its first read adds that one empty table, as every ledger entry point does.
 
-**The due list and `filing pending`.** A suppressed test no longer gets its de-flake task during the merge. The merge writes the test's occurrence row and one item on the ledger's due list (`flake_debt_due`, in the same `runs.db`) in one local transaction, and the orchestrator's `flake-debt-drain` background service files the owner afterwards, every 30 seconds, through the same `open_debt` rule as before. Until that filing completes, an open debt row with no owner and an item on the due list reads `filing pending since <time>` (its oldest item's enqueue time): expected, and normally gone within a minute. An ownerless row with no item still reads `*** NO OWNER (invariant breach) ***`. The `due list:` line gives the list's size and the age of its oldest item, and says `PAST THE 30-MINUTE BOUND` once that item has waited longer. A failed filing is retried after 5 minutes, then 10, 20, 40, and hourly after that; nothing is dropped, and nothing caps how many de-flake tasks a burst files. A suppression at a merge sha that does not contain a finished de-flake task's fix closes that task's cycle without a regression escalation.
+**The due list and `filing pending`.** A suppressed test no longer gets its de-flake task during the merge. The merge writes the test's occurrence row and one item on the ledger's due list (`flake_debt_due`, in the same `runs.db`) in one local transaction, and the orchestrator's `flake-debt-drain` background service files the owner afterwards, every 30 seconds, through the same `open_debt` rule as before. Beside it, the `flake-debt-resolution` service closes, hourly, the cycle of every open row whose owner reads back done (see `OWNER DONE` below). Until that filing completes, an open debt row with no owner and an item on the due list reads `filing pending since <time>` (its oldest item's enqueue time): expected, and normally gone within a minute. An ownerless row with no item still reads `*** NO OWNER (invariant breach) ***`. The `due list:` line gives the list's size and the age of its oldest item, and says `PAST THE 30-MINUTE BOUND` once that item has waited longer. A failed filing is retried after 5 minutes, then 10, 20, 40, and hourly after that; nothing is dropped, and nothing caps how many de-flake tasks a burst files. A suppression at a merge sha that does not contain a finished de-flake task's fix closes that task's cycle without a regression escalation.
 
 **Owner markers.** A stored owner is only a pointer, so the report reads every open row's owner live and marks the row when no live task owns the test. Each marker is a §5.9 breach, and the non-convergence line counts them as `owner_done=` and `owner_closed=`.
 
-- `OWNER DONE, DEBT CYCLE NOT CLOSED`: the de-flake task finished, but the ledger never closed its cycle. Closing is lazy today: the test's next suppression closes it, and θ's sweep will once task 3792 lands. If the marker is still there after a later suppression, the orchestrator log's `could not read owner` warning says why `get_task` keeps failing.
+- `OWNER DONE, DEBT CYCLE NOT CLOSED`: the de-flake task finished, but the ledger has not closed its cycle yet. The orchestrator's `flake-debt-resolution` background service closes such cycles hourly, as does the test's next suppression. Each pass writes one `flake_debt_resolution_pass` event (`examined`, `resolved`, `owner_unreadable`, `stop`), an empty pass included, so an hour with no event means the service is not running. A pass reads at most 50 owned rows, resuming where the last pass stopped, so a larger backlog takes more than one pass. It stops at the first owner it cannot read, so `owner_unreadable` is 0 or 1, never a count, and `stop` is then `task_client_failed`; `stop` is `ledger_unreadable` when `runs.db` could not be read, which is not an empty backlog. The first pass runs an hour after the orchestrator starts, and the resume point lives in memory, so a restart starts the walk again from the first row. A marker that survives a pass that reached its row means `get_task` kept failing, and the orchestrator log's `could not read owner` warning says why.
 - `OWNER CANCELLED OR GONE`: the next suppression files a replacement.
 - `(deferred: filed, never released)` is a note, not a breach.
 - `owner liveness: READ FAILED`: no row carries a marker because nothing could be read, not because the owners are healthy, and both counts read `n/a`.
@@ -799,6 +799,149 @@ exists, which bounces the server behind every orchestrator, the dashboard and
 MCP sessions. A clean stop exits 0. A refusal exits 1, and systemd
 retries it with a 5s→60s backoff until the cause is fixed.
 
+#### The defect filer
+
+One `client-feed file-defects --config <policy>` per client project, run as
+`client-feed-filer@<name>.service`. It reads the project's `in/inbox.jsonl`
+and files each portal `defect_reported` line in that project, through
+fused-memory, as a fix task plus the human gate it waits on
+(`plans/client-feed-prd.md` §14). What it may open, connect to and write is
+its isolation invariant, §14.5. `scripts/setup-host.sh` renders the unit from
+`scripts/client-feed-filer.service.template` beside the publisher's, and never
+enables it.
+
+It reads the same policy file as the publisher. That file must carry a
+`filer:` block, whose schema and defaults live in
+`client-feed/src/client_feed/policy.py::FilerPolicy`:
+
+- `state_dir` is required and has no default. Use
+  `~/.local/state/client-feed/<name>/filer/`, owned by Leo. It must lie
+  outside `out_dir`, `in_dir` and `project_root`. That rule is checked again at
+  start with every symlink resolved, before the directory is made (mode 0700)
+  and after. The directory holds only `filer.lock` and `cursor.json`. The
+  cursor is an optimisation: every report is re-derived from the task store,
+  so a deleted cursor re-reads the inbox from its start and files nothing
+  twice.
+- `auto_dispatch` stays `false` until gate σ5 flips it. While it is false,
+  every fix waits on a gate.
+
+The filer runs no git, so unlike the publisher it does not check the
+`project_root` git work tree or `out_dir`. It refuses a policy without a
+`filer:` block, and a `state_dir` that reaches one of the three directories.
+Each refusal exits 1.
+
+One filer holds a state dir at a time, through an exclusive lock on
+`filer.lock`. A second filer on the same policy, the unit or a hand run,
+exits 3 (`client-feed/src/client_feed/cli.py::EXIT_LOCK_HELD`) before it makes
+any request. To run one by hand, stop the instance first.
+
+- `--once` runs one pass and prints its report as JSON. It exits 0 even when
+  a report could not be filed. Such a report is named under `unconverged`, by
+  the refusing tool and its code, and is retried on the next pass. Each entry
+  there also carries its record's `attempts`, `last_tool` and `last_code`, and
+  `stalled` (see "A stalled ref" below). An
+  unreachable fused-memory exits 1. The loop instead counts it as a
+  transient pass and backs off.
+- `--check` is σ4's install check. It takes the lock and handshakes with
+  `fused_memory_url`. It names any tool of the closed set
+  (`client-feed/src/client_feed/filer_tools.py::CLOSED_TOOLS`) the server does
+  not list. It looks up `portal:<project_id>:check:1`, a ref the portal never
+  mints. Then it prints the calls one pass would make over the inbox: reads
+  performed, writes withheld. It writes nothing but the lock file, and stores
+  no cursor. It exits 0 only when every tool is listed, nothing refused, and
+  no stored ref is stalled.
+
+Inbox lines that fail the inbox contract are logged as a WARNING with their
+byte offsets, never their text: such a line may carry raw client text.
+
+Before enabling the filer for a live client, Leo confirms σ4's six checks
+(`plans/client-feed-prd.md` §14.8, row σ4):
+
+1. The portal runs as its dedicated account.
+2. P2's check passes on this host.
+3. A probe from the portal account to the fused-memory URL, and to every
+   escalation port named in the registered projects'
+   `dark-factory-orchestrator.yaml`, is refused.
+4. The client project's orchestrator is running and its L2 queue is watched.
+5. Its feed declares criteria.
+6. `client-feed file-defects --config <policy> --check` passes.
+
+Then, from inside the main checkout, as for the publisher:
+
+```bash
+# render client-feed-filer@.service with the arguments setup-host.sh §7a passes; enables nothing.
+# Writes nothing if uv is not on PATH (an empty --uv-path renders an ExecStart systemd rejects):
+command -v uv >/dev/null || { echo 'uv is not on PATH' >&2; false; } \
+  && repo="$(git rev-parse --show-toplevel)" \
+  && python3 "$repo/scripts/render_systemd_unit.py" --unit client-feed-filer \
+       --template "$repo/scripts/client-feed-filer.service.template" \
+       --repo-root "$repo" --uv-path "$(command -v uv)" \
+       --output ~/.config/systemd/user/client-feed-filer@.service \
+  && systemctl --user daemon-reload
+# check the install; it prints its report as JSON and exits 1 on any problem:
+uv run --no-sync --project client-feed client-feed file-defects --config ~/.config/client-feed/<name>.yaml --check
+systemctl --user enable --now client-feed-filer@<name>.service
+journalctl --user -u client-feed-filer@<name>.service
+```
+
+A report Leo rules on in the portal arrives as a `defect_ruled` line
+(decision 14). The filer then acts on its own fix and gate only. What it writes
+on the fix's defect depends on where that defect stands:
+
+- A defect still open is withdrawn as not a defect, and Leo's acceptance is
+  recorded.
+- A defect already proven is not withdrawn, and neither is one already exempted
+  or pending on another closure. The state machine lets a closure leave only an
+  open defect, and no closure may follow a proof
+  (`shared/src/shared/defects.py::DEFECT_TRANSITIONS`). So the filer makes no
+  defect write and logs a WARNING naming the ref.
+
+In every case a pending fix is still cancelled, a started fix is left running,
+and a done fix is left untouched. The gate is cancelled after the fix's step,
+because cancelling a gate first would release the fix.
+
+**A stalled ref.** Every refusal that a retry alone will not clear counts an
+attempt against the ref in `cursor.json`'s `refs`, at whichever step it came,
+filing or ruling. Transport, HTTP-status and reconciliation-backlog refusals
+do not count; the loop backs off for those instead. The record names the
+refusing tool (`last_tool`) and its code (`last_code`), and is dropped once
+the ref converges. Its `restatements` counts only the refusals of the fix's
+restatement: the typed-facts fallback is taken once those reach
+`client-feed/src/client_feed/filer.py::FALLBACK_AFTER_RESTATEMENTS`, or at
+once for a fallback-class code. Refusals at any other step move `attempts` and
+the stall, never the fallback. At
+`client-feed/src/client_feed/filer_state.py::STALLED_AFTER_ATTEMPTS` attempts
+the ref is stalled. Each pass then logs it at ERROR rather than WARNING, and
+still retries it at the normal interval, so it converges on the pass after its
+cause is cleared. The ERROR line names that cause, the record's `last_tool` and
+`last_code`, before the refusal of the pass itself: a transient refusal of a
+stalled ref leaves its record, and so its cause, unchanged.
+
+```bash
+journalctl --user -u client-feed-filer@<name>.service -p err
+```
+
+With the instance stopped, `--check` names the stored stalled refs under
+`stalled`, each with its last tool and code, and exits 1.
+
+`FALLBACK_AFTER_RESTATEMENTS` and `STALLED_AFTER_ATTEMPTS` are equal, so a ref
+refused only at its restatement reaches the stall on the pass that first takes
+the fallback. If a later step of that pass is refused too, the ref is logged
+as stalled before its fallback has had a pass of its own.
+
+Two refusals stall a ref until an operator acts:
+
+- `commit_planning` refused `deferral_invalid`: another hold, not the filer's
+  planning hold, sits on the fix or its gate, and `commit_planning` releases
+  only a planning hold. Check who holds it. Once it may go, release it with a
+  plain `set_task_status pending`.
+- `set_task_status` refused `FollowupHolderProtectedError`: the fix or gate is
+  its project's follow-up holder. Cancelling it releases every held follow-up,
+  which is a human act made with `release_holder`.
+
+A report the filer has not filed in time shows as the `filer` source under
+"Reading the heartbeat's degraded list" below.
+
 #### Reading the heartbeat's degraded list
 
 ```bash
@@ -813,7 +956,21 @@ What a degraded source holds back is stated in `plans/client-feed-prd.md`
 §12:
 
 - `engagement`: reveals are disabled for the pass (δ entry (d)).
-- `inbox`: the inbox offset is held (δ entry (e)).
+- `inbox`: the inbox offset is held (δ entry (e)), and so is the defect
+  scan's `defect_scan_offset`. `pending_reports` gains no new report, but it
+  still loses any report whose carrier appears.
+- `filer`: a `defect_reported` line older than `filer_grace_seconds`
+  (`client-feed/src/client_feed/policy.py::Policy`, default 600) still has no
+  non-deferred carrier. The reason names each such ref, and the report waits
+  in `cursor.json`'s `pending_reports` until its carrier appears or a
+  `defect_ruled` line rules it. It is raised while the engagement is unusable,
+  and while `tasks` is degraded, too. A second reason, `… waiting on a deferred
+  gate past …`, names a filed report whose unfinished fix depends on its gate
+  while that gate is still `deferred`, so the gate is never dispatched to Leo's
+  L2 queue. Such a ref waits in `cursor.json`'s `deferred_gate_reports` from
+  the first pass that saw it so, until the gate leaves `deferred` or the fix
+  finishes. It too is kept while `tasks` is degraded (PRD §12, 2026-11-26,
+  task 11885).
 - `git`: a merge commit git cannot read holds the landing batch (γ entry (f)).
   Unparseable git output and a timed-out `git cat-file --batch` read degrade
   `git` too (task 7484 entry (c)).
@@ -822,6 +979,39 @@ What a degraded source holds back is stated in `plans/client-feed-prd.md`
   `skipped N rows: …` (γ entry (f)).
 
 The same failures are WARNING lines in the unit's journal.
+
+#### Rolling back the publisher
+
+1.0 code refuses a 1.1 `cursor.json`, because `Cursor` is `extra='forbid'`
+(`client-feed/src/client_feed/feed_io.py::Cursor`), and then restarts every
+source from the beginning. So before starting 1.0 code, stop the instance and
+delete the `defect_scan_offset`, `pending_reports` and `deferred_gate_reports`
+keys from `out/cursor.json`, keeping the file 0640. Rewriting it in place keeps
+its mode and owner:
+
+```bash
+systemctl --user stop client-feed@<name>.service
+python3 -c 'import json, sys; p = sys.argv[1]; c = json.load(open(p)); c.pop("defect_scan_offset", None); c.pop("pending_reports", None); c.pop("deferred_gate_reports", None); open(p, "w").write(json.dumps(c))' <out>/cursor.json
+```
+
+1.0 code refolds the `state.json` a 1.1 publisher wrote from the feed. A
+`defect_filed` line is an unknown type to it and is skipped. A heartbeat whose
+`degraded` names `filer` is not skipped: `filer` is not a 1.0 `Source`, so 1.0
+code refuses to open a feed holding one, with a contract violation at that
+line. Roll back only while `grep -c '"source":"filer"' <out>/feed.jsonl`
+prints 0; once a heartbeat has named `filer`, fix forward instead.
+
+Rolling back to a feed 1.1 build from before task 11885 needs the same stop and
+one key popped. Every cursor a later build writes carries
+`deferred_gate_reports`, as `{}` when nothing is held, and the earlier build's
+`Cursor` refuses that key whatever it holds. The other two keys are 1.1 keys,
+so they stay. The `filer` caveat above does not apply: `filer` is a `Source` in
+every 1.1 build.
+
+```bash
+systemctl --user stop client-feed@<name>.service
+python3 -c 'import json, sys; p = sys.argv[1]; c = json.load(open(p)); c.pop("deferred_gate_reports", None); open(p, "w").write(json.dumps(c))' <out>/cursor.json
+```
 
 #### The isolation check
 
@@ -1290,7 +1480,13 @@ That latency is faster than any real model call.
   A missing CLI binary raises before any call is recorded. So no
   `invocations` rows next to a steady ticket rate is itself the signal. The
   ledger is written only while `usage_cap.enabled`; without it the table
-  stays empty whatever the curator does, so skip this check.
+  stays empty whatever the curator does, so skip this check. The same table
+  also carries `recon_stage_memory_consolidator`,
+  `recon_stage_task_knowledge_sync`, `recon_stage_integrity_check`,
+  `recon_judge`, `recon_verify` and `link_adjudicator` rows (task 10414). The
+  recon roles are written by the server, under the same `usage_cap.enabled`
+  caveat; `link_adjudicator` rows come from the operator-run
+  `fused-memory/scripts/link_heal.py`, which opens the file itself.
 - **It does not fire during an all-accounts-capped period, by design.** Capped
   tickets park as `awaiting_curation` (outside the window), and a later
   verdict's latency includes the parked time. Caps show in `get_curator_state` and on
@@ -1751,46 +1947,84 @@ That clause is absent on the ordinary gate path, where the dirty snapshot
 has not been taken yet and no WIP is known to be at risk.
 
 A normal `git commit --only` whose pre-commit hook outlives the 300s
-grace produces exactly that: a blocked merge, **no** recovery advice, and
-**nothing for you to do** — it is retried on re-dispatch.
+grace produces exactly that: a blocked merge, **no** destructive advice,
+and **nothing for you to do** — it is retried on re-dispatch.
 
-There is exactly one genuine operator action, and it is triggered by the
-lock having **already been older, the moment the merge worker first
-observed it, than the staleness floor** — not by the age in the line
-above. That post-wait age necessarily exceeds the grace whenever we
-waited the grace out (it is the initial age *plus* the wait), so it says
-nothing about staleness; the 301s example above is a perfectly live
-commit. The distinguishing sentence is spelled out in the reason and
-simply does not appear otherwise:
+The reason's last sentence comes from a holder check on the lock
+(`orchestrator/src/orchestrator/index_lock_liveness.py::diagnose_index_lock`),
+which has three outcomes:
 
-> `… The lock was ALREADY 3600s old when the merge worker FIRST observed
-> it — older than the 300s staleness floor (max of the configured 300s
-> grace and the 300s pre-commit budget) — so it is likely a crashed-git
-> leftover rather than a live commit: confirm no git process is running
-> in project_root, then clear it with rm -f /…/.git/index.lock.`
+- **A live git process may hold it.** The merge worker looks for
+  processes named `git` whose cwd is in `project_root`'s own work tree
+  (nested worktrees excluded) **and** which started before the lock was
+  last written, and the reason names each one by pid and command:
 
-The floor is `max(git.merge_park_lock_grace_seconds, 300s)`, **not** the
-configured grace alone. Tuning the grace *down* (including to `0`, the
-probe-only fail-fast off-switch) shortens how long the worker **waits**;
-it must never widen what counts as a crashed leftover, or a live
-half-second-old `git commit --only` would be reported as one. Tuning the
-grace *up* does raise the bar — an operator who allows longer hooks has
-declared locks that old to be normal.
+  > … A live git process that started before the lock was written is
+  > running in project_root's work tree and may hold it: pid 728900
+  > (`git commit --only plans/x.md -m …`). A long pre-commit hook is
+  > normal, so do NOT remove the lock: wait for that process to exit,
+  > then re-submit the merge.
 
-Only when you see that sentence should you clear the lock by hand, and
-only after confirming no git process is running in `project_root`. The
-advice is gated this narrowly because `rm -f` on a **live** commit's
-index lock corrupts that in-flight commit — the same reason
-`advance_main` never removes the lock itself.
+  When it names several processes it says "wait for those processes to
+  exit".
 
-A lock that is *already* past the staleness floor when first observed
-**skips the wait entirely** — it is reported immediately, with the same
-recovery sentence. Waiting cannot change a verdict that is already
-"crashed leftover", and the merge worker is serialized, so burning the
+  A `git` that started *after* the lock was written cannot have created
+  it and is ignored. The common case is the merge worker's own read-only
+  `git cherry` / `git log` children, which sit in `project_root` much of
+  the time; they never mask a crashed leftover.
+
+  A listed process wins **whatever the lock's age**: it may hold the
+  lock, so wait and re-submit; never `rm -f` it. A reify pre-commit runs
+  `verify.sh` for 10-60+ minutes, so a lock an hour old with a live
+  holder is a healthy commit, not a crash (task 5229).
+- **A complete scan found no live git process, and the lock was already
+  older than the staleness floor when the merge worker first observed
+  it.** This is the only case that gets the `rm -f` sentence:
+
+  > `… The lock was ALREADY 3600s old when the merge worker FIRST
+  > observed it, past the 300s staleness floor, and a complete /proc scan
+  > found no git process in project_root's work tree, so it is likely a
+  > crashed-git leftover: confirm no git process is running in
+  > project_root, then clear it with rm -f /…/.git/index.lock and
+  > re-submit the merge.`
+- **Anything else** gets no recovery sentence: a young lock, or a scan
+  that could not place a `git` that started before the lock was written
+  (another user's, say, whose cwd it may not read). Unknown is never read
+  as "nobody holds it". A `git` it cannot place that started *after* the
+  lock cannot have written it, so it does not block the proof.
+
+The age that counts is the one at the merge worker's **first
+observation**, not the age in the line above. That post-wait age
+necessarily exceeds the grace whenever we waited the grace out (it is the
+initial age *plus* the wait), so the 301s example above is a perfectly
+live commit. The floor is `max(git.merge_park_lock_grace_seconds, 300s)`,
+**not** the configured grace alone. Tuning the grace *down* (including to
+`0`, the probe-only fail-fast off-switch) shortens how long the worker
+**waits**; it must never widen what counts as a crashed leftover. Tuning
+the grace *up* does raise the bar. And the floor is only the second
+condition: age alone never earns `rm -f`.
+
+Do not check for a holder with `lsof` or `fuser` on the lock. git closes
+the lockfile's descriptor before it runs hooks, so for the whole of a
+pre-commit hook **no process has `index.lock` open**, and those tools
+report nobody for a perfectly live commit. Look for the `git` process
+itself: the pid the reason names, or any `git` whose cwd is
+`project_root`. A candidate must also have started before the lock's
+mtime: compare `ps -o lstart= -p <pid>` with `stat -c %y <lock>`. Removing a live commit's index lock corrupts that
+in-flight commit, which is also why `advance_main` never removes the lock
+itself.
+
+A proven crashed leftover **skips the wait entirely**: it is reported
+immediately, with the same `rm -f` sentence, and its reason reads
+`waited 0s`, which is correct, not a mis-report. That reason is rendered
+from the same scan that skipped the wait, so a `git` that appears a moment
+later cannot turn it into "wait for that process". After a full wait, the
+reason instead names whoever held the lock at the deadline. Waiting cannot clear a
+lock nobody holds, and the merge worker is serialized, so burning the
 full grace on every queued task until you clear the file would just be a
-slow-motion version of the stall this whole mechanism removes. So the
-blocked reason for a leftover reads `waited 0s`; that is correct, not a
-mis-report.
+slow-motion version of the stall this whole mechanism removes. A lock
+with a live holder, or one the scan cannot prove unowned, always gets the
+full wait, however old it is.
 
 One window the gate cannot cover: it is a *probe*, so a foreign process
 can still grab the index between it and the post-advance
@@ -1885,6 +2119,51 @@ A carrier walked to `merge-deferred` and submitted with `merge_request` is
 held for as long as its request is live. The two-pass count starts only once
 the request resolves without landing (blocked, cancelled, or superseded into
 a train that derailed). Re-read the task after any non-landed outcome.
+
+### Bringing up or checking a verify host (roster file, task 11733)
+
+The roster file, the contract and both scripts are described in SETUP.md §12;
+this is the order to run them in. `<host>` is the host's name in the roster.
+
+1. **Write its roster entry** in `~/.config/orchestrator/verify-hosts.yaml`
+   (or the file `ORCH_VERIFY_HOSTS_FILE` names), shaped like
+   `config/verify-hosts.example.yaml`. Add the ssh alias first: the scripts
+   reach the host only through it. A project's hosts have one home, so before
+   the entry names a project under `projects:`, remove that project's inline
+   `verify_runners` block and any `ORCH_VERIFY_RUNNERS` entry. In the other
+   order every load of its config fails and names both: its orchestrator's
+   start, restart and reload, and the pre-commit hook in each of its
+   checkouts. Removing the inline list first costs at most a restart that
+   verifies locally.
+2. **Provision:** `scripts/deploy/provision_verify_host.sh <host>`. Run it
+   with `--dry-run` first to see each step and the parameters it resolved
+   without touching the host. A full run ends with the checker and returns
+   its exit code.
+3. **Check:** `scripts/deploy/check_verify_host.py <host>` on its own, at any
+   later time; `--json` for a record.
+4. **Restart the project's orchestrator.** The roster entry is its runner
+   list, and the roster is restart-tier.
+5. **Preflight** with `orchestrator verify-host-preflight --runner <host>`
+   once task β has landed: it runs the project's full gate on the host
+   through the production dispatch path.
+6. **After a `host_config` edit**, run
+   `provision_verify_host.sh <host> --sync-config`, which installs only the
+   re-rendered per-host YAML files. Never edit them on the host: the next
+   sync overwrites the edit, and the checker fails it until then.
+
+**Reading a row.** `observed` says what was found and `needed` what the
+contract wants. A `fail` makes the check exit 1. Most are fixed by
+re-running the provisioning script, whose steps are idempotent and named
+after the rows. Three rows have no step that can fix them, so fix those on
+the host by hand: `kernel` (Landlock off in the host's kernel), `disk` (too
+little free space) and `no_credentials` (a credential file in the verify
+user's home, which no script deletes). A `network` fail means the dispatcher
+could not reach the host either: add or repair the ssh alias and pin its host
+key. An `observed` of `not observed: <reason>` means the observation itself
+failed, not the requirement. A `warn` does not fail the check: `memory` warns
+when no project states `verify_cgroup_memory.max_gib`, and `disk` when no
+project states `disk_footprint_gib` or a synchronous write is slower than
+the contract's provisional threshold.
 
 ### Reading a verify-host bench (`quarantine_class`, task 6565)
 
@@ -1999,7 +2278,7 @@ cleanup. What bounds each class:
 |---|---|---|
 | `_merge-<8hex>` worktrees and `.merge_verify_pgids` records on a remote host | a `verify-merge`/`verify-task` killed before its `finally` | task 4196 (pending); until it lands, `scripts/verify_host_hygiene.py`. `orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker.reap_orphaned_merge_worktrees` runs only where a merge worker runs |
 | `df-verify-*.scope` on a remote host | a verify controller that died while its scope ran | nothing automatic: this tool, or a reboot. 2829's `orchestrator/src/orchestrator/verify.py::reap_leftover_verify_scopes` sweeps only the orchestrator's own host (follow-up ticket `tkt_0RX7YZB882KPFAWE04DKAKQ81X`) |
-| gate checkouts under `dark-factory-gate/` | one per gate sha | 6565's `orchestrator/src/orchestrator/verify_runner.py::RemoteRunner.reap_idle_gates`, 7 days idle. `.build-*.lock` files are never reaped, by design |
+| gate checkouts under `dark-factory-gate/` | one per gate sha | 6565's `orchestrator/src/orchestrator/verify_runner.py::RemoteRunner.reap_idle_gates`, 7 days idle. A reaped sha's `.build-<sha>.lock` is unlinked with it, under that lock, and a failed ensure unlinks its own (task 8519). Only an ensure killed before its clone creates the sha dir leaves an orphan lock; the protocol is in the header of `orchestrator/src/orchestrator/remote_gate/reap-gates.sh`. |
 | reify `_merge-verify/target` | reify merge verifies | the 7042 trim timer (reify-owned) |
 | `_mainsweep-*` / `_mainprobe-*` | main-tip sweeps and probes | 5584 / 6794, on the workstation warm-lanes pool, not the laptop |
 | numeric task worktrees from 2026-03..04 | one-time residue; no orchestrator runs on the laptop | this tool; no live generator. The tool refuses any repo holding a task store, so it cannot reach a live orchestrator's task worktrees; `--class verify-scope` alone still runs on an orchestrator host |
@@ -2107,7 +2386,7 @@ cannot see `tailscaled.service` or `network-online.target`, so the unit has no
 `After=`. Until tailscaled assigns its address, rclone fails to bind it, and
 that failure takes the loopback address down too. The unit retries every 2 s,
 and `StartLimitIntervalSec=0` keeps a slow tailscale start from tripping the
-start limit.
+start limit. Why one process serves both addresses: PRD open question 10.
 
 ### The host configuration file
 
@@ -2243,6 +2522,11 @@ Each executing host has the sentinel `__build_cache_degraded__<host>`, category
 C10. When it fires: run `--check` on the workstation and
 `--check --host-config` on the host, then read that host's latest rows.
 
+When the store is unreachable on the workstation, check `tailscale ip -4`
+first. The store is one rclone process bound to both addresses, so with no
+tailscale address it serves neither, and the workstation's own builds fall
+back too (PRD open question 10).
+
 ### Pruning
 
 `build-cache-store-prune.timer` runs daily, delayed at random by up to an hour,
@@ -2276,24 +2560,13 @@ diff /tmp/drift-<workstation>.tsv /tmp/drift-leo-laptop.tsv
 ```
 
 Zero differences outside `#info` lines are required before gates ι and κ.
-Each pkg-config module that reify's dependencies probe has its own
-`pkg-config.<module>` line, carrying its version and `libdir`, or `ABSENT`, so
-the diff names the module. α's cross-host misses were `xscrnsaver` present on
-the laptop only (libxss-dev, esc-10782-1). The module list is derived from the
-checkout's `Cargo.lock` on every run: each locked registry crate's
-`[package.metadata.system-deps]` entries, read from its source under
-`$CARGO_HOME/registry/src`, plus the pkg-config names in x11-dl's `build.rs`.
-`#info.cargo.registry-sources-missing` names locked registry crates whose
-source is not on that host. It is informational and never compared: it lists
-what the host has not fetched, mostly target-specific crates a Linux build
-never downloads. If a missing crate declares system-deps, its
-`pkg-config.<module>` lines are absent on that host only, so the diff shows
-it. Run `cargo fetch` in the reify checkout on that host and probe again. Whole-system
-package and module lists are not compared, because the hosts legitimately
-differ in hundreds of unrelated packages. A probe of a checkout with no
-`Cargo.lock` exits 2.
+When `#info.cargo.registry-sources-missing` names a crate on one host only, run
+`cargo fetch` in that host's reify checkout and probe again.
 
-`REIFY_PROBE_DEEP=1` adds the digests of the C++ wrappers' header closures.
+It exits 0 when it printed every line, 1 when deriving the pkg-config module
+lines from `Cargo.lock` failed, and 2 when the checkout is not a directory or
+has no `Cargo.lock`. `REIFY_PROBE_DEEP=1` adds the digests of the C++
+wrappers' header closures. PRD C13 says what each line covers and why.
 
 ### Shrinking the old host sccache cache
 
@@ -2308,6 +2581,39 @@ systemctl --user edit sccache.service   # [Service] Environment=SCCACHE_CACHE_SI
 Restart it only with the merge queue halted and idle. The home filesystem was
 91% full when this was planned, and the store replaces that cache rather than
 adding to it.
+
+---
+
+## 5b. Warm-lane script resolution
+
+Each warm-lane wrapper in `GitOps` runs the project's `scripts/<name>` if it
+exists, else dark-factory's `orchestrator/scripts/warm-lane/<name>`. The
+order, and the WARNING when neither exists, are described in
+`orchestrator/scripts/warm-lane/README.md` "Resolution order"; the design is
+PRD `plans/warm-lane-infra-repatriation-prd.md` D3.
+
+`git.warm_lane_df_preferred_scripts` reverses the order per script, so a
+project can run dark-factory's copy without deleting its own. It accepts
+`warm-lane-disk-guard.sh` (both the hard and the soft guard),
+`warm-lane-audit.sh`, `warm-lane-gc.sh`, `warm-lane-degenerate-ref-check.sh`
+and `thin-warm-lane.sh`; any other name fails config load. Default `[]`.
+
+```yaml
+git:
+  warm_lane_df_preferred_scripts: [warm-lane-gc.sh]
+```
+
+- **Confirm it.** Every invocation logs the resolved copy at INFO. Grep the
+  orchestrator journal for `resolved warm-lane-gc.sh -> ... (dark-factory)`.
+  If dark-factory's copy is absent, the project copy runs and the line reads
+  `(project)`.
+- **Revert it.** Delete the line and call `mcp__escalation__reload_config`.
+  The knob is green tier: check that `applied` names
+  `git.warm_lane_df_preferred_scripts`. The next wrapper invocation resolves
+  project-first again; a script already running is unaffected.
+- **The systemd sweep is not governed by this knob.** Repointing reify's
+  `reify-warm-lane-gc.service` at dark-factory's sweep (PRD leaf η) also needs
+  `REIFY_WARM_LANE_GC_SEED_SCRIPT` in the unit's environment.
 
 ---
 
@@ -2371,6 +2677,9 @@ takes no arguments: it always re-reads that process's own
 - `git.merge_park_lock_grace_seconds` (the `advance_main` index-lock
   stand-off budget — re-read per advance, see
   [§"Merge-halt semantics"](#merge-halt-semantics-wip_conflict--unmerged_state))
+- `git.warm_lane_df_preferred_scripts` (warm-lane scripts that resolve
+  dark-factory's copy first — read per wrapper invocation, see
+  [§5b](#5b-warm-lane-script-resolution))
 - The `git.offline_lane_*` leaf tunables
 - `config_key_census.*` (the unknown-key census escape hatch — see
   [§6a](#6a-unknown-config-key-census); green-tier on purpose, so a
@@ -2415,7 +2724,14 @@ takes no arguments: it always re-reads that process's own
   `tests/scripts/test_merge_gate_history_leg.py::test_every_test_file_importing_a_history_helper_is_accounted_for`
   on an unmarked test file importing a history-reading helper, and
   `tests/scripts/test_merge_gate_history_leg.py::test_the_leg_runs_exactly_the_roots_that_own_marked_tests`
-  keeps the leg's segments on the packages that own marked tests. Green-tier
+  keeps the leg's segments on the packages that own marked tests. Every
+  module's `lint_command` also runs `tests/scripts/git_history_census.py` over
+  that module's gate test roots, so an unaccounted history reader, or a
+  registry entry under those roots that is stale or doubles another
+  accounting, fails at task verify and in the pre-commit hook rather than
+  first at the merge gate;
+  the throwaway-repo registry now lives at
+  `tests/scripts/git_history_census.py::READS_ONLY_THROWAWAY_REPOS`. Green-tier
   for the same reason as `merge_gate_history_pure`.
 - `merge_deep.*`, including `chain_cap` and `depth_table` (deep merge-ahead
   chains — see
@@ -2427,6 +2743,13 @@ takes no arguments: it always re-reads that process's own
   kill all land on the next dispatch round.
 - `plan_text_fp_gate_enabled` (task 4031 amendment gate; OFF = pre-4031
   Lever-B skip).
+- `defect_tests.*` (whole submodel: `mode`, `max_plan_repairs`,
+  `max_proof_replans`, `proof_timeout_secs`, `streak_threshold`,
+  `test_file_pattern`). `mode` (`off` / `shadow` / `enforce`, shipped
+  `shadow`) governs only the plan, proof and merge gates
+  (`plans/defect-tests-prd.md` I5); `mode: off` also stops the verify test
+  legs injecting `-p _df_defect_plugin`, from the next verify leg. Normative
+  home: `orchestrator/src/orchestrator/defect_tests_config.py::DefectTestsConfig`.
 - `verify_task_host_policy`, `verify_task_remote_modules`,
   `verify_task_remote_red_confirms_locally` and
   `verify_task_remote_cross_check_every_n` (task 6670; default `local`, which
@@ -2491,13 +2814,24 @@ a bind change is restart-only in both processes (the orchestrator's
   the next call, allowlisted or not.
 - `mem0_update.content_amend_allowed_agent_prefixes` and
   `mem0_update.metadata_patch_allowed_agent_prefixes` — two independently
-  configurable `agent_id`-prefix allowlists, both shipping as
-  `['recon-stage-', 'curator-']`: `recon-stage-` admits every
+  configurable `agent_id`-prefix allowlists. The content-amend list ships
+  as `['recon-stage-', 'curator-']` and the metadata-patch list as
+  `['recon-stage-', 'curator-', 'link-heal-']`: `recon-stage-` admits every
   reconciliation stage agent, and `curator-` admits the interactive
   memory-consolidation sitting defined by `skills/curate-fused-memories`
   (esc-3524-1 ruling (b), promoted to an all-deployments schema default on
   2026-08-12; it deliberately holds both arms because retain-and-tag
-  stamps retained peers via metadata-only patches). The lists are separate
+  stamps retained peers via metadata-only patches). `link-heal-` admits the
+  link-heal executor's metadata-only heals
+  (`plans/write-triage-link-healing-prd.md` H1) and never content amends.
+  Task 6431 (2026-11-25) moved `link-heal-` out of `config.yaml` into this
+  schema default, so that change takes effect on a fused-memory restart
+  (`scripts/restart-fused-memory.sh`); do not run
+  `mcp__fused-memory__reload_config` between its merge and that restart. A
+  reload in that window rebuilds the old in-memory two-item default, applies
+  it green-tier, and drops `link-heal-` from the live metadata arm until the
+  next restart (fail-closed: link-heal writes are refused with
+  `Mem0UpdateNotAuthorized`). The lists are separate
   because the arms carry different risk: widening
   **`metadata_patch_allowed_agent_prefixes` alone** remains the supported
   way to admit a new interactive tagging flow without granting anyone
@@ -2798,6 +3132,7 @@ time, rather than silently matching nothing (or everything).
 | `min_routing_tier` | The task's persisted routing-tier counter is at least this value |
 | `min_dispatch_count` | The task's dispatch count is at least this value |
 | `simple_saturated` | The task's routing metadata's `simple_saturated` flag equals this bool |
+| `split` | `{salt, buckets, bucket}`: the task is in arm `bucket` of a `buckets`-way split keyed on a salted sha256 of its task id (`shared/src/shared/routing_split.py::split_bucket`); an invocation with no task id is in no arm. `buckets >= 2` and `0 <= bucket < buckets` are checked at load and reload. The arm is not recorded on the event: it is recomputed from (salt, task id) |
 
 `set` (all optional — a rule may set any subset; unset fields fall through
 to the next-lower layer):
@@ -2877,20 +3212,46 @@ In-workflow roles, the steward and unblock_auto also emit an
 `routing_decision` row is written before the lifetime-budget check, so the
 row also exists when that check skips the triage. Today this is
 what you read directly (`routing_decision` events, `metadata.routing` per
-task) — there is not
-yet an auto-escalating retry ladder or a rendered rollup panel; see below.
+task), alongside the per-(model×role) rollup described below.
 
-### Adaptive-routing substrate (not yet active)
+### Adaptive-routing and experiment substrate
 
-The resolver already supports the `min_routing_tier` and
-`simple_saturated` match conditions and ladder-relative bumps, and the
-`metadata.routing` mirror already stores the counters — this is
-substrate for a later automated fleet rule (retry-tier escalation,
-saturation → full-path). **Not yet live on main:** automatic retry-tier
-increment, an automatic "simple-task saturated" stamp, admission of any
-model beyond the stock `haiku`/`sonnet`/`opus` set, and a per-(model×role)
-rollup panel (done/blocked/cap-hit rates, cost-per-done) in the digest or
-dashboard.
+The resolver's `min_routing_tier` and `simple_saturated` match conditions,
+ladder-relative bumps and the `metadata.routing` counters are all driven
+automatically on main:
+
+- **Retry-tier increment.** A terminal failure bumps the task's routing tier
+  (`orchestrator/src/orchestrator/harness.py::_maybe_bump_routing_tier`), and
+  the `retry-tier-up` rule, kept last in the rule list, moves the retry of an
+  implementer, debugger or architect up the ladder.
+- **Simple-saturated stamp.** A `complexity=simple` task whose SIMPLE_TASK dispatch
+  exhausts its turn cap is stamped `simple_saturated` automatically
+  (`orchestrator/src/orchestrator/workflow.py::_stamp_simple_saturated`); its
+  later dispatches take the full architect path, and the
+  `simple-saturated-full-path` rule routes that architect to `opus`.
+- **Models beyond `haiku`/`sonnet`/`opus`.** dark-factory's `allowed_models`
+  admits `claude-fable-5-1`, capped by a `per_model_daily_ceiling_usd`.
+- **Per-(model×role) rollup.**
+  `orchestrator/src/orchestrator/digest.py::model_role_rollup` aggregates
+  invocation count, done, blocked and cap-hit rates, cost and cost-per-done
+  for each (model, role) cell, plus per-role turn-cap saturation. The digest
+  renders it, and the dashboard serves it as the `by_model_role` block of
+  `GET /api/v2/dashboard/costs`, drawn on the overview tab.
+
+**What the rollup does and does not attribute.** It counts per invocation: one
+row per invocation, joined to its run's `task_results` outcome, so a task's
+done or blocked outcome is credited to every role (and model) that touched
+that run, not only the one that decided it. It carries no plan-size covariate:
+a cell holding mostly large plans reads worse than one holding small ones
+regardless of the model. Read it as a descriptive cost and outcome table, not
+as a causal comparison of models.
+
+The `split` condition (see the condition table above) is the experiment
+substrate on main: it assigns tasks to arms deterministically. Its reader,
+`scripts/routing_experiment_readout.py`, is not on main yet; task 8374 adds
+it. That script computes per-task, per-arm metrics (with the plan-size
+covariates the rollup lacks) across every project ledger. Once it lands,
+compare arms with the readout, not the rollup.
 
 ---
 
@@ -2952,8 +3313,9 @@ restart:
   passes its own deadline (a per-unit cap and a sweep-wide ceiling bound the
   wait). Units still on pre-5371 code, and units that refuse the request, keep
   the legacy merge-idle gate: defer while busy, then force-restart after
-  `ORCH_RESTART_FORCE_FIRE_AFTER_SECS` (10 minutes since 2026-08-26, 75
-  minutes before that). The script stamps the clock only
+  `ORCH_RESTART_FORCE_FIRE_AFTER_SECS` (10 minutes, the settled default of
+  that legacy gate; it was 75 minutes until 2026-08-26, and the script's
+  sweep-wide verify ceiling is derived counting it). The script stamps the clock only
   once the restart is fully verified (the script exits 0). Note this env
   knob is a *different* setting from the coordinator's
   `orchestrator_restart_force_fire_after_secs` config field below, despite
@@ -4292,23 +4654,49 @@ directly, not just interactive sessions. Treat it accordingly:
 
 dark-factory and the sibling **reify** repo each carry a copy of the
 lock-charter file-path allowlist (`FILE_EXTENSIONS` /
-`EXTENSIONLESS_FILENAMES`). They must agree, and that agreement is checked
-*live, in-suite*, on the merge-verify critical path. That is why the
-2026-07-29 incident happened: reify widened its allowlist 36 → 58 with no
-dark-factory change involved, and every dark-factory worktree's full suite
-went red.
+`EXTENSIONLESS_FILENAMES`). They must agree. Until task 11623 that agreement
+was checked *live, in-suite*, on the merge-verify critical path, so a verdict
+depended on whichever reify HEAD the verifying host had checked out. That is
+why the 2026-07-29 incident happened (reify widened its allowlist 36 → 58 with
+no dark-factory change involved, and every dark-factory worktree's full suite
+went red), and why reify's 2026-11-23 `sccache` addition reddened unchanged
+main on one host and a correct mirror fix on another.
 
-That in-suite check is **still live**, and this section does not retire it:
-the Tier-2 guard in `fused-memory/tests/test_lock_charter_guard.py` still
-shells out to reify's `scripts/lock-charter-guard.sh` and hard-asserts the
-two vectors match, on the merge-verify path. Re-run the 2026-07-29 shape
-today and it reds again — that guard is what you will actually see fail.
-The script below does not replace it. It **adds** an off-critical-path way
-to run the same comparison, so you can answer "did reify move?"
-deliberately: without a suite run, and without attributing the red to
-whatever branch happened to be in the lane (see the attribution contract
-below). Run it whenever either repo's allowlist changes, and before
-believing an in-suite drift failure:
+**The merge gate no longer reads any reify checkout.** The lock-charter suites
+pin committed data only: each vector copy against the literals in its own test
+file (`shared/tests/test_locking.py`,
+`fused-memory/tests/test_lock_charter_guard.py`), fused-memory's copy against
+`shared.locking` (`test_gamma_vectors_match_shared_locking`), and this
+checkout's own tracked corpus
+(`tests/repo_guards/test_lock_charter_tracked_corpus.py`). A reify-side change
+to its extension or extension-less list no longer reds any dark-factory merge,
+on any host.
+
+The cross-repo comparison runs **nightly at 01:45** instead, through
+`lock-charter-drift-check.timer` ([§12](#12-nightly-maintenance-timers)). Its
+wrapper, `scripts/lock-charter-drift-check.sh`, runs
+`scripts/lock_charter_drift_heal.py` against `/home/leo/src/reify`
+(`REIFY_REPO` overrides that path), which routes the outcome:
+
+- **`drift`** files **one** heal task, deduped on metadata
+  `x_lock_charter_drift`. It names every drifted name, split into
+  only-in-reify and only-in-dark-factory, and the four files a mirror edit
+  touches (`HEAL_SITES`: both vector copies and both test vectors). While that
+  task is open, a persisting drift adopts it instead of filing again; once it
+  is done or cancelled, renewed drift files a fresh one.
+- **`unavailable`** files one `escalate_info` (category `infra_issue`) in slot
+  `lock-charter-drift:unavailable`, skipped while one is pending there.
+- **`ok`** calls nothing.
+
+To see what the nightly run would route, without calling either MCP server:
+
+```bash
+uv run --project shared python scripts/lock_charter_drift_heal.py --dry-run
+```
+
+The comparison itself still runs by hand. Run it whenever either repo's
+allowlist changes, and to confirm a heal task's mirror edit is complete (it
+exits 0):
 
 ```bash
 uv run --project shared python scripts/check_lock_charter_drift.py
@@ -4317,10 +4705,9 @@ uv run --project shared python scripts/check_lock_charter_drift.py \
     --reify-repo /path/to/reify
 ```
 
-The reify checkout is located by `--reify-repo`, then `$REIFY_ROOT`, then a
-marker-bound nearest-ancestor walk — the same single-sourced resolution
-(`shared/src/shared/reify_checkout.py`) the in-suite guards use, so the
-script and the suite can never disagree about *which* checkout they mean.
+Both scripts locate the reify checkout by `--reify-repo`, then `$REIFY_ROOT`,
+then a marker-bound nearest-ancestor walk — the single-sourced resolution in
+`shared/src/shared/reify_checkout.py`.
 
 ### The three exit codes
 
@@ -4331,7 +4718,7 @@ never read as a pass.
 | Exit | Status | Meaning |
 |---|---|---|
 | `0` | `ok` | Both vectors agree and reify's tracked corpus is fully covered by the allowlist. |
-| `1` | `drift` | The two repos disagree, or a tracked reify path has an extension the allowlist rejects. |
+| `1` | `drift` | The two repos disagree, a tracked reify path has an extension the allowlist rejects, or (the `extensionless` part) a tracked reify file with no extension is not allowlisted or an allowlisted name is also a reify directory. |
 | `2` | `unavailable` | The comparison **did not happen** — no reify checkout found, no guard script, the guard exited non-zero, it timed out, or the corpus sweep could not run. |
 
 ### Attribution contract
@@ -4339,10 +4726,10 @@ never read as a pass.
 Read the outcome as a statement about the *pair of repos*, not about
 whatever dark-factory branch happens to be under test:
 
-- **`drift` is a cross-repo MIRROR gap, owned by a mirror task. It is NEVER
-  a fault in the dark-factory branch under test.** Do not debug, revert, or
-  re-dispatch a task on the strength of a drift result; file/advance the
-  mirror work instead.
+- **`drift` is a cross-repo MIRROR gap, owned by the heal task the nightly
+  run files. It is NEVER a fault in any dark-factory branch.** Do not debug,
+  revert, or re-dispatch a task on the strength of a drift result; advance the
+  heal task instead.
 - **`unavailable` is not a pass.** Nothing was compared. Fix the
   availability problem (check out the sibling, correct `$REIFY_ROOT`, repair
   the guard script) and re-run before drawing any conclusion.
@@ -4401,7 +4788,7 @@ critical path — so a cold cache degrades to the previous behaviour exactly.
 | A `durable_write_dead_letter` escalation appears (`esc-durable-write-dead-letter-N`, agent_role `fused-memory/dead-letter-guard`) | A durably-queued memory write exhausted its attempts and was **permanently abandoned** — `add_episode`, `add_memory`'s Graphiti leg, or a derived `mem0_classify_and_add` fact. The caller was already told it succeeded: the record's `reported_to_caller=` line says exactly what it was told (`add_episode` returned `status='queued'`; `add_memory` returned `stores_queued` containing graphiti), or says plainly that no synchronous claim was made — an `add_memory_graphiti` death carrying that neutral line came from `replay_from_store`, the operation's second producer, which has no caller and mints no `write_op_id`, so there is nobody to warn. One record folds every death sharing `(project_id, operation, error class)` — deliberately keyed on the error CLASS, not its message, because the esc-3561-3 errors carried a different uuid per write — so `dedupe_count` is the VOLUME, not the record count: 28 lost writes page once | Read **`post_execute` first**; it decides the remedy and the two are opposites. `True` means the backend write LANDED and only the post-write callback kept failing (`durable_queue.py::POST_EXECUTE_DEAD_PREFIX`), so a blind replay **duplicates** it — check `backend_ops` joined on `write_op_id`, never on `backend_ops.operation`, which is the literal `'add_episode'` for both the add_episode and add_memory_graphiti paths, before acting. `False` means the write never landed: `replay_dead_letters` is the safe default once the cause is fixed, `delete_dead_letters` only when the item is known unrecoverable. The escalation is self-sufficient for triage by design — corroborating PULL surfaces exist but are not substitutes: `dead_by_operation` on `get_queue_stats` / `memory_service.py::MemoryService.get_status`, and `reconciliation/queue_health.py::summarize_graphiti_queue_health`'s aggregate `dead_count`, both read the LIVE `write_queue` table and go to zero once `delete_dead_letters` sweeps the rows (that sweep had already erased 26 of the 28 rows in esc-3561-3). `dead_by_operation` is also GROUP-scoped, so a `project_id`-scoped call covers that project's Graphiti group only: a dead `mem0_classify_and_add` for the same project appears under group `mem0_<project_id>` or in the unscoped call, and `{}` from the scoped probe does not contradict the alarm. Anyone holding a `write_op_id` can read the durable per-write record via `write_journal.py::WriteJournal.get_write_op` (`terminal_status`/`terminal_error`, task 3582) |
 | A reviewer verdict carried `note_dispositions` that were not applied: the info note is still pending after the review, or was later closed by the router or promoted instead of carrying the reviewer's class | One of four mechanisms. (i) The workflow rejected the entry: `orchestrator/src/orchestrator/escalation_router.py::reviewer_note_refusal` admits only a pending, router-owned info L0 of the reviewed task that is agent-filed, not mechanical, and not already held on a curator ticket, so an unknown id, another task's record, a non-info or eval-lane record, a harness or mechanical notice, or a router-disabled config is refused; a refusal logs the WARNING `info-l0-router: rejected the reviewer disposition` with the reason and emits `info_l0_dispositioned` with class `rejected_disposition`. (ii) `work` never closes a note, by design: it stamps the reviewer mark (triaged_by `reviewer-comprehensive/workflow`) and the exit router converts the note. (iii) The verdict was lost or errored, so nothing was applied: `TaskWorkflow._salvageable_verdict_payload` drops a malformed payload whole, and an ERROR verdict carries no dispositions (`orchestrator/src/orchestrator/review_payload.py::normalize_review`). (iv) Applying raised, which logs an exception and emits class `router-error` | Read the task's `info_l0_dispositioned` events (`class`, `reason`) and the journal WARNING to see which case applied. Nothing needs repairing, and a pending note must not be hand-closed: the exit finalizer, or the orphan reaper or startup amnesty, routes it, which is the designed backstop (`plans/info-l0-disposition-router-prd.md` boundary row 17). A `convert_to_task` L1 under `harness-info-l0-router` with reason `router_error` means the router already dismissed the note (`orchestrator/src/orchestrator/escalation_router.py::_promote` dismisses before it files the L1), so act on that L1, not the note. If the journal shows the ERROR `could not file its fallback L1`, the note is dismissed and its text survives only in that log line. A recurring (i) for the reviewer's own notes points at a briefing/eligibility mismatch; file it against `reviewer_notes` / `reviewer_note_refusal` |
 | A `legibility census commit did not land`, `legibility census refused by its landing gate` or `legibility trickle codebook commit failed` escalation, or one that repeats nightly | The target's pre-commit hook or the census landing gate refused a machine-written legibility write, which was quarantined and rolled back | [§12 Unlanded legibility writes and the quarantine](#unlanded-legibility-writes-and-the-quarantine) |
-| An orchestrator unit restarts every ~100 s | A startup step, or a crash site between steps, raises a process-killing fault on every start (a `BaseException` such as `SystemExit`, or a fatal step's refusal), so systemd's `Restart=` loops the unit. A non-fatal step that raises an ordinary `Exception` is reported on `orchestrator-startup-<step>` and skipped instead, and does not loop | `journalctl --user -u orchestrator-<name>.service` for the traceback. Then `sqlite3 <project_root>/data/orchestrator/runs.db "SELECT run_id, started_at, startup_completed_at, exit_reason FROM runs ORDER BY rowid DESC LIMIT 10"`: `startup_crash:<site>` names the step, or `before-first-step` / `after-<step>` for a crash between steps; `cancelled` is a SIGTERM; a NULL `exit_reason` with `startup_completed_at` set is a start that came up. `cat <project_root>/data/orchestrator/startup_failures.json` shows the current streak. After 3 consecutive crashes at one non-fatal step, the next start skips that step and files the born-at-L2 `orchestrator-startup-crash-loop` (`orchestrator/src/orchestrator/startup_steps.py::page_crash_loop`); a fatal step, or a crash outside any step, still runs and pages the same way. The `finish_startup` of a start that comes up clears the journal, so fix the cause before the next restart. A crash the process cannot record itself (SIGKILL, an import error) is the [§8](#8-fleet-redeploy--watchdog) watchdog's `orchestrator-crash-loop-<unit>` page instead |
+| An orchestrator unit restarts every ~100 s | A startup step, or a crash site between steps, raises a process-killing fault on every start (a `BaseException` such as `SystemExit`, or a fatal step's refusal), so systemd's `Restart=` loops the unit. A non-fatal step that raises an ordinary `Exception` is reported on `orchestrator-startup-<step>` and skipped instead, and does not loop | `journalctl --user -u orchestrator-<name>.service` for the traceback. Then `sqlite3 <project_root>/data/orchestrator/runs.db "SELECT run_id, started_at, startup_completed_at, exit_reason FROM runs ORDER BY rowid DESC LIMIT 10"`: `startup_crash:<site>` names the step, or `before-first-step` / `after-<step>` for a crash between steps; `cancelled` is a SIGTERM; `startup_completed_at` is written the moment startup finishes (`orchestrator/src/orchestrator/run_store.py::RunStore.mark_startup_completed`), so a NULL `exit_reason` with it set is a start that came up: still live, returned cleanly, or killed later (SIGKILL included). Both NULL is a start still in startup, or one killed before it came up, unless the journal shows the WARNING `Failed to record startup completion for run <run_id>`: that start came up but its stamp failed (`orchestrator/src/orchestrator/harness.py::Harness._stamp_startup_completed`). `cat <project_root>/data/orchestrator/startup_failures.json` shows the current streak. After 3 consecutive crashes at one non-fatal step, the next start skips that step and files the born-at-L2 `orchestrator-startup-crash-loop` (`orchestrator/src/orchestrator/startup_steps.py::page_crash_loop`); a fatal step, or a crash outside any step, still runs and pages the same way. The `finish_startup` of a start that comes up clears the journal, so fix the cause before the next restart. A crash the process cannot record itself (SIGKILL, an import error) is the [§8](#8-fleet-redeploy--watchdog) watchdog's `orchestrator-crash-loop-<unit>` page instead |
 
 ---
 
@@ -4535,7 +4922,11 @@ audit (task 5655) lands while the project's merge gate runs
 `merge_verify_breadth: "full"` (the default): that gate still runs every unit a
 task-role replay skipped, so a task-role false hit cannot land a red on main. A
 project set to `scoped` keeps `task_mode` behind the audit too. The merge role (and `remote_merge_mode`) stays
-behind the audit: `merge_mode: on` waits for task 5655. Before flipping a role
+behind the audit: `merge_mode: on` waits for task 5655 and task 9094. The audit
+runs test legs only, and
+`orchestrator/src/orchestrator/merge_lane/gates.py::_type_covered_modules`
+counts a `cache_hit` type unit as coverage, so a replayed pyright unit would be
+neither audited nor re-checked by the pre-advance unscoped type gate. Before flipping a role
 to `on`, check its `log` window for a `ran_red` unit carrying an
 `evidence_event_id` for a cause the branch's own diff explains; spurious reds (infra kill, worker crash,
 deploy clock, known load flake) do not block the flip.
@@ -4621,7 +5012,7 @@ commands arrive with the tasks named.
 
 | Lane command | Task | What it does |
 |---|---|---|
-| `verify-cache-audit` | 5655 (ε) | Runs the merge-role command set uncached (`DF_VERIFY_CACHE=off`) at the head each lane pass runs from (above). A red attributable to a `cache_hit` unit evicts that unit's entries, bumps the streak and returns the leak record as an evidence note; the lane renders it into the fix task it files once the red persists. A repeated pass of the same leak is counted once |
+| `verify-cache-audit` | 5655 (ε) | Runs every module's test leg uncached (`DF_VERIFY_CACHE=off`) at the head each lane pass runs from (above). Lint and type legs are not audited until task 9094. A red attributable to a `cache_hit` unit evicts that unit's entries, bumps the streak and returns the leak record as an evidence note; the lane renders it into the fix task it files once the red persists. A repeated pass of the same leak is counted once |
 | the separate recording lane command | 5656 (ζ1) | Records per-test input sets from green runs for the per-test tier. It consumes green runs' coverage only, so it does not wait for the audit |
 
 The audit plugs into the offline lane's red path through the `on_pass_outcome`
@@ -4636,7 +5027,14 @@ is under "Kill switch and re-enabling".
 
 Two attributable leaks within seven days set `policy_state.disabled_until` (14
 days from the second leak, with a reason and the leak evidence) and file an L2
-blocker naming both. While it is in the future **both roles run every unit**,
+blocker naming both. If that filing fails, every later reproduced audit red
+files it from the policy row
+(`orchestrator/src/orchestrator/verify_cache/audit_hook.py::VerifyCacheAuditHook`);
+a green pass asks no hook, so a queue still broken when the audit goes green
+leaves the blocker unfiled until the audit's next reproduced red. An audit with
+no escalation queue wired files on the project's on-disk queue
+(`orchestrator/src/orchestrator/offline_lane_pass.py::lane_pass_outcome_hooks`).
+While `disabled_until` is in the future **both roles run every unit**,
 whatever the modes say, and remote dispatches carry it. A cacheable unit shows
 as `unavailable` (or `ran_red`; see the `disabled` row above). The units settled
 before the switch is read (listed under "Reading a verify event") show plain
@@ -4645,10 +5043,14 @@ effect. The switch lives in the
 registry, not in config, so a reload does not clear it.
 
 To re-enable once the leaks are fixed, an operator runs `orchestrator
-verify-cache enable --config <path>`, or calls `resolve_issue` on the blocker;
-either records the re-enable. Waiting out `disabled_until` also re-enables. Both
-arrive with task 5655; `orchestrator verify-cache status` shows the switch
-meanwhile (`policy: DISABLED until …` with the reason and leaks).
+verify-cache enable --reason "<why the cache is safe again>" --config <path>`,
+which clears `disabled_until` with that reason and resolves the pending
+blocker. Resolving the blocker by hand (`resolve_issue`) does **not** re-enable
+the cache: while `disabled_until` is in the future, the audit re-files a
+hand-resolved blocker at its next reproduced red. Waiting out `disabled_until`
+also re-enables, and the audit's next reproduced red resolves that disable's
+blocker. `orchestrator verify-cache status` shows the switch meanwhile
+(`policy: DISABLED until …` with the reason and leaks).
 
 ### Never cached
 
@@ -4726,6 +5128,7 @@ declared registry and its `LoadState`-aware detector).
 | Slot | Job | Units |
 |---|---|---|
 | 01:30 | Timeout-headroom self-check (per-test ceiling anchors and family leg budgets against the verify archive; files `escalate_info`) | `timeout-headroom-selfcheck.timer` |
+| 01:45 | Cross-repo lock-charter drift check (reify vs dark-factory allowlists; files one heal task / escalate_info) | `lock-charter-drift-check.timer` |
 | 02:00 | Shared-repo incremental repack + commit-graph (every orchestrator root, one at a time) | `shared-repo-git-maintenance.timer` |
 | 02:15 | link-heal sweep (adjudicate new triage children; records + report; writes gated) | `fused-memory-link-heal.timer` |
 | 02:30 | Transcript secret sweep (leo-laptop runs its own copy) | `transcript-secret-sweep.timer` |
@@ -4746,7 +5149,8 @@ caught up on next boot/login rather than silently skipped) and
 `RandomizedDelaySec=300`.
 
 Per-job docs: [Timeout headroom self-check (01:30)](#timeout-headroom-self-check-0130)
-for the 01:30 job; [docs/shared-repo-git-maintenance.md](docs/shared-repo-git-maintenance.md)
+for the 01:30 job; [§9a Cross-repo lock-charter reconciliation](#9a-cross-repo-lock-charter-reconciliation)
+for the 01:45 job; [docs/shared-repo-git-maintenance.md](docs/shared-repo-git-maintenance.md)
 for the 02:00 job; [docs/flag-marker-sweep-recurring.md](docs/flag-marker-sweep-recurring.md)
 for the 03:30 job; [Nightly link-heal sweep (02:15)](#nightly-link-heal-sweep-0215) for the
 02:15 one; the sections below for the 02:30, 03:00, 03:15, 03:45, 04:00 and 05:00 ones,
@@ -5088,7 +5492,17 @@ everything already on disk.
   dark-factory's `.env` alone, so such a value is never matched. Task 6820
   filed this gap as a follow-up.
 - **What it files.** One `risk_identified` info escalation per sweep that
-  redacted or refused anything, naming each path with its per-variable counts.
+  redacted or refused anything. Its detail lists each refused line first
+  (path, line number, variable), then one line per directory group: the first
+  directory under the swept root (an archive or verify-logs task dir, an
+  offline-lane lane, a `~/.claude/projects` session dir, a pytest `pytest-N`
+  session dir), with its file count, occurrence count and variable names. The
+  detail is bounded at `scripts/transcript_secret_sweep.py::MAX_DETAIL_BYTES`
+  UTF-8 bytes and `MAX_DETAIL_LINES` lines. When it overflows, its last line
+  gives the `journalctl ... -o json | jq ... | head -n 1` command that rejoins
+  the run's full record and prints it alone, even when the next night's run
+  falls in the same window: journald splits that line into 48 KB entries and
+  keeps it about three weeks. The record line names each path with its per-variable counts.
   It prints one JSON record line to the journal, and never prints a value.
   A `*.xml.gz` that does not decompress is listed under `unreadable` in that
   record line and left as found.
@@ -5405,13 +5819,17 @@ file the Memory tab misreads.
 
 ### Nightly quality snapshot (03:45)
 
-**What it does.** Measures each Python project's `main` once a night with the
-factory's quality-metrics instrument, through
-`scripts/quality_snapshot_cadence.py` (its module docstring and `--help`). The
-skip of a sha already measured at the same identity, and the pinned tree the
-measurement runs in, are `plans/quality-dashboard-prd.md` decisions 18-19. It
-is pure CPU: no LLM, and it never commits. It is deliberately not coupled to
-the legibility trickle.
+**What it does.** Measures each project's `main` once a night, through
+`scripts/quality_snapshot_cadence.py` (its module docstring and `--help`), with
+the factory instrument the tree's structure selects
+(`scripts/quality_snapshot_cadence.py::_instrument_for`). A root
+`pyproject.toml` means `scripts/quality_metrics_snapshot.py`. Otherwise a root
+`Cargo.toml` means `scripts/rust_metrics_snapshot.py` under the rules file
+`scripts/rust_metrics_rules/<project_id>.toml`. A tree with neither fails the
+run. The skip of a sha already measured at the same identity, and the pinned
+tree the measurement runs in, are `plans/quality-dashboard-prd.md` decisions
+18-19. It is pure CPU: no LLM, and it never commits. It is deliberately not
+coupled to the legibility trickle.
 
 | File | Role |
 |---|---|
@@ -5421,9 +5839,27 @@ the legibility trickle.
 | `scripts/quality_snapshot_alarm.py` | files the failure escalation |
 | `scripts/install-quality-snapshot-timer.sh` | installs one project's instance |
 
-**Instances.** `dark_factory`, `solar_challenge`, `solar_challenge_platform`
-and `scoping_intake`. reify is out of scope until the Rust snapshot variant's
-gaps are owned.
+**Instances.** The Python projects `dark_factory`, `solar_challenge`,
+`solar_challenge_platform` and `scoping_intake`, and the Cargo project `reify`,
+whose install is task 11691, the operator gate filed from task 10131.
+
+**What the Rust path needs.**
+- tokei and cargo on the systemd user manager's PATH.
+  `~/.config/environment.d/995-user-path.conf` puts `~/.cargo/bin` there from
+  boot (Linger=yes), so both resolve at 03:45 even after an unattended
+  reboot. A missing tokei fails the run naming `cargo install --locked tokei`.
+- rustup resolves cargo per tree, from the project's `rust-toolchain.toml`.
+  Its version is not part of the identity: cargo supplies only package names
+  and manifest paths.
+- lizard from the factory `.venv`. It is in orchestrator's dev group, so
+  `uv sync --all-packages` installs it, and it runs as `python -m lizard`
+  under the measuring interpreter, whose lizard version params record.
+- A rules file per Cargo project. A missing one fails the run naming the path;
+  write it from the project's `/review-all` overlay, as
+  `scripts/rust_metrics_rules/reify.toml` was.
+
+A reify point costs about 10 minutes of wall clock (9m51s measured on a shared
+clone, 2026-11-25), well inside the unit's `TimeoutStartSec=2h`.
 
 **Where snapshots land.**
 `/home/leo/src/dark-factory/data/quality-metrics/<project_id>/<as_of_sha>.json`,
@@ -5433,14 +5869,19 @@ after each run, but a run killed by `TimeoutStartSec` can leave one there:
 remove the directory, then run `git -C <project_root> worktree prune`. Nothing
 is committed by machine. `/review-all` copies its own baseline to
 `plans/quality-metrics/` in its Phase 5, and its Phase 1 reads both homes
-(`skills/review-all/SKILL.md`).
+(`skills/review-all/SKILL.md`). The dashboard charts Python snapshots only. It
+lists a Rust snapshot under "Not placed", with the Python instrument's refusal
+naming the `rust-metrics-snapshot` instrument, until the Rust series of task
+11692 lands. Until then reify's list grows one line per night.
 
 **Deploy.** From the main checkout after landing, once per project:
 `scripts/install-quality-snapshot-timer.sh <project_root>`. The project id
 derives from the root, and the instance's root lives in
 `~/.config/dark-factory/quality-snapshot/<project_id>.env`. An agent cannot
 run it (see "The nightly ladder" above); this landing's deploy is task 9986.
-It is done when `systemctl --user list-timers --all` lists
+reify's is `scripts/install-quality-snapshot-timer.sh /home/leo/src/reify`,
+after `uv sync --all-packages` in the main checkout installs lizard (task
+11691). It is done when `systemctl --user list-timers --all` lists
 `quality-snapshot@<project_id>.timer`.
 
 **When it fails.** The wrapper's `quality_snapshot_cadence:` line is in
@@ -6366,12 +6807,34 @@ an off-cadence run would spend a Fable budget nobody scheduled.
 scripts/install-return-brief-timer.sh
 ```
 
-**Adding a project.** The brief scans every project root that
-`_task_db_scan.discover_project_roots` returns, plus every queue the decision
-registry has recorded. For a project the registry has never seen (e.g.
-know-live), set `DASHBOARD_KNOWN_PROJECT_ROOTS` (comma-separated) in the
-unit's environment. It replaces the default root rather than adding to it,
-so list dark-factory too.
+**Which projects sections 2–5 list.** Every measured project that is active.
+A project is active when its orchestrator unit is running, or when anything
+landed or was escalated in the window. The render finds a root's unit from
+the unit files in `--units-dir` (default `~/.config/systemd/user`, read
+through `scripts/orchestrator_projects.py`) and reads its state with
+`systemctl --user show`. A signal the render cannot read keeps the project
+listed, so an unreadable store never hides one. A paused project keeps its
+rows, each flagged `scheduler paused: <reason>` from its runs.db
+`scheduler_state`. One line closing the page, `Inactive projects (not in
+sections 2–5): ...`, names every other project with its root and reason.
+Section 3, "Landed", counts landings on main per
+`shared/src/shared/quality_series/landings.py::landings` (merge commits and
+fast-forwards, each train member counted), not orchestrator runs that
+finished done. Beside that count it states the unit's state and the window's
+new escalations. So the render runs one `git rev-list` per measured root and
+one `systemctl --user show` per orchestrator unit naming one. It makes no
+network call.
+
+**Adding a project.** The brief measures every project root that holds a
+queue the night scanned: each configured root's own queues, plus every queue
+the decision registry has recorded. So a project appears once the registry
+has seen it. The configured list is what
+`_task_db_scan.discover_project_roots` returns. Set
+`DASHBOARD_KNOWN_PROJECT_ROOTS` (comma-separated) in the unit's environment
+only for a project the registry has never seen and whose root holds no
+queue. The header names those roots on its `configured roots holding no
+scanned queue` line. The variable replaces the default root rather than
+adding to it, so list dark-factory too.
 
 **The apply half is agent work, not timer work.** Leo's answers are applied
 by a watcher session, following `skills/escalation-watcher/SKILL.md`,
@@ -6417,11 +6880,12 @@ checkout that ran the job:
 
 **What the report is for.** It measures regrowth. Re-emissions are
 near-verbatim, and the detector catches those. The report is
-`authoritative: false`. **Gate filing from it is blocked**: the detector's
-paraphrase recall is far below what enumerating a gate's members needs.
-Task 4916 owns that wiring and the precondition it waits on. The measured
-numbers are `recall_caveat` in `duplicate-audit.yaml`, and every report
-carries a copy. Read them there.
+`authoritative: false`. **Gate filing from it is descoped** by Leo's
+2026-11-17 ruling (esc-10244-1), and nothing is waiting to wire it.
+Duplicate detection stays with reconciliation Stage 1
+(`plans/memory-auto-consolidation-prd.md` D1). The measured numbers and the
+ruling (`gate_filing_ruling`) are `recall_caveat` in `duplicate-audit.yaml`,
+and every report carries a copy. Read them there.
 
 **Reading the diff.** Each cluster carries a `cluster_key` and a `lineage`
 status: `baseline`, `new`, `unchanged`, `grew`, `shrank` or `split`. A key is

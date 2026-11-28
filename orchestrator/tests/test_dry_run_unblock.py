@@ -39,6 +39,7 @@ from shared.testing import make_gate_mock
 
 from orchestrator.agents import sandbox_dispatch
 from orchestrator.agents.invoke import invoke_agent
+from orchestrator.agents.lane_task_guidance import UNLINKED_TASK_STATE_GUIDANCE
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import OrchestratorConfig, TranscriptArchiveConfig
 from orchestrator.dry_run_unblock import _TASK_EMPTY_STATE, _TASK_UNAVAILABLE_STATE
@@ -2851,6 +2852,19 @@ class TestPromptCarriesTaskContext:
         reviews_dir = TaskArtifacts.for_task(tmp_path, '42').artifact_path('reviews')
         assert f'**Reviews directory:** {reviews_dir}' in prompt.splitlines(), prompt
         assert str(tmp_path / '.task' / 'reviews') not in prompt, prompt
+
+    @pytest.mark.asyncio
+    async def test_prompt_says_which_task_state_is_not_under_the_task_dir(self, tmp_path):
+        """All nine census sightings of fk-a6083fb7ed86 were unblock-auto
+        investigators reading `<worktree>/.task/metadata.json`, which no lane
+        link exposes. The note must point at where this investigator reads
+        that state, since its prompt does not carry it."""
+        prompt = await _capture_investigation_prompt(tmp_path, _TaskDocScheduler())
+
+        assert UNLINKED_TASK_STATE_GUIDANCE in prompt, prompt
+        start = prompt.index(UNLINKED_TASK_STATE_GUIDANCE)
+        paragraph = prompt[start:].split('\n\n', 1)[0]
+        assert 'mcp__fused-memory__get_task' in paragraph, paragraph
 
     @pytest.mark.asyncio
     async def test_prompt_names_the_reviews_directory_its_caller_chose(self, tmp_path):

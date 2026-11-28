@@ -112,6 +112,12 @@ class EventType(StrEnum):
     cap_hit = 'cap_hit'
     lock_acquired = 'lock_acquired'
     lock_released = 'lock_released'
+    # A recovered merge request's task holds less than its journalled keys after
+    # orchestrator/src/orchestrator/recovered_merge_holds.py::RecoveredMergeHolds.restore.
+    # data: {request_id, cause (HoldShortfall there), restored: [keys],
+    # unheld: [keys] (empty when underivable), blockers: [{module, owner, kind}],
+    # error: repr of what failed, or None}
+    recovered_merge_hold_incomplete = 'recovered_merge_hold_incomplete'
     # Durable persist of the plan-tightened lock set on the success branch of
     # handle_blast_radius_expansion. Payload: {files, released, acquired,
     # persisted: bool}. Complements lock_released (reason='plan_refinement')
@@ -253,6 +259,11 @@ class EventType(StrEnum):
     # measured_at: ISO-8601 str} — the suppressed pytest node-ids, the merge
     # commit whose verify was suppressed, and when the suppression was decided.
     merge_flake_suppressed = 'merge_flake_suppressed'
+    # One row per flake-debt resolution pass, zero-row passes included, so an hour
+    # with no row means the service is not running.  Producer:
+    # harness.py::Harness._run_flake_debt_resolution_pass; data:
+    # flake_debt_drain.py::ResolutionPassReport.event_data.
+    flake_debt_resolution_pass = 'flake_debt_resolution_pass'
     # One firing of Abort trigger 3 (no in-flight verify progress for a full
     # budget) in orchestrator/src/orchestrator/merge_lane/inflight_verify.py::
     # InflightVerifyRun._abort_no_progress, requeue and cap-out alike.
@@ -299,9 +310,12 @@ class EventType(StrEnum):
     #     {merge_commit, shadow_compare, warm_test_count, cold_test_count}.
     verdict_parity_ok = 'verdict_parity_ok'
     # A due drift check could not acquire both host slots within its settle
-    # window, so it ran nothing and re-arms for the next landing.  Producer:
+    # window, or a warm lane where a pool is configured, so it ran nothing and
+    # re-arms for the next landing.  Producer:
     # merge_lane/drift.py::_run_drift_check.  Payload {merge_sha,
-    # consecutive_deferrals, hosts}, hosts being HostAllocator.host_states().
+    # consecutive_deferrals, hosts, cause, detail}, hosts being
+    # HostAllocator.host_states(), cause a DriftDeferralCause value and detail
+    # the cause's own report (why no warm lane could be seeded), else null.
     drift_check_deferred = 'drift_check_deferred'
     # Land-time remote-green cross-check (task 2822, fix b) telemetry. The
     # AGREE case reuses verdict_parity_ok above; these two give the divergence
@@ -382,6 +396,8 @@ class EventType(StrEnum):
     # escalation (task 2757; Reify 5120 RCA RC-2).  task_id-keyed; payload shape:
     # {reason, category, failure_category, cause_hint}.
     merge_blocked = 'merge_blocked'
+    # One merge pre-verify screen run (task 7919); payload: merge_lane/screen.py::MergeScreen.
+    merge_screen = 'merge_screen'
     # A resumed task branch whose HEAD does not merge cleanly onto main, found at
     # dispatch start before planning (task 7736).  Sole emit site:
     # orchestrator/src/orchestrator/workflow.py::TaskWorkflow._settle_conflicting_base,
@@ -421,6 +437,10 @@ class EventType(StrEnum):
     # in-worktree path is None-safe (correctness fix still applies; only the
     # event is dispatch-local, mirroring merge_flake_suppressed).
     trivial_pass_escalated = 'trivial_pass_escalated'
+    # Task 5411: the merge gate a post-merge verify took, narrow or full, and what it ran
+    # (docs/narrow-merge-gate.md). task_id-keyed; data carries {resolution, miss_reason,
+    # miss_path, changed_paths, commands (None on the full gate), passed, base_sha, merge_sha}.
+    merge_gate_resolution = 'merge_gate_resolution'
     # Contract-currency (INV-2, plans/merge-verdict-integrity-prd.md §1, §3.1)
     # telemetry: a RemoteRunner's verdict is adoptable only if the remote ran
     # the dispatcher's own gate code.  Since task 6565 every remote verify runs
@@ -434,10 +454,13 @@ class EventType(StrEnum):
     #
     # runner_synced: emitted when the remote was brought current with the
     # dispatcher — a gate checkout built for the deployed sha (right after
-    # runner_stale, kind='gate_checkout'), or the project checkout's main ref
-    # mirror-forced after a non-fast-forward (kind='project_main_mirror').  data
-    # carries {runner, kind, from_head, to_head, forced}; forced is True only on
-    # the project-main mirror arm.
+    # runner_stale, kind='gate_checkout'), the project checkout's main ref
+    # mirror-forced after a non-fast-forward (kind='project_main_mirror'), or
+    # the project checkout's tags force-mirrored after a plain tag push was
+    # refused twice, the retry ruling out a ref-lock race between roles
+    # (kind='project_tag_mirror'; from_head/to_head null, a tag set has no
+    # single head).  data carries {runner, kind, from_head, to_head, forced};
+    # forced is True on both project mirror arms and False on gate_checkout.
     runner_stale = 'runner_stale'
     runner_synced = 'runner_synced'
     # Task 6565 (design D1): the process's deployed sha is flagged — HEAD moved

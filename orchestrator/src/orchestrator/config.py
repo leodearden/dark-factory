@@ -9,9 +9,11 @@ import os
 import posixpath
 import re
 import stat
-from dataclasses import dataclass
+from collections import Counter
+from collections.abc import Mapping, Sequence
+from dataclasses import asdict, dataclass
 from itertools import pairwise
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from types import UnionType
 from typing import Annotated, Any, Literal, NamedTuple, Union, get_args, get_origin
 
@@ -23,6 +25,7 @@ from pydantic import (
     PrivateAttr,
     TypeAdapter,
     ValidationError,
+    ValidationInfo,
     field_validator,
     model_validator,
 )
@@ -52,13 +55,16 @@ from orchestrator.config_census_ignore import (  # noqa: F401 (re-exported for t
     audit_census_ignore_entries,
     parse_census_ignore_entries,
 )
+from orchestrator.defect_tests_config import DefectTestsConfig
 from orchestrator.implementer_brief_variant import ImplementerBriefVariant
 from orchestrator.merge_pool_config import MergePoolConfig
+from orchestrator.narrow_gate_config import NarrowMergeGateConfig
 from orchestrator.routing import DEFAULT_ALLOWED_MODELS, DEFAULT_LADDER
 from orchestrator.shadow_types import ShadowShape
 from orchestrator.task_priority import PRIORITY_TIERS
 from orchestrator.verify_admission_gate import AdmissionOrder
-from orchestrator.verify_cache.modes import CacheMode, VerifyRole
+from orchestrator.verify_cache.modes import CacheMode, VerifyRole, forced_off, most_conservative
+from orchestrator.verify_host_roster_file import RosterFileError, load_roster, roster_file_path
 
 logger = logging.getLogger(__name__)
 
@@ -80,6 +86,15 @@ VerifyHostPolicy = Literal['prefer_local', 'prefer_remote']
 # this name as its HostPolicy, so the config field and the dispatcher's
 # eligibility match share one vocabulary.
 VerifyTaskHostPolicy = Literal['local', 'remote_modules', 'remote_all']
+
+#: The script names GitOps's warm-lane wrappers resolve (git_ops.py::GitOps._resolve_warm_lane_script_logged).
+WarmLaneWrapperScript = Literal[
+    'warm-lane-disk-guard.sh',
+    'warm-lane-audit.sh',
+    'warm-lane-gc.sh',
+    'warm-lane-degenerate-ref-check.sh',
+    'thin-warm-lane.sh',
+]
 
 
 # --- Priority-tier constants (value/h scheduler) ---
@@ -207,6 +222,10 @@ class ConfigRequiredError(Exception):
     """
 
 
+class VerifyRunnersDeclaredTwiceError(ValueError):
+    """A project names verify hosts both inline and in the roster file (PRD verify-host-roster decision 7)."""
+
+
 def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
     """Deep-merge *override* into *base*.  Override values win at leaf level."""
     merged = base.copy()
@@ -279,6 +298,12 @@ class YamlSettingsSource(PydanticBaseSettingsSource):
 # --- Sub-models ---
 
 
+_EVAL_ONLY_JUDGE_DESCRIPTION = (
+    'Completion judge setting; the judge runs in evals only '
+    '(see OrchestratorConfig.judge_after_each_iteration).'
+)
+
+
 class ModelsConfig(BaseModel):
     """Model selection per agent role."""
 
@@ -291,7 +316,7 @@ class ModelsConfig(BaseModel):
     triage: str = Field(default='sonnet')
     module_tagger: str = Field(default='haiku')
     deep_reviewer: str = Field(default='opus')
-    judge: str = Field(default='sonnet')
+    judge: str = Field(default='sonnet', description=_EVAL_ONLY_JUDGE_DESCRIPTION)
     simple_task: str = Field(default='sonnet')
 
 
@@ -307,7 +332,7 @@ class BudgetsConfig(BaseModel):
     triage: float = Field(default=2.0)
     module_tagger: float = Field(default=2.0)
     deep_reviewer: float = Field(default=15.0)
-    judge: float = Field(default=0.50)
+    judge: float = Field(default=0.50, description=_EVAL_ONLY_JUDGE_DESCRIPTION)
     simple_task: float = Field(default=2.50)
 
 
@@ -323,7 +348,7 @@ class TurnsConfig(BaseModel):
     triage: int = Field(default=25)
     module_tagger: int = Field(default=30)
     deep_reviewer: int = Field(default=100)
-    judge: int = Field(default=15)
+    judge: int = Field(default=15, description=_EVAL_ONLY_JUDGE_DESCRIPTION)
     simple_task: int = Field(default=50)
 
 
@@ -339,7 +364,7 @@ class EffortConfig(BaseModel):
     triage: str = Field(default='medium')
     module_tagger: str = Field(default='medium')
     deep_reviewer: str = Field(default='xhigh')
-    judge: str = Field(default='medium')
+    judge: str = Field(default='medium', description=_EVAL_ONLY_JUDGE_DESCRIPTION)
     simple_task: str = Field(default='high')
 
 
@@ -365,7 +390,7 @@ class TimeoutsConfig(BaseModel):
     triage: float = Field(default=300.0)
     module_tagger: float = Field(default=300.0)
     deep_reviewer: float = Field(default=2400.0)
-    judge: float = Field(default=300.0)
+    judge: float = Field(default=300.0, description=_EVAL_ONLY_JUDGE_DESCRIPTION)
     # Dedicated per-role knob (deliberately decoupled from
     # OrchestratorConfig.invocation_timeout — see that field's docstring):
     # today simple_task's timeout comes from the getattr(timeouts_cfg,
@@ -416,8 +441,33 @@ class BackendsConfig(BaseModel):
     triage: str = Field(default='claude')
     module_tagger: str = Field(default='claude')
     deep_reviewer: str = Field(default='claude')
-    judge: str = Field(default='claude')
+    judge: str = Field(default='claude', description=_EVAL_ONLY_JUDGE_DESCRIPTION)
     simple_task: str = Field(default='claude')
+
+
+class SplitMatch(BaseModel):
+    """One arm of a salted-hash split of the task id, evaluated by
+    ``orchestrator/src/orchestrator/routing.py::_rule_matches`` via
+    ``shared/src/shared/routing_split.py::split_bucket`` and validated at
+    load and reload.
+    """
+
+    model_config = ConfigDict(extra='forbid', frozen=True)
+
+    salt: str = Field(min_length=1)
+    buckets: int = Field(ge=2)
+    bucket: int = Field(ge=0)
+
+    @field_validator('bucket')
+    @classmethod
+    def _bucket_within_buckets(cls, value: int, info: ValidationInfo) -> int:
+        buckets = info.data.get('buckets')
+        if buckets is not None and value >= buckets:
+            raise ValueError(
+                f'bucket {value} is out of range for buckets={buckets}; '
+                'a split needs 0 <= bucket < buckets'
+            )
+        return value
 
 
 class RuleMatch(BaseModel):
@@ -438,6 +488,9 @@ class RuleMatch(BaseModel):
     silently never match; populate ``metadata['priority']`` explicitly if
     you need this condition to fire. See ``orchestrator.routing.
     _rule_matches``'s docstring for the same note.
+
+    ``split`` (a ``SplitMatch``) matches only the task ids that fall in one
+    arm of a salted-hash split.
     """
 
     model_config = ConfigDict(extra='forbid')
@@ -451,6 +504,7 @@ class RuleMatch(BaseModel):
     min_routing_tier: int | None = None
     min_dispatch_count: int | None = None
     simple_saturated: bool | None = None
+    split: SplitMatch | None = None
 
 
 class RuleSet(BaseModel):
@@ -1483,26 +1537,58 @@ class SpeculationProbeConfig(BaseModel):
         return v
 
 
+class _RoleModeFields(NamedTuple):
+    """The VerifyCacheConfig fields holding one verify role's modes."""
+
+    mode: str
+    remote_mode: str
+
+
+#: The roles the verify cache acts for; it has no mode for any other (background is always OFF).
+_ROLE_MODE_FIELDS: dict[VerifyRole, _RoleModeFields] = {
+    'task': _RoleModeFields('task_mode', 'remote_task_mode'),
+    'merge': _RoleModeFields('merge_mode', 'remote_merge_mode'),
+}
+
+
 class VerifyCacheConfig(BaseModel):
     """How far the verify-result cache may act, per verify role
     (plans/verify-result-cache-prd.md § Amendments, A3: per-role modes).
 
     Each role's mode is its own green-tier reload leaf. The kill switch is not
-    here: it lives in the registry's policy_state.
+    here: it lives in the registry's policy_state. Remote replay has its own
+    per-role mode, never less conservative than the role's (A5.2).
     """
 
     model_config = ConfigDict(extra='forbid')
 
     task_mode: CacheMode = CacheMode.OFF
     merge_mode: CacheMode = CacheMode.OFF
+    remote_task_mode: CacheMode = CacheMode.OFF
+    remote_merge_mode: CacheMode = CacheMode.OFF
+    remote_candidates_per_unit: int = Field(default=16, ge=1)
 
     def mode_for(self, role: VerifyRole) -> CacheMode:
-        """*role*'s mode; the cache has no background role, so that is always OFF."""
-        if role == 'task':
-            return self.task_mode
-        if role == 'merge':
-            return self.merge_mode
-        return CacheMode.OFF
+        """*role*'s mode; the cache has no background role, so that is always OFF.
+        DF_VERIFY_CACHE=off forces every role OFF (plans/verify-result-cache-prd.md, Amendment A3)."""
+        fields = _ROLE_MODE_FIELDS.get(role)
+        if forced_off() or fields is None:
+            return CacheMode.OFF
+        return getattr(self, fields.mode)
+
+    def remote_mode_for(self, role: VerifyRole) -> CacheMode:
+        """The mode a remote verify of *role* may act under: the role's own mode, capped by its remote mode."""
+        fields = _ROLE_MODE_FIELDS.get(role)
+        if fields is None:
+            return CacheMode.OFF
+        return most_conservative(self.mode_for(role), getattr(self, fields.remote_mode))
+
+    def with_mode(self, role: VerifyRole, mode: CacheMode) -> 'VerifyCacheConfig':
+        """A validated copy whose *role* acts under *mode*, as a runner pins the mode its dispatcher shipped."""
+        fields = _ROLE_MODE_FIELDS.get(role)
+        if fields is None:
+            raise ValueError(f'the verify cache has no {role!r} mode to pin')
+        return type(self).model_validate({**self.model_dump(), fields.mode: mode})
 
 
 class DepthRow(NamedTuple):
@@ -1623,6 +1709,69 @@ class MergeDeepConfig(BaseModel):
                     f'rows: {unordered!r}'
                 )
         return table
+
+
+class MergeScreenConfig(BaseModel):
+    """The merge pre-verify screen (task 7919, plans/merge-pre-verify-screen-prd.md).
+
+    ``manifest`` is the kill switch: ``None`` (the default) means no screen
+    code runs at any dispatch site. Every bound below fails OPEN: an
+    instrument fault, timeout or unavailable lane lets the item proceed to
+    its ordinary verify. Decisions 3, 4 and 8 of the PRD are the canonical
+    narrative.
+
+    Plain BaseModel (no ``frozen``) so ``_set_leaf`` mutates it in place on
+    hot-reload, as :class:`MergeDeepConfig` does; every leaf is green-tier.
+    """
+
+    manifest: str | None = Field(
+        default=None,
+        description=(
+            'Repo-relative path of the screen manifest, read in the SCREENED '
+            'tree. null is the kill switch: no screen code runs at any site. '
+            'See plans/merge-pre-verify-screen-prd.md decision 3.'
+        ),
+    )
+    timeout_secs: float = Field(
+        default=180.0,
+        gt=0,
+        description=(
+            'Bound on one whole item screen, base re-runs and lane reset '
+            'included. On overrun the item proceeds (fail open). See '
+            'plans/merge-pre-verify-screen-prd.md decisions 4 and 8.'
+        ),
+    )
+    chain_timeout_secs: float = Field(
+        default=30.0,
+        gt=0,
+        description=(
+            'Bound on one chain-tip screen. On overrun the chain proceeds '
+            '(fail open). See plans/merge-pre-verify-screen-prd.md decisions 4 and 8.'
+        ),
+    )
+    error_streak_alarm: int = Field(
+        default=5,
+        ge=1,
+        description=(
+            'Consecutive instrument-error screens that file one info L1 naming '
+            'the kill switch. Errors never block an item. See '
+            'plans/merge-pre-verify-screen-prd.md decision 8.'
+        ),
+    )
+
+    @field_validator('manifest', mode='after')
+    @classmethod
+    def _validate_manifest(cls, manifest: str | None) -> str | None:
+        if manifest is None:
+            return None
+        if not manifest:
+            raise ValueError('manifest must be a repo-relative path or null, not empty')
+        path = PurePosixPath(manifest)
+        if path.is_absolute() or '..' in path.parts:
+            raise ValueError(
+                f'manifest must be repo-relative with no ".." segment; got {manifest!r}'
+            )
+        return manifest
 
 
 class RetentionConfig(BaseModel):
@@ -2467,9 +2616,12 @@ class GitConfig(BaseModel):
             'because parking through a foreign process\'s index lock would '
             'clobber the in-flight commit\'s staged/working state. This knob '
             'governs the WAIT only: the crashed-leftover verdict that offers '
-            'an operator destructive `rm -f <lock>` recovery keys on '
+            'an operator destructive `rm -f <lock>` recovery, and skips the '
+            'wait, requires a holder scan that found no live git process in '
+            'project_root\'s work tree AND a first-observed age past '
             'max(this, merge_gates._STALE_LOCK_FLOOR_S), so lowering it (0 '
-            'included) never widens what counts as a stale lock.'
+            'included) never widens what counts as a stale lock, and no '
+            'setting makes a lock with a live holder count as one.'
         ),
     )
     offline_lane_persist_passes: int = Field(
@@ -2709,6 +2861,19 @@ class GitConfig(BaseModel):
             'Default False → byte-identical and revertible, mirroring the '
             'warm_lane_disk_guard convention; reify enables it in its own '
             'orchestrator.yaml.'
+        ),
+    )
+    warm_lane_df_preferred_scripts: list[WarmLaneWrapperScript] = Field(
+        default_factory=list,
+        description=(
+            "Warm-lane wrapper scripts that resolve dark-factory's copy "
+            '(orchestrator/scripts/warm-lane/<name>) first and the '
+            "project's scripts/<name> second. Default [] keeps project-first "
+            'for every script. warm-lane-disk-guard.sh covers both the hard '
+            'and the soft guard wrapper. Green tier: removing an entry and '
+            'calling reload_config reverts it. See '
+            'git_ops.py::GitOps._warm_lane_script_candidates and '
+            'plans/warm-lane-infra-repatriation-prd.md D3.'
         ),
     )
     warm_lane_min_free_gib: int = Field(
@@ -3290,6 +3455,28 @@ class RemoteGatePaths(NamedTuple):
     root: str
 
 
+# The name the merge lane and the task-side pool give the local slot
+# (verify_runner.py::HostAllocator, verify_hosts.py::HostPool).
+LOCAL_VERIFY_HOST_NAME = 'local'
+
+
+def require_unique_unreserved_runner_names(names: Sequence[str]) -> None:
+    """Raise ValueError unless every name is unique and none is the local slot's."""
+    duplicated = sorted(name for name, count in Counter(names).items() if count > 1)
+    reserved = LOCAL_VERIFY_HOST_NAME in names
+    if not duplicated and not reserved:
+        return
+    found = []
+    if duplicated:
+        found.append(f'duplicated {duplicated}')
+    if reserved:
+        found.append(f'reserved {[LOCAL_VERIFY_HOST_NAME]}')
+    raise ValueError(
+        f'verify_runners: runner names must be unique and none may be '
+        f'{LOCAL_VERIFY_HOST_NAME!r}; {", ".join(found)}'
+    )
+
+
 class VerifyRunnerConfig(BaseModel):
     """Configuration for a single remote verify runner (Lever C).
 
@@ -3423,6 +3610,11 @@ _OVERRIDABLE_FIELDS = frozenset({
 
 ModuleVerifyCache = Literal['default', 'never']
 
+
+def check_module_verify_cache(owner: str, value: object) -> None:
+    if value not in get_args(ModuleVerifyCache):
+        raise ValueError(f'{owner}: verify_cache is {value!r}, expected one of {get_args(ModuleVerifyCache)}')
+
 _DISCOVERY_EXCLUDED_DIRS = frozenset({
     '.git', '.venv', 'venv', '.worktrees',
     'node_modules', '__pycache__', 'build', 'target', '.gradle',
@@ -3461,11 +3653,7 @@ class ModuleConfig:
     verify_cache: ModuleVerifyCache = 'default'
 
     def __post_init__(self) -> None:
-        if self.verify_cache not in get_args(ModuleVerifyCache):
-            raise ValueError(
-                f'module {self.prefix!r}: verify_cache is {self.verify_cache!r}, '
-                f'expected one of {get_args(ModuleVerifyCache)}',
-            )
+        check_module_verify_cache(f'module {self.prefix!r}', self.verify_cache)
 
 
 def _discover_module_configs(project_root: Path) -> dict[str, ModuleConfig]:
@@ -4047,10 +4235,17 @@ class OrchestratorConfig(BaseSettings):
     # (that dir is preserved for forensics regardless of this flag).
     recycle_config_dir_on_zero_output: bool = Field(default=True)
 
-    # Completion judge — opt-in loop-exit hint after each implementer iteration.
-    # Default False: production orchestrator runs unaffected. Eval runner
-    # enables this per-task (see evals/runner.py build_eval_orch_config).
-    judge_after_each_iteration: bool = Field(default=False)
+    judge_after_each_iteration: bool = Field(
+        default=False,
+        description=(
+            'Run the completion judge (role judge) after each implementer iteration; '
+            'a verdict of complete with substantive work ends EXECUTE early. '
+            'Evals only: production leaves it False, and '
+            'orchestrator/src/orchestrator/evals/runner.py::build_eval_orch_config '
+            'turns it on for every eval run, shadow cells included, unless the '
+            'fixture sets it False (task 5377).'
+        ),
+    )
 
     # Merge conflict reduction
     max_advance_attempts: int = Field(default=3)
@@ -4905,6 +5100,8 @@ class OrchestratorConfig(BaseSettings):
     # escalations sit pending until the next orchestrator restart dismisses
     # them unread.  Set ``orphan_l0_reaper_enabled = False`` to disable.
     orphan_l0_reaper_enabled: bool = Field(default=True)
+    # Also the startup strand sweep's classification threshold:
+    # orchestrator/src/orchestrator/harness.py::Harness._dismiss_stale_escalations.
     orphan_l0_timeout_secs: float = Field(default=600.0)
     orphan_l0_check_interval_secs: float = Field(default=60.0)
 
@@ -5712,6 +5909,9 @@ class OrchestratorConfig(BaseSettings):
     # checks PRD delta). Task 2583 (epsilon) extends this sub-model further.
     delivered_checks: DeliveredChecksConfig = Field(default_factory=DeliveredChecksConfig)
 
+    # Defect-test gates and the verify-leg plugin injection (plans/defect-tests-prd.md).
+    defect_tests: DefectTestsConfig = Field(default_factory=DefectTestsConfig)
+
     # Warm-lane session-resume guard (task γ, plans/warm-lane-session-resume-prd.md).
     # An absent stanza yields the enabled-by-default instance (default_factory
     # suffices — no defaults.yaml edit, like delivered_checks). Read by the
@@ -5729,9 +5929,16 @@ class OrchestratorConfig(BaseSettings):
     # defaults.yaml declares the block explicitly so the knob is discoverable.
     merge_deep: MergeDeepConfig = Field(default_factory=MergeDeepConfig)
 
+    # The merge pre-verify screen (task 7919). manifest null is its kill switch;
+    # the defaults live in MergeScreenConfig only, not in defaults.yaml.
+    merge_screen: MergeScreenConfig = Field(default_factory=MergeScreenConfig)
+
     # The merge pool's order, promotion period and bounce cap (task 9933,
     # plans/priority-at-later-gates-prd.md). Nothing reads it yet.
     merge_pool: MergePoolConfig = Field(default_factory=MergePoolConfig)
+
+    # The docs-only and comments-only merge gate (task 5411, docs/narrow-merge-gate.md). Off by default.
+    narrow_merge_gate: NarrowMergeGateConfig = Field(default_factory=NarrowMergeGateConfig)
 
     # Early start on a predecessor's branch (plans/early-start-on-predecessor-branch-prd.md).
     # The defaults live in EarlyStartConfig only, not in defaults.yaml.
@@ -6022,6 +6229,14 @@ class OrchestratorConfig(BaseSettings):
     @classmethod
     def _resolve_project_root(cls, v: Path) -> Path:
         return v.resolve()
+
+    @field_validator('verify_runners', mode='after')
+    @classmethod
+    def _require_unique_unreserved_runner_names(
+        cls, v: list[VerifyRunnerConfig],
+    ) -> list[VerifyRunnerConfig]:
+        require_unique_unreserved_runner_names([runner.name for runner in v])
+        return v
 
     @field_validator('verify_env_probes', mode='after')
     @classmethod
@@ -6722,6 +6937,30 @@ def config_unknown_keys_signature(census: list[ConfigUnknownKey]) -> str:
     return hashlib.sha256(joined.encode('utf-8')).hexdigest()[:16]
 
 
+def _roster_verify_runners(
+    config: OrchestratorConfig, env: Mapping[str, str], config_path: Path,
+) -> list[VerifyRunnerConfig]:
+    """This project's runners from the private roster file (SETUP.md §12, PRD verify-host-roster §6.3)."""
+    roster_path = roster_file_path(env)
+    project_id = config.fused_memory.project_id
+    runners = load_roster(roster_path).runners_for_project(project_id)
+    try:
+        roster_runners = [VerifyRunnerConfig.model_validate(asdict(runner)) for runner in runners]
+        require_unique_unreserved_runner_names([runner.name for runner in roster_runners])
+    except ValueError as exc:
+        raise RosterFileError(f'{roster_path}: project {project_id!r}: {exc}') from exc
+    if roster_runners and config.verify_runners:
+        raise VerifyRunnersDeclaredTwiceError(
+            f'project {project_id!r} names its verify hosts twice: inline runners '
+            f'{[runner.name for runner in config.verify_runners]}, declared by {config_path} '
+            f'or by the ORCH_VERIFY_RUNNERS environment variable, which ranks above it; '
+            f'and roster hosts {[runner.name for runner in roster_runners]} in {roster_path}.  '
+            f'Keep the roster file: remove the verify_runners block from {config_path} '
+            f'and any ORCH_VERIFY_RUNNERS entry (SETUP.md §12).'
+        )
+    return roster_runners
+
+
 def load_config(config_path: Path | None = None) -> OrchestratorConfig:
     """Load configuration from an explicit YAML file.
 
@@ -6761,6 +7000,9 @@ def load_config(config_path: Path | None = None) -> OrchestratorConfig:
 
     os.environ['ORCH_CONFIG_PATH'] = str(config_path)
     config = OrchestratorConfig()
+    roster_runners = _roster_verify_runners(config, os.environ, config_path)
+    if roster_runners:
+        config.verify_runners = roster_runners
     # κ: fold the shared sccache backend into verify_env so the LOCAL merge-verify
     # path (run_scoped_verification in verify.py reads config.verify_env) points at
     # the shared backend without requiring verify.py changes.  The assignment is
@@ -6981,8 +7223,12 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
     # separate RELOADABLE_FIELDS edit, so chains can be turned on, retuned or
     # killed (chain_cap -> 0) without a restart. See MergeDeepConfig.
     _submodel_leaf_paths('merge_deep', MergeDeepConfig),
+    # The merge screen (task 7919): read per screen, so its kill switch applies live.
+    _submodel_leaf_paths('merge_screen', MergeScreenConfig),
     # The merge pool's knobs (task 9933): every leaf hot, as merge_deep's are.
     _submodel_leaf_paths('merge_pool', MergePoolConfig),
+    # The narrow merge gate (task 5411): read per merge verify, so its kill switch applies live.
+    _submodel_leaf_paths('narrow_merge_gate', NarrowMergeGateConfig),
     # Verify-result cache (task 5652): read per verify decision, so green tier;
     # each role's mode is its own leaf, so a task-only edit applies alone.
     _submodel_leaf_paths('verify_cache', VerifyCacheConfig),
@@ -7027,6 +7273,8 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
     # Live shadow eval (task 5382, plans/live-shadow-eval-prd.md C6): green tier on
     # purpose, NOT auto_eval_redo_budget_usd's restart tier (PRD S2).
     _submodel_leaf_paths('shadow_eval', ShadowEvalConfig),
+    # Defect tests: green tier, so the human gate flips mode without a restart (PRD Config).
+    _submodel_leaf_paths('defect_tests', DefectTestsConfig),
     {
         # Steward grace
         'steward_completion_timeout',
@@ -7198,6 +7446,9 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
         # captured at startup), so a reload takes effect on the very next
         # advance and an operator can retune the stand-off live.
         'git.merge_park_lock_grace_seconds',
+        # GitOps reads it per resolution off this same GitConfig object (I3): a reload applies
+        # from the next wrapper invocation, never to a run already spawned. List leaf, compared by equality.
+        'git.warm_lane_df_preferred_scripts',
         # Generic per-project offline-lane commands + legacy-numeric gate (task
         # 2789, D6 green-tier): the worker re-reads config.git each _run_once,
         # so the command list, per-command priorities, and the legacy-numeric

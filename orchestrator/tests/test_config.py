@@ -4718,3 +4718,73 @@ class TestProjectReviewConfig:
         review = project_review_config(tmp_path)
 
         assert review.briefing_path == load_packaged_defaults()['review']['briefing_path']
+
+
+WARM_LANE_WRAPPER_SCRIPTS = (
+    'warm-lane-disk-guard.sh',
+    'warm-lane-audit.sh',
+    'warm-lane-gc.sh',
+    'warm-lane-degenerate-ref-check.sh',
+    'thin-warm-lane.sh',
+)
+
+
+class TestWarmLaneDfPreferredScripts:
+    """``git.warm_lane_df_preferred_scripts`` lists wrapper scripts that resolve
+    dark-factory's copy first (task 7864, PRD D3 as amended)."""
+
+    def test_default_is_empty_and_not_shared(self):
+        from orchestrator.config import GitConfig
+
+        first, second = GitConfig(), GitConfig()
+        assert first.warm_lane_df_preferred_scripts == []
+        assert first.warm_lane_df_preferred_scripts is not second.warm_lane_df_preferred_scripts
+
+    @pytest.mark.parametrize('name', WARM_LANE_WRAPPER_SCRIPTS)
+    def test_every_wrapper_script_name_round_trips(self, name):
+        from orchestrator.config import GitConfig
+
+        cfg = GitConfig.model_validate({'warm_lane_df_preferred_scripts': [name]})
+        assert cfg.warm_lane_df_preferred_scripts == [name]
+
+    @pytest.mark.parametrize('name', [
+        'seed-warm-lane.sh',
+        'refresh-warm-base.sh',
+        'warm-lane-gc-sweep.sh',
+        'provision-warm-lane-fs.sh',
+        'lib_lane_state.sh',
+        'scripts/warm-lane-gc.sh',
+        'warm-lane-gc',
+    ])
+    def test_a_name_no_wrapper_resolves_is_rejected_by_name(self, name):
+        from orchestrator.config import GitConfig
+
+        with pytest.raises(ValidationError) as exc:
+            GitConfig.model_validate({'warm_lane_df_preferred_scripts': [name]})
+        [err] = exc.value.errors()
+        assert err['type'] == 'literal_error'
+        assert err['loc'] == ('warm_lane_df_preferred_scripts', 0)
+        assert err['input'] == name
+
+    def test_the_leaf_is_green_tier_reloadable(self):
+        assert 'git.warm_lane_df_preferred_scripts' in RELOADABLE_FIELDS
+
+    @pytest.mark.usefixtures('code_default_config')
+    def test_apply_reload_reaches_the_held_git_config(self):
+        from orchestrator.config import GitConfig
+
+        live = OrchestratorConfig()
+        held = live.git
+        fresh = OrchestratorConfig(
+            git=GitConfig(warm_lane_df_preferred_scripts=['warm-lane-gc.sh']),
+        )
+
+        report = apply_reload(live, fresh)
+
+        assert report['reloaded'] is True
+        assert report['error'] is None
+        assert report['applied']['git.warm_lane_df_preferred_scripts'] == {
+            'old': [], 'new': ['warm-lane-gc.sh'],
+        }
+        assert report['restart_required'] == {}
+        assert held.warm_lane_df_preferred_scripts == ['warm-lane-gc.sh']

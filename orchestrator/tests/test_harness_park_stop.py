@@ -17,11 +17,9 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-import pytest_asyncio
 from _orch_helpers import HermeticMcpSession
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
-from shared.cost_store import CostStore
 
 import orchestrator.digest as digest
 from orchestrator.config import OrchestratorConfig
@@ -35,35 +33,6 @@ from orchestrator.pause_policy import (
 )
 from orchestrator.run_store import RunStore
 from orchestrator.scheduler import Scheduler
-
-# ---------------------------------------------------------------------------
-# Helpers shared by cost-ceiling tests
-# ---------------------------------------------------------------------------
-
-@pytest_asyncio.fixture
-async def _cost_store_factory(tmp_path: Path):
-    """Fixture factory that opens CostStore instances and closes them on teardown.
-
-    Usage within a test::
-
-        store = await _cost_store_factory()
-        store2 = await _cost_store_factory('other.db')
-
-    All opened stores are closed in a ``finally`` block when the test finishes,
-    preventing aiosqlite connection and background-thread leaks.
-    """
-    stores: list[CostStore] = []
-
-    async def _open(filename: str = 'cost.db') -> CostStore:
-        store = CostStore(tmp_path / filename)
-        await store.open()
-        stores.append(store)
-        return store
-
-    yield _open
-
-    for store in stores:
-        await store.close()
 
 
 def _iso(delta: timedelta) -> str:
@@ -1274,7 +1243,7 @@ class TestHarnessRunForever:
         harness.scheduler.acquire_next = AsyncMock(side_effect=[assignment, None, None])
         harness.scheduler.get_statuses = AsyncMock(return_value=({'1': 'pending'}, None))
 
-        async def fake_slot(_assignment, _sem):
+        async def fake_slot(_assignment, _lease):
             return TaskReport(task_id='T1', title='t', outcome=WorkflowOutcome.DONE)
 
         harness._run_slot = fake_slot  # type: ignore[method-assign]
@@ -2815,15 +2784,16 @@ class TestHarnessDigestDoneCountSource:
             f'got {harness._ewa_value!r}'
         )
 
-        # The rendered digest's "Tasks done in window" figure must also equal 4,
-        # proving both the EWA input AND the displayed count come from EventStore
-        # (single source of truth — task 1421 Fix 1).
+        # The rendered digest's done-runs figure (the EWA denominator) must also
+        # equal 4, proving both the EWA input AND the displayed count come from
+        # EventStore (single source of truth — task 1421 Fix 1).
         digest_dir = tmp_path / 'data' / 'digests'
         digest_files = sorted(digest_dir.glob('digest-*.md'))
         assert digest_files, 'Expected at least one digest file written by _maybe_write_digest'
         content = digest_files[-1].read_text()
-        assert '## Tasks done in window\n4\n' in content, (
-            f'Expected rendered digest to show "Tasks done in window\\n4\\n"; '
+        expected = f'- {digest.DONE_RUNS_LABEL}, the EWA denominator: 4'
+        assert expected in content.splitlines(), (
+            f'Expected rendered digest to show {expected!r}; '
             f'digest content:\n{content}'
         )
 

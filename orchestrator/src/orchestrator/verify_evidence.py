@@ -132,6 +132,22 @@ def module_leg_name(module_prefix: str | None, leg: str) -> str:
     return f'module:{module_prefix or GLOBAL_MODULE}:{leg}'
 
 
+class LegCommands(Protocol):
+    @property
+    def test_command(self) -> str | None: ...
+    @property
+    def lint_command(self) -> str | None: ...
+    @property
+    def type_check_command(self) -> str | None: ...
+
+
+def module_unit_ids(module_prefix: str | None, commands: LegCommands) -> tuple[str, ...]:
+    """The unit of every leg of module *module_prefix* whose command *commands* sets."""
+    return tuple(
+        module_leg_name(module_prefix, leg) for leg, attr in COMMAND_FIELD_BY_LEG.items() if getattr(commands, attr)
+    )
+
+
 def module_leg_unit(module_prefix: str | None, leg: str, rc: int) -> VerifyUnit:
     """The unit for one module leg that ran and exited *rc*."""
     return VerifyUnit(

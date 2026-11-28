@@ -136,7 +136,7 @@ _ALL_ENUMERATED_CODES: dict[str, list[str]] = {
     ],
     'post_merge': [
         'post_merge_equivalence_failed', 'post_merge_pyright_broken',
-        'post_rebase_verify_fail',
+        'post_rebase_verify_fail', 'screen_failed',
     ],
     'train': ['train_incomplete', 'train_rebase_conflict', 'train_partial_flip'],
     'terminal_failure': [

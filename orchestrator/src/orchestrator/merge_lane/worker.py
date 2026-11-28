@@ -117,6 +117,7 @@ from orchestrator.merge_lane.gates import (
     _reverify_rebased_tree,
     _run_unscoped_typechecks,
 )
+from orchestrator.merge_lane.git_read import second_parents
 from orchestrator.merge_lane.halt import HaltState
 from orchestrator.merge_lane.host_quarantine import HostQuarantine
 from orchestrator.merge_lane.intake import (
@@ -129,6 +130,7 @@ from orchestrator.merge_lane.intake_buffers import (
     IntakeLifecycle,
     MergeIntake,
     answers_to,
+    resolved_with_shutdown,
 )
 from orchestrator.merge_lane.landed_outbox import LandedOutbox, LandedRow, MergeProvenance
 from orchestrator.merge_lane.landing_evidence import patch_content_contained
@@ -183,6 +185,7 @@ from orchestrator.merge_lane.request_ledger import (
     report_stuck_requests,
 )
 from orchestrator.merge_lane.reverify_gate_decision import GateClearance, ReverifyDispatch
+from orchestrator.merge_lane.screen import Bounce, ScreenPort, ScreenSite, screen_or_proceed
 from orchestrator.merge_lane.shadow import (
     _maybe_schedule_shadow_compare,
     _run_cold_shadow_verify,
@@ -191,7 +194,9 @@ from orchestrator.merge_lane.speculation_controller import (
     LiveTip,
     PermitLedger,
     SpeculationController,
+    fresh_dequeue_offer,
 )
+from orchestrator.merge_lane.tested_tree import TestedTree
 from orchestrator.merge_lane.tip_relation import (
     TipRelation,
     classify_tip_relation,
@@ -265,6 +270,7 @@ from orchestrator.merge_lane.verify_failure_outcome import (
 from orchestrator.merge_verify_facts import (
     ChainDepthReason,
 )
+from orchestrator.narrow_gate_delta import train_exclusions
 from orchestrator.scheduler import StaleEvidenceRejection
 from orchestrator.task_priority import TaskPriorityLookup
 from orchestrator.task_status import WORKFLOW_PRESERVE_STATUSES
@@ -964,6 +970,41 @@ def _train_cancel_refusal(
     return None
 
 
+def _split_coalesce_exclusions(
+    candidates: Sequence[MergeRequest],
+    reason_of: Callable[[MergeRequest], str | None],
+    exclusions: list[dict[str, str]],
+) -> list[MergeRequest]:
+    """The *candidates* *reason_of* leaves eligible; each excluded one is logged and appended to *exclusions*."""
+    eligible: list[MergeRequest] = []
+    for candidate in candidates:
+        reason = reason_of(candidate)
+        if not reason:
+            eligible.append(candidate)
+            continue
+        exclusions.append({'request_id': candidate.request_id, 'reason': reason})
+        logger.info(
+            'Coalesce exclusion: request_id=%s task_id=%s branch=%s reason=%s',
+            candidate.request_id, candidate.task_id, candidate.branch.bare_id, reason,
+        )
+    return eligible
+
+
+def _coalesce_suppressed(eligible: Sequence[MergeRequest], exclusions: list[dict[str, str]]) -> bool:
+    """Log a near-train the *exclusions* cut below two members, auditable without an event; always False.
+
+    The pass starts from at least two candidates, so only an exclusion can leave fewer.
+    """
+    logger.info(
+        'Coalesce near-train suppressed: exclusion gate left only %d '
+        'eligible candidate(s) (need ≥2); tasks will merge solo. '
+        'exclusions=%r',
+        len(eligible),
+        exclusions,
+    )
+    return False
+
+
 _MERGE_CANCEL_RETIRE_REASON = 'merge_cancel_retire'
 """Reason string for the C1 worktree removal driven by ``merge_cancel``
 retirement (task ε) — distinguishes a cancel-retirement reap from the C3
@@ -1221,11 +1262,15 @@ _COALESCE_RISKY_TERMINAL_STATES: frozenset[str] = frozenset({'blocked', 'error'}
 # nothing would park it merge-deferred, so a train holding it could never land.
 COALESCE_EXCLUDED_NO_AWAITING_WORKFLOW = 'no_awaiting_workflow'
 
-# How long a one-strike derail marker is remembered (task 5352).  An upper
-# bound on the subject, not a tuning dial: seven days is a generous outer
-# bound on a task's residency in the merge queue, and the marker must not
-# outlive the task it was recorded against.
-_COALESCE_DERAIL_TTL = timedelta(days=7)
+# Exclusion reason for a waiting single the narrow merge gate would verify
+# narrowly (task 5411, docs/narrow-merge-gate.md): a train would make it pay the
+# full gate it was routed away from.
+COALESCE_EXCLUDED_NARROW_MERGE_GATE = 'narrow_merge_gate'
+
+# How long a per-task marker (task 5352's one-strike derail, task 11047's
+# un-chained mark) is remembered: a generous outer bound on a task's merge-queue
+# residency, not a tuning dial, since no marker may outlive its task.
+_MERGE_QUEUE_RESIDENCY_BOUND = timedelta(days=7)
 
 
 class _TrainMergeHost(Protocol):
@@ -1247,6 +1292,7 @@ class _TrainMergeHost(Protocol):
     _clock: ClockPort
     _host_quarantine: HostQuarantine
     _escalation_queue: Any
+    _screen: ScreenPort | None
 
     # ── Per-task counters (mutated by shared helpers) ─────────────────────
     _post_merge_verify_timeouts: dict[str, int]
@@ -1520,6 +1566,39 @@ async def _forget_landed_stack_bases(git_ops: GitOps, req: GroupMergeRequest) ->
             "Train %s: could not clear its members' stack-base records",
             req.train_id, exc_info=True,
         )
+
+
+async def _screen_merged_item(
+    worker: _TrainMergeHost,
+    req: MergeRequest,
+    result: MergedOk | Decided,
+    *,
+    started_monotonic: float | None,
+) -> MergedOk | Decided:
+    """Screen the merger's merged item before it reaches verify; a bounce becomes a :class:`Decided`.
+
+    Only the merger loop calls this, so the remerge paths, which share
+    :func:`classify_and_merge`, never screen. The bounce is delivered as the
+    drop guard's is: no verify, no host lease
+    (plans/merge-pre-verify-screen-prd.md decisions 1 and 7).
+    """
+    if worker._screen is None or not isinstance(result, MergedOk):
+        return result
+    merge_result = result.merge_result
+    assert merge_result.merge_commit is not None
+    decision = await screen_or_proceed(
+        worker._screen, task_id=req.task_id, merged_sha=merge_result.merge_commit.strip(),
+        base_sha=merge_result.pre_merge_sha, config=req.config, site=ScreenSite.MERGER,
+    )
+    if not isinstance(decision, Bounce):
+        return result
+    if result.merge_wt is not None:
+        await worker._git_ops.cleanup_merge_worktree(result.merge_wt)
+    _emit_merge_attempt(
+        worker._event_store, req.task_id, OutcomeKind.screen_failed,
+        duration_ms=_elapsed_ms(started_monotonic),
+    )
+    return Decided(decision.outcome)
 
 
 async def classify_and_merge(
@@ -2052,6 +2131,7 @@ async def build_chain(
             links.append((req.task_id, res.merge_commit))
             link_request_ids.append(req.request_id)
             tip = res.merge_commit
+        link_tips = await second_parents(git_ops, [commit for _, commit in links])
     except BaseException as exc:
         # A cancellation mid-build must not strand a pool lane in ASSIGNED
         # (mirrors merge_to_main's except BaseException cleanup).
@@ -2106,6 +2186,7 @@ async def build_chain(
         links=links, tip=tip,
         truncated_at=truncated_at, truncated_reason=truncated_reason,
         lane=lane, lane_warm=warm, link_request_ids=tuple(link_request_ids),
+        link_tips=link_tips,
     )
 
 
@@ -2661,6 +2742,44 @@ def _derail_on_train_verify_failure(
         event_store, req, OutcomeKind.verify_failed, started_monotonic=started_monotonic,
     )
     return verify_outcome
+
+
+async def _screen_train_tip(
+    worker: _TrainMergeHost,
+    req: GroupMergeRequest,
+    merge_result: MergeResult,
+    *,
+    started_monotonic: float,
+) -> MergeOutcome | None:
+    """Screen a declared train's merged tip before its verify; ``None`` lets the verify run.
+
+    A bounce derails the train with the screen's own outcome, UNTAGGED: it
+    never goes through :func:`_derail_on_train_verify_failure`, so it is not
+    read as a cross-member interaction (plans/merge-pre-verify-screen-prd.md
+    decision 7).
+    """
+    if worker._screen is None:
+        return None
+    assert merge_result.merge_commit is not None
+    decision = await screen_or_proceed(
+        worker._screen, task_id=req.task_id, merged_sha=merge_result.merge_commit.strip(),
+        base_sha=merge_result.pre_merge_sha, config=req.config, site=ScreenSite.TRAIN,
+    )
+    if not isinstance(decision, Bounce):
+        return None
+    if merge_result.merge_worktree:
+        await worker._git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+    logger.info('Train %s: merge screen bounced the tip on %s', req.train_id, decision.check_ids)
+    _emit_train_event(
+        worker._event_store, EventType.train_derailed,
+        task_id=req.task_id, train_id=req.train_id,
+        member_task_ids=req.member_task_ids,
+        data={'derail_reason': decision.outcome.reason},
+    )
+    _emit_train_attempt(
+        worker._event_store, req, OutcomeKind.screen_failed, started_monotonic=started_monotonic,
+    )
+    return decision.outcome
 
 
 @dataclasses.dataclass(frozen=True)
@@ -3224,6 +3343,9 @@ async def _do_train_merge(
             f'Train {req.train_id}: merge_to_main reported success '
             f'but merge_worktree is None'
         )
+    screened = await _screen_train_tip(worker, req, merge_result, started_monotonic=t0)
+    if screened is not None:
+        return screened
 
     # (e) Workspace-wide post-merge verify via the shared helper, on the
     # worker's injected VerifyPort and a leased host (_leased_train_verify).
@@ -4670,9 +4792,12 @@ class SpeculativeMergeWorker:
         host_holder_reader: Callable[[], Mapping[str, str]] | None = None,
         on_host_readmitted: Callable[[str], None] | None = None,
         task_priority: TaskPriorityLookup | None = None,
+        screen: ScreenPort | None = None,
     ):
         self._git_ops = git_ops
         self._queue = queue
+        # The merge pre-verify screen (task 7919); None screens nothing at any site.
+        self._screen = screen
         self._event_store = event_store
         # Task η (AFK coverage gap): harness-owned handles for the
         # merge-verify dry-run investigation spawn.  The worker holds none of
@@ -4819,8 +4944,16 @@ class SpeculativeMergeWorker:
         # so its own subset tree gets a verdict that IS attributable to it.  The
         # mark lasts until a verdict for the task is applied, which is when its
         # request is retired (`_retire_item`): a verify the cascade cancels or
-        # voids keeps it.
-        self._next_dispatch_unchained: set[str] = set()
+        # voids keeps it, and so does a retire with the shutdown outcome,
+        # which is no verdict.
+        # The set is restart-durable (task 11047, interim until BatchState
+        # replaces the mark): a worker built over the same project data
+        # directory starts with the marks the previous process held, whether
+        # that process was killed or gracefully stopped.
+        self._next_dispatch_unchained: PersistentSet = PersistentSet(
+            guard_path(_root, 'next_dispatch_unchained_task_ids.json'),
+            ttl=_MERGE_QUEUE_RESIDENCY_BOUND,
+        )
         # task 2828 amend (reviewer_comprehensive, robustness): per-task
         # consecutive contended-lease requeue counter.  Incremented each time
         # merge_verify_lease raises MergeVerifyLeaseContended and the item is
@@ -5145,13 +5278,14 @@ class SpeculativeMergeWorker:
         # The chain link _land_chain_prefix is landing across its awaits; still
         # LANE_BUFFERED to the registry, so cancel_request refuses it by id.
         self._landing_link_ids: frozenset[str] = frozenset()
-        # The most recent request whose merge commit was handed to the verifier
-        # and has NOT yet been finalized (verified + CAS-advanced).  Read ONLY by
-        # _await_unadvanced_predecessor, which parks a train behind it — see that
+        # The newest request whose merge commit the merger handed to the
+        # verifier.  Read by _await_unadvanced_predecessor, which parks a train
+        # behind it until it is finalized (verified + CAS-advanced) — see that
         # method for why parking spares the train a re-verify of its rebased
-        # tip.  Set at the post-put success site in _merger_loop; never
-        # explicitly cleared, because a finalized request's Future is already
-        # done and the wait is then a no-op.
+        # tip — and by _merger_build_awaiting_dispatch, so a fresh dequeue
+        # stacks on its build while that build awaits dispatch.  Set at the
+        # post-put success site in _merger_loop; never explicitly cleared,
+        # because both readers skip a request whose Future is already done.
         self._last_merged_request: MergeRequest | None = None
         # δ/1720 one-strike registry — task_ids of members whose coalesce-formed
         # train derailed (MergeOutcome('blocked') on a train with train_id
@@ -5159,14 +5293,14 @@ class SpeculativeMergeWorker:
         # survives re-dispatch as a new MergeRequest with the same task_id —
         # and, since task 5352, a worker restart too: the marker is persisted
         # under project_root/data/orchestrator/guards/ and decays only via
-        # _COALESCE_DERAIL_TTL, which IS the decay policy this comment used to
-        # defer to a richer injectable predicate.  Unlike the sibling
+        # _MERGE_QUEUE_RESIDENCY_BOUND, which IS the decay policy this comment
+        # used to defer to a richer injectable predicate.  Unlike the sibling
         # _..._state_path attributes above there is no Path|None to thread and
         # no is-None branch at the call site: guard_path returns None for an
         # absent project_root and PersistentSet absorbs it as the in-memory mode.
         self._coalesce_derailed_task_ids: MutableSet[str] = PersistentSet(
             guard_path(_root, 'coalesce_derailed_task_ids.json'),
-            ttl=_COALESCE_DERAIL_TTL,
+            ttl=_MERGE_QUEUE_RESIDENCY_BOUND,
         )
         # α liveness ledger: ephemeral _merge-<uuid> worktrees owned by THIS
         # SpeculativeMergeWorker instance.  Touched every _heartbeat_loop tick
@@ -5379,13 +5513,18 @@ class SpeculativeMergeWorker:
         if current is not None and current != ItemLifecycleState.TERMINAL:
             self._note_transition(request_id, current, ItemLifecycleState.TERMINAL)
         retired = self._live_items.pop(request_id, None)
-        if retired is not None:
-            # A request's gate attempts and its un-chained mark leave the lane
-            # with it, whichever exit it took, so a resubmission starts its own
-            # count (task 8525) and may chain again (task 10723).
-            task_id = _request_of(retired).task_id
-            self._gate_retries.pop(task_id, None)
-            self._next_dispatch_unchained.discard(task_id)
+        if retired is None:
+            return
+        # A request's gate attempts leave the lane with it, whichever exit it
+        # took, so a resubmission starts its own count (task 8525). Its
+        # un-chained mark leaves too, so it may chain again (task 10723), and a
+        # drop (a cancelled Future) ends it although the journal keeps the entry
+        # (orchestrator/src/orchestrator/merge_lane/intake_buffers.py::survives_restart).
+        # Only the shutdown outcome keeps it: no verdict, and the request comes back.
+        request = _request_of(retired)
+        self._gate_retries.pop(request.task_id, None)
+        if not resolved_with_shutdown(request.result):
+            self._next_dispatch_unchained.discard(request.task_id)
 
     def _note_requeue(
         self,
@@ -6097,6 +6236,7 @@ class SpeculativeMergeWorker:
                 verify_base_divergence=lambda item, main: (
                     self._verify_base_divergence_at_dispatch(item, main)
                 ),
+                live_trees=lambda: self._live_tested_trees(),
             ),
             chain_planning=ChainPlanning(
                 probe_placement=lambda item: self._probe_verify_placement(item),
@@ -6684,17 +6824,17 @@ class SpeculativeMergeWorker:
         held = [sha for sha in shas if self._speculation_controller.holds_base(sha)]
         if not held:
             return
-        live_tip = self._merger_live_tip(doomed)
+        live_tip = self._live_frozen_tip(doomed)
         for sha in held:
             self._speculation_controller.on_base_invalidated(sha, live_tip)
 
-    def _merger_live_tip(self, doomed: Collection[str] = ()) -> LiveTip | None:
-        """The frontier tip the merger may stack on, with its owner, or None;
-        *doomed* commits count as dead.  Reads no main, so
-        :meth:`_record_dead_base` stays synchronous."""
+    def _live_frozen_tip(self, doomed: Collection[str] = ()) -> LiveTip | None:
+        """The frozen-prefix tip the §5.3 detector expects, with its owner,
+        while it is live, else None; *doomed* commits count as dead, and it
+        reads no main (plans/merge-lane-policy-prd.md D1)."""
         frontier = self._verify_frontier_entries()
         tip = choose_remerge_base(
-            '', frontier_tip(frontier) or '', {*self._dead_base_commits, *doomed}, frontier,
+            '', self._newest_frozen_commit() or '', {*self._dead_base_commits, *doomed}, frontier,
             permit_available=True,
         ).tip
         if tip is None:
@@ -6702,6 +6842,28 @@ class SpeculativeMergeWorker:
         return LiveTip(
             tip, next(e.item.request for e in frontier if entry_successor_base(e) == tip),
         )
+
+    def _fresh_dequeue_offer(self, req: MergeRequest) -> LiveTip | None:
+        """The base offered to a fresh dequeue of *req*: none for a train,
+        which skips the speculative pipeline, else :func:`fresh_dequeue_offer`'s."""
+        if isinstance(req, GroupMergeRequest):
+            return None
+        return fresh_dequeue_offer(
+            self._merger_build_awaiting_dispatch(), self._dead_base_commits,
+            self._live_frozen_tip(),
+        )
+
+    def _merger_build_awaiting_dispatch(self) -> LiveTip | None:
+        """The merger's newest build and its request, while that build awaits
+        dispatch; its commit may be empty or dead."""
+        req = self._last_merged_request
+        build = (
+            self._live_items.get(req.request_id)
+            if req is not None and not req.result.done() else None
+        )
+        if not isinstance(build, RealMergeItem):
+            return None
+        return LiveTip(build.merge_result.merge_commit or '', build.request)
 
     def _cascade_doomed_commits(self) -> frozenset[str]:
         """The commits :meth:`_verifier_loop`'s head-failure cascade tears down
@@ -8545,6 +8707,10 @@ class SpeculativeMergeWorker:
           verify_base — the dispatch-time base facts ({main_sha, merge_base_sha},
             VerifyBaseFacts) the entry's verify classifies against; None until
             its verify resolves them.
+          tree — the in-flight entry's TestedTree wire form ({base_commit,
+            root_commit, members: [{request_id, task_id, merge_commit, tip,
+            own}]}); None elsewhere and until published
+            (plans/merge-pool-batches-prd.md §6.1).
         State values: queued, merging, awaiting_host, awaiting_verify,
           dispatching, verifying, passthrough, gate_reverify, finalizing.
           A request still waiting for the merger whose outcome is already
@@ -8580,6 +8746,7 @@ class SpeculativeMergeWorker:
                 'verify_started_at': None,
                 'verify_age_secs': None,
                 'verify_base': None,
+                'tree': None,
             }
 
         def _infl_entry(infl: InflightEntry, position: int) -> dict:
@@ -8604,6 +8771,7 @@ class SpeculativeMergeWorker:
                 dataclasses.asdict(infl.verify_base)
                 if infl.verify_base is not None else None
             )
+            e['tree'] = infl.tree.to_wire() if infl.tree is not None else None
             return e
 
         # Pre-scan container membership (task 2435 kappa-b) — computed BEFORE
@@ -10592,36 +10760,26 @@ class SpeculativeMergeWorker:
         # signature (keyed on the structural waiting set) so risk signals —
         # which are monotonic within a process — only re-evaluate when the
         # structural set changes, avoiding per-tick event-store reads.
-        eligible: list[MergeRequest] = []
         exclusions: list[dict[str, str]] = []
-        for _c in candidates:
-            _reason = self._coalesce_exclusion_reason(_c)
-            if _reason:
-                exclusions.append({'request_id': _c.request_id, 'reason': _reason})
-                logger.info(
-                    'Coalesce exclusion: request_id=%s task_id=%s branch=%s reason=%s',
-                    _c.request_id, _c.task_id, _c.branch.bare_id, _reason,
-                )
-            else:
-                eligible.append(_c)
-        candidates = eligible
+        candidates = _split_coalesce_exclusions(candidates, self._coalesce_exclusion_reason, exclusions)
         if len(candidates) < 2:
-            # The exclusion gate reduced eligible candidates below the 2-member
-            # minimum needed to form a train.  Log so the decision is auditable
-            # even though no event is emitted (a train_coalesced event only fires
-            # when a train actually forms).  The excluded tasks will merge solo.
-            if exclusions:
-                logger.info(
-                    'Coalesce near-train suppressed: exclusion gate left only %d '
-                    'eligible candidate(s) (need ≥2); tasks will merge solo. '
-                    'exclusions=%r',
-                    len(candidates),
-                    exclusions,
-                )
-            return False
+            return _coalesce_suppressed(candidates, exclusions)
 
+        # The narrow-gate signal reads git, so it runs while _coalescing_ids
+        # guards the eligible set, and drops its items before any anchor is chosen.
         self._coalescing_ids = frozenset(c.request_id for c in candidates)
         try:
+            narrow = await train_exclusions(
+                orch_config.narrow_merge_gate, self._git_ops.project_root, self._git_ops.config.main_branch,
+                {c.task_id: c.branch.full_name for c in candidates},
+            )
+            narrow_reasons = dict.fromkeys(narrow, COALESCE_EXCLUDED_NARROW_MERGE_GATE)
+            candidates = _split_coalesce_exclusions(
+                candidates, lambda c: narrow_reasons.get(c.task_id), exclusions,
+            )
+            if len(candidates) < 2:
+                return _coalesce_suppressed(candidates, exclusions)
+            self._coalescing_ids = frozenset(c.request_id for c in candidates)
             return await self._stack_coalesce_train(candidates, exclusions, orch_config)
         finally:
             self._coalescing_ids = frozenset()
@@ -10651,7 +10809,6 @@ class SpeculativeMergeWorker:
         ranges_by_id: dict[str, dict] = {
             tid: r for tid, r in zip(all_ids, range_results, strict=True)
         }
-
         selected = select_train_members(
             anchor.task_id, other_ids, ranges_by_id,
             orch_config.merge_train_max_members,
@@ -10881,32 +11038,18 @@ class SpeculativeMergeWorker:
                     if req is None:
                         exited_via_sentinel = True
                         break  # shutdown sentinel
-                    # ATTACH or FALLBACK: decide whether this fresh dequeue is a
-                    # late arrival that can attach to the in-flight predecessor's
-                    # merge commit (task 1862), delegated to the controller.
-                    #
-                    # ATTACH — all four conditions must hold:
-                    #   (a) pending_spec_base: predecessor's commit was recorded
-                    #   (b) held_by_merger: speculation permit is still held
-                    #   (c) pending_predecessor: predecessor request is known
-                    #   (d) predecessor still in-flight (result future not done)
-                    #
-                    # On ATTACH: spec_base = pending_spec_base so this late
-                    # arrival merges against main+A, not plain main.  The
-                    # retained permit transfers to the verifier item on drain.
-                    #
-                    # On FALLBACK (any condition fails): release the held permit
-                    # if present and merge non-speculatively against actual main.
-                    _pending_predecessor = self._speculation_controller.pending_predecessor
-                    attached_base = self._speculation_controller.on_dequeue(req)
-                    if attached_base is not None:
-                        assert _pending_predecessor is not None
+                    # ATTACH to the pending base or the offered base, else
+                    # FALLBACK to main: see SpeculationController.on_dequeue.
+                    attached = self._speculation_controller.on_dequeue(
+                        req, live_tip=self._fresh_dequeue_offer(req),
+                    )
+                    if attached is not None:
                         logger.debug(
                             'Task %s: late arrival attaches to in-flight '
                             'predecessor %s (spec_base=%s)',
                             req.task_id,
-                            _pending_predecessor.task_id,
-                            attached_base[:8],
+                            attached.owner.task_id,
+                            attached.sha[:8],
                         )
 
                 # MQ-invariants eta (task 1992): arm the request-liveness ledger
@@ -11127,10 +11270,10 @@ class SpeculativeMergeWorker:
                     # events internally, so the event stream is identical to the
                     # pre-extraction inline copy.  See its docstring for the full
                     # equivalence-matrix contract shared with _do_merge/_remerge.
-                    result = await classify_and_merge(
+                    result = await _screen_merged_item(self, req, await classify_and_merge(
                         self, req, base_for_merge, speculative=speculative,
                         started_monotonic=t0,
-                    )
+                    ), started_monotonic=t0)
                     if isinstance(result, Decided):
                         # Uniform _oob_deliver call: its own predicate already
                         # excludes status in {'done','already_merged'}, so this
@@ -15335,6 +15478,10 @@ class SpeculativeMergeWorker:
         rebased_heads = {e.gate.rebased_sha for e in frozen if e.gate is not None}
         rebased_heads |= rebased_head_commits(frozen)
         return stacked_on, rebased_heads
+
+    def _live_tested_trees(self) -> tuple[TestedTree, ...]:
+        """The published tested trees of the frozen prefix, a dispatch's possible bases."""
+        return tuple(e.tree for e in self._frozen_inflight_entries() if e.tree is not None)
 
     async def dispatch_parked_rebased_head(
         self,

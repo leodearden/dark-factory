@@ -44,7 +44,6 @@ from legibility.detectors import (  # noqa: E402  # debt: task 6760
     classify_agent_class,
     dialogue_turn_text,
     error_hits,
-    is_client_rendered_turn,
     message_content,
     record_hits,
 )
@@ -494,26 +493,22 @@ def score_signals(counts: Mapping[str, int], n_user_turns: int) -> float:
 
 def iter_user_turns(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Return the human user turns, each with its record index: the records
-    :func:`detectors.dialogue_turn_text` keeps, the one rule the classifier's
-    INTERACTIVE also asks. Beyond that shared rule, the gold bucket alone
-    excludes a turn the client composed from a UI action
-    (:func:`detectors.is_client_rendered_turn`): an arg-less slash command, a
-    local command's output echo, and the bare interrupt marker, which stays
-    an interrupt signal the Interrupts section already lists.
+    :func:`detectors.dialogue_turn_text` keeps. That one rule, which the
+    classifier's INTERACTIVE also asks, is the whole filter; it already drops
+    client-rendered turns (:func:`detectors.is_client_rendered_turn`).
 
-    This function is the SINGLE source for both the gold user_corrections
+    This function is the SINGLE source for both the gold user_turns
     section and render_digest's n_user_turns score component, so a turn
     this filter drops leaves the body AND the score together --
     which is exactly what confusion-census-2026-07-31 §3.1 asks for, its
     clusters 1.1(b) and 1.2 being one event observed from two surfaces.
-    User corrections are gold (PRD Sec 5) -- this is the highest-priority
+    User turns are gold (PRD Sec 5) -- this is the highest-priority
     digest section.
     """
     return [
         {'index': index, 'text': text}
         for index, record in enumerate(records)
         if (text := dialogue_turn_text(record)) is not None
-        and not is_client_rendered_turn(text)
     ]
 
 
@@ -569,7 +564,9 @@ keys do NOT bump it.
        (reingestion.HARNESS_PROMPT_MARKERS, task 6847), consulted by the
        gold-turn filter and every dialogue carrier.
   10 -- the client-rendered turn rule (detectors.is_client_rendered_turn,
-       task 7442), consulted by the gold-turn filter only.
+       task 7442), inside detectors.dialogue_turn_text since task 11556,
+       consulted by the gold-turn filter and the classifier's interactive
+       fallback, never by a dialogue carrier.
 
 This answers ``plans/confusion-census-2026-07-31.md:151`` (Sec 6): the
 next census must be able to tell a pre-fix trace from a live regression.
@@ -714,7 +711,7 @@ def _derive_encoded_dir(records: list[dict[str, Any]], cwd: str, path: Any) -> s
 
 
 SECTION_HEADINGS: dict[str, str] = {
-    'user_corrections': 'User Corrections',
+    'user_turns': 'User Turns',
     'error_neighborhoods': 'Error Neighborhoods',
     'self_corrections': 'Self-Corrections',
     'retry_loops': 'Retry Loops',
@@ -732,12 +729,12 @@ Sec 11 alpha observable: "frontmatter + the four signal-class sections")."""
 SECTION_PRIORITY: tuple[str, ...] = (
     'designed_outcomes',
     'retry_loops', 'not_found', 'error_neighborhoods', 'df_guard', 'interrupt',
-    'self_corrections', 'user_corrections',
+    'self_corrections', 'user_turns',
 )
 """Section keys in ASCENDING signal priority -- index 0 is dropped/trimmed
-FIRST under the 15KB soft cap, the last entry ('user_corrections', gold)
+FIRST under the 15KB soft cap, the last entry ('user_turns', gold)
 is trimmed LAST (PRD Sec 7.2: "truncate lowest-signal sections last"; PRD
-Sec 5: user corrections are gold). Digest bodies render in the REVERSE of
+Sec 5: user turns are gold). Digest bodies render in the REVERSE of
 this order (gold first). Ranking mirrors SIGNAL_WEIGHTS magnitude
 (self_correct 3.0 > df_guard/interrupt 2.0 > tool_error/not_found 1.0),
 with retry_loops below those since it carries no SIGNAL_WEIGHTS entry at
@@ -768,7 +765,7 @@ def _record_label(index: int) -> str:
     return f'(record {index})'
 
 
-def _render_user_corrections(items: list[dict[str, Any]]) -> list[str]:
+def _render_user_turns(items: list[dict[str, Any]]) -> list[str]:
     return [f"- {_record_label(item['index'])} {item['text']}" for item in items]
 
 
@@ -883,8 +880,8 @@ _SectionDetector = Callable[[_DigestScan], list[dict[str, Any]]]
 _ItemRenderer = Callable[[list[dict[str, Any]]], list[str]]
 
 _SECTION_RENDERERS: dict[str, tuple[_SectionDetector, _ItemRenderer]] = {
-    'user_corrections': (
-        lambda scan: iter_user_turns(scan.records), _render_user_corrections,
+    'user_turns': (
+        lambda scan: iter_user_turns(scan.records), _render_user_turns,
     ),
     'error_neighborhoods': (
         lambda scan: iter_genuine_errors(neighborhoods=scan.neighborhoods),
@@ -1090,7 +1087,7 @@ def _build_sections(
 
 
 def _render_body(sections: dict[str, list[str]]) -> str:
-    """Render non-empty sections, gold (user_corrections) first, retry_loops
+    """Render non-empty sections, gold (user_turns) first, retry_loops
     last -- the REVERSE of the ascending-priority SECTION_PRIORITY order."""
     blocks = []
     for key in reversed(SECTION_PRIORITY):
@@ -1242,7 +1239,7 @@ def render_digest(
     back to mirror-encoding the derived ``cwd`` (see
     :func:`_derive_encoded_dir`). When the unrestricted render exceeds
     *max_bytes*, :func:`_truncate_sections` trims lowest-signal sections
-    first (gold user-corrections last); a digest already under the cap is
+    first (gold user turns last); a digest already under the cap is
     returned unmodified (zero trim iterations).
     """
     cwd = _derive_cwd(records)

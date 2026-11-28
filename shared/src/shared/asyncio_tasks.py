@@ -18,7 +18,9 @@ drain, await or gauge their registry independently.
 :func:`cancel_bounded` is the bounded counterpart for a caller that must see
 the task end, or learn that it would not, within a known time (task 6660). A
 single ``cancel()`` followed by an unbounded ``await`` hangs forever on a task
-that survives one cancel.
+that survives one cancel. :func:`cancel_all_within` bounds the wait for many
+tasks at once, returning the ones still running for the caller to dispose of
+(task 7247).
 
 :func:`gather_unwound` is ``asyncio.gather`` for children that own
 subprocesses: an exception, an outer cancel included, propagates only once
@@ -34,10 +36,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Collection, Sequence
 from typing import TypeVar
 
-__all__ = ['abandon_task', 'cancel_bounded', 'gather_unwound', 'track_task']
+__all__ = ['abandon_task', 'cancel_all_within', 'cancel_bounded', 'gather_unwound', 'track_task']
 
 logger = logging.getLogger(__name__)
 
@@ -113,25 +115,67 @@ async def cancel_bounded(
 ) -> bool:
     """Cancel *task* and wait a bounded time for it to end; True iff it ended.
 
-    A task can survive one ``cancel()``: an inner ``except CancelledError``
-    that awaits again, or asyncio's subprocess transport cancelled between
-    spawning a child and connecting its pipes. So a task still running after
-    the first window of *grace_secs* is cancelled once more and given a second
-    window. One that outlives both is handed to :func:`track_task` with
-    *registries*, so it stays referenced until it ends, and False is returned.
+    The cancel policy is :func:`_cancel_twice`'s, with both windows
+    *grace_secs* long. A task that outlives both windows is handed to
+    :func:`track_task` with *registries*, so it stays referenced until it ends,
+    and False is returned.
 
     Never raises the task's own exception; it is consumed, as
     :func:`track_task` consumes it.
     """
-    for _attempt in range(2):
-        task.cancel()
-        await asyncio.wait({task}, timeout=grace_secs)
-        if task.done():
-            if not task.cancelled():
-                task.exception()
-            return True
+    if not await _cancel_twice({task}, first_window_secs=grace_secs, second_window_secs=grace_secs):
+        return True
     track_task(task, *registries)
     return False
+
+
+async def cancel_all_within(
+    tasks: Collection[asyncio.Task],
+    *,
+    timeout_secs: float,
+) -> set[asyncio.Task]:
+    """Cancel every task and wait at most *timeout_secs* in all; return those still running.
+
+    The cancel policy is :func:`_cancel_twice`'s. The first window is two
+    thirds of *timeout_secs* and the second the remaining third: the second
+    cancel is the fallback for a task that absorbed the first, so it should not
+    cut short a task still honestly unwinding from the first, for instance
+    still killing its subprocess. Unlike ``wait_for(gather(...))``, a task that
+    survives both cancels cannot extend the wait. The returned tasks are
+    neither cancelled again nor awaited: the caller decides what becomes of
+    them, for example :func:`track_task`. The exceptions of the tasks that
+    ended are consumed.
+    """
+    first_window_secs = timeout_secs * 2 / 3
+    return await _cancel_twice(
+        tasks, first_window_secs=first_window_secs, second_window_secs=timeout_secs - first_window_secs,
+    )
+
+
+async def _cancel_twice(
+    tasks: Collection[asyncio.Task], *, first_window_secs: float, second_window_secs: float,
+) -> set[asyncio.Task]:
+    """Cancel *tasks* and wait *first_window_secs*; cancel those still running and wait *second_window_secs*.
+
+    A task can survive one ``cancel()``: an inner ``except CancelledError``
+    that awaits again, or asyncio's subprocess transport cancelled between
+    spawning a child and connecting its pipes. The second cancel ends it,
+    except for a task awaiting :func:`gather_unwound`, which deliberately does
+    not end until its children have unwound and so may come back as still
+    running. The tasks that outlive both windows are returned; the exceptions
+    of those that ended are consumed.
+    """
+    pending = set(tasks)
+    for window_secs in (first_window_secs, second_window_secs):
+        if not pending:
+            break
+        for task in pending:
+            task.cancel()
+        done, pending = await asyncio.wait(pending, timeout=window_secs)
+        for task in done:
+            if not task.cancelled():
+                task.exception()
+    return pending
 
 
 _Gathered = TypeVar('_Gathered')
@@ -142,23 +186,52 @@ async def gather_unwound(*aws: Awaitable[_Gathered]) -> list[_Gathered]:
 
     A plain gather raises at its first cancelled or failed child, so a sibling
     still unwinding, for instance still killing its subprocess, would outlive
-    the call that gathered it. Here, as in a ``TaskGroup``, the other children are cancelled
-    and then awaited, and cancelling the caller again meanwhile does not cut
-    that wait short. The exception raised is the one the gather raised, unless
-    the caller was cancelled during the wait: that cancel is raised instead, so
-    it is never swallowed. A child already asked to cancel (a cancelled gather
-    asks every child) is not asked again, which would interrupt the kill it is
-    awaiting.
+    the call that gathered it. Here the other children are cancelled and then
+    awaited, as in a ``TaskGroup``, and cancelling the caller again meanwhile
+    does not cut that wait short. The exception raised is the one the gather
+    raised, unless the caller was cancelled: that cancel is raised instead, so
+    it is never swallowed, with the gather's exception as its context if the
+    gather had raised by then. Unlike a ``TaskGroup``, only that one exception
+    propagates: any other child failure, for instance a kill that failed while
+    unwinding from the caller's cancel, is logged at WARNING rather than
+    dropped. Cancelling the caller, once or repeatedly, asks each child to
+    cancel at most once, and never a child already cancelling: asking again
+    would interrupt the kill it is awaiting.
     """
     children = [asyncio.ensure_future(aw) for aw in aws]
+    gathered = asyncio.gather(*children)
+    gathered.add_done_callback(_consume_outcome)
     try:
-        return await asyncio.gather(*children)
-    except BaseException:
+        await asyncio.wait((gathered,))
+        return gathered.result()
+    except BaseException as raised:
         for child in children:
             if not (isinstance(child, asyncio.Task) and child.cancelling()):
                 child.cancel()
-        await _await_all_through_cancels(children)
+        try:
+            await _await_all_through_cancels(children)
+        finally:
+            _log_failures_other_than(raised, children)
         raise
+
+
+def _consume_outcome(gathered: asyncio.Future) -> None:
+    """Retrieve *gathered*'s exception, which nothing else retrieves once the caller has stopped waiting for it."""
+    if not gathered.cancelled():
+        gathered.exception()
+
+
+def _log_failures_other_than(raised: BaseException, children: Sequence[asyncio.Future]) -> None:
+    """Log each ended child's failure that is neither a cancel nor *raised*, which reaches the caller anyway."""
+    for child in children:
+        failure = None if child.cancelled() else child.exception()
+        if failure is None or failure is raised or isinstance(failure, asyncio.CancelledError):
+            continue
+        logger.warning(
+            'gather_unwound child %r failed, but its caller sees another exception, so the failure is logged here',
+            child,
+            exc_info=failure,
+        )
 
 
 async def _await_all_through_cancels(children: Sequence[asyncio.Future]) -> None:

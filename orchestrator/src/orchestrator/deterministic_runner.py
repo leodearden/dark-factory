@@ -38,6 +38,7 @@ from shared.before_done_paths import (
     require_runnable_script,
     resolve_before_done_paths,
 )
+from shared.human_curator_gate import curator_gate_declarer, is_human_curator_gate
 from shared.milestone_rearm import rearmed_milestone
 from shared.repo_paths import DARK_FACTORY_ROOT_ENV, resolve_dark_factory_root
 from shared.task_fields import dependency_ids
@@ -105,6 +106,7 @@ from orchestrator.systemd_inspect import (
     _wedged_unit_sentinel,
     inspect_systemd_unit,
 )
+from orchestrator.task_status import TERMINAL_STATUSES
 from orchestrator.workflow import WorkflowOutcome
 
 if TYPE_CHECKING:
@@ -477,26 +479,6 @@ def _is_operational_llm_gate(metadata: dict) -> bool:
     return metadata.get(OPERATIONAL_LLM_GATE_MARKER_KEY) is True
 
 
-def _is_human_curator_gate(metadata: dict) -> bool:
-    """Return True iff *metadata* marks a gate needing human CONTENT adjudication.
-
-    Task 3341.  Keys on ``HUMAN_CURATOR_GATE_KEY`` via plain TRUTHINESS —
-    a DELIBERATE divergence from ``_is_operational_llm_gate`` directly above,
-    which uses a strict ``is True``.  The two markers have opposite failure
-    costs, so they get opposite postures:
-
-    * ``_is_operational_llm_gate`` is a ROUTING hint. A false positive
-      misroutes a human-handling lane, so failing open (``is True``) is right.
-    * This is a SAFETY gate. A false NEGATIVE silently reproduces the task-3181
-      phantom-done — the exact failure this predicate exists to prevent. So a
-      truthy-but-not-``True`` value (e.g. the string ``'true'`` from a hand
-      edit or a JSON round-trip) must fail CLOSED: the guard still applies.
-
-    Pinned by ``test_string_truthy_curator_gate_marker_still_trips_the_guard``.
-    """
-    return bool(metadata.get(HUMAN_CURATOR_GATE_KEY))
-
-
 def _curator_adjudication_confirmed(metadata: dict) -> bool:
     """Return True iff *metadata* carries positive proof the content review happened.
 
@@ -699,6 +681,35 @@ def file_deterministic_escalation(
 
 
 @dataclass(frozen=True)
+class GatePin:
+    """The declared pin a gate's escalation is filed with; empty means unpinned."""
+
+    declared_by: tuple[str, ...] = ()
+    reason: str = ''
+
+
+def curator_gate_pin(task_id: str, metadata: dict) -> GatePin:
+    """The declared pin for a human-curator gate's escalation, or an empty ``GatePin``.
+
+    Why the record carries it: docs/deterministic-runner.md
+    "Human-curator gate contract".
+    """
+    if not is_human_curator_gate(metadata):
+        return GatePin()
+    return GatePin(
+        declared_by=(curator_gate_declarer(task_id),),
+        reason=(
+            f'Task {task_id} carries `metadata.{HUMAN_CURATOR_GATE_KEY}`: it closes '
+            'only on human CONTENT adjudication of every entry it names. '
+            'Acknowledge this pin only after that review is done and '
+            f'`metadata.{HUMAN_CURATOR_ADJUDICATED_AT_KEY}` is stamped, or when '
+            "cancelling the gate with action='abandon'. A factual finding that "
+            'does not complete the review belongs in amend_escalation, not in a close.'
+        ),
+    )
+
+
+@dataclass(frozen=True)
 class GateEscalationFields:
     """The fields of a pure gate's born-at-L2 escalation that depend on the task."""
 
@@ -707,6 +718,7 @@ class GateEscalationFields:
     detail: str
     options: tuple[str, ...]
     review_due: ReviewDueState | None
+    pin: GatePin
 
 
 def gate_escalation_category(metadata: dict) -> str:
@@ -735,6 +747,7 @@ def build_gate_escalation_fields(
     The operational-LLM token prefix applies to either.
     """
     task = task or {}
+    task_id = str(task.get('id'))
     dep_ids = dependency_ids(task)
     detail_parts = [task.get('description', '')]
     if dep_ids:
@@ -746,7 +759,7 @@ def build_gate_escalation_fields(
         detail_parts.append(human_gate.detail_line())
     elif human_gate is not None:
         due = build_review_due(
-            human_gate, human_gate_task_id=str(task.get('id')),
+            human_gate, human_gate_task_id=task_id,
             escalation_id=escalation_id, fired_at=fired_at,
         )
         category = REVIEW_DUE_CATEGORY
@@ -769,6 +782,7 @@ def build_gate_escalation_fields(
         detail=detail,
         options=tuple(metadata.get('gate_options') or ()),
         review_due=payload,
+        pin=curator_gate_pin(task_id, metadata),
     )
 
 
@@ -1489,7 +1503,7 @@ class DeterministicRunner:
         return WorkflowOutcome.BLOCKED
 
     async def _file_curator_adjudication_missing_and_block(
-        self, task_id: str, task: dict,
+        self, task_id: str, task: dict, metadata: dict,
     ) -> WorkflowOutcome:
         """File a born-at-L2 ``curator_adjudication_missing`` escalation and block.
 
@@ -1538,6 +1552,7 @@ class DeterministicRunner:
         # its actual target project via --config, so a cwd-derived value would
         # silently aim most operators at the wrong project.
         project_root = _snippet_project_root(self.scheduler)
+        escalation_id = self.escalation_queue.make_id(task_id)
         detail = (
             f"Task {task_id} ({title!r}) is a deterministic pure gate marked "
             f"`metadata.{HUMAN_CURATOR_GATE_KEY}`, meaning it closes only when a "
@@ -1560,8 +1575,15 @@ class DeterministicRunner:
             f"'<ISO-8601 timestamp>'}}, metadata_mode='merge')\n"
             f"      The stamp must be a non-empty string; a bare `true` is NOT "
             f"accepted (it asserts the conclusion without recording when the "
-            f"review happened).\n"
-            f"  (b) Cancel the task, if the content work is no longer wanted.\n\n"
+            f"review happened). This record is filed with the gate's declared "
+            f"pin, so the resolve must name it:\n"
+            f"      resolve_issue(escalation_id={escalation_id!r}, action='resume', "
+            f"acknowledge_declared_pins=[{escalation_id!r}], "
+            f"resolution_class='actionable', resolution='<what was reviewed>')\n"
+            f"  (b) Cancel the task, if the content work is no longer wanted: "
+            f"resolve_issue(escalation_id={escalation_id!r}, action='abandon', "
+            f"acknowledge_declared_pins=[{escalation_id!r}], "
+            f"resolution_class='actionable', resolution='<why it is cancelled>')\n\n"
             f"Resolving THIS escalation without doing (a) or (b) will simply "
             f"re-file it on the next dispatch."
         )
@@ -1570,8 +1592,9 @@ class DeterministicRunner:
         # the identical pending query and only reaches here when it came back
         # empty, so any filter written here would be unreachable by
         # construction.
+        pin = curator_gate_pin(task_id, metadata)
         esc = Escalation(
-            id=self.escalation_queue.make_id(task_id),
+            id=escalation_id,
             task_id=task_id,
             agent_role=DETERMINISTIC_AGENT_ROLE,
             severity='critical',
@@ -1579,6 +1602,8 @@ class DeterministicRunner:
             summary=summary[:200],
             detail=detail,
             level=2,
+            pin_declared_by=list(pin.declared_by),
+            pin_declared_reason=pin.reason,
         )
         self.escalation_queue.submit(esc)
         logger.info(
@@ -2039,6 +2064,8 @@ class DeterministicRunner:
                 options=list(fields.options),
                 level=2,
                 review_due=fields.review_due,
+                pin_declared_by=list(fields.pin.declared_by),
+                pin_declared_reason=fields.pin.reason,
             )
             self.escalation_queue.submit(esc)
             logger.info(
@@ -2894,6 +2921,22 @@ class DeterministicRunner:
     # Main runner
     # ------------------------------------------------------------------
 
+    async def _store_row(self, assignment) -> dict:
+        """The dispatched task's row as the store holds it now; the dispatched row when that read fails.
+
+        The scheduler confirmed the row after claiming it, but a write can
+        still land before the runner starts (task 11430).
+        """
+        task_id = str(assignment.task_id)
+        row = await self.scheduler.get_task(task_id)
+        if row is None:
+            logger.warning(
+                'DeterministicRunner: task %s could not be re-read at entry — acting on the dispatched row',
+                task_id,
+            )
+            return assignment.task
+        return row
+
     async def run(self, assignment) -> WorkflowOutcome:
         """Execute the deterministic gate logic for *assignment*.
 
@@ -2914,12 +2957,22 @@ class DeterministicRunner:
         stamp-only fallback on the recovery paths too, and keeps an inspect
         failure from being reported as a deploy-script failure.
 
+        Everything acts on the task row as the store holds it at entry
+        (:meth:`_store_row`); a row already done or cancelled returns DONE
+        with no write and no escalation.
+
         Raises:
             ValueError — if ``always_escalates`` is False with ``before_done=None``
                 (unsupported misconfiguration in β).
         """
         task_id = str(assignment.task_id)
-        task = assignment.task
+        task = await self._store_row(assignment)
+        if task.get('status') in TERMINAL_STATUSES:
+            logger.info(
+                'DeterministicRunner: task %s is already %s in the store — nothing to run',
+                task_id, task.get('status'),
+            )
+            return WorkflowOutcome.DONE
         metadata = task.get('metadata') or {}
         description = task.get('description', '')
         before_done = metadata.get('before_done')
@@ -2954,7 +3007,7 @@ class DeterministicRunner:
         # would delete the signal in exactly the configurations where it is the
         # last one standing.
         # Pinned by test_curator_marker_on_a_non_pure_gate_is_loud.
-        if before_done is not None and _is_human_curator_gate(metadata):
+        if before_done is not None and is_human_curator_gate(metadata):
             logger.warning(
                 'DeterministicRunner: task %s carries metadata.%s but ALSO a '
                 'before_done action. A curator gate is a pure gate by '
@@ -3106,7 +3159,7 @@ class DeterministicRunner:
                     # CONTENT work a curator gate asks for. Task 3181 is where
                     # the two diverged. Fail closed.
                     if (
-                        _is_human_curator_gate(metadata)
+                        is_human_curator_gate(metadata)
                         and not _curator_adjudication_confirmed(metadata)
                     ):
                         logger.warning(
@@ -3123,7 +3176,7 @@ class DeterministicRunner:
                             HUMAN_CURATOR_ADJUDICATED_AT_KEY,
                         )
                         return await self._file_curator_adjudication_missing_and_block(
-                            task_id, task,
+                            task_id, task, metadata,
                         )
                 logger.info(
                     'DeterministicRunner: task %s gate resolved — setting done',
@@ -3142,7 +3195,7 @@ class DeterministicRunner:
                             note='resumed after gate resolution',
                         ),
                     )
-                elif _is_human_curator_gate(metadata):
+                elif is_human_curator_gate(metadata):
                     # Curator gate closing legitimately (task 3341).  Reaching
                     # here means BOTH rungs of the proof ladder held: a closed
                     # own-role escalation record exists (rung one, task 2954)
@@ -3367,7 +3420,9 @@ class DeterministicRunner:
                 # had not yet landed when the snapshot was read — so b-self was
                 # skipped and the second dispatch fell through to the
                 # crash-window detector below, filing a born-at-L2 infra_issue
-                # false positive.  Re-read the CURRENT task (a fresh get_task,
+                # false positive.  Since run() acts on the store's row read at
+                # entry (task 11430), this re-read differs from it only when
+                # that entry read failed.  Re-read the CURRENT task (a fresh get_task,
                 # taken at execution time ~seconds later, after the first
                 # dispatch's writes landed): if it is an already-completed
                 # scheduled self-deploy, the deploy is done (scheduled) — return

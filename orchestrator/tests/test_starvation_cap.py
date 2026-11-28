@@ -65,7 +65,7 @@ def _world(
     return LockWorld(
         tasks=tasks,
         blockers_of=lambda tid: tuple(blockers.get(tid, ())),
-        now=NOW,
+        as_of=NOW,
         claimant_ttl=TTL,
         in_flight=frozenset(tasks) if in_flight is None else in_flight,
     )

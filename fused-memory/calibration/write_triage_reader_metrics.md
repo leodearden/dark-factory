@@ -463,7 +463,8 @@ stratified bootstrap 95% interval.
   sample rate is dominated by the contested census, 332 of 371. The
   population rate is dominated by the 14 amended conflicts: each amended item
   stands for 12.24 amended writes (1,224 / 100), each restated item for 1.25
-  (125 / 100).
+  (125 / 100). `plans/write-triage-m3-levers.md` classifies these 39 hits and
+  replays the soak corpus under each M3 lever (task 7519).
 - **M4** counts every decided attach, contested ones included, and leaves 2
   UNCLEAR out. Its population rate sits above the sample rate because the
   amended stratum is weighted 12.24 per item.

@@ -16,14 +16,18 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar, assert_never, cast
 
+import httpx
+from graphiti_core.errors import EdgeNotFoundError
 from graphiti_core.nodes import EpisodeType
 from shared.streak import KeyedStreaks
 
+from fused_memory.backends.episode_toolcall_leak_scan import EpisodeToolcallLeakScan
 from fused_memory.backends.graphiti_client import (
     ActiveEdgesError,
     AmbiguousEntityError,
     GraphitiBackend,
     ReadCompleteness,
+    build_llm_client,
     read_all_valid_edges_checked,
     read_entity_nodes_checked,
 )
@@ -80,6 +84,8 @@ from fused_memory.models.memory import (
     EpisodeStatus,
     MemoryResult,
     ReadRouteResult,
+    graphiti_hit_attribution,
+    mem0_hit_attribution,
     render_add_memory_message,
 )
 from fused_memory.models.reconciliation import (
@@ -117,15 +123,20 @@ from fused_memory.routing.router import ReadRouter
 from fused_memory.services import mem0_retry_backlog_alarm, mem0_write_retry, overreach_guard
 from fused_memory.services.agent_project_storm_counters import AgentProjectStormCounters
 from fused_memory.services.billing_exhaustion_alarm import (
+    ApiKeyCreditsParkGuard,
     BillingExhaustionAlarm,
-    BillingParkPolicy,
 )
+from fused_memory.services.billing_park_policy import BillingParkPolicy
 from fused_memory.services.classification_fallback_alarm import (
     ClassificationFallbackAlarm,
     journal_params,
 )
 from fused_memory.services.completion_claim_gate import UNVERIFIED_CLAIM_TAG
-from fused_memory.services.durable_queue import DeadLetterEvent, DurableWriteQueue
+from fused_memory.services.durable_queue import (
+    DeadLetterEvent,
+    DurableWriteQueue,
+    release_attempt_budget,
+)
 from fused_memory.services.mem0_add_outcome import (
     RAISED_MEM0_ADD,
     Mem0AddOutcome,
@@ -152,7 +163,10 @@ from fused_memory.services.overreach_shadow import (
     open_overreach_shadow,
     shadow_job_from_write,
 )
+from fused_memory.services.plan_cap_alarm import PlanCapAlarm
+from fused_memory.services.plan_route import PlanRoute, PlanRouteParkGuard, PlanRouteSite
 from fused_memory.services.provider_billing import (
+    BillingSource,
     billing_source_of,
     classify_billing_exhaustion,
 )
@@ -186,6 +200,7 @@ from fused_memory.services.write_journal import (
 )
 from fused_memory.utils.async_utils import gather_collect, gather_or_raise
 from fused_memory.utils.canonical_labels import Referent, parse_node_name, scan_content
+from fused_memory.utils.mem0_content_keys import mem0_payload_text
 from fused_memory.utils.referent_resolution import (
     REFERENT_SOURCES,
     ReferentSet,
@@ -303,45 +318,16 @@ _DEPENDENCY_FACT_RE = re.compile(r'\bdepends on\b', re.I)
 # dedup/no-op.
 _MEM0_ADD_INFER_PINNED_FALSE = True
 
-# Canonical order for extracting a memory's human-readable content string from a
-# raw Qdrant payload: mem0 stores the verbatim content under 'data', but older
-# / alternately-written points use 'memory' or 'content'. First non-empty string
-# wins. Kept package-internal here (a deliberate minor duplication of scripts/
-# clear_malformed_empty_memory.py:_CONTENT_KEYS and audit_duplicate_memories.py)
-# rather than importing from scripts/, so the service has no scripts/ dependency.
-_MEM0_CONTENT_KEYS = ('data', 'memory', 'content')
-
-
-def _mem0_content(payload: dict) -> str:
-    """The human-readable text of a RAW Qdrant payload, or ``''``.
-
-    First non-empty string among :data:`_MEM0_CONTENT_KEYS`.  Shared by every
-    caller that turns a raw payload into text — ``get_memory_by_id`` and the
-    topic-anchored pin in :meth:`MemoryService.search` — so the fallback ORDER
-    lives in exactly one place.  A second inline copy of this loop would be a
-    place for the two paths to disagree about which key holds the body (INV-5).
-
-    Note this is the RAW-PAYLOAD path, distinct from the Mem0 *search item*
-    path in ``_search_mem0``: a search item and a scroll payload do not put the
-    text under the same key, which is exactly why guessing one key is wrong.
-    """
-    for key in _MEM0_CONTENT_KEYS:
-        value = payload.get(key)
-        if isinstance(value, str) and value:
-            return value
-    return ''
-
-
 def metadata_row_text(row: Mapping[str, Any]) -> str:
     """The text of one ``get_memories_by_metadata`` row, or ``''``.
 
     That row is ``{'id', 'created_at', 'metadata'}``
     (``backends/mem0_client.py::Mem0Backend._normalise_point``) with no
     top-level text key: the text lives only inside the ``metadata`` payload,
-    where :func:`_mem0_content` owns the key order.
+    read by ``utils/mem0_content_keys.py::mem0_payload_text``.
     """
     payload = row.get('metadata')
-    return _mem0_content(payload) if isinstance(payload, dict) else ''
+    return mem0_payload_text(payload) if isinstance(payload, dict) else ''
 
 
 def _decode_mem0_tombstone(record: ReconLedgerRecord) -> dict | None:
@@ -1445,6 +1431,21 @@ class MemoryNotFoundError(Exception):
     """Raised when a mem0 memory id is not found."""
 
 
+def memory_not_found(
+    store: str, memory_id: str, project_id: str, *, nothing_was: str
+) -> dict:
+    """The RETURNED refusal for a mutation whose target id resolves to nothing."""
+    return {
+        'error': (
+            f'Memory {memory_id!r} does not exist in {store} for project '
+            f'{project_id!r}; nothing was {nothing_was}.'
+        ),
+        'error_type': 'MemoryNotFound',
+        'store': store,
+        'id': memory_id,
+    }
+
+
 def _serialize_temporal(
     valid_at: Any,
     invalid_at: Any,
@@ -1595,6 +1596,7 @@ def _graph_search_result(
         )),
         metadata=metadata,
         created_at=_created_at_to_utc_iso(getattr(edge, 'created_at', None)),
+        **graphiti_hit_attribution(getattr(edge, 'group_id', None)),
     )
 
 
@@ -2165,9 +2167,12 @@ class MemoryService:
         config: FusedMemoryConfig,
         *,
         mem0_retry_policy: Mem0RetryPolicy = DEFAULT_MEM0_RETRY_POLICY,
+        queue_clock: Callable[[], float] = time.time,
     ):
+        """*queue_clock* schedules the durable queue, and the plan route, whose probe times become parked rows' horizons."""
         self.config = config
         self._mem0_retry_policy = mem0_retry_policy
+        self._queue_clock = queue_clock
         self.graphiti = GraphitiBackend(config)
         self.mem0 = Mem0Backend(config)
         self.classifier = WriteClassifier(config)
@@ -2175,6 +2180,17 @@ class MemoryService:
         self.durable_queue: DurableWriteQueue | None = None
         self._billing_alarm = BillingExhaustionAlarm(
             resolve_project_root=lambda: configured_primary_root(self.config.taskmaster) or None,
+        )
+        def queue_moment() -> datetime:
+            return datetime.fromtimestamp(queue_clock(), UTC)
+
+        self._plan_cap_alarm = PlanCapAlarm(
+            resolve_project_root=lambda: configured_primary_root(self.config.taskmaster) or None,
+            count_parked_or_in_flight=self._count_parked_or_in_flight_writes,
+            clock=queue_moment,
+        )
+        self.plan_route = PlanRoute(
+            config.plan_route, listener=self._plan_cap_alarm, clock=queue_moment,
         )
         self._event_buffer: EventBuffer | None = None
         self._write_journal: WriteJournal | None = None
@@ -2431,9 +2447,55 @@ class MemoryService:
         if self._event_buffer:
             await self._event_buffer.push(event)
 
+    async def _count_parked_writes(self) -> int:
+        if self.durable_queue is None:
+            return 0
+        return (await self.durable_queue.get_stats())['counts'].get('parked', 0)
+
+    async def _count_parked_or_in_flight_writes(self) -> int:
+        if self.durable_queue is None:
+            return 0
+        counts = (await self.durable_queue.get_stats())['counts']
+        return counts.get('parked', 0) + counts.get('in_flight', 0)
+
+    async def _global_parked_count(self, queue_stats: object, project_id: str | None) -> int:
+        """The global parked count, read from *queue_stats* when they are unscoped."""
+        if project_id is None and isinstance(queue_stats, dict) and 'counts' in queue_stats:
+            return queue_stats['counts'].get('parked', 0)
+        return await self._count_parked_writes()
+
+    async def _plan_route_status(
+        self, queue_stats: object, project_id: str | None,
+    ) -> dict[str, Any]:
+        """get_status's plan_route field. A queue that cannot be counted costs
+        only ``parked_items`` (None), never the latch."""
+        try:
+            parked_items: int | None = await self._global_parked_count(queue_stats, project_id)
+        except Exception:
+            logger.warning(
+                'get_status: could not count parked writes; plan_route reports parked_items=None',
+                exc_info=True,
+            )
+            parked_items = None
+        return self.plan_route.state().to_status(
+            parked_items=parked_items, escalation_id=self._plan_cap_alarm.escalation_id(),
+        )
+
+    def _graphiti_plan_route_client(self) -> httpx.AsyncClient | None:
+        provider = self.config.llm.providers.openai
+        if self.config.llm.provider != 'openai' or provider is None or not provider.api_url:
+            return None
+        return self.plan_route.http_client_for(provider.api_url, site=PlanRouteSite.GRAPHITI)
+
     async def initialize(self) -> None:
         """Initialize backends and the durable write queue."""
-        await self.graphiti.initialize()
+        plan_client = self._graphiti_plan_route_client()
+        if plan_client is None:
+            await self.graphiti.initialize()
+        else:
+            await self.graphiti.initialize(
+                llm_client=build_llm_client(self.config, http_client=plan_client),
+            )
 
         qcfg = self.config.queue
 
@@ -2466,7 +2528,11 @@ class MemoryService:
             transient_error_names=qcfg.transient_error_names,
             on_terminal=self._record_queue_terminal_outcome,
             on_dead_letter=self._report_queue_dead_letter,
-            park_policy=BillingParkPolicy(self._billing_alarm),
+            park_policy=BillingParkPolicy({
+                BillingSource.API_KEY_CREDITS: ApiKeyCreditsParkGuard(self._billing_alarm),
+                BillingSource.PLAN_CAP: PlanRouteParkGuard(self.plan_route),
+            }),
+            clock=self._queue_clock,
         )
         self.durable_queue.register_callback(
             QueueCallback.DUAL_WRITE_EPISODE, self._dual_write_callback
@@ -2613,6 +2679,7 @@ class MemoryService:
         *,
         token_probe: Callable[[], contextlib.AbstractAsyncContextManager[TokenMeasurement]]
         | None = None,
+        on_landed: Callable[[], None] | None = None,
     ) -> Any:
         """Execute a backend call and log to write journal.
 
@@ -2621,36 +2688,22 @@ class MemoryService:
         per-call-site opt-in. A ``token_probe`` window wraps only the awaited
         call, and the LLM tokens it measured are journaled with the row. A
         probe that fails to open is journaled as this call's failure, and
-        ``coro`` is closed unawaited.
+        ``coro`` is closed unawaited. Only a failed or cancelled BACKEND call
+        is journaled as a failure: an interrupted success-row write journals
+        nothing rather than a false failure. ``on_landed`` lets a queue
+        executor declare the moment its write landed: it runs once the call
+        returns, before its success row is journaled.
         """
         measurement = TokenMeasurement()
-        result = None
-        duration_ms: float | None = None
         started = time.perf_counter()
         try:
             async with (
                 token_probe() if token_probe is not None else contextlib.nullcontext(measurement)
             ) as measurement:
                 result = await coro
-            duration_ms = _elapsed_ms_since(started)
-            if self._write_journal:
-                await self._write_journal.log_backend_op(
-                    write_op_id=write_op_id,
-                    causation_id=causation_id,
-                    backend=backend,
-                    operation=operation,
-                    payload=payload,
-                    result_summary=str(result)[:500] if result else None,
-                    success=True,
-                    duration_ms=duration_ms,
-                    llm_tokens=measurement.usage,
-                )
-            return result
         except (Exception, asyncio.CancelledError) as e:
             if asyncio.iscoroutine(coro):
                 coro.close()
-            if duration_ms is None:
-                duration_ms = _elapsed_ms_since(started)
             if self._write_journal:
                 await self._write_journal.log_backend_op(
                     write_op_id=write_op_id,
@@ -2660,10 +2713,26 @@ class MemoryService:
                     payload=payload,
                     success=False,
                     error=f'{type(e).__name__}: {e}',
-                    duration_ms=duration_ms,
+                    duration_ms=_elapsed_ms_since(started),
                     llm_tokens=measurement.usage,
                 )
             raise
+        duration_ms = _elapsed_ms_since(started)
+        if on_landed is not None:
+            on_landed()
+        if self._write_journal:
+            await self._write_journal.log_backend_op(
+                write_op_id=write_op_id,
+                causation_id=causation_id,
+                backend=backend,
+                operation=operation,
+                payload=payload,
+                result_summary=str(result)[:500] if result else None,
+                success=True,
+                duration_ms=duration_ms,
+                llm_tokens=measurement.usage,
+            )
+        return result
 
     async def _record_queue_terminal_outcome(
         self,
@@ -6002,6 +6071,7 @@ class MemoryService:
                 # spend no LLM, so they stay unprobed rather than journaling a
                 # zero that reads like a measurement.
                 token_probe=self.graphiti.token_probe,
+                on_landed=release_attempt_budget,
             )
             reconcile_stats = await self._reconcile_episode_identity(
                 result, group_id=group_id, referents=referents.refs,
@@ -6120,6 +6190,7 @@ class MemoryService:
                 coro=self.mem0.add(
                     content=value.content, scope=scope, metadata=metadata
                 ),
+                on_landed=release_attempt_budget,
             )
             succeeded = True
             return result
@@ -6200,6 +6271,7 @@ class MemoryService:
             operation='add',
             payload={'content': fact_text[:200]},
             coro=self.mem0.add(content=fact_text, scope=scope, metadata=metadata),
+            on_landed=release_attempt_budget,
         )
         # Only once the write has landed: a failed write is retried through this
         # whole executor, and a retry must not count the same fact again.
@@ -7877,12 +7949,13 @@ class MemoryService:
                     # rather than trusting writes to be well-formed.)
                     pinned.insert(pin_at, MemoryResult(
                         id=canonical_id,
-                        content=_mem0_content(payload_meta),
+                        content=mem0_payload_text(payload_meta),
                         category=_mem0_category(custom),
                         source_store=SourceStore.mem0,
                         relevance_score=0.0,
                         metadata=custom,
                         created_at=created_at if isinstance(created_at, str) else None,
+                        **mem0_hit_attribution(managed, custom),
                         topic_anchored=True,
                     ))
                     pin_at += 1
@@ -8104,6 +8177,7 @@ class MemoryService:
                 relevance_score=_rrf_score(rank),
                 metadata=metadata,
                 created_at=item.get('created_at'),
+                **mem0_hit_attribution(item, meta),
             ))
         return results
 
@@ -8565,6 +8639,11 @@ class MemoryService:
             limit=limit,
         )
 
+    async def scan_episode_toolcall_leaks(self, project_id: str) -> EpisodeToolcallLeakScan:
+        """The Graphiti counterpart of :meth:`scan_memory_content`: which of the
+        project's episodes carry a leaked tool-call fragment."""
+        return await self.graphiti.scan_episode_toolcall_leaks(group_id=project_id)
+
     async def get_memories_by_metadata(
         self,
         project_id: str,
@@ -8616,7 +8695,8 @@ class MemoryService:
         string.
 
         Returns ``{'id', 'content', 'metadata'}`` — where ``content`` is the
-        first non-empty string among the canonical ``_MEM0_CONTENT_KEYS``
+        first non-empty string among the canonical
+        ``utils/mem0_content_keys.py::MEM0_CONTENT_KEYS``
         (``data`` → ``memory`` → ``content``) and ``metadata`` is the FULL
         unprocessed Qdrant payload — or ``None`` on a genuine not-found.
 
@@ -8629,7 +8709,7 @@ class MemoryService:
         payload = await self.mem0.get_point_by_id(memory_id, scope)
         if payload is None:
             return None
-        return {'id': memory_id, 'content': _mem0_content(payload), 'metadata': payload}
+        return {'id': memory_id, 'content': mem0_payload_text(payload), 'metadata': payload}
 
     async def cosine_to_memories(
         self, *, query: str, memory_ids: Sequence[str], project_id: str,
@@ -9316,9 +9396,13 @@ class MemoryService:
                 # The child's OWN subtree went first, so its ids precede it
                 # here — the same deepest-first order the deletes actually
                 # ran in. Dropping this frame's return value would report
-                # A→B→C as having destroyed only B.
-                deleted.extend(child_result.get('cascaded_child_ids') or [])
-                deleted.append(child_id)
+                # A→B→C as having destroyed only B. A child that vanished
+                # before its own delete (MemoryNotFound) was not destroyed by
+                # this cascade, so it is not reported; one that genuinely
+                # survived is still caught by the re-count below.
+                if child_result.get('status') == 'deleted':
+                    deleted.extend(child_result.get('cascaded_child_ids') or [])
+                    deleted.append(child_id)
 
         if await self._count_children(memory_id, project_id=project_id):
             survivors = [
@@ -9334,6 +9418,27 @@ class MemoryService:
                 )
 
         return deleted
+
+    async def memory_exists(
+        self, memory_id: str, *, store: SourceStore, project_id: str
+    ) -> bool:
+        """Whether *memory_id* resolves in *store*; a read failure propagates.
+
+        Only a definite miss answers False, so an unknown (a ``TimeoutError``
+        included) is never mistaken for an absent record.
+
+        PUBLIC and side-effect-free for the reason :meth:`refuse_if_children`
+        is: the MCP tool layer settles the target's existence BEFORE its
+        citation passes mutate task metadata, since the refusal below in
+        :meth:`delete_memory` fires only after them.
+        """
+        if store == SourceStore.mem0:
+            return await self.get_memory_by_id(project_id, memory_id) is not None
+        try:
+            await self.graphiti.get_edge_text(memory_id, group_id=project_id)
+        except EdgeNotFoundError:
+            return False
+        return True
 
     async def delete_memory(
         self,
@@ -9396,20 +9501,24 @@ class MemoryService:
         ``success=True`` journal entry and a ``memory_deleted`` event while
         nothing was removed.
 
-        EXISTENCE IS NOT CHECKED, and the difference is user-visible: a
-        well-formed UUID that no longer resolves — a stale id copied out of an
-        old report, a survivor id from an earlier consolidation — still reports
-        ``deleted``, for exactly the same backend reason. Closing that half
-        needs a per-store existence read: ``update_memory`` below already does
-        it for its Qdrant arm (see the §5(c) read-leg comment there), while the
-        Graphiti arm additionally needs a ``remove_edge`` that distinguishes
-        not-found from already-deleted. Deliberately out of scope here — task
-        3132 closes the malformed-shape half only.
+        EXISTENCE IS CHECKED next, in both stores, for the same backend reason:
+        a well-formed UUID that resolves to nothing (a stale id from an old
+        report, a survivor of an earlier consolidation) RETURNS
+        ``MemoryNotFound`` and leaves no backend call, journal row or event. It
+        returns rather than raises because every internal and script caller
+        treats "did not raise" as success, and some delete one id twice by
+        design. A raised read propagates, because an unknown is not a miss.
+        ``GraphitiBackend.remove_edge`` stays idempotent for its other callers;
+        the Graphiti read is ``get_edge_text``. In the mem0 arm the read runs
+        before the child gate, so a ``cascade=True`` aimed at a missing parent
+        destroys NOTHING: children still carrying its dead ``parent_id`` are
+        not swept up. They are live records and the correct referents of
+        whatever cites them; deleting them is a separate, explicit call.
 
-        The guard sits above the store branch so ONE check covers both the
+        Both guards sit above the store branch so ONE check covers both the
         Graphiti and Mem0 paths, and above the journal write and event emission
-        so a rejected delete leaves no false audit trail. It sits BELOW
-        ``SourceStore(store)`` so a call that is wrong in both ways reports the
+        so a rejected delete leaves no false audit trail. The shape guard sits
+        BELOW ``SourceStore(store)`` so a call that is wrong in both ways reports the
         bad store first — the same store-then-shape precedence the MCP boundary
         gives agents, rather than the inverse for internal callers.
 
@@ -9443,6 +9552,8 @@ class MemoryService:
                 'cascade if a plain delete of this record is what was meant.'
             )
         require_full_uuid(memory_id, field_name='memory_id')
+        if not await self.memory_exists(memory_id, store=source, project_id=project_id):
+            return memory_not_found(store, memory_id, project_id, nothing_was='deleted')
 
         write_op_id = str(uuid_mod.uuid4())
         cascaded_child_ids: list[str] = []
@@ -9732,15 +9843,7 @@ class MemoryService:
         # distinction away at the one layer that still has it.
         existing = await self.get_memory_by_id(project_id=project_id, memory_id=memory_id)
         if existing is None:
-            return {
-                'error': (
-                    f'Memory {memory_id!r} does not exist in mem0 for project '
-                    f'{project_id!r}; nothing was updated.'
-                ),
-                'error_type': 'MemoryNotFound',
-                'store': 'mem0',
-                'id': memory_id,
-            }
+            return memory_not_found('mem0', memory_id, project_id, nothing_was='updated')
 
         # The FULL raw Qdrant payload — mem0-owned keys and custom provenance
         # keys alike. Copied so the arms below can compute a delta against it
@@ -11491,6 +11594,8 @@ class MemoryService:
                 status['queue'] = await self.durable_queue.get_stats(group_id=project_id)
             except Exception as e:
                 status['queue'] = {'error': str(e)}
+
+        status['plan_route'] = await self._plan_route_status(status.get('queue'), project_id)
 
         # Server uptime fields (informational; dashboard reads uptime_seconds as primary)
         status['started_at'] = self._started_at.isoformat()

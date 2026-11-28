@@ -330,7 +330,8 @@ For a publisher configured with root R, output directory O and inbox directory I
 under O is a function of R's git objects, R's `.taskmaster/tasks/tasks.db` rows with `tag='master'`,
 R's `data/orchestrator/runs.db`, R's `data/escalations/` queue-root records, of which only `id`,
 `task_id`, `status`, `level` and `members` are read, R's `data/verify-logs/`, R's `acceptance/criteria.yaml`, the policy,
-and I's `inbox.jsonl` and `engagement.json`, filtered by the policy's visible set. It opens no other
+O's `criteria-staging.json` (written by `client-feed criteria-results`, §7.7), and I's `inbox.jsonl`
+and `engagement.json`, filtered by the policy's visible set. It opens no other
 path. It writes nowhere but O. The portal account reads O and nothing under R.
 
 The client defect filer is a separate process under its own invariant (§14.5); it widens nothing here.
@@ -528,7 +529,7 @@ escalation text (never shown). A second feed transport. Per-person links. Failin
     `client-feed/src/client_feed/inbox.py::read_inbox`, with its offset in `Cursor.inbox_offset`.
 - 2026-10-22, from task 7221 (B22). These bind γ (6970) and ε (6972):
   - (a) A test case id reaches the feed through
-    `client-feed/src/client_feed/sources/archive.py::_case_id`, which applies
+    `client-feed/src/client_feed/sources/archive.py::case_id`, which applies
     `client-feed/src/client_feed/redact.py::redact_paths`. γ emits `read_archived_run`'s case ids as
     they are and never re-derives them.
   - (b) ε's `criteria_results` `results[].tests` carries those same ids. The collection map's nodeids
@@ -712,12 +713,137 @@ escalation text (never shown). A second feed transport. Per-person links. Failin
     producer drift, any more than the copied DDL can (2026-10-21 (g)). For this seam the boundary test
     does.
 
+- 2026-11-24, from ε (task 6972). These bind ζ (6973), defect-tests ι and the portal:
+  - (a) `criteria_declared` is read every pass from `acceptance/criteria.yaml` at main's head,
+    through git objects and never the working tree
+    (`client-feed/src/client_feed/criteria.py::read_declared`, which reads one path through
+    `client-feed/src/client_feed/sources/git.py::path_entry`). It is emitted when its path-redacted
+    criteria differ from the state's (`client-feed/src/client_feed/criteria.py::declared_event`).
+    That covers the first start and every content change. A removed file emits an empty
+    declaration. An unreadable or invalid file, or a symlink at the path, is `criteria` in
+    `degraded`, and the state's declaration stands. The file's own shape is
+    `client-feed/src/client_feed/criteria.py::CriteriaFile`: `format: 1` and `criteria`, with ids
+    unique (`client-feed/src/client_feed/contract.py::UniqueCriteria`) and each a `CriterionId`
+    (§14.2 decision 12).
+  - (b) `criteria_results{verify}` joins the newest verify run of a pass that has archived junits
+    (`client-feed/src/client_feed/stream_events.py::VerifyReports`). Each junit report is joined
+    with the collection map beside it at
+    `client-feed/src/client_feed/criteria.py::collection_map_path`, over every case read uncapped
+    (`client-feed/src/client_feed/sources/archive.py::read_junit_cases`). So the outcomes never
+    depend on the `test_results` case cap, and a case id in one report never borrows another
+    report's binding. A run none of whose junits has a map records nothing. The event is emitted
+    when its payload differs from the state's
+    (`client-feed/src/client_feed/criteria.py::results_event`), so a later run with unchanged
+    outcomes still moves `run_at`. The `run_kind` records are compared separately, so a staging run
+    never suppresses a verify run or the reverse.
+  - (c) The outcome rule (`client-feed/src/client_feed/criteria.py::join_criteria`): `failed` if any
+    bound case failed or errored; `passed` only if every bound test has cases and all of them
+    passed; otherwise `not_run`. A skipped or absent bound test therefore never reads `passed`.
+    `tests` holds the bound case ids, sorted and unique. A binding to an undeclared criterion is
+    ignored.
+  - (d) `out/criteria-staging.json` is `client-feed/src/client_feed/criteria.py::CriteriaRun`
+    `{commit, run_at, results}`, where `run_at` is the CLI's clock when it joined. It is written by
+    `client-feed criteria-results` (`client-feed/src/client_feed/cli.py::_run_criteria_results`)
+    through `client-feed/src/client_feed/feed_io.py::write_atomically`, the same atomic, group-readable
+    writer as `state.json`. The publisher reads it every pass and emits `criteria_results{staging}`
+    when it differs from the state. The CLI accepts `--run-kind staging` only, and a staging file it
+    cannot write is a named refusal, exit 1. A malformed staging file is `criteria` in `degraded` and
+    does not hold the verify results.
+  - (e) `test_results.cases[].criterion` stays null. Binding it from the same map is left to sit
+    with ι's `cases[].defects`, which reads that map's `defects`
+    (follow-up ticket tkt_0RXBYTA3ZE3K2KQSNATM2CZWS9).
+
+- 2026-11-26, from ζ (task 6973). These bind the portal (scoping-intake κ, task 56) and σ3 (7407):
+  - (a) The committed fixture is `client-feed/tests/fixtures/snapshot-dark-factory/`. Its file set is
+    fixed: `feed.jsonl` and `state.json`, beside a README
+    (`client-feed/tests/fixtures/snapshot-dark-factory/README.md`). The files are one
+    `client-feed snapshot` of this repository at the generating commit, over the live slice in (b).
+    The policy is project `dark-factory` with `visible_globs` `*/src/**` and `*/tests/**`, and
+    `max_cases_per_run` 20. The inbox asks for `client-feed/src/client_feed/envelope.py` and `../x`.
+    The one regenerate command is
+    `cd client-feed && CLIENT_FEED_REGENERATE_SNAPSHOT_FIXTURE=1 uv run pytest tests/test_isolation.py -k b22`.
+    It writes the files only after every B22 assertion has passed, and they are never hand-edited.
+    `client-feed/tests/test_isolation.py::test_the_committed_dark_factory_snapshot_is_a_valid_bounded_leak_free_feed`
+    checks four things on the committed files: they validate as project `dark-factory`; they leak no
+    marker, home or tmp path, and no forbidden key; they hold at least one `task_upserted`,
+    `tree_snapshot` and `file_revealed`; and every `test_results` has at most 20 cases. Most of each
+    file is the tree snapshot.
+  - (b) B22 never snapshots the live root in place. A task or merge worktree has no `.taskmaster/` or
+    `data/`, and the main checkout's stores take minutes to snapshot. Instead it runs on a shared,
+    unchecked-out clone whose `main` is HEAD (`client-feed/tests/_git_repo.py::clone_of_checkout`).
+    The clone holds a read-only slice of the live stores
+    (`client-feed/tests/_live_slice.py::copy_live_slice`): `plans/client-feed-prd.md`'s master tasks
+    with their dependencies, events, task results, verify archives and escalation root records.
+    Every live database is attached through a `file:...?mode=ro` URI. Each `task_upserted` title
+    must equal the path-redacted live title, read back read-only
+    (`client-feed/tests/_live_slice.py::live_titles`) straight after the copy. B22 is skipped only
+    when the checkout that `shared/src/shared/project_layout.py::main_checkout_of` names has no
+    `.taskmaster/tasks/tasks.db`, or has one holding no master task under `plans/client-feed-prd.md`.
+    A snapshot that reports any source in `degraded` fails it.
+    B1, B2, B15, the ban in (d) and the fixture check never skip.
+  - (c) The recorder `client-feed/tests/_audit_hook.py::recording` now records database opens
+    (`client-feed/tests/_audit_hook.py::DatabaseOpened`, a `file:` URI decoded to its path). It also
+    records the cwd and args of every `subprocess.Popen` (`client-feed/tests/_audit_hook.py::Spawned`),
+    and every directory listing (`client-feed/tests/_audit_hook.py::Listed`, `os.listdir` and
+    `os.scandir`, through which glob and `Path.iterdir` list). B1 fails on a listing of any directory
+    outside the project root and the out and in dirs. B1 exempts only
+    `client-feed/tests/_audit_hook.py::interpreter_roots`, the sys prefixes and site-packages.
+    `client-feed/tests/_audit_hook.py::runtime_roots` adds the CA bundles and stays
+    B30's exemption, through `AuditRecord.opens_outside_runtime` and
+    `AuditRecord.mutations_outside_runtime`.
+  - (d) `default_project_root` is proven unused twice. At runtime,
+    `client-feed/tests/_call_watch.py::watching` counts calls to the function's code object on every
+    thread during B1's snapshot. Statically,
+    `client-feed/tests/test_isolation.py::test_no_client_feed_source_names_default_project_root` runs
+    `git grep` over `client-feed/src`.
+  - (e) γ's checkout test, `client-feed/tests/test_cli_publish.py::test_a_snapshot_of_this_checkout_is_a_valid_feed_that_leaks_nothing`,
+    moved into
+    `client-feed/tests/test_isolation.py::test_b22_a_snapshot_of_this_checkout_over_its_live_slice_is_valid_and_leaks_nothing`,
+    which now runs on real data and answers reveals. The one assertion not carried over, CLI-level
+    redaction of invented titles, stays covered by `client-feed/tests/test_publisher.py` and
+    `client-feed/tests/test_dump_sources.py`.
+
+- 2026-11-26, from task 11885 (spawned from task 11881). The publisher's deferred-gate check (B41):
+  - (a) A carrier waits on a deferred gate when two things hold
+    (`client-feed/src/client_feed/sources/tasks.py::DefectCarrier`): it is unfinished, so neither
+    `done` nor `cancelled`; and it depends on a gate for its own ref
+    (`x_client_defect_gate_for == ref`) whose status is `deferred`. Its ref is then held in
+    `cursor.json.deferred_gate_reports: {ref: first_seen}`
+    (`client-feed/src/client_feed/filer_checks.py::still_behind_deferred_gates`). The time is the
+    publisher's own clock on the pass that first saw it so, not a line's `at`, so it restarts if the
+    cursor is lost. The entry is dropped once the carrier no longer waits, and a gate held again after
+    its release starts a new one. While any entry is older than `filer_grace_seconds`, the heartbeat
+    names `filer` with the reason
+    `N defect report(s) waiting on a deferred gate past <filer_grace_seconds>s: <ref>, …`
+    (`client-feed/src/client_feed/filer_checks.py::deferred_gate_degradation`). With the carriers
+    unreadable, the map stands, as `pending_reports` does.
+  - (b) Why. Decision 4 says nothing is left `deferred`, and decision 7's end state has no task left
+    `deferred`. That end state breaks when the filer's one `commit_planning([fix, gate])` releases the
+    fix and refuses the gate with `not_planning_hold`
+    (`fused-memory/src/fused_memory/middleware/deferral_gate.py::_not_planning_refusal`). The
+    feed then says `gated: true`, while the gate stays `deferred`, is never dispatched, and never
+    reaches Leo's L2 queue. Before this check, only the filer's journal and `--check` said so.
+  - (c) Unchanged: decision 8's carrier rule, `defect_filed` and its `gated`, B33, and the unfiled
+    reason. A report behind a deferred gate has a carrier, so it is filed and never reads as unfiled.
+    The two reasons name two states, each on its own clock.
+  - (d) The reader now also reads each gate's `status`, a column already in §4 decision 6's
+    allowlist. The ref reader's two fields of §14.3 do not grow, and the reason carries refs and
+    the state phrase only.
+  - (e) Rolling back across this change means deleting `deferred_gate_reports` from `cursor.json`
+    too. Code from before it refuses the key, because `Cursor` is `extra='forbid'`.
+  - (f) The portal needs nothing. It renders each `filer` reason verbatim
+    (`scoping_intake/defect_report_pages.py::leos_reports_html`), and a `degraded` holding two
+    `filer` entries with different reasons is already legal.
 
 ## 13. Open questions (tactical)
 
 1. **Tree-snapshot cost on large repos.** Suggested: snapshot only on head change; blob line counts
    cached by sha in `cursor.json`; last-change dates from the commits walked since the previous
-   snapshot. Decide in β2/γ.
+   snapshot. Decide in β2/γ. Measure any fix against
+   `client-feed/tests/test_isolation.py::test_b22_a_snapshot_of_this_checkout_over_its_live_slice_is_valid_and_leaks_nothing`,
+   which snapshots this repository's `*/src/**` and `*/tests/**` on every client-feed verify. When
+   ζ (6973) landed it took about a minute, most of it the publisher counting lines blob by blob over
+   the visible tree, which the engagement and the reveal requests trigger.
 2. **One unit per project or one unit with a list.** **Decided by η (6974):** one instance per
    project, `client-feed@<name>.service`, `--config %h/.config/client-feed/<name>.yaml`.
 3. **Default globs** for visible, test, docs and generated sets. Suggested as in §7.2 and §7.6, with
@@ -767,6 +893,8 @@ What an operator sees:
 - `get_task` on that carrier shows `metadata.defects[0]` with `origin: client`.
 - A report not filed within `filer_grace_seconds` makes the publisher's heartbeat name `filer` in
   `degraded`, with the ref.
+- So does a filed report whose fix has waited `filer_grace_seconds` on a gate left `deferred`
+  (§12, 2026-11-26, task 11885).
 
 | Mechanism | Consumer |
 |---|---|
@@ -888,6 +1016,10 @@ What an operator sees:
      Rolling back means deleting `defect_scan_offset` and `pending_reports` first.
    - The heartbeat names `filer` in `degraded`, with the refs, while any entry is older than
      `filer_grace_seconds`.
+   - A filed report whose unfinished carrier waits on a `deferred` gate for its ref is held in
+     `cursor.json.deferred_gate_reports` and named under `filer` too, with its own reason. The
+     carrier rule above is unchanged, and rolling back deletes that key as well (§12, 2026-11-26,
+     task 11885).
    - The filer writes nothing under O, I or R, which keeps one writer per directory (§4.1). A dead
      filer is distinct from "no reports" (INV-6, INV-13).
 9. **The filer is narrow in code shape and in process.**
@@ -1025,7 +1157,10 @@ A line that fails the contract is rejected and counted under `inbox` (§12, 2026
 
 - `state.json` gains `defects_filed: {ref: {block, report, task_id, gated}}`. Natural key: `ref`.
 - `Source` gains `filer`. `heartbeat.degraded` names it with the reason
-  `N defect report(s) unfiled past <filer_grace_seconds>s: <ref>, …`.
+  `N defect report(s) unfiled past <filer_grace_seconds>s: <ref>, …`. For a filed report whose
+  carrier waits on a `deferred` gate, the reason is
+  `N defect report(s) waiting on a deferred gate past <filer_grace_seconds>s: <ref>, …`
+  (§12, 2026-11-26, task 11885).
 - **Compatibility.** A new type and a new state key are minor changes: the portal ignores both until
   it reads them. A new `Source` member is not minor for a reader that validates `Source` as a closed
   enum, and the portal's `scoping_intake/feed.py::FeedSource` does. P1a therefore adds `filer` to
@@ -1150,6 +1285,7 @@ For a filer configured with policy P (root R, inbox directory I, state directory
 | B38 | Ruled before filing | a `defect_reported` line and its `defect_ruled` line read in one pass; the same two lines read in two passes with the filer restarted between | nothing is filed for the ref in the first case; in the second the fix and gate the first pass filed are withdrawn and cancelled by the second, fix before gate; one `defect_filed` was emitted and `task_upserted` shows both cancelled |
 | B39 | Bounded, idempotent, convergent | the ruled ref's fix `pending` with its gate; the same inbox run twice; the filer killed after the withdrawal, after the fix's cancel, and before the gate's cancel; a ruled ref whose fix is `in-progress`, and one whose fix is `done` | the end state (withdrawn, fix cancelled, gate cancelled) is reached from each crash point; the recording fake sees writes only on the two tasks whose `metadata.source` is `client-defect-filer` and whose ref matches; the `in-progress` and `done` fixes are withdrawn but not cancelled; B30's tool-name set is the amended closed set, and `set_task_status` is seen with `cancelled` only |
 | B40 | Decision 7's order on a terminal fix | a ruled ref whose fix is `done` | no defect write is attempted on it (none is allowed on a terminal task); the refusal is recorded as converged and not retried; the gate, if still pending, is cancelled |
+| B41 | Held behind a deferred gate (§12, 2026-11-26, task 11885) | a `pending` fix depending on its gate, the gate left `deferred`; then the gate released; again with the task store made unreadable; a `done` or `cancelled` fix behind a deferred gate; a report unfiled past the grace, then filed behind a deferred gate; a released gate held again | one `defect_filed` with `gated: true`; the ref is held in `deferred_gate_reports` from the first pass that saw it so, and once the grace passes the heartbeat names `filer` with the deferred-gate reason, never the unfiled one; it clears once the gate is released; it stays held and named while `tasks` is degraded; a finished fix is never named; the unfiled report leaves `pending_reports` and is held from the pass that files it; a gate held again is held from the pass that sees it so |
 
 B3 is extended with a task carrying a `review:` ref and a foreign project's `portal:` ref: neither
 reaches O.
@@ -1271,6 +1407,7 @@ G7, design-time notes:
   - A restater failure is a quarantine.
   - A validation refusal is a gated fallback.
   - An unfiled report is `degraded: filer`.
+  - A filed report behind a deferred gate is `degraded: filer` (B41).
   - A rejected line is counted under `inbox`.
   - A kept report with no line is named on the admin page.
 - `holds-owned-and-bounded`: the gate is owned by Leo through the L2 ladder; `deferred` appears only

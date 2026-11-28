@@ -2,18 +2,25 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from typing import Any
 
 import pytest
 
 from orchestrator.agents.token_pricing import FALLBACK_PRICE, TokenUsage, price_tokens
+from orchestrator.config import ModelsConfig
 from orchestrator.evals.metrics import (
+    DispatchRecord,
+    EndpointKind,
     EvalMetrics,
     compute_composite,
+    dispatched_models,
     is_false_green,
     is_null_work,
+    off_pin_roles,
 )
+from orchestrator.routing import DispatchedRoute, RoutingDecision
 
 
 class TestComputeComposite:
@@ -197,7 +204,7 @@ class TestResolveCostUsd:
                        cache rate and were priced at input_per_1m (WARNING)
       - cli          → NATIVE cloud endpoint, model unlisted (CLI cost is
                        trustworthy for the real Anthropic API)
-      - unpriced_proxy → a PROXIED endpoint (is_local_model) whose model is
+      - unpriced_proxy → a PROXIED endpoint (cli_cost_untrusted) whose model is
                        unlisted → loud WARNING + a DEFINED fallback, never the
                        raw CLI number (which is wrong for proxied endpoints).
     """
@@ -211,7 +218,7 @@ class TestResolveCostUsd:
             model='model-x',
             prices={'model-x': {'input_per_1m': 2.0, 'output_per_1m': 8.0}},
             cli_cost_usd=99.0,          # must be IGNORED when the model is priced
-            is_local_model=False,
+            cli_cost_untrusted=False,
         )
         assert source == 'price_table'
         assert cost == pytest.approx(6.0)
@@ -226,7 +233,7 @@ class TestResolveCostUsd:
             model='model-x',
             prices={'model-x': PriceEntry(input_per_1m=2.0, output_per_1m=8.0)},
             cli_cost_usd=99.0,
-            is_local_model=False,
+            cli_cost_untrusted=False,
         )
         assert source == 'price_table'
         assert cost == pytest.approx(6.0)
@@ -239,7 +246,7 @@ class TestResolveCostUsd:
             model='claude-sonnet-4',    # not in prices
             prices={},
             cli_cost_usd=3.5,
-            is_local_model=False,       # NATIVE cloud → CLI cost is trustworthy
+            cli_cost_untrusted=False,       # NATIVE cloud → CLI cost is trustworthy
         )
         assert source == 'cli'
         assert cost == pytest.approx(3.5)
@@ -253,7 +260,7 @@ class TestResolveCostUsd:
                 model='local-llama-70b',    # not in prices
                 prices={},
                 cli_cost_usd=0.0,           # raw CLI cost is WRONG for proxied
-                is_local_model=True,        # PROXIED endpoint (ANTHROPIC_BASE_URL)
+                cli_cost_untrusted=True,        # PROXIED endpoint (ANTHROPIC_BASE_URL)
             )
 
         assert source == 'unpriced_proxy'
@@ -276,7 +283,7 @@ class TestResolveCostUsd:
             model='model-x',
             prices={'model-x': {'input_per_1m': 2.0, 'output_per_1m': 8.0}},
             cli_cost_usd=99.0,
-            is_local_model=True,        # proxied — but priced → price_table wins
+            cli_cost_untrusted=True,        # proxied — but priced → price_table wins
         )
         assert source == 'price_table'
         assert cost == pytest.approx(6.0)
@@ -303,7 +310,7 @@ class TestResolveCostUsd:
             model='glm-5.3',
             prices={'glm-5.3': self._GLM_RATES},
             cli_cost_usd=99.0,
-            is_local_model=True,
+            cli_cost_untrusted=True,
         )
         assert (cost, source) == (pytest.approx(0.43232032), 'price_table')
 
@@ -317,7 +324,7 @@ class TestResolveCostUsd:
                 model='mimo-pro',
                 prices={'mimo-pro': {'input_per_1m': 1.0, 'output_per_1m': 4.0}},
                 cli_cost_usd=0.0,
-                is_local_model=True,
+                cli_cost_untrusted=True,
             )
 
         assert source == 'price_table_no_cache_rate'
@@ -337,7 +344,7 @@ class TestResolveCostUsd:
                 model='mimo-pro',
                 prices={'mimo-pro': {'input_per_1m': 1.0, 'output_per_1m': 4.0}},
                 cli_cost_usd=0.0,
-                is_local_model=True,
+                cli_cost_untrusted=True,
             )
 
         assert source == 'price_table'
@@ -351,7 +358,7 @@ class TestResolveCostUsd:
             model='local-llama-70b',
             prices={},
             cli_cost_usd=0.0,
-            is_local_model=True,
+            cli_cost_untrusted=True,
         )
 
         assert source == 'unpriced_proxy'
@@ -447,6 +454,19 @@ class TestIsProxiedEndpoint:
         from orchestrator.evals import metrics, runner
 
         assert runner.is_proxied_endpoint is metrics.is_proxied_endpoint
+
+
+class TestEndpointKindAndCostTrustPersistence:
+    def test_the_endpoint_kind_survives_a_json_round_trip_as_the_member(self):
+        m = EvalMetrics(endpoint_kind=EndpointKind.VENDOR_CLOUD)
+        persisted = json.loads(json.dumps(m.to_dict()))
+        assert persisted['endpoint_kind'] == 'vendor_cloud'
+        assert EvalMetrics.from_dict(persisted).endpoint_kind is EndpointKind.VENDOR_CLOUD
+
+    def test_an_empty_record_has_no_endpoint_kind_and_trusts_the_cli_cost(self):
+        m = EvalMetrics.from_dict({})
+        assert m.endpoint_kind is None
+        assert m.cli_cost_untrusted is False
 
 
 # ---------------------------------------------------------------------------
@@ -627,3 +647,155 @@ class TestBlendComposite:
         assert blend_composite(
             0.9, 1.0, 1.0, tests_pass=None, plan_only=True, no_plan=False,
         ) == pytest.approx(0.94, abs=1e-4)
+
+
+# ---------------------------------------------------------------------------
+# Task 8499: the persisted per-role dispatch record and the off-pin accessor.
+# ---------------------------------------------------------------------------
+
+_SEATED_SONNET = ModelsConfig(implementer='sonnet', judge='sonnet')
+_CAPACITY_EXHAUSTED = 'config:model-capacity-exhausted'
+
+
+def _dispatched(
+    role: str, model: str, source_layer: str, rule_id: str | None, served: str | None,
+    *, rejected: tuple[str, ...] = (),
+) -> DispatchedRoute:
+    decision = RoutingDecision(
+        model=model, effort='high', budget_usd=5.0, max_turns=80,
+        source_layer=source_layer, rule_id=rule_id, rejected=rejected,
+    )
+    return DispatchedRoute(role, decision, served)
+
+
+def _record(
+    model: str, served: str | None, source_layer: str, rule_id: str | None,
+    *, configured_model: str | None, rejected: list[str] | None = None,
+) -> DispatchRecord:
+    return DispatchRecord(
+        model=model, served_model_id=served, source_layer=source_layer, rule_id=rule_id,
+        configured_model=configured_model, rejected=rejected or [],
+    )
+
+
+class TestDispatchedModels:
+    def test_each_role_keeps_its_distinct_records_in_first_dispatch_order(self):
+        sonnet = _dispatched('implementer', 'sonnet', 'config', 'large-plan-steps', 'claude-sonnet-5-5')
+        routes = [
+            sonnet,
+            sonnet,
+            _dispatched('judge', 'sonnet', 'config', None, 'claude-sonnet-5-5'),
+            sonnet,
+            _dispatched('implementer', 'opus', 'policy_rule', 'retry-tier-up', 'claude-opus-5-5'),
+        ]
+
+        assert dispatched_models(routes, _SEATED_SONNET) == {
+            'implementer': [
+                _record(
+                    'sonnet', 'claude-sonnet-5-5', 'config', 'large-plan-steps',
+                    configured_model='sonnet',
+                ),
+                _record(
+                    'opus', 'claude-opus-5-5', 'policy_rule', 'retry-tier-up',
+                    configured_model='sonnet',
+                ),
+            ],
+            'judge': [_record('sonnet', 'claude-sonnet-5-5', 'config', None, configured_model='sonnet')],
+        }
+
+    def test_no_routes_is_an_empty_mapping(self):
+        assert dispatched_models([], _SEATED_SONNET) == {}
+
+    def test_a_decision_rejection_persists_as_a_list(self):
+        routes = [
+            _dispatched('implementer', 'opus', 'role_default', None, None, rejected=(_CAPACITY_EXHAUSTED,)),
+        ]
+
+        [record] = dispatched_models(routes, _SEATED_SONNET)['implementer']
+
+        assert record['rejected'] == [_CAPACITY_EXHAUSTED]
+
+    def test_configured_model_is_read_from_the_role_seat(self):
+        routes = [
+            _dispatched('reviewer_comprehensive', 'haiku', 'config', None, None),
+            _dispatched('resettled_adjudicator', 'opus', 'role_default', None, None),
+        ]
+
+        dispatched = dispatched_models(routes, ModelsConfig(reviewer='haiku'))
+
+        assert dispatched['reviewer_comprehensive'][0]['configured_model'] == 'haiku'
+        assert dispatched['resettled_adjudicator'][0]['configured_model'] is None
+
+    def test_off_pin_roles_reads_none_as_not_recorded(self):
+        assert off_pin_roles(None) is None
+
+    def test_off_pin_roles_of_an_empty_mapping_is_empty(self):
+        assert off_pin_roles({}) == []
+
+    @pytest.mark.parametrize(
+        ('source_layer', 'rejected'),
+        [
+            ('policy_rule', []),
+            ('metadata_override', []),
+            ('role_default', [_CAPACITY_EXHAUSTED]),
+        ],
+    )
+    def test_a_seated_role_that_ran_another_model_is_off_pin(
+        self, source_layer: str, rejected: list[str],
+    ):
+        dispatched = {
+            'implementer': [
+                _record('sonnet', 'claude-sonnet-5-5', 'config', None, configured_model='sonnet'),
+                _record(
+                    'opus', 'claude-opus-5-5', source_layer, None,
+                    configured_model='sonnet', rejected=rejected,
+                ),
+            ],
+            'judge': [_record('sonnet', 'claude-sonnet-5-5', 'config', None, configured_model='sonnet')],
+        }
+
+        assert off_pin_roles(dispatched) == ['implementer']
+
+    def test_a_role_without_a_seat_is_never_off_pin(self):
+        dispatched = {
+            'implementer': [_record('sonnet', None, 'config', None, configured_model='sonnet')],
+            'resettled_adjudicator': [_record('opus', None, 'role_default', None, configured_model=None)],
+        }
+
+        assert off_pin_roles(dispatched) == []
+
+    def test_running_the_seated_model_is_on_pin_whatever_the_layer(self):
+        dispatched = {
+            'implementer': [_record('sonnet', None, 'metadata_override', None, configured_model='sonnet')],
+        }
+
+        assert off_pin_roles(dispatched) == []
+
+    def test_several_off_pin_roles_come_back_sorted(self):
+        dispatched = {
+            'implementer': [_record('opus', None, 'role_default', None, configured_model='sonnet')],
+            'architect': [_record('opus', None, 'config', None, configured_model='opus')],
+            'debugger': [_record('opus', None, 'policy_rule', 'large-plan-steps', configured_model='sonnet')],
+        }
+
+        assert off_pin_roles(dispatched) == ['debugger', 'implementer']
+
+    def test_a_legacy_cell_reads_back_as_not_recorded(self):
+        assert EvalMetrics.from_dict({}).dispatched_models is None
+
+    def test_dispatched_models_survive_a_json_round_trip(self):
+        m = EvalMetrics(dispatched_models={
+            'implementer': [
+                _record(
+                    'sonnet', 'claude-sonnet-5-5', 'config', 'large-plan-steps',
+                    configured_model='sonnet',
+                ),
+                _record(
+                    'opus', None, 'role_default', None,
+                    configured_model='sonnet', rejected=[_CAPACITY_EXHAUSTED],
+                ),
+            ],
+            'judge': [_record('sonnet', None, 'config', None, configured_model='sonnet')],
+        })
+
+        assert EvalMetrics.from_dict(json.loads(json.dumps(m.to_dict()))) == m

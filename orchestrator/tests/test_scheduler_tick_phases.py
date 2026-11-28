@@ -9,6 +9,7 @@ suite that exercises full ticks end-to-end.
 
 import dataclasses
 import inspect
+import logging
 from datetime import UTC, datetime, timedelta
 from typing import cast
 from unittest.mock import AsyncMock
@@ -345,8 +346,22 @@ class TestPolicySelectionPrepPhases:
         assert any(str(t.get('id')) == 'A' for t in ctx.candidates)
         assert 'A' in ctx.candidate_signals
 
+    @staticmethod
+    def _starvation_ctx(**overrides) -> TickContext:
+        task = {'id': 'A', 'status': 'pending', 'dependencies': []}
+        fields = {
+            'tasks': [task],
+            'status_map': {'A': 'pending'},
+            'tasks_by_id': {'A': task},
+            'candidates': [task],
+            'tasks_read_at': datetime(2026, 11, 25, tzinfo=UTC),
+        }
+        return TickContext(**(fields | overrides))
+
     @pytest.mark.asyncio
-    async def test_phase_starvation_scans_candidates(self, scheduler: Scheduler):
+    async def test_phase_starvation_scans_candidates(
+        self, scheduler: Scheduler, caplog: pytest.LogCaptureFixture
+    ):
         calls: list[str] = []
 
         async def _spy(task_id, **kwargs):
@@ -355,17 +370,35 @@ class TestPolicySelectionPrepPhases:
         scheduler._callbacks = dataclasses.replace(
             scheduler._callbacks, on_starvation_warn=_spy
         )
-        task = {'id': 'A', 'status': 'pending', 'dependencies': []}
-        ctx = TickContext(
-            tasks=[task],
-            status_map={'A': 'pending'},
-            tasks_by_id={'A': task},
-            candidates=[task],
-        )
 
-        result = await scheduler._phase_starvation(ctx)
+        with caplog.at_level(logging.WARNING, logger='orchestrator.scheduler'):
+            result = await scheduler._phase_starvation(self._starvation_ctx())
 
         assert result is _CONTINUE
+        assert not [
+            r for r in caplog.records
+            if 'Starvation watchdog pass raised' in r.getMessage()
+        ]
+
+    @pytest.mark.asyncio
+    async def test_phase_starvation_without_tasks_read_at_logs_the_invariant(
+        self, scheduler: Scheduler, caplog: pytest.LogCaptureFixture
+    ):
+        with caplog.at_level(logging.WARNING, logger='orchestrator.scheduler'):
+            result = await scheduler._phase_starvation(
+                self._starvation_ctx(tasks_read_at=None)
+            )
+
+        assert result is _CONTINUE
+        raised = [
+            r for r in caplog.records
+            if 'Starvation watchdog pass raised' in r.getMessage()
+        ]
+        assert len(raised) == 1
+        exc_info = raised[0].exc_info
+        assert exc_info is not None
+        assert isinstance(exc_info[1], ValueError)
+        assert 'tasks_read_at is unset' in str(exc_info[1])
 
     @pytest.mark.asyncio
     async def test_phase_reserve_now_installs_parks_and_clears_flag(self, tmp_path):

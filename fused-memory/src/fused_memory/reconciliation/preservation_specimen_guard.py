@@ -17,6 +17,11 @@ were declined and cancelled by hand.  A twin specimen was not so lucky — it
 stopped being one when its pinning escalation lost open status in an
 orphan-reaper cascade.  Task 4223's record holds the dates, ids and counts.
 
+TWO LAYERS, TWO MODULES.  This module filters Stage 1's flags.  The
+``submit_task`` layer, ``middleware/preserved_specimen_gate_guard.py`` (task
+5456), refuses the reset gate itself and reuses :func:`corroborate_preservation`
+for its verdict.
+
 WHY A SUPPRESSION LIST DID NOT FIX IT.  A ``stage1_flag_suppression`` record
 for task 3105 already existed, and was later WIDENED to blanket by removing its
 ``flag_types`` key.  Recurrence continued anyway, for two independent reasons
@@ -69,7 +74,8 @@ extractor), ``shared.task_statuses`` (the closed status vocabulary),
 type-only ``models.reconciliation`` (the journal run shape) and,
 optionally, ``escalation.dedupe.file_or_fold_l1``.  It reaches
 nothing in ``stages/``, ``middleware/`` or ``prompts/``; the consolidator
-calls in, passing the journal its persistence check reads.  It performs detection only — it drops flags, never writes tasks or
+(passing the journal its persistence check reads) and the ``submit_task``
+layer call in.  It performs detection only — it drops flags, never writes tasks or
 memories.
 
 WHAT "DISTINCTIVE" MEANS HERE, AND WHY IT IS CHECKED.  Both token families are
@@ -102,9 +108,10 @@ from fused_memory.reconciliation.standing_decision_constants import (
     MEM0_KIND_INVESTIGATION_OUTCOME,
 )
 
-# The scroll-row text reader, IMPORTED rather than re-spelled: it owns the
-# canonical raw-payload key fallback through ``_mem0_content``, and a second
-# copy would be one more place for the two to drift (INV-5).
+# The scroll-row text reader, IMPORTED rather than re-spelled: it reads the
+# canonical raw-payload key fallback through
+# ``utils/mem0_content_keys.py::mem0_payload_text``, and a second copy would be
+# one more place for the two to drift (INV-5).
 from fused_memory.services.memory_service import metadata_row_text
 
 if TYPE_CHECKING:
@@ -135,9 +142,11 @@ __all__ = [
     'UNRESOLVED_CORROBORATION_SUBJECT',
     'UNRESOLVED_TASK_IDS_STAT',
     'GRAPHITI_TASK_ENTITY_TEMPLATE',
+    'PreservationCorroboration',
     'PreservationSuppressionResult',
     'RunHistory',
     'cites_preservation',
+    'corroborate_preservation',
     'filter_preservation_specimen_flags',
     'flag_asserts_stranded',
     'maybe_escalate_preservation_suppression_storm',
@@ -257,7 +266,7 @@ PRESERVATION_SUPPRESSION_STORM_THRESHOLD_PER_CYCLE: int = 5
 #: Wall-clock ceiling on ONE cycle's corroboration, in seconds.
 #:
 #: The guard's cost is per-CANDIDATE, not per-cycle (see
-#: :func:`_corroborate_preservation`'s cost note): each genuinely stranded task
+#: :func:`corroborate_preservation`'s cost note): each genuinely stranded task
 #: with no preservation record costs two semantic Graphiti searches, and the
 #: candidate population peaks during a fleet-wide stall — the cycle where Stage
 #: 1 finishing promptly matters most.  Without a ceiling the guard's
@@ -558,9 +567,13 @@ def preservation_mem0_filters(task_id: str) -> dict[str, Any]:
     makes a retrieved row a RECORDED not-actionable adjudication rather than
     any passing mention of the task.
 
-    The one source of this filter: :func:`_corroborate_preservation` queries
+    The one source of this filter: :func:`corroborate_preservation` queries
     it, and Stage 1's ``## Preserved-Specimen Corroboration`` directive renders
     it as the call the agent should run.  A fresh dict on every call.
+
+    Channel 1's recall rests on writers stamping ``metadata.task_id``; the
+    schema they are taught is
+    ``reconciliation/recon_self_model.py::render_investigation_outcome_section``.
 
     Pure, sync, no I/O.
     """
@@ -699,7 +712,7 @@ def _graphiti_citation(entity: Any) -> str | None:
 
 
 @dataclass(frozen=True)
-class _Corroboration:
+class PreservationCorroboration:
     """One task's corroboration verdict.
 
     - ``citation`` — the citing ref, or ``None`` when no channel produced one.
@@ -716,9 +729,9 @@ class _Corroboration:
     degraded: bool
 
 
-async def _corroborate_preservation(
+async def corroborate_preservation(
     memory_service: Any, project_id: str, task_id: str, *, log: logging.Logger,
-) -> _Corroboration:
+) -> PreservationCorroboration:
     """Corroborate *task_id* as a preserved specimen across both channels.
 
     Two channels, OR'd, cheapest-first.
@@ -796,7 +809,7 @@ async def _corroborate_preservation(
     else:
         citation = _first_citation(rows, metadata_row_text, 'id')
         if citation is not None:
-            return _Corroboration(citation=citation, degraded=False)
+            return PreservationCorroboration(citation=citation, degraded=False)
 
     try:
         entity = await memory_service.get_entity(
@@ -810,7 +823,7 @@ async def _corroborate_preservation(
             'task %s in project %s — verdict unresolved, flag kept',
             task_id, project_id, exc_info=True,
         )
-        return _Corroboration(citation=None, degraded=True)
+        return PreservationCorroboration(citation=None, degraded=True)
 
     if _is_degraded_entity_result(entity):
         log.warning(
@@ -818,7 +831,7 @@ async def _corroborate_preservation(
             'task %s in project %s — verdict unresolved, flag kept',
             task_id, project_id,
         )
-        return _Corroboration(citation=None, degraded=True)
+        return PreservationCorroboration(citation=None, degraded=True)
 
     if not _entity_is_scoped_to_task(entity, task_id):
         # A resolved NEGATIVE, not a degraded read: the lookup answered, and
@@ -832,13 +845,13 @@ async def _corroborate_preservation(
             'flag kept',
             GRAPHITI_TASK_ENTITY_TEMPLATE.format(task_id=task_id), task_id, project_id,
         )
-        return _Corroboration(citation=None, degraded=degraded)
+        return PreservationCorroboration(citation=None, degraded=degraded)
 
-    return _Corroboration(citation=_graphiti_citation(entity), degraded=degraded)
+    return PreservationCorroboration(citation=_graphiti_citation(entity), degraded=degraded)
 
 
 def _component_citations(
-    task_ids: tuple[str, ...], verdicts: dict[str, _Corroboration],
+    task_ids: tuple[str, ...], verdicts: dict[str, PreservationCorroboration],
 ) -> dict[str, str]:
     """``{component: citation}`` for each of *task_ids* that corroborated, in order.
 
@@ -872,7 +885,7 @@ async def filter_preservation_specimen_flags(
        what keeps a preserved task's UNRELATED findings reaching Stage 2 — the
        guard drops the adjudicated class, not the task.
     2. Each candidate is corroborated ONCE by
-       :func:`_corroborate_preservation`, positive and negative verdicts alike,
+       :func:`corroborate_preservation`, positive and negative verdicts alike,
        so a task appearing on N flags costs one corroboration pass.
     3. A stranded flag is dropped, and its citations recorded, only when EVERY
        component of its task_id corroborated; one where only some did is kept
@@ -932,7 +945,7 @@ async def filter_preservation_specimen_flags(
             unresolved_task_ids=(), candidate_task_ids=(),
         )
 
-    verdicts: dict[str, _Corroboration] = {}
+    verdicts: dict[str, PreservationCorroboration] = {}
     unresolved: list[str] = []
     loop_clock = asyncio.get_running_loop()
     deadline = loop_clock.time() + budget_seconds
@@ -953,11 +966,11 @@ async def filter_preservation_specimen_flags(
             break
         try:
             # The per-call cap is the REMAINING budget, so one hung backend read
-            # cannot outlast the cycle's ceiling on its own; _corroborate_
-            # preservation re-raises CancelledError, which is what lets wait_for
-            # convert the cancellation into the TimeoutError caught here.
+            # cannot outlast the cycle's ceiling on its own; corroborate_preservation
+            # re-raises CancelledError, which is what lets wait_for convert the
+            # cancellation into the TimeoutError caught here.
             verdict = await asyncio.wait_for(
-                _corroborate_preservation(memory_service, project_id, task_id, log=log),
+                corroborate_preservation(memory_service, project_id, task_id, log=log),
                 timeout=remaining,
             )
         except TimeoutError:
@@ -966,7 +979,7 @@ async def filter_preservation_specimen_flags(
                 'task %s in project %s — verdict unresolved, flag kept',
                 remaining, task_id, project_id,
             )
-            verdict = _Corroboration(citation=None, degraded=True)
+            verdict = PreservationCorroboration(citation=None, degraded=True)
         verdicts[task_id] = verdict
         if verdict.citation is None and verdict.degraded:
             unresolved.append(task_id)

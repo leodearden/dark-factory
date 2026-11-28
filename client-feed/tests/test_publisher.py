@@ -1,5 +1,6 @@
 """One publisher pass: every source read as its own unit, the events built in a fixed order, a heartbeat last."""
 
+import json
 import logging
 import os
 import shutil
@@ -11,7 +12,16 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
-from _archive_files import junit_xml, passed, red, write_junit, write_plan, write_summary
+import yaml
+from _archive_files import (
+    junit_xml,
+    passed,
+    red,
+    task_dir,
+    write_junit,
+    write_plan,
+    write_summary,
+)
 from _git_repo import Repo, make_repo, path_with_git_answering, path_with_git_killed_on
 from _in_dir import write_engagement
 from _stores import EscalationQueueDir, RunsDb, TasksDb
@@ -19,6 +29,10 @@ from shared.project_layout import runs_db, tasks_db
 
 from client_feed.contract import (
     BranchSnapshot,
+    CriteriaDeclared,
+    CriteriaResults,
+    CriterionOutcome,
+    CriterionResult,
     Degradation,
     FactoryState,
     FeedLine,
@@ -26,6 +40,7 @@ from client_feed.contract import (
     MergeLanded,
     PrdUpserted,
     ReviewCounts,
+    RunKind,
     SchedulerState,
     Source,
     TaskPhase,
@@ -37,6 +52,13 @@ from client_feed.contract import (
     VerifyTestResults,
     WaitingOn,
     parse_state,
+)
+from client_feed.criteria import (
+    CRITERIA_RELPATH,
+    STAGING_FILENAME,
+    CriteriaRun,
+    collection_map_path,
+    write_staging,
 )
 from client_feed.feed_io import CURSOR_FILENAME, Cursor, OutDir, read_feed_lines
 from client_feed.fold import fold
@@ -766,4 +788,245 @@ def test_publish_rereads_every_task_on_its_first_pass_and_then_every_rescan_cade
     passes_before = sum(isinstance(line, Heartbeat) for line in lines[:late_at])
     assert passes_before == TASKS_RESCAN_PASSES
     assert stored_cursor(project).tasks_updated_at == UPDATED_9
+    assert_valid(project)
+
+
+# acceptance criteria
+
+CRITERION_IDS = ('C-1', 'C-2', 'C-3')
+STAGED = CriteriaRun(
+    commit='f' * 40,
+    run_at=at(40),
+    results=(CriterionResult(id='C-1', outcome=CriterionOutcome.FAILED, tests=('tests.e2e::t',)),),
+)
+
+
+def _declare_criteria(project: Project, text: str | None = None) -> None:
+    """acceptance/criteria.yaml declaring C-1..C-3, committed on main."""
+    declared = {
+        'format': 1,
+        'criteria': [
+            {
+                'id': criterion_id,
+                'prd': X_PRD,
+                'capability': 'Widget',
+                'statement': f'The widget meets {criterion_id}.',
+                'kind': 'success',
+            }
+            for criterion_id in CRITERION_IDS
+        ],
+    }
+    project.repo.write(CRITERIA_RELPATH, yaml.safe_dump(declared) if text is None else text)
+    project.repo.commit('Declare the acceptance criteria', when=at(19))
+
+
+def _bind(junit: Path) -> None:
+    """A defect-tests collection map beside `junit` binding test_a to C-1 and test_b to C-2."""
+    collection_map = {
+        'tests/test_a.py::test_a': {'defects': [], 'criterion': 'C-1'},
+        'tests/test_a.py::test_b': {'defects': [], 'criterion': 'C-2'},
+    }
+    collection_map_path(junit).write_text(json.dumps(collection_map))
+
+
+def _map_beside_the_archived_junit(project: Project) -> None:
+    (junit,) = task_dir(project.root).glob('*.junit-*.xml.gz')
+    _bind(junit)
+
+
+def _task_9_verify_run_with_a_map(project: Project) -> None:
+    """Task 9's verify window [at(40), at(50)]: test_a red and test_b green, with a map beside its junit."""
+    write_plan(project.root, at(41), task_id=9)
+    write_summary(project.root, at(45), commands=RED_TEST, task_id=9)
+    junit = write_junit(
+        project.root,
+        at(45),
+        junit_xml(red('test_a', 'failure', 'AssertionError'), passed('test_b')),
+        task_id=9,
+    )
+    _bind(junit)
+    project.runs.emit('phase_enter', at=at(40), task_id=9, phase='verify')
+    project.runs.emit('phase_exit', at=at(50), task_id=9, phase='verify')
+
+
+TASK_9_RESULTS = (
+    CriterionResult(id='C-1', outcome=CriterionOutcome.FAILED, tests=('tests.test_a::test_a',)),
+    CriterionResult(id='C-2', outcome=CriterionOutcome.PASSED, tests=('tests.test_a::test_b',)),
+    CriterionResult(id='C-3', outcome=CriterionOutcome.NOT_RUN, tests=()),
+)
+
+
+def _criteria_events(project: Project) -> list[CriteriaDeclared | CriteriaResults]:
+    return [
+        line for line in feed(project) if isinstance(line, CriteriaDeclared | CriteriaResults)
+    ]
+
+
+def _results_of(project: Project, kind: RunKind) -> list[CriteriaResults]:
+    return [
+        line
+        for line in feed(project)
+        if isinstance(line, CriteriaResults) and line.run_kind is kind
+    ]
+
+
+def test_b20_a_pass_publishes_the_declared_criteria_and_the_verify_runs_outcomes(
+    project: Project,
+) -> None:
+    _declare_criteria(project)
+    _map_beside_the_archived_junit(project)
+
+    run_pass(project.policy, project.open(), now=NOW)
+
+    lines = feed(project)
+    assert [line.type for line in lines[-4:]] == [
+        'prd_upserted',
+        'criteria_declared',
+        'criteria_results',
+        'heartbeat',
+    ]
+    declared, results = lines[-3], lines[-2]
+    assert isinstance(declared, CriteriaDeclared)
+    assert [criterion.id for criterion in declared.criteria] == list(CRITERION_IDS)
+    assert isinstance(results, CriteriaResults)
+    assert (results.run_kind, results.at, results.run_at) == (RunKind.VERIFY, at(10), at(10))
+    assert results.results == (
+        CriterionResult(id='C-1', outcome=CriterionOutcome.PASSED, tests=('tests.test_a::test_a',)),
+        CriterionResult(id='C-2', outcome=CriterionOutcome.FAILED, tests=('tests.test_a::test_b',)),
+        CriterionResult(id='C-3', outcome=CriterionOutcome.NOT_RUN, tests=()),
+    )
+    assert_valid(project)
+
+
+def test_a_second_pass_appends_no_criteria_event_again(project: Project) -> None:
+    _declare_criteria(project)
+    _map_beside_the_archived_junit(project)
+    out = project.open()
+    run_pass(project.policy, out, now=NOW)
+    first = len(feed(project))
+
+    run_pass(project.policy, out, now=NOW)
+
+    assert [line.type for line in feed(project)[first:]] == ['heartbeat']
+
+
+def test_the_criteria_join_reads_every_case_whatever_the_case_cap(project: Project) -> None:
+    _declare_criteria(project)
+    _map_beside_the_archived_junit(project)
+    capped = project.policy.model_copy(update={'max_cases_per_run': 1})
+
+    run_pass(capped, project.open(), now=NOW)
+
+    (test_results,) = [line for line in feed(project) if isinstance(line, VerifyTestResults)]
+    assert [case.id for case in test_results.cases] == ['tests.test_a::test_b']
+    (verify,) = _results_of(project, RunKind.VERIFY)
+    assert verify.results[0].outcome is CriterionOutcome.PASSED
+
+
+def test_a_run_whose_junit_has_no_map_records_no_criteria_results(project: Project) -> None:
+    _declare_criteria(project)
+
+    run_pass(project.policy, project.open(), now=NOW)
+
+    assert [event.type for event in _criteria_events(project)] == ['criteria_declared']
+
+
+def test_a_staging_file_is_published_once_as_the_staging_results(project: Project) -> None:
+    _declare_criteria(project)
+    write_staging(project.out_dir, STAGED)
+    out = project.open()
+
+    run_pass(project.policy, out, now=NOW)
+    run_pass(project.policy, out, now=NOW)
+
+    (staging,) = _results_of(project, RunKind.STAGING)
+    assert (staging.commit, staging.run_at, staging.results) == (
+        STAGED.commit,
+        STAGED.run_at,
+        STAGED.results,
+    )
+    assert_valid(project)
+
+
+def test_an_invalid_criteria_file_is_named_criteria_and_every_other_source_still_publishes(
+    project: Project,
+) -> None:
+    _declare_criteria(project, text='format: 2\ncriteria: []\n')
+    _map_beside_the_archived_junit(project)
+
+    report = run_pass(project.policy, project.open(), now=NOW)
+
+    assert [degradation.source for degradation in report.degraded] == [Source.CRITERIA]
+    assert CRITERIA_RELPATH in report.degraded[0].reason
+    assert last_heartbeat(project).degraded == report.degraded
+    assert _criteria_events(project) == []
+    assert [line.type for line in feed(project)] == FIRST_PASS_TYPES
+
+
+def test_a_malformed_staging_file_is_named_criteria_and_the_verify_criteria_still_publish(
+    project: Project,
+) -> None:
+    _declare_criteria(project)
+    _map_beside_the_archived_junit(project)
+    (project.out_dir / STAGING_FILENAME).write_text('not json')
+
+    report = run_pass(project.policy, project.open(), now=NOW)
+
+    assert [degradation.source for degradation in report.degraded] == [Source.CRITERIA]
+    assert STAGING_FILENAME in report.degraded[0].reason
+    assert [event.type for event in _criteria_events(project)] == [
+        'criteria_declared',
+        'criteria_results',
+    ]
+    assert _results_of(project, RunKind.STAGING) == []
+
+
+def test_of_two_tested_runs_in_one_pass_only_the_newest_is_joined(project: Project) -> None:
+    _declare_criteria(project)
+    _map_beside_the_archived_junit(project)
+    _task_9_verify_run_with_a_map(project)
+
+    run_pass(project.policy, project.open(), now=NOW)
+
+    (verify,) = _results_of(project, RunKind.VERIFY)
+    assert (verify.run_at, verify.results) == (at(50), TASK_9_RESULTS)
+    assert_valid(project)
+
+
+def test_a_malformed_archived_map_is_named_criteria_and_the_declaration_still_publishes(
+    project: Project,
+) -> None:
+    _declare_criteria(project)
+    (junit,) = task_dir(project.root).glob('*.junit-*.xml.gz')
+    collection_map_path(junit).write_text('[]')
+
+    report = run_pass(project.policy, project.open(), now=NOW)
+
+    assert [degradation.source for degradation in report.degraded] == [Source.CRITERIA]
+    assert 'invalid_map' in report.degraded[0].reason
+    assert [event.type for event in _criteria_events(project)] == ['criteria_declared']
+    assert_valid(project)
+
+
+def test_a_new_verify_run_joins_the_states_declaration_while_the_criteria_file_is_invalid(
+    project: Project,
+) -> None:
+    _declare_criteria(project)
+    _map_beside_the_archived_junit(project)
+    out = project.open()
+    run_pass(project.policy, out, now=NOW)
+    first = len(feed(project))
+    project.repo.write(CRITERIA_RELPATH, 'format: 2\ncriteria: []\n')
+    project.repo.commit('Break the acceptance criteria', when=at(39))
+    _task_9_verify_run_with_a_map(project)
+
+    report = run_pass(project.policy, out, now=NOW)
+
+    assert [degradation.source for degradation in report.degraded] == [Source.CRITERIA]
+    assert CRITERIA_RELPATH in report.degraded[0].reason
+    (verify,) = [
+        line for line in feed(project)[first:] if isinstance(line, CriteriaDeclared | CriteriaResults)
+    ]
+    assert isinstance(verify, CriteriaResults)
+    assert (verify.run_kind, verify.run_at, verify.results) == (RunKind.VERIFY, at(50), TASK_9_RESULTS)
     assert_valid(project)

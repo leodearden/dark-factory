@@ -397,7 +397,7 @@ class TestSubagentDigest:
         _, subagent = self._tree(tmp_path)
         rendered = digest.build_digest(subagent)
         assert _frontmatter(rendered)['n_user_turns'] == 0
-        assert '## User Corrections' not in rendered
+        assert f"## {digest.SECTION_HEADINGS['user_turns']}" not in rendered
 
     def test_parent_digest_names_no_parent(self, tmp_path):
         parent, _ = self._tree(tmp_path)

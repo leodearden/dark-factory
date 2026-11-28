@@ -38,6 +38,9 @@ from fused_memory.embedder.endpoint_probe import (  # noqa: E402  # debt: task 1
 from fused_memory.maintenance.rebuild_summaries import (  # noqa: E402  # debt: ticket tkt_0RWT5KQG42DBD4GM4C51E2Y7NT
     RebuildResult,
 )
+from fused_memory.models.invocation_ledger import (  # noqa: E402  # debt: task 10130
+    invocations_ledger_path,
+)
 from fused_memory.reconciliation.audit_trail_rotation import (  # noqa: E402
     memory_service_archive,
 )
@@ -74,6 +77,7 @@ if TYPE_CHECKING:
     from fused_memory.reconciliation.journal import ReconciliationJournal
     from fused_memory.reconciliation.recon_ledger import ReconLedgerStore
     from fused_memory.reconciliation.sqlite_watchdog import SqliteWatchdog
+    from fused_memory.server.embedded_uvicorn import EmbeddedUvicornServer
     from fused_memory.server.topic_cluster_store import TopicClusterStore
     from fused_memory.services.consolidation_ops import MemoryUpdater
     from fused_memory.services.journal_growth_alarm import JournalGrowthAlarm
@@ -525,16 +529,6 @@ class _ASGIExceptionShield:
             return
 
 
-def configure_uvicorn_logging():
-    for logger_name in ['uvicorn', 'uvicorn.error', 'uvicorn.access']:
-        uv_logger = logging.getLogger(logger_name)
-        uv_logger.handlers.clear()
-        handler = logging.StreamHandler(sys.stderr)
-        handler.setFormatter(logging.Formatter(LOG_FORMAT, datefmt=DATE_FORMAT))
-        uv_logger.addHandler(handler)
-        uv_logger.propagate = False
-
-
 def _require_http_transport_for_reconciliation(config: Any) -> None:
     """Guard: raise if reconciliation is enabled but transport is not 'http'.
 
@@ -743,7 +737,7 @@ async def run_server():
     # The helper closes the CostStore if UsageGate construction fails, so the
     # open aiosqlite connection never leaks even though this runs before the
     # try/finally that wraps transport.serve().
-    curator_cost_store, curator_usage_gate = await _setup_curator_usage_gate(config)
+    invocations_store, curator_usage_gate = await _setup_curator_usage_gate(config)
 
     # Stage-2 LLM adjudicator for path-scope guard (task 1822): wired only in
     # multi-project mode when config.path_scope_adjudicator.enabled is True.
@@ -757,7 +751,7 @@ async def run_server():
         path_scope_adjudicator = PathScopeAdjudicator(
             config.path_scope_adjudicator,
             usage_gate=curator_usage_gate,
-            cost_store=curator_cost_store,
+            cost_store=invocations_store,
             cwd=Path(_primary_root) if _primary_root else None,
             scope_violation_escalator=scope_violation_escalator,
         )
@@ -791,7 +785,10 @@ async def run_server():
         from fused_memory.reconciliation.bulk_reset_guard import BulkResetGuard
         from fused_memory.reconciliation.event_buffer import EventBuffer
         from fused_memory.reconciliation.event_queue import EventQueue
-        from fused_memory.reconciliation.harness import ReconciliationHarness
+        from fused_memory.reconciliation.harness import (
+            ReconciliationHarness,
+            build_reconciliation_usage_gate,
+        )
         from fused_memory.reconciliation.journal import ReconciliationJournal
         from fused_memory.reconciliation.sqlite_watchdog import SqliteWatchdog
         from fused_memory.reconciliation.targeted import TargetedReconciler
@@ -887,11 +884,16 @@ async def run_server():
         # Wire event emission into memory_service
         memory_service.set_event_buffer(event_buffer)
 
+        # Built here because TargetedReconciler is constructed before the harness and both share it.
+        recon_usage_gate = build_reconciliation_usage_gate(config.reconciliation)
+
         # Targeted reconciler (needs memory_service + taskmaster + journal)
         targeted = None
         if taskmaster is not None and taskmaster.connected:
             targeted = TargetedReconciler(
                 memory_service, taskmaster, recon_journal, config, event_buffer,
+                cost_store=invocations_store,
+                usage_gate=recon_usage_gate,
             )
             # Wire the planned episode registry so _on_task_done can promote planned
             # episodes when tasks complete (otherwise the promotion code is dead code).
@@ -921,7 +923,7 @@ async def run_server():
             event_queue=event_queue,
             backlog_policy=backlog_policy,
             usage_gate=curator_usage_gate,
-            cost_store=curator_cost_store,
+            cost_store=invocations_store,
             ticket_store=ticket_store,
             bulk_reset_guard=bulk_reset_guard,
             prefix_registry=prefix_registry,
@@ -1000,6 +1002,8 @@ async def run_server():
             escalation_listener=_claim_listener(
                 systemd_listeners, config.reconciliation.escalation_port,
             ),
+            cost_store=invocations_store,
+            usage_gate=recon_usage_gate,
         )
         harness_loop_task = asyncio.create_task(reconciliation_harness.run_loop())
         logger.info('  Reconciliation: enabled (background loop started)')
@@ -1018,7 +1022,7 @@ async def run_server():
             taskmaster, None, event_buffer,
             config=config, escalator=curator_escalator,
             usage_gate=curator_usage_gate,
-            cost_store=curator_cost_store,
+            cost_store=invocations_store,
             ticket_store=ticket_store,
             prefix_registry=prefix_registry,
             scope_violation_escalator=scope_violation_escalator,
@@ -1134,6 +1138,7 @@ async def run_server():
         # unconditionally pre-initialized to None near the top of
         # run_server(), so it's always bound here — no locals() guard needed.
         recon_ledger=recon_ledger,
+        invocations_store=invocations_store,
     )
     if _checkpoint_targets:
         from fused_memory.services.journal_growth_alarm import JournalGrowthAlarm
@@ -1204,19 +1209,16 @@ async def run_server():
     logger.info(f'Starting MCP server with transport: {transport}')
 
     # recon_report_state already initialized above (PRD γ, task 1546 step-12)
-    server: Any | None = None  # primary uvicorn.Server
-    recon_server: Any | None = None  # uvicorn.Server for the 2nd port
     try:
         if transport == 'stdio':
             await mcp.run_stdio_async()
         elif transport == 'sse':
             await mcp.run_sse_async()
         elif transport == 'http':
-            import uvicorn
+            from fused_memory.server.embedded_uvicorn import EmbeddedUvicornServer
 
             display_host = 'localhost' if config.server.host == '0.0.0.0' else config.server.host
             logger.info(f'  MCP Endpoint: http://{display_host}:{config.server.port}/mcp/')  # mcp-url-sweep: allow display string in a startup log line, never fetched
-            configure_uvicorn_logging()
             starlette_app = mcp.streamable_http_app()
 
             # Return JSON (not plain-text) for 404s so that MCP SDK
@@ -1235,7 +1237,7 @@ async def run_server():
                 graceful_shutdown_timeout=config.server.graceful_shutdown_timeout,
                 keepalive_timeout=config.server.keepalive_timeout,
             )
-            server = uvicorn.Server(uv_config)
+            server = EmbeddedUvicornServer(uv_config)
             primary_socket = _claim_listener(systemd_listeners, config.server.port)
             if systemd_listeners:
                 logger.warning(
@@ -1264,14 +1266,12 @@ async def run_server():
                     task_interceptor=task_interceptor,
                     known_projects=_known_projects_map,
                 )
-            recon_server = uvicorn.Server(_pre_recon_uv_config)
-            recon_server.install_signal_handlers = lambda: None  # type: ignore[attr-defined]
+            recon_server = EmbeddedUvicornServer(_pre_recon_uv_config)
 
-            # Take ownership of SIGTERM/SIGINT before uvicorn's serve() can
-            # install its own handlers. We need to differentiate operator-stop
+            # EmbeddedUvicornServer leaves SIGTERM/SIGINT to
+            # _install_operator_stop_handler, which differentiates operator-stop
             # (clean exit 0, do not restart) from cascade-shutdown (exit 1, do
             # restart) — uvicorn's default handlers don't expose that distinction.
-            server.install_signal_handlers = lambda: None  # type: ignore[attr-defined]  # uvicorn stubs don't declare this as writable
             _install_operator_stop_handler(
                 _make_operator_stop_callback(server, recon_server),
             )
@@ -1297,18 +1297,6 @@ async def run_server():
             )
 
             _sd_notify('READY=1')
-            # Wrap both serve() coroutines in named tasks so that a failure in
-            # one (e.g. port-already-bound on the recon port) automatically
-            # cancels the other rather than leaving it running unmanaged.
-            # asyncio.gather() with bare coroutines wraps them in Tasks internally
-            # but does NOT cancel the sibling on first failure — the surviving
-            # Task would continue serving while the finally block runs, emitting
-            # "Task was destroyed but it is pending!" on loop teardown.
-            _primary_task = asyncio.create_task(
-                server.serve(sockets=[primary_socket] if primary_socket else None),
-                name='fused_memory_primary',
-            )
-            _recon_task = asyncio.create_task(recon_server.serve(), name='fused_memory_recon_report')
 
             # Signal the harness once the recon-report server is accepting connections.
             # Polls uvicorn's server.started flag (set inside serve() after startup()).
@@ -1324,16 +1312,11 @@ async def run_server():
 
                 asyncio.create_task(_watch_recon_server_ready(), name='recon_server_readiness_watcher')
 
-            try:
-                await asyncio.gather(_primary_task, _recon_task)
-            except BaseException:
-                # Cancel whichever task is still running to prevent orphaned tasks.
-                _primary_task.cancel()
-                _recon_task.cancel()
-                # Await with return_exceptions=True so CancelledErrors are collected
-                # as values rather than re-raised; the outer finally handles shutdown.
-                await asyncio.gather(_primary_task, _recon_task, return_exceptions=True)
-                raise
+            await _serve_primary_and_recon(
+                server,
+                recon_server,
+                primary_sockets=[primary_socket] if primary_socket else None,
+            )
         else:
             raise ValueError(f'Unsupported transport: {transport}')
     finally:
@@ -1348,17 +1331,6 @@ async def run_server():
         if topic_cluster_store is not None:
             with contextlib.suppress(BaseException):
                 topic_cluster_store.close()
-        # Symmetrically tear down both servers so that a failure in either
-        # (e.g. recon_server port-already-bound) doesn't leave the primary
-        # server serving while the rest of the app shuts down.
-        if server is not None:
-            server.should_exit = True
-            with contextlib.suppress(BaseException):
-                await server.shutdown()
-        if recon_server is not None:
-            recon_server.should_exit = True
-            with contextlib.suppress(BaseException):
-                await recon_server.shutdown()
         _stop_watchdog_thread()
         if janitor_task is not None:
             janitor_task.cancel()
@@ -1393,7 +1365,7 @@ async def run_server():
             event_queue=event_queue,
             sqlite_watchdog=sqlite_watchdog,
             taskmaster=taskmaster,
-            curator_cost_store=curator_cost_store,
+            invocations_store=invocations_store,
             curator_usage_gate=curator_usage_gate,
             recon_ledger=recon_ledger,
         )
@@ -1409,6 +1381,7 @@ def _collect_checkpoint_targets(
     memory_service,
     known_projects: dict[str, str] | None = None,
     recon_ledger=None,
+    invocations_store: CostStore | None = None,
 ) -> list[tuple[str, object]]:
     """Gather every live SQLite store that exposes a ``checkpoint`` method.
 
@@ -1445,6 +1418,8 @@ def _collect_checkpoint_targets(
     shadow = getattr(memory_service, 'overreach_shadow', None)
     if shadow is not None and hasattr(shadow, 'checkpoint'):
         targets.append(('overreach_shadow', shadow.checkpoint))
+    if invocations_store is not None and hasattr(invocations_store, 'checkpoint'):
+        targets.append(('invocations_ledger', invocations_store.checkpoint))
     if known_projects:
         for project_id, root in known_projects.items():
             targets.append((
@@ -2012,8 +1987,13 @@ async def _build_recon_ledger_store(data_dir: Path) -> ReconLedgerStore:
 
 
 def _resolve_curator_cost_store_path(config: FusedMemoryConfig) -> Path:
-    """Return the SQLite path for the curator CostStore, under :func:`resolve_data_dir`."""
-    return resolve_data_dir(config) / 'curator_events.db'
+    """The process's one invocations ledger, under :func:`resolve_data_dir`.
+
+    The curator family and recon (stages, judge, verify loop) write it through
+    the server's store; the operator script link_heal.py writes its link
+    adjudicator rows to the same file.
+    """
+    return invocations_ledger_path(resolve_data_dir(config))
 
 
 def _resolve_curator_escalator_state_path(config: FusedMemoryConfig) -> Path:
@@ -2086,9 +2066,11 @@ async def _setup_curator_usage_gate(
     run key the gate's account events and the curator's invocations share.
 
     Otherwise the CostStore is opened first (persistent aiosqlite connection).
-    If ``UsageGate.__init__`` or the success-path log subsequently raises for
-    any reason, both the gate (if constructed) and the open store are cleaned up
-    before re-raising — preventing a file-handle / WAL thread leak that would
+    The gate is built without it, stamped, and only then given the store through
+    ``UsageGate.attach_cost_store``, so the ``reserve_config`` row that attaching
+    records carries the run key. If ``UsageGate.__init__``, the attach or the
+    success-path log subsequently raises for any reason, both the gate (if
+    constructed) and the open store are cleaned up before re-raising — preventing a file-handle / WAL thread leak that would
     occur if the caller's ``finally:`` block never ran.
 
     **Cancellation hardening:** each cleanup await is wrapped in
@@ -2109,14 +2091,15 @@ async def _setup_curator_usage_gate(
     from shared.usage_gate import UsageGate
 
     db_path = _resolve_curator_cost_store_path(config)
-    curator_cost_store = CostStore(db_path)
-    await curator_cost_store.open()
-    logger.info(f'  Curator cost store: {db_path}')
+    invocations_store = CostStore(db_path)
+    await invocations_store.open()
+    logger.info(f'  Invocations ledger: {db_path}')
 
     curator_usage_gate: UsageGate | None = None
     try:
-        curator_usage_gate = UsageGate(config.usage_cap, cost_store=curator_cost_store)
+        curator_usage_gate = UsageGate(config.usage_cap)
         curator_usage_gate.run_id = run_id or _mint_curator_run_id()
+        curator_usage_gate.attach_cost_store(invocations_store)
         logger.info(
             f'  Curator usage gate: {curator_usage_gate.account_count} account(s) '
             f'from {config.usage_cap.accounts_file or "inline"}',
@@ -2128,12 +2111,12 @@ async def _setup_curator_usage_gate(
             except BaseException:
                 logger.exception('UsageGate shutdown failed during rollback')
         try:
-            await asyncio.shield(curator_cost_store.close())
+            await asyncio.shield(invocations_store.close())
         except BaseException:
             logger.exception('CostStore close failed during UsageGate init rollback')
         raise
 
-    return (curator_cost_store, curator_usage_gate)
+    return (invocations_store, curator_usage_gate)
 
 
 def _install_safe_tool_wrapper(mcp: Any) -> None:
@@ -2272,7 +2255,7 @@ def _build_uvicorn_config(
     graceful_shutdown_timeout: int,
     keepalive_timeout: int | None = None,
 ) -> Any:  # uvicorn.Config
-    """Construct a uvicorn.Config with a bounded graceful-shutdown wait.
+    """Construct a uvicorn.Config with a bounded graceful-shutdown wait that leaves process logging alone.
 
     Single tested seam for both uvicorn.Config construction sites (primary
     server and recon-report server) so timeout_graceful_shutdown is always
@@ -2281,21 +2264,23 @@ def _build_uvicorn_config(
     in-flight request hang server.shutdown() indefinitely and starve the
     downstream _graceful_shutdown cleanup and force-exit watchdog.
 
+    The config is built by embedded_uvicorn_config, so uvicorn's records
+    propagate to this module's logging.basicConfig handler.
+
     keepalive_timeout is optional: when omitted, uvicorn's own
     timeout_keep_alive default applies unchanged (matches the pre-existing
     recon-report site, which never set it).
     """
-    import uvicorn
+    from fused_memory.server.embedded_uvicorn import embedded_uvicorn_config
 
     kwargs: dict[str, Any] = {
         'host': host,
         'port': port,
-        'log_level': 'info',
         'timeout_graceful_shutdown': graceful_shutdown_timeout,
     }
     if keepalive_timeout is not None:
         kwargs['timeout_keep_alive'] = keepalive_timeout
-    return uvicorn.Config(app, **kwargs)
+    return embedded_uvicorn_config(app, **kwargs)
 
 
 def _claim_listener(listeners: dict[int, socket.socket], port: int) -> socket.socket | None:
@@ -2395,6 +2380,40 @@ def _build_recon_report_components(
     return state, mcp, uv_config
 
 
+async def _serve_primary_and_recon(
+    server: EmbeddedUvicornServer,
+    recon_server: EmbeddedUvicornServer,
+    *,
+    primary_sockets: list[socket.socket] | None,
+) -> None:
+    """Serve both servers until both stop; a failure in either cancels the other.
+
+    Each serve() runs in its own task, because a bare gather leaves the
+    survivor of a failure serving unmanaged. A serve() that returned has run
+    uvicorn's own shutdown, and a second one would log it all again, so only a
+    server whose serve() was cancelled or raised is shut down here. Contract
+    pinned by fused-memory/tests/test_operator_signal_handler.py::TestServePrimaryAndRecon.
+    """
+    serving = [
+        (server, asyncio.create_task(server.serve(sockets=primary_sockets), name='fused_memory_primary')),
+        (recon_server, asyncio.create_task(recon_server.serve(), name='fused_memory_recon_report')),
+    ]
+    tasks = [task for _, task in serving]
+    try:
+        await asyncio.gather(*tasks)
+    except BaseException:
+        for task in tasks:
+            task.cancel()
+        await asyncio.wait(tasks)
+        raise
+    finally:
+        for stopped_server, task in serving:
+            if not (task.done() and not task.cancelled() and task.exception() is None):
+                stopped_server.should_exit = True
+                with contextlib.suppress(BaseException):
+                    await stopped_server.shutdown()
+
+
 def _make_operator_stop_callback(
     *servers: Any,
     clock: Callable[[], float] = time.monotonic,
@@ -2406,7 +2425,7 @@ def _make_operator_stop_callback(
     arriving within ``repeat_window_secs`` of the FIRST signal is the same stop
     delivered twice and is ignored. A later signal also sets ``force_exit``,
     keeping uvicorn's deliberate-second-Ctrl-C escape hatch, which is otherwise
-    lost because ``install_signal_handlers`` is neutered. Contract pinned by
+    lost because EmbeddedUvicornServer disables uvicorn's signal capture. Contract pinned by
     fused-memory/tests/test_operator_signal_handler.py::TestOperatorStopCallbackForceExit.
     """
     first_signal_at: float | None = None
@@ -2446,9 +2465,10 @@ def _install_operator_stop_handler(on_operator_stop: Callable[[], None]) -> None
     Mirrors :func:`_register_drain_signal_handler`'s loop / signal.signal
     fallback pattern.
 
-    Must be called BEFORE ``uvicorn.Server.serve()`` and uvicorn's
-    ``install_signal_handlers`` must be neutered, otherwise uvicorn replaces
-    our handlers from inside ``serve()`` and we never observe SIGTERM.
+    The servers must be EmbeddedUvicornServer instances, which disable
+    uvicorn's signal capture: a plain ``uvicorn.Server.serve()`` replaces
+    these handlers for its lifetime and re-raises each caught signal when
+    it returns.
     """
     try:
         loop = asyncio.get_running_loop()
@@ -2524,7 +2544,7 @@ async def _graceful_shutdown(
     event_queue: EventQueue | None = None,
     sqlite_watchdog: SqliteWatchdog | None = None,
     taskmaster: Any = None,
-    curator_cost_store: CostStore | None = None,
+    invocations_store: CostStore | None = None,
     curator_usage_gate: UsageGate | None = None,
     recon_ledger: ReconLedgerStore | None = None,
 ) -> None:
@@ -2535,15 +2555,16 @@ async def _graceful_shutdown(
     2. Close task_interceptor (release curator's Qdrant client).
     3. Shutdown curator_usage_gate (cancel resume-probe + drain background
        cost-event tasks, so no write lands on a closed connection).
-    4. Close curator_cost_store (independent SQLite connection; slotted near
-       task_interceptor to keep curator-lifecycle cleanup together; only safe
-       after gate.shutdown() has drained all in-flight save_account_event tasks).
-    5. Cancel SQLite watchdog (purely observational; close before drainer so
+    4. Cancel SQLite watchdog (purely observational; close before drainer so
        the wedge-detection logic doesn't trip during a legitimate shutdown drain).
-    6. Close event_queue (WP-B: bounded flush to SQLite; residue → dead-letter).
+    5. Close event_queue (WP-B: bounded flush to SQLite; residue → dead-letter).
        Must happen BEFORE memory_service.close(), because the drainer writes
        into the SQLite event buffer that memory_service owns.
-    7. Cancel harness loop task (stops background reconciliation + escalation server).
+    6. Cancel harness loop task (stops background reconciliation + escalation server).
+    7. Close invocations_store (independent SQLite connection). Only safe after
+       gate.shutdown() has drained all in-flight save_account_event tasks, and
+       after the harness loop has stopped: the recon stages, judge and verify
+       loop write their invocations rows through it.
     8. Close Taskmaster supervisor (cleanly tears down the Node child after
        harness/interceptor stop generating new requests). Done before
        memory_service.close() because MemoryService still holds a reference.
@@ -2570,9 +2591,6 @@ async def _graceful_shutdown(
     if curator_usage_gate is not None:
         await _run_shielded('curator_usage_gate.shutdown', curator_usage_gate.shutdown)
 
-    if curator_cost_store is not None:
-        await _run_shielded('curator_cost_store.close', curator_cost_store.close)
-
     if sqlite_watchdog is not None:
         await _run_shielded('sqlite_watchdog.close', sqlite_watchdog.close)
 
@@ -2591,6 +2609,9 @@ async def _graceful_shutdown(
             _await_harness,
             timeout=_HARNESS_CANCEL_TIMEOUT,
         )
+
+    if invocations_store is not None:
+        await _run_shielded('invocations_store.close', invocations_store.close)
 
     if taskmaster is not None:
         await _run_shielded('taskmaster.close', taskmaster.close)

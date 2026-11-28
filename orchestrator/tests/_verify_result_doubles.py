@@ -11,6 +11,7 @@ The two-sided proof lives in ``orchestrator/tests/test_verify_result_doubles.py`
 from __future__ import annotations
 
 import dataclasses
+import inspect
 import logging
 import traceback
 from typing import Any
@@ -34,13 +35,22 @@ def real_verify_result(passed: bool) -> VerifyResult:
 _VERIFY_RESULT_FIELD_NAMES = frozenset(f.name for f in dataclasses.fields(VerifyResult))
 
 
+# A MagicMock carrying VerifyResult's own properties, so each one derives from the double's fields.
+_FakeVerifyResult = type(
+    '_FakeVerifyResult',
+    (MagicMock,),
+    dict(inspect.getmembers_static(VerifyResult, lambda member: isinstance(member, property))),
+)
+
+
 def fake_verify_result(*, passed: bool, **overrides: Any) -> MagicMock:
     """Return a ``MagicMock(spec=VerifyResult)`` whose every field is seeded
     from ``real_verify_result(passed)``, with *overrides* layered on top.
 
     Reading an attribute VerifyResult lacks raises AttributeError; an
-    *overrides* key that is not a VerifyResult field raises TypeError. Methods
-    such as ``failure_report()`` stay mocked. The reasons behind each choice
+    *overrides* key that is not a VerifyResult field raises TypeError.
+    Properties such as ``ran_narrow_gate`` are VerifyResult's own, read off the
+    double's fields; methods such as ``failure_report()`` stay mocked. The reasons behind each choice
     are pinned in ``orchestrator/tests/test_verify_result_doubles.py``.
     """
     if unknown := set(overrides) - _VERIFY_RESULT_FIELD_NAMES:
@@ -48,7 +58,7 @@ def fake_verify_result(*, passed: bool, **overrides: Any) -> MagicMock:
             f'fake_verify_result: not VerifyResult fields: {sorted(unknown)}'
         )
     real = real_verify_result(passed)
-    fake = MagicMock(spec=VerifyResult)
+    fake = _FakeVerifyResult(spec=VerifyResult)
     for f in dataclasses.fields(VerifyResult):
         setattr(fake, f.name, getattr(real, f.name))
     for key, value in overrides.items():

@@ -9,9 +9,15 @@
 # are exactly 40 hex digits or start with .trash-. A sha dir is reaped under its
 # build lock (never while ensure-gate.sh builds or touches it), is renamed to
 # trash first so an interrupted reap never leaves a half-dir at a sha path, and
-# is aged by its mtime, which every ensure refreshes. Lock files are never
-# reaped: flock does not touch their mtime, so an age rule would unlink a held
-# lock.
+# is aged by its mtime, which every ensure refreshes.
+#
+# Build lock protocol, binding on every locker of $GATE_ROOT/.build-<sha>.lock
+# (this script, ensure-gate.sh and any future one): this script unlinks a reaped
+# sha's lock and ensure-gate.sh unlinks its lock when it fails, each under that
+# lock. So a locker holds the lock only once a re-check after flock finds fd 9
+# still the file at the lock path; one that finds it replaced retakes it
+# (ensure-gate.sh) or skips the sha (here). Only that verified holder unlinks a
+# lock, and no lock is aged, so a lock another process holds is never unlinked.
 set -euo pipefail
 
 [[ ${GATE_ROOT:-} == /* ]] || {
@@ -21,11 +27,14 @@ set -euo pipefail
 [[ -f $GATE_ROOT/.dark-factory-gate-root ]] || exit 0
 
 reap_sha_dir() {
-	local dir=$1 trash=''
-	exec 9>"$GATE_ROOT/.build-$(basename "$dir").lock"
-	if flock -n 9 && [[ -n $(find "$dir" -maxdepth 0 -mtime +7 2>/dev/null) ]]; then
+	local dir=$1 lock trash=''
+	lock="$GATE_ROOT/.build-$(basename "$dir").lock"
+	exec 9>"$lock"
+	if flock -n 9 && [[ /dev/fd/9 -ef $lock ]] &&
+		[[ -n $(find "$dir" -maxdepth 0 -mtime +7 2>/dev/null) ]]; then
 		trash=$(mktemp -u -d "$GATE_ROOT/.trash-XXXXXXXX")
 		mv -T "$dir" "$trash"
+		rm -f "$lock"
 	fi
 	exec 9>&-
 	[[ -z $trash ]] || rm -rf "$trash"

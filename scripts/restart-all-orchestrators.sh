@@ -102,10 +102,9 @@ set -euo pipefail
 #   ORCH_FLEET_DIR                       fleet-common heartbeat dir
 #                                         (default: /home/leo/src/dark-factory/data/fleet)
 #   ORCH_RESTART_FORCE_FIRE_AFTER_SECS    busy-grace before a forced restart
-#                                         (default: 600 = 10m; temporarily
-#                                         lowered from 4500 = 75m on
-#                                         2026-08-26 -- see the note at its
-#                                         assignment below)
+#                                         (default: 600 = 10m, permanent for
+#                                         the legacy merge-idle gate -- see the
+#                                         note at its assignment below)
 #   ORCH_DRAIN_FRESH_WINDOW_SECS          heartbeat freshness window
 #                                         (default: 120 = 2x run-loop tick)
 #   ORCH_DRAIN_POLL_INTERVAL_SECS         re-check interval while deferring
@@ -159,8 +158,8 @@ VERIFY_TIMEOUT="${RESTART_VERIFY_TIMEOUT:-30}"
 #      transient unit with no runtime timeout -- so the extra grace only DELAYS
 #      a genuine FAILED verdict; it never manufactures a new kill/timeout.
 #   2. This same chokepoint's --drain gate already tolerates
-#      ORCH_RESTART_FORCE_FIRE_AFTER_SECS (default 600s = 10m since
-#      2026-08-26; 4500s = 75m before that) of deferral PER busy unit, so the
+#      ORCH_RESTART_FORCE_FIRE_AFTER_SECS (default 600s = 10m; 4500s = 75m
+#      until 2026-08-26) of deferral PER busy unit, so the
 #      caller already budgets for a multiple of the added ~120s/unit for the
 #      (rarer) dead-unit case. Point 1 is what actually makes this safe: the
 #      callers are detached with no runtime timeout, so the added grace only
@@ -232,29 +231,22 @@ LEASE_FILE="${ORCH_FLEET_LEASE:-$REPO_DIR/data/orchestrator/fleet_redeploy_lease
 # Stamped once by lease_acquire and preserved by every later rewrite, so the
 # readers' age bound measures the SWEEP, not its most recent unit transition.
 LEASE_STARTED_TS=""
-# TEMPORARY MITIGATION 2026-08-26 (was 4500 = 75m; revert to 4500 once the
-# tasks below land). A permanently-busy unit burns this ENTIRE grace on EVERY
-# sweep, and dark-factory is restarted LAST (SELF_UNIT), so the grace sets how
-# long the fleet-deploy clock stays unstamped -- and the clock is the ONLY
-# coordination state between the two redeploy tiers (it is stamped just once,
-# on the verified-fresh exit-0 path below). Measured 2026-08-24/25:
-# orchestrator-my-solar-challenge.service has heartbeat merge_idle:false with a
-# merge-queue head queued 33.8 days, so all four --drain sweeps deferred the
-# full 75m, stretching each sweep to ~81m. In that window the merge-landed
-# coordinator (and, via a TOCTOU on the same clock, this backstop's own next
-# tick) legitimately passed their 8h min-interval checks and redeployed the
-# fleet a SECOND time -- three dark_factory runs of 1.26h/0.92h/1.33h that
-# together spent $146.39 and landed zero tasks.
-# 600s shrinks a sweep to ~15m, which shrinks that collision window; it does
-# NOT reduce the restart COUNT. Since task 5371 this grace is only the LEGACY
-# gate (pre-5371 units, refused requests); a merge verify in flight is awaited
-# under the two-stage drain above, not killed at 600s. The real fixes are the head-start reference
-# point and an in-flight lease (see the filed tasks); revert this then.
-# TRADE-OFF: a genuinely mid-merge unit now gets 10m, not 75m, before it is
+# Busy grace of the LEGACY merge-idle gate: 600s = 10m is the settled, permanent
+# value (it was 4500 = 75m until 2026-08-26). Since task 5371 it governs only
+# pre-5371 units and units whose drain request is refused or unwritable, which
+# are deferred while merge-busy and force-restarted once it elapses. A unit that
+# has acknowledged its drain request and reports a merge verify in flight
+# (verdict verifying) is awaited under the two-stage drain above, never
+# force-restarted at this grace. The collision that motivated shrinking it (a
+# permanently-busy unit stretching every sweep and letting a second redeploy
+# fire) is history: the backstop head start (task 4754) and the in-flight fleet
+# lease (task 4755) are live. The value is load-bearing for the
+# DRAIN_SWEEP_VERIFY_MAX_WAIT_SECS derivation below, which counts this 600s:
+# raising it requires re-deriving that ceiling in the same commit, or a sweep
+# can overrun the 14400s fleet lease.
+# TRADE-OFF: a genuinely mid-merge legacy-gate unit gets 10m before it is
 # force-restarted. I9 keeps that crash-safe (recover_pending_merges), but a
-# long verify (reify) can lose more work. Today reify's and dark-factory's
-# heartbeats both read STALE, so they get only DRAIN_UNKNOWN_GRACE_SECS
-# anyway and this changes nothing for them.
+# long verify can lose more work.
 FORCE_FIRE_AFTER_SECS="${ORCH_RESTART_FORCE_FIRE_AFTER_SECS:-600}"
 DRAIN_FRESH_WINDOW_SECS="${ORCH_DRAIN_FRESH_WINDOW_SECS:-120}"
 DRAIN_POLL_INTERVAL_SECS="${ORCH_DRAIN_POLL_INTERVAL_SECS:-30}"

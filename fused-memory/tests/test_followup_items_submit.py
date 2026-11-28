@@ -96,12 +96,10 @@ async def test_re_filing_the_same_observations_is_an_idempotency_hit(
         metadata=_bundle(_FIRST, _SECOND, suggestion_hash='forged-first'),
     )
 
-    submitted = await stack.call(
-        'submit_task', title='A later agent re-files them', description='The same two, reordered.',
+    _ticket, resolved = await stack.submit(
+        title='A later agent re-files them', description='The same two, reordered.',
         metadata=_bundle(_SECOND, _FIRST, escalation_id='esc-other', suggestion_hash='forged-second'),
     )
-    assert 'ticket' in submitted, submitted
-    resolved = await stack.call('resolve_ticket', ticket=submitted['ticket'], timeout_seconds=30)
 
     assert (resolved['status'], resolved['reason'], str(resolved['task_id'])) == (
         'combined', 'idempotency_hit', first,

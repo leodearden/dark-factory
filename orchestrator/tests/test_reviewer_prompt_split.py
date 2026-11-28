@@ -8,7 +8,7 @@ RED until ``orchestrator.agents.roles`` defines ``REVIEWER_COMPREHENSIVE.prompt_
 The frozen CONTRACT tokens asserted below are exactly what the verdict-tools
 server + ``read_verdict`` parse: the ``submit_review_verdict`` tool name, its
 field names, the ``reviewer_{name}`` identity literal, and the
-``verdict``/``severity`` enums. Everything else (the blocking-vs-suggestion
+``verdict``/``severity``/``kind`` and ruling-subject enums. Everything else (the blocking-vs-suggestion
 judgment rules and the specialization footer) is editable HEURISTICS.
 """
 
@@ -16,14 +16,16 @@ from __future__ import annotations
 
 from typing import Any
 
+from shared.defects import IssueKind, RulingSubject
 from shared.prompt_artifact import ArtifactProvenance, PromptArtifactStore, PromptSpec
 
 from orchestrator.agents.roles import _REVIEWER_PROMPT_HARNESS_VERSION, REVIEWER_COMPREHENSIVE
 
 # Frozen machine-contract tokens: the exact strings the verdict-tools server
 # and read_verdict parse (tool name, field names, reviewer-identity literal,
-# verdict/severity enums). These must survive in .contract verbatim, and in
-# ANY resolved prompt text regardless of what heuristics are pinned.
+# verdict/severity/kind/ruling-subject enums). These must survive in .contract
+# verbatim, and in ANY resolved prompt text regardless of what heuristics are
+# pinned.
 _FROZEN_CONTRACT_TOKENS = (
     'submit_review_verdict',
     '**reviewer**',
@@ -40,6 +42,10 @@ _FROZEN_CONTRACT_TOKENS = (
     '"addressed"',
     '"no_action"',
     '"work"',
+    '`kind`',
+    *(f'"{kind}"' for kind in IssueKind),
+    '**defect_rulings**',
+    *(f'"{subject}"' for subject in RulingSubject),
 )
 
 
@@ -72,8 +78,8 @@ class TestReviewerPromptSplit:
         assert isinstance(spec, PromptSpec)
         assert spec.prompt_id == 'reviewer_comprehensive'
 
-    def test_prompt_harness_version_is_reviewer_v2(self):
-        assert REVIEWER_COMPREHENSIVE.prompt_harness_version == 'reviewer-v2'
+    def test_prompt_harness_version_is_reviewer_v3(self):
+        assert REVIEWER_COMPREHENSIVE.prompt_harness_version == 'reviewer-v3'
 
     # -- (a) structure/partition: machine-contract landmarks in .contract only --
 

@@ -391,21 +391,32 @@ can point at something a human should look at. Code: `orchestrator/src/orchestra
   alarm stays open and the baseline stays. That case is the first ticks after a restart,
   before holders re-dispatch. Resolving there would close a standing wedge at every restart,
   and since a resolve keeps the baseline, the same wedge would never be re-filed.
-- *Liveness* (`orchestrator/src/orchestrator/blocker_liveness.py`). A HELD module's owner must
-  be a slot this scheduler process has dispatched and not released (`Scheduler._dispatched`);
-  otherwise the reason is `lock_without_slot`, a lock no running slot will release. A dispatched
-  owner with a live claimant is live: `shared.task_claimant.has_live_claimant` at
-  `claimant_liveness_ttl_secs`, the dispatch gate's own predicate and TTL. A workflow heartbeats
-  for its whole slot, merge phase included, so a slow holder reads live. Without a live claimant,
-  a dispatched owner is `no_live_claimant` when `in-progress` and `blocked` when `blocked`. It is
-  live when `pending` (dispatched, not yet claimed), terminal, or gone from the active read: its
-  slot is unwinding to its release. The slot's own exit path bounds that unwinding, and the
-  terminal-status watcher force-releases a slot that never unwinds
-  (`orchestrator/src/orchestrator/harness.py::Harness._force_release_wedged_slot`). The cap L1
-  reads the lock view and the in-flight set together, after the tick's awaits. A PARKED blocker's owner is followed to its own blockers, at most
-  `PARK_FOLLOW_DEPTH` = 3 parks deep (park, park, park, holder). A cycle, a deeper chain, or an
-  owner absent from the read or terminal is non-live. A park owner whose modules are all free
-  waits only for a run slot, which is live.
+- *Liveness* (`orchestrator/src/orchestrator/blocker_liveness.py`; AMENDED 2026-11-24, task
+  10700; AMENDED 2026-11-25, task 11627). A HELD module's owner must be a slot this scheduler
+  process has dispatched and not released (`Scheduler._dispatched`); otherwise the reason is
+  `lock_without_slot`, a lock no running slot will release. A dispatched owner is live when
+  terminal, `pending` with no claimant (dispatched, not yet claimed), or gone from the active
+  read: its slot awaits its claim or is unwinding to its release. The slot's own exit path
+  bounds that unwinding, and the terminal-status watcher force-releases a slot that never unwinds
+  (`orchestrator/src/orchestrator/harness.py::Harness._force_release_wedged_slot`). Any other
+  dispatched owner is live while someone alive holds it:
+  `shared.task_claimant.is_stranded_any_status` at `claimant_liveness_ttl_secs`, the dispatch
+  gate's `has_live_claimant` (its predicate and TTL) plus the legacy `metadata.infra_hold`
+  exemption. A workflow heartbeats for its whole slot, merge phase included, so a slow holder
+  reads live. An owner no one alive holds is `blocked` when `blocked`
+  (`shared.task_claimant.is_stranded_blocked`) and `no_live_claimant` in any other non-terminal
+  status. A `pending` owner still carrying a claimant whose heartbeat went stale is a slot whose
+  requeue exit hung past the TTL. Nothing else watches a non-terminal hung slot, so it reads
+  `no_live_claimant`, non-live as a stranded `blocked` owner is. The cap L1 reads the lock view
+  and the in-flight set together, after the tick's awaits. It judges claimant heartbeats as of
+  the tick's task read (`TickContext.tasks_read_at`), not the phase's wall clock, because the
+  phases between the two can outlast `claimant_liveness_ttl_secs`: judged at the phase's clock,
+  heartbeating holders filed the false `no_live_claimant` cap L1s
+  `esc-__starvation_auto_pin_cap__-160` and `-162` (task 11627). A heartbeat that goes stale
+  during a long tick is named on the next tick. A PARKED blocker's owner is followed
+  to its own blockers, at most `PARK_FOLLOW_DEPTH` = 3 parks deep (park, park, park, holder). A
+  cycle, a deeper chain, or an owner absent from the read or terminal is non-live. A park owner
+  whose modules are all free waits only for a run slot, which is live.
 - *FILE* when no cap alarm is open, the cohort alarms, and it is news against the last
   announcement: a new non-live holder, a new module behind a non-live holder (a live
   holder's lock turnover is never news), or growth to

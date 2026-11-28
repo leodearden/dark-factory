@@ -82,7 +82,7 @@ PER_PROJECT_MCP_CALLS: tuple[str, ...] = (
 """The bounded OPERATIONS one project root can cost, as a roster.
 
 OPERATIONS, not HTTP requests, and the distinction is load-bearing: the status
-map is walked in :data:`~dashboard.data.tasks.STATUSES_SAFE_PAGE_SIZE` pages,
+map is walked in ``shared/src/shared/status_paging.py::STATUSES_SAFE_PAGE_SIZE`` pages,
 so ``get_statuses[walk]`` is ``ceil(N / 2000)`` requests on the wire — three on
 this repo's own tree. It is nonetheless ONE entry here because it is bounded as
 one, by a single ``asyncio.wait_for(PER_CALL_TIMEOUT)`` around the whole walk.

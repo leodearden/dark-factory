@@ -240,6 +240,18 @@ last of β–ζ): gates per landing < 0.3; voids per landing < 0.1; P(gate|gate)
 predicate false → `chain_cap: 0` (hot) and an L2 escalation naming the predicate; the policy leaves are not
 reverted by the predicate (reverting is the human's call).
 
+*Amended 2026-11-26, Leo's ruling (esc-8532-3, on task 8532's readout).* Two predicates change.
+(1) Voids per landing counts only voids after a verify host was acquired. A void discarded at point
+`dispatch`, before any host is taken, costs no host time and is not counted. The limit stays < 0.1.
+(2) The local merge-verify hours / week < 60 predicate is removed. It is §1 item 5's 60 h, carried into leaf
+ι's instrument. A saturated lane is acceptable as long as waits are not excessive, and median queue-to-land
+already tests waiting. It is replaced by merge-verify hours per landing < 0.75 h: the host-hours of completed
+(`merge_verify.duration_ms`) plus cancelled (`merge_verify_cancelled.elapsed_ms`) merge verifies across all
+hosts in the window, summed rather than unioned because it measures cost, divided by landings
+(`merge_finalized` done ∪ `train_merged` members). Leo chose the limit as a no-regression bar. Weekly values
+by this rule: 10-22 0.99, 10-29 1.24, 11-05 0.83, 11-12 0.90; task 8532's window reads about 0.74.
+The instrument is `scripts/merge_lane_canary.py::D12_ROWS`; it still evaluates ten rows. Task 11875.
+
 **D13. 5056 closes with the report as its measurement; 5098 closes when this PRD commits.** 5059/7860 (the
 chain assessment and the trains human gate) stay; 7860 reads leaf ι's readout.
 

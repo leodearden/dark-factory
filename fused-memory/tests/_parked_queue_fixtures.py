@@ -8,7 +8,7 @@ write has parked.
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -17,7 +17,7 @@ from unittest.mock import AsyncMock
 from _fm_polling import poll_until
 from _queued_write_fixtures import queued
 
-from fused_memory.services.durable_queue import DurableWriteQueue, ParkedWriteEvent
+from fused_memory.services.durable_queue import DurableWriteQueue, ParkDecision, ParkedWriteEvent
 
 
 class Exhausted(Exception):
@@ -30,12 +30,17 @@ class RecordingParkPolicy:
     cleared: int = 0
     raise_on_parked: bool = False
     raise_on_cleared: bool = False
+    retry_at: Callable[[], float | None] = lambda: None
+    observe: Callable[[ParkedWriteEvent], None] = lambda event: None
 
-    def park_reason(self, exc: BaseException) -> str | None:
-        return 'test-park' if isinstance(exc, Exhausted) else None
+    def park_decision(self, exc: BaseException) -> ParkDecision | None:
+        if not isinstance(exc, Exhausted):
+            return None
+        return ParkDecision('test-park', retry_at=self.retry_at())
 
     async def on_parked(self, event: ParkedWriteEvent) -> None:
         self.parked.append(event)
+        self.observe(event)
         if self.raise_on_parked:
             raise RuntimeError('on_parked hook failed')
 

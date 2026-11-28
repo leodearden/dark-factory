@@ -2243,6 +2243,38 @@ def with_junitxml(cmd: VerifyCmd, junit_path: str) -> VerifyCmd:
     return _append_value_flag(cmd, '--junitxml', junit_path)
 
 
+#: The injected pytest plugin's module name (plans/defect-tests-prd.md decision 19).
+DEFECT_PLUGIN_MODULE = '_df_defect_plugin'
+
+
+def with_defect_plugin(cmd: VerifyCmd) -> VerifyCmd:
+    """Return *cmd* with ``-p _df_defect_plugin`` appended to ``base_flags``.
+
+    Copies ``with_junitxml``'s shape: a no-op (returns *cmd* ITSELF) unless
+    ``cmd.tool is ToolKind.PYTEST and cmd.raw is None``, and also when the
+    pair is already there, so a re-parsed or twice-mutated command stays
+    byte-identical. A raw-retained pytest chain and an OPAQUE command are
+    left untouched rather than rewritten: no collection map is written for
+    such a leg, and its proof and keep-check record PROOF_UNSUPPORTED_RUNNER
+    / KEEP_CHECK_UNSUPPORTED downstream (plans/defect-tests-prd.md B22,
+    decision 2).
+    """
+    if cmd.tool is not ToolKind.PYTEST or cmd.raw is not None or carries_defect_plugin(cmd):
+        return cmd
+    return _append_value_flag(cmd, '-p', DEFECT_PLUGIN_MODULE)
+
+
+def carries_defect_plugin(cmd: VerifyCmd) -> bool:
+    """True when *cmd* is a structured pytest command whose ``base_flags`` hold ``-p _df_defect_plugin``."""
+    if cmd.tool is not ToolKind.PYTEST or cmd.raw is not None:
+        return False
+    flags = cmd.base_flags
+    return any(
+        flag == '-p' and value == DEFECT_PLUGIN_MODULE
+        for flag, value in zip(flags, flags[1:], strict=False)
+    )
+
+
 def with_pytest_timeout(cmd: VerifyCmd, secs: int) -> VerifyCmd:
     """Return *cmd* with a ``--timeout <secs>`` per-test timeout appended to ``base_flags``.
 

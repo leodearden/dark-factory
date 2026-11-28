@@ -36,6 +36,7 @@ from orchestrator.merge_lane.dispatch_ports import (
     SpeculationPermits,
     VerifyFrontier,
 )
+from orchestrator.merge_lane.git_read import is_ancestor_or_raise
 from orchestrator.merge_lane.halt import HaltState
 from orchestrator.merge_lane.inflight_verify import (
     InflightVerifyCall,
@@ -48,7 +49,8 @@ from orchestrator.merge_lane.post_merge_verify import (
     placeholder_local_runner,
     run_post_merge_verify,
 )
-from orchestrator.merge_lane.remerge_base import RemergeClaim
+from orchestrator.merge_lane.remerge_base import RemergeClaim, entry_successor_base
+from orchestrator.merge_lane.tested_tree import TreeMember, resolve_tested_tree
 from orchestrator.merge_lane.types import (
     ChainResult,
     DecidedItem,
@@ -129,6 +131,31 @@ class _Placement:
     probe_base: str | None
     chain: ChainResult | None
     divergence: VerifyBaseDivergence | None
+    base_on_main: bool
+
+
+def _own_members(item: RealMergeItem, chain: ChainResult | None) -> tuple[TreeMember, ...]:
+    """The verifying entry's own members: its owner, then each chained link in land order.
+
+    An owner that is a gate-rebased head has no branch tip of its own.
+    """
+    merge_commit = (item.merge_result.merge_commit or '').strip()
+    owner = TreeMember(
+        request_id=item.request.request_id,
+        task_id=item.request.task_id,
+        merge_commit=merge_commit,
+        tip=None if item.gate_rebase_of is not None else item.merged_branch_tip,
+        own=True,
+    )
+    if chain is None:
+        return (owner,)
+    links = (
+        TreeMember(request_id=rid, task_id=task_id, merge_commit=commit, tip=tip, own=True)
+        for rid, (task_id, commit), tip in zip(
+            chain.link_request_ids, chain.links, chain.link_tips, strict=True,
+        )
+    )
+    return (owner, *links)
 
 
 def _passthrough(
@@ -566,6 +593,7 @@ class VerifyDispatcher:
         build is released by the builder, before any chain reaches this frame.
         """
         divergence, guard_main = await self._observe_verify_base(item)
+        base_on_main = await self._base_on_main(item, guard_main)
         stacked_on, rebased_heads = self._frontier.frontier_base_commits()
         facts = MergeVerifyDispatchFacts(
             runner_reason=lease.reason,
@@ -583,7 +611,30 @@ class VerifyDispatcher:
             probe_base=probe.base if probe is not None else None,
             chain=deep.chain,
             divergence=divergence,
+            base_on_main=base_on_main,
         )
+
+    async def _base_on_main(self, item: RealMergeItem, guard_main: str | None) -> bool:
+        """Whether main contains *item*'s base; a failed read is logged and reads as not on main.
+
+        Read before the chain build: an await after it would leak the chain's
+        lane on an external cancel (see :meth:`_place`).
+        """
+        base_sha = item.base_sha
+        if not base_sha or not guard_main:
+            return False
+        if base_sha == guard_main:
+            return True
+        try:
+            return await is_ancestor_or_raise(
+                self._git_ops(), ancestor=base_sha, descendant=guard_main,
+            )
+        except Exception:
+            logger.warning(
+                'Task %s: main containment of base %s unknown; tree root unresolved',
+                item.request.task_id, base_sha, exc_info=True,
+            )
+            return False
 
     async def _observe_verify_base(
         self, item: RealMergeItem,
@@ -639,4 +690,30 @@ class VerifyDispatcher:
             verify_base_divergence=placement.divergence,
         )
         entry_slot.entry = entry
+        self._record_tested_tree(entry_slot, entry, item, placement)
         return entry
+
+    def _record_tested_tree(
+        self, entry_slot: InflightEntrySlot, entry: InflightEntry, item: RealMergeItem,
+        placement: _Placement,
+    ) -> None:
+        """Publish the tree *entry* verifies, before its verify first runs (PRD §6.1).
+
+        Never raises: it runs after the lease-holding verify task is
+        scheduled, so a raise would orphan that task. A tree that cannot be
+        recorded is logged and the entry keeps ``tree`` None.
+        """
+        try:
+            tree = resolve_tested_tree(
+                base_commit=item.base_sha,
+                base_on_main=placement.base_on_main,
+                live_trees=self._frontier.live_trees(),
+                own_members=_own_members(item, placement.chain),
+            )
+            tree.require_verifies(item.request.request_id, entry_successor_base(entry) or '')
+            entry_slot.publish_tree(tree)
+        except Exception:
+            logger.exception(
+                'Task %s: tested tree not recorded; the entry carries none',
+                item.request.task_id,
+            )

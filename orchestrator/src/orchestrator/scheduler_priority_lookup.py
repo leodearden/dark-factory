@@ -46,6 +46,21 @@ def pin_orders(rows: Mapping[str, OverrideRow]) -> dict[str, int]:
     return {task_id: row.pin_order or 0 for task_id, row in rows.items() if row.pinned}
 
 
+def combine_priority(
+    task_id: str, base_tier: str | None, orders: Mapping[str, int] | None,
+) -> TaskPriority:
+    """*task_id*'s priority from its base tier and the pin orders; *orders* ``None`` means pins unknown.
+
+    The one place a base tier is combined with pins.
+    """
+    if orders is None:
+        return TaskPriority(tier=base_tier, pinned=None, base_tier=base_tier)
+    order = orders.get(task_id)
+    if order is None:
+        return TaskPriority(tier=base_tier, pinned=False, base_tier=base_tier)
+    return TaskPriority(tier=PINNED, pinned=True, base_tier=base_tier, pin_order=order)
+
+
 class LookupPins:
     """The lookup's own pin map: task id to pin order, ``None`` while unknown.
 
@@ -97,9 +112,4 @@ class LookupPins:
         self._orders = pin_orders(rows)
 
     def priority(self, task_id: str, base_tier: str | None) -> TaskPriority:
-        if self._orders is None:
-            return TaskPriority(tier=base_tier, pinned=None, base_tier=base_tier)
-        order = self._orders.get(task_id)
-        if order is None:
-            return TaskPriority(tier=base_tier, pinned=False, base_tier=base_tier)
-        return TaskPriority(tier=PINNED, pinned=True, base_tier=base_tier, pin_order=order)
+        return combine_priority(task_id, base_tier, self._orders)

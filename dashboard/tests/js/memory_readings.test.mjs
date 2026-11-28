@@ -1,6 +1,7 @@
 // Module-contract tests for memory_readings.js, the CLIENT reader of the two
-// memory payloads: the write-queue Datum served by /memory (server half
-// dashboard/src/dashboard/data/memory.py::write_queue_datum) and the MEMORY_OPS
+// memory payloads: the write-queue and plan-route Datums served by /memory
+// (server halves dashboard/src/dashboard/data/memory.py::write_queue_datum and
+// ::plan_route_datum) and the MEMORY_OPS
 // block served by /memory-graphs, whose totals and newest_hour_total are served
 // Datums (data/write_journal.py::get_memory_ops via
 // redux_api.shape_memory_graphs; server half test_memory_graphs.py). MemoryTab, the Overview and the topbar read
@@ -43,6 +44,9 @@ const {
   opsCaption,
   opsTotalText,
   newestHourOps,
+  planRoute,
+  planRouteText,
+  planRouteHealth,
 } = readings;
 const { isDatum, datumView, EM_DASH } = datum;
 
@@ -211,6 +215,128 @@ test('queueHealth: a fresh queue with no measured parked count is amber, not gre
 
 test('queueHealth: a stale queue always warns', () => {
   assert.equal(queueHealth(writeQueue(memoryData(queueStats('stale', counts())))).warn, true);
+});
+
+// ── Plan route ──────────────────────────────────────────────────────────────
+
+const CAPPED_ROUTE = Object.freeze({
+  state: 'capped',
+  proxy_host: 'plan-proxy.internal',
+  capped_since: '2026-10-03T11:40:00+00:00',
+  resets_at: '2026-10-03T16:00:00+00:00',
+  next_probe_at: '2026-10-03T12:10:00+00:00',
+  parked_items: 3,
+  judge_fail_opens_since_latch: 2,
+  escalation_id: 'esc-plan-route-capped-1',
+});
+const OK_ROUTE = Object.freeze({
+  ...CAPPED_ROUTE,
+  state: 'ok',
+  capped_since: null,
+  resets_at: null,
+  next_probe_at: null,
+  parked_items: 0,
+  judge_fail_opens_since_latch: 0,
+  escalation_id: null,
+});
+const ROUTE_REASON = 'get_status reports no plan_route: fused-memory predates task 9944';
+
+// A served plan_route Datum, honouring datum.py's unknown triad.
+function routeReading(state, value) {
+  if (state === 'unknown') {
+    return { value: null, as_of: null, state, reason: ROUTE_REASON, freshness_bound_seconds: 30 };
+  }
+  return {
+    value,
+    as_of: MEASURED_AT,
+    state,
+    reason: state === 'fresh' ? null : 'measured 90s before it was served, past the 30s freshness bound',
+    freshness_bound_seconds: 30,
+  };
+}
+
+function routeData(planRouteBlock, receipts = { [MEMORY_ENDPOINT]: RECEIPT }) {
+  return { MEMORY_STATUS: { plan_route: planRouteBlock }, __receipt: receipts };
+}
+
+test('planRoute: a fresh plan route is the served Datum, stamped with its receipt', () => {
+  const route = planRoute(routeData(routeReading('fresh', CAPPED_ROUTE)));
+  assert.ok(isDatum(route));
+  assert.equal(route.state, 'fresh');
+  assert.deepEqual(route.value, CAPPED_ROUTE);
+  assert.equal(route.as_of, MEASURED_AT);
+  assert.equal(route._served_at, SERVED_AT);
+  assert.equal(route._received_at, RECEIVED_AT);
+});
+
+test('planRoute: a served unknown keeps the SERVER\'s reason verbatim', () => {
+  const route = planRoute(routeData(routeReading('unknown')));
+  assert.equal(route.state, 'unknown');
+  assert.equal(route.value, null);
+  assert.equal(route.reason, ROUTE_REASON);
+});
+
+test('planRoute: before the first /memory receipt the route is not yet fetched', () => {
+  const route = planRoute(routeData(routeReading('fresh', CAPPED_ROUTE), {}));
+  assert.equal(route.state, 'unknown');
+  assert.equal(route.reason, 'not yet fetched');
+});
+
+test('planRoute: a delivered payload with no plan_route is a hole naming the /memory payload', () => {
+  const route = planRoute({ MEMORY_STATUS: {}, __receipt: { [MEMORY_ENDPOINT]: RECEIPT } });
+  assert.equal(route.state, 'unknown');
+  assert.match(route.reason, /\/memory payload/);
+  assert.match(route.reason, /plan_route/);
+});
+
+test('planRouteText: a capped route says since when, when it resets and how much is parked', () => {
+  assert.equal(
+    planRouteText(CAPPED_ROUTE),
+    'plan route: CAPPED since 2026-10-03T11:40:00+00:00, resets 2026-10-03T16:00:00+00:00, 3 parked',
+  );
+});
+
+test('planRouteText: a capped route with no known reset says so rather than inventing one', () => {
+  assert.equal(
+    planRouteText({ ...CAPPED_ROUTE, resets_at: null }),
+    'plan route: CAPPED since 2026-10-03T11:40:00+00:00, resets unknown, 3 parked',
+  );
+});
+
+test('planRouteText: a capped route whose parked writes could not be counted says so', () => {
+  assert.equal(
+    planRouteText({ ...CAPPED_ROUTE, parked_items: null }),
+    'plan route: CAPPED since 2026-10-03T11:40:00+00:00, resets 2026-10-03T16:00:00+00:00, unknown parked',
+  );
+});
+
+test('planRouteText: an ok route and an unconfigured one', () => {
+  assert.equal(planRouteText(OK_ROUTE), 'plan route: ok');
+  assert.equal(planRouteText({ ...OK_ROUTE, state: 'unconfigured' }), 'plan route: not configured');
+});
+
+test('planRouteText never runs over a hole', () => {
+  const route = planRoute(routeData(routeReading('unknown')));
+  assert.equal(datumView(route, { format: planRouteText }).text, EM_DASH);
+});
+
+test('planRouteHealth: a capped route is a measured red fault', () => {
+  assert.equal(planRouteHealth(planRoute(routeData(routeReading('fresh', CAPPED_ROUTE)))).ok, false);
+});
+
+test('planRouteHealth: a fresh ok route is green, and so is an unconfigured one', () => {
+  const health = value => planRouteHealth(planRoute(routeData(routeReading('fresh', value))));
+  assert.deepEqual(health(OK_ROUTE), { ok: true, warn: false });
+  assert.deepEqual(health({ ...OK_ROUTE, state: 'unconfigured' }), { ok: true, warn: false });
+});
+
+test('planRouteHealth: an unread latch is amber, never green-ok and never red', () => {
+  assert.deepEqual(planRouteHealth(planRoute(routeData(routeReading('unknown')))), { ok: true, warn: true });
+  assert.deepEqual(planRouteHealth(planRoute({ MEMORY_STATUS: {}, __receipt: {} })), { ok: true, warn: true });
+});
+
+test('planRouteHealth: a stale ok route always warns', () => {
+  assert.deepEqual(planRouteHealth(planRoute(routeData(routeReading('stale', OK_ROUTE)))), { ok: true, warn: true });
 });
 
 // ── Memory ops (PRD sketch #11, at the client) ──────────────────────────────

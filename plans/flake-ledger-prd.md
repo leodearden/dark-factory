@@ -310,7 +310,8 @@ live read of the owner; it stamps the task's merge commit from that read (`metad
 and a `done` task with no recorded commit still resolves, so the commit is never a precondition.
 Today the close is lazy only: `open_debt` makes it at the next suppression of the same test, which a
 real fix prevents, so a fixed test's row stays open until task θ (3792) lands the eager periodic
-sweep. The agent's duty is the same either way: keep the test's pytest node-id byte-identical, since
+sweep. (Amended 2026-11-24: the eager close landed separately as task 8409,
+`flake_debt_drain.py::DebtResolutionSweep`, hourly; 3792 keeps the health classes.) The agent's duty is the same either way: keep the test's pytest node-id byte-identical, since
 `flake_debt.test_id` is the primary key and a renamed, parametrized or re-classed test orphans the row
 and hides a recurrence.
 

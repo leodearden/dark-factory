@@ -10,7 +10,6 @@ Every call passes ``context`` so no memory recall is made.
 from __future__ import annotations
 
 import pytest
-from _briefing_helpers import briefing as briefing
 from escalation.disposition import ReviewerDisposition
 from escalation.models import Escalation
 

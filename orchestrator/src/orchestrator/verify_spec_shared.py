@@ -14,22 +14,32 @@ from typing import Any
 
 from pydantic import BaseModel, TypeAdapter, ValidationError
 
-from orchestrator.config import GitConfig, ModuleConfig, OrchestratorConfig
+from orchestrator.config import (
+    GitConfig,
+    ModuleConfig,
+    ModuleVerifyCache,
+    OrchestratorConfig,
+    check_module_verify_cache,
+)
 
 
 @dataclass(frozen=True)
 class VerifyCommand:
-    """Frozen projection of a (scoped) ModuleConfig's command-bearing fields.
+    """The projection of a scoped ModuleConfig's commands and of its verify_cache
+    flag, which decides whether a runner may replay or record the module.
 
-    Mirrors ``ModuleConfig.prefix`` + the three command fields.  Timeouts and
-    environment variables live at spec level (shared across the bundle), so
-    they are NOT duplicated here.
+    Timeouts and environment variables live at spec level (shared across the
+    bundle), so they are NOT duplicated here.
     """
 
     prefix: str
     test_command: str | None = None
     lint_command: str | None = None
     type_check_command: str | None = None
+    verify_cache: ModuleVerifyCache = 'default'
+
+    def __post_init__(self) -> None:
+        check_module_verify_cache(f'VerifyCommand {self.prefix!r}', self.verify_cache)
 
     def to_dict(self) -> dict:
         return {
@@ -37,6 +47,7 @@ class VerifyCommand:
             "test_command": self.test_command,
             "lint_command": self.lint_command,
             "type_check_command": self.type_check_command,
+            "verify_cache": self.verify_cache,
         }
 
     @classmethod
@@ -46,6 +57,7 @@ class VerifyCommand:
             test_command=d.get("test_command"),
             lint_command=d.get("lint_command"),
             type_check_command=d.get("type_check_command"),
+            verify_cache=d.get("verify_cache", "default"),
         )
 
     @classmethod
@@ -55,6 +67,7 @@ class VerifyCommand:
             test_command=mc.test_command,
             lint_command=mc.lint_command,
             type_check_command=mc.type_check_command,
+            verify_cache=mc.verify_cache,
         )
 
 
@@ -98,6 +111,7 @@ def module_config_from_command(
         test_command=vc.test_command,
         lint_command=vc.lint_command,
         type_check_command=vc.type_check_command,
+        verify_cache=vc.verify_cache,
         verify_env=dict(verify_env) if verify_env is not None else None,
         verify_cold_command_timeout_secs=cold_timeout_secs,
     )

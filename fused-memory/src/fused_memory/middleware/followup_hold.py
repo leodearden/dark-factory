@@ -17,8 +17,10 @@ from typing import TYPE_CHECKING, Any, ClassVar, Final
 
 from pydantic import BaseModel, ConfigDict, ValidationError
 from shared.followup_hold_records import (
+    FINDING_SET_HOLD_METADATA_KEY,
     FOLLOWUP_HOLD_METADATA_KEY,
     FOLLOWUP_HOLDER_METADATA_KEY,
+    FindingSetHold,
     FollowupHold,
     FollowupHolder,
     PromotionCause,
@@ -49,6 +51,7 @@ __all__ = [
     'HOLDER_GATE_KEYS',
     'HOLDER_MINT_SOURCE',
     'PROTECTED_STATUSES',
+    'WAITING_STATUSES',
     'DuplicateFollowupHolderError',
     'FollowupHolderProtectedError',
     'FollowupHolders',
@@ -66,6 +69,7 @@ __all__ = [
     'held_by',
     'held_count',
     'hold_at_create',
+    'hold_birth',
     'hold_scope',
     'is_holder',
     'judge_update',
@@ -80,23 +84,27 @@ __all__ = [
     'release_held',
     'releases_holder',
     'remove_holder_edge',
+    'starts_waiting',
     'unregister_promotion_guard',
+    'waits_on_its_dependencies',
 ]
 
 HELD_PRIORITIES: Final = frozenset({'low', 'polish'})
 PROTECTED_STATUSES: Final = frozenset({TaskStatus.DONE, TaskStatus.CANCELLED, TaskStatus.DEFERRED})
 HOLDER_GATE_KEYS: Final = frozenset({FOLLOWUP_HOLDER_METADATA_KEY, 'deferred_watch', 'trigger_met'})
 HOLDER_MINT_SOURCE: Final = 'followup-holder-mint'
-
-_WAITING_STATUSES: Final = frozenset(ACTIVE - {TaskStatus.DEFERRED})
+WAITING_STATUSES: Final = frozenset(ACTIVE - {TaskStatus.DEFERRED})
 
 _FOLLOWUP_SOURCE: Final = 'agent-followup'
 _REVIEW_SUGGESTIONS_CONTEXT: Final = 'review_suggestions'
 _FINDING_KEY: Final = 'x_finding_key'
 _PRD_PATH_KEY: Final = 'prd_path'
 _CITATION_KEYS: Final = (_FINDING_KEY, _PRD_PATH_KEY)
-_HOLD_EXCLUDING_KEYS: Final = ('execution_class', *_CITATION_KEYS, 'human_decomposed')
-_HOLD_SCOPE_KEYS: Final = ('source', 'spawn_context', 'task_kind', *_HOLD_EXCLUDING_KEYS)
+_UNCITED_ARM_EXCLUSIONS: Final = (*_CITATION_KEYS, 'human_decomposed')
+_HOLD_SCOPE_KEYS: Final = (
+    'source', 'spawn_context', 'task_kind', 'execution_class', *_UNCITED_ARM_EXCLUSIONS,
+    FINDING_SET_HOLD_METADATA_KEY,
+)
 _BACKFILL_FIELDS: Final = (
     'priority',
     'dependencies',
@@ -114,24 +122,69 @@ def is_holder(task: Mapping[str, object]) -> bool:
     return metadata is not None and metadata.get(FOLLOWUP_HOLDER_METADATA_KEY) is not None
 
 
-def hold_scope(metadata: object, priority: object) -> bool:
-    """Decision 9: a low follow-up or reviewer suggestion of the normal kind that nothing cites.
+def hold_scope(metadata: object, priority: object, *, task_id: object = None) -> bool:
+    """Decision 9: a low task of the normal kind needing no human, in one of two arms.
 
-    ``human_decomposed`` is the mark every planning-mode birth carries, so a PRD decompose is
-    never held at filing or by the backfill.
+    The uncited follow-up arm holds a follow-up or reviewer suggestion that nothing cites.
+    ``human_decomposed`` is the mark every planning-mode birth carries, so this arm never holds a
+    PRD decompose. The finding-set arm holds a task that cites a finding and carries a valid
+    ``finding_set_hold`` marker, whatever its source, and even when it was born in planning mode.
+
+    A ``finding_set_hold`` marker that holds nothing, because it is malformed or because the task
+    fails the rule, logs one WARNING naming *task_id* (``None`` for a filing not yet created) and
+    why, so a ruling the hold does not enforce is never silent.
     """
-    if not isinstance(priority, str) or priority not in HELD_PRIORITIES:
-        return False
     fields = raw_metadata_dict(metadata, source=_METADATA_SOURCE)
+    gate_refusal = _gate_refusal(fields, priority)
+    if gate_refusal is None and _uncited_followup(fields):
+        return True
+    return _finding_set_member(fields, gate_refusal, task_id)
+
+
+def _gate_refusal(fields: Mapping[str, object], priority: object) -> str | None:
+    """Why the task fails the gate both arms share, or None when it passes."""
+    if not isinstance(priority, str) or priority not in HELD_PRIORITIES:
+        return f'priority {priority!r} is not low or polish'
+    if fields.get('task_kind') not in (None, 'normal'):
+        return f"task_kind {fields.get('task_kind')!r} is not normal"
+    if fields.get('execution_class'):
+        return f"it carries execution_class {fields.get('execution_class')!r}"
+    return None
+
+
+def _uncited_followup(fields: Mapping[str, object]) -> bool:
     filed_as_followup = (
         fields.get('source') == _FOLLOWUP_SOURCE
         or fields.get('spawn_context') == _REVIEW_SUGGESTIONS_CONTEXT
     )
-    return (
-        filed_as_followup
-        and fields.get('task_kind') in (None, 'normal')
-        and not any(fields.get(key) for key in _HOLD_EXCLUDING_KEYS)
-    )
+    return filed_as_followup and not any(fields.get(key) for key in _UNCITED_ARM_EXCLUSIONS)
+
+
+def _finding_set_member(fields: Mapping[str, object], gate_refusal: str | None, task_id: object) -> bool:
+    marker = _finding_set_hold(fields, task_id)
+    if marker is None:
+        return False
+    refusal = gate_refusal
+    if refusal is None and not fields.get(_FINDING_KEY):
+        refusal = f'it cites no finding: {_FINDING_KEY} is missing or empty'
+    if refusal is not None:
+        logger.warning(
+            'followup_hold: task %s carries finding_set_hold (ruling %r) but is not held: %s',
+            task_id, marker.ruling, refusal,
+        )
+        return False
+    return True
+
+
+def _finding_set_hold(fields: Mapping[str, object], task_id: object) -> FindingSetHold | None:
+    raw = fields.get(FINDING_SET_HOLD_METADATA_KEY)
+    if raw is None:
+        return None
+    try:
+        return FindingSetHold.model_validate(raw)
+    except ValidationError as exc:
+        logger.warning('followup_hold: task %s carries a malformed finding_set_hold marker: %s', task_id, exc)
+        return None
 
 
 def hold_at_create(
@@ -147,14 +200,49 @@ def hold_at_create(
     return held_kwargs, held_metadata
 
 
+async def hold_birth(
+    tm: TaskBackendProtocol,
+    project_root: str,
+    holders: FollowupHolders,
+    kwargs: Mapping[str, object],
+    metadata: object,
+) -> tuple[dict[str, Any], object, int | None]:
+    """Decision 9 at either creation path: the ``add_task`` arguments, metadata and holder of a birth.
+
+    A birth the hold rule matches is held behind the project's holder, minted on first need; any
+    other comes back unchanged with no holder. The caller holds the project's write lock, as
+    :meth:`FollowupHolders.ensure_holder` requires.
+    """
+    if not hold_scope(metadata, kwargs.get('priority')):
+        return dict(kwargs), metadata, None
+    holder_id = await holders.ensure_holder(tm, project_root)
+    held_kwargs, held_metadata = hold_at_create(
+        kwargs, metadata, holder_id, held_at=datetime.now(UTC).isoformat(),
+    )
+    return held_kwargs, held_metadata, holder_id
+
+
 def held_by(task: Mapping[str, object]) -> int | None:
-    """The holder an active row waits behind now: its record names the edge, and the edge is the authority.
+    """The holder an active row is parked behind now: its record names the edge, and the edge is the authority.
 
     A promoted row keeps its record but has lost the edge, so it is not held. A record that does
     not parse holds nothing and logs one WARNING naming the task.
     """
     record = _current_hold(task)
     return None if record is None else record.holder
+
+
+def waits_on_its_dependencies(task: Mapping[str, object]) -> bool:
+    """True when *task*'s held dependencies must be promoted: its status is in WAITING_STATUSES and it is not itself held.
+
+    A held task is parked behind its holder, not waiting (PRD §3 decision 14, §9 open question 7).
+    """
+    return task.get('status') in WAITING_STATUSES and held_by(task) is None
+
+
+def starts_waiting(old_status: str | None, status: str) -> bool:
+    """A status landing that starts a task waiting on its dependencies."""
+    return old_status not in WAITING_STATUSES and status in WAITING_STATUSES
 
 
 def _current_hold(task: Mapping[str, object]) -> FollowupHold | None:
@@ -204,9 +292,10 @@ _HOLDER_WATCH = (
     'dependency edge until each is promoted (plans/follow-up-filing-shape-prd.md §4.3).'
 )
 _HOLDER_DESCRIPTION = (
-    "This project's follow-up holder. Low-priority agent follow-ups and reviewer suggestions are "
-    'filed depending on it, so they wait here until a citation, a combine, a pack or a human '
-    'promotes them.'
+    "This project's follow-up holder. Low-priority agent follow-ups, reviewer suggestions and "
+    'finding-set members carrying finding_set_hold are filed depending on it, so they wait here '
+    'until a citation, a combine, a pack or a human promotes them. A citation does not promote a '
+    'finding-set member; every other cause does.'
 )
 _HOLDER_DETAILS = (
     'Minted by fused-memory (plans/follow-up-filing-shape-prd.md §4.3). It is a deterministic pure '
@@ -341,7 +430,8 @@ _HOLDER_EDGE_STRIP_HINT = (
     'This task is a held follow-up: it depends on its project\'s follow-up holder, and a machine '
     'caller may not drop that edge with a dependencies replacement. Keep the holder id in the '
     'dependencies list. A held follow-up leaves the hold by promotion: cite it with x_finding_key '
-    'or prd_path, depend on it from a pending task, or have a human call '
+    'or prd_path (unless it carries finding_set_hold, which a citation does not promote), depend '
+    'on it from an unheld task that is not deferred, done or cancelled, or have a human call '
     'remove_dependency(task, holder). See docs/task-authoring.md §3.4.'
 )
 
@@ -488,7 +578,7 @@ async def protection_refusal(
 
 
 class PromotionDeferral(BaseModel):
-    """A registered guard's answer that a held task must not be promoted yet, and why."""
+    """The answer, from the finding-set rule or a registered guard, that a held task must not be promoted yet, and why."""
 
     model_config = ConfigDict(frozen=True, extra='forbid')
 
@@ -535,9 +625,10 @@ async def promote(
     The caller holds the project's interceptor write lock, so each task is read and promoted with
     no write in between. Each promotion is ONE backend write that drops the holder edge and stamps
     ``followup_hold.promoted``, then one ``followup_promoted`` event; ``pending_since`` is never
-    written. A registered guard's deferral, or a guard that raises, leaves its task held, emits
-    ``followup_promotion_deferred`` and promotes none of that task's dependencies. A task that is
-    not held now promotes nothing. Returns the promoted ids in promotion order; an unknown *by*
+    written. A deferral leaves its task held, emits ``followup_promotion_deferred`` and promotes
+    none of that task's dependencies: a ``citation`` of a task carrying ``finding_set_hold`` is
+    deferred before any registered guard runs, and then a registered guard's deferral, or a guard
+    that raises, defers too. A task that is not held now promotes nothing. Returns the promoted ids in promotion order; an unknown *by*
     raises ``ValueError``.
     """
     walk = await _promote_frontier(tm, project_root, [(held_id, PromotionCause(by), ref)], emit)
@@ -665,12 +756,12 @@ async def _stamp_human_release(
 async def promote_dependencies_of(
     tm: TaskBackendProtocol, project_root: str, task_id: int, *, emit: HoldEmit,
 ) -> tuple[int, ...]:
-    """An edge onto a held task promotes it once its dependent is pending and not itself held.
+    """An edge onto a held task promotes it once its dependent waits on its dependencies and is not itself held.
 
     So an edge between two held tasks keeps both held. Same precondition as :func:`promote`.
     """
     row = await _live_row(tm, project_root, task_id)
-    if row is None or row.get('status') != TaskStatus.PENDING or held_by(row) is not None:
+    if row is None or not waits_on_its_dependencies(row):
         return ()
     seeds = _dependent_seeds(task_id, _local_dependencies(row))
     return (await _promote_frontier(tm, project_root, seeds, emit)).promoted
@@ -813,7 +904,14 @@ class PromotionDeferredError(TaskmasterError):
 
 
 def _first_deferral(row: Mapping[str, object], cause: PromotionCause, ref: str | None) -> PromotionDeferral | None:
-    """The first registered guard's deferral; a guard that raises defers too, so a fault keeps the task held."""
+    """The finding-set rule's deferral, else the first registered guard's.
+
+    A ``citation`` of a task carrying ``finding_set_hold`` is deferred before any registered guard
+    runs. A guard that raises defers too, so a fault keeps the task held.
+    """
+    finding_set = _finding_set_deferral(row, cause)
+    if finding_set is not None:
+        return finding_set
     for guard in tuple(_PROMOTION_GUARDS):
         try:
             deferral = guard(row, cause.value, ref)
@@ -824,6 +922,22 @@ def _first_deferral(row: Mapping[str, object], cause: PromotionCause, ref: str |
         if deferral is not None:
             return deferral
     return None
+
+
+def _finding_set_deferral(row: Mapping[str, object], cause: PromotionCause) -> PromotionDeferral | None:
+    """Decision 14's citation exception: a set held by ruling is not scheduled one member at a time."""
+    if cause is not PromotionCause.CITATION:
+        return None
+    marker = _finding_set_hold(raw_metadata_dict(row.get('metadata'), source=_METADATA_SOURCE), row.get('id'))
+    if marker is None:
+        return None
+    return PromotionDeferral(
+        guard=FINDING_SET_HOLD_METADATA_KEY,
+        reason=(
+            f'held as a finding set by ruling ({marker.ruling}): a citation does not schedule one member; '
+            'a human releases it with remove_dependency on the holder edge or the holder release'
+        ),
+    )
 
 
 async def backfill(
@@ -839,8 +953,8 @@ async def backfill(
 
     Each task's edge and record land in one backend write under the interceptor's write lock, with
     no journal row and no ``task_modified`` event. A task that already carries a ``followup_hold``
-    record was promoted or released and is never re-held. A pending follow-up that an active,
-    non-deferred task outside the stock waits on, directly or through other stock tasks, is left
+    record was promoted or released and is never re-held. A pending follow-up that a task in
+    :data:`WAITING_STATUSES` outside the stock waits on, directly or through other stock tasks, is left
     unheld, because nothing would promote it; ``known_roots`` are the projects whose
     ``external_deps`` can cite this one. One ``followup_hold_backfilled`` event is emitted per
     call, its count possibly 0, so a reader can tell the backfill ran.
@@ -880,12 +994,12 @@ async def _hold_stock(
 
 
 async def _unheld_stock(tm: TaskBackendProtocol, project_root: str) -> list[dict[str, Any]]:
-    """The pending tasks the hold rule matches that were never held."""
+    """The pending tasks never held that the hold rule matches; a row once held is never re-judged."""
     pending = await tm.get_tasks(project_root, statuses=[TaskStatus.PENDING], fields=_BACKFILL_FIELDS)
     return [
         task for task in pending['tasks']
-        if hold_scope(task.get('metadata'), task.get('priority'))
-        and FOLLOWUP_HOLD_METADATA_KEY not in raw_metadata_dict(task.get('metadata'), source=_METADATA_SOURCE)
+        if FOLLOWUP_HOLD_METADATA_KEY not in raw_metadata_dict(task.get('metadata'), source=_METADATA_SOURCE)
+        and hold_scope(task.get('metadata'), task.get('priority'), task_id=task.get('id'))
     ]
 
 
@@ -919,7 +1033,7 @@ async def _cited_by_waiting_dependents(
     statuses = await tm.get_statuses(project_root, ids=[str(dependent) for dependent in cited_by])
     return frozenset(
         candidate
-        for dependent, cited in cited_by.items() if statuses.get(str(dependent)) in _WAITING_STATUSES
+        for dependent, cited in cited_by.items() if statuses.get(str(dependent)) in WAITING_STATUSES
         for candidate in cited
     )
 
@@ -936,7 +1050,7 @@ async def _cited_by_other_projects(
     for root in known_roots:
         if resolve_project_id(root) == project_id:
             continue
-        waiting = await tm.get_tasks(root, statuses=sorted(_WAITING_STATUSES), fields=_EXTERNAL_DEPS_FIELDS)
+        waiting = await tm.get_tasks(root, statuses=sorted(WAITING_STATUSES), fields=_EXTERNAL_DEPS_FIELDS)
         cited.update(
             task_id for task in waiting['tasks'] for task_id in _external_citations(task, project_id)
         )

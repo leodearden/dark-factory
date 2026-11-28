@@ -1376,6 +1376,7 @@ dependencies = [
     { name = "aiosqlite" },
     { name = "anthropic" },
     { name = "dark-factory-shared" },
+    { name = "escalation" },
     { name = "graphiti-core", extra = ["falkordb"] },
     { name = "mcp" },
     { name = "mem0ai" },
@@ -1388,7 +1389,7 @@ dependencies = [
 
 [package.dev-dependencies]
 dev = [
-    { name = "escalation" },
+    { name = "client-feed" },
     { name = "pyright" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
@@ -1407,6 +1408,7 @@ requires-dist = [
     { name = "aiosqlite", specifier = ">=0.20.0" },
     { name = "anthropic", specifier = ">=0.52.0" },
     { name = "dark-factory-shared", editable = "shared" },
+    { name = "escalation", editable = "escalation" },
     { name = "graphiti-core", extras = ["falkordb"], specifier = ">=0.28.1" },
     { name = "mcp", specifier = ">=1.9.4" },
     { name = "mem0ai", specifier = ">=1.0.10" },
@@ -1419,7 +1421,7 @@ requires-dist = [
 
 [package.metadata.requires-dev]
 dev = [
-    { name = "escalation", editable = "escalation" },
+    { name = "client-feed", editable = "client-feed" },
     { name = "pyright", specifier = ">=1.1.404" },
     { name = "pytest", specifier = ">=8.0.0" },
     { name = "pytest-asyncio", specifier = ">=0.21.0" },
@@ -2208,6 +2210,19 @@ wheels = [
 ]
 
 [[package]]
+name = "lizard"
+version = "1.26.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "pathspec" },
+    { name = "pygments" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/72/b1/47a2a3ca5aa0d57e8affeafaef79827e971dc448fb2b40b55708c81ebf62/lizard-1.26.1.tar.gz", hash = "sha256:9a4d7372faa12dbe725cfb6dcadf9bed4916f9176a154b285917713012ac35c3", size = 178050, upload-time = "2026-11-16T11:22:09.333Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/6f/c8/c4af1e2aeb2fa71495684c64d491a8b9713344f0eeb3884ccfefc7569d2f/lizard-1.26.1-py2.py3-none-any.whl", hash = "sha256:344e2bfb1b41d31207223ba844fac1f84da80053edf901b3df4ee051b152d0f5", size = 188521, upload-time = "2026-11-16T11:22:07.7Z" },
+]
+
+[[package]]
 name = "mando"
 version = "0.7.1"
 source = { registry = "https://pypi.org/simple" }
@@ -2875,6 +2890,7 @@ dependencies = [
 [package.dev-dependencies]
 dev = [
     { name = "complexipy" },
+    { name = "lizard" },
     { name = "mutmut" },
     { name = "pyright" },
     { name = "pytest" },
@@ -2900,6 +2916,7 @@ requires-dist = [
 [package.metadata.requires-dev]
 dev = [
     { name = "complexipy", specifier = ">=6.2,<7" },
+    { name = "lizard", specifier = ">=1.26,<1.27" },
     { name = "mutmut", specifier = ">=3.7,<3.8" },
     { name = "pyright", specifier = ">=1.1.404" },
     { name = "pytest", specifier = ">=8.0.0" },
@@ -2926,6 +2943,15 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/72/55/b748445cb4ea6b125626f15379be7c96d1035d4fa3e8fee362fa92298abf/pathable-0.5.0.tar.gz", hash = "sha256:d81938348a1cacb525e7c75166270644782c0fb9c8cecc16be033e71427e0ef1", size = 16655, upload-time = "2026-02-20T08:47:00.748Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/52/96/5a770e5c461462575474468e5af931cff9de036e7c2b4fea23c1c58d2cbe/pathable-0.5.0-py3-none-any.whl", hash = "sha256:646e3d09491a6351a0c82632a09c02cdf70a252e73196b36d8a15ba0a114f0a6", size = 16867, upload-time = "2026-02-20T08:46:59.536Z" },
+]
+
+[[package]]
+name = "pathspec"
+version = "1.1.1"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/5a/82/42f767fc1c1143d6fd36efb827202a2d997a375e160a71eb2888a925aac1/pathspec-1.1.1.tar.gz", hash = "sha256:17db5ecd524104a120e173814c90367a96a98d07c45b2e10c2f3919fff91bf5a", size = 135180, upload-time = "2026-04-27T01:46:08.907Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/f1/d9/7fb5aa316bc299258e68c73ba3bddbc499654a07f151cba08f6153988714/pathspec-1.1.1-py3-none-any.whl", hash = "sha256:a00ce642f577bf7f473932318056212bc4f8bfdf53128c78bbd5af0b9b20b189", size = 57328, upload-time = "2026-04-27T01:46:07.06Z" },
 ]
 
 [[package]]

@@ -1294,16 +1294,6 @@ class TestRunsStartupOutcome:
 
         assert self._outcome(db_path, 'run-1') == (None, None)
 
-    def test_startup_completed_at_is_stored_as_utc_text(self, tmp_path):
-        store, db_path = self._started(tmp_path)
-        completed = datetime(2026, 11, 15, 1, 2, 3, tzinfo=timezone(timedelta(hours=2)))
-
-        store.finish_run(
-            'run-1', _sample_report(), startup_completed_at=completed, exit_reason=None,
-        )
-
-        assert self._outcome(db_path, 'run-1') == ('2026-11-14T23:02:03+00:00', None)
-
     @pytest.mark.parametrize(
         ('reason', 'stored'),
         [(RunExitReason.startup_crash('2e'), 'startup_crash:2e'), (RunExitReason.cancelled(), 'cancelled')],
@@ -1328,13 +1318,35 @@ class TestRunsStartupOutcome:
         assert kind.value in str(raised.value)
         assert repr(site) in str(raised.value)
 
-    def test_a_naive_startup_completed_at_is_refused(self, tmp_path):
+    def test_mark_startup_completed_stores_utc_text_and_leaves_the_run_open(self, tmp_path):
+        store, db_path = self._started(tmp_path)
+        completed = datetime(2026, 11, 15, 1, 2, 3, tzinfo=timezone(timedelta(hours=2)))
+
+        store.mark_startup_completed('run-1', completed)
+
+        assert self._outcome(db_path, 'run-1') == ('2026-11-14T23:02:03+00:00', None)
+        conn = sqlite3.connect(str(db_path))
+        try:
+            (completed_at,) = conn.execute(
+                'SELECT completed_at FROM runs WHERE run_id = ?', ('run-1',),
+            ).fetchone()
+        finally:
+            conn.close()
+        assert completed_at is None
+
+    def test_mark_startup_completed_refuses_a_naive_instant(self, tmp_path):
         store, _db_path = self._started(tmp_path)
 
         with pytest.raises(ValueError, match='timezone-aware'):
-            store.finish_run(
-                'run-1', _sample_report(), startup_completed_at=datetime(2026, 11, 15),
-            )
+            store.mark_startup_completed('run-1', datetime(2026, 11, 15))
+
+    def test_finish_run_leaves_a_stamped_startup_completed_at_alone(self, tmp_path):
+        store, db_path = self._started(tmp_path)
+        store.mark_startup_completed('run-1', datetime(2026, 11, 15, 1, 2, 3, tzinfo=UTC))
+
+        store.finish_run('run-1', _sample_report(), exit_reason=RunExitReason.cancelled())
+
+        assert self._outcome(db_path, 'run-1') == ('2026-11-15T01:02:03+00:00', 'cancelled')
 
 
 class TestGetTaskOutcome:

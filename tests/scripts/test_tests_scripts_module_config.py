@@ -384,18 +384,21 @@ def test_executed_for_touched_is_hermetic_against_the_ambient_orch_config_path(
     )
 
 
-# The WORST run on record of the SERIAL form of this module's test_command
-# (without `-n auto --dist loadgroup`): the form verify's ENV_TRANSIENT recovery
-# re-runs under the same per-command budget. Every run behind this figure, each
-# labelled by the command that produced it, and the sizing rule are recorded
-# ONCE, in the MEASUREMENT PROVENANCE block above verify_command_timeout_secs in
+# The WORST GREEN run on record of this module's test_command in EITHER form:
+# the verbatim PARALLEL form (`-n auto --dist loadgroup`) or the SERIAL form,
+# which verify's ENV_TRANSIENT recovery re-runs under the same per-command
+# budget, so the budget must never be sized below the serial worst either.
+# Since task 11824 it is a parallel-form archive run, above every serial run
+# recorded. Every run behind this figure, each labelled by the command that
+# produced it, and the sizing rule are recorded ONCE, in the MEASUREMENT
+# PROVENANCE block above verify_command_timeout_secs in
 # tests/scripts/orchestrator.yaml. Read them there rather than copying them here.
-MEASURED_SUITE_WORST_SECS = 397.47
+MEASURED_SUITE_WORST_SECS = 735.0351408086717
 # DERIVED from the measurement above, never hand-set beside it, so the two
 # cannot silently diverge again — see module_budget_family.min_budget's docstring
 # for the rot that motivated this and
 # test_min_module_budget_is_derived_from_the_measured_worst_run for the guard
-# that makes it a property here. 2 * 397.47 -> 794.94 -> 700.
+# that makes it a property here.
 #
 # CORRECTED IN PLACE (task 4320): this used to call a LOCAL `_min_budget` copy
 # defined a few lines above, one of three spellings of a single derivation
@@ -527,8 +530,9 @@ def test_tests_scripts_module_carries_its_own_tight_verify_budget(
 
     - Below (b): at least ``MIN_MODULE_BUDGET_SECS``, which is not a literal
       but ``min_budget(MEASURED_SUITE_WORST_SECS)`` — ~2x the worst RECORDED
-      run of the SERIAL form of this module's test_command (the form verify's
-      ENV_TRANSIENT recovery runs), floored to the nearest 100s.
+      green run of this module's test_command in EITHER form (the verbatim
+      parallel form, or the serial form verify's ENV_TRANSIENT recovery re-runs
+      under the same budget), floored to the nearest 100s.
       An achievable floor derived from measurement, not a guess, and derived
       rather than transcribed so it cannot fall out of step with the figure it
       is derived from.
@@ -568,8 +572,8 @@ def test_tests_scripts_module_carries_its_own_tight_verify_budget(
         f'{MODULE_PREFIX}/orchestrator.yaml declares no '
         'verify_command_timeout_secs (task 3350), so this suite silently '
         'inherits the repo-root whole-fleet ceiling — the budget sized for '
-        'seven subprojects, applied to a suite whose worst RECORDED run of the '
-        f'serial form of its own test_command is {MEASURED_SUITE_WORST_SECS}s'
+        'seven subprojects, applied to a suite whose worst RECORDED green run of '
+        f'its own test_command, in either form, is {MEASURED_SUITE_WORST_SECS}s'
     )
 
     # (b) Measurement-derived floor — DERIVED by min_budget from
@@ -579,8 +583,9 @@ def test_tests_scripts_module_carries_its_own_tight_verify_budget(
         f'{mc.verify_command_timeout_secs} is below the '
         f'{MIN_MODULE_BUDGET_SECS}s floor (task 3350). That floor is not a '
         f'literal: it is min_budget(MEASURED_SUITE_WORST_SECS='
-        f'{MEASURED_SUITE_WORST_SECS}), ~2x the worst RECORDED run of the '
-        "SERIAL form of this module's test_command floored to the nearest 100s "
+        f'{MEASURED_SUITE_WORST_SECS}), ~2x the worst RECORDED green run of '
+        "this module's test_command in EITHER form (parallel or serial), floored "
+        'to the nearest 100s '
         "— see tests/scripts/orchestrator.yaml's MEASUREMENT PROVENANCE block "
         'for every run behind it. A budget '
         'under the floor would manufacture infra_timeout on the honest green '

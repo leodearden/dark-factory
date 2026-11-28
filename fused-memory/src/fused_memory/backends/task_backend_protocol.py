@@ -89,6 +89,7 @@ class TaskBackendProtocol(Protocol):
         offset: int = 0,
         tag: str | None = None,
         include_value: bool = False,
+        include_rows: bool = False,
     ) -> MetadataLookupResult:
         """One page of tasks whose top-level ``metadata[key]`` matches; see plans/task-metadata-lookup-prd.md."""
         ...

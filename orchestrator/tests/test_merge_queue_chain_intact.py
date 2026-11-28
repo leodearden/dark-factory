@@ -31,6 +31,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from _git_fixtures import seed_repo
 from _merge_lane_fakes import VerifyTasks, lane_scene_config
 from _merge_lane_fakes import verifies as verifies
 
@@ -73,24 +74,13 @@ from orchestrator.merge_lane.worker import (
 )
 from orchestrator.verify_runner import HostLease
 
-# ── Fixtures (mirrored from test_merge_queue_verify_base_invariant.py) ────────
-
-
-async def _setup_repo(repo: Path) -> None:
-    await _run(['git', 'init', '-b', 'main'], cwd=repo)
-    await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=repo)
-    await _run(['git', 'config', 'user.name', 'Test'], cwd=repo)
-    (repo / 'README.md').write_text('# Test\n')
-    await _run(['git', 'add', '-A'], cwd=repo)
-    await _run(['git', 'commit', '-m', 'Initial commit'], cwd=repo)
+# ── Fixtures (git_repo seeds via seed_repo; the rest mirror
+#    test_merge_queue_verify_base_invariant.py) ──────────────────────────────
 
 
 @pytest.fixture
 def git_repo(tmp_path: Path) -> Path:
-    repo = tmp_path / 'repo'
-    repo.mkdir()
-    asyncio.run(_setup_repo(repo))
-    return repo
+    return seed_repo(tmp_path / 'repo')
 
 
 @pytest.fixture

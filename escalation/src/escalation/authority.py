@@ -108,6 +108,10 @@ ROLE_LEVEL_ALLOWLIST: dict[str, frozenset[int]] = {
     EXECUTOR_IDENTITY: frozenset({0, 1, 2}),
 }
 
+# Identities refused when they assert ruled_by_human=True: neither seat is a
+# human (plans/instruments-honesty-prd.md decision 9).
+RULED_BY_HUMAN_FORBIDDEN: frozenset[str] = frozenset({_WATCHER_AUTO_IDENTITY, EXECUTOR_IDENTITY})
+
 # Identities permitted to mint a new L2 via promote_to_l2. Header-less
 # (absent identity) callers are unaffected — this only gates identified
 # callers not in this set. The coordinator is a member because PRD §3

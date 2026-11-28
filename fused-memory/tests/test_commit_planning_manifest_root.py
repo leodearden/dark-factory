@@ -7,17 +7,14 @@ branch that holds a PRD family not yet on main.
 
 from __future__ import annotations
 
-import contextlib
-from collections.abc import AsyncIterator, Callable
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
-from unittest.mock import AsyncMock, patch
 
 import pytest
 import yaml
-from _fastmcp_tool_result import tool_result_dict
 from _fm_git_repos import _init_git_repo, git_stdout
-from _hermetic_task_stack import hermetic_task_stack
+from _hermetic_task_stack import HermeticTaskStack, hermetic_task_stack
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 pytestmark = [pytest.mark.asyncio, pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)]
@@ -71,24 +68,8 @@ def write_prd_family(root: Path, stem: str, label: str) -> Path:
     return sidecar
 
 
-@contextlib.asynccontextmanager
-async def task_stack(main: Path) -> AsyncIterator[Any]:
-    """The hermetic MCP server over *main*, its corpus indexing stubbed out.
-
-    A ``pending`` commit indexes the batch into the curator corpus, which
-    reaches a live embedder; that is not this file's subject.
-    """
-    async with hermetic_task_stack(main) as (server, interceptor):
-        with patch.object(interceptor, 'index_committed_tasks', AsyncMock()):
-            yield server
-
-
-async def call(server: Any, tool: str, args: dict[str, Any]) -> dict[str, Any]:
-    return tool_result_dict(await server._tool_manager.call_tool(tool, args))
-
-
-async def submit_planned(server: Any, root: Path, metadata: dict[str, Any]) -> str:
-    submitted = await call(server, 'submit_task', {
+async def submit_planned(stack: HermeticTaskStack, root: Path, metadata: dict[str, Any]) -> str:
+    submitted = await stack.call('submit_task', {
         'project_root': str(root),
         'title': f"Producer for {metadata.get('prd_task_label')}",
         'planning_mode': True,
@@ -110,10 +91,10 @@ async def test_prd_family_only_in_a_worktree_is_stamped_there(
     git_stdout(wt, 'add', '-A')
     git_stdout(wt, 'commit', '-q', '--no-verify', '-m', 'prd: foo')
 
-    async with task_stack(main) as server:
-        task_id = await submit_planned(server, main, _producer_metadata())
+    async with hermetic_task_stack(main) as stack:
+        task_id = await submit_planned(stack, main, _producer_metadata())
 
-        result = await call(server, 'commit_planning', {
+        result = await stack.call('commit_planning', {
             'project_root': str(main), 'task_ids': task_id, 'manifest_root': str(wt),
         })
 
@@ -121,7 +102,7 @@ async def test_prd_family_only_in_a_worktree_is_stamped_there(
             'path': _SIDECAR_REL, 'stamped': ['alpha'], 'missing_labels': [], 'errors': [],
         }, result
         assert 'manifest_stamping_action_required' not in result
-        task = await call(server, 'get_task', {'id': task_id, 'project_root': str(main)})
+        task = await stack.call('get_task', {'id': task_id, 'project_root': str(main)})
         assert task['status'] == 'pending'
         assert [check['name'] for check in task['metadata']['delivered_checks']] == [_CHECK_NAME]
 
@@ -136,12 +117,12 @@ CaseBuilder = Callable[[Path, Path, Path], tuple[str, list[Path]]]
 
 
 async def assert_refused_before_anything(
-    server: Any, root: Path, task_id: str, result: dict[str, Any], reason_code: str,
+    stack: HermeticTaskStack, root: Path, task_id: str, result: dict[str, Any], reason_code: str,
 ) -> None:
     assert result.get('error_type') == 'ManifestRootRefused', result
     assert result['reason_code'] == reason_code, result
     assert 'manifest_stamping' not in result
-    task = await call(server, 'get_task', {'id': task_id, 'project_root': str(root)})
+    task = await stack.call('get_task', {'id': task_id, 'project_root': str(root)})
     assert task['status'] == 'deferred'
     assert 'delivered_checks' not in task['metadata']
 
@@ -201,15 +182,15 @@ async def test_manifest_root_that_is_not_a_worktree_of_the_repo_is_refused(
     manifest_root, sidecars = build_case(tmp_path, main, wt)
     snapshot = {sidecar: sidecar.read_bytes() for sidecar in sidecars}
 
-    async with task_stack(main) as server:
-        task_id = await submit_planned(server, main, _producer_metadata())
+    async with hermetic_task_stack(main) as stack:
+        task_id = await submit_planned(stack, main, _producer_metadata())
 
-        result = await call(server, 'commit_planning', {
+        result = await stack.call('commit_planning', {
             'project_root': str(main), 'task_ids': task_id, 'target_status': target_status,
             'manifest_root': manifest_root,
         })
 
-        await assert_refused_before_anything(server, main, task_id, result, reason_code)
+        await assert_refused_before_anything(stack, main, task_id, result, reason_code)
         assert manifest_root in result['error']
 
     assert {sidecar: sidecar.read_bytes() for sidecar in sidecars} == snapshot
@@ -224,14 +205,14 @@ async def test_manifest_root_is_refused_when_project_root_is_not_a_git_checkout(
     sidecar = write_prd_family(wt, 'foo', 'alpha')
     snapshot = sidecar.read_bytes()
 
-    async with task_stack(store) as server:
-        task_id = await submit_planned(server, store, _producer_metadata())
+    async with hermetic_task_stack(store) as stack:
+        task_id = await submit_planned(stack, store, _producer_metadata())
 
-        result = await call(server, 'commit_planning', {
+        result = await stack.call('commit_planning', {
             'project_root': str(store), 'task_ids': task_id, 'manifest_root': str(wt),
         })
 
-        await assert_refused_before_anything(server, store, task_id, result, 'other_repository')
+        await assert_refused_before_anything(stack, store, task_id, result, 'other_repository')
         assert f'project_root {str(store)!r} is not a git checkout' in result['error']
 
     assert sidecar.read_bytes() == snapshot
@@ -244,16 +225,16 @@ async def test_manifest_root_is_refused_when_git_cannot_run(
     sidecar = write_prd_family(wt, 'foo', 'alpha')
     snapshot = sidecar.read_bytes()
 
-    async with task_stack(main) as server:
-        task_id = await submit_planned(server, main, _producer_metadata())
+    async with hermetic_task_stack(main) as stack:
+        task_id = await submit_planned(stack, main, _producer_metadata())
 
         with monkeypatch.context() as env:
             env.setenv('PATH', str(tmp_path / 'no-git-here'))
-            result = await call(server, 'commit_planning', {
+            result = await stack.call('commit_planning', {
                 'project_root': str(main), 'task_ids': task_id, 'manifest_root': str(wt),
             })
 
-        await assert_refused_before_anything(server, main, task_id, result, 'probe_failed')
+        await assert_refused_before_anything(stack, main, task_id, result, 'probe_failed')
 
     assert sidecar.read_bytes() == snapshot
 
@@ -268,10 +249,10 @@ async def test_absent_sidecar_is_reported_with_the_root_searched(
     if searched == 'wt':
         args['manifest_root'] = str(wt)
 
-    async with task_stack(main) as server:
-        task_id = await submit_planned(server, main, _producer_metadata())
+    async with hermetic_task_stack(main) as stack:
+        task_id = await submit_planned(stack, main, _producer_metadata())
 
-        result = await call(server, 'commit_planning', {**args, 'task_ids': task_id})
+        result = await stack.call('commit_planning', {**args, 'task_ids': task_id})
 
         assert result['manifest_stamping'] == {
             'path': None,
@@ -281,7 +262,7 @@ async def test_absent_sidecar_is_reported_with_the_root_searched(
             'sidecar_not_found': {'root': str(root.resolve()), 'paths': [_SIDECAR_REL]},
         }, result
         assert 'manifest_stamping_action_required' not in result
-        task = await call(server, 'get_task', {'id': task_id, 'project_root': str(main)})
+        task = await stack.call('get_task', {'id': task_id, 'project_root': str(main)})
         assert task['status'] == 'pending'
 
 
@@ -291,13 +272,13 @@ async def test_absent_sidecar_beside_a_found_one_is_reported(
     main, wt = repo_layout
     write_prd_family(wt, 'foo', 'alpha')
 
-    async with task_stack(main) as server:
-        alpha = await submit_planned(server, main, _producer_metadata(label='alpha'))
+    async with hermetic_task_stack(main) as stack:
+        alpha = await submit_planned(stack, main, _producer_metadata(label='alpha'))
         beta = await submit_planned(
-            server, main, _producer_metadata(prd_path='plans/bar-prd.md', label='beta'),
+            stack, main, _producer_metadata(prd_path='plans/bar-prd.md', label='beta'),
         )
 
-        result = await call(server, 'commit_planning', {
+        result = await stack.call('commit_planning', {
             'project_root': str(main), 'task_ids': f'{alpha},{beta}', 'manifest_root': str(wt),
         })
 

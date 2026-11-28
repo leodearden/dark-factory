@@ -11,9 +11,14 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 from _git_root_helper import make_git_root
+from _invocation_ledger import invocation_rows
+from _invocation_tokens import LEDGER_TOKENS, agent_result_with_tokens
 from shared.cli_invoke import AgentResult
+from shared.cost_store import CostStore
+from shared.testing import make_gate_mock
 
 from fused_memory.config.schema import ReconciliationConfig
+from fused_memory.models.invocation_ledger import InvocationLedger, LedgerRole
 from fused_memory.reconciliation.verify import CodebaseVerifier
 
 
@@ -126,3 +131,68 @@ async def test_no_ambient_settings_file_can_widen_the_read_confinement(git_root)
     kwargs = await _verify_cli_kwargs(git_root)
     assert kwargs['setting_sources'] == []
     assert not kwargs.get('allowed_tools')
+
+
+async def _verify_with_ledger(tmp_path, git_root, served: AgentResult):
+    config = ReconciliationConfig(agent_llm_provider='claude_cli')
+    db_path = tmp_path / 'curator_events.db'
+    async with CostStore(db_path) as store:
+        ledger = InvocationLedger(store, LedgerRole.RECON_VERIFY, 'run-v', 'proj-v')
+        with patch('shared.cli_invoke.invoke_claude_agent', new=AsyncMock(return_value=served)):
+            result = await CodebaseVerifier(config).verify(
+                claim='a.py defines x', codebase_root=git_root, ledger=ledger,
+            )
+    return config, result, await invocation_rows(db_path)
+
+
+@pytest.mark.asyncio
+async def test_a_verify_lands_one_invocations_row(tmp_path, git_root):
+    served = agent_result_with_tokens(
+        success=True,
+        structured_output={'verdict': 'confirmed', 'confidence': 0.9, 'evidence': [], 'summary': 's'},
+        cost_usd=0.11,
+    )
+
+    config, result, rows = await _verify_with_ledger(tmp_path, git_root, served)
+
+    assert result.verdict == 'confirmed'
+    assert len(rows) == 1
+    row = rows[0]
+    assert row['role'] == 'recon_verify'
+    assert row['run_id'] == 'run-v'
+    assert row['project_id'] == 'proj-v'
+    assert row['model'] == config.agent_llm_model
+    assert {key: row[key] for key in LEDGER_TOKENS} == LEDGER_TOKENS
+
+
+@pytest.mark.asyncio
+async def test_an_audited_max_turns_failure_still_lands_a_row(tmp_path, git_root):
+    exhausted = agent_result_with_tokens(success=False, subtype='error_max_turns')
+
+    _config, result, rows = await _verify_with_ledger(tmp_path, git_root, exhausted)
+
+    assert len(rows) == 1
+    assert result.agent_failed is True
+
+
+@pytest.mark.asyncio
+async def test_a_verifier_given_a_usage_gate_dispatches_on_the_pooled_account_token(git_root):
+    """Only invoke_claude_agent is patched, so invoke_with_cap_retry's real
+    gated branch runs: the CLI must authenticate on the gate's pooled account,
+    never on the ambient ~/.claude login (task 11783)."""
+    gate = make_gate_mock(before_invoke=AsyncMock(return_value='pooled-token'))
+    served = AgentResult(
+        success=True,
+        output='',
+        structured_output={'verdict': 'confirmed', 'confidence': 1.0, 'evidence': [], 'summary': 's'},
+    )
+    with patch('shared.cli_invoke.invoke_claude_agent', autospec=True, return_value=served) as mock_agent:
+        result = await CodebaseVerifier(ReconciliationConfig(), usage_gate=gate).verify(
+            claim='x.py defines x', codebase_root=git_root,
+        )
+
+    mock_agent.assert_called_once()
+    assert mock_agent.call_args.kwargs['oauth_token'] == 'pooled-token'
+    gate.confirm_account_ok.assert_called_once_with('pooled-token')
+    assert result.verdict == 'confirmed'
+    assert result.agent_failed is False

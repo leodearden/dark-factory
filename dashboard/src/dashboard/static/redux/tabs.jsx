@@ -30,13 +30,18 @@ const { projectCensus, censusOver, projectRows, viewRows, terminalSelectingProje
 // Windowed headers are labelled from the payload's served-window echo — window_chip.js.
 const { windowEcho, windowLabel, recentMergesCaption } = window.DF_WINDOW_CHIP;
 const {
-  projectInQueue, inQueueOver, inQueueHistory, latencyCaption, depthBucketCaption,
+  projectInQueue, inQueueOver, inQueueHistory, latencyCaption,
   queuedSince, projectSpeculative, speculativeOver, hitRateText, recentTotal,
-  attemptCount, attemptsOver, attemptsHistory, worstP95Over, projectAttempts, projectDepth, totalHint,
+  attemptCount, attemptsOver, attemptsHistory, worstP95Over, projectAttempts, totalHint,
+  projectLandingRate, landingRateCaption, landingRateReading,
 } = window.DF_MERGE_QUEUE;
-const { writeQueue, queueHint, newestHourOps, opsTotals, opsCaption, opsTotalText } = window.DF_MEMORY_READINGS;
+const { writeQueue, queueHint, newestHourOps, opsTotals, opsCaption, opsTotalText, planRoute, planRouteText, planRouteHealth } = window.DF_MEMORY_READINGS;
+// The one health -> tone mapping the Overview's rows read too — system_health.js.
+const { healthTone } = window.DF_SYSTEM_HEALTH;
 // PerfTab reads the served cards, and why a tile over them is empty — performance_cards.js.
 const { projectCards, cardsAbsentReason, cardsShortfall } = window.DF_PERFORMANCE_CARDS;
+// PerfTab reads each project's hourly series, and their mean sparks — performance_history.js.
+const { projectHistory, meanHistorySpark } = window.DF_PERFORMANCE_HISTORY;
 const { useState: uS } = React;
 // The persisted UI-preference hooks — persisted_state.js.
 const { createPersistedHooks } = window.DF_PERSISTED_STATE;
@@ -94,7 +99,8 @@ const fmtAgeSecs = secs => {
 
 // ── Cross-project aggregation helpers (no synthetic fallbacks) ──
 // PERFORMANCE is keyed by project: a served `cards` Datum (paths/escalation/hist/ttc)
-// plus three *_history series. These return null when there's no data (UI renders '—').
+// beside one history_labels axis its series align to, read through performance_history.js.
+// These return null when there's no data (UI renders '—').
 // A project whose cards Datum is a hole has no block, so it carries no weight.
 const cardBlocks = perf => Object.values(perf || {}).map(p => p.cards?.value).filter(Boolean);
 function _weightedMean(samples) {
@@ -407,7 +413,7 @@ function OrchTab({ projectFilter, search }) {
                   <div>
                     <div style={{ fontSize: 11, color: 'var(--fg-3)', marginBottom: 4 }}>Started · {o.started}</div>
                     <div style={{ fontSize: 11, color: 'var(--fg-3)', marginBottom: 4 }}>Updated · {window.DF_SHELL.timeago(o.last_update)}</div>
-                    <div style={{ fontSize: 11, color: 'var(--fg-3)', marginBottom: 4 }}>Completed / day · {windowLabel(windowEcho(DF.__receipt, EP.burndown))}</div>
+                    <div style={{ fontSize: 11, color: 'var(--fg-3)', marginBottom: 4 }}>Closed / day (any path: gates, recon and bulk closes included) · {windowLabel(windowEcho(DF.__receipt, EP.burndown))}</div>
                     <div style={{ height: 50 }}><SP values={DF.BURNDOWN_BY_PROJECT[o.project]?.completed_per_day?.values || []} color={CP.accent} /></div>
                   </div>
                 </div>
@@ -444,65 +450,10 @@ function PerfTab({ projectFilter }) {
             : <span title={shortfall}>{hint} · partial fleet</span>);
           const countHint = value => (value == null ? null : `${totalTasks} tasks (window)`);
           const fmtPct = v => `${v.toFixed(1)}`;
-          // Aggregate historical sparks across the in-scope projects.
-          // Per-project hour buckets must be aligned by label before summing.
-          const histKeys = Object.keys(subset);
-          const buildAggSpark = field => {
-            const bucketMap = {};
-            histKeys.forEach(pid => {
-              const h = subset[pid][field] || { labels: [], values: [], p50: [], p95: [] };
-              const labels = h.labels || [];
-              const values = field === 'time_centiles_history' ? (h.p95 || []) : (h.values || []);
-              labels.forEach((lbl, i) => {
-                bucketMap[lbl] = (bucketMap[lbl] || 0) + (values[i] || 0);
-              });
-            });
-            return Object.keys(bucketMap).sort().map(k => bucketMap[k]);
-          };
-          const buildP50Spark = () => {
-            const bucketMap = {};
-            histKeys.forEach(pid => {
-              const h = subset[pid].time_centiles_history || { labels: [], p50: [] };
-              (h.labels || []).forEach((lbl, i) => {
-                // For ttc: average across projects per bucket (medians don't sum).
-                bucketMap[lbl] = bucketMap[lbl] || { sum: 0, n: 0 };
-                bucketMap[lbl].sum += (h.p50 || [])[i] || 0;
-                bucketMap[lbl].n += 1;
-              });
-            });
-            return Object.keys(bucketMap).sort()
-              .map(k => Math.round(bucketMap[k].sum / Math.max(1, bucketMap[k].n)));
-          };
-          const buildP95Spark = () => {
-            const bucketMap = {};
-            histKeys.forEach(pid => {
-              const h = subset[pid].time_centiles_history || { labels: [], p95: [] };
-              (h.labels || []).forEach((lbl, i) => {
-                bucketMap[lbl] = bucketMap[lbl] || { sum: 0, n: 0 };
-                bucketMap[lbl].sum += (h.p95 || [])[i] || 0;
-                bucketMap[lbl].n += 1;
-              });
-            });
-            return Object.keys(bucketMap).sort()
-              .map(k => Math.round(bucketMap[k].sum / Math.max(1, bucketMap[k].n)));
-          };
-          const buildPctSpark = field => {
-            const bucketMap = {};
-            histKeys.forEach(pid => {
-              const h = subset[pid][field] || { labels: [], values: [] };
-              (h.labels || []).forEach((lbl, i) => {
-                bucketMap[lbl] = bucketMap[lbl] || { sum: 0, n: 0 };
-                bucketMap[lbl].sum += (h.values || [])[i] || 0;
-                bucketMap[lbl].n += 1;
-              });
-            });
-            return Object.keys(bucketMap).sort()
-              .map(k => Math.round(bucketMap[k].sum / Math.max(1, bucketMap[k].n) * 10) / 10);
-          };
-          const p50Spark = buildP50Spark();
-          const p95Spark = buildP95Spark();
-          const onePassSpark = buildPctSpark('one_pass_history');
-          const escalationSpark = buildPctSpark('escalation_history');
+          const p50Spark = meanHistorySpark(subset, 'p50');
+          const p95Spark = meanHistorySpark(subset, 'p95');
+          const onePassSpark = meanHistorySpark(subset, 'one_pass');
+          const escalationSpark = meanHistorySpark(subset, 'escalation');
           return (
             <>
               <ST label="p50 time-to-completion"
@@ -523,7 +474,6 @@ function PerfTab({ projectFilter }) {
       <div className="col-span-12"><GroupAllToggle allOpen={allOpen} onSetAll={setAll} /></div>
 
       {projects.map(pid => {
-        const p = DF.PERFORMANCE[pid];
         const cards = projectCards(DF, pid);
         const block = cards.value;
         const summary = (
@@ -586,8 +536,8 @@ function PerfTab({ projectFilter }) {
                       ))}
                     </div>
                     {(() => {
-                      const h = p.time_centiles_history || { labels: [], p50: [], p95: [] };
-                      if (!h.labels || h.labels.length < 2) {
+                      const h = projectHistory(DF.PERFORMANCE, pid);
+                      if (h.labels.length < 2) {
                         return (
                           <div style={{ fontSize: 10, color: 'var(--fg-3)' }}>
                             ttc trend — not enough history yet
@@ -635,6 +585,7 @@ function PerfTab({ projectFilter }) {
 // ── Memory ──
 function MemoryTab({ projectFilter, onNavigate }) {
   const queue = writeQueue(DF);
+  const route = planRoute(DF);
   const projects = Object.entries(DF.MEMORY_STATUS.projects).filter(([pid]) => projectFilter.length === 0 || projectFilter.includes(pid));
   return (
     <div className="grid cols-12" style={{ gap: 12 }}>
@@ -653,6 +604,10 @@ function MemoryTab({ projectFilter, onNavigate }) {
         <ST label="fused-memory"
             datum={plainDatum(DF.MEMORY_STATUS.uptime_seconds, EP.memory)} format={secs => `up ${window.DF_SHELL.fmtUptime(secs)}`}
             hint={DF.MEMORY_STATUS.started_at || '—'} />
+      </div>
+
+      <div className="col-span-12 mono" data-testid="memory-plan-route" style={{ fontSize: 12, color: CP[healthTone(planRouteHealth(route))] }}>
+        <DatumReading datum={route} format={planRouteText} />
       </div>
 
       <div className="col-span-8 panel">
@@ -945,8 +900,8 @@ function MergeTab({ projectFilter }) {
         const speculative = projectSpeculative(DF, pid);
         const windowTotal = recentTotal(DF, pid);
         const attempts = projectAttempts(DF, pid);
-        const depth = projectDepth(DF, pid);
-        const depthSeries = depth.value;
+        const landingRate = projectLandingRate(DF, pid);
+        const rates = landingRate.value;
         const tried = attempts.value;
         const summary = (
           <>
@@ -962,9 +917,8 @@ function MergeTab({ projectFilter }) {
             <ProjectGroup id={pid} label={pid} open={openMap[pid]} onToggle={() => toggle(pid)} summary={summary}>
               <div className="grid cols-12 stack-narrow" style={{ gap: 12 }}>
                 <div className="col-span-7 panel">
-                  <DatumPanelHead title={`Merge attempts · ${depthBucketCaption(depthSeries)}`} datum={depth}
-                      reading={series => `peak ${Math.max(0, ...series.values)}/bucket`} />
-                  {depthSeries && <div className="panel-body"><LC labels={depthSeries.labels.map(String)} series={[{ values: depthSeries.values, color: CP.accent }]} height={180} countAxis formatX={window.DF_SHELL.fmtDateTime} /></div>}
+                  <DatumPanelHead title={`Throughput · ${landingRateCaption(rates)}`} datum={landingRate} reading={landingRateReading} />
+                  {rates && rates.values.length > 0 && <div className="panel-body"><LC labels={rates.labels.map(String)} series={[{ values: rates.values, color: CP.accent }]} height={180} formatX={window.DF_SHELL.fmtDateTime} /></div>}
                 </div>
 
                 <div className="col-span-5 panel">
@@ -1251,7 +1205,7 @@ function BurnTab({ projectFilter, displayWindow }) {
             deltaDir={pendingNow < pendingThen ? 'down' : 'up'}
             history={b.pending} sparkColor={CP.warn} />
         <ST label="Forecast clear" datum={burndownDatum(DF, b, 'forecast')} format={forecastText}
-            hint="7d vs lifetime velocity" history={b.pending} sparkColor={CP.ok} />
+            hint="backlog drain at the 7d vs lifetime close rate, not landings" history={b.pending} sparkColor={CP.ok} />
       </div>
 
       <div className="col-span-12" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
@@ -1350,7 +1304,7 @@ function BurnTab({ projectFilter, displayWindow }) {
                   <div className="panel-head"><span className="title">Velocity</span></div>
                   <div className="panel-body" style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
                     <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
-                      <div><div className="mono" style={{ fontSize: 22, color: CP.ok }}><DatumReading datum={pbLatest} format={r => r.velocity.toFixed(1)} /></div><div style={{ fontSize: 10, color: 'var(--fg-3)' }}>completed/day</div></div>
+                      <div><div className="mono" style={{ fontSize: 22, color: CP.ok }}><DatumReading datum={pbLatest} format={r => r.velocity.toFixed(1)} /></div><div style={{ fontSize: 10, color: 'var(--fg-3)' }}>closed/day (any path)</div></div>
                       <div><div className="mono" style={{ fontSize: 22, color: CP.warn }}><DatumReading datum={pbLatest} format={r => r.counts.pending} /></div><div style={{ fontSize: 10, color: 'var(--fg-3)' }}>pending now</div></div>
                     </div>
                     <div>

@@ -11,13 +11,22 @@ orchestrator, fused-memory and the dashboard all run code that defines it.
 ``snapshot_at is None`` means no producer has written a snapshot.
 Contract: plans/review-all-s14-shared-leaves-prd.md (decision 12, invariant I4,
 INV-13).
+
+``read_scheduler_state_checked`` is the one cross-checked reader of the pause
+fact: it serves the snapshot as a cache over the runs.db ``scheduler_state``
+row, which is that fact's home.
 """
 
 from __future__ import annotations
 
+import json
+import logging
+import sqlite3
 from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import datetime
-from typing import Any
+from pathlib import Path
+from typing import Any, Self
 
 from pydantic import (
     AwareDatetime,
@@ -29,14 +38,21 @@ from pydantic import (
     field_serializer,
 )
 
+from shared.project_layout import StrPath, runs_db, scheduler_state_json
+
 __all__ = [
+    'CheckedSchedulerState',
     'MalformedSnapshotError',
     'OverrideRecord',
     'ParkRecord',
+    'PauseRow',
     'PinQueueEntry',
     'RequeueCooldown',
     'SchedulerStateSnapshot',
+    'read_scheduler_state_checked',
 ]
+
+logger = logging.getLogger(__name__)
 
 _RECORD_CONFIG = ConfigDict(frozen=True, extra='ignore')
 
@@ -44,7 +60,7 @@ _EXCLUSIVE = 1
 
 
 class MalformedSnapshotError(ValueError):
-    """The input to ``SchedulerStateSnapshot.from_json`` is not a snapshot's wire form."""
+    """The input to ``SchedulerStateSnapshot.from_json`` or ``from_bytes`` is not a snapshot's wire form."""
 
 
 class ParkRecord(BaseModel):
@@ -145,7 +161,7 @@ class SchedulerStateSnapshot(BaseModel):
         return cls()
 
     @classmethod
-    def from_json(cls, data: Mapping[str, Any]) -> SchedulerStateSnapshot:
+    def from_json(cls, data: Mapping[str, Any]) -> Self:
         """Parse a snapshot's wire form; unknown keys are ignored.
 
         Raises MalformedSnapshotError when *data* does not have the snapshot's shape.
@@ -154,6 +170,19 @@ class SchedulerStateSnapshot(BaseModel):
             return cls.model_validate(data)
         except ValidationError as exc:
             raise MalformedSnapshotError(str(exc)) from exc
+
+    @classmethod
+    def from_bytes(cls, raw: bytes) -> Self:
+        """Parse the bytes of ``scheduler_state.json``.
+
+        Raises MalformedSnapshotError when *raw* is not JSON text holding a
+        snapshot's wire form.
+        """
+        try:
+            data = json.loads(raw)
+        except (json.JSONDecodeError, UnicodeDecodeError, RecursionError) as exc:
+            raise MalformedSnapshotError(str(exc)) from exc
+        return cls.from_json(data)
 
     def to_json(self) -> dict[str, Any]:
         return self.model_dump(mode='json')
@@ -189,3 +218,120 @@ class SchedulerStateSnapshot(BaseModel):
         published, so an older producer reads as it always did.
         """
         return self.holder_limits.get(key, _EXCLUSIVE)
+
+
+class PauseRow(BaseModel):
+    """The runs.db ``scheduler_state`` row, as its raw stored strings."""
+
+    model_config = _RECORD_CONFIG
+
+    reason: str
+    pause_at: str
+    pause_class: str | None = None
+
+
+class CheckedSchedulerState(SchedulerStateSnapshot):
+    """The snapshot cross-checked against the runs.db pause row.
+
+    ``is_paused``, ``pause_reason`` and ``pause_class`` are the SERVED verdict:
+    the pause fact's home is the runs.db row, and the JSON snapshot is a cache
+    of it. ``pause_row`` is the row as read, ``None`` when there is none or it
+    is unreadable. Contract: plans/instruments-honesty-prd.md (decision 5,
+    §Contract "Scheduler state reader").
+    """
+
+    snapshot_age_s: float | None = None
+    pause_row: PauseRow | None = None
+    pause_disagreement: bool = False
+
+
+@dataclass(frozen=True)
+class _PauseRowRead:
+    readable: bool
+    row: PauseRow | None = None
+
+
+_PAUSE_ROWS_LATEST_FIRST = (
+    'SELECT project_id, pause_reason, pause_at, pause_class FROM scheduler_state '
+    'ORDER BY pause_at DESC'
+)
+
+
+def read_scheduler_state_checked(root: StrPath, *, now: datetime) -> CheckedSchedulerState:
+    """The scheduler state of the project at *root*, its pause verdict cross-checked.
+
+    The snapshot is read from ``scheduler_state.json`` and the pause row from
+    runs.db, opened read-only so the reader never creates or writes it. When
+    the row is readable and the snapshot is unreadable or disagrees with it,
+    the row's verdict is served. Unreadable inputs are logged, never raised.
+
+    Raises:
+        ValueError: *now* is naive.
+    """
+    if now.tzinfo is None:
+        raise ValueError(f'now must be timezone-aware; got naive {now.isoformat()!r}')
+    snapshot = _read_snapshot(scheduler_state_json(root))
+    row_read = _read_pause_row(runs_db(root))
+    served = snapshot if snapshot is not None else CheckedSchedulerState()
+    disagreement = (
+        snapshot is not None
+        and row_read.readable
+        and snapshot.is_paused != (row_read.row is not None)
+    )
+    update: dict[str, Any] = {
+        'snapshot_age_s': (
+            (now - served.snapshot_at).total_seconds() if served.snapshot_at is not None else None
+        ),
+        'pause_row': row_read.row,
+        'pause_disagreement': disagreement,
+    }
+    if row_read.readable and (snapshot is None or disagreement):
+        row = row_read.row
+        update['is_paused'] = row is not None
+        update['pause_reason'] = row.reason if row is not None else None
+        update['pause_class'] = row.pause_class if row is not None else None
+    return served.model_copy(update=update)
+
+
+def _read_snapshot(path: Path) -> CheckedSchedulerState | None:
+    try:
+        raw = path.read_bytes()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        logger.warning('scheduler snapshot %s is unreadable: %s', path, exc)
+        return None
+    try:
+        return CheckedSchedulerState.from_bytes(raw)
+    except MalformedSnapshotError as exc:
+        logger.warning('scheduler snapshot %s is not a snapshot: %s', path, exc)
+        return None
+
+
+def _read_pause_row(path: Path) -> _PauseRowRead:
+    if not path.exists():
+        return _PauseRowRead(readable=False)
+    try:
+        conn = sqlite3.connect(f'{path.resolve().as_uri()}?mode=ro', uri=True)
+        try:
+            found = conn.execute(_PAUSE_ROWS_LATEST_FIRST).fetchall()
+        finally:
+            conn.close()
+    except sqlite3.Error as exc:
+        logger.warning('runs.db %s pause row is unreadable: %s', path, exc)
+        return _PauseRowRead(readable=False)
+    if not found:
+        return _PauseRowRead(readable=True)
+    if len(found) > 1:
+        logger.warning(
+            'runs.db %s holds pause rows for several project_ids %s; serving the latest, '
+            'though the orchestrator restores and clears only the row keyed on its configured project_id',
+            path, [project_id for project_id, *_ in found],
+        )
+    _, reason, pause_at, pause_class = found[0]
+    try:
+        row = PauseRow(reason=reason, pause_at=pause_at, pause_class=pause_class)
+    except ValidationError as exc:
+        logger.warning('runs.db %s pause row is malformed: %s', path, exc)
+        return _PauseRowRead(readable=False)
+    return _PauseRowRead(readable=True, row=row)

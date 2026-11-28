@@ -21,6 +21,7 @@ Harness mirrors ``test_workflow_skew_surfacing.py``'s ``_make_routing_workflow``
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -421,3 +422,113 @@ class TestPreStewardL0GateSignatureAware:
             f'open L1 must not suppress the steward-facing L0); got {submitted_escs}'
         )
         assert l0s[0].category == 'merge_error'
+
+
+_SCREEN_REASON = (
+    'Merge screen found 1 failing check on the merged tree: inline_suppressions: '
+    'scripts/x.py:3 adds a suppression with no debt or ratified owner'
+)
+
+
+def _screen_bounce() -> MergeOutcome:
+    return MergeOutcome(
+        'blocked',
+        reason=_SCREEN_REASON,
+        failure_category='merge_screen',
+        failure_cause_hint='inline_suppressions',
+        block_category=MergeBlockCategory.MERGE_SCREEN,
+    )
+
+
+def _l0_capturing_queue(submitted: list) -> MagicMock:
+    queue = MagicMock()
+    queue.has_open_l1 = MagicMock(return_value=False)
+    queue.make_id = MagicMock(return_value='esc-screen-1')
+    queue.submit = MagicMock(side_effect=submitted.append)
+    queue.get_by_task = MagicMock(return_value=[])
+    return queue
+
+
+class TestMergeScreenBounceSurfacing:
+    """A merge screen bounce (task 7919) files under ``merge_screen`` everywhere
+    the generic blocked path files a category, and thrashes like a verify failure."""
+
+    def test_the_review_l0_and_event_carry_the_merge_screen_category(self, tmp_path: Path) -> None:
+        config = _make_routing_config(tmp_path)
+        worktree = tmp_path / 'task-wt'
+        worktree.mkdir()
+        store = EventStore(tmp_path / 'runs.db', run_id='run-screen')
+        workflow = _make_routing_workflow(config, worktree, event_store=store)
+        submitted: list = []
+        merge_queue: asyncio.Queue = asyncio.Queue()
+        workflow.merge_queue = merge_queue
+        bounce = _screen_bounce()
+
+        with patch.object(
+            workflow, 'escalation_queue', new=_l0_capturing_queue(submitted),
+        ), patch.object(
+            workflow, '_ensure_steward_started', new=AsyncMock(return_value=None),
+        ), patch.object(
+            workflow, '_ensure_l1_escalation_for_blocked', new=AsyncMock(return_value=None),
+        ), patch.object(workflow, '_steward', new=None):
+            driven = asyncio.run(drive_merge(
+                workflow._submit_to_merge_queue('task/42', pre_rebased=False, merge_phase=True),
+                merge_queue,
+                bounce,
+            ))
+
+        assert driven.result == WorkflowOutcome.BLOCKED
+        assert workflow.artifacts is not None
+        review = json.loads(workflow.artifacts.artifact_path('reviews/merge.json').read_text())
+        assert [issue['category'] for issue in review['issues']] == ['merge_screen']
+        l0s = [esc for esc in submitted if esc.level == 0]
+        assert [esc.category for esc in l0s] == ['merge_screen']
+        assert 'scripts/x.py:3' in l0s[0].summary
+        assert 'scripts/x.py:3' in l0s[0].detail
+        (row,) = store.fetch_events_by_type(EventType.merge_blocked)
+        assert row['data']['category'] == 'merge_screen'
+        assert row['data']['failure_category'] == 'merge_screen'
+        assert row['data']['cause_hint'] == 'inline_suppressions'
+
+    def test_two_identical_screen_bounces_escalate_to_a_human(self, tmp_path: Path) -> None:
+        config = _make_routing_config(tmp_path)
+        assert config.max_consecutive_merge_thrash == 2
+        worktree = tmp_path / 'task-wt'
+        worktree.mkdir()
+        workflow = _make_routing_workflow(config, worktree)
+        workflow.scheduler.update_task = AsyncMock(return_value=True)
+        mark_blocked = AsyncMock(side_effect=[
+            WorkflowOutcome.REQUEUED, WorkflowOutcome.REQUEUED, WorkflowOutcome.BLOCKED,
+        ])
+        merge_queue: asyncio.Queue = asyncio.Queue()
+        workflow.merge_queue = merge_queue
+
+        async def bounce_then_check_thrash() -> WorkflowOutcome | None:
+            bounce = _screen_bounce()
+            driven = await drive_merge(
+                workflow._submit_to_merge_queue('task/42', pre_rebased=False, merge_phase=True),
+                merge_queue,
+                bounce,
+            )
+            assert driven.result == WorkflowOutcome.REQUEUED
+            assert workflow._last_merge_block_reason == _SCREEN_REASON, (
+                '_run_merge_phase runs the thrash guard only when the bounce set this gate'
+            )
+            ledger =(workflow.task.get('metadata') or {}).get('retry_ledger') or {}
+            return await workflow._check_merge_outcome_thrash(
+                ledger.get('last_merge_outcome_signature'), workflow._merge_outcome_signature(),
+            )
+
+        async def two_bounces() -> list[WorkflowOutcome | None]:
+            return [await bounce_then_check_thrash() for _ in range(2)]
+
+        with patch.object(workflow, '_mark_blocked', new=mark_blocked), patch.object(
+            workflow, '_write_merge_failure_review', new=MagicMock(),
+        ):
+            first, second = asyncio.run(two_bounces())
+
+        assert first is None
+        assert second == WorkflowOutcome.BLOCKED
+        assert mark_blocked.await_count == 3
+        assert mark_blocked.await_args is not None
+        assert mark_blocked.await_args.kwargs.get('escalate_to_human') is True

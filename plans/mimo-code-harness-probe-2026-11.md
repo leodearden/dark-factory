@@ -48,7 +48,11 @@ Detection: the exit code is insufficient. The arm reads
 `mimo session list --format json` (cwd = the worktree) and then
 `mimo export <id>` under the same `MIMOCODE_HOME`. That recovered the lost
 run's usage, the 401 as `info.error`, and 33 completed steps after a
-wall-clock kill.
+wall-clock kill. The run's `AgentResult.transcript_turns` counts the stored
+assistant steps that recorded token usage, so a productive wall-clock kill
+classifies as timed-out-with-progress. A stored step without usage is a
+request the endpoint never answered and counts no turn, so a run killed
+holding only such steps stays a no-progress timeout.
 
 Usage is summed over every exported session. The run's outcome and output
 come from its root session's last assistant step. The root is the session
@@ -137,6 +141,14 @@ inherited `MIMOCODE_*` variable is removed too. MiMo Code is an OpenCode fork,
 and OpenCode honours `OPENCODE_CONFIG_CONTENT`- and `OPENCODE_PERMISSION`-style
 overrides. A MiMo equivalent left on the host for interactive use could
 otherwise add MCP servers or relax a deny.
+
+Measured 2026-11-15 with mimo 0.1.16 (`mimo debug config` in a temp
+`MIMOCODE_HOME`): `OPENCODE_CONFIG_CONTENT` and `OPENCODE_PERMISSION` are not
+honoured. `MIMOCODE_CONFIG_CONTENT` (an injected mcp server appeared) and
+`MIMOCODE_PERMISSION` (`bash: deny` appeared) are honoured, and the arm's
+`MIMOCODE_*` scrub
+(`orchestrator/src/orchestrator/agents/mimo_backend.py::mimo_spawn_env`)
+already removes both. So no `OPENCODE_*` scrub is needed.
 
 | variable | value |
 |---|---|

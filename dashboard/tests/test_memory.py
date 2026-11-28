@@ -1032,6 +1032,122 @@ class TestWriteQueueDatum:
         validate_datum(datum, self.MEASURED_AT)
 
 
+class TestPlanRouteDatum:
+    """plan_route_datum: the one normaliser of get_status's plan_route for /memory."""
+
+    MEASURED_AT = datetime(2026, 10, 3, 12, 0, tzinfo=UTC)
+    CAPPED = {
+        'state': 'capped',
+        'proxy_host': 'plan-proxy.internal',
+        'capped_since': '2026-10-03T11:40:00+00:00',
+        'resets_at': '2026-10-03T16:00:00+00:00',
+        'next_probe_at': '2026-10-03T12:10:00+00:00',
+        'parked_items': 3,
+        'judge_fail_opens_since_latch': 2,
+        'escalation_id': 'esc-plan-route-capped-1',
+    }
+    OK = {
+        'state': 'ok',
+        'proxy_host': 'plan-proxy.internal',
+        'capped_since': None,
+        'resets_at': None,
+        'next_probe_at': None,
+        'parked_items': 0,
+        'judge_fail_opens_since_latch': 0,
+        'escalation_id': None,
+    }
+
+    @staticmethod
+    def _status(plan_route: object) -> dict:
+        return {'graphiti': {}, 'mem0': {}, 'projects': {}, 'plan_route': plan_route}
+
+    def test_a_capped_route_is_a_fresh_datum_of_exactly_its_fields(self):
+        from dashboard.data.memory import PLAN_ROUTE_FRESHNESS_BOUND_SECONDS, plan_route_datum
+
+        datum = plan_route_datum(
+            self._status({**self.CAPPED, 'a_newer_servers_field': 1}),
+            measured_at=self.MEASURED_AT,
+        )
+
+        assert datum == Datum(
+            self.CAPPED,
+            self.MEASURED_AT,
+            DatumState.FRESH,
+            None,
+            PLAN_ROUTE_FRESHNESS_BOUND_SECONDS,
+        )
+
+    def test_an_ok_route_is_a_fresh_datum(self):
+        from dashboard.data.memory import plan_route_datum
+
+        datum = plan_route_datum(self._status(self.OK), measured_at=self.MEASURED_AT)
+
+        assert datum.state is DatumState.FRESH
+        assert datum.value == self.OK
+
+    @pytest.mark.parametrize('plan_route', ['capped', None, ['ok']], ids=['str', 'null', 'list'])
+    def test_a_plan_route_that_is_not_an_object_is_unknown(self, plan_route):
+        from dashboard.data.memory import plan_route_datum
+
+        datum = plan_route_datum(self._status(plan_route), measured_at=self.MEASURED_AT)
+
+        assert datum.state is DatumState.UNKNOWN
+        assert 'plan_route' in (datum.reason or '')
+
+    def test_the_servers_own_failure_to_read_the_route_is_unknown_with_its_error(self):
+        from dashboard.data.memory import PLAN_ROUTE_FRESHNESS_BOUND_SECONDS, plan_route_datum
+
+        datum = plan_route_datum(
+            self._status({'error': 'latch read failed'}), measured_at=self.MEASURED_AT,
+        )
+
+        assert datum == unknown_datum('latch read failed', PLAN_ROUTE_FRESHNESS_BOUND_SECONDS)
+
+    def test_an_offline_status_is_unknown_with_the_verbatim_error(self):
+        from dashboard.data.memory import PLAN_ROUTE_FRESHNESS_BOUND_SECONDS, plan_route_datum
+
+        datum = plan_route_datum(
+            {'offline': True, 'error': 'X'}, measured_at=self.MEASURED_AT,
+        )
+
+        assert datum == unknown_datum('X', PLAN_ROUTE_FRESHNESS_BOUND_SECONDS)
+
+    def test_an_offline_status_without_an_error_still_says_why(self):
+        from dashboard.data.memory import plan_route_datum
+
+        datum = plan_route_datum({'offline': True}, measured_at=self.MEASURED_AT)
+
+        assert datum.state is DatumState.UNKNOWN
+        assert 'get_status' in (datum.reason or '')
+
+    def test_a_server_that_reports_no_plan_route_is_unknown(self):
+        from dashboard.data.memory import plan_route_datum
+
+        datum = plan_route_datum(
+            {'graphiti': {}, 'mem0': {}, 'projects': {}}, measured_at=self.MEASURED_AT,
+        )
+
+        assert datum.state is DatumState.UNKNOWN
+        assert 'plan_route' in (datum.reason or '')
+
+    @pytest.mark.parametrize(
+        'status',
+        [
+            {'plan_route': CAPPED},
+            {'plan_route': 'capped'},
+            {'offline': True, 'error': 'X'},
+            {},
+        ],
+        ids=['capped', 'not-an-object', 'offline', 'absent'],
+    )
+    def test_result_passes_the_datum_contract(self, status):
+        from dashboard.data.memory import plan_route_datum
+
+        datum = plan_route_datum(status, measured_at=self.MEASURED_AT)
+
+        validate_datum(datum, self.MEASURED_AT)
+
+
 # ── the hand-rolled per-URL loops obey the same log policy ──────
 
 

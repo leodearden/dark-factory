@@ -100,6 +100,7 @@ no longer exist. Neither sweep lane reaches those: δ globs `.worktrees-orphaned
 orphaned lane exists. Accepted as a transient irrelevance by operator decision — dead lanes are not read. (2) Live
 plans carry **19 hard-damage strings across 16 tasks**; three of those tasks (3382, 4081 pending; 3133 blocked) are
 plans an implementer will read *next*, and ε repairs them only on the next plan-tools read.
+3382's read happened on 2026-11-26, and left no journal line: see §2.5, "Recurrence log continued (2026-11-27)".
 
 **Re-measured 2026-08-25 over `.worktrees/.task-meta/*/plan.json` (task 4696), and the corpus had GROWN.** Predicate: a closing tag whose name is a plan-tools parameter, or an invoke closer, or a parameter-open token, over `design_decisions` / `reuse` / `steps` / `prerequisites`.
 
@@ -377,6 +378,34 @@ preserved the raw payload on the record. Same blindness as above: the owner read
 `preservation_failures` were both 0. Closed by the reify L2 watcher on Leo's ruling of 2026-11-22. The gate held;
 this is a floor-count datum for the gated boundary, not landed damage.
 
+**Recurrence log continued (2026-11-27) — `esc-markup-residue-12`, task 3382: NOT a boundary recurrence, but two
+journal gaps (task 11978).** The specimen is 3382's `design_decisions[1].decision`: a decision that absorbed its own
+`rationale`, an invoke closer and the opening of a NEXT `add_design_decision` call, so the tail re-declares `decision`.
+- **Origin is pre-guard.** It was written 2026-08-01T03:13:29Z by 3382's architect (session
+  `0872e952-1e46-4bd9-91a8-58662c354bde`) through `add_design_decision.decision`, and the server answered ok — 19 days
+  before the γ2 guard was registered (`37eed69c97`, task 4457). §2.4 and D8 already counted it among the live plans
+  with hard damage.
+- **Today's boundary holds.** Replayed in-process through today's plan-tools, the call is refused
+  `mcp_markup_unrepairable` and journalled as one `markup_detected` line. The replay rules out an uncovered tool, an
+  uncovered parameter and a pattern variant. The pre-guard origin above is what makes the fourth candidate, another
+  server instance, moot: no instance had a guard on 2026-08-01.
+- **Gap 1, closed here for unsandboxed roles: the read-time path had no journal channel.** On
+  2026-11-26T15:27:19Z the re-dispatched implementer's first `mark_step_done` ran ε's read-time repair, which repaired
+  two trailing `\x3c/rationale>` mis-closes and classified the decision unrepairable (its recovered set collides with
+  the supplied set). That verdict reached only that response's `markup_repairs` key and a stdio subprocess's stderr.
+  Task 11978 journals every disclosed stored fact to `plan-tools.jsonl` as a `stored_markup_detected` line
+  (`orchestrator/src/orchestrator/mcp/stored_markup_journal.py`). That holds only where the host can reach the
+  journal: 3382's own read came from a landlocked implementer, so the same read today still leaves no line until
+  Gap 2 closes.
+- **Gap 2, open: sandboxed roles cannot reach the journal.** That session was a landlocked implementer, and the write
+  set grants nothing under the main checkout's `data/` (EACCES on append, probed 2026-11-27). Nine
+  `record_step_deviation` refusals from 2026-10-31 to 2026-11-26 are in their plans' `_markup_rejections` stamps but
+  not in the journal, so **the journal's silence since 2026-09-22 is not evidence of zero leaks**. Open as
+  `tkt_0RXFFAY29XAEX8SSSW0A49T2SB`; it needs a ruling against the os-sandbox PRD's ratified read-only main-tree row.
+- **Downstream, the gate held.** On merge, the completion-memory builder forwarded the decision raw, and fused-memory's
+  own guard refused it — that refusal is `esc-markup-residue-12`. The raw forwarding is filed as
+  `tkt_0RXFFB0B4ATJ3DXQXX1FFSQ71T`.
+
 ### 2.6 The corruption is deterministically repairable
 
 Replaying all 334 specimens through a schema-validated repairer: **308 repair cleanly (92.2%), recovering 194 dropped parameters**; 26 (7.8%) are ambiguous (doubly-corrupted calls) and must escalate. Recovered parameters are exactly the silently-lost ones: `add_memory.category` ×70, `add_memory.project_id` ×32, `add_design_decision.rationale` ×25, `add_memory.agent_id` ×18, `escalate_info.suggested_action` ×13, `submit_review_verdict.issues` ×10, `submit_task.priority` ×5.
@@ -515,7 +544,7 @@ Every rewrite is **atomic**: repair into a temp file in the same directory, veri
 
   **UNIFORM over every registered tool of both servers** (16 + 4), not narrowed to the prose-bearing ones: the guard scans every string argument of every tool, so any tool on these servers can be the one that bounces a caller.
 
-  **A decorator rather than twenty signature edits.** `accepts_markup_override` (`shared/src/shared/mcp_markup_middleware.py`) appends the keyword-only parameter to the wrapped tool's `__signature__`. Twenty copies of a declaration no tool body reads is the lock-step duplication INV-5 exists to end, and it would leave twenty places for a future tool to be born without it. It also gives `strip_markup_override` ONE load-bearing call site: the decorator consumes the map, so no tool body can persist the flag — "never written" is structural, not a promise repeated at each registration site — and a caller's non-flag residue is reported there as a warning naming the leftover KEYS only.
+  **A decorator rather than twenty signature edits.** `accepts_markup_override` (`shared/src/shared/markup_override_param.py`, moved out of the middleware module by task 5055) appends the keyword-only parameter to the wrapped tool's `__signature__`. Twenty copies of a declaration no tool body reads is the lock-step duplication INV-5 exists to end, and it would leave twenty places for a future tool to be born without it. It also gives `strip_markup_override` ONE load-bearing call site: the decorator consumes the map, so no tool body can persist the flag — "never written" is structural, not a promise repeated at each registration site — and a caller's non-flag residue is reported there as a warning naming the leftover KEYS only.
 
   **Substrate, measured (fastmcp 3.2.2 / CPython 3.13.9), because §6 has been wrong about this library before:** FastMCP builds `inputSchema` from `__signature__`, so a `tools/list` round-trip advertises `"metadata": {"anyOf": [{"additionalProperties": true, "type": "object"}, {"type": "null"}], "default": null}` with the tool's own `required` and its `additionalProperties: false` both preserved; calls with and without the argument both succeed; and an `async def` tool needs the async wrapper branch or FastMCP receives an un-awaited coroutine.
 
@@ -524,6 +553,18 @@ Every rewrite is **atomic**: repair into a temp file in the same directory, veri
   **The parameter DESCRIBES ITSELF, because declaring it closed one diagnostic.** *(Amended after review.)* An undescribed `metadata: object|null` on twenty agent-facing tools invites the wrong call — on `create_plan` or a verdict tool it reads as somewhere to attach metadata to what the tool writes — and a caller who believes that has its map dropped by `_consume_override` with the only report going to a server log it cannot read. Before the declaration, pydantic bounced that caller: a bad response, but a response. So the declaration carries a pydantic `Field(description=...)`, spelled from `MARKUP_OVERRIDE_KEY` so the schema and `_OVERRIDE_SENTENCE` cannot name different flags, stating both what the map is for and that nothing in it is persisted. Measured (fastmcp 3.2.2): an `Annotated[..., Field(description=...)]` annotation survives the `__signature__` route and lands as that property's `description`. Handing the leftover key NAMES back to the caller was considered and rejected: raising re-creates exactly the bounce this decision removed below, and widening a tool's RESULT to carry a guard diagnostic would rewrite the structured-content contract of all twenty. The mistake is forestalled in the contract instead of reported after the fact.
 
   **A pre-existing sharp edge is REMOVED:** the flag sent alongside any other metadata key used to yield a raw pydantic `Unexpected keyword argument` on these twenty tools. Checked that nothing depended on that shape before relying on it. The escalation surface (`escalate_info`, `escalate_blocker`) still declares no `metadata` and keeps the DROP branch, so `_OVERRIDE_SENTENCE`'s promise stays true there.
+
+- **D13 — A residue record names its caller uniformly, states what its custody proves, and reports a swallowed override.** *(task 5055.)* Four gaps, each measured in the code before this decision.
+
+  **Host attribution fills only the axes the arguments left `None`.** The middleware reads its caller off the call's own arguments, and no plan-tools or verdict-tools tool, nor `stamp_triage` or `resolve_issue`, declares one, so their records named nobody. `shared/src/shared/mcp_markup_middleware.py::HostAttribution` is an optional provider each host injects with what it knows: plan-tools its new `--caller-role` launch flag, verdict-tools its verdict role, the escalation server the connection's `X-Escalation-Identity` header (attribution only, never a gate). The arguments always win, and a provider that raises falls back to argument-only attribution without changing the call's outcome. fused-memory wires none, because its memory tools declare `agent_id` themselves. The flag is optional because an orchestrator still running an older launcher spawns the new server without it.
+
+  **One rendering of the caller.** `residue_header_lines` renders the caller keys `subject_task_id`, `subject_agent_role`, `agent_id` and `project` (`RESIDUE_CALLER_KEYS`), then `override_swallowed`, the one header key that describes the leak rather than the caller, as `key=repr` lines, an absent key as `None`. Every residue kind carries `override_swallowed` as a bool. The orchestrator sink, the escalation server and `markup_tripwire` all call it. Three hand-spelled renderings are how plan-tools records came to omit the role.
+
+  **The custody claim is the caveat, not "the only surviving copy".** All three filers told the reader that the residue was the only surviving copy, while the refusal told the caller to resend from its own copy. In the field, 3 of 3 checked genuine-leak residues had been resent within about a minute, and the content of esc-plan-tools-markup-residue-10 was already in plan.json. So a refused record now states `MARKUP_REFUSAL_CUSTODY_CAVEAT`: the call wrote nothing and its caller was told to resend; whether it did is not known; look at the destination for a later write before recovering, because recovering a resent payload writes a duplicate. The unrecovered-parameter kind states `MARKUP_UNRECOVERED_PARAM_CUSTODY_CAVEAT` instead, through the same constant at every sink that files it: nothing bounced that caller, the drop was reported only in the forwarded result's metadata, and no resend is coming, so the record is the only copy the boundary holds. Residue is still never deduped, for the real reason: each record holds a different caller's payload.
+
+  **A swallowed override is reported, never honoured.** The leak swallows every parameter after the leaking one, so a `metadata` override sent after it arrives inside the leaked value. `shared/src/shared/toolcall_markup.py::swallowed_markup_override` finds it there. It is evidence of a real leak, because a genuine quotation never makes the harness over-consume, so it is not honoured. Nor does it come back to be honoured later: the swallowed `metadata` is restored WITHOUT the flag, on both tiers, so a bounce's `repaired_call` resubmitted verbatim, as its hint prescribes, is guarded like any other call. The strip applies to any recovered `metadata`, because `repair()` recovers only names the caller did not supply (B9), so it never depends on `swallowed_markup_override`'s non-validating scan, and on a repaired call `override_swallowed` reports either source: that scan, or the validated recovery. The refusal and reject payloads and the residue record carry `override_swallowed`, and the hint gives the one structural escape: send `metadata` as the first argument, ahead of the string that carries the markup. The override sentence and the parameter's own schema description say the same.
+
+  **Not decided here.** Moving plan-tools or fused-memory to FORWARD_REPAIR would change D3's tiers. The fused-memory tier is `plans/uuid-prefix-resolution-prd.md` open question 3, reserved to a separate operator decision.
 
 - **D7 — The upstream defect is not fixable here.** The originating error is model-side (wrong closing-tag dialect); the *amplification* — silently over-consuming and dropping parameters instead of raising a parse error — is the harness parser's. Neither is in this repo. Everything in this PRD is containment, recovery and repair.
 

@@ -2991,6 +2991,30 @@ class TestClearVerifyHostSkewAgreesOnLevel:
         assert (data['quarantine_class'], data['evidence']) == ('skew', 'ensure_gate')
         assert data['resolved_escalation_ids'] == ['esc-skew-l2']
 
+    def test_a_level_2_record_on_a_real_queue_closes_with_a_resolution_class(self, tmp_path):
+        """A level-2 close must be classified (plans/instruments-honesty-prd.md decision 8)."""
+        from escalation.models import Escalation
+        from escalation.queue import EscalationQueue
+
+        from orchestrator.merge_lane.liveness import (
+            _clear_verify_host_skew,
+            _verify_host_skew_sentinel,
+        )
+        queue = EscalationQueue(tmp_path)
+        record = Escalation(
+            id='esc-skew-l2', task_id=_verify_host_skew_sentinel('laptop'),
+            agent_role='orchestrator-verify-host-monitor', severity='blocking',
+            category='infra_issue', summary='laptop gate skew', level=2,
+        )
+        queue.submit(record)
+        _clear_verify_host_skew(
+            queue, None, 'laptop', downtime_s=60.0, evidence=RecoveryEvidence.ENSURE_GATE,
+        )
+        closed = queue.get(record.id)
+        assert closed is not None
+        assert closed.status != 'pending'
+        assert closed.resolution_class is not None
+
 
 # ---------------------------------------------------------------------------
 # 1795/step-13 RED: _reprobe_quarantined_hosts async method

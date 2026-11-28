@@ -16,7 +16,7 @@ from pathlib import Path
 
 import pytest
 from escalation.authority import COORDINATOR_IDENTITY, EXECUTOR_IDENTITY, ClassSwitch
-from escalation.classify import classify_resolver_tier
+from escalation.classify import resolver_tier
 from escalation.models import Escalation
 from orchestrator.decision_registry import (
     AuditOutcome,
@@ -224,7 +224,9 @@ class TestApplyAcrossTwoPorts:
             record = _record(served, esc_id)
             assert record.status != 'pending'
             assert record.resolved_by == COORDINATOR_IDENTITY
-            assert classify_resolver_tier(record.resolved_by) == 'human'
+            assert record.resolution_class is not None
+            assert record.ruled_by_human is True
+            assert resolver_tier(record) == 'human-ruled'
             agreed = payloads.parse_agreed_marker(record.triage_note or '')
             assert isinstance(agreed, payloads.AgreedMarker)
             assert (agreed.answer, agreed.answer_rounds) == ('A', 1)

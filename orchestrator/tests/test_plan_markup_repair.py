@@ -23,7 +23,6 @@ from orchestrator.mcp.plan_markup_repair import (
 )
 
 #: pytest finds a fixture by its name in the requesting module's namespace.
-plan_artifacts = _plan_markup_fixtures.plan_artifacts
 isolate_the_refusal_memo = _plan_markup_fixtures.isolate_the_refusal_memo
 
 RATIONALE_PROSE = 'A rationale the harness folded into the decision before it.'

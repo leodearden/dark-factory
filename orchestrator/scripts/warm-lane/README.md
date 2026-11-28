@@ -19,6 +19,11 @@ order:
 3. Neither → a WARNING naming **both** tried paths, and the wrapper's
    existing fail-soft sentinel.
 
+A name listed in `git.warm_lane_df_preferred_scripts` swaps steps 1 and 2, so
+dark-factory's copy is tried first; the both-paths WARNING still names both,
+in that order. See
+`orchestrator/src/orchestrator/config.py::GitConfig.warm_lane_df_preferred_scripts`.
+
 Project-first is PRD decision D3: a project that has invested in its own
 warm-lane tooling keeps it, and dark-factory's copy is the floor rather than
 the ceiling. Resolution is repo-relative (`Path(__file__).resolve().parents[2]
@@ -309,7 +314,7 @@ overlooked, because the deferral was measured; the resolution is appended to it.
   left false). It was deferred with the cost measured, not overlooked:
 
   - The rendered glob
-    `_merge-*,_solo-*,_substrate-gate-*,_merge-verify,_offline-deep,.lane-state,.task-meta,_mainprobe-*,_mainsweep-*,_iact-*`
+    `_merge-*,_solo-*,_substrate-gate-*,_merge-verify,_offline-deep,.lane-state,.task-meta,_mainprobe-*,_mainsweep-*,_driftcheck-*,_iact-*`
     is behaviourally **indistinguishable** from gc.sh's then-current default
     under any black-box test: `_merge-verify` is already covered by `_merge-*`,
     and `.lane-state`/`.task-meta` are dot-prefixed while gc.sh's candidate loop

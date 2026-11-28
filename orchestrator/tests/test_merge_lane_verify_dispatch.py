@@ -14,6 +14,7 @@ import asyncio
 import contextlib
 import dataclasses
 import importlib
+import logging
 from pathlib import Path
 from typing import Any, cast
 
@@ -34,6 +35,7 @@ from _orch_helpers import wait_responsive
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, MergeVerifyLeaseContended
+from orchestrator.merge_lane import tested_tree
 from orchestrator.merge_lane.dead_base_ledger import DeadBaseSite, VoidPoint
 from orchestrator.merge_lane.dispatch_ports import (
     ChainPlanning,
@@ -49,6 +51,7 @@ from orchestrator.merge_lane.dispatch_ports import (
     VerifyFrontier,
     VerifyRetryBudgets,
 )
+from orchestrator.merge_lane.git_read import GitReadFailed
 from orchestrator.merge_lane.halt import HaltState
 from orchestrator.merge_lane.intake import MERGE_LANES
 from orchestrator.merge_lane.main_health_probe import MainHealthProbeHandles
@@ -58,6 +61,7 @@ from orchestrator.merge_lane.types import (
     CapPermit,
     DecidedItem,
     InflightEntry,
+    InflightEntrySlot,
     InflightStatus,
     InflightVerifyResult,
     ItemLifecycleState,
@@ -98,6 +102,8 @@ class _Ports:
         self.main = 'f' * 40
         self.remerged: Any = None
         self.placement_error: BaseException | None = None
+        self.live_trees: tuple[tested_tree.TestedTree, ...] = ()
+        self.live_trees_error: BaseException | None = None
         self._streak = 0
         self._cap_outs = 0
 
@@ -143,6 +149,11 @@ class _Ports:
             raise self.placement_error
         return NO_DEEP_PLACEMENT
 
+    def _live_trees(self) -> tuple[tested_tree.TestedTree, ...]:
+        if self.live_trees_error is not None:
+            raise self.live_trees_error
+        return self.live_trees
+
     def custody(self) -> DispatchCustody:
         return DispatchCustody(
             request_abandoned=lambda req: self.abandoned,
@@ -171,6 +182,7 @@ class _Ports:
             frontier_depth=lambda: 0,
             frontier_base_commits=lambda: (set(), set()),
             verify_base_divergence=lambda item, main: None,
+            live_trees=self._live_trees,
         )
 
     def chain_planning(self) -> ChainPlanning:
@@ -365,8 +377,11 @@ def _local_lease() -> HostLease:
 
 async def _verify(
     dispatcher: VerifyDispatcher, item: RealMergeItem, lease: HostLease,
+    probe_base: str | None = None,
 ) -> InflightVerifyResult:
-    return await asyncio.wait_for(dispatcher.run_inflight_verify(item, lease), timeout=30.0)
+    return await asyncio.wait_for(
+        dispatcher.run_inflight_verify(item, lease, probe_base=probe_base), timeout=30.0,
+    )
 
 
 @pytest.mark.asyncio
@@ -532,6 +547,68 @@ class TestPostMergeVerify:
 
         assert outcome is None
         assert verifier.verified == ['vd-1']
+
+
+def _recorded_per_call(dispatcher: VerifyDispatcher, monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
+    """Each post_merge_verify call's per-call keywords, recorded on the way into the real one."""
+    calls: list[dict[str, Any]] = []
+    real = dispatcher.post_merge_verify
+
+    def recording(git_ops: GitOps, req: MergeRequest, merge_wt: Path, **per_call: Any) -> Any:
+        calls.append(per_call)
+        return real(git_ops, req, merge_wt, **per_call)
+
+    monkeypatch.setattr(dispatcher, 'post_merge_verify', recording)
+    return calls
+
+
+@pytest.mark.asyncio
+class TestNarrowGateBase:
+    """Task 5411: an in-flight verify offers the narrow gate its item's frozen merge-time base."""
+
+    async def test_a_local_verify_offers_the_items_base(self, scene: _Scene, monkeypatch: pytest.MonkeyPatch) -> None:
+        dispatcher = scene.dispatcher(FakeVerifier(passes()))
+        calls = _recorded_per_call(dispatcher, monkeypatch)
+        item = await scene.merged_item()
+
+        await _verify(dispatcher, item, _local_lease())
+
+        assert [call['narrow_gate_base'] for call in calls] == [item.base_sha]
+
+    async def test_a_remote_verify_offers_the_items_base(self, scene: _Scene, monkeypatch: pytest.MonkeyPatch) -> None:
+        dispatcher = scene.dispatcher(FakeVerifier(passes()))
+        calls = _recorded_per_call(dispatcher, monkeypatch)
+        item = await scene.merged_item()
+        lease = HostLease(name='laptop', runner=cast(Any, FakeRemoteRunner('laptop')), is_local=False)
+
+        await _verify(dispatcher, item, lease)
+
+        assert [call['narrow_gate_base'] for call in calls] == [item.base_sha]
+
+    async def test_a_probe_base_relabels_attribution_but_not_the_gate_base(self, scene: _Scene, monkeypatch: pytest.MonkeyPatch) -> None:
+        dispatcher = scene.dispatcher(FakeVerifier(passes()))
+        calls = _recorded_per_call(dispatcher, monkeypatch)
+        item = await scene.merged_item()
+        probe_base = 'e' * 40
+
+        await _verify(dispatcher, item, _local_lease(), probe_base=probe_base)
+
+        [call] = calls
+        assert (call['narrow_gate_base'], call['main_sha']) == (item.base_sha, probe_base)
+
+    async def test_a_gate_history_leg_offers_no_base(self, scene: _Scene, monkeypatch: pytest.MonkeyPatch) -> None:
+        dispatcher = scene.dispatcher(FakeVerifier(passes()))
+        calls = _recorded_per_call(dispatcher, monkeypatch)
+        item = await scene.merged_item()
+
+        await dispatcher.gate_history_leg(
+            scene.git_ops, item.request, item.merge_wt,
+            timeouts={}, enospc_retries={}, max_timeouts=3, max_enospc=1,
+            merge_sha=item.merge_result.merge_commit,
+        )
+
+        [call] = calls
+        assert 'narrow_gate_base' not in call
 
 
 async def _launched(entry: InflightEntry | NoHost) -> InflightEntry:
@@ -753,6 +830,169 @@ class TestDispatch:
             ('record_item_commit_dead', DeadBaseSite.DISPATCH_VOID, True),
         ]
         assert scene.hosts.acquired == []
+
+
+async def _git(repo: Path, *args: str) -> str:
+    proc = await asyncio.create_subprocess_exec(
+        'git', *args, cwd=repo,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+    )
+    out, err = await proc.communicate()
+    assert proc.returncode == 0, err.decode()
+    return out.decode().strip()
+
+
+def _owner_of(item: RealMergeItem, tip: str | None) -> tested_tree.TreeMember:
+    merge_commit = item.merge_result.merge_commit
+    assert merge_commit is not None
+    return tested_tree.TreeMember(
+        request_id=item.request.request_id,
+        task_id=item.request.task_id,
+        merge_commit=merge_commit,
+        tip=tip,
+        own=True,
+    )
+
+
+async def _tree_of(dispatcher: VerifyDispatcher, item: RealMergeItem) -> tested_tree.TestedTree:
+    entry = await _launched(await dispatcher.dispatch(item))
+    assert entry.tree is not None
+    return entry.tree
+
+
+@pytest.mark.asyncio
+class TestTheTestedTree:
+    """PRD plans/merge-pool-batches-prd.md §6.1 and §7 row 2, at dispatch."""
+
+    async def _with_branch_tip(self, item: RealMergeItem) -> RealMergeItem:
+        tip = await _git(item.request.worktree, 'rev-parse', 'HEAD')
+        return dataclasses.replace(item, merged_branch_tip=tip)
+
+    async def test_a_base_on_mains_tip_is_its_own_root(self, scene: _Scene) -> None:
+        dispatcher = scene.dispatcher(FakeVerifier(passes()))
+        item = await self._with_branch_tip(await scene.merged_item())
+        scene.ports.main = item.base_sha
+
+        tree = await _tree_of(dispatcher, item)
+
+        assert tree.base_commit == tree.root_commit == item.base_sha
+        assert tree.members == (_owner_of(item, item.merged_branch_tip),)
+
+    async def test_a_landed_commit_behind_mains_tip_is_its_own_root(
+        self, scene: _Scene,
+    ) -> None:
+        dispatcher = scene.dispatcher(FakeVerifier(passes()))
+        item = await self._with_branch_tip(await scene.merged_item())
+        repo = scene.config.project_root
+        old_main = item.base_sha
+        advanced = await _git(repo, 'commit-tree', f'{old_main}^{{tree}}', '-p', old_main, '-m', 'advance')
+        await _git(repo, 'update-ref', 'refs/heads/main', advanced, old_main)
+        assert await scene.git_ops.get_main_sha() == advanced
+        scene.ports.in_verify = True
+
+        tree = await _tree_of(dispatcher, item)
+
+        assert tree.base_commit == tree.root_commit == old_main
+        assert tree.members == (_owner_of(item, item.merged_branch_tip),)
+
+    async def test_a_base_on_an_in_flight_owner_is_built_on_that_owner_alone(
+        self, scene: _Scene,
+    ) -> None:
+        dispatcher = scene.dispatcher(FakeVerifier(passes()))
+        main = await scene.git_ops.get_main_sha()
+        ahead = await scene.merged_item('ahead')
+        ahead_owner = _owner_of(ahead, 't' * 40)
+        link = tested_tree.TreeMember(
+            request_id='r-link', task_id='link', merge_commit='l' * 40, tip='k' * 40, own=True,
+        )
+        scene.ports.live_trees = (
+            tested_tree.TestedTree(base_commit=main, root_commit=main, members=(ahead_owner, link)),
+        )
+        item = dataclasses.replace(
+            await scene.merged_item(), base_sha=ahead_owner.merge_commit, speculative=True,
+        )
+
+        tree = await _tree_of(dispatcher, item)
+
+        assert tree.base_commit == ahead_owner.merge_commit
+        assert tree.root_commit == main
+        assert tree.members == (ahead_owner.as_built_on(), _owner_of(item, None))
+
+    async def test_a_base_no_live_entry_owns_has_no_root(self, scene: _Scene) -> None:
+        dispatcher = scene.dispatcher(FakeVerifier(passes()))
+        ahead = await scene.merged_item('ahead')
+        ahead_commit = ahead.merge_result.merge_commit
+        assert ahead_commit is not None
+        item = dataclasses.replace(
+            await scene.merged_item(), base_sha=ahead_commit, speculative=True,
+        )
+
+        tree = await _tree_of(dispatcher, item)
+
+        assert tree.base_commit == ahead_commit
+        assert tree.root_commit is None
+        assert tree.members == (_owner_of(item, None),)
+
+    async def test_a_rebased_head_owner_has_no_tip(self, scene: _Scene) -> None:
+        dispatcher = scene.dispatcher(FakeVerifier(passes()))
+        item = dataclasses.replace(
+            await self._with_branch_tip(await scene.merged_item()), gate_rebase_of='x' * 40,
+        )
+        scene.ports.main = item.base_sha
+
+        tree = await _tree_of(dispatcher, item)
+
+        assert tree.members == (_owner_of(item, None),)
+
+    async def test_the_tree_is_published_once(self, scene: _Scene) -> None:
+        dispatcher = scene.dispatcher(FakeVerifier(passes()))
+        item = await scene.merged_item()
+        scene.ports.main = item.base_sha
+        entry = await _launched(await dispatcher.dispatch(item))
+        assert entry.tree is not None
+
+        with pytest.raises(tested_tree.TestedTreeViolation):
+            InflightEntrySlot(entry=entry).publish_tree(entry.tree)
+
+    async def test_a_tree_that_cannot_be_recorded_leaves_none_and_the_verify_still_runs(
+        self, scene: _Scene, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        verifier = FakeVerifier(passes())
+        dispatcher = scene.dispatcher(verifier)
+        item = await scene.merged_item()
+        scene.ports.main = item.base_sha
+        scene.ports.live_trees_error = RuntimeError('frontier unreadable')
+
+        with caplog.at_level(logging.ERROR, logger='orchestrator.merge_lane'):
+            entry = await _launched(await dispatcher.dispatch(item))
+
+        assert entry.tree is None
+        assert entry.verify_task is not None
+        assert entry.verify_task.result().outcome is None
+        assert verifier.verified == ['vd-1']
+        [record] = [r for r in caplog.records if 'tested tree not recorded' in r.getMessage()]
+        assert record.exc_info is not None
+        assert str(record.exc_info[1]) == 'frontier unreadable'
+
+    async def test_a_failed_main_containment_read_is_logged_and_leaves_no_root(
+        self, scene: _Scene, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        dispatcher = scene.dispatcher(FakeVerifier(passes()))
+        unknown = 'e' * 40
+        item = dataclasses.replace(await scene.merged_item(), base_sha=unknown, speculative=True)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
+            tree = await _tree_of(dispatcher, item)
+
+        assert tree.base_commit == unknown
+        assert tree.root_commit is None
+        assert tree.members == (_owner_of(item, None),)
+        [record] = [r for r in caplog.records if 'main containment' in r.getMessage()]
+        assert record.levelno == logging.WARNING
+        assert unknown in record.getMessage()
+        assert record.exc_info is not None
+        assert isinstance(record.exc_info[1], GitReadFailed)
+        assert record.exc_info[1].stderr
 
 
 _HOMES = {

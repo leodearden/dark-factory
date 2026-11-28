@@ -348,7 +348,7 @@ function mountAnalyticsAcrossJuly15(harness) {
           esc_per_done_daily: REGIME_LABELS.map((date, i) => ({ date, ratio: i / 4 })),
           done_counts_read: true,
         },
-        samples: [['2026-07-15', 'human', 1, 3600], ['2026-07-16', 'steward', 1, 86400]],
+        samples: [['2026-07-15', 'human-ruled', 1, 3600], ['2026-07-16', 'steward', 1, 86400]],
       }],
       { regimeMarkers: JULY_15_MARKERS },
     ),

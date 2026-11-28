@@ -17,6 +17,7 @@ from datetime import UTC, datetime
 from typing import Any, TypedDict, TypeVar
 from urllib.parse import urlparse
 
+import httpx
 from falkordb.asyncio import FalkorDB
 from graphiti_core import Graphiti
 from graphiti_core.cross_encoder.client import CrossEncoderClient
@@ -33,7 +34,12 @@ from graphiti_core.llm_client import OpenAIClient
 from graphiti_core.llm_client.client import LLMClient
 from graphiti_core.llm_client.config import LLMConfig as GraphitiLLMConfig
 from graphiti_core.nodes import EpisodeType, EpisodicNode
+from openai import AsyncOpenAI
 
+from fused_memory.backends.episode_toolcall_leak_scan import (
+    EpisodeToolcallLeakScan,
+    read_episode_toolcall_leaks,
+)
 from fused_memory.backends.exact_episode_window import ExactEpisodeWindowGraphiti
 from fused_memory.backends.falkor_edge_search import FalkorEdgeSearch
 from fused_memory.backends.falkor_entity_edges import bind_entity_endpoints
@@ -104,6 +110,7 @@ from fused_memory.backends.paged_read import (
 from fused_memory.backends.recent_episodes import read_recent_group_episodes
 from fused_memory.backends.relates_to_schema import ACTIVE_EDGE_PREDICATE, active_edge_filter
 from fused_memory.backends.sdk_client_lifecycle import close_wrapped_sdk_clients
+from fused_memory.backends.sdk_request_timeout import bounded_openai_embedder
 from fused_memory.backends.timeout_budget import await_within
 from fused_memory.config.env_precedence import warn_if_ambient_base_url_is_overridden
 from fused_memory.config.schema import FusedMemoryConfig, OpenAIProviderConfig
@@ -202,7 +209,9 @@ def check_openai_responses_api() -> None:
     )
 
 
-def build_llm_client(cfg: FusedMemoryConfig) -> LLMClient | None:
+def build_llm_client(
+    cfg: FusedMemoryConfig, *, http_client: httpx.AsyncClient | None = None,
+) -> LLMClient | None:
     """Construct the graphiti LLM client from unified config, or None.
 
     Returns None when the configured provider block is absent or carries no
@@ -225,8 +234,11 @@ def build_llm_client(cfg: FusedMemoryConfig) -> LLMClient | None:
     Every returned client carries an ``AttributingTokenUsageTracker``, installed
     here once rather than per arm, so ``measure_llm_tokens`` can attribute its
     spend on whichever arm is configured.
+
+    ``http_client``, when given, carries every request of an OpenAI-shaped arm
+    (the plan route's gated client, task 9944); the anthropic arm ignores it.
     """
-    llm_client = _construct_llm_client(cfg)
+    llm_client = _construct_llm_client(cfg, http_client=http_client)
     if llm_client is not None:
         llm_client.token_tracker = AttributingTokenUsageTracker()
     return llm_client
@@ -242,19 +254,22 @@ def build_embedder(cfg: FusedMemoryConfig) -> OpenAIEmbedder | None:
     provider = cfg.embedder.providers.openai
     if cfg.embedder.provider != 'openai' or provider is None or not provider.api_key:
         return None
-    embedder = OpenAIEmbedder(
-        config=OpenAIEmbedderConfig(
+    embedder = bounded_openai_embedder(
+        OpenAIEmbedderConfig(
             api_key=provider.api_key,
             embedding_model=cfg.embedder.model,
             base_url=provider.api_url,
             embedding_dim=cfg.embedder.dimensions,
-        )
+        ),
+        cfg.embedder.request_attempts,
     )
     logger.info(f'Graphiti embedder: {cfg.embedder.provider}/{cfg.embedder.model}')
     return embedder
 
 
-def _construct_llm_client(cfg: FusedMemoryConfig) -> LLMClient | None:
+def _construct_llm_client(
+    cfg: FusedMemoryConfig, *, http_client: httpx.AsyncClient | None,
+) -> LLMClient | None:
     # LLMConfig rejects this at load; a config mutated afterwards is not re-validated.
     if cfg.llm.structured_output_mode != 'auto' and cfg.llm.client_class != 'openai_generic':
         logger.warning(
@@ -278,6 +293,10 @@ def _construct_llm_client(cfg: FusedMemoryConfig) -> LLMClient | None:
                 max_tokens=cfg.llm.max_tokens,
                 base_url=cfg.llm.providers.openai.api_url,
             )
+            sdk_client = (
+                AsyncOpenAI(api_key=api_key, base_url=llm_config.base_url, http_client=http_client)
+                if http_client is not None else None
+            )
             llm_client: LLMClient
             # max_tokens= below is load-bearing on both arms, not redundant with llm_config: see
             # fused-memory/tests/test_local_endpoint_base_url_integration.py::TestGraphitiLLMPathReachesConfiguredEndpoint::test_configured_max_tokens_reaches_the_wire
@@ -287,12 +306,17 @@ def _construct_llm_client(cfg: FusedMemoryConfig) -> LLMClient | None:
                     if cfg.llm.structured_output_mode == 'json_object'
                     else TokenRecordingOpenAIGenericClient
                 )
-                llm_client = generic_cls(config=llm_config, max_tokens=cfg.llm.max_tokens)
+                llm_client = generic_cls(
+                    config=llm_config, client=sdk_client, max_tokens=cfg.llm.max_tokens,
+                )
             else:
                 check_openai_responses_api()
-                llm_client = OpenAIClient(config=llm_config, max_tokens=cfg.llm.max_tokens)
+                llm_client = OpenAIClient(
+                    config=llm_config, client=sdk_client, max_tokens=cfg.llm.max_tokens,
+                )
+            route = ' via the plan route' if http_client is not None else ''
             logger.info(
-                f'Graphiti LLM: {cfg.llm.provider}/{cfg.llm.model} '
+                f'Graphiti LLM: {cfg.llm.provider}/{cfg.llm.model}{route} '
                 f'({type(llm_client).__name__}, max_tokens={cfg.llm.max_tokens})'
             )
             return llm_client
@@ -1833,11 +1857,7 @@ class GraphitiBackend:
         ``group_id``, so a uuid belonging to another project's graph can
         neither be read nor redacted through this call.
 
-        NOT PROVIDED HERE: Graphiti-side DISCOVERY — enumerating which
-        episodes across a graph carry a leak. That needs a full episode scan
-        with no payload index to lean on, and is tracked as follow-up work.
-        This is the remediation primitive for an episode you have ALREADY
-        identified, by hand or from the Mem0 sweep's report.
+        Discovery of which episodes carry a leak is :meth:`scan_episode_toolcall_leaks`.
 
         Args:
             episode_uuid: UUID of the EpisodicNode to redact.
@@ -1898,6 +1918,29 @@ class GraphitiBackend:
             'old_content': old_content,
             'new_content': new_content,
         }
+
+    @_canonicalize_group_args
+    async def scan_episode_toolcall_leaks(
+        self, *, group_id: str, page_size: int = _DEFAULT_READ_PAGE_SIZE,
+    ) -> EpisodeToolcallLeakScan:
+        """Find which of *group_id*'s episodes carry a leaked tool-call fragment.
+
+        Raises:
+            IncompleteEnumerationError: if the candidate read was structurally refused or capped.
+            TimeoutError: if a read outlasts its budget.
+        """
+        scan = await read_episode_toolcall_leaks(
+            self.graph_access.graph(group_id), group_id=group_id, page_size=page_size,
+        )
+        apply_incompleteness_policy(
+            scan.candidates,
+            method='scan_episode_toolcall_leaks',
+            group_id=group_id,
+            returned_count=len(scan.leaks),
+            noun='leaked episodes',
+            consequence='are not an incidence rate and must not drive a redaction sweep',
+        )
+        return scan
 
     @_canonicalize_group_args
     async def remove_edge(self, edge_uuid: str, *, group_id: str) -> None:

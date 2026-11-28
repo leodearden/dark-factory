@@ -32,6 +32,7 @@ from datetime import datetime
 from pathlib import Path
 
 import pytest
+from _orch_helpers import env_resolving_running_interpreter
 
 # Reused verbatim from the sibling shipped-script contract rather than
 # re-derived: WARM_LANE_SCRIPT_DIR is resolved from __file__ (not the process
@@ -57,6 +58,24 @@ _BASH = shutil.which('bash') or '/bin/bash'
 # harness
 # ---------------------------------------------------------------------------
 
+def _sanitized_env_with_test_python3(
+    extra: dict[str, str] | None = None,
+) -> dict[str, str]:
+    """``_sanitized_env`` with a bare ``python3`` bound to the interpreter running this test.
+
+    That interpreter is capable by construction (this module imports
+    ``orchestrator.git_ops``), so a bridge case never depends on what the host's
+    ``PATH`` carries.  A ``PATH`` in *extra* is refused: prepending a capable
+    interpreter ahead of a stub would make a hostile-``PATH`` case pass vacuously.
+    """
+    if extra is not None and 'PATH' in extra:
+        raise ValueError(
+            "extra['PATH'] would be shadowed by the test interpreter's bin dir; "
+            'a PATH-stubbing case must call _sanitized_env directly',
+        )
+    return env_resolving_running_interpreter(_sanitized_env(extra=extra))
+
+
 def _run_sourced(
     snippet: str,
     *,
@@ -70,7 +89,9 @@ def _run_sourced(
     ``lane_protect_glob`` cases: unlike the pure-bash lane-state half, those
     pay a real ``python3`` interpreter start plus the ``orchestrator.git_ops``
     import chain, which on a loaded host (this repo's own fleet saturates it)
-    measures single-digit seconds cold.
+    measures single-digit seconds cold.  The default *env* binds a bare
+    ``python3`` to the running interpreter, so a bridge case never depends on
+    what the host's ``PATH`` carries.
     """
     script = f'source {shlex.quote(str(LIB))}\n{snippet}\n'
     return subprocess.run(
@@ -79,7 +100,7 @@ def _run_sourced(
         text=True,
         timeout=timeout,
         cwd=str(cwd if cwd is not None else WARM_LANE_SCRIPT_DIR),
-        env=_sanitized_env() if env is None else env,
+        env=_sanitized_env_with_test_python3() if env is None else env,
     )
 
 
@@ -1510,7 +1531,9 @@ class TestLaneProtectGlobHonoursTheConfiguredIactBand:
         proc = _run_sourced(
             'lane_protect_glob _lane- _spec-',
             cwd=tmp_path,
-            env=_sanitized_env(extra={'REIFY_WARM_LANE_IACT_PREFIX': '_int-'}),
+            env=_sanitized_env_with_test_python3(
+                extra={'REIFY_WARM_LANE_IACT_PREFIX': '_int-'},
+            ),
             timeout=_BRIDGE_TIMEOUT,
         )
         assert proc.returncode == 0, proc.stderr
@@ -1537,7 +1560,9 @@ class TestLaneProtectGlobHonoursTheConfiguredIactBand:
         proc = _run_sourced(
             'lane_protect_glob',
             cwd=tmp_path,
-            env=_sanitized_env(extra={'REIFY_WARM_LANE_IACT_PREFIX': ''}),
+            env=_sanitized_env_with_test_python3(
+                extra={'REIFY_WARM_LANE_IACT_PREFIX': ''},
+            ),
             timeout=_BRIDGE_TIMEOUT,
         )
         assert proc.returncode == 0, proc.stderr

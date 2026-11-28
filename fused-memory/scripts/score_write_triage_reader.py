@@ -43,6 +43,9 @@ Run from ``fused-memory/``. This scores the committed soak baseline::
         --out calibration/write_triage_v2_soak_baseline.json \
         --markdown calibration/write_triage_v2_soak_baseline.md
 
+:func:`item_readings` gives each write's decided derivation and M3 ending,
+for a caller that compares two outcome sets item by item.
+
 ``--items`` and ``--verdicts`` each take one or more JSONL files. The brief
 the verdicts were rated under is recorded in the report: ``--corpus-record``
 takes it from a corpus summary's or derivation's latest re-rate (e.g.
@@ -125,7 +128,8 @@ _REQUIRED_ITEM_KEYS = ('entry_id', 'outcome', 'band', 'project', 'stratum')
 _FLAG_KEYS = ('via_sibling', 'cross_category', 'parent_edited_after_attach')
 _ENDINGS = (OUTCOME_RESTATED, OUTCOME_AMENDED, 'stored_unlinked', OUTCOME_CONTESTED, 'stored_linked')
 """Where a CONFLICT write can end up: its attach outcome, or stored with or without a mark."""
-_HIDDEN_ENDINGS = frozenset({OUTCOME_RESTATED, OUTCOME_AMENDED, 'stored_unlinked'})
+HIDDEN_ENDINGS = frozenset({OUTCOME_RESTATED, OUTCOME_AMENDED, 'stored_unlinked'})
+"""The endings M3 counts as hidden: attached without a contest, or stored without a mark."""
 _SCOPE_LABELS: Mapping[str, str] = MappingProxyType({
     _rubric.Resolved.CENTRAL: 'central', _rubric.Resolved.SECONDARY: 'secondary',
 })
@@ -263,6 +267,45 @@ class _Scored:
 
 
 _Predicate = Callable[[_Scored, '_rubric.Decided'], bool]
+
+
+@dataclass(frozen=True)
+class ItemReading:
+    """One write's current-basis derivation and, for a CONFLICT write, where it ended up.
+
+    ``decided`` is None when the derivation was UNCLEAR. ``m3_ending`` is one
+    of the M3 endings for a decided CONFLICT write and None otherwise; it is
+    hidden when it is in :data:`HIDDEN_ENDINGS`.
+    """
+
+    entry_id: str
+    stratum: str
+    outcome: str
+    decided: _rubric.Decided | None
+    m3_ending: str | None
+
+
+def item_readings(
+    items: Iterable[Mapping[str, Any]], verdicts: Iterable[Mapping[str, Any]],
+) -> tuple[ItemReading, ...]:
+    """Each item's reading, sorted by entry_id; refuse an incomplete corpus as score_reader does."""
+    judgements = _rubric.resolve_judgements(verdicts)
+    scored = [_score(item, judgements) for item in _reader_items(items)]
+    _refuse_incomplete(scored)
+    return tuple(
+        ItemReading(
+            entry_id=s.item.entry_id, stratum=s.item.stratum, outcome=s.item.outcome,
+            decided=s.decided, m3_ending=_m3_ending(s),
+        )
+        for s in scored
+    )
+
+
+def _m3_ending(s: _Scored) -> str | None:
+    decided = s.decided
+    if decided is None or not decided.conflict:
+        return None
+    return _ending(s, decided)
 
 
 def score_reader(
@@ -618,11 +661,9 @@ def _ending(s: _Scored, decided: _rubric.Decided) -> str:
 
 
 def _m3(scored: Sequence[_Scored], weights: Mapping[str, float] | None) -> dict[str, Any]:
-    endings = Counter(
-        _ending(s, s.decided) for s in scored if s.decided is not None and s.decided.conflict
-    )
+    endings = Counter(ending for s in scored if (ending := _m3_ending(s)) is not None)
     block = _proportion(
-        scored, lambda _: True, lambda s, d: _ending(s, d) in _HIDDEN_ENDINGS, weights,
+        scored, lambda _: True, lambda s, _: _m3_ending(s) in HIDDEN_ENDINGS, weights,
         within=lambda _, d: d.conflict,
     )
     return {**block, 'by_ending': {ending: endings[ending] for ending in _ENDINGS}}

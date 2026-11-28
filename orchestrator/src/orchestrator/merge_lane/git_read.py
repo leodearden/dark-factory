@@ -55,4 +55,26 @@ async def is_ancestor_or_raise(
     raise GitReadFailed(command, err)
 
 
-__all__ = ['GitReadFailed', 'git_read', 'is_ancestor_or_raise', 'resolve_commit']
+async def second_parents(git_ops: GitOps, commits: Sequence[str]) -> tuple[str, ...]:
+    """Each merge commit's second parent, in order, read by one ``git rev-parse``.
+
+    No commits runs no git.  A commit with no second parent makes git exit
+    non-zero, which raises :class:`GitReadFailed`, as does an answer whose
+    line count is not one per commit.
+    """
+    if not commits:
+        return ()
+    command = ['git', 'rev-parse', *(f'{commit}^2' for commit in commits)]
+    parents = tuple((await git_read(git_ops, command)).split())
+    if len(parents) != len(commits):
+        raise GitReadFailed(command, f'expected {len(commits)} parents, read {len(parents)}')
+    return parents
+
+
+__all__ = [
+    'GitReadFailed',
+    'git_read',
+    'is_ancestor_or_raise',
+    'resolve_commit',
+    'second_parents',
+]

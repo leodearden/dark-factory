@@ -1,0 +1,18 @@
+{
+  "task_id": "11974",
+  "reason": "wiring test for the lane stop predicate reads the harness's drain flag, as the file's other wiring tests read its lane slots",
+  "measures": [
+    {
+      "measure": "private_reads",
+      "key": "orchestrator/tests/test_harness_offline_lane.py",
+      "baseline": 35,
+      "current": 39
+    },
+    {
+      "measure": "total:private_reads",
+      "key": "<cluster>",
+      "baseline": 6142,
+      "current": 6146
+    }
+  ]
+}

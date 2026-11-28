@@ -458,8 +458,8 @@ class TestScorePanelRunCost:
 class TestScorePanelRunReviews:
     @pytest.mark.asyncio
     async def test_an_error_reviews_issues_never_reach_the_matcher(self) -> None:
-        issue_a = {'severity': 'blocking', 'location': 'a.py:1', 'category': 'bug', 'description': 'A'}
-        issue_b = {'severity': 'suggestion', 'location': 'b.py:2', 'category': 'style', 'description': 'B'}
+        issue_a = {'kind': 'defect', 'severity': 'blocking', 'location': 'a.py:1', 'category': 'bug', 'description': 'A'}
+        issue_b = {'kind': 'defect', 'severity': 'suggestion', 'location': 'b.py:2', 'category': 'style', 'description': 'B'}
         diff = CorpusDiff(
             diff_id='d4', language='python', source='synthetic',
             diff_text='diff', description='d', ground_truth=[_make_gt('gt1')],

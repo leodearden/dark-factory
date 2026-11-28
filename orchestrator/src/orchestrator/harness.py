@@ -32,7 +32,7 @@ from escalation.grant_delivery import (
 from escalation.models import DeliveredCheckOwner, Escalation, cascade_parent_id
 from escalation.pins import classify_pins
 from shared import delivered_check_polarity
-from shared.asyncio_tasks import abandon_task
+from shared.asyncio_tasks import abandon_task, cancel_all_within, track_task
 from shared.cli_invoke import (
     AllAccountsCappedException,
     invoke_with_cap_retry,
@@ -132,10 +132,20 @@ from orchestrator.deterministic_runner import (
 from orchestrator.eligibility_clock import EligibilityClockStore
 from orchestrator.escalation_router import InfoL0Sweep, RouterPorts, read_hold, router_owns
 from orchestrator.event_store import EventStore, EventType
-from orchestrator.flake_debt_drain import DRAIN_INTERVAL_SECS, run_drain_pass
+from orchestrator.flake_debt_drain import (
+    DRAIN_INTERVAL_SECS,
+    RESOLUTION_INTERVAL_SECS,
+    DebtResolutionSweep,
+    run_drain_pass,
+)
 from orchestrator.flake_ledger import ledger_db_path
 from orchestrator.fleet_drain import DrainIdentity, DrainParticipant, FleetDrainEvent
-from orchestrator.fleet_heartbeat import build_heartbeat_payload, resolve_fleet_dir, write_heartbeat
+from orchestrator.fleet_heartbeat import (
+    build_heartbeat_payload,
+    is_bare_unit_name,
+    resolve_fleet_dir,
+    write_heartbeat,
+)
 from orchestrator.fm_retry import is_fm_null_sentinel
 from orchestrator.git_ops import GitOps, classify_worktree_entry
 from orchestrator.l0_promotion import promote_l0_to_l1
@@ -193,6 +203,7 @@ from orchestrator.proc_supervision import EscalationSpec
 from orchestrator.project_slice_weight import ensure_project_slice_weight
 from orchestrator.provenance_conflict import ProvenanceConflictSink
 from orchestrator.quarantine_provenance import QuarantineOutcome
+from orchestrator.recovered_merge_holds import RecoveredMergeHolds
 from orchestrator.recovered_merge_owner import RecoveredMergeOwner
 from orchestrator.recovery_emission import (
     STREAK_CHARGING_SITES,
@@ -234,7 +245,9 @@ from orchestrator.service_restart import (
     schedule_detached_systemd_restart,
 )
 from orchestrator.slot_lease import (
+    LendingRule,
     SlotLease,
+    SlotLendingError,
     SuspendedTask,
     culprit,
     suspended_slot_tasks,
@@ -339,6 +352,8 @@ logger = logging.getLogger(__name__)
 
 # Force-release claimant clears that outlived their bound, kept referenced until they unwind.
 _UNDRAINED_CLAIMANT_CLEARS: set[asyncio.Task] = set()
+# Workflow tasks that outlived the shutdown drain, kept referenced until they unwind.
+_UNDRAINED_SHUTDOWN_WORKFLOWS: set[asyncio.Task] = set()
 
 # Maximum number of same-signature blocked→pending re-pends allowed before the
 # 4th flip is withheld and a born-at-L2 human escalation is filed.  A module
@@ -656,6 +671,11 @@ _WATCHER_ALLOWED_TOOLS: list[str] = [
     'Bash(git diff:*)',
     'Bash(git status:*)',
     'Bash(git show:*)',
+    # Existence (`-e`) / type (`-t`) probes of an object or a <ref>:<path>,
+    # backing SKILL.md's orphan-reaper investigation step and close
+    # conditions 2 and 3. Covered by
+    # TestWatcherAllowedTools.test_required_tool_is_granted_and_not_disallowed.
+    'Bash(git cat-file:*)',
     'Bash(git rev-parse:*)',
     'Bash(git branch:*)',
     'Bash(git ls-files:*)',
@@ -665,8 +685,9 @@ _WATCHER_ALLOWED_TOOLS: list[str] = [
     # promote_to_l2 (see SKILL.md "Delegating deep RCA to an opus subagent").
     # The spawned subagent inherits this same allowed/disallowed-tools
     # posture, so it cannot edit code or touch main regardless of its prompt.
-    # Covered by TestWatcherAllowedTools.test_task_in_allowed_tools — keep in
-    # lockstep with that test if this entry ever moves or is removed.
+    # Covered by
+    # TestWatcherAllowedTools.test_required_tool_is_granted_and_not_disallowed
+    # — keep in lockstep with that test if this entry ever moves or is removed.
     'Task',
     # Escalation MCP: read + autonomous resolve + L1→L2 promotion
     # (promote_to_l2 is needed by the consumer-per-level contract so the
@@ -692,6 +713,8 @@ _WATCHER_ALLOWED_TOOLS: list[str] = [
     'mcp__fused-memory__get_task',
     'mcp__fused-memory__get_tasks',
     'mcp__fused-memory__search',
+    # Read-only existence lookup for dependency_discovered and workflow_slot_wedged (task 10426)
+    'mcp__fused-memory__search_tasks',
     'mcp__fused-memory__update_task',
     'mcp__fused-memory__add_dependency',
     # Convert-to-tracked-work filing (task 3726): submit_task files the
@@ -1674,6 +1697,30 @@ class _OrphanDisposition(Enum):
     KEPT = 'kept'
 
 
+@dataclass(frozen=True)
+class _StaleL0StrandSweep:
+    """The strands one startup sweep dismissed, tallied once for its WARNING line and its record."""
+
+    strands: tuple[dict[str, Any], ...]
+
+    @property
+    def max_pending_secs(self) -> int:
+        return max(s['pending_secs'] for s in self.strands)
+
+    @property
+    def workflow_waiting(self) -> int:
+        return sum(1 for s in self.strands if s['workflow_blocked'])
+
+    @property
+    def files_a_record(self) -> bool:
+        """Only a strand a workflow was waiting on earns a level-1 record (task 5200).
+
+        Leo's ruling (b) on esc-__stale_l0_strand_sweep__-4: an info-only
+        sweep's record is noise, so it keeps its telemetry and files nothing.
+        """
+        return self.workflow_waiting > 0
+
+
 class Harness:
     """Top-level orchestration loop."""
 
@@ -1953,7 +2000,8 @@ class Harness:
             ReviewCheckpoint(config, self.mcp, self.usage_gate)
             if config.review.enabled else None
         )
-        # The running focused review checkpoint, if any; dispatch pauses while set.
+        # The running focused review checkpoint, if any: while set, a merge
+        # cannot start a second one.
         self._review_task: asyncio.Task | None = None
         # Slot and review-checkpoint tasks still running.  Each task removes
         # itself from its done-callback, so the set is never rebound.
@@ -2262,6 +2310,15 @@ class Harness:
         self._lock_file: IO | None = None
 
     @property
+    def draining(self) -> bool:
+        """True once run()'s finally has begun draining in-flight slots: the host is stopping.
+
+        The one read of the drain fact for a component that must tell the host's own stop
+        from any other cause, such as a child a signal ended (task 11974).
+        """
+        return self._draining
+
+    @property
     def _filing_claimant_run_id(self) -> str | None:
         """This harness process's identity, stamped on every ``Escalation`` it files.
 
@@ -2405,7 +2462,8 @@ class Harness:
         orphan-l0-reaper, terminal-status-watcher, watcher-supervisor,
         stranded-reconcile, main-tip-sweep, no-landings-breaker,
         deterministic-recon-sweep, warm-lane-gc, stale-service-restart,
-        merge-heartbeat, verify-admission-watch, flake-debt-drain.
+        merge-heartbeat, verify-admission-watch, flake-debt-drain,
+        flake-debt-resolution.
         loop-stall-monitor starts first so it watches every other service's
         whole life, and stops last (task 7366). escalation-server and
         merge-worker start next: the recovery block (which runs immediately
@@ -2415,9 +2473,10 @@ class Harness:
         seven sweeps are conditionally registered on their own
         ``config.X_enabled`` gate — ``BackgroundService`` itself has no
         ``enabled`` field (PRD §5.3 shape); a disabled sweep is simply
-        absent from the registry. The last four always run: they must keep
+        absent from the registry. The last five always run: they must keep
         their cadence whatever the dispatch loop is doing (task 5344; the
-        verify-admission watch, task 5628; the flake-debt drain, task 6934).
+        verify-admission watch, task 5628; the flake-debt drain, task 6934;
+        the flake-debt resolution sweep, task 8409).
         """
         if self._lifecycle is not None:
             return
@@ -2550,11 +2609,21 @@ class Harness:
             stop_timeout_secs=_LIFECYCLE_SWEEP_STOP_TIMEOUT_SECS,
             max_failure_logs=_BG_LOOP_MAX_FAILURE_LOGS,
         ))
-        drain_client = SchedulerChronicFlakeTaskClient(self.scheduler, self.config.project_root)
+        ledger_client = SchedulerChronicFlakeTaskClient(self.scheduler, self.config.project_root)
         registry.register(BackgroundService(
             name='flake-debt-drain',
-            pass_fn=functools.partial(self._run_flake_debt_drain_pass, drain_client),
+            pass_fn=functools.partial(self._run_flake_debt_drain_pass, ledger_client),
             interval_secs=DRAIN_INTERVAL_SECS,
+            backoff=sweep_backoff,
+            stop_timeout_secs=_LIFECYCLE_SWEEP_STOP_TIMEOUT_SECS,
+            max_failure_logs=_BG_LOOP_MAX_FAILURE_LOGS,
+        ))
+        registry.register(BackgroundService(
+            name='flake-debt-resolution',
+            pass_fn=functools.partial(
+                self._run_flake_debt_resolution_pass, ledger_client, DebtResolutionSweep(),
+            ),
+            interval_secs=RESOLUTION_INTERVAL_SECS,
             backoff=sweep_backoff,
             stop_timeout_secs=_LIFECYCLE_SWEEP_STOP_TIMEOUT_SECS,
             max_failure_logs=_BG_LOOP_MAX_FAILURE_LOGS,
@@ -2579,6 +2648,23 @@ class Harness:
             escalation_queue=self._escalation_queue,
             filing_claimant_run_id=self._filing_claimant_run_id,
         )
+
+    async def _run_flake_debt_resolution_pass(
+        self, task_client: SchedulerChronicFlakeTaskClient, sweep: DebtResolutionSweep,
+    ) -> None:
+        """One pass of the flake ledger's eager resolution sweep (plans/flake-ledger-prd.md
+        task θ, task 8409), recorded as one ``flake_debt_resolution_pass`` event."""
+        report = await sweep.run_pass(
+            ledger_db_path(Path(self.config.project_root)),
+            self.config.fused_memory.project_id,
+            task_client=task_client,
+        )
+        if self.event_store is not None:
+            await asyncio.to_thread(
+                self.event_store.emit,
+                EventType.flake_debt_resolution_pass,
+                data=report.event_data(),
+            )
 
     async def _run_verify_admission_watch_pass(self) -> None:
         """One tick of the task-verify admission watch on this process's gate.
@@ -2975,7 +3061,7 @@ class Harness:
             # in a consistent post-startup state.
             self.scheduler.finish_startup()
             journal.clear()
-            startup_completed_at = datetime.now(UTC)
+            startup_completed_at = self._stamp_startup_completed()
 
             statuses, _ = await self.scheduler.get_statuses()
             self.report.total_tasks = sum(1 for s in statuses.values() if s == 'pending')
@@ -2994,14 +3080,6 @@ class Harness:
             )
 
             while True:
-                # If a review checkpoint is running, don't acquire new tasks —
-                # wait for in-flight tasks (and the review, itself live) to end.
-                if self._review_task is not None:
-                    await asyncio.wait(
-                        set(self._live_tasks), return_when=asyncio.FIRST_COMPLETED,
-                    )
-                    continue
-
                 # A slot is taken before a task is picked, so no picked task
                 # holds its module locks while waiting for one (task 8480).
                 scope = slots.free_scope()
@@ -3122,7 +3200,9 @@ class Harness:
                         'slot: every general run slot is held',
                         assignment.task_id,
                     )
-                self._launch_slot(assignment, sem, task_reports)
+                self._launch_slot(
+                    assignment, SlotLease(assignment.task_id, self.scheduler, sem), task_reports,
+                )
 
             self._compute_tallies(task_reports)
 
@@ -3162,18 +3242,7 @@ class Harness:
             # usage_gate.shutdown() has drained the existing ones, leaving
             # the event loop alive forever.  Each slot's done-callback
             # collects its synthetic CANCELLED report.
-            if self._live_tasks:
-                live = set(self._live_tasks)
-                logger.info(f'Cancelling {len(live)} active workflow task(s)')
-                for t in live:
-                    t.cancel()
-                try:
-                    await asyncio.wait_for(
-                        asyncio.gather(*live, return_exceptions=True),
-                        timeout=15.0,
-                    )
-                except TimeoutError:
-                    logger.error('Workflow tasks did not drain within 15s')
+            await self._drain_live_workflows()
             self._compute_tallies(task_reports)
 
             self.report.completed_at = datetime.now(UTC).isoformat()
@@ -3184,11 +3253,12 @@ class Harness:
             if self._run_store and self._run_id:
                 try:
                     self._run_store.finish_run(
-                        self._run_id, self.report,
-                        startup_completed_at=startup_completed_at, exit_reason=exit_reason,
+                        self._run_id, self.report, exit_reason=exit_reason,
                     )
                 except Exception as e:
                     logger.warning(f'Failed to finalize run metrics: {e}')
+
+            await self._flush_scheduler_snapshot()
 
             # Checkpoint all SQLite WAL files while the event loop is still
             # healthy — truncates the WAL so a subsequent crash cannot leave
@@ -3232,26 +3302,7 @@ class Harness:
             # 4b. Last-resort straggler sweep — catches any task the named
             # cleanup above missed (orphan probe tasks, cost-event
             # fire-and-forgets, sub-tasks spawned by merge/escalation stop).
-            current = asyncio.current_task()
-            stragglers = [
-                t for t in asyncio.all_tasks()
-                if t is not current and not t.done()
-            ]
-            if stragglers:
-                names = [t.get_name() for t in stragglers]
-                logger.warning(
-                    f'Cancelling {len(stragglers)} straggler task(s): {names}'
-                )
-                for t in stragglers:
-                    t.cancel()
-                try:
-                    await asyncio.wait_for(
-                        asyncio.gather(*stragglers, return_exceptions=True),
-                        timeout=5.0,
-                    )
-                except TimeoutError:
-                    still = [t.get_name() for t in stragglers if not t.done()]
-                    logger.error(f'Stragglers did not die within 5s: {still}')
+            await self._sweep_straggler_tasks()
 
             # Release singleton lock
             if self._lock_file is not None:
@@ -3260,6 +3311,51 @@ class Harness:
 
         logger.info(self.report.summary())
         return self.report
+
+    # How long shutdown waits for cancelled workflow slots to unwind (run()'s step 4a).
+    _SHUTDOWN_WORKFLOW_DRAIN_SECS: float = 15.0
+
+    async def _drain_live_workflows(self) -> None:
+        """Cancel every live workflow slot; detach those still running after ``_SHUTDOWN_WORKFLOW_DRAIN_SECS``.
+
+        A detached slot leaves ``_live_tasks`` and is tracked in
+        ``_UNDRAINED_SHUTDOWN_WORKFLOWS`` until it ends.
+        """
+        live = set(self._live_tasks)
+        if not live:
+            return
+        logger.info('Cancelling %d active workflow task(s)', len(live))
+        undrained = await cancel_all_within(live, timeout_secs=self._SHUTDOWN_WORKFLOW_DRAIN_SECS)
+        if not undrained:
+            return
+        self._live_tasks.difference_update(undrained)
+        for task in undrained:
+            track_task(task, _UNDRAINED_SHUTDOWN_WORKFLOWS)
+        logger.error(
+            '%d workflow task(s) did not end within %.0fs of their shutdown cancel; detached: %s',
+            len(undrained), self._SHUTDOWN_WORKFLOW_DRAIN_SECS,
+            sorted(t.get_name() for t in undrained),
+        )
+
+    # How long shutdown waits for cancelled straggler tasks to unwind (run()'s step 4b).
+    _SHUTDOWN_STRAGGLER_DRAIN_SECS: float = 5.0
+
+    async def _sweep_straggler_tasks(self) -> None:
+        """Cancel every other live task; never wait past ``_SHUTDOWN_STRAGGLER_DRAIN_SECS``."""
+        current = asyncio.current_task()
+        stragglers = [t for t in asyncio.all_tasks() if t is not current and not t.done()]
+        if not stragglers:
+            return
+        logger.warning(
+            'Cancelling %d straggler task(s): %s',
+            len(stragglers), [t.get_name() for t in stragglers],
+        )
+        still = await cancel_all_within(stragglers, timeout_secs=self._SHUTDOWN_STRAGGLER_DRAIN_SECS)
+        if still:
+            logger.error(
+                'Stragglers did not die within %.0fs: %s',
+                self._SHUTDOWN_STRAGGLER_DRAIN_SECS, sorted(t.get_name() for t in still),
+            )
 
     async def _tag_prd_metadata(self, prd_path: Path, pre_parse_ids: set[str]) -> None:
         """Tag tasks with the PRD they were created from."""
@@ -8481,6 +8577,7 @@ class Harness:
                     esc.id,
                     'auto-resolved: pool storage is present again',
                     resolved_by=self._POOL_STORAGE_ABSENT_ROLE,
+                    resolution_class='benign',
                 )
                 logger.info(
                     'Pool-storage-absent: auto-resolved escalation %s', esc.id,
@@ -9008,6 +9105,7 @@ class Harness:
                     esc.id,
                     'auto-resolved: warm-lane base is healthy again',
                     resolved_by=self._WARM_BASE_HARD_DOWN_ROLE,
+                    resolution_class='benign',
                 )
                 logger.info(
                     'Warm-base hard-down: auto-resolved escalation %s', esc.id,
@@ -9130,6 +9228,7 @@ class Harness:
                     esc.id,
                     resolution_reason,
                     resolved_by='orchestrator-no-landings-breaker',
+                    resolution_class='benign',
                 )
                 logger.info(
                     'No-landings breaker: auto-resolved INFO escalation %s', esc.id
@@ -9897,6 +9996,7 @@ class Harness:
                 existing_id,
                 resolution=evidence.value,
                 resolved_by=self._WATCHER_OUTAGE_ALARM.role,
+                resolution_class='benign',
             )
             logger.info(
                 'Resolved watcher-outage L2 escalation %s (watcher recovered, evidence=%s)',
@@ -9954,6 +10054,7 @@ class Harness:
                         esc.id,
                         'tree now clean at startup',
                         resolved_by='orchestrator-dirty-tree-guard',
+                        resolution_class='benign',
                     )
             return
         logger.warning(
@@ -10022,6 +10123,7 @@ class Harness:
                         esc.id,
                         'config now has no unknown keys at startup',
                         resolved_by='orchestrator-config-key-guard',
+                        resolution_class='benign',
                     )
                 return
 
@@ -10117,9 +10219,9 @@ class Harness:
             )
 
     async def _run_slot(
-        self, assignment, sem: asyncio.Semaphore
+        self, assignment, lease: SlotLease
     ) -> TaskReport | None:
-        """Run a single workflow slot."""
+        """Run a single workflow slot on *lease*."""
         report = None
         # Hoisted (task 3172) so the `except asyncio.CancelledError` handler can
         # read the live phase defensively: a cancel landing during slot SETUP
@@ -10131,7 +10233,6 @@ class Harness:
         # preventing the rapid re-block loop where reconciliation immediately
         # re-dispatches the task before it can make progress.
         arm_requeue_cooldown = False
-        lease = SlotLease(assignment.task_id, self.scheduler, sem)
         self._slot_lease_registry()[assignment.task_id] = lease
         try:
             logger.info(
@@ -12125,10 +12226,12 @@ class Harness:
             logger.error(f'Full review failed: {e}')
 
     def _trigger_review_checkpoint(self) -> None:
-        """Spawn a review checkpoint as a concurrent task.
+        """Spawn a review checkpoint as a concurrent task that runs beside dispatch.
 
-        The main loop will pause task acquisition while ``_review_task`` is
-        set, but in-flight tasks continue in their worktrees.
+        Pausing dispatch would protect nothing: in-flight slots and the merge
+        lane land on main during a checkpoint either way (Phase 1's tree
+        stability is task 11085).  The review's merge scope is fixed when it
+        starts (review_checkpoint.py::ReviewCheckpoint.run_focused).
         """
         task = asyncio.create_task(
             self._run_review_checkpoint(), name='review-checkpoint',
@@ -12138,7 +12241,7 @@ class Harness:
         task.add_done_callback(self._finish_review_checkpoint)
 
     def _finish_review_checkpoint(self, t: asyncio.Task) -> None:
-        """Done-callback of the review task: let the loop dispatch again."""
+        """Done-callback of the review task: clear the running-checkpoint mark so a later merge can trigger the next one."""
         self._live_tasks.discard(t)
         self._review_task = None
         error = None if t.cancelled() else t.exception()
@@ -12183,6 +12286,19 @@ class Harness:
                 await self._tag_task_modules()
             except Exception as tag_err:
                 logger.warning(f'Post-review module tagging failed: {tag_err}')
+
+    def _stamp_startup_completed(self) -> datetime:
+        """Record on this run's runs row that startup finished; return the instant."""
+        at = datetime.now(UTC)
+        if self._run_store is not None and self._run_id is not None:
+            try:
+                self._run_store.mark_startup_completed(self._run_id, at)
+            except Exception:
+                logger.warning(
+                    'Failed to record startup completion for run %s', self._run_id,
+                    exc_info=True,
+                )
+        return at
 
     def _checkpoint_stores(self) -> None:
         """Run WAL TRUNCATE checkpoint on each SQLite store — best-effort.
@@ -12247,6 +12363,7 @@ class Harness:
             enforce_merge_liveness_margin,
             enforce_persistent_worktree_serial_lane,
         )
+        from orchestrator.merge_lane.screen import MergeScreen
         from orchestrator.merge_lane.worker import PRODUCTION_VERIFIER, SpeculativeMergeWorker
 
         # K = verify hosts + 1 counts the frontier and sizes the worker's
@@ -12335,6 +12452,10 @@ class Harness:
             host_holder_reader=self._host_pool.holders,
             on_host_readmitted=self._note_verify_host_readmitted,
             task_priority=self._task_priority,
+            screen=MergeScreen(
+                self.git_ops, event_store=self.event_store,
+                escalation_queue=self._escalation_queue,
+            ),
         )
         # Manage every remote host from the start, so a task-path bench before
         # the first merge lands on a tracked host (task 6670).  Without a
@@ -12634,6 +12755,7 @@ class Harness:
             task_client=SchedulerChronicFlakeTaskClient(self.scheduler, self.config.project_root),
             escalation_queue=self._escalation_queue,
             pass_outcome_hooks=lane_pass_outcome_hooks(self.config, self._escalation_queue),
+            stopping=lambda: self.draining,
         )
         if not worker.acquire_lock():
             logger.warning(
@@ -13010,10 +13132,11 @@ class Harness:
         The ``pass_fn`` of the merge-heartbeat service, so it refreshes on
         its own cadence whatever the dispatch loop is doing (task 5344).
         Fail-open: any exception (state read or disk write) is swallowed and
-        logged.
+        logged; the WARNING names ``ORCH_UNIT`` and its expected shape only
+        when that value fails ``is_bare_unit_name``.
         """
+        unit = os.environ.get('ORCH_UNIT', '')
         try:
-            unit = os.environ.get('ORCH_UNIT', '')
             reading = await self._drain_participant.on_heartbeat_pass()
             queue_empty = self._merge_queue.empty()
             if reading.depth is None:
@@ -13034,10 +13157,18 @@ class Harness:
             )
             await asyncio.to_thread(write_heartbeat, resolve_fleet_dir(), unit, payload)
         except Exception:
-            logger.warning(
-                'merge heartbeat write failed; continuing (fail-open)',
-                exc_info=True,
-            )
+            if is_bare_unit_name(unit):
+                logger.warning(
+                    'merge heartbeat write failed; continuing (fail-open)', exc_info=True,
+                )
+            else:
+                logger.warning(
+                    'merge heartbeat write failed; continuing (fail-open). ORCH_UNIT '
+                    "was %r, but it must be this orchestrator's systemd unit, e.g. "
+                    'orchestrator-dark-factory.service; set it on that unit.',
+                    unit,
+                    exc_info=True,
+                )
 
     def _announce_deployed_sha(self) -> None:
         """Log the deployed sha; warn and emit an event when it is flagged (6565 D1).
@@ -13253,17 +13384,24 @@ class Harness:
         operator-tuned "an unattended L0 this old is overdue" bound avoids
         minting a guessed constant.
 
+        The anchor decides CLASSIFICATION only: the ``'stale-strand'`` stamp,
+        the per-strand event and the WARNING line.  The level-1 record is
+        filed only when a strand had a workflow waiting (Leo's ruling (b) on
+        esc-__stale_l0_strand_sweep__-4, task 5200).  With
+        ``info_l0_router_enabled`` the info notes the router owns are routed
+        first, never dismissed unread (plans/info-l0-disposition-router-prd.md
+        boundary #16): a held or still-unrouted one survives the sweep for the
+        orphan reaper, and none is counted as a strand, so the records filed
+        are for blocking strands.  An info strand (the router off, or an
+        eval-lane note the router does not own) is stamped and reported but
+        files no record; it stays readable by id from the escalation archive.
+
         Why the startup sweep is the ONLY place this class is ever observed:
         ``_reap_orphan_l0_escalations`` skips any L0 whose task has a live
         workflow attending it ("active workflow will handle it"), so a blocking
         L0 with a parked workflow can never age out there.  The origin strand
         esc-5189-7 sat pending 20h58m for exactly that reason — a workflow WAS
         attending it — and then this sweep closed it as ordinary restart noise.
-
-        Info notes the info-L0 router owns are routed first, never dismissed
-        unread (plans/info-l0-disposition-router-prd.md boundary #16): a held
-        or still-unrouted one survives the sweep for the orphan reaper, and
-        none is counted as a strand.
         """
         if self._escalation_queue is None:
             return
@@ -13324,10 +13462,13 @@ class Harness:
         """Per-record detail for the L0s about to be swept as strands.
 
         Taken BEFORE ``dismiss_all_pending`` because the sweep returns only an
-        int, and the whole point of task 3172 is the per-record detail.  Safe
-        to read here: this runs at startup step 1c, immediately after
-        ``_lifecycle.start_all()``, with no dispatched workflows yet, so the
-        queue is single-writer.
+        int, and the whole point of task 3172 is the per-record detail.  This
+        runs at startup step 1c with no in-process workflows dispatched yet,
+        but other processes (fused-memory middlewares, reconciliation) write
+        the same queue directory and may file or resolve an L0 between this
+        snapshot and ``dismiss_all_pending``, so the per-record detail is
+        best-effort telemetry.  The concurrency contract is
+        ``escalation/src/escalation/sweep.py``'s module docstring.
 
         ``workflow_blocked`` is DERIVED from the record's own severity, not
         from harness runtime state: at this point the process has just
@@ -13375,11 +13516,7 @@ class Harness:
         return strands
 
     def _report_stale_l0_strands(self, strands: list[dict[str, Any]]) -> None:
-        """Emit one event per swept strand and file the aggregate escalation.
-
-        No-op when nothing was stranded — an ordinary restart that sweeps only
-        seconds-old L0s stays quiet.
-        """
+        """Emit one event per swept strand, log the sweep, and hand it to the record filer."""
         if not strands:
             return
 
@@ -13391,21 +13528,27 @@ class Harness:
                     data={k: v for k, v in strand.items() if k != 'task_id'},
                 )
 
-        max_age = max(s['pending_secs'] for s in strands)
+        sweep = _StaleL0StrandSweep(tuple(strands))
+        filing = (
+            'filing the level-1 strand record' if sweep.files_a_record
+            else 'no level-1 record filed because no workflow was waiting'
+        )
         logger.warning(
-            f'Dismissed {len(strands)} STALE-STRAND L0 escalation(s) at startup '
-            f'(max pending {max_age}s); these had been waiting far longer than '
-            f'the {self.config.orphan_l0_timeout_secs:.0f}s strand threshold and '
-            f'are NOT ordinary restart artifacts'
+            f'Dismissed {len(sweep.strands)} STALE-STRAND L0 escalation(s) at startup '
+            f'(max pending {sweep.max_pending_secs}s, {sweep.workflow_waiting} with a '
+            f'workflow waiting); these had been waiting far longer than the '
+            f'{self.config.orphan_l0_timeout_secs:.0f}s strand threshold and are '
+            f'NOT ordinary restart artifacts; {filing}'
         )
 
-        self._file_stale_l0_strand_escalation(strands)
+        self._file_stale_l0_strand_escalation(sweep)
 
     # Strand-sweep aggregate escalation (task 3172).  One record per sweep that
-    # strands anything, however many strands it sweeps.  The rate is bounded by
-    # the strand threshold, not by a guard: each sweep dismisses every pending
-    # L0, so a strand at the next sweep was filed after this one and has aged
-    # past orphan_l0_timeout_secs since (task 4988).
+    # strands an L0 a workflow was waiting on (task 5200), however many strands
+    # it sweeps.  The rate is bounded by the strand threshold, not by a guard:
+    # each sweep dismisses every pending L0, so a strand at the next sweep was
+    # filed after this one and has aged past orphan_l0_timeout_secs since
+    # (task 4988).
 
     @staticmethod
     def _open_stale_l0_strand_records(
@@ -13448,8 +13591,11 @@ class Harness:
             f'the strands this sweep dismissed, which no earlier record lists.\n\n'
         )
 
-    def _file_stale_l0_strand_escalation(self, strands: list[dict[str, Any]]) -> None:
+    def _file_stale_l0_strand_escalation(self, sweep: _StaleL0StrandSweep) -> None:
         """File ONE level-1 escalation for the strands this restart destroyed.
+
+        Filed only when ``sweep.files_a_record``: a strand had a workflow
+        waiting.  The record then names every strand, info ones included.
 
         Level is load-bearing.  ``dismiss_all_pending`` sweeps every pending L0
         at startup, so an aggregate filed at L0 would be erased by the very
@@ -13468,16 +13614,16 @@ class Harness:
         it into the same decision instead of closing it as a duplicate.
         """
         queue = getattr(self, '_escalation_queue', None)
-        if not queue or not strands:
+        if not queue or not sweep.files_a_record:
             return
+        strands = sweep.strands
         try:
             open_records = self._open_stale_l0_strand_records(queue.get_pending())
 
-            max_age = max(s['pending_secs'] for s in strands)
-            blocked = sum(1 for s in strands if s['workflow_blocked'])
+            max_age = sweep.max_pending_secs
             summary = (
                 f'{len(strands)} L0 escalation(s) stranded across restart '
-                f'(max pending {max_age}s, {blocked} with a workflow waiting)'
+                f'(max pending {max_age}s, {sweep.workflow_waiting} with a workflow waiting)'
             )[:200]
             lines = '\n'.join(
                 f'  - {s["escalation_id"]} (task {s["task_id"]}): pending '
@@ -13640,6 +13786,12 @@ class Harness:
         (task 7277): a landing drives the landed-outbox done-write through
         :meth:`_reconcile_landing`, a durable failure blocks the task and files
         an L1, and an outcome that halted the merge queue files the halt-owning L1.
+
+        Each recovered request's in-progress task then re-takes its journalled
+        files through
+        ``orchestrator/src/orchestrator/recovered_merge_holds.py::RecoveredMergeHolds``
+        (task 10093), before the first ``acquire_next``, which
+        ``Scheduler.finish_startup`` gates.
         """
         report = await recover_pending_merges(
             self._merge_store,
@@ -13653,13 +13805,20 @@ class Harness:
             enqueue_merge_request=enqueue_merge_request,
             select_recovery_winner=select_recovery_winner,
         )
+        requests = report.get('requests', [])
+        holds = RecoveredMergeHolds(
+            self.scheduler, lock_depth=self.config.lock_depth, event_store=self.event_store,
+        )
         RecoveredMergeOwner(
             tasks=self.scheduler,
             escalations=self._escalation_queue,
             reconcile_landing=self._reconcile_landing,
             merge_halt=self._merge_worker,
             event_store=self.event_store,
-        ).adopt(report.get('requests', []), schedule=self._schedule_coro_threadsafe)
+            holds=holds,
+            stopping=lambda: self.draining,
+        ).adopt(requests, schedule=self._schedule_coro_threadsafe)
+        await holds.restore(requests)
         logger.info(
             '_recover_pending_merges: recovered=%d dropped=%d coalesced=%d '
             'journal_corrupt=%s',
@@ -14761,9 +14920,9 @@ class Harness:
             await asyncio.sleep(self.config.idle_poll_secs)
 
     def _launch_slot(
-        self, assignment, sem: asyncio.Semaphore, task_reports: list[TaskReport],
+        self, assignment, lease: SlotLease, task_reports: list[TaskReport],
     ) -> asyncio.Task:
-        """Start the slot task for *assignment*, whose *sem* permit is already held."""
+        """Start the slot task for *assignment*, running on *lease*, which holds its permit or borrows one."""
         self._task_modules[assignment.task_id] = list(assignment.modules)
         # Register escalation wake-event BEFORE create_task so Fix #1a
         # (_on_escalation_resolved orphan-flip gate) sees task_id in
@@ -14775,7 +14934,7 @@ class Harness:
         # for, so a reject that brings the task back re-announces.
         self._landing_rejects.release(assignment.task_id)
         task = asyncio.create_task(
-            self._run_slot(assignment, sem),
+            self._run_slot(assignment, lease),
             name=f'workflow-{assignment.task_id}',
         )
         self._live_tasks.add(task)
@@ -14802,7 +14961,35 @@ class Harness:
                 if self._escalation_events.get(tid) is ev else None
             )
         )
+        # Backstop for a slot that never released its lease: cancelled before
+        # its first step, or its finally raised first.  Otherwise a no-op.
+        task.add_done_callback(lambda _t, lease=lease: lease.release(requeued=False))
         return task
+
+    def _launch_borrowing_slot(
+        self, assignment, lender_task_id: str, task_reports: list[TaskReport],
+    ) -> asyncio.Task:
+        """Start *assignment*'s slot on a permit borrowed from *lender_task_id*'s live slot.
+
+        Synchronous, so a caller can make it part of one uninterrupted claim
+        step.  Rules: ``plans/early-start-on-predecessor-branch-prd.md``
+        section 5.3 "Slot".
+        """
+        leases = self._slot_lease_registry()
+        lender = leases.get(lender_task_id)
+        if lender is None:
+            raise SlotLendingError(
+                LendingRule.NO_LIVE_SLOT, lender_task_id=lender_task_id, borrower_task_id=assignment.task_id,
+            )
+        if assignment.task_id in leases:
+            raise SlotLendingError(
+                LendingRule.BORROWER_HAS_SLOT, lender_task_id=lender_task_id, borrower_task_id=assignment.task_id,
+            )
+        slot = self._launch_slot(assignment, lender.lend(assignment.task_id), task_reports)
+        logger.info(
+            'task %s launched on a slot borrowed from task %s', assignment.task_id, lender_task_id,
+        )
+        return slot
 
     def _slot_lease_registry(self) -> dict[str, SlotLease]:
         """The slot-lease registry, lazily created when absent (``_cancel_causes``'s idiom)."""
@@ -15661,10 +15848,12 @@ class Harness:
         see ``Harness._build_lifecycle_registry`` for the periodic invocation
         context.
 
-        On a PASS (task 2114), also self-heals: calls
-        ``_close_superseded_main_sweep_escalations`` with the just-verified
-        clean SHA to auto-close any prior main-sweep escalation whose swept
-        SHA this clean tip has superseded.  Never called on the failure path.
+        On a PASS (task 2114) of EITHER seed mode, warm passes included, also
+        self-heals: calls ``_close_superseded_main_sweep_escalations`` with
+        the just-verified clean SHA to auto-close any prior main-sweep
+        escalation whose swept SHA this clean tip has superseded.  Never
+        called on the failure path.  The accepted risk of closing on a warm
+        pass is stated on ``_close_superseded_main_sweep_escalations``.
 
         Before filing, a drifting result is passed through
         ``verify.confirm_main_tip_failure_is_real`` (task 2370): a fresh
@@ -15824,15 +16013,24 @@ class Harness:
 
         ``_run_main_tip_sweep`` never closed its own stale failing escalation
         once a LATER pass verified main clean — this is the pile-up gap.  The
-        only fail-safe positive evidence that the cited defect is actually
-        fixed is a FRESH full-verify PASS at a SHA that is a STRICT
-        descendant of the failed swept SHA (main advanced and now verifies
-        clean).  A bare ``is_ancestor(cited_sha, main)`` is unsafe: the
+        accepted positive evidence that the cited defect is actually fixed is
+        a full-verify PASS, from a warm (CoW-seeded) or a cold build, at a SHA
+        that is a STRICT descendant of the failed swept SHA (main advanced and
+        now verifies clean).  A bare ``is_ancestor(cited_sha, main)`` is unsafe: the
         failing SHA is itself an ancestor of an un-advanced (still-broken)
         main, and ``git merge-base --is-ancestor`` is reflexive (a commit is
         trivially an ancestor of itself) — so an escalation whose swept SHA
         equals *clean_sha* at 12-hex precision is explicitly guarded rather
         than auto-closed, even though ``is_ancestor`` would return True.
+
+        Accepting a warm pass is a ruling (Leo 2026-10-09, esc-5812-4 option
+        C) with a known residual risk.  SHA dedup (``_last_swept_main_sha``)
+        stops the cold control (``main_tip_sweep_cold_interval_secs``, daily
+        by default) from re-checking a SHA a warm pass already cleared, so a
+        wrong warm pass, e.g. from a poisoned warm base, can close a real
+        red-main escalation and mask a red main for up to about 24 h, until a
+        cold sweep of a later tip.  Pinned by
+        ``orchestrator/tests/test_harness_escalation_revalidation_sweep.py::TestMainTipSweepSelfHealWiring``.
 
         Enumerates every pending escalation and closes (``close_only``, via
         ``resolve(dismiss=True)`` — never resumed/re-pended) each
@@ -16160,6 +16358,8 @@ class Harness:
             level=2,
             filing_claimant_run_id=self._filing_claimant_run_id,
             review_due=fields.review_due,
+            pin_declared_by=list(fields.pin.declared_by),
+            pin_declared_reason=fields.pin.reason,
         )
         self._escalation_queue.submit(esc)
         if self.event_store:
@@ -18691,6 +18891,8 @@ class Harness:
         4. Logs a WARNING so the operator sees it.
         5. Files an auto-resumable scheduler-pause L1 — unless ``file_escalation``
            is False.
+        6. Flushes scheduler_state.json (``_flush_scheduler_snapshot``) last,
+           after the runs.db row, so steps 1-5 run without yielding.
 
         ``file_escalation`` defaults True for every automatic trip (park-stop,
         cost-ceiling, EWA, watcher) so an AFK operator is notified.  A *deliberate*
@@ -18747,6 +18949,8 @@ class Harness:
         if file_escalation:
             self._file_scheduler_pause_escalation(reason)
 
+        await self._flush_scheduler_snapshot()
+
     async def resume_scheduler(self) -> None:
         """Clear the scheduler pause so acquire_next() resumes dispatching.
 
@@ -18761,6 +18965,8 @@ class Harness:
            signals that the situation is under control — a clean reset is less
            surprising than watching the EWA trip instantly again.
         5. Logs INFO.
+        6. Flushes scheduler_state.json (``_flush_scheduler_snapshot``) last,
+           after the runs.db clear, so steps 1-5 run without yielding.
         """
         # Snapshot the class BEFORE resume() clears it.
         prior_class = self.scheduler.pause_class
@@ -18786,6 +18992,19 @@ class Harness:
                 EventType.scheduler_resumed,
                 data={'pause_class': prior_class.value if prior_class else None},
             )
+
+        await self._flush_scheduler_snapshot()
+
+    async def _flush_scheduler_snapshot(self) -> None:
+        """Force a best-effort scheduler_state.json write; never raises.
+
+        A paused scheduler never ticks, so pause, resume, restore and shutdown
+        call this (plans/instruments-honesty-prd.md decision 5).
+        """
+        try:
+            await self.scheduler.flush_state_snapshot()
+        except Exception:
+            logger.warning('failed to flush the scheduler state snapshot', exc_info=True)
 
     async def _load_persisted_scheduler_pause(self) -> None:
         """Restore scheduler pause state from runs.db on restart.
@@ -18902,6 +19121,7 @@ class Harness:
                 '_load_persisted_scheduler_pause: failed to read pause state',
                 exc_info=True,
             )
+        await self._flush_scheduler_snapshot()
 
     def _reassert_restored_pause(
         self, reason: str, pause_class: PauseClass,
@@ -18943,10 +19163,13 @@ class Harness:
            the submissions diff (the EWA NUMERATOR).
         5. Compute window (last window_end → now).
         6. Aggregate escalation stats (fail-open).
-        7. Count done tasks in EventStore (fail-open).
-           done_count from EventStore is the single source of truth for both
-           the rendered digest figure and the update_ewa input — ensuring the
-           operator sees exactly the number that drove the EWA decision.
+        7. Count done runs in EventStore (fail-open): the former count, the
+           EWA denominator.  It is rendered beside the numerator under
+           digest.DONE_RUNS_LABEL, so the operator sees exactly the number
+           that drove the EWA decision.
+        7b. Count landings on main in the window (fail-open, None when
+            unreadable) through asyncio.to_thread: landings() runs a blocking
+            git first-parent cross-check that would otherwise stall the loop.
         8. Query cost stats from CostStore (fail-open).
         9. Read parked-task counts from Scheduler state.
         10. Update EWA using EventStore done_count.
@@ -19038,6 +19261,17 @@ class Harness:
                 )
                 if events_db_path is not None
                 else 0
+            )
+
+            # (7b) Landings in window, off the loop (INV-8; landings() runs git).
+            landings_count = (
+                await asyncio.to_thread(
+                    digest_mod.landings_in_window,
+                    events_db_path, Path(self.config.project_root), window_start, window_end,
+                    main_ref=self.config.git.main_branch,
+                )
+                if events_db_path is not None
+                else None
             )
 
             # (8) Cost stats (fail-open via cost_in_window).
@@ -19137,6 +19371,7 @@ class Harness:
                 pause_visibility=pause_visibility,
                 chain_telemetry=chain_telemetry,
                 lane_record_divergence=lane_record_divergence,
+                landings_count=landings_count,
             )
 
             digest_mod.write_digest_entry(digest_dir, inputs)

@@ -185,6 +185,9 @@ enumeration (amended 2026-10-05: 5414 is done, `cdc15a6b56`).
    and the hatch, poetry, flit and pdm equivalents) are not read. A workspace root that
    also carries `[project]`, as this repo's does, stays a workspace. Found by
    `review-all-solar_challenge-20261013`, whose run-local shim this replaces.
+   *Amended 2026-11-18 (task 6941):* `workspace_domain` is renamed `measurement_domain`,
+   since it also enumerates a single package; the text above keeps the name it was
+   written under.
 4. **Measure the checked-out commit, refuse a dirty domain.** `as_of_sha` is
    `git rev-parse HEAD`; if `git status --porcelain` lists any path under the domain the
    run exits 2 naming the paths. Files are read from the work tree and measured with

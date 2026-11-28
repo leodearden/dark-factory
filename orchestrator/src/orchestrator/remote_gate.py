@@ -164,6 +164,11 @@ def wire_classes() -> tuple[type, ...]:
     from orchestrator.task_verify_spec import TaskVerifySpec
     from orchestrator.verify import VerifyResult
     from orchestrator.verify_admission_record import AdmissionLeg
+    from orchestrator.verify_cache.keys import UnitKey
+    from orchestrator.verify_cache.policy import Admission
+    from orchestrator.verify_cache.recorder import CacheReport, ReportedUnit
+    from orchestrator.verify_cache.registry import Candidate
+    from orchestrator.verify_cache.remote_view import ShippedView
     from orchestrator.verify_evidence import VerifyUnit
     from orchestrator.verify_runner import MergeVerifySpec, UnscopedTypecheckSpec
     from orchestrator.verify_spec_shared import VerifyCommand
@@ -178,6 +183,12 @@ def wire_classes() -> tuple[type, ...]:
         VerifyCommand,
         UnscopedTypecheckSpec,
         FailureEvidence,
+        ShippedView,
+        Candidate,
+        CacheReport,
+        ReportedUnit,
+        UnitKey,
+        Admission,
     )
 
 
@@ -268,9 +279,9 @@ def reap_script_text() -> str:
     """The text of ``remote_gate/reap-gates.sh``, shipped as package data.
 
     Its contract: env ``GATE_ROOT`` (absolute).  Under a root carrying
-    :data:`GATE_ROOT_MARKER` it deletes sha dirs idle for 7 days and trash
-    older than a day; elsewhere it does nothing.  Run detached: it prints
-    nothing and its outcome is not awaited.
+    :data:`GATE_ROOT_MARKER` it deletes sha dirs idle for 7 days, each with
+    its build lock, and trash older than a day; elsewhere it does nothing.
+    Run detached: it prints nothing and its outcome is not awaited.
     """
     return _packaged_script('reap-gates.sh')
 

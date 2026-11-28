@@ -8,12 +8,15 @@ behind the return brief's "every claim re-checked at generation time and
 timestamped": an unstamped claim is unrepresentable.
 
 The runs.db figures are the connection-taking query forms of
-``orchestrator.digest``'s readers (``query_count_done_in_window``,
+``orchestrator.digest``'s readers (``query_landings_in_window``,
 ``query_model_role_rollup``), run over this module's own ``connect_ro``
-connection. The path-taking digest readers fail open to a zero that cannot be
+connection. The path-taking digest readers fail open to a value that cannot be
 told from a true zero, so this module never calls them: a ``sqlite3.Error``
 from the open or the query flags the figure ``unreadable``, a missing table
-included, since the query names it.
+included, since the query names it. Landed is the landings on main in the
+window, per the quality dashboard's landing datum
+(``shared.quality_series.landings``): merge commits and fast-forwards, each
+train member counted. Its git read failing flags it ``unreadable`` too.
 
 Read-only: every store is opened ``mode=ro`` and every queue is read through
 the unlocked scan helpers, so nothing here creates a file or a directory.
@@ -22,6 +25,7 @@ from __future__ import annotations
 
 import sqlite3
 import statistics
+import subprocess
 from collections import Counter, defaultdict
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, fields, replace
@@ -30,6 +34,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Generic, Literal, TypeVar
 
+import orchestrator_projects
 from _task_db_scan import (
     runs_db_path,
     tasks_db_path,
@@ -44,8 +49,10 @@ from orchestrator.decision_registry import (
     decisions_dir,
     normalize_escalations_dir,
 )
-from orchestrator.digest import ModelRoleRow, query_count_done_in_window, query_model_role_rollup
+from orchestrator.digest import ModelRoleRow, query_landings_in_window, query_model_role_rollup
 from shared.project_id import fold_project_token
+from shared.quality_series import UnrecognisedTrainEvent
+from shared.quality_series.git_lines import GitObjectMissing, GitTimeout, GitUnavailable
 from shared.tasks_db_readonly import TaskDbProblem, TaskDbUnreadable, connect_ro
 from sitting import inventory, payloads
 from sitting.inventory import QUEUE_SUBDIRS, PendingRecords, Shortfall
@@ -55,6 +62,7 @@ Status = Literal['ok', 'source_missing', 'unreadable']
 STATUSES: tuple[Status, ...] = ('ok', 'source_missing', 'unreadable')
 
 NO_OPEN_ESCALATION = 'blocked with no open escalation'
+INACTIVE_REASON = 'unit inactive, no activity'
 UNKNOWN_OPEN_ESCALATIONS = 'open escalations unknown: no queue of this project was read'
 
 SHADOW_ONLY = (
@@ -62,8 +70,12 @@ SHADOW_ONLY = (
     'autonomously: every ruling counted here is a shadow-only proposal, a measurement never applied.'
 )
 
+_LANDINGS_UNREADABLE = (GitUnavailable, GitTimeout, GitObjectMissing, UnrecognisedTrainEvent)
+ACTIVE_UNIT_STATES = frozenset({'active', 'reloading', 'activating'})
+
 T = TypeVar('T')
 Refusal = tuple[Status, Shortfall]
+ActiveStateProbe = Callable[[str], str]
 TrialOutcome = Literal['agreed', 'disagreed', 'no_lean', 'unanswered', 'rejected']
 
 
@@ -243,6 +255,8 @@ class PreparerTrial:
 
 @dataclass(frozen=True)
 class ProjectState:
+    """One project's measurements; whether it is active is derived from three of them, never stored."""
+
     project: str
     root: str
     landed: Measurement[int]
@@ -250,19 +264,96 @@ class ProjectState:
     spend: Measurement[tuple[ModelRoleRow, ...]]
     standing_policy: Measurement[StandingPolicyRulings]
     trial: Measurement[PreparerTrial]
+    unit_active: Measurement[bool]
+    pause_reason: Measurement[str | None]
+    new_escalations: Measurement[int]
+
+    @property
+    def inactive_reason(self) -> str | None:
+        """INACTIVE_REASON only when all three activity signals were read and show none; an unread one keeps it active."""
+        signals = (self.unit_active, self.landed, self.new_escalations)
+        if not all(signal.ok for signal in signals):
+            return None
+        idle = not self.unit_active.value and self.landed.value + self.new_escalations.value == 0
+        return INACTIVE_REASON if idle else None
+
+    @property
+    def active(self) -> bool:
+        return self.inactive_reason is None
 
 
 def project_queue_dirs(project_root: Path | str) -> tuple[str, ...]:
     return tuple(normalize_escalations_dir(Path(project_root) / subdir) for subdir in QUEUE_SUBDIRS)
 
 
-def landed(runs_db: Path | str, window: Window, *, now: datetime) -> Measurement[int]:
-    """Tasks completed ``done`` in *window*, per ``orchestrator.digest.query_count_done_in_window``."""
-    return _from_runs_db(Path(runs_db), 0, lambda conn: query_count_done_in_window(conn, *window.iso()), now)
+def landed(runs_db: Path | str, window: Window, *, now: datetime, repo: Path | str) -> Measurement[int]:
+    """Landings on *repo*'s main in *window*, per ``orchestrator.digest.query_landings_in_window``."""
+    try:
+        return _from_runs_db(Path(runs_db), 0, lambda conn: query_landings_in_window(conn, repo, *window.iso()), now)
+    except _LANDINGS_UNREADABLE as exc:
+        gap = Shortfall('landings', str(repo), f'{type(exc).__name__}: {exc}')
+        return Measurement(0, _stamp(now), str(runs_db), 'unreadable', (gap,))
+
+
+def systemctl_active_state(unit: str) -> str:
+    """*unit*'s ActiveState as the user systemd prints it; a failed or missing ``systemctl`` raises."""
+    return subprocess.run(
+        ['systemctl', '--user', 'show', '--property=ActiveState', '--value', unit],
+        check=True, capture_output=True, text=True, timeout=10,
+    ).stdout.strip()
+
+
+@dataclass(frozen=True)
+class OrchestratorUnits:
+    """The installed orchestrator units by the root their ``--config`` names, and the probe reading a unit's state."""
+
+    scan: orchestrator_projects.UnitScan
+    active_state: ActiveStateProbe
+
+
+def unit_active(root: Path | str, units: OrchestratorUnits, *, now: datetime) -> Measurement[bool]:
+    """Whether an orchestrator unit running *root* is in ``ACTIVE_UNIT_STATES``; a unit that cannot be read is named.
+
+    A scan problem may hide a unit naming the root, so it makes a False unreadable.
+    """
+    stamp = _stamp(now)
+    resolved = Path(root).resolve()
+    names = units.scan.roots.get(resolved, ())
+    states: list[str] = []
+    failures: list[Shortfall] = []
+    for name in names:
+        try:
+            states.append(units.active_state(name))
+        except (subprocess.SubprocessError, OSError) as exc:
+            failures.append(Shortfall('orchestrator_unit', name, f'{type(exc).__name__}: {exc}'))
+    source = f'systemctl --user show {", ".join(names)}' if names else f'no orchestrator unit names {resolved}'
+    if any(state in ACTIVE_UNIT_STATES for state in states):
+        return Measurement(True, stamp, source, 'ok', tuple(failures))
+    shortfalls = (*failures, *(Shortfall('orchestrator_units', '', problem) for problem in units.scan.problems))
+    return Measurement(False, stamp, source, 'unreadable' if shortfalls else 'ok', shortfalls)
+
+
+def scheduler_pause(runs_db: Path | str, *, now: datetime) -> Measurement[str | None]:
+    """The held pause reason(s) in *runs_db*'s ``scheduler_state``, or None when its scheduler is not paused."""
+    def read(conn: sqlite3.Connection) -> str | None:
+        rows = conn.execute('SELECT pause_reason FROM scheduler_state ORDER BY pause_at').fetchall()
+        return '; '.join(dict.fromkeys(reason for (reason,) in rows)) or None
+
+    unpaused: str | None = None
+    return _from_runs_db(Path(runs_db), unpaused, read, now)
+
+
+def new_escalations(queue_dirs: Iterable[str], window: Window, *, now: datetime) -> Measurement[int]:
+    """Records filed (by ``timestamp``) in *window*, root tier and archive, at any level and status."""
+    def measure(queues: Sequence[str]) -> tuple[int, tuple[Shortfall, ...]]:
+        filed, shortfalls = _records(queues, lambda esc: window.holds(inventory.parse_stamp(esc.timestamp)))
+        return len(filed), shortfalls
+
+    return _over_queues(queue_dirs, 0, measure, now)
 
 
 def spend_and_cap_hits(runs_db: Path | str, window: Window, *, now: datetime) -> Measurement[tuple[ModelRoleRow, ...]]:
-    """Per-(model, role) cost, cap-hit rate and $/done, per ``orchestrator.digest.query_model_role_rollup``."""
+    """Per-(model, role) cost, cap-hit rate and $ per done run, per ``orchestrator.digest.query_model_role_rollup``."""
     return _from_runs_db(
         Path(runs_db), (), lambda conn: tuple(query_model_role_rollup(conn, *window.iso()).rows), now,
     )
@@ -380,6 +471,7 @@ def measure_projects(
     *,
     window: Window,
     now: datetime,
+    units: OrchestratorUnits,
 ) -> Mapping[str, ProjectState]:
     """Every per-project measurement, keyed by canonical project token; a root with no stores is flagged, never dropped.
 
@@ -392,7 +484,7 @@ def measure_projects(
     for root in project_roots:
         by_project[fold_project_token(Path(root).name)].append(root)
     return MappingProxyType({
-        project: _measure_project(project, roots[0], _fold_collisions(project, roots), pending, window, now)
+        project: _measure_project(project, roots[0], _fold_collisions(project, roots), pending, window, now, units)
         for project, roots in by_project.items()
     })
 
@@ -492,6 +584,7 @@ def _measure_project(
     pending: Mapping[str, PendingRecords],
     window: Window,
     now: datetime,
+    units: OrchestratorUnits,
 ) -> ProjectState:
     """Each measurement guarded by ``unreadable_if_raises`` and carrying *noted*, the root-level shortfalls."""
     queues = _measured_queues(root)
@@ -506,12 +599,16 @@ def _measure_project(
     return ProjectState(
         project=project,
         root=str(root),
-        landed=guarded('runs_db', str(runs_db), 0, lambda: landed(runs_db, window, now=now)),
+        landed=guarded('runs_db', str(runs_db), 0, lambda: landed(runs_db, window, now=now, repo=root)),
         stuck=guarded('tasks_db', tasks_db, (), lambda: stuck(root, pending, now=now)),
         spend=guarded('runs_db', str(runs_db), (), lambda: spend_and_cap_hits(runs_db, window, now=now)),
         standing_policy=guarded('escalation_queue', queue_source, StandingPolicyRulings(_fold_reports((), window)),
                                 lambda: standing_policy_rulings(queues, window, now=now)),
         trial=guarded('escalation_queue', queue_source, _trial(()), lambda: preparer_trial(queues, window, now=now)),
+        unit_active=guarded('orchestrator_units', str(root), False, lambda: unit_active(root, units, now=now)),
+        pause_reason=guarded('runs_db', str(runs_db), None, lambda: scheduler_pause(runs_db, now=now)),
+        new_escalations=guarded('escalation_queue', queue_source, 0,
+                                lambda: new_escalations(queues, window, now=now)),
     )
 
 
@@ -579,17 +676,26 @@ def _fold_reports(reports: Sequence[AgreementReport], window: Window) -> Agreeme
     )
 
 
-def _resolved_in_window(queues: Sequence[str], window: Window) -> tuple[list[Escalation], tuple[Shortfall, ...]]:
-    resolved: list[Escalation] = []
+def _records(
+    queues: Sequence[str], keep: Callable[[Escalation], bool],
+) -> tuple[list[Escalation], tuple[Shortfall, ...]]:
+    """The records *keep* accepts across *queues*' root tiers and archives, and every record that could not be read."""
+    kept: list[Escalation] = []
     shortfalls: list[Shortfall] = []
     for queue in queues:
         for path in iter_all_escalation_paths(Path(queue)):
             esc, problem = inventory.read_escalation(path)
             if problem is not None:
                 shortfalls.append(problem)
-            if esc is not None and esc.status != 'pending' and window.holds(inventory.parse_stamp(esc.resolved_at)):
-                resolved.append(esc)
-    return resolved, tuple(shortfalls)
+            if esc is not None and keep(esc):
+                kept.append(esc)
+    return kept, tuple(shortfalls)
+
+
+def _resolved_in_window(queues: Sequence[str], window: Window) -> tuple[list[Escalation], tuple[Shortfall, ...]]:
+    return _records(
+        queues, lambda esc: esc.status != 'pending' and window.holds(inventory.parse_stamp(esc.resolved_at)),
+    )
 
 
 def _trial(resolved: Iterable[Escalation]) -> PreparerTrial:

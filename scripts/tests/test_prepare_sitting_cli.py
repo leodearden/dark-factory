@@ -11,7 +11,7 @@ from datetime import datetime
 from pathlib import Path
 
 import pytest
-from escalation.models import Escalation
+from escalation.models import RESOLUTION_CLASSES, Escalation
 from orchestrator.decision_registry import DecisionRecord, normalize_escalations_dir
 from orchestrator.session_records import SessionRecord, Status
 from shared.project_id import fold_project_token
@@ -313,6 +313,8 @@ class TestRecommendOnly:
         assert resolve['tool'] == 'resolve_issue'
         assert resolve['args']['escalation_id'] == 'esc-400-1'
         assert 'Leo 2026-09-20: esc-400-1 option A' in resolve['args']['resolution']
+        assert resolve['args']['ruled_by_human'] is True
+        assert resolve['args']['resolution_class'] in RESOLUTION_CLASSES
         assert close['tool'] == 'cli:session_registry'
         (argv,) = close['args']
         assert argv[2] == 'file-and-close-decision'
@@ -828,6 +830,15 @@ class TestHandoverPerProject:
         assert probe.status == 'mentions'
         assert 'the reify cockpit' in probe.evidence
         assert 'dark-factory watcher' not in probe.evidence
+
+    def test_the_first_scanned_root_of_a_folded_project_supplies_its_handover(self, env):
+        twin = env.tmp / 'elsewhere' / 'dark_factory'
+        df_handover = _write_handover(env.df, '# handover\n\nthe subject root\n')
+        _write_handover(twin, '# handover\n\nthe twin root\n')
+
+        sources = _sources(env, [env.df, twin])
+
+        assert sources.handovers['dark_factory'] == df_handover
 
     def test_an_override_replaces_only_its_projects_handover(self, env, reify, elsewhere):
         probes = _handover_probes(env, [env.df, reify], mod.HandoverOverride('reify', elsewhere))

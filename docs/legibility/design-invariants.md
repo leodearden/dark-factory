@@ -519,10 +519,7 @@ INV-10; facing a report, gate or counter over a store, INV-13.
 sets, the gate-arm table, the calibration selectors and the dashboard's
 served metrics are projections computed from it. No other Python module
 spells a metric name, and a parity test between two spellings is not
-compliance. One known second spelling remains outside the guard's scope: the
-Host load card's presentation list (`METRICS` in
-`dashboard/src/dashboard/static/redux/tab_overview.jsx`), which renders only
-the names it lists; a served metric missing from it is not displayed.
+compliance.
 
 **Checkable design question(s)**: Does this feature add, rename or read a
 load-sampler metric, an admission rule, an arm-to-metric mapping, or a

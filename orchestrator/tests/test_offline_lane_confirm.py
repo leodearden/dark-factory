@@ -9,7 +9,6 @@ from __future__ import annotations
 import json
 import os
 import shlex
-import sys
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
@@ -29,6 +28,7 @@ from _lane_confirm_project import (
     write_pytest_config,
     write_script,
 )
+from _orch_helpers import env_resolving_running_interpreter
 from _serial_recovery_helpers import effective_worker_count
 
 from orchestrator.config import LaneCommand
@@ -838,7 +838,7 @@ def store(tmp_path: Path) -> RunRecordStore:
 
 @pytest.fixture
 def pytest_on_path(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv('PATH', f'{Path(sys.executable).parent}{os.pathsep}{os.environ["PATH"]}')
+    monkeypatch.setenv('PATH', env_resolving_running_interpreter(os.environ)['PATH'])
 
 
 async def _detect(store: RunRecordStore, cmd: LaneCommand, project: Path) -> RunRecord:

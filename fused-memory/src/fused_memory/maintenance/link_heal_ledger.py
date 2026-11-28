@@ -36,6 +36,7 @@ from types import MappingProxyType
 from typing import Any
 
 from shared.sqlite_column_migration import add_column_if_missing_sync
+from shared.sqlite_sync_base import CheckpointResult, apply_full_durability_pragmas_sync
 
 from fused_memory.maintenance.link_heal import (
     BasisSource,
@@ -55,6 +56,7 @@ from fused_memory.maintenance.link_heal_store import (
 
 LEDGER_FILENAME = 'link_heal.db'
 LOCK_FILENAME = 'link_heal.lock'
+_BUSY_TIMEOUT_MS = 5000
 
 UNDO_ACTION = 'undo'
 
@@ -239,6 +241,7 @@ _ADDED_COLUMNS = (
     ('actions', 'before_child_snapshot_id', 'INTEGER'),
     ('actions', 'before_parent_snapshot_id', 'INTEGER'),
     ('actions', 'after_child_snapshot_id', 'INTEGER'),
+    ('runs', 'invocation_run_id', 'TEXT'),
 )
 
 _ACTION_COLUMNS = (
@@ -294,6 +297,11 @@ class AmbiguousRun(LookupError):
 
 @dataclass(frozen=True)
 class RunRow:
+    """One run; ``invocation_run_id`` is the invocations-ledger run id its adjudicator wrote
+    under (``models/invocation_ledger.py::invocations_ledger_path``), which can hold no rows,
+    as when every verdict was reused; None for a run with no adjudicator, or one whose calls
+    are written nowhere."""
+
     run_id: str
     source: RunSource
     writes: bool
@@ -302,6 +310,7 @@ class RunRow:
     counts: Mapping[str, Any] | None
     plan_sha256: str | None
     plan_path: Path | None
+    invocation_run_id: str | None
 
     @property
     def kind(self) -> RunKind:
@@ -546,11 +555,15 @@ class UndoStepRow:
 
 
 class LinkHealLedger:
-    """``link_heal.db``: runs, adjudications and actions. One connection; a commit per operation."""
+    """``link_heal.db``: runs, adjudications and actions.
+
+    One connection, in WAL under the shared durability triad; a commit per operation.
+    """
 
     def __init__(self, db_path: Path) -> None:
         self.db_path = db_path
         self._conn = sqlite3.connect(db_path)
+        apply_full_durability_pragmas_sync(self._conn, busy_timeout_ms=_BUSY_TIMEOUT_MS)
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(_SCHEMA)
         for table, column, column_ddl in _ADDED_COLUMNS:
@@ -560,12 +573,19 @@ class LinkHealLedger:
     def close(self) -> None:
         self._conn.close()
 
-    def start_run(self, source: RunSource, *, writes: bool) -> str:
+    def checkpoint(self) -> CheckpointResult:
+        """Truncate the WAL into the main database file."""
+        return CheckpointResult.from_pragma_rows(self._conn.execute('PRAGMA wal_checkpoint(TRUNCATE)'))
+
+    def start_run(
+        self, source: RunSource, *, writes: bool, invocation_run_id: str | None = None,
+    ) -> str:
         run_id = new_run_id()
         with self._conn:
             self._conn.execute(
-                'INSERT INTO runs (run_id, source, writes, started_at) VALUES (?, ?, ?, ?)',
-                (run_id, source.value, int(writes), _now()),
+                'INSERT INTO runs (run_id, source, writes, started_at, invocation_run_id) '
+                'VALUES (?, ?, ?, ?, ?)',
+                (run_id, source.value, int(writes), _now(), invocation_run_id),
             )
         return run_id
 
@@ -1198,6 +1218,7 @@ def _run_row(row: sqlite3.Row) -> RunRow:
         counts=_loads_or_none(row['counts_json']),
         plan_sha256=row['plan_sha256'],
         plan_path=None if row['plan_path'] is None else Path(row['plan_path']),
+        invocation_run_id=row['invocation_run_id'],
     )
 
 

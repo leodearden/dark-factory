@@ -1,9 +1,12 @@
-"""Shared test kit: lines for a fabricated ``/proc``.
+"""Shared test kit: stand-in ``/proc`` trees for proc_group tests.
 
 Consumers import by bare module name (``from _synthetic_proc import ...``):
 ``conftest.py`` prepends ``shared/tests`` to ``sys.path``.
 """
 from __future__ import annotations
+
+from collections.abc import Iterable
+from pathlib import Path
 
 
 def synthetic_stat_line(
@@ -34,3 +37,18 @@ def synthetic_stat_line(
         + ' '.join(counters)
         + '\n'
     )
+
+
+def real_proc_view(view_dir: Path, pids: Iterable[int]) -> Path:
+    """A /proc holding only *pids*, each linked to its real ``/proc/<pid>``, at *view_dir*.
+
+    Also holds ``self``, which ``_RootViews`` reads for the scanner's own mount
+    namespace. A scan pointed here reads real kernel-written content while
+    walking only the named pids, so its cost no longer depends on the host's
+    process count. *view_dir* must not exist yet.
+    """
+    view_dir.mkdir()
+    for pid in pids:
+        (view_dir / str(pid)).symlink_to(f'/proc/{pid}')
+    (view_dir / 'self').symlink_to('/proc/self')
+    return view_dir

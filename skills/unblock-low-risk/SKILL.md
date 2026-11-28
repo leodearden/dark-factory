@@ -100,6 +100,29 @@ The watcher pre-gated, but you re-assert defensively (state can change between t
    must always be routed to a human. This skill will therefore never reach this class's proposals;
    the gate aborts them upstream.
 
+## Defect fixes
+
+When step 3's fix is for a defect (wrong runtime behaviour), it is made test-first.
+The rule's one home is `orchestrator/src/orchestrator/agents/roles.py::DEFECT_TEST_RULE`,
+the text the factory's fixing agents are given. The excerpt below is rendered
+from it and kept equal to it by `tests/scripts/test_defect_rule_mirror.py`.
+
+<!-- defect-test-rule-mirror:begin  rendered from orchestrator/src/orchestrator/agents/roles.py::DEFECT_TEST_RULE; pinned by tests/scripts/test_defect_rule_mirror.py -->
+```text
+## Fixing a defect
+
+A defect is wrong runtime behaviour. A defect fix starts from a test that fails
+without the fix and passes with it: write that test first and watch it fail.
+In a pytest project, when the defect is declared, mark that test
+`@pytest.mark.defect("<ref>")` with the defect's ref. A test carrying
+`@pytest.mark.defect` is a defect's reproducing test.
+
+Never weaken a failing test (loosen or delete an assertion, skip it, mark it
+xfail, or delete the test) without stating in the commit message why the test,
+not the code, was wrong.
+```
+<!-- defect-test-rule-mirror:end -->
+
 ## Procedure
 
 Run these strictly in order. Stop and ABORT at the first step that is not cleanly satisfied.
@@ -130,6 +153,7 @@ Run these strictly in order. Stop and ABORT at the first step that is not cleanl
    direct test files). The moment the correct fix demands touching a file outside that set — or any
    of `main`-only paths, CI config, infra, or `dark-factory-orchestrator.yaml`/`.mcp.json`/systemd units —
    the change is no longer low-risk: **ABORT**. Do not commit `.task/`.
+   A defect fix follows [Defect fixes](#defect-fixes).
 
 4. **Rebase onto main.** `git -C <worktree> rebase main` (main may have moved). On **any conflict** →
    run [Rebase recovery preflight](#rebase-recovery-preflight) to leave the worktree clean, then
@@ -635,9 +659,9 @@ stamp is an available option on every failing arm.
 
 Some proposals originate from a **post-merge-verify block**, not an ordinary
 agent-block: the task's solution already passed its own verify **and**
-review, but landing on `main` jammed (e.g. a rebase conflict, or an
-import/type/lint break introduced by whatever landed on `main` after this
-branch was verified). Recognize this mode from
+review, but landing on `main` jammed (the only kind this mode completes is
+an import/type/lint break introduced by whatever landed on `main` after this
+branch was verified; a rebase conflict is never completed here). Recognize this mode from
 `latest['block_class'] == 'merge_verify_red'` (present on the same
 `dry_run_proposals[-1]` entry precondition 1 already reads).
 
@@ -653,9 +677,10 @@ unchanged — there is nothing extra for you to check.
 
 Two refinements to the Procedure for this mode specifically:
 
-- **Step 3 (apply the fix — scoped)** is, in practice, either a **rebase/
-  conflict resolution** confined to files already in the task's own diff,
-  or an **import/type/lint repair** against the new `main` tip. If the fix
+- **Step 3 (apply the fix — scoped)** is, in this mode, an
+  **import/type/lint repair** against the new `main` tip only. A conflict
+  at step 4 aborts in this mode exactly as in every other: this mode never
+  resolves conflicts. If the fix
   demands anything beyond that (a logic change, a genuinely new and
   unrelated test failure, a cross-module edit), the investigator's
   labelling guidance (`skills/unblock-auto/SKILL.md`) says that should

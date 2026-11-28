@@ -27,7 +27,7 @@
 # Re-measured 2026-11-23 over main dfae8ef060: main grew test_steward_outcome.py
 # by 2 and test_info_l2_never_gates.py by 1, so 1,880 in 442.  Re-measured over
 # main 873e979e48: main added one sleep in test_main_ticket_janitor_wiring.py, so
-# 1,881 in 443.
+# 1,881 in 443.  Task 11733 removed that sleep, and with it that file's entry.
 TIMING_DEPENDENCE_DEBT: dict[str, int] = {
     # orchestrator/tests
     'orchestrator/tests/test_merge_queue_request_liveness.py': 46,
@@ -37,11 +37,11 @@ TIMING_DEPENDENCE_DEBT: dict[str, int] = {
     'orchestrator/tests/test_deterministic_runner.py': 29,
     'orchestrator/tests/test_usage_gate.py': 25,
     'orchestrator/tests/test_cli.py': 22,
-    'orchestrator/tests/test_lane_lock_leak_guard.py': 21,
     'orchestrator/tests/test_merge_queue_multihost_wiring.py': 19,
     'orchestrator/tests/test_verify.py': 19,
     'orchestrator/tests/test_verify_admission_order_integration.py': 18,
     'orchestrator/tests/test_workflow_merge_gating_strand.py': 18,
+    'orchestrator/tests/test_lane_lock_leak_guard.py': 17,
     'orchestrator/tests/test_merge_queue_supervisor.py': 17,
     'orchestrator/tests/test_workflow_escalated_steward_stall.py': 17,
     'orchestrator/tests/test_merge_queue_coalesce.py': 16,
@@ -77,7 +77,7 @@ TIMING_DEPENDENCE_DEBT: dict[str, int] = {
     'orchestrator/tests/test_runner_matrix.py': 6,
     'orchestrator/tests/test_verify_admission_watch.py': 6,
     'orchestrator/tests/test_verify_ruff_config_boundary.py': 6,
-    'orchestrator/tests/test_verify_runner.py': 6,
+    'orchestrator/tests/test_verify_runner.py': 5,
     'orchestrator/tests/test_before_done_script.py': 5,
     'orchestrator/tests/test_cli_verify_task.py': 5,
     'orchestrator/tests/test_decision_registry.py': 5,
@@ -85,7 +85,7 @@ TIMING_DEPENDENCE_DEBT: dict[str, int] = {
     'orchestrator/tests/test_merge_lane_verify_dispatch.py': 5,
     'orchestrator/tests/test_merge_queue_lifecycle_registry.py': 5,
     'orchestrator/tests/test_merge_skew_tripwire.py': 5,
-    'orchestrator/tests/test_offline_lane_outage_probe.py': 5,
+    'orchestrator/tests/test_offline_lane_outage_probe.py': 3,
     'orchestrator/tests/test_workflow_operator_merge_cancel.py': 5,
     'orchestrator/tests/test_artifacts.py': 4,
     'orchestrator/tests/test_atomic_train_merge.py': 4,
@@ -117,7 +117,6 @@ TIMING_DEPENDENCE_DEBT: dict[str, int] = {
     'orchestrator/tests/test_offline_lane.py': 3,
     'orchestrator/tests/test_sighup.py': 3,
     'orchestrator/tests/test_spawn_t3_lane.py': 3,
-    'orchestrator/tests/test_verify_cancel_unwind.py': 3,
     'orchestrator/tests/test_verify_hosts.py': 3,
     'orchestrator/tests/test_verify_merge_env_overrides.py': 3,
     'orchestrator/tests/test_verify_relocated_scope_reap.py': 3,
@@ -133,7 +132,6 @@ TIMING_DEPENDENCE_DEBT: dict[str, int] = {
     'orchestrator/tests/test_escalation_scan_off_loop.py': 2,
     'orchestrator/tests/test_flake_debt_drain.py': 2,
     'orchestrator/tests/test_flake_ledger.py': 2,
-    'orchestrator/tests/test_harness_main_health_fix_reserve.py': 2,
     'orchestrator/tests/test_live_refs_lib.py': 2,
     'orchestrator/tests/test_liveness_boundary_gate.py': 2,
     'orchestrator/tests/test_merge_lane_intake.py': 2,
@@ -156,8 +154,8 @@ TIMING_DEPENDENCE_DEBT: dict[str, int] = {
     'orchestrator/tests/test_verify_admission_call_sites.py': 2,
     'orchestrator/tests/test_verify_admission_cancel_release.py': 2,
     'orchestrator/tests/test_verify_admission_executor_bypass.py': 2,
+    'orchestrator/tests/test_verify_cancel_unwind.py': 2,
     'orchestrator/tests/test_verify_cmd.py': 2,
-    'orchestrator/tests/test_verify_role_integration.py': 2,
     'orchestrator/tests/test_verify_scope_handshake_fds.py': 2,
     'orchestrator/tests/test_warm_lane_audit_mount_and_age.py': 2,
     'orchestrator/tests/test_warm_lane_bash_suite.py': 2,
@@ -255,7 +253,7 @@ TIMING_DEPENDENCE_DEBT: dict[str, int] = {
     'fused-memory/tests/test_event_queue.py': 16,
     'fused-memory/tests/test_harness.py': 16,
     'fused-memory/tests/arm_harness/test_usage_tap.py': 12,
-    'fused-memory/tests/test_event_loop_lag.py': 12,
+    'fused-memory/tests/test_event_loop_lag.py': 11,
     'fused-memory/tests/test_ticket_worker.py': 11,
     'fused-memory/tests/test_sqlite_watchdog.py': 10,
     'fused-memory/tests/test_billing_exhaustion_e2e.py': 10,
@@ -354,7 +352,6 @@ TIMING_DEPENDENCE_DEBT: dict[str, int] = {
     'fused-memory/tests/test_ticket_parking.py': 1,
     'fused-memory/tests/test_write_triage_judge_wording.py': 1,
     'fused-memory/tests/test_link_heal_theta_seam.py': 1,
-    'fused-memory/tests/test_main_ticket_janitor_wiring.py': 1,
     # shared/tests
     'shared/tests/test_concurrency.py': 46,
     'shared/tests/test_probe_loop.py': 24,
@@ -390,7 +387,6 @@ TIMING_DEPENDENCE_DEBT: dict[str, int] = {
     'shared/tests/test_config_dir_credentials_live.py': 1,
     'shared/tests/test_defect_enumerator.py': 1,
     'shared/tests/test_deploy_clock_redirect.py': 1,
-    'shared/tests/test_jcodemunch_launch.py': 1,
     'shared/tests/test_merge_subject.py': 1,
     'shared/tests/test_proc_group_leader_pidfd.py': 1,
     'shared/tests/test_proc_group_mount_ns.py': 1,

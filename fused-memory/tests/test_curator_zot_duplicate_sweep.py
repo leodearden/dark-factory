@@ -6,14 +6,16 @@ import asyncio
 from datetime import datetime, timedelta
 
 import pytest
+from _curator_helpers import exhaustible_embedder, in_memory_corpus_curator
 
-from fused_memory.middleware.curator_types import embedding_text
+from fused_memory.middleware.curator_types import CandidateTask, embedding_text
 from fused_memory.middleware.curator_zot_duplicate_sweep import (
     DuplicateFinding,
     build_duplicate_metadata,
     select_near_duplicate,
     sweep_zot_duplicate,
 )
+from fused_memory.middleware.task_curator import CorpusSearchError
 
 
 def _hit(task_id, score, title='dup title'):
@@ -258,17 +260,34 @@ class TestSweepZotDuplicate:
         }]
 
     @pytest.mark.asyncio
-    async def test_search_error_yields_none(self):
+    async def test_search_error_propagates(self):
         curator = _FakeSearchCurator(raises=RuntimeError('qdrant down'))
         reader = _RecordingStatusReader()
-        assert await _sweep(curator, reader) is None
+        with pytest.raises(RuntimeError, match='qdrant down'):
+            await _sweep(curator, reader)
         assert reader.calls == []
 
     @pytest.mark.asyncio
-    async def test_status_read_error_yields_none(self):
+    async def test_status_read_error_propagates(self):
         curator = _FakeSearchCurator([_hit('42', 0.9)])
         reader = _RecordingStatusReader(raises=RuntimeError('db locked'))
-        assert await _sweep(curator, reader) is None
+        with pytest.raises(RuntimeError, match='db locked'):
+            await _sweep(curator, reader)
+
+    @pytest.mark.asyncio
+    async def test_an_exhausted_embedder_is_not_reported_as_no_duplicate(self):
+        embedder = exhaustible_embedder()
+        curator = in_memory_corpus_curator(embedder)
+        reader = _RecordingStatusReader({'42': 'pending'})
+        try:
+            await curator.record_task('42', CandidateTask(title='Existing gate fix'), 'proj')
+            embedder.exhaust()
+            with pytest.raises(CorpusSearchError) as raised:
+                await _sweep(curator, reader)
+        finally:
+            await curator.close()
+        assert raised.value.billing_exhausted == 'api_key_credits'
+        assert reader.calls == []
 
     @pytest.mark.asyncio
     async def test_cancelled_error_propagates(self):

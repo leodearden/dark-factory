@@ -23,7 +23,7 @@ import pytest
 from _eval_diff_repo import repo_with_commit
 
 from orchestrator.evals import runner
-from orchestrator.evals.metrics import EvalMetrics, RoleUnderTest
+from orchestrator.evals.metrics import EndpointKind, EvalMetrics, RoleUnderTest
 from orchestrator.evals.results import EvalResult
 from orchestrator.evals.runner import collect_metrics
 from orchestrator.evals.scoring import (
@@ -368,6 +368,7 @@ async def _collect_recovered(tmp_path: Path, task: dict, wf: MagicMock) -> EvalM
         return await collect_metrics(
             wf, worktree, {**task, 'pre_task_commit': base},
             role=RoleUnderTest.IMPLEMENTER, sandbox_backend='none',
+            endpoint_kind=EndpointKind.NATIVE_ANTHROPIC,
         )
 
 

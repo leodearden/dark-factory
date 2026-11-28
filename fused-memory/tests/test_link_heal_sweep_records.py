@@ -488,6 +488,22 @@ class TestAllowedWrites:
         assert f'link_heal.py undo --run {report.apply_run_id}' in report.report_path.read_text()
 
     @pytest.mark.asyncio
+    async def test_only_the_plan_run_names_the_invocations_run_its_adjudicator_wrote_under(
+        self, harness, ledger, tmp_path,
+    ):
+        _seed(harness)
+        record_calibration(ledger, passed=True)
+
+        report = await _sweep(
+            harness, ledger, tmp_path, settings=_settings(writes=True), filer=RecordingFiler(),
+            adjudicate=FakeAdjudicator(ANSWERS.__getitem__, invocation_run_id='inv-sweep'),
+        )
+
+        assert ledger.resolve_run(report.plan_run_id).invocation_run_id == 'inv-sweep'
+        assert report.apply_run_id is not None
+        assert ledger.resolve_run(report.apply_run_id).invocation_run_id is None
+
+    @pytest.mark.asyncio
     async def test_the_records_show_each_heal_and_its_after_state(self, harness, ledger, tmp_path):
         _seed(harness)
         record_calibration(ledger, passed=True)

@@ -248,6 +248,17 @@ class TestTheRecordsCarryTheAdjudication:
         assert (record.verdict, record.reason, record.model) == (None, None, None)
         assert (record.prompt_sha256, record.adjudication_id) == (None, None)
 
+    @pytest.mark.asyncio
+    async def test_the_run_names_the_invocations_run_its_adjudicator_wrote_under(
+        self, harness, ledger, tmp_path,
+    ):
+        seed_sightings(harness, 2)
+        fake = FakeAdjudicator(lambda _text: Verdict.EXTENDS, invocation_run_id='inv-plan')
+
+        report = await adjudicated_plan(harness, ledger, fake, tmp_path / 'plan.json')
+
+        assert ledger.resolve_run(report.run_id).invocation_run_id == 'inv-plan'
+
 
 class TestOnlyVerdictRowLinksAreSent:
     @pytest.mark.asyncio

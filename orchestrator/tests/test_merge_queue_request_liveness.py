@@ -45,6 +45,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _git_fixtures import seed_repo
 from _merge_lane_fakes import (
     FakeClock,
     FakeVerifier,
@@ -63,9 +64,10 @@ from _orch_helpers import VERIFY_CLI_PER_TEST_TIMEOUT, wait_responsive
 from _recording_event_store import _RecordingEventStore
 
 from orchestrator.config import GitConfig, OrchestratorConfig
-from orchestrator.git_ops import GitOps, _run
+from orchestrator.git_ops import GitOps
 from orchestrator.merge_lane.intake import MERGE_LANES
 from orchestrator.merge_lane.types import InflightEntry, MergeOutcome, MergeRequest, QueuedBranch
+from orchestrator.narrow_gate_config import NarrowMergeGateConfig
 
 # ---------------------------------------------------------------------------
 # Fixtures + helpers (per-file duplication convention — see
@@ -73,23 +75,10 @@ from orchestrator.merge_lane.types import InflightEntry, MergeOutcome, MergeRequ
 # ---------------------------------------------------------------------------
 
 
-async def _setup_repo(repo: Path) -> None:
-    """Initialise a bare git repository with a single commit on main."""
-    await _run(['git', 'init', '-b', 'main'], cwd=repo)
-    await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=repo)
-    await _run(['git', 'config', 'user.name', 'Test'], cwd=repo)
-    (repo / 'README.md').write_text('# Test\n')
-    await _run(['git', 'add', '-A'], cwd=repo)
-    await _run(['git', 'commit', '-m', 'Initial commit'], cwd=repo)
-
-
 @pytest.fixture
 def git_repo(tmp_path: Path) -> Path:
     """Create a temporary git repository with an initial commit."""
-    repo = tmp_path / 'repo'
-    repo.mkdir()
-    asyncio.run(_setup_repo(repo))
-    return repo
+    return seed_repo(tmp_path / 'repo')
 
 
 @pytest.fixture
@@ -108,10 +97,15 @@ def git_ops(git_config: GitConfig, git_repo: Path) -> GitOps:
     return GitOps(git_config, git_repo)
 
 
+# These scenes pace dispatch against sub-second liveness budgets, so the narrow merge gate's
+# pre-dispatch decision, on in the repo yaml the suite loads, is held off; its own tests cover it.
+_GATE_OFF = NarrowMergeGateConfig()
+
+
 @pytest.fixture
 def config(git_repo: Path, git_config: GitConfig) -> OrchestratorConfig:
-    """Single-host (no verify_runners) OrchestratorConfig."""
-    return lane_scene_config(git_repo, git_config)
+    """Single-host (no verify_runners) OrchestratorConfig, narrow merge gate off."""
+    return lane_scene_config(git_repo, git_config, narrow_merge_gate=_GATE_OFF)
 
 
 # ── Warm-lane variants (task 3003, pre-1) ──────────────────────────────────
@@ -146,8 +140,8 @@ def warm_git_ops(warm_git_config: GitConfig, git_repo: Path) -> GitOps:
 
 @pytest.fixture
 def warm_config(git_repo: Path, warm_git_config: GitConfig) -> OrchestratorConfig:
-    """Single-host OrchestratorConfig with the warm merge-verify lane ON."""
-    return lane_scene_config(git_repo, warm_git_config)
+    """Single-host OrchestratorConfig with the warm merge-verify lane ON, narrow merge gate off."""
+    return lane_scene_config(git_repo, warm_git_config, narrow_merge_gate=_GATE_OFF)
 
 
 def _make_request(

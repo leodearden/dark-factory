@@ -10,7 +10,15 @@ import json
 from pathlib import Path
 
 import pytest
+from _defect_ruling_fixtures import (
+    RULED_REF,
+    SECOND_RULED_REF,
+    contract_ruling,
+    contract_ruling_without,
+    parse_ref_message,
+)
 from escalation.disposition import ReviewerDisposition
+from shared.defects import IssueKind, IssueKindFlag, RulingSubject, issue_kind_of
 
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.evals import compare
@@ -19,19 +27,22 @@ from orchestrator.evals.results import EvalResult
 from orchestrator.evals.scoring import quality_from_review_artifact
 from orchestrator.mcp import verdict_tools as _verdict_tools
 from orchestrator.review_payload import (
+    KIND_FLAG_KEY,
+    DefectRuling,
     NoteDisposition,
     ReviewPayload,
     ReviewPayloadError,
     Verdict,
     normalize_review,
+    parse_defect_rulings,
     parse_note_dispositions,
 )
 
 _REVIEWER = 'reviewer_comprehensive'
 
-_BLOCKING = {'severity': 'blocking', 'description': 'b1', 'location': 'm/x.py:1'}
-_SUGGESTION_1 = {'severity': 'suggestion', 'description': 's1', 'location': 'm/x.py:2'}
-_SUGGESTION_2 = {'severity': 'suggestion', 'description': 's2', 'location': 'm/x.py:3'}
+_BLOCKING = {'kind': 'defect', 'severity': 'blocking', 'description': 'b1', 'location': 'm/x.py:1'}
+_SUGGESTION_1 = {'kind': 'defect', 'severity': 'suggestion', 'description': 's1', 'location': 'm/x.py:2'}
+_SUGGESTION_2 = {'kind': 'defect', 'severity': 'suggestion', 'description': 's2', 'location': 'm/x.py:3'}
 
 
 def _payload(verdict: str = 'ISSUES_FOUND', issues: list | None = None) -> dict:
@@ -73,8 +84,8 @@ class TestNormalizeReview:
         assert normalize_review(envelope) == normalize_review(payload)
 
     def test_every_non_blocking_issue_is_a_suggestion(self):
-        nit = {'severity': 'nit', 'description': 'n'}
-        unrated = {'description': 'u'}
+        nit = {'kind': 'defect', 'severity': 'nit', 'description': 'n'}
+        unrated = {'kind': 'defect', 'description': 'u'}
         payload = normalize_review(
             _payload(issues=[dict(_BLOCKING), dict(_SUGGESTION_1), nit, unrated]),
         )
@@ -153,6 +164,40 @@ class TestNormalizeReview:
         artifact['issues'][0]['severity'] = 'suggestion'
 
         assert payload.issues[0] == _BLOCKING
+
+
+def _sole_issue(issue: dict) -> dict:
+    (normalised,) = normalize_review(_payload(issues=[issue])).issues
+    return normalised
+
+
+class TestIssueKind:
+    def test_a_legacy_issue_without_kind_normalises_to_a_flagged_defect(self):
+        issue = _sole_issue({'severity': 'blocking', 'description': 'd'})
+
+        reading = issue_kind_of(issue)
+
+        assert reading.kind is IssueKind.DEFECT
+        assert reading.flag is IssueKindFlag.MISSING
+        assert issue[KIND_FLAG_KEY] == IssueKindFlag.MISSING.value
+
+    def test_an_unrecognised_kind_is_flagged_as_unrecognised(self):
+        issue = _sole_issue({'severity': 'blocking', 'kind': 'bug'})
+
+        assert issue[KIND_FLAG_KEY] == IssueKindFlag.UNRECOGNISED.value
+        assert issue_kind_of(issue).kind is IssueKind.DEFECT
+
+    @pytest.mark.parametrize('kind', list(IssueKind))
+    def test_a_recognised_kind_is_left_unflagged(self, kind: IssueKind):
+        issue = _sole_issue({'severity': 'blocking', 'kind': kind.value})
+
+        assert KIND_FLAG_KEY not in issue
+        assert issue_kind_of(issue).kind is kind
+
+    def test_a_received_kind_flag_gives_way_to_the_normalisers_reading(self):
+        issue = _sole_issue({'severity': 'blocking', 'kind': 'defect', KIND_FLAG_KEY: 'missing'})
+
+        assert KIND_FLAG_KEY not in issue
 
 
 class TestReviewPayload:
@@ -304,6 +349,124 @@ class TestNoteDispositions:
         )
 
 
+_CLOSURE_RAW = contract_ruling()
+_RETIREMENT_RAW = contract_ruling(
+    ref=SECOND_RULED_REF, subject=RulingSubject.RETIREMENT.value, accepted=False,
+)
+_CLOSURE = DefectRuling(RULED_REF, RulingSubject.CLOSURE, True)
+_RETIREMENT = DefectRuling(SECOND_RULED_REF, RulingSubject.RETIREMENT, False)
+
+
+def _with_rulings(raw: object, verdict: str = 'PASS') -> dict:
+    return {**_payload(verdict, issues=[]), 'defect_rulings': raw}
+
+
+class TestDefectRulings:
+    @pytest.mark.parametrize('shape', ['flat', 'envelope'])
+    def test_rulings_normalise_to_typed_values_in_order(self, shape: str):
+        payload = _with_rulings([dict(_CLOSURE_RAW), dict(_RETIREMENT_RAW)])
+        artifact = (
+            payload if shape == 'flat'
+            else _verdict_tools._envelope(_REVIEWER, 'sid', payload)
+        )
+
+        assert normalize_review(artifact).defect_rulings == (_CLOSURE, _RETIREMENT)
+
+    def test_the_parser_reads_the_wire_shape_in_order(self):
+        assert parse_defect_rulings(
+            [dict(_CLOSURE_RAW), dict(_RETIREMENT_RAW)], reviewer=_REVIEWER,
+        ) == (_CLOSURE, _RETIREMENT)
+
+    def test_absent_or_null_rulings_are_empty(self):
+        assert normalize_review(_payload('PASS', issues=[])).defect_rulings == ()
+        assert normalize_review(_with_rulings(None)).defect_rulings == ()
+        assert parse_defect_rulings(None) == ()
+
+    def test_error_verdict_drops_rulings(self):
+        payload = normalize_review(_with_rulings([dict(_CLOSURE_RAW)], verdict='ERROR'))
+
+        assert payload.defect_rulings == ()
+
+    def test_error_payload_with_rulings_is_rejected_at_construction(self):
+        with pytest.raises(ReviewPayloadError):
+            ReviewPayload(Verdict.ERROR, issues=(), reviewer='r', defect_rulings=(_CLOSURE,))
+
+    def test_non_list_value_raises_naming_the_value(self):
+        with pytest.raises(ReviewPayloadError, match='closure-everything'):
+            normalize_review(_with_rulings('closure-everything'))
+
+    @pytest.mark.parametrize(
+        ('entry', 'named'),
+        [
+            pytest.param(RULED_REF, 'str', id='entry-not-a-mapping'),
+            pytest.param(contract_ruling_without('ref'), 'None', id='missing-ref'),
+            pytest.param(
+                contract_ruling(ref='not-a-ref'), 'not-a-ref', id='malformed-ref',
+            ),
+            pytest.param(contract_ruling(subject='closed'), 'closed', id='unknown-subject'),
+            pytest.param(
+                contract_ruling_without('accepted'), 'accepted', id='missing-accepted',
+            ),
+            pytest.param(contract_ruling(accepted=1), '1', id='int-accepted'),
+            pytest.param(contract_ruling(accepted='true'), "'true'", id='str-accepted'),
+        ],
+    )
+    def test_malformed_entry_raises_naming_its_index_and_value(self, entry: object, named: str):
+        with pytest.raises(ReviewPayloadError, match=named) as raised:
+            normalize_review(_with_rulings([dict(_RETIREMENT_RAW), entry]))
+
+        assert 'defect_rulings entry 1' in str(raised.value)
+        assert _REVIEWER in str(raised.value)
+
+    @pytest.mark.parametrize('ref', [None, 'not-a-ref', 'review:7048'])
+    def test_a_bad_ref_is_refused_in_parse_refs_own_words(self, ref: object):
+        with pytest.raises(ReviewPayloadError) as raised:
+            parse_defect_rulings([contract_ruling(ref=ref)], reviewer=_REVIEWER)
+
+        assert parse_ref_message(ref) in str(raised.value)
+
+    def test_unknown_subject_lists_the_valid_values(self):
+        with pytest.raises(ReviewPayloadError) as raised:
+            parse_defect_rulings([contract_ruling(subject='closed')], reviewer=_REVIEWER)
+
+        for subject in RulingSubject:
+            assert repr(subject.value) in str(raised.value)
+
+    def test_a_duplicated_ref_and_subject_names_both_indices(self):
+        duplicate = contract_ruling(accepted=False)
+
+        with pytest.raises(ReviewPayloadError, match=RULED_REF) as raised:
+            parse_defect_rulings(
+                [dict(_CLOSURE_RAW), dict(_RETIREMENT_RAW), duplicate], reviewer=_REVIEWER,
+            )
+
+        assert 'entries 0 and 2' in str(raised.value)
+
+    def test_one_ref_may_be_ruled_under_each_subject(self):
+        retirement = contract_ruling(subject=RulingSubject.RETIREMENT.value)
+
+        assert parse_defect_rulings([dict(_CLOSURE_RAW), retirement]) == (
+            _CLOSURE, DefectRuling(RULED_REF, RulingSubject.RETIREMENT, True),
+        )
+
+    def test_to_record_carries_rulings_and_round_trips(self):
+        payload = normalize_review(_with_rulings([dict(_CLOSURE_RAW), dict(_RETIREMENT_RAW)]))
+        record = payload.to_record()
+
+        assert record['defect_rulings'] == [_CLOSURE_RAW, _RETIREMENT_RAW]
+        assert type(record['defect_rulings'][0]['subject']) is str
+        json.dumps(record)
+        assert normalize_review(record) == payload
+
+    def test_to_record_without_rulings_has_no_rulings_key(self):
+        record = normalize_review(_payload('PASS', issues=[])).to_record()
+
+        assert 'defect_rulings' not in record
+
+    def test_defect_ruling_is_frozen(self):
+        pytest.raises(dataclasses.FrozenInstanceError, setattr, _CLOSURE, 'accepted', False)
+
+
 def _task_artifacts(root: Path) -> TaskArtifacts:
     artifacts = TaskArtifacts(root)
     artifacts.init('df_task', 'T', 'd')
@@ -347,3 +510,14 @@ def test_b4_envelope_and_legacy_payload_agree_in_production_and_evals(
     _task_artifacts(tmp_path / 'wt_envelope').write_verdict(_REVIEWER, envelope)
     assert _eval_score(tmp_path / 'wt_legacy') == score
     assert _eval_score(tmp_path / 'wt_envelope') == score
+
+
+def test_an_aggregated_legacy_issue_without_kind_reads_as_a_flagged_defect(tmp_path: Path):
+    legacy = {'severity': 'blocking', 'description': 'b1', 'location': 'm/x.py:1'}
+    artifacts = _task_artifacts(tmp_path)
+    artifacts.write_review(_REVIEWER, _payload(issues=[legacy]))
+
+    (issue,) = artifacts.aggregate_reviews().blocking_issues
+
+    assert issue[KIND_FLAG_KEY] == IssueKindFlag.MISSING.value
+    assert issue_kind_of(issue).kind is IssueKind.DEFECT

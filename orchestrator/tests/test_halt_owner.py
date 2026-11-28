@@ -509,7 +509,7 @@ class TestRehydrateMergeHalt:
         assert restarted.halt_owner_esc_id == parked.id
 
         # ── and resolution — the ONE unhalt edge — still releases it ──────
-        queue.resolve(parked.id, 'operator cleaned project_root', resolved_by='test')
+        queue.resolve(parked.id, 'operator cleaned project_root', resolved_by='test', resolution_class='actionable')
         assert restarted.is_wip_halted is False, (
             'resolving the parked record is the sole unhalt edge and must '
             'still work after the promotion'

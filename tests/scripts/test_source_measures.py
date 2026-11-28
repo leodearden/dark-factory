@@ -1028,7 +1028,7 @@ class TestTrackedPythonFilesFailsHard:
 
 
 # ---------------------------------------------------------------------------
-# The workspace domain: every tracked .py of each member, classified.
+# The measurement domain: every tracked .py of each member, classified.
 
 #: Declared out of alphabetical order, so declared order is what is pinned.
 _DOMAIN_PYPROJECT = '[tool.uv.workspace]\nmembers = ["beta", "alpha"]\n'
@@ -1071,7 +1071,7 @@ def _domain_repo(
     return repo
 
 
-class TestWorkspaceDomain:
+class TestMeasurementDomain:
     @pytest.fixture
     def root(self, tmp_path: Path) -> Path:
         return _domain_repo(tmp_path / 'repo', untracked=('alpha/src/alpha/untracked.py',))
@@ -1079,13 +1079,13 @@ class TestWorkspaceDomain:
     def test_members_come_in_declared_order_then_the_pseudo_members(
         self, root: Path
     ) -> None:
-        members = source_measures.workspace_domain(root)
+        members = source_measures.measurement_domain(root)
         assert tuple(member.name for member in members) == ('beta', 'alpha', 'scripts', 'tests')
         assert tuple(member.pseudo for member in members) == (False, False, True, True)
 
     def test_each_members_files_are_classified_in_path_order(self, root: Path) -> None:
         src, tests = source_measures.FileKind.SRC, source_measures.FileKind.TESTS
-        members = source_measures.workspace_domain(root)
+        members = source_measures.measurement_domain(root)
         assert {
             member.name: [(f.path, f.kind, f.import_name) for f in member.files]
             for member in members
@@ -1112,7 +1112,7 @@ class TestWorkspaceDomain:
         }
 
     def test_extra_import_roots_give_their_files_a_second_name(self, root: Path) -> None:
-        members = {member.name: member for member in source_measures.workspace_domain(root)}
+        members = {member.name: member for member in source_measures.measurement_domain(root)}
         scripts = {f.path: f for f in members.pop('scripts').files}
         assert {path: f.extra_import_names for path, f in scripts.items()} == {
             'scripts/legibility/y.py': (),
@@ -1133,7 +1133,7 @@ class TestWorkspaceDomain:
     def test_files_outside_every_member_root_are_not_in_the_domain(
         self, root: Path
     ) -> None:
-        paths = {f.path for member in source_measures.workspace_domain(root) for f in member.files}
+        paths = {f.path for member in source_measures.measurement_domain(root) for f in member.files}
         outside = {
             'hooks/h.py',
             'hooks/tests/test_h.py',
@@ -1143,20 +1143,20 @@ class TestWorkspaceDomain:
         assert not outside & paths
 
     def test_every_blob_is_the_content_sha_of_its_file(self, root: Path) -> None:
-        files = [f for member in source_measures.workspace_domain(root) for f in member.files]
+        files = [f for member in source_measures.measurement_domain(root) for f in member.files]
         assert files
         for f in files:
             assert f.blob == git(root, 'hash-object', f.path).strip(), f.path
 
     def test_the_result_is_frozen(self, root: Path) -> None:
-        member = source_measures.workspace_domain(root)[0]
+        member = source_measures.measurement_domain(root)[0]
         with pytest.raises(dataclasses.FrozenInstanceError):
             member.name = 'other'  # type: ignore[misc]
         with pytest.raises(dataclasses.FrozenInstanceError):
             member.files[0].blob = '0' * 40  # type: ignore[misc]
 
     def test_kind_is_a_structured_value_that_reads_as_its_name(self, root: Path) -> None:
-        kinds = {f.kind for member in source_measures.workspace_domain(root) for f in member.files}
+        kinds = {f.kind for member in source_measures.measurement_domain(root) for f in member.files}
         assert all(isinstance(kind, source_measures.FileKind) for kind in kinds)
         assert str(source_measures.FileKind.SRC) == 'src'
         assert str(source_measures.FileKind.TESTS) == 'tests'
@@ -1164,7 +1164,7 @@ class TestWorkspaceDomain:
     def test_the_real_workspace_is_enumerated(self) -> None:
         # ANTI-VACUITY over the real checkout: floors and membership, never
         # exact counts.
-        members = source_measures.workspace_domain(REPO_ROOT)
+        members = source_measures.measurement_domain(REPO_ROOT)
         names = tuple(member.name for member in members)
         assert len(names) >= 9
         assert names[-2:] == ('scripts', 'tests')
@@ -1209,7 +1209,7 @@ class TestSrcModuleName:
     def test_it_agrees_with_the_domain_on_every_declared_members_file(
         self, tmp_path: Path
     ) -> None:
-        members = source_measures.workspace_domain(_domain_repo(tmp_path / 'repo'))
+        members = source_measures.measurement_domain(_domain_repo(tmp_path / 'repo'))
         declared = [f for member in members if not member.pseudo for f in member.files]
         assert len(declared) >= 5
         assert [source_measures.src_module_name(f.path) for f in declared] == [
@@ -1300,7 +1300,7 @@ def _primary_name(domain_file: source_measures.DomainFile) -> tuple[str, ...]:
 
 class TestUniqueImportPaths:
     def test_each_name_maps_to_the_one_file_it_names(self, tmp_path: Path) -> None:
-        domain = source_measures.workspace_domain(_domain_repo(tmp_path / 'repo'))
+        domain = source_measures.measurement_domain(_domain_repo(tmp_path / 'repo'))
         paths = source_measures.unique_import_paths(domain, lambda f: f.import_names)
         assert paths['legibility.y'] == 'scripts/legibility/y.py'
         assert 'y' not in paths
@@ -1312,7 +1312,7 @@ class TestUniqueImportPaths:
         self, tmp_path: Path
     ) -> None:
         repo = _domain_repo(tmp_path / 'repo', tracked=(*_DOMAIN_TRACKED, 'scripts/lms_z.py'))
-        domain = source_measures.workspace_domain(repo)
+        domain = source_measures.measurement_domain(repo)
         with pytest.raises(source_measures.MetricsError) as refused:
             source_measures.unique_import_paths(domain, lambda f: f.import_names)
         assert (
@@ -1366,13 +1366,13 @@ _READER_REFUSED_MEMBER_LISTS = {
 }
 
 
-class TestWorkspaceDomainFailsHard:
+class TestMeasurementDomainFailsHard:
     """A domain that cannot be enumerated whole raises, never reads as partial."""
 
     def test_a_missing_pyproject_is_refused(self, tmp_path: Path) -> None:
         root = _domain_repo(tmp_path / 'repo', pyproject=None)
         with pytest.raises(source_measures.MetricsError, match='pyproject.toml'):
-            source_measures.workspace_domain(root)
+            source_measures.measurement_domain(root)
 
     @pytest.mark.parametrize(
         ('pyproject', 'pattern'),
@@ -1408,7 +1408,7 @@ class TestWorkspaceDomainFailsHard:
     ) -> None:
         root = _domain_repo(tmp_path / 'repo', pyproject=pyproject)
         with pytest.raises(source_measures.MetricsError, match=pattern):
-            source_measures.workspace_domain(root)
+            source_measures.measurement_domain(root)
 
     @pytest.mark.parametrize(
         'pyproject',
@@ -1422,7 +1422,7 @@ class TestWorkspaceDomainFailsHard:
         with pytest.raises(_checkout.CheckoutBindingError) as read:
             _checkout.workspace_members(root)
         with pytest.raises(source_measures.MetricsError) as measured:
-            source_measures.workspace_domain(root)
+            source_measures.measurement_domain(root)
         assert str(read.value) in str(measured.value)
 
     def test_a_declared_member_with_no_tracked_python_is_refused(
@@ -1434,7 +1434,7 @@ class TestWorkspaceDomainFailsHard:
             tracked=('alpha/src/alpha/a.py', 'gamma/pyproject.toml'),
         )
         with pytest.raises(source_measures.MetricsError, match='gamma'):
-            source_measures.workspace_domain(root)
+            source_measures.measurement_domain(root)
 
     def test_a_declared_members_refusal_names_its_own_roots(self, tmp_path: Path) -> None:
         root = _domain_repo(
@@ -1443,7 +1443,7 @@ class TestWorkspaceDomainFailsHard:
             tracked=('alpha/src/alpha/a.py', 'gamma/pyproject.toml'),
         )
         with pytest.raises(source_measures.MetricsError, match='gamma/src') as refused:
-            source_measures.workspace_domain(root)
+            source_measures.measurement_domain(root)
         assert 'gamma/tests' in str(refused.value)
 
     def test_a_single_package_named_like_a_pseudo_member_is_refused(
@@ -1457,7 +1457,7 @@ class TestWorkspaceDomainFailsHard:
             tracked=('src/scripts/a.py', 'scripts/tool.py'),
         )
         with pytest.raises(source_measures.MetricsError, match=r"'scripts'.*pseudo-member"):
-            source_measures.workspace_domain(root)
+            source_measures.measurement_domain(root)
 
     def test_a_path_under_two_members_roots_is_refused_naming_both(
         self, tmp_path: Path
@@ -1472,7 +1472,7 @@ class TestWorkspaceDomainFailsHard:
         with pytest.raises(
             source_measures.MetricsError, match='scripts/tool/src/tool/b.py'
         ) as refused:
-            source_measures.workspace_domain(root)
+            source_measures.measurement_domain(root)
         assert "'scripts/tool'" in str(refused.value)
         assert "'scripts'" in str(refused.value)
 
@@ -1482,7 +1482,7 @@ class TestWorkspaceDomainFailsHard:
         root = _domain_repo(
             tmp_path / 'repo', pyproject=_workspace('alpha'), tracked=('alpha/src/alpha/a.py',)
         )
-        members = source_measures.workspace_domain(root)
+        members = source_measures.measurement_domain(root)
         assert [(member.name, member.files) for member in members[1:]] == [
             ('scripts', ()),
             ('tests', ()),
@@ -1496,7 +1496,7 @@ class TestWorkspaceDomainFailsHard:
         with pytest.raises(
             source_measures.MetricsError, match=r'unmerged.*alpha/src/alpha/conflict\.py'
         ):
-            source_measures.workspace_domain(root)
+            source_measures.measurement_domain(root)
 
     def test_a_missing_git_is_a_named_hard_failure(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -1506,14 +1506,14 @@ class TestWorkspaceDomainFailsHard:
         empty_bin.mkdir()
         monkeypatch.setenv('PATH', str(empty_bin))
         with pytest.raises(source_measures.MetricsError, match='could not run git'):
-            source_measures.workspace_domain(root)
+            source_measures.measurement_domain(root)
 
     def test_a_subdirectory_of_the_work_tree_is_refused(self, tmp_path: Path) -> None:
         root = _domain_repo(tmp_path / 'repo')
         with pytest.raises(
             source_measures.MetricsError, match='not the top of a git work tree'
         ):
-            source_measures.workspace_domain(root / 'alpha')
+            source_measures.measurement_domain(root / 'alpha')
 
 
 def _commit(root: Path, message: str) -> None:
@@ -1628,13 +1628,13 @@ class TestSinglePackageDomain:
 
     def test_the_package_then_only_the_scripts_pseudo_member(self, root: Path) -> None:
         # No `tests` pseudo-member: top-level tests/ is the package's own.
-        members = source_measures.workspace_domain(root)
+        members = source_measures.measurement_domain(root)
         assert tuple(member.name for member in members) == ('solo', 'scripts')
         assert tuple(member.pseudo for member in members) == (False, True)
 
     def test_files_are_classified_by_the_src_layout(self, root: Path) -> None:
         src, tests = source_measures.FileKind.SRC, source_measures.FileKind.TESTS
-        members = source_measures.workspace_domain(root)
+        members = source_measures.measurement_domain(root)
         assert {
             member.name: [(f.path, f.kind, f.import_name) for f in member.files]
             for member in members
@@ -1657,7 +1657,7 @@ class TestSinglePackageDomain:
         root = _domain_repo(
             tmp_path / 'repo', pyproject='[project]\nname = "root"\n' + _DOMAIN_PYPROJECT
         )
-        members = source_measures.workspace_domain(root)
+        members = source_measures.measurement_domain(root)
         assert tuple(member.name for member in members) == ('beta', 'alpha', 'scripts', 'tests')
 
     def test_the_uncommitted_paths_follow_the_same_layout(self, root: Path) -> None:
@@ -1673,7 +1673,7 @@ class TestSinglePackageDomain:
     @pytest.mark.parametrize(
         'enumerate_domain',
         [
-            pytest.param(source_measures.workspace_domain, id='workspace_domain'),
+            pytest.param(source_measures.measurement_domain, id='measurement_domain'),
             pytest.param(source_measures.uncommitted_domain_paths, id='uncommitted_domain_paths'),
         ],
     )

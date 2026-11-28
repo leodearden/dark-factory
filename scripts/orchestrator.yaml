@@ -196,12 +196,13 @@ test_command: "uv run --project shared pytest tests/scripts/ scripts/tests/ --tb
 # it, that same one-line edit ran NONE of the touched module's own tests.
 #
 # CLOSURE RECORD (task 3458). verify_command_timeout_secs no longer stays
-# UNSET here — see the PER-MODULE VERIFY BUDGET block at the bottom of this
-# file, which sizes it at 2400s from exactly the six measured runs above
+# UNSET here. Task 3458 sized it at 2400s, in the PER-MODULE VERIFY BUDGET
+# block at the bottom of this file, from exactly the six measured runs above
 # (four of the union, two of the command it replaced), using the SLOWEST
-# (930.59s wall, run 4) rather than the mean. The margin this paragraph used
+# (930.59s wall, run 4) rather than the mean; that block holds the current
+# figure and what it is sized against. The margin this paragraph used
 # to worry about — "only ~3.9x under that ceiling, not the ~6.4x the first
-# three runs implied" — is why 2400s (~2.6x the worst run) is the tightest
+# three runs implied" — is why 2400s (~2.6x the worst run) was the tightest
 # honestly declarable value: anything tighter risks red-walling this very
 # verification pass under load.
 #
@@ -276,7 +277,7 @@ test_command: "uv run --project shared pytest tests/scripts/ scripts/tests/ --tb
 # pyproject.toml, and held there by tests/scripts/test_nonmember_ruff_config.py.
 # Read them there; do not restate them here, or the two will drift and only one
 # copy is guarded.
-lint_command: "uv run --project shared ruff check scripts/ && python3 tests/scripts/raw_envelope_literal_guard.py scripts"
+lint_command: "uv run --project shared ruff check scripts/ && python3 tests/scripts/raw_envelope_literal_guard.py scripts && uv run --project shared python tests/scripts/git_history_census.py tests/scripts scripts/tests"
 
 # TYPE IS NOW DECLARED — task 3456 closed the gap task 3445 recorded here.
 #
@@ -433,9 +434,30 @@ type_check_command: "uv run --project shared pyright scripts/"
 # knowingly-open above — see the CLOSURE RECORD in the COST DELTA block).
 #
 # (1) MEASUREMENT PROVENANCE — every run this budget is sized against, so a
-# later reader sees the whole measured set, not the convenient half. Two
-# fresh, independent, sequential runs of the verbatim command above, at this
-# branch's base commit 37f761f5a4:
+# later reader sees the whole measured set, not the convenient half.
+#
+# W is an ARCHIVE figure since task 11825: the worst GREEN test command of
+# this leg in the main checkout's verify archive, read on 2026-11-27 by
+# `scripts/timeout_headroom_selfcheck.py --dry-run --project-root <main
+# checkout>` (slot timeout-headroom:leg_budget:scripts:2400). It is a SCOPED
+# task-role leg over scripts/tests/ files, NOT the verbatim union command
+# above. It is the sizing input all the same, because the family floor sizes
+# against the leg's longest green test command of any role and any command
+# (scripts/timeout_headroom_selfcheck.py module docstring, LEG BUDGET).
+# RE-MEASURE by repeating that dry-run, never by scaling. Archive records age
+# out, so a W that DROPS between two dry-runs means records left the window,
+# not that the suite got faster.
+#
+#   run 7   rc=0   1219.31s   ARCHIVE: task 5296 attempt 1, task role,
+#                             xdist -n 8, loadavg1 154 -> 191, started
+#                             2026-11-22T17:55:14Z; summary, in the main
+#                             checkout:
+#                             data/verify-logs/5296/attempt-1.scripts.summary-20261122T181534_082242Z.json
+#                                                         <- WORST ON RECORD; W
+#
+# HISTORY: task 3458's measured set, sized against until task 11825. Two
+# fresh, independent, sequential runs of the verbatim command above, at task
+# 3458's base commit 37f761f5a4:
 #
 #   run 5   exit 0   2099 passed, 1 skipped   355.79s pytest / 360.47s wall
 #   run 6   exit 0   2099 passed, 1 skipped   275.44s pytest / 293.32s wall
@@ -453,7 +475,12 @@ type_check_command: "uv run --project shared pyright scripts/"
 # this command; runs 5-6 are otherwise the same command against the same two
 # target trees as runs 3-4.
 #
-# (2) THE SIZING ARITHMETIC. W = 930.59s (run 4), the largest wall-clock of
+# (2) THE SIZING ARITHMETIC (task 11825). W = 1219.31s, the archive run of
+# (1), the worst GREEN run on record, never the mean. The key declares the
+# larger of the two gated floors (see the RAISE-TOGETHER RULE); at this W that
+# is min_leg_budget_for_family(W), the FAMILY-CEILING FLOOR stated just above
+# the key. The ~2.6x multiple below is this family's sizing habit, not a gate.
+# HISTORY (task 3458): W = 930.59s (run 4), the largest wall-clock of
 # the five runs that recorded one; run 3 recorded only a pytest-internal
 # duration (310.33s pytest, no wall-clock captured), well under W either way,
 # so it cannot change which run is worst — never the mean. A mean would land
@@ -465,10 +492,10 @@ type_check_command: "uv run --project shared pyright scripts/"
 # measurement time, not suite variance, which is exactly why the max and not
 # the mean is the sizing input (the same reasoning
 # tests/scripts/orchestrator.yaml applies to its own budget).
-# verify_command_timeout_secs: 2400 is ~2.6x W — the same multiple
-# tests/scripts/orchestrator.yaml uses for its own 600s budget (~2.6x its
-# 233.50s worst of two runs) — kept identical across the two sibling configs
-# deliberately, not coincidentally.
+# Task 3458 sized verify_command_timeout_secs at 2400, ~2.6x that W — the same
+# multiple tests/scripts/orchestrator.yaml then used for its own 600s budget
+# (~2.6x its 233.50s worst of two runs) — kept identical across the two
+# sibling configs deliberately, not coincidentally.
 #
 # (3) SCOPE: this is a PER-COMMAND budget. It bounds the TEST leg on its own,
 # not test+lint+type summed — each leg is timed independently by
@@ -481,14 +508,16 @@ type_check_command: "uv run --project shared pyright scripts/"
 # was not separately timed but is orders of magnitude cheaper than either.
 #
 # (4) HOW MUCH THIS ACTUALLY BUYS, stated plainly rather than oversold: a
-# narrowing from the repo-root 3600s ceiling to 2400s — a hang surfaces in
-# ~40 minutes instead of ~60. That is modest, and deliberately NOT the
-# tests/scripts sibling's "surfaces a hang in minutes" framing: that suite
-# measures ~105-233s, so its 600s budget buys a far sharper narrowing than
-# this one can. Nothing tighter is honestly declarable here without risking
-# the green path itself, because an observed HONEST GREEN run has measured
-# 930.59s. THE DUPLICATE-RUN COST IS STILL NOT RESOLVED BY THIS CHANGE —
-# tests/scripts/ still executes twice per full verify (see "THE DUPLICATE-RUN
+# narrowing under the repo-root ceiling,
+# dark-factory-orchestrator.yaml::verify_command_timeout_secs, to the value
+# below. That is modest, and deliberately NOT the tests/scripts sibling's
+# "surfaces a hang in minutes" framing: that suite measured ~105-233s when
+# this was written, so its then-600s budget bought a far sharper narrowing
+# than this one can. Nothing tighter is honestly declarable here without
+# risking the green path itself, because an observed HONEST GREEN run has
+# measured tests/scripts/test_scripts_module_config.py::
+# MEASURED_SUITE_WORST_SECS. THE DUPLICATE-RUN COST IS STILL NOT RESOLVED BY
+# THIS CHANGE — tests/scripts/ still executes twice per full verify (see "THE DUPLICATE-RUN
 # COST IS NOT RESOLVED BY THIS CHANGE" above); that remains task 3383's
 # dedupe-by-command guard in verify.run_full_verification, a fix of a
 # different class from a yaml budget.
@@ -496,25 +525,45 @@ type_check_command: "uv run --project shared pyright scripts/"
 # (5) verify_cold_command_timeout_secs is DELIBERATELY LEFT UNSET — no build
 # step on this module to budget for. Per verify._resolve_verify_timeout's
 # cascade, an unset module cold knob does NOT inherit this warm value: a cold
-# verify falls through to the repo-root verify_cold_command_timeout_secs
-# (5400s), and a merge-cold verify falls through first to
-# config.merge_verify_cold_command_timeout_secs (7200s, shipped by the
+# verify falls through to the repo-root
+# dark-factory-orchestrator.yaml::verify_cold_command_timeout_secs, and a
+# merge-cold verify falls through first to
+# config.merge_verify_cold_command_timeout_secs (shipped by the
 # package-bundled orchestrator/src/orchestrator/defaults.yaml, not overridden
 # by the root yaml). This asymmetry is deliberate, not an oversight, and is
 # GATED — not merely asserted here — by
 # tests/scripts/test_scripts_module_config.py::
 # test_scripts_module_cold_verify_falls_through_to_the_root_cold_ceiling.
 #
-# (6) RAISE-TOGETHER RULE. If this suite's measured cost grows toward 2400s,
-# re-measure and raise BOTH this value and MIN_MODULE_BUDGET_SECS in
-# tests/scripts/test_scripts_module_config.py — never quietly widen one
-# without the other; that guard exists specifically to make a silent widening
-# impossible.
+# (6) RAISE-TOGETHER RULE. Whenever a re-measure (the selfcheck dry-run of
+# (1)) moves W, re-record MEASURED_SUITE_WORST_SECS in
+# tests/scripts/test_scripts_module_config.py and, in the SAME commit, raise
+# the value declared below to the larger of the two gated floors,
+# max(min_leg_budget_for_family(W), MIN_MODULE_BUDGET_SECS).
+# MIN_MODULE_BUDGET_SECS follows BY DERIVATION (min_budget: ~2x the worst run,
+# floored to the nearest 100s), so it is not a separate thing to raise. Never
+# quietly widen one without the other; that guard exists specifically to make
+# a silent widening impossible.
+#   IT HAS FIRED ONCE (task 11825): MEASURED_SUITE_WORST_SECS 930.59 ->
+#   1219.31 and the budget below 2400 -> 2500 in the same change; the derived
+#   floor followed 1800 -> 2400 with no hand edit.
 #
 # GATED by tests/scripts/test_scripts_module_config.py::
 # test_scripts_module_carries_its_own_measured_verify_budget (this value:
 # declared / measurement-derived floor / strictly below the root ceiling /
-# honoured by the real verify._resolve_verify_timeout resolver) and by
+# honoured by the real verify._resolve_verify_timeout resolver), by
 # test_scripts_module_cold_verify_falls_through_to_the_root_cold_ceiling
-# (point (5) above).
-verify_command_timeout_secs: 2400
+# (point (5) above), and, for the FAMILY-CEILING FLOOR below, by
+# tests/scripts/test_module_verify_budgets.py::test_every_leg_running_the_family_outlasts_its_ceiling.
+#
+# FAMILY-CEILING FLOOR (task 11825). This leg runs whole-tree guard family
+# members, whose per-test ceiling is
+# shared/src/shared/whole_tree_guard_family.py::WHOLE_TREE_SCAN_TEST_TIMEOUT.
+# A budget below W + that ceiling kills the leg before a member's backstop
+# fires, turning an attributable hang into a retried infra_timeout. min_budget(W)
+# is ~2W and this floor ~W + that ceiling; the key below declares the larger of
+# the two, which at today's W is this one. W already sits just above that
+# ceiling, but this floor rounds UP to the next 100s where min_budget rounds
+# DOWN, so this floor still binds. Gated by
+# tests/scripts/test_module_verify_budgets.py::test_every_leg_running_the_family_outlasts_its_ceiling.
+verify_command_timeout_secs: 2500

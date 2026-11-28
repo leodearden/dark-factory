@@ -46,8 +46,9 @@ import subprocess
 import textwrap
 import uuid
 import warnings
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from pathlib import Path
+from types import MappingProxyType
 from unittest.mock import AsyncMock, MagicMock
 
 import _verify_boundary_ceilings
@@ -75,17 +76,18 @@ from _verify_boundary_harness import (
     git_push_succeeds,
     kill_holder_tree,
     loopback_ssh_run,
+    read_proc_state,
     sleeper_spec,
     snapshot_pre_kill_tree,
     spawn_ssh_heartbeat_dispatcher,
     spawn_verify_merge,
     stderr_tail,
     sweep_tagged,
-    tagged_pids,
     verify_merge_argv,
     wait_for_marker,
     wait_for_marker_stable,
     wait_for_pgid_file,
+    wait_pid_tagged,
     wait_pids_exited,
     wait_subtree_live,
     worktree_base_for,
@@ -100,6 +102,7 @@ from _verify_host_drive import (
 from _verify_merge_cli_fixtures import _setup_verify_repo
 from click.testing import CliRunner
 from escalation.queue import EscalationQueue
+from shared.proc_group import StatFields
 
 import orchestrator.cli_config as cli_config
 from orchestrator.cli import main
@@ -180,15 +183,14 @@ def _swept_test_functions() -> Iterator[tuple[str, ast.FunctionDef | ast.AsyncFu
 
 #: The helpers whose ``timeout`` default now resolves to
 #: :func:`row_discovery_ceiling_secs`, i.e. can spend up to
-#: ROW_DISCOVERY_CEILING_MAX_SECS each.
-_SCALED_DISCOVERY_HELPERS: frozenset[str] = frozenset(
-    {'wait_for_pgid_file', 'wait_subtree_live'}
-)
-
-#: The seams that TOGETHER mean "this call never touches real /proc" -- see
-#: :func:`_scaled_discovery_call_count`.  BOTH are required: either one alone
-#: leaves the other half of the poll tick reading real /proc.
-_DISCOVERY_SEAM_KWARGS: frozenset[str] = frozenset({'_probe_children', '_ppid_map'})
+#: ROW_DISCOVERY_CEILING_MAX_SECS each, mapped to that helper's OWN seams
+#: that TOGETHER mean "this call never touches real /proc" -- see
+#: :func:`_scaled_discovery_call_count`.  None: the helper has no such seams.
+_SCALED_DISCOVERY_HELPERS: Mapping[str, frozenset[str] | None] = MappingProxyType({
+    'wait_for_pgid_file': None,
+    'wait_pid_tagged': frozenset({'_tagged_pids'}),
+    'wait_subtree_live': frozenset({'_probe_children', '_ppid_map'}),
+})
 
 #: Last-resort stand-in for the pytest-timeout budget an unmarked test
 #: inherits, used ONLY when pytest-timeout did not configure this run at all
@@ -258,8 +260,9 @@ def _scaled_discovery_call_count(func_node) -> int:
     ``row_discovery_ceiling_secs()``.  An explicit unscaled value (e.g.
     ``timeout=30.0``) does not count -- it cannot exceed what it names.
 
-    A call passing the FULL private seam set (``_probe_children`` AND
-    ``_ppid_map``) is EXEMPT, and that rule is load-bearing: a fully
+    A call passing its OWN helper's FULL private seam set (for
+    wait_subtree_live, ``_probe_children`` AND ``_ppid_map``) is EXEMPT, and
+    that rule is load-bearing: a fully
     seam-injected call never touches real /proc and returns in microseconds at
     ``interval=0``.  Without it the three deterministic wait_subtree_live
     tests in test_verify_boundary_harness.py would each be told to carry a
@@ -286,8 +289,9 @@ def _scaled_discovery_call_count(func_node) -> int:
             and node.func.id in _SCALED_DISCOVERY_HELPERS
         ):
             continue
+        seams = _SCALED_DISCOVERY_HELPERS[node.func.id]
         # Superset, not intersection: the FULL seam set must be injected.
-        if {kw.arg for kw in node.keywords} >= _DISCOVERY_SEAM_KWARGS:
+        if seams is not None and {kw.arg for kw in node.keywords} >= seams:
             continue
         timeout_arg = next(
             (kw.value for kw in node.keywords if kw.arg == 'timeout'), None
@@ -509,6 +513,40 @@ def test_timeout_mark_budget_names_the_offence_of_each_banned_mark():
     assert budget == 120.0
     assert offence is not None
     assert 'LITERAL' in offence
+
+
+def test_scaled_discovery_call_count_bills_a_tag_wait():
+    """wait_pid_tagged is a load-scaled discovery wait, so the sweep bills it."""
+    (func,) = ast.parse(textwrap.dedent('''
+        def test_waits(pid, tag):
+            wait_pid_tagged(pid, tag)
+            wait_pid_tagged(pid, tag, timeout=row_discovery_ceiling_secs())
+            wait_pid_tagged(pid, tag, timeout=5.0)
+    ''')).body
+
+    assert _scaled_discovery_call_count(func) == 2, (
+        'a load-scaled tag wait the discovery-budget sweep does not bill can be '
+        'truncated by pytest-timeout instead of failing with its own assertion'
+    )
+
+
+@pytest.mark.parametrize(
+    ('call', 'billed'),
+    [
+        ('wait_pid_tagged(pid, tag, _tagged_pids=fake)', 0),
+        ('wait_subtree_live(pid, _probe_children=fake, _ppid_map=fake)', 0),
+        ('wait_subtree_live(pid, _ppid_map=fake)', 1),
+        ('wait_subtree_live(pid, _tagged_pids=fake)', 1),
+        ('wait_for_pgid_file(path, _probe_children=fake, _ppid_map=fake)', 1),
+    ],
+)
+def test_scaled_discovery_call_count_exempts_a_call_only_by_its_own_helpers_full_seam_set(
+    call, billed
+):
+    """A seam exempts only the helper that takes it, and only all of its seams together."""
+    (func,) = ast.parse(f'def test_wait(pid, tag, path, fake):\n    {call}\n').body
+
+    assert _scaled_discovery_call_count(func) == billed
 
 
 #: Anti-vacuity floor for the sweep below: an AST matcher that silently stops
@@ -898,6 +936,42 @@ def test_untorn_down_holders_flags_only_holders_never_passed_to_kill_holder_tree
     )
 
 
+def _untagged_build_diagnosis(state: StatFields | None) -> str:
+    """Why a build never matched its holder's tag, judged from its last /proc *state*.
+
+    tagged_pids skips a vanished pid and reads a zombie's environ as empty, so
+    a build that exited misses every probe just as a live untagged one does.
+    """
+    if state is None:
+        return 'the build has no /proc entry: it exited, a harness or leader failure'
+    if state.terminated:
+        return (
+            f'the build is a zombie (state {state.state}): it exited, a harness or '
+            f'leader failure'
+        )
+    return (
+        f'the build is alive (state {state.state}, ppid {state.ppid}) yet untagged: '
+        f'verify.py::_target_subprocess_env dropped the tag, so kill_holder_tree '
+        f'cannot sweep an orphaned build'
+    )
+
+
+@pytest.mark.parametrize(
+    ('state', 'exited'),
+    [
+        (None, True),
+        (StatFields(comm='sleep', state='Z', ppid=1, pgrp=4242), True),
+        (StatFields(comm='sleep', state='S', ppid=1, pgrp=4242), False),
+    ],
+)
+def test_untagged_build_diagnosis_blames_the_scrub_only_for_a_live_build(state, exited):
+    """A build that exited is a harness failure, never reported as a scrub regression."""
+    diagnosis = _untagged_build_diagnosis(state)
+
+    assert ('it exited' in diagnosis) is exited
+    assert ('_target_subprocess_env' in diagnosis) is not exited
+
+
 @pytest.mark.timeout(ROW_PER_TEST_TIMEOUT_SECS)
 def test_spawned_verify_merge_build_carries_the_holder_tag(tmp_path):
     """The real CLI's session-escaped build inherits its holder's tag.
@@ -924,10 +998,10 @@ def test_spawned_verify_merge_build_carries_the_holder_tag(tmp_path):
             f'(verify.py::_run_cmd start_new_session), or this test is not '
             f'exercising the escape the sweep exists for'
         )
-        assert build_pid in tagged_pids(holder.tag), (
+        assert wait_pid_tagged(build_pid, holder.tag, timeout=row_discovery_ceiling_secs()), (
             f'the build pid={build_pid} spawned by holder pid={holder.pid} '
-            f'does not carry {HOLDER_TAG_ENV}={holder.tag} -- the target-env '
-            f'scrub dropped it, so kill_holder_tree cannot sweep an orphaned build'
+            f'never carried {HOLDER_TAG_ENV}={holder.tag} within the discovery '
+            f'ceiling; {_untagged_build_diagnosis(read_proc_state(build_pid))}'
         )
     finally:
         kill_holder_tree(holder, timeout=ROW5_HOLDER_TEARDOWN_CEILING_SECS)

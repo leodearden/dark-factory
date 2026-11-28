@@ -8,6 +8,7 @@ interceptor's), and records what the seam emits.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -20,10 +21,12 @@ from _submit_stack import Stack
 from _submit_stack import passthrough_main_checkout as passthrough_main_checkout
 from _submit_stack import stack as stack
 from shared.followup_hold_records import FOLLOWUP_HOLD_METADATA_KEY
+from shared.task_statuses import TaskStatus
 
 from fused_memory.middleware.followup_hold import (
     FollowupHolders,
     PromotionDeferral,
+    backfill,
     hold_at_create,
     promote,
     promote_dependencies_of,
@@ -34,6 +37,9 @@ from fused_memory.middleware.followup_hold import (
 from fused_memory.models.reconciliation import EventType
 
 _FOLLOWUP = {'source': 'agent-followup', 'spawn_context': 'agent_followup', 'spawned_from': '101'}
+_SET_MEMBER = {
+    'source': 'review-all', 'x_finding_key': ['fk-1'], 'finding_set_hold': {'ruling': 'Leo 2026-11-12 on fk-1'},
+}
 _HELD_AT = '2026-11-19T00:00:00+00:00'
 
 
@@ -53,19 +59,27 @@ class _Store:
     def events(self, event_type: EventType) -> list[dict[str, Any]]:
         return [payload for emitted_type, payload in self.emitted if emitted_type == event_type]
 
-    async def held(self, title: str, *, dependencies: Sequence[int] = (), status: str = 'pending') -> int:
-        kwargs, metadata = hold_at_create(
+    async def held(
+        self, title: str, *, dependencies: Sequence[int] = (), status: str = 'pending',
+        metadata: Mapping[str, Any] = _FOLLOWUP,
+    ) -> int:
+        kwargs, held_metadata = hold_at_create(
             {'title': title, 'description': f'{title}: one observation.', 'priority': 'low',
              'dependencies': ','.join(str(dependency) for dependency in dependencies)},
-            _FOLLOWUP, self.holder, held_at=_HELD_AT,
+            metadata, self.holder, held_at=_HELD_AT,
         )
-        return await self._add(metadata=metadata, status=status, **kwargs)
+        return await self._add(metadata=held_metadata, status=status, **kwargs)
 
     async def plain(self, title: str, *, dependencies: Sequence[int] = (), status: str = 'pending') -> int:
         return await self._add(
             title=title, description=f'{title}: one task.', priority='medium',
             dependencies=','.join(str(dependency) for dependency in dependencies),
             metadata={'files': ['src/app/a.py']}, status=status,
+        )
+
+    async def candidate(self, title: str) -> int:
+        return await self._add(
+            title=title, description=f'{title}: one observation.', priority='low', metadata=_FOLLOWUP,
         )
 
     async def _add(self, *, metadata: Mapping[str, Any], **fields: Any) -> int:
@@ -188,9 +202,10 @@ async def test_an_unknown_cause_is_refused(store: _Store) -> None:
 
 
 @pytest.mark.asyncio
-async def test_a_pending_unheld_dependent_promotes_its_held_dependency(store: _Store) -> None:
+@pytest.mark.parametrize('status', ['pending', 'in-progress', 'blocked', 'review', 'merge-deferred', 'infra-hold'])
+async def test_a_waiting_unheld_dependent_promotes_its_held_dependency(store: _Store, status: str) -> None:
     held = await store.held('The retry loop swallows the timeout')
-    dependent = await store.plain('Ship the retry budget', dependencies=[held])
+    dependent = await store.plain('Ship the retry budget', dependencies=[held], status=status)
 
     promoted = await promote_dependencies_of(store.stack.backend, store.stack.root, dependent, emit=store.emit)
 
@@ -202,7 +217,7 @@ async def test_a_pending_unheld_dependent_promotes_its_held_dependency(store: _S
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('shape', ['held', 'deferred', 'in-progress'])
+@pytest.mark.parametrize('shape', ['held', 'deferred', 'done', 'cancelled'])
 async def test_a_dependent_that_is_not_waiting_unheld_promotes_nothing(store: _Store, shape: str) -> None:
     held = await store.held('The retry loop swallows the timeout')
     if shape == 'held':
@@ -215,6 +230,28 @@ async def test_a_dependent_that_is_not_waiting_unheld_promotes_nothing(store: _S
     assert promoted == ()
     await _assert_held(store, held)
     assert store.emitted == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('status', list(TaskStatus), ids=[status.value for status in TaskStatus])
+async def test_the_backfill_holds_exactly_what_a_dependent_in_that_status_would_not_promote(
+    store: _Store, status: TaskStatus,
+) -> None:
+    held = await store.held('The retry loop swallows the timeout')
+    candidate = await store.candidate('The cache key ignores the tenant')
+    dependent = await store.plain('Ship the retry budget', dependencies=[held, candidate], status=status.value)
+    backend, root = store.stack.backend, store.stack.root
+
+    await backfill(
+        backend, root, holders=FollowupHolders(on_minted=_unannounced), write_lock=asyncio.Lock(),
+        emit=store.emit, known_roots=[root],
+    )
+    backfill_held = store.holder in await store.dependencies(candidate)
+    promoted = await promote_dependencies_of(backend, root, dependent, emit=store.emit)
+
+    assert backfill_held is not (held in promoted), (
+        f'a {status.value} dependent: the backfill held={backfill_held}, promotion promoted={promoted}'
+    )
 
 
 @pytest.mark.asyncio
@@ -370,3 +407,32 @@ async def test_releasing_again_promotes_only_what_the_first_release_left_held(
     assert store.events(EventType.followup_promoted) == [
         {'task_id': str(left_held), 'by': 'human', 'ref': 'release_holder'},
     ]
+
+
+@pytest.mark.asyncio
+async def test_a_citation_leaves_a_held_finding_set_member_held(store: _Store) -> None:
+    held = await store.held('Switch judge.py to the public name', metadata=_SET_MEMBER)
+
+    promoted = await store.promote(held, by='citation', ref='fk-1')
+
+    assert promoted == ()
+    await _assert_held(store, held)
+    [deferred] = store.events(EventType.followup_promotion_deferred)
+    assert {key: deferred[key] for key in ('task_id', 'by', 'ref', 'guard')} == {
+        'task_id': str(held), 'by': 'citation', 'ref': 'fk-1', 'guard': 'finding_set_hold',
+    }
+    assert 'Leo 2026-11-12 on fk-1' in deferred['reason']
+    assert store.events(EventType.followup_promoted) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('by', ['dependent', 'combine', 'pack', 'rider', 'human'])
+async def test_every_other_cause_still_promotes_a_held_finding_set_member(store: _Store, by: str) -> None:
+    held = await store.held('Switch judge.py to the public name', metadata=_SET_MEMBER)
+
+    promoted = await store.promote(held, by=by, ref='r')
+
+    assert promoted == (held,)
+    assert store.holder not in await store.dependencies(held)
+    assert (await store.record(held))['promoted']['by'] == by
+    assert store.events(EventType.followup_promotion_deferred) == []

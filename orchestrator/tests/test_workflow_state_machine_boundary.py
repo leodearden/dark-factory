@@ -97,6 +97,7 @@ from orchestrator.harness import TaskReport
 from orchestrator.merge_lane.landed_outbox import MergeProvenance
 from orchestrator.module_charter import derive_modules
 from orchestrator.scheduler import BlastRadiusResult, SetTaskStatusRejected, TaskAssignment
+from orchestrator.slot_lease import SlotLease
 from orchestrator.unblock_types import BlockClass
 from orchestrator.verify import VerifyResult
 from orchestrator.verify_categories import FailureCategory
@@ -499,6 +500,7 @@ class _WideningReplanStub(AgentStub):
             self._blocked = True
             review = _make_review(role, 'ISSUES_FOUND', [{
                 'severity': 'blocking',
+                'kind': 'test_quality',
                 'location': 'lib.py:5',
                 'category': 'missing_edge_case',
                 'description': 'No test for empty name',
@@ -1292,7 +1294,7 @@ class TestHarnessConsumesTerminalReport:
                 modules=[],
             )
             sem = asyncio.Semaphore(1)
-            result = await harness._run_slot(assignment, sem)
+            result = await harness._run_slot(assignment, SlotLease(assignment.task_id, harness.scheduler, sem))
 
         assert result is not None
         return result

@@ -13,7 +13,11 @@ from typing import Any
 
 import pytest
 from pydantic import ValidationError
-from shared.followup_hold_records import FOLLOWUP_HOLD_METADATA_KEY, FOLLOWUP_HOLDER_METADATA_KEY
+from shared.followup_hold_records import (
+    FINDING_SET_HOLD_METADATA_KEY,
+    FOLLOWUP_HOLD_METADATA_KEY,
+    FOLLOWUP_HOLDER_METADATA_KEY,
+)
 
 from fused_memory.middleware.followup_hold import (
     FollowupHolderProtectedError,
@@ -29,6 +33,8 @@ from fused_memory.middleware.followup_hold import (
     protected_status,
     protected_update,
     releases_holder,
+    starts_waiting,
+    waits_on_its_dependencies,
 )
 
 _MARKER = {'project_id': 'dark_factory', 'minted_at': '2026-11-08T00:00:00+00:00'}
@@ -126,6 +132,84 @@ def test_a_low_followup_is_in_hold_scope(metadata: Any, priority: str) -> None:
 ])
 def test_a_task_outside_the_hold_rule_is_not_held(metadata: Any, priority: str | None) -> None:
     assert not hold_scope(metadata, priority)
+
+
+_SET_MARKER = {'ruling': 'Leo 2026-11-12 on fk-c0932f0b7df1'}
+_FINDING_SET = {
+    'source': 'review-all',
+    'x_finding_key': ['fk-c0932f0b7df1'],
+    'x_finding_run': 'review-all-dark_factory-20261008',
+    FINDING_SET_HOLD_METADATA_KEY: _SET_MARKER,
+}
+
+
+@pytest.mark.parametrize(('metadata', 'priority'), [
+    (_FINDING_SET, 'low'),
+    (_FINDING_SET, 'polish'),
+    ({**_FINDING_SET, 'human_decomposed': True}, 'low'),
+    ({**_FINDING_SET, 'prd_path': 'plans/x-prd.md'}, 'low'),
+    ({**_FINDING_SET, 'complexity': 'simple'}, 'low'),
+    ({**_FINDING_SET, 'x_finding_key': 'fk-x'}, 'low'),
+    (json.dumps({**_FINDING_SET, 'human_decomposed': True}), 'low'),
+], ids=['low', 'polish', 'planning-birth', 'prd-path', 'simple', 'scalar-finding-key', 'json-string'])
+def test_a_marked_finding_set_member_is_in_hold_scope(metadata: Any, priority: str) -> None:
+    assert hold_scope(metadata, priority)
+
+
+@pytest.mark.parametrize(('metadata', 'priority'), [
+    (_FINDING_SET, 'medium'),
+    ({**_FINDING_SET, 'task_kind': 'deterministic'}, 'low'),
+    ({**_FINDING_SET, 'execution_class': 'operational'}, 'low'),
+    ({'source': 'review-all', FINDING_SET_HOLD_METADATA_KEY: _SET_MARKER}, 'low'),
+    ({**_FINDING_SET, 'x_finding_key': []}, 'low'),
+    ({**_FINDING_SET, FINDING_SET_HOLD_METADATA_KEY: None}, 'low'),
+], ids=['medium', 'deterministic', 'execution-class', 'no-finding-key', 'empty-finding-key', 'marker-none'])
+def test_a_marked_task_outside_the_finding_set_arm_is_not_held(metadata: Any, priority: str) -> None:
+    assert not hold_scope(metadata, priority)
+
+
+@pytest.mark.parametrize(('metadata', 'priority', 'reason'), [
+    (_FINDING_SET, 'medium', "priority 'medium'"),
+    ({**_FINDING_SET, 'task_kind': 'deterministic'}, 'low', "task_kind 'deterministic'"),
+    ({**_FINDING_SET, 'execution_class': 'operational'}, 'low', "execution_class 'operational'"),
+    ({'source': 'review-all', FINDING_SET_HOLD_METADATA_KEY: _SET_MARKER}, 'low', 'x_finding_key'),
+    ({**_FINDING_SET, 'x_finding_key': []}, 'low', 'x_finding_key'),
+], ids=['medium', 'deterministic', 'execution-class', 'no-finding-key', 'empty-finding-key'])
+def test_a_valid_marker_the_rule_refuses_warns_naming_the_task_and_why(
+    metadata: Any, priority: str, reason: str, caplog: pytest.LogCaptureFixture,
+) -> None:
+    with caplog.at_level('WARNING', logger='fused_memory.middleware.followup_hold'):
+        assert not hold_scope(metadata, priority, task_id=42)
+
+    [message] = caplog.messages
+    assert 'task 42' in message and FINDING_SET_HOLD_METADATA_KEY in message, message
+    assert _SET_MARKER['ruling'] in message and reason in message, message
+
+
+def test_a_held_or_unmarked_task_logs_nothing(caplog: pytest.LogCaptureFixture) -> None:
+    with caplog.at_level('WARNING', logger='fused_memory.middleware.followup_hold'):
+        assert hold_scope(_FINDING_SET, 'low', task_id=42)
+        assert hold_scope(_FOLLOWUP, 'low', task_id=43)
+        assert not hold_scope(_FOLLOWUP, 'medium', task_id=44)
+
+    assert caplog.messages == []
+
+
+@pytest.mark.parametrize('marker', [
+    {},
+    {'ruling': ''},
+    {**_SET_MARKER, 'extra': 1},
+    'yes',
+], ids=['empty', 'empty-ruling', 'extra-key', 'string'])
+def test_a_malformed_finding_set_marker_is_not_held_and_warns(
+    marker: object, caplog: pytest.LogCaptureFixture,
+) -> None:
+    with caplog.at_level('WARNING', logger='fused_memory.middleware.followup_hold'):
+        assert not hold_scope({**_FINDING_SET, FINDING_SET_HOLD_METADATA_KEY: marker}, 'low', task_id=42)
+
+    assert any(
+        FINDING_SET_HOLD_METADATA_KEY in message and 'task 42' in message for message in caplog.messages
+    ), caplog.messages
 
 
 _HELD_AT = '2026-11-19T04:30:00+00:00'
@@ -313,6 +397,44 @@ def test_a_promoted_row_keeps_its_record_but_is_not_held() -> None:
     promoted = {**_HOLD_RECORD, 'promoted': {'by': 'citation', 'at': _HELD_AT, 'ref': 'fk-1'}}
 
     assert held_by(_held_row(dependencies=[3], record=promoted)) is None
+
+
+@pytest.mark.parametrize('status', ['pending', 'in-progress', 'blocked', 'review', 'merge-deferred', 'infra-hold'])
+def test_an_unheld_row_in_a_waiting_status_waits_on_its_dependencies(status: str) -> None:
+    assert waits_on_its_dependencies({'id': 12, 'status': status, 'dependencies': [3], 'metadata': {}})
+
+
+def test_a_promoted_row_waits_on_its_dependencies() -> None:
+    promoted = {**_HOLD_RECORD, 'promoted': {'by': 'citation', 'at': _HELD_AT, 'ref': 'fk-1'}}
+
+    assert waits_on_its_dependencies(_held_row(dependencies=[3], record=promoted))
+
+
+@pytest.mark.parametrize('status', ['deferred', 'done', 'cancelled'])
+def test_an_unheld_row_that_is_deferred_or_settled_does_not_wait(status: str) -> None:
+    assert not waits_on_its_dependencies({'id': 12, 'status': status, 'dependencies': [3], 'metadata': {}})
+
+
+@pytest.mark.parametrize('status', ['pending', 'in-progress'])
+def test_a_held_row_does_not_wait_on_its_dependencies(status: str) -> None:
+    assert not waits_on_its_dependencies(_held_row(status))
+
+
+@pytest.mark.parametrize(('old_status', 'status'), [
+    ('deferred', 'pending'), ('deferred', 'blocked'), ('done', 'pending'), ('cancelled', 'pending'),
+])
+def test_a_landing_from_deferred_or_settled_into_a_waiting_status_starts_waiting(old_status: str, status: str) -> None:
+    assert starts_waiting(old_status, status)
+
+
+@pytest.mark.parametrize(('old_status', 'status'), [
+    ('in-progress', 'pending'), ('blocked', 'pending'), ('pending', 'in-progress'),
+    ('pending', 'deferred'), ('pending', 'done'), ('pending', 'pending'),
+])
+def test_a_landing_that_was_already_waiting_or_stops_waiting_does_not_start_waiting(
+    old_status: str, status: str,
+) -> None:
+    assert not starts_waiting(old_status, status)
 
 
 @pytest.mark.parametrize('record', [

@@ -43,13 +43,21 @@ if TYPE_CHECKING:
 
 from shared.asyncio_tasks import gather_unwound
 from shared.cgroup_slice import project_slice_name
+from shared.defect_plugin_location import DEFECT_PLUGIN_DIR
 from shared.proc_group import terminate_process_group
 from shared.psi import cpu_some10_or_none, read_psi_sample
 from shared.python_env import without_python_env_selection
 from shared.secret_env import without_account_pool
 from shared.verify_admission import acquire_task_slot, is_gated_role, nice_prefix
 
-from orchestrator import remote_gate, verify_evidence, verify_fallback_floor, verify_plan
+from orchestrator import (
+    narrow_gate_delta,
+    narrow_gate_plan,
+    remote_gate,
+    verify_evidence,
+    verify_fallback_floor,
+    verify_plan,
+)
 from orchestrator.cargo_scope import discover_workspace_crates, files_to_crates
 from orchestrator.config import ModuleConfig, OrchestratorConfig
 
@@ -60,6 +68,8 @@ from orchestrator.config import ModuleConfig, OrchestratorConfig
 # flake_ledger depends only on shared.sqlite_sync_base, so there is no cycle.
 from orchestrator.flake_ledger import FlakeCallSite, FlakeSuppression, FlakeVerdict
 from orchestrator.main_tip_sweep_cadence import SweepSeedMode
+from orchestrator.narrow_gate_class import ChangedPath, GateMiss, MergeGateResolution, MissReason
+from orchestrator.narrow_gate_plan import NarrowGateDecision
 from orchestrator.relocated_scopes import relocated_scopes
 from orchestrator.scope_launch_handshake import ScopeLaunchHandshake
 from orchestrator.tree_removal import remove_tree
@@ -79,8 +89,8 @@ from orchestrator.verify_admission_record import (
 )
 from orchestrator.verify_cache.modes import CacheMode, VerifyRole
 from orchestrator.verify_cache.policy import LegResult
-from orchestrator.verify_cache.recorder import CacheRecord, LegRun
-from orchestrator.verify_cache.registry import Entry
+from orchestrator.verify_cache.recorder import CacheRecord, CacheReport, LegRun
+from orchestrator.verify_cache.registry import Candidate, Entry
 from orchestrator.verify_cache.replay import CacheAccess, ReplayPlan, plan_replay
 from orchestrator.verify_categories import (
     ARCHIVE_DENY_LIST as _ARCHIVE_DENY_LIST,  # noqa: F401 — re-exported for external consumers
@@ -115,6 +125,7 @@ from orchestrator.verify_cmd import (
     applied_worker_count,
     apply_pytest_numprocesses,
     cargo_scope,
+    carries_defect_plugin,
     govern_cpu,
     parse_config_command,
     render,
@@ -123,6 +134,7 @@ from orchestrator.verify_cmd import (
     serial_pytest,
     split_and_chain_segments,
     split_chain_tail,
+    with_defect_plugin,
     with_junitxml,
     with_pytest_timeout,
 )
@@ -1352,6 +1364,20 @@ def parse_pytest_failures(test_output: str) -> tuple[PytestFailure, ...]:
     )
 
 
+def failure_sections(test_output: str, failures: Iterable[PytestFailure]) -> dict[PytestFailure, str]:
+    """Each of *failures*' own FAILURES/ERRORS section body in *test_output*, for those a section singles out.
+
+    A failure whose section is absent, or shares its title with another it cannot be told
+    apart from (see ``parse_pytest_failures``), has no entry.
+    """
+    sections = _section_bodies(test_output)
+    return {
+        failure: body
+        for failure in failures
+        if (body := _section_body_of(sections, failure.node_id, failure.kind)) is not None
+    }
+
+
 def node_ids_of(failures: Iterable[PytestFailure]) -> list[str]:
     """Node ids in order, de-duplicated on ``node_id`` alone."""
     return list(dict.fromkeys(failure.node_id for failure in failures))
@@ -1449,6 +1475,14 @@ def _junit_testcase_id(testcase: ET.Element) -> str:
     return strip_xdist_group_suffix(f'{owner}::{name}' if owner else name)
 
 
+def _junit_dotted_path(path: str) -> str:
+    """A node id's file *path* as a junit classname spells it.
+
+    The path half of ``_pytest/junitxml.py::mangle_test_address``.
+    """
+    return path.replace('/', '.').removesuffix('.py')
+
+
 def _junit_spelling(node_id: str) -> str:
     """*node_id* as :func:`_junit_testcase_id` spells its testcase, when the rootdir is the id's root.
 
@@ -1456,9 +1490,19 @@ def _junit_spelling(node_id: str) -> str:
     """
     path, bracket, params = node_id.partition('[')
     names = path.split('::')
-    names[0] = names[0].replace('/', '.').removesuffix('.py')
+    names[0] = _junit_dotted_path(names[0])
     names[-1] += bracket + params
     return f"{'.'.join(names[:-1])}::{names[-1]}"
+
+
+def _junit_container(node_id: str) -> str:
+    """The junit classname of *node_id* read as a module or class, when the rootdir is the id's root."""
+    path, *names = node_id.partition('[')[0].split('::')
+    return '.'.join([_junit_dotted_path(path), *names])
+
+
+def _junit_classname_under(classname: str, containers: Collection[str]) -> bool:
+    return any(classname == container or classname.startswith(f'{container}.') for container in containers)
 
 
 def _junit_testcase_never_ran(testcase: ET.Element) -> bool:
@@ -1536,15 +1580,55 @@ NodeIdStatus = Literal['pass', 'fail', 'error', 'skipped']
 _NODE_ID_STATUS_PRECEDENCE: tuple[NodeIdStatus, ...] = ('fail', 'error', 'skipped', 'pass')
 
 
-def _junit_testcase_statuses(path: Path) -> dict[str, NodeIdStatus] | None:
-    """``{junit id: status}`` for every testcase of the report at *path*; ``None`` when no report parsed.
+#: Bound on a ``NodeIdResult.detail``: a long traceback keeps its head, where
+#: the assertion message is.
+_NODE_ID_DETAIL_MAX_CHARS = 4000
+
+
+@dataclass(frozen=True)
+class NodeIdResult:
+    """One node id's outcome from ``run_node_id_results``.
+
+    ``detail`` is the junit ``<failure>``/``<error>`` message attribute and
+    text, which carry the assertion message and traceback, bounded by
+    ``_NODE_ID_DETAIL_MAX_CHARS``; ``''`` for a pass, a skip, or an id no
+    testcase reported. It is NOT pytest's captured stdout/stderr:
+    ``junit_logging`` is not enabled.
+    """
+
+    status: NodeIdStatus
+    detail: str = ''
+
+
+def _by_node_id_precedence(result: NodeIdResult) -> int:
+    return _NODE_ID_STATUS_PRECEDENCE.index(result.status)
+
+
+def _junit_outcome_detail(outcome: ET.Element) -> str:
+    parts = (outcome.get('message', ''), (outcome.text or '').strip())
+    return '\n'.join(part for part in parts if part)[:_NODE_ID_DETAIL_MAX_CHARS]
+
+
+def _junit_testcase_result(testcase: ET.Element) -> NodeIdResult:
+    failure = testcase.find('failure')
+    if failure is not None:
+        return NodeIdResult('fail', _junit_outcome_detail(failure))
+    error = testcase.find('error')
+    if error is not None:
+        return NodeIdResult('error', _junit_outcome_detail(error))
+    return NodeIdResult('skipped' if _junit_testcase_never_ran(testcase) else 'pass')
+
+
+def _junit_testcase_results(path: Path) -> dict[str, NodeIdResult] | None:
+    """``{junit id: result}`` for every testcase of the report at *path*; ``None`` when no report parsed.
 
     A ``<failure>`` is ``'fail'``. An ``<error>`` without one, a setup or
     teardown error, is ``'error'``: the test got no verdict. A test that never
     executed is ``'skipped'``; any other testcase ran and passed. Ids use the
     spelling of :func:`_extract_test_ids_from_junit`. pytest writes a test that
     fails and then errors in teardown as two testcases with one id; repeats
-    fold by ``_NODE_ID_STATUS_PRECEDENCE``, so that test stays ``'fail'``.
+    fold by ``_NODE_ID_STATUS_PRECEDENCE``, keeping the winning testcase's
+    detail, so that test stays ``'fail'`` with its failure text.
     """
     try:
         root = ET.parse(path).getroot()
@@ -1552,22 +1636,13 @@ def _junit_testcase_statuses(path: Path) -> dict[str, NodeIdStatus] | None:
         return None
     if root is None:
         return None
-    statuses: dict[str, NodeIdStatus] = {}
+    results: dict[str, NodeIdResult] = {}
     for testcase in root.iter('testcase'):
-        if testcase.find('failure') is not None:
-            status: NodeIdStatus = 'fail'
-        elif testcase.find('error') is not None:
-            status = 'error'
-        elif _junit_testcase_never_ran(testcase):
-            status = 'skipped'
-        else:
-            status = 'pass'
         testcase_id = _junit_testcase_id(testcase)
-        prior = statuses.get(testcase_id)
-        statuses[testcase_id] = status if prior is None else _NODE_ID_STATUS_PRECEDENCE[min(
-            _NODE_ID_STATUS_PRECEDENCE.index(prior), _NODE_ID_STATUS_PRECEDENCE.index(status),
-        )]
-    return statuses
+        result = _junit_testcase_result(testcase)
+        prior = results.get(testcase_id)
+        results[testcase_id] = result if prior is None else min(prior, result, key=_by_node_id_precedence)
+    return results
 
 
 def _extract_failing_test_ids_from_junit(path: Path) -> list[str] | None:
@@ -2645,6 +2720,32 @@ def _with_junitxml_str(cmd: str | None, junit_path: str) -> str | None:
     return render(rewritten)
 
 
+def _with_defect_plugin_str(cmd: str | None) -> str | None:
+    """Inject ``-p _df_defect_plugin`` into a structured ``pytest`` command, via VerifyCmd.
+
+    The string-level parse -> ``with_defect_plugin`` -> identity -> render
+    wrapper, shaped like ``_with_junitxml_str``: an untouched command comes
+    back BYTE-identical. A raw-retained pytest chain is the one suppression
+    logged at INFO (plans/defect-tests-prd.md B22), because that leg loses a
+    named capability. An OPAQUE, non-pytest or already-injected command was
+    never going to gain the plugin here, so it is not logged.
+    """
+    if cmd is None:
+        return None
+    parsed = parse_config_command(cmd)
+    rewritten = with_defect_plugin(parsed)
+    if rewritten is parsed:
+        if parsed.tool is ToolKind.PYTEST and parsed.raw is not None:
+            logger.info(
+                'defect plugin injection suppressed: %s is a raw-retained pytest '
+                'command, so no collection map is written for this leg, and its '
+                'defect proof and keep-check record unsupported',
+                cmd,
+            )
+        return cmd
+    return render(rewritten)
+
+
 def _tool_for_cmd(cmd: str | None) -> ToolKind:
     """Resolve *cmd*'s ``ToolKind`` for ``classify_failure`` dispatch (task δ).
 
@@ -3404,8 +3505,24 @@ class _JunitReportPlan:
         return owned
 
 
+COLLECTION_MAP_SUFFIX = '.tests.json'
+
+
+def collection_map_path(report: Path) -> Path:
+    """The defect-test collection map beside a junit *report*: its full file name plus ``.tests.json``.
+
+    The orchestrator's single home of the map's name, for a live junit
+    (``r.xml.tests.json``) and an archived one
+    (``attempt-1.pkg.junit-<stamp>.xml.gz.tests.json``) alike. The plugin
+    ``shared/src/shared/_pytest_inject/_df_defect_plugin.py`` holds the
+    writer's own copy, because it can import nothing; their agreement is
+    proven end to end in ``orchestrator/tests/test_verify_defect_injection.py``.
+    """
+    return report.with_name(report.name + COLLECTION_MAP_SUFFIX)
+
+
 def _clear_junit_report(junit_path: Path) -> None:
-    """Remove any report left at *junit_path* by an earlier pytest invocation.
+    """Remove any report, and its collection map, left at *junit_path* by an earlier pytest invocation.
 
     Belongs immediately before each test-leg run that injects ``--junitxml``,
     NOT where the path is computed: pytest is invoked 1..N times inside one
@@ -3417,13 +3534,16 @@ def _clear_junit_report(junit_path: Path) -> None:
 
     Siting it at the write also means a leg with no test command clears
     nothing, so a type-only gate cannot delete a report it could never write.
+
+    The sibling collection map goes with it, so a run that writes no map (mode
+    off, or a crash) never leaves a predecessor's map beside a fresh junit, to
+    be archived as this run's.
     """
-    try:
-        junit_path.unlink(missing_ok=True)
-    except OSError as exc:
-        logger.warning(
-            '_clear_junit_report: could not remove %s: %s', junit_path, exc,
-        )
+    for path in (junit_path, collection_map_path(junit_path)):
+        try:
+            path.unlink(missing_ok=True)
+        except OSError as exc:
+            logger.warning('_clear_junit_report: could not remove %s: %s', path, exc)
 
 
 def _write_run_log(
@@ -3661,6 +3781,12 @@ def _archive_junit_report(
     *segment_label* names one segment of a segmented task leg (task 5671),
     whose segments each write their own report; omitted, the name is the
     per-leg one.
+
+    The cost and the attributing kinds both archive the report's collection
+    map the same way: copied uncompressed to ``collection_map_path(dest)``, so
+    a reader holding the archived junit's path (client-feed task 6972, the
+    defect-test consumers) derives the map from it. No map, no copy; a failed
+    copy warns and still returns the archived report.
     """
     dest: Path | None = None
     try:
@@ -3684,7 +3810,18 @@ def _archive_junit_report(
             junit_path, dest, exc_info=True,
         )
         return None
+    _archive_collection_map(collection_map_path(junit_path), collection_map_path(dest))
     return dest
+
+
+def _archive_collection_map(live_map: Path, archived_map: Path) -> None:
+    try:
+        if live_map.is_file():
+            shutil.copyfile(live_map, archived_map)
+    except OSError as exc:  # observability may not fail a verify
+        logger.warning(
+            '_archive_junit_report: could not archive %s → %s: %s', live_map, archived_map, exc,
+        )
 
 
 def _write_json_artifact(path: Path, payload: dict, caller: str) -> 'Path | None':
@@ -4107,7 +4244,7 @@ def _trivial_pass(reason: str) -> 'VerifyResult':
     )
 
 
-def _replay_hint(replayed: Iterable[tuple[str, Entry]]) -> str:
+def _replay_hint(replayed: Iterable[tuple[str, Entry | Candidate]]) -> str:
     """Name each replayed unit's entry and evidence event (I1)."""
     return '; '.join(
         f'replayed {unit_id} from entry {entry.entry_id} (evidence event {entry.evidence_event_id})'
@@ -4115,7 +4252,7 @@ def _replay_hint(replayed: Iterable[tuple[str, Entry]]) -> str:
     )
 
 
-def _cache_hit_result(replay: ReplayPlan, replayed: Iterable[tuple[str, Entry]]) -> 'VerifyResult':
+def _cache_hit_result(replay: ReplayPlan, replayed: Iterable[tuple[str, Entry | Candidate]]) -> 'VerifyResult':
     """The verdict of units that replay recorded greens: a pass that ran nothing, never readable as a run (I1)."""
     return VerifyResult(
         passed=True,
@@ -4300,6 +4437,89 @@ def _merge_config_only_diff_forces_full_gate(
     return any(
         fnmatch.fnmatchcase(f, g) for f in changed_files for g in globs
     )
+
+
+async def narrow_merge_gate_decision(
+    worktree: Path,
+    config: OrchestratorConfig,
+    *,
+    base_sha: str,
+    merge_sha: str,
+) -> NarrowGateDecision:
+    """THE merge-role narrow resolution for the merge *merge_sha* onto *base_sha*, checked out at *worktree*.
+
+    The docs or comments gate when the real tree delta qualifies and its evidence is on disk;
+    otherwise the full gate, with the miss that sent it there (docs/narrow-merge-gate.md). The
+    2838 globs and reify's verify-pipeline-guard still force the full gate, through the helpers
+    above. Never raises: a fault degrades to the full gate rather than stalling the merge lane.
+    """
+    if not config.narrow_merge_gate.enabled:
+        return NarrowGateDecision.full(GateMiss(MissReason.DISABLED))
+    try:
+        return await _narrow_merge_gate_decision_body(worktree, config, base_sha, merge_sha)
+    except Exception:
+        logger.warning('narrow_merge_gate_decision: unexpected error for %s; full gate', worktree, exc_info=True)
+        return NarrowGateDecision.full(GateMiss(MissReason.DECISION_FAULT))
+
+
+async def _narrow_merge_gate_decision_body(
+    worktree: Path, config: OrchestratorConfig, base_sha: str, merge_sha: str,
+) -> NarrowGateDecision:
+    if await narrow_gate_delta.read_head(worktree) != merge_sha:
+        return NarrowGateDecision.full(GateMiss(MissReason.EVIDENCE_ABSENT))
+    delta = await narrow_gate_delta.read_tree_delta(worktree, base_sha, merge_sha)
+    tree_paths = await narrow_gate_delta.list_tree_paths(worktree, merge_sha)
+    if delta is None or tree_paths is None:
+        return NarrowGateDecision.full(GateMiss(MissReason.DELTA_UNREADABLE))
+    changed = tuple(change.path for change in delta)
+    if not delta:
+        return NarrowGateDecision.full(GateMiss(MissReason.EMPTY_DELTA))
+    modules = list(config.module_configs_or_empty.values())
+    lister = narrow_gate_plan.module_test_lister(tree_paths, [mc.prefix for mc in modules])
+    miss = await _narrow_gate_evidence_miss(worktree, config, delta, [t for mc in modules for t in lister(mc.prefix)])
+    if miss is not None:
+        return NarrowGateDecision.full(miss, changed)
+    classification = await narrow_gate_delta.classify_tree_delta(
+        worktree, base_sha, merge_sha, config.narrow_merge_gate.docs_paths,
+    )
+    if classification.miss is not None:
+        return NarrowGateDecision.full(classification.miss, changed)
+    # The guard-family scan reads and parses thousands of test files: keep it off the event loop (INV-8).
+    plan = await asyncio.to_thread(
+        narrow_gate_plan.narrow_gate_plan,
+        classification.resolution, changed, modules,
+        list_pkg_tests=lister, worktree_reader=_worktree_reader(worktree, cache={}),
+    )
+    if plan is None:
+        return NarrowGateDecision.full(GateMiss(MissReason.EMPTY_COMMAND_SET), changed)
+    return NarrowGateDecision(classification, plan, changed)
+
+
+async def _narrow_gate_evidence_miss(
+    worktree: Path,
+    config: OrchestratorConfig,
+    delta: Sequence[ChangedPath],
+    module_tests: Sequence[str],
+) -> GateMiss | None:
+    """The miss when *worktree*'s disk cannot vouch for the delta, or a full-gate backstop fires.
+
+    Every present changed path and every registered module's test file must be on disk: a
+    clobbered worktree (incident 83336a32) would otherwise shrink what the narrow gate runs.
+    """
+    present = [change.path for change in delta if change.status != 'D']
+    absent = await asyncio.to_thread(_first_absent_file, worktree, (*present, *sorted(module_tests)))
+    if absent is not None:
+        return GateMiss(MissReason.EVIDENCE_ABSENT, absent)
+    if _merge_config_only_diff_forces_full_gate(config, [change.path for change in delta]):
+        return GateMiss(MissReason.FORCED_FULL_GATE)
+    if await _verify_pipeline_guard_requires_full_gate(worktree, present):
+        return GateMiss(MissReason.FORCED_FULL_GATE)
+    return None
+
+
+def _first_absent_file(worktree: Path, paths: Sequence[str]) -> str | None:
+    """The first of *paths* that is not a file under *worktree*; thousands of stats, so callers run it off the event loop (INV-8)."""
+    return next((path for path in paths if not (worktree / path).is_file()), None)
 
 
 def _single_subproject_prefix(files: list[str], worktree: Path | None) -> str | None:
@@ -5235,6 +5455,10 @@ class VerifyResult:
     # Task 5653: what this verdict leaves for the verify-result cache. Off-wire:
     # a runner's record is not shipped, and it never enters equality.
     cache_record: CacheRecord | None = remote_gate.off_wire_field(default=None, compare=False)
+    # The runner's report of its units for the dispatcher's recorder, on the wire (task 9123).
+    cache_report: CacheReport | None = field(default=None, compare=False)
+    # Task 5411: the narrow merge gate this verdict ran, or None for every other verify.
+    narrow_gate: MergeGateResolution | None = None
 
     def __post_init__(self) -> None:
         mismatch = _module_attribution_mismatch(
@@ -5250,6 +5474,29 @@ class VerifyResult:
         if self.units is not None:
             self.units = verify_evidence.units_from_wire(self.units)
         self.cache_mode = CacheMode(self.cache_mode)
+        if self.narrow_gate is not None:
+            self.narrow_gate = MergeGateResolution(self.narrow_gate)
+            if not self.narrow_gate.is_narrow:
+                raise ValueError(
+                    f'VerifyResult.narrow_gate must be None or a narrow resolution, got {self.narrow_gate.value!r}',
+                )
+
+    @property
+    def ran_narrow_gate(self) -> bool:
+        """Whether this verdict ran only a narrow gate's command set (docs/narrow-merge-gate.md)."""
+        return self.narrow_gate is not None and self.narrow_gate.is_narrow
+
+    @property
+    def is_whole_tree_evidence(self) -> bool:
+        """Whether this verdict ran a gate over the whole tree: not a trivial pass, nor a narrow gate's."""
+        return not self.trivial and not self.ran_narrow_gate
+
+    @property
+    def partial_evidence_label(self) -> str | None:
+        """What this verdict ran short of the whole tree, its narrow gate or 'trivial'; None for whole-tree evidence."""
+        if self.is_whole_tree_evidence:
+            return None
+        return self.narrow_gate.value if self.narrow_gate is not None else 'trivial'
 
     @property
     def plan_hash(self) -> str | None:
@@ -5537,6 +5784,7 @@ def _target_subprocess_env(
     extra: dict[str, str] | None,
     *,
     worktree: Path | None = None,
+    defect_plugin: bool = False,
 ) -> dict[str, str]:
     """Build the subprocess env for a TARGET project's verify/build/test spawn.
 
@@ -5569,6 +5817,12 @@ def _target_subprocess_env(
     aimed at a pyproject declaring no ``[tool.ruff]`` it silently falls back to
     ruff's built-in defaults — a false green.  See pyproject.toml's
     ``[tool.ruff]`` decision block.)
+
+    When *defect_plugin* is set (a test leg injecting ``-p _df_defect_plugin``),
+    ``DEFECT_PLUGIN_DIR`` is MERGED into ``PYTHONPATH`` after the overlay, never
+    assigned: appended last, once, so a caller's own ``PYTHONPATH`` survives, and
+    the directory holds only the plugin module, so it shadows nothing
+    (plans/defect-tests-prd.md decision 19, B21).
     """
     env = {
         k: v
@@ -5588,7 +5842,18 @@ def _target_subprocess_env(
         env['RUFF_CACHE_DIR'] = str(Path(worktree) / '.ruff_cache')
     if extra:
         env.update(extra)
+    if defect_plugin:
+        env['PYTHONPATH'] = _pythonpath_with_plugin_dir(env.get('PYTHONPATH'))
     return env
+
+
+def _pythonpath_with_plugin_dir(pythonpath: str | None) -> str:
+    plugin_dir = str(DEFECT_PLUGIN_DIR)
+    if not pythonpath:
+        return plugin_dir
+    if plugin_dir in pythonpath.split(os.pathsep):
+        return pythonpath
+    return f'{pythonpath}{os.pathsep}{plugin_dir}'
 
 
 # ``ruff check --show-settings`` prints ``Settings path: "<abs path>"`` as its
@@ -6137,6 +6402,17 @@ class _ClockKw(TypedDict, total=False):
     clock_stop: ClockStopConfig | None
 
 
+class _DefectPluginKw(TypedDict, total=False):
+    """Keyword arguments for the defect-plugin PYTHONPATH merge in ``_run_cmd``."""
+
+    defect_plugin: bool
+
+
+def _defect_plugin_kw(cmd: str) -> _DefectPluginKw:
+    """Ask ``_run_cmd`` for the PYTHONPATH merge exactly when *cmd* carries ``-p _df_defect_plugin``."""
+    return {'defect_plugin': True} if carries_defect_plugin(parse_config_command(cmd)) else {}
+
+
 def _match_clock_marker(line: str, cfg: ClockStopConfig) -> str | None:
     """Return 'stop', 'heartbeat', or 'start' if *line*, after stripping leading
     whitespace, STARTS WITH the respective configured marker string; else None.
@@ -6385,6 +6661,7 @@ async def _run_cmd(
     cpu_weight: int | None = None,
     memory_properties: tuple[str, ...] = (),
     clock_stop: ClockStopConfig | None = None,
+    defect_plugin: bool = False,
 ) -> tuple[int, str, bool]:
     """Run a shell command, return (returncode, combined output, timed_out).
 
@@ -6483,7 +6760,9 @@ async def _run_cmd(
     # Pinned by test_verify_ruff_config_boundary.py::
     # test_segmented_chain_anchors_each_segment_at_its_own_cwd — kept on one
     # line so the name greps.
-    subprocess_env: dict[str, str] = _target_subprocess_env(env, worktree=cwd)
+    subprocess_env: dict[str, str] = _target_subprocess_env(
+        env, worktree=cwd, defect_plugin=defect_plugin,
+    )
 
     proc = None
     pgid: int | None = None
@@ -7488,7 +7767,7 @@ async def _preprovision_shared_venv(
     *,
     verify_env: dict[str, str],
     timeout: float,
-) -> None:
+) -> bool:
     """Synchronously populate the shared ``.venv`` before the test/lint/type gather.
 
     On a COLD verify worktree the shared ``.venv`` is populated only as a SIDE
@@ -7504,10 +7783,13 @@ async def _preprovision_shared_venv(
     through ``_run_cmd`` so it inherits the ghost-venv isolation scrub from
     ``_target_subprocess_env`` (the TARGET's ``uv`` resolves the TARGET's
     ``.venv``) with no new isolation code.
+
+    Returns False only when this call ran the command and it exited non-zero or
+    timed out; an empty knob, a coalesced or recently-done skip, and rc 0 are True.
     """
     cmd = config.verify_cold_preprovision_command
     if not cmd:
-        return
+        return True
     key = str(worktree.resolve())
     # Fast path: recently provisioned for this worktree — skip without taking the
     # lock (the common case once a worktree's first cold verify has run).  TTL'd
@@ -7515,7 +7797,7 @@ async def _preprovision_shared_venv(
     # skipping on a stale "done" key.
     done_at = _PREPROVISION_DONE.get(key)
     if done_at is not None and time.monotonic() - done_at < _PREPROVISION_DONE_TTL:
-        return
+        return True
     # Get-or-create the per-worktree lock.  Synchronous (no await between the get
     # and the set) → atomic under asyncio, so no separate guard lock is needed.
     lock = _PREPROVISION_LOCKS.get(key)
@@ -7528,7 +7810,7 @@ async def _preprovision_shared_venv(
         # (freshness re-checked against the TTL, as in the fast path).
         done_at = _PREPROVISION_DONE.get(key)
         if done_at is not None and time.monotonic() - done_at < _PREPROVISION_DONE_TTL:
-            return
+            return True
         logger.info('Cold-verify shared-venv pre-provision: running %r in %s', cmd, worktree)
         started = time.monotonic()
         rc, out, _ = await _run_cmd(cmd, worktree, timeout, env=verify_env or None)
@@ -7560,6 +7842,7 @@ async def _preprovision_shared_venv(
         # prune stale entries so the guard stays bounded across many worktrees.
         _PREPROVISION_DONE[key] = time.monotonic()
         _prune_preprovision_guard()
+        return rc == 0
 
 
 async def _provision_main_tip_worktree(
@@ -7567,16 +7850,16 @@ async def _provision_main_tip_worktree(
     config: OrchestratorConfig,
     *,
     role: Literal['merge', 'task', 'background'],
-) -> None:
+) -> bool:
     """Provision a throwaway main-tip worktree the way the merge gate provisions its own.
 
     Goes through ``_preprovision_shared_venv`` (same coalescing and fail-open
     policy), with *role*'s verify env and in the warm timeout tier its verify legs
     use. Such a worktree has no ``.task/``, so ``run_verification``'s ``is_cold``
     gate never provisions it; without this, an environment-only failure on a
-    green main reads as red (task 6917).
+    green main reads as red (task 6917). Returns ``_preprovision_shared_venv``'s result.
     """
-    await _preprovision_shared_venv(
+    return await _preprovision_shared_venv(
         worktree, config,
         verify_env=_resolve_verify_env(config, None, role=role),
         timeout=_resolve_verify_timeout(config, None, is_cold=False),
@@ -7870,6 +8153,12 @@ async def run_verification(
             if segment_chained_test and label is LegSlot.TEST
             else None
         )
+        # Offers each command of this leg the `-p` pair (decision 19). The
+        # PYTHONPATH merge follows from the command the offer produced
+        # (`_defect_plugin_kw`), so a command the mutator leaves alone
+        # (raw-retained, OPAQUE, not pytest) gets neither half.
+        inject_defect_plugin = label is LegSlot.TEST and config.defect_tests.injects_plugin
+        _plugin_kw: _DefectPluginKw = {}
         # junitxml injection (task μ, verify-scope-inversion-prd.md): only
         # the 'test' leg, only when it runs as one command and the junit plan
         # above gave it a path. _with_junitxml_str keeps the
@@ -7890,6 +8179,12 @@ async def run_verification(
             _clear_junit_report(junit.leg_path)
             cmd = _with_junitxml_str(cmd, str(junit.leg_path))
             assert cmd is not None  # None only when the input is None; guarded above
+        # After the junitxml injection and before the `-n` cap and the
+        # governance wrap, for the same opaque-after-governance reason.
+        if inject_defect_plugin and chain_segments is None:
+            cmd = _with_defect_plugin_str(cmd)
+            assert cmd is not None  # None only when the input is None; guarded above
+            _plugin_kw = _defect_plugin_kw(cmd)
         # Admission gate (task 2390 T2): only the pytest ('test') leg is
         # gated by the shared.verify_admission flock semaphore + role nice
         # tier; lint/type ride alongside within the same verify, ungated.
@@ -8089,6 +8384,11 @@ async def run_verification(
                         _clear_junit_report(segment_report)
                         reported = _with_junitxml_str(segment_cmd, str(segment_report))
                         assert reported is not None  # None only for a None input
+                    segment_plugin_kw: _DefectPluginKw = {}
+                    if inject_defect_plugin:
+                        reported = _with_defect_plugin_str(reported)
+                        assert reported is not None  # None only for a None input
+                        segment_plugin_kw = _defect_plugin_kw(reported)
                     capped = reported
                     if pytest_n_capped:
                         capped = _with_pytest_numprocesses_str(
@@ -8118,6 +8418,7 @@ async def run_verification(
                         ),
                         **_scope_kw,
                         **_clock_kw,
+                        **segment_plugin_kw,
                     )
 
                 rc, out, timed_out_flag, segment_dicts = await _run_segmented(
@@ -8147,6 +8448,7 @@ async def run_verification(
                     log_path=_stream_log_path(label, current_attempt),
                     **_scope_kw,
                     **_clock_kw,
+                    **_plugin_kw,
                 )
                 rc, out, timed_out_flag = outcome
                 scope_launch_refused = isinstance(outcome, ScopeLaunchRefused)
@@ -9580,6 +9882,31 @@ def _settled_against(replay: ReplayPlan, result: VerifyResult) -> VerifyResult:
     return replace(result, units=units, cache_record=record, cache_mode=mode)
 
 
+async def _run_narrow_gate(
+    decision: NarrowGateDecision | None,
+    registry: list[ModuleConfig],
+    execute: Callable[[verify_plan.VerifyPlan, list[ModuleConfig]], Awaitable[VerifyResult]],
+    persist: Callable[[dict], None],
+) -> VerifyResult | None:
+    """The verdict of *decision*'s narrow plan over *registry*; None when the full gate must run instead.
+
+    A full decision carries no plan. A plan the registry would run no command of is refused too:
+    a merge verdict never vouches for a tree nothing ran on (INV-1).
+    """
+    if decision is None or decision.plan is None:
+        return None
+    scoped = _executed_module_configs_from_plan(registry, decision.plan)
+    commands = sum(cmd is not None for mc in scoped for cmd in (mc.test_command, mc.lint_command, mc.type_check_command))
+    if not commands:
+        logger.warning('Verification mode: %s has no registered command to run; full gate', decision.resolution)
+        return None
+    logger.info('Verification mode: %s (%d command(s))', decision.resolution, commands)
+    plan_dict = decision.plan.to_dict()
+    persist(plan_dict)
+    result = await execute(decision.plan, scoped)
+    return replace(result, plan=plan_dict, narrow_gate=decision.resolution)
+
+
 async def run_scoped_verification(
     worktree: Path,
     config: OrchestratorConfig,
@@ -9596,8 +9923,11 @@ async def run_scoped_verification(
     event_store: 'EventStore | None' = None,
     admission_plan: AdmissionPlan | None = None,
     verify_cache: CacheAccess | None = None,
+    narrow_gate: NarrowGateDecision | None = None,
 ) -> VerifyResult:
     """Run verification scoped to specific subprojects and optionally to task files.
+
+    A narrow *narrow_gate* at role ``'merge'`` runs exactly its plan instead (docs/narrow-merge-gate.md).
 
     *verify_cache* joins the verify-result cache: dispatcher-side callers pass
     the harness's one ``CacheAccess.on_dispatcher``, keyed on its deployed sha;
@@ -9658,6 +9988,7 @@ async def run_scoped_verification(
         event_store=event_store,
         admission_plan=admission_plan,
         verify_cache=verify_cache,
+        narrow_gate=narrow_gate,
     )
     return await _recorded_admission_plan(config, event_store, admission_plan, scoped_verify)
 
@@ -9678,6 +10009,7 @@ async def _run_scoped_verification_body(
     event_store: 'EventStore | None',
     admission_plan: AdmissionPlan | None,
     verify_cache: CacheAccess | None,
+    narrow_gate: NarrowGateDecision | None = None,
 ) -> VerifyResult:
     """``run_scoped_verification``'s scoping and execution; every leg joins *admission_plan*,
     and every execution goes through the verify-result cache's funnel."""
@@ -9823,6 +10155,16 @@ async def _run_scoped_verification_body(
         # their work. The artifact widening and both planner sites below read
         # this one on-disk set.
         existing_files = [f for f in task_files or () if (worktree / f).exists()]
+        narrowed = await _run_narrow_gate(
+            narrow_gate if role == 'merge' else None,
+            list(config.module_configs_or_empty.values()),
+            lambda plan, scoped: _execute(plan, scoped, _verify_planned(plan)),
+            lambda plan_dict: _persist_verify_plan(
+                plan_dict, worktree, attempt_id=attempt_id, task_id=task_id, archive_root=archive_root,
+            ),
+        )
+        if narrowed is not None:
+            return narrowed
         if task_files:
             # Task 5296: a touched behavioural artifact (a skills/ script, an
             # agent-prompt SKILL.md, the root yaml) runs the registered
@@ -11483,32 +11825,36 @@ def _node_id_test_config(
 #: hung test is bounded by it rather than by the verify command timeout.
 _NODE_ID_RUN_TIMEOUT_SECS: int = 300
 
+#: An id no testcase reported: no verdict and no failure text.
+_NODE_ID_UNREPORTED = NodeIdResult('error')
 
-def _node_id_statuses(
+
+def _node_id_results(
     report: Path, prefix: str, qualified_by_id: Mapping[str, str],
-) -> dict[str, NodeIdStatus] | None:
-    """The status of each id the junit *report* records; ``None`` when no report parsed.
+) -> dict[str, NodeIdResult] | None:
+    """The result of each id the junit *report* records; ``None`` when no report parsed.
 
     An id names the testcase spelled from its qualified id with the rootdir at
-    the tree root or at the module dir, and a function id without parameters
-    names every parametrization of it. An id that names no testcase is left out.
+    the tree root or at the module dir; a function id without parameters
+    names every parametrization of it, and a module or class id every
+    testcase under it. An id that names no testcase is left out.
     """
-    testcases = _junit_testcase_statuses(report)
+    testcases = _junit_testcase_results(report)
     if testcases is None:
         return None
-    statuses: dict[str, NodeIdStatus] = {}
+    results: dict[str, NodeIdResult] = {}
     for node_id, qualified in qualified_by_id.items():
-        spellings = {
-            _junit_spelling(qualified),
-            _junit_spelling(qualified.removeprefix(f'{prefix}/')),
-        }
-        named: list[NodeIdStatus] = [
-            status for testcase, status in testcases.items()
+        rooted = (qualified, qualified.removeprefix(f'{prefix}/'))
+        spellings = {_junit_spelling(spelled) for spelled in rooted}
+        containers = {_junit_container(spelled) for spelled in rooted}
+        named = [
+            result for testcase, result in testcases.items()
             if spellings & {testcase, testcase.partition('[')[0]}
+            or _junit_classname_under(testcase.partition('::')[0], containers)
         ]
         if named:
-            statuses[node_id] = min(named, key=_NODE_ID_STATUS_PRECEDENCE.index)
-    return statuses
+            results[node_id] = min(named, key=_by_node_id_precedence)
+    return results
 
 
 async def _node_id_run(
@@ -11517,7 +11863,7 @@ async def _node_id_run(
     module_config: ModuleConfig,
     qualified_by_id: Mapping[str, str],
     report: Path,
-) -> dict[str, NodeIdStatus] | None:
+) -> dict[str, NodeIdResult] | None:
     """One run of *qualified_by_id* into *report*, read back per reported id; ``None`` when no report was read."""
     try:
         await run_verification(
@@ -11534,16 +11880,16 @@ async def _node_id_run(
             list(qualified_by_id), module_config.prefix, exc_info=True,
         )
         return None
-    return _node_id_statuses(report, module_config.prefix, qualified_by_id)
+    return _node_id_results(report, module_config.prefix, qualified_by_id)
 
 
-_NodeIdSubsetRun = Callable[[Sequence[str]], Awaitable[dict[str, NodeIdStatus] | None]]
+_NodeIdSubsetRun = Callable[[Sequence[str]], Awaitable[dict[str, NodeIdResult] | None]]
 
 
 async def _bisect_refused_run(
     run: _NodeIdSubsetRun, refused: Sequence[str],
-) -> dict[str, NodeIdStatus]:
-    """The statuses of the *refused* ids, a run that reported none of them, found by bisection.
+) -> dict[str, NodeIdResult]:
+    """The results of the *refused* ids, a run that reported none of them, found by bisection.
 
     The halves run in turn, and a half that reports nothing is split again.
     When the first half reports, the cause lies in the second, so the second
@@ -11566,7 +11912,7 @@ async def _run_node_id_group(
     module_config: ModuleConfig,
     qualified_by_id: Mapping[str, str],
     report: Path | None,
-) -> dict[str, NodeIdStatus]:
+) -> dict[str, NodeIdResult]:
     """Every id of one module's group, run together into *report*, which is removed afterwards.
 
     A run whose written report records none of its ids is bisected.
@@ -11576,20 +11922,20 @@ async def _run_node_id_group(
             'run_node_ids: no junit report path in %s for module %r — %s each read error',
             tree, module_config.prefix, list(qualified_by_id),
         )
-        return {node_id: 'error' for node_id in qualified_by_id}
+        return {node_id: _NODE_ID_UNREPORTED for node_id in qualified_by_id}
 
-    async def run(node_ids: Sequence[str]) -> dict[str, NodeIdStatus] | None:
+    async def run(node_ids: Sequence[str]) -> dict[str, NodeIdResult] | None:
         subset = {node_id: qualified_by_id[node_id] for node_id in node_ids}
         return await _node_id_run(tree, config, module_config, subset, report)
 
     try:
-        statuses = await run(list(qualified_by_id))
-        if statuses == {}:
-            statuses = await _bisect_refused_run(run, list(qualified_by_id))
+        results = await run(list(qualified_by_id))
+        if results == {}:
+            results = await _bisect_refused_run(run, list(qualified_by_id))
     finally:
         _clear_junit_report(report)
-    reported = statuses or {}
-    return {node_id: reported.get(node_id, 'error') for node_id in qualified_by_id}
+    reported = results or {}
+    return {node_id: reported.get(node_id, _NODE_ID_UNREPORTED) for node_id in qualified_by_id}
 
 
 def _node_ids_by_module(
@@ -11615,19 +11961,33 @@ async def run_node_ids(
     *,
     concurrent_groups: bool = False,
 ) -> Mapping[str, NodeIdStatus]:
-    """Run exactly the pytest node *ids* in *tree*; return each one's status, keyed as given.
+    """Each id's status alone: the projection of :func:`run_node_id_results`, the one node-id runner (INV-5)."""
+    results = await run_node_id_results(
+        tree, config, module_configs, ids, concurrent_groups=concurrent_groups,
+    )
+    return MappingProxyType({node_id: result.status for node_id, result in results.items()})
+
+
+async def run_node_id_results(
+    tree: Path,
+    config: OrchestratorConfig,
+    module_configs: Sequence[ModuleConfig],
+    ids: Collection[str],
+    *,
+    concurrent_groups: bool = False,
+) -> Mapping[str, NodeIdResult]:
+    """Run exactly the pytest node *ids* in *tree*; return each one's result, keyed as given.
 
     ``'pass'`` and ``'fail'`` are verdicts on the test. ``'skipped'`` means it
     never ran, which is not a pass: SKIP is not ALLOW. ``'error'`` means no
-    verdict was obtained: the id maps to no module in *module_configs*, names
-    no test function (a module or class id matches no testcase), was never
-    reported, errored in setup or teardown, or its run raised or wrote no
-    junit report.
+    verdict was obtained: the id maps to no module in *module_configs*,
+    names no testcase, was never reported, errored in setup or teardown, or
+    its run raised or wrote no junit report.
 
-    A function id without its parameters names every parametrization:
-    ``'fail'`` if any failed, else ``'error'`` if any errored, else
-    ``'skipped'`` if any was skipped, else ``'pass'`` (every parametrization
-    passed).
+    A function id without its parameters names every parametrization, and a
+    module or class id every testcase under it: ``'fail'`` if any failed,
+    else ``'error'`` if any errored, else ``'skipped'`` if any was skipped,
+    else ``'pass'`` (every one passed).
 
     Each id is mapped to its module on its own, so one unmappable id errors
     alone. The ids of one module run together, serially, scoped and with a
@@ -11646,25 +12006,30 @@ async def run_node_ids(
 
     *concurrent_groups* runs the module groups at once, each writing its own
     report; the serial default is what an isolation-sensitive caller needs.
+
+    Each result's ``detail`` is its junit failure or error text (see
+    :class:`NodeIdResult`): the assertion message, never captured output.
+    An id that got no testcase, including every unmappable one, has
+    ``detail == ''``.
     """
     mc_by_prefix = {mc.prefix: mc for mc in module_configs}
     qualified_by_prefix = _node_ids_by_module(tree, mc_by_prefix, ids)
     token = uuid.uuid4().hex
 
-    def run_group(prefix: str) -> Awaitable[dict[str, NodeIdStatus]]:
+    def run_group(prefix: str) -> Awaitable[dict[str, NodeIdResult]]:
         return _run_node_id_group(
             tree, config, mc_by_prefix[prefix], qualified_by_prefix[prefix],
             _prepare_junit_report_path(tree, prefix, group=f'node-ids-{token}'),
         )
 
     if concurrent_groups:
-        group_statuses = await gather_unwound(*map(run_group, qualified_by_prefix))
+        group_results = await gather_unwound(*map(run_group, qualified_by_prefix))
     else:
-        group_statuses = [await run_group(prefix) for prefix in qualified_by_prefix]
-    statuses: dict[str, NodeIdStatus] = {}
-    for one_group in group_statuses:
-        statuses.update(one_group)
-    return MappingProxyType({node_id: statuses.get(node_id, 'error') for node_id in ids})
+        group_results = [await run_group(prefix) for prefix in qualified_by_prefix]
+    results: dict[str, NodeIdResult] = {}
+    for one_group in group_results:
+        results.update(one_group)
+    return MappingProxyType({node_id: results.get(node_id, _NODE_ID_UNREPORTED) for node_id in ids})
 
 
 #: Generous per-test timeout (seconds) injected into the main-tip-sweep

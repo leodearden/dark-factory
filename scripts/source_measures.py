@@ -910,7 +910,7 @@ def blob_sha(path: Path) -> str:
 
 
 # ---------------------------------------------------------------------------
-# The workspace domain: each member's tracked .py files, classified.
+# The measurement domain: each member's tracked .py files, classified.
 
 
 class FileKind(enum.StrEnum):
@@ -1241,7 +1241,7 @@ def _require_disjoint_members(domain: tuple[DomainMember, ...]) -> None:
         )
 
 
-def workspace_domain(root: Path) -> tuple[DomainMember, ...]:
+def measurement_domain(root: Path) -> tuple[DomainMember, ...]:
     """Every member's tracked ``.py`` files, classified src or tests.
 
     The member list's one home is the root pyproject.toml: a uv workspace's

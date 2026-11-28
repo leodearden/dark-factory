@@ -35,7 +35,6 @@ from orchestrator.artifacts import TaskArtifacts
 from orchestrator.mcp import markup_journal, plan_markup_repair, plan_markup_stamp, plan_tools
 
 #: pytest finds a fixture by its name in the requesting module's namespace.
-plan_artifacts = _plan_markup_fixtures.plan_artifacts
 isolate_the_refusal_memo = _plan_markup_fixtures.isolate_the_refusal_memo
 
 

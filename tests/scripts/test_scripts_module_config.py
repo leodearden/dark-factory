@@ -1798,22 +1798,17 @@ def test_root_fleet_chain_and_scripts_module_agree_on_the_scripts_suites(
         )
 
 
-# The scripts module's own measured wall-clock. Task 3458 ran two fresh,
-# independent, sequential runs of the verbatim union test_command at this
-# branch's base commit 37f761f5a4 (360.47s and 293.32s wall) and combined
-# them with the four runs of the byte-identical command already recorded in
-# scripts/orchestrator.yaml's MEASURED GREEN / COST DELTA blocks (444.17s,
-# 565.37s wall; 310.33s pytest-only; 914.61s pytest / 930.59s wall). The
-# floor below is set against the WORST wall-clock across ALL SIX of those
-# (930.59s, the "amendment-pass verification" run) — never the mean: that
-# same block records a ~3x spread (310.33s -> 914.61s) for a BYTE-IDENTICAL
-# command on a BYTE-IDENTICAL tree, which is this oversubscribed host's LOAD
-# at measurement time, not suite variance. Neither of task 3458's own two
-# fresh runs came anywhere near this worst figure, which is itself evidence
-# for sizing against the max rather than any single run: the worst case is
-# real but not the common case, so a mean or a fresh-only measurement would
-# both have under-sized the floor.
-MEASURED_SUITE_WORST_SECS = 930.59
+# The WORST GREEN test command on record for this leg in the verify archive.
+# Since task 11825 it is a scoped task-role leg over scripts/tests/ files, not
+# the verbatim union test_command. It is the right sizing input all the same,
+# because the family floor sizes against the leg's longest green test command
+# of any role and any command (scripts/timeout_headroom_selfcheck.py module
+# docstring, LEG BUDGET): the per-command budget must outlast whatever the leg
+# actually runs. Every run behind this figure, the earlier figures it replaced,
+# and the sizing rule are recorded ONCE, in the PER-MODULE VERIFY BUDGET block
+# above verify_command_timeout_secs in scripts/orchestrator.yaml. Read them
+# there rather than copying them here.
+MEASURED_SUITE_WORST_SECS = 1219.3075953563675
 # DERIVED from MEASURED_SUITE_WORST_SECS, not hand-set, so the two cannot
 # silently diverge — that exact pair has already rotted once, in the sibling
 # guard tests/scripts/test_tests_scripts_module_config.py, which left a
@@ -1843,9 +1838,6 @@ MEASURED_SUITE_WORST_SECS = 930.59
 # module's worst-run figure above stays this module's own, and the sibling's
 # stays the sibling's.
 #
-# ~2x the worst observed run, rounded DOWN to the nearest 100s:
-# 2 * 930.59 -> 1861.18 -> 1800.
-#
 # CORRECTED IN PLACE (task 4320): this line used to INLINE that expression as
 # `(int(2 * MEASURED_SUITE_WORST_SECS) // 100) * 100`, which was the third
 # spelling of one derivation across this family — the other two being a
@@ -1856,7 +1848,7 @@ MEASURED_SUITE_WORST_SECS = 930.59
 # evaluates this expression in a namespace holding only `min_budget` and
 # `MEASURED_SUITE_WORST_SECS` and NO __builtins__, so re-inlining it here would
 # raise NameError on `int` and fail there — even though it would still compute
-# 1800 today.
+# the same floor today.
 MIN_MODULE_BUDGET_SECS = min_budget(MEASURED_SUITE_WORST_SECS)
 
 
@@ -1872,23 +1864,28 @@ def test_scripts_module_carries_its_own_measured_verify_budget(
     assertion-for-assertion (task 3350's shape, applied here by task 3458).
     Two sides are bounded:
 
-    - Below (b): at least 1800s, ~2x the worst of six measured runs of the
-      verbatim union test_command (930.59s — see MEASURED_SUITE_WORST_SECS
-      above). An achievable floor derived from measurement, not a guess.
-    - Above (c): strictly below the repo-root ceiling (3600s): a real
-      narrowing, not a relabelling.
+    - Below (b): at least ``MIN_MODULE_BUDGET_SECS``, which is
+      ``min_budget(MEASURED_SUITE_WORST_SECS)``: ~2x the leg's worst green
+      test command on record, floored to the nearest 100s. An achievable
+      floor derived from measurement, not a guess. It is one of two gated
+      floors, and the binding floor is the larger of the two; the other, the
+      family floor, is gated in ``tests/scripts/test_module_verify_budgets.py::
+      test_every_leg_running_the_family_outlasts_its_ceiling``.
+    - Above (c): strictly below the repo-root ceiling
+      (``dark-factory-orchestrator.yaml::verify_command_timeout_secs``): a
+      real narrowing, not a relabelling.
 
     SCOPE, stated honestly rather than copied from the sibling: this is a
     floor-REGRESSION guard, not a suite-growth detector. Nothing here
     re-measures anything, and if the suite doubles tomorrow the frozen
-    constant still passes. The narrowing this buys is also modest, unlike
-    the sibling's "surfaces a hang in minutes": 3600s -> 2400s means a hang
-    surfaces in ~40 minutes instead of ~60, because an observed HONEST GREEN
-    run of this suite has measured 930.59s, and nothing tighter than ~2.6x
-    that is declarable without manufacturing infra_timeout on the green path
-    under load — the same failure this task exists to prevent, one level
-    down. The duplicate-run cost that inflates the measured figure
-    (tests/scripts/ collected twice per full verify) is task 3383's
+    constant still passes. The narrowing this buys under the repo-root
+    ceiling is also modest, unlike the sibling's "surfaces a hang in
+    minutes", because an honest green run of this leg has measured
+    ``MEASURED_SUITE_WORST_SECS``, and nothing much tighter than the gated
+    floors on that figure is declarable without manufacturing infra_timeout
+    on the green path under load — the same failure this task exists to
+    prevent, one level down. The duplicate-run cost that inflates the
+    measured figure (tests/scripts/ collected twice per full verify) is task 3383's
     dedupe-by-command guard in verify.run_full_verification, not something a
     yaml budget can fix.
 
@@ -1911,9 +1908,10 @@ def test_scripts_module_carries_its_own_measured_verify_budget(
     assert mc.verify_command_timeout_secs >= MIN_MODULE_BUDGET_SECS, (
         f'{MODULE_PREFIX} verify_command_timeout_secs='
         f'{mc.verify_command_timeout_secs} is below the {MIN_MODULE_BUDGET_SECS}s '
-        f'floor (task 3458). The suite has measured up to '
-        f'{MEASURED_SUITE_WORST_SECS}s across six independent runs (see '
-        'scripts/orchestrator.yaml\'s MEASURED GREEN / COST DELTA blocks); a '
+        f'floor (task 3458). That floor is min_budget(MEASURED_SUITE_WORST_SECS='
+        f'{MEASURED_SUITE_WORST_SECS}), the leg\'s worst green test command on '
+        'record (see scripts/orchestrator.yaml\'s PER-MODULE VERIFY BUDGET '
+        'block for every run behind it); a '
         'budget under the floor would manufacture infra_timeout on the honest '
         'green path — the exact defect this task exists to remove, '
         'reintroduced one level down'
@@ -1984,9 +1982,10 @@ def test_scripts_module_cold_verify_falls_through_to_the_root_cold_ceiling(
     ``verify_cold_command_timeout_secs`` UNSET on this module (no build step
     to budget for). Per ``verify._resolve_verify_timeout``'s documented
     cascade, an unset module cold knob falls through to
-    ``config.verify_cold_command_timeout_secs`` (the repo-root 5400s) — NOT
-    to the new warm value — and ``is_merge_verify=True`` wins first with
-    ``config.merge_verify_cold_command_timeout_secs`` (7200s, shipped by the
+    ``config.verify_cold_command_timeout_secs`` (the repo-root
+    ``dark-factory-orchestrator.yaml::verify_cold_command_timeout_secs``) —
+    NOT to the new warm value — and ``is_merge_verify=True`` wins first with
+    ``config.merge_verify_cold_command_timeout_secs`` (shipped by the
     package-bundled ``orchestrator/src/orchestrator/defaults.yaml`` and not
     overridden by the root yaml).
 
@@ -2035,7 +2034,7 @@ def test_scripts_module_cold_verify_falls_through_to_the_root_cold_ceiling(
     # NOT redundant with (b) above: nothing before this line bounds root_cold
     # against the module's own warm budget, so this independently catches the
     # root cold ceiling ever being configured down to (or below)
-    # verify_command_timeout_secs — a real, if currently slack (5400 vs 2400),
+    # verify_command_timeout_secs — a real, if currently slack,
     # cross-file misconfiguration nothing else in this file checks for. (It
     # would follow from the warm-budget test's (c) — module warm < root warm
     # — only if root_cold >= root_warm is also assumed, which is true on this

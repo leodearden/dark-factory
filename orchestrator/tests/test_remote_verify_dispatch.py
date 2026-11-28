@@ -12,6 +12,7 @@ rather than passing against a hand-typed marker string.
 import asyncio
 import dataclasses
 import json
+import logging
 import shlex
 import shutil
 import subprocess
@@ -21,11 +22,27 @@ from collections.abc import Awaitable, Callable, Iterator
 from pathlib import Path
 
 import pytest
-from _gate_fixtures import gate_argv, gated_remote_runner
+from _gate_fixtures import (
+    TEST_CODE_CHECKOUT,
+    TEST_DEPLOYED_SHA,
+    TEST_DF_REMOTE,
+    TEST_GATE_ROOT,
+    RecordingEvents,
+    Run,
+    ensure_reply,
+    gate_argv,
+    gated_remote_runner,
+    is_ensure,
+    is_gate_publish,
+    is_tag_listing,
+    is_tag_push,
+    tag_refspec,
+)
 from _xdist_crash_fixtures import XDIST_IN_FLIGHT_NODEID, XDIST_SESSION_ABORTED_OUTPUT
 
 from orchestrator import verify
 from orchestrator.config import OrchestratorConfig
+from orchestrator.event_store import EventType
 from orchestrator.task_verify_spec import TaskVerifySpec, task_spec_from_json, task_spec_to_json
 from orchestrator.verify import (
     SIGNAL_KILL_SUMMARY_MARKER,
@@ -897,3 +914,333 @@ class TestParkedMergeSlotProbesItsOwnRequest:
             assert allocator.is_parked('laptop') is True
         finally:
             _stop(own)
+
+
+# ---------------------------------------------------------------------------
+# RemoteRunner tag mirror (task 11840)
+# ---------------------------------------------------------------------------
+
+_TAG = 'v0.2-alpha'
+
+
+def _git(repo: Path, *args: str) -> str:
+    return subprocess.run(
+        ['git', '-C', str(repo), *args], capture_output=True, text=True, check=True,
+    ).stdout.strip()
+
+
+def _commit(repo: Path, name: str) -> str:
+    (repo / name).write_text(name)
+    _git(repo, 'add', '-A')
+    _git(repo, '-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-q', '-m', name)
+    return _git(repo, 'rev-parse', 'HEAD')
+
+
+def _annotated_tag(repo: Path, name: str) -> None:
+    _git(repo, '-c', 'user.name=t', '-c', 'user.email=t@t', 'tag', '-a', name, '-m', 'rel')
+
+
+class _TagScene:
+    """A dispatcher checkout and a bare project repo standing in for the laptop's.
+
+    The runner pushes with real git from the dispatcher to the bare repo; only
+    the gate publish and ensure are answered.  Its verify ssh records whether
+    ``watched_tag`` resolves on the bare repo at the moment the verify starts.
+    """
+
+    def __init__(self, root: Path) -> None:
+        self.dispatcher = root / 'dispatcher'
+        self.dispatcher.mkdir()
+        _git(self.dispatcher, 'init', '-q')
+        self.first = _commit(self.dispatcher, 'first')
+        self.remote = root / 'project.git'
+        _git(root, 'init', '-q', '--bare', str(self.remote))
+        self.watched_tag = _TAG
+        self.argvs: list[list[str]] = []
+        self.seen: list[tuple[int, str]] = []
+
+    @property
+    def head(self) -> str:
+        return _git(self.dispatcher, 'rev-parse', 'HEAD')
+
+    def seed_remote_main(self) -> None:
+        """The remote holds the dispatcher's main and none of its tags."""
+        _git(self.dispatcher, 'push', '-q', str(self.remote), 'HEAD:refs/heads/main')
+
+    def tag_object(self, repo: Path, tag: str) -> str:
+        return _git(repo, 'rev-parse', f'refs/tags/{tag}')
+
+    def tag_pushes(self) -> list[str]:
+        return [spec for spec in map(tag_refspec, self.argvs) if spec is not None]
+
+    @property
+    def _pre_receive(self) -> Path:
+        return self.remote / 'hooks' / 'pre-receive'
+
+    def refuse_tags(self) -> None:
+        """The remote's pre-receive hook rejects every tag ref, as a host refusing tags would."""
+        self._pre_receive.write_text(
+            '#!/bin/sh\n'
+            'while read old new ref; do\n'
+            '  case "$ref" in refs/tags/*) echo "tags refused" >&2; exit 1;; esac\n'
+            'done\n'
+        )
+        self._pre_receive.chmod(0o755)
+
+    def accept_tags(self) -> None:
+        self._pre_receive.unlink()
+
+    async def run(self, argv: list[str], *, cwd: str | None = None) -> tuple[int, str, str]:
+        self.argvs.append(list(argv))
+        if is_gate_publish(argv):
+            return (0, '', '')
+        if is_ensure(argv):
+            return (0, ensure_reply(), '')
+        assert argv[0] == 'git', argv
+        done = await asyncio.to_thread(subprocess.run, argv, cwd=cwd, capture_output=True, text=True)
+        return done.returncode, done.stdout.strip(), done.stderr.strip()
+
+    async def ssh_run(self, argv: list[str], *, cwd: object = None) -> tuple[int, str, str]:
+        done = subprocess.run(
+            ['git', '-C', str(self.remote), 'rev-parse', '-q', '--verify',
+             f'refs/tags/{self.watched_tag}^{{commit}}'],
+            capture_output=True, text=True,
+        )
+        self.seen.append((done.returncode, done.stdout.strip()))
+        return (0, result_to_json(_green()), '')
+
+    def runner(
+        self, *, run: Run | None = None, id_factory: Callable[[], str] | None = None,
+    ) -> RemoteRunner:
+        return RemoteRunner(
+            'laptop', 'laptop.local', str(self.remote), str(self.dispatcher),
+            df_remote_checkout=TEST_DF_REMOTE,
+            gate_checkouts_path=TEST_GATE_ROOT,
+            deployed_sha=TEST_DEPLOYED_SHA,
+            code_checkout=TEST_CODE_CHECKOUT,
+            run=run or self.run,
+            ssh_run=self.ssh_run,
+            id_factory=id_factory or (lambda: 'fixed-id'),
+        )
+
+
+@pytest.fixture
+def tag_scene(tmp_path: Path) -> _TagScene:
+    return _TagScene(tmp_path)
+
+
+async def _verify_as(
+    role: str, runner: RemoteRunner, sha: str, *, event_store: RecordingEvents,
+) -> VerifyResult:
+    if role == 'merge':
+        return await runner.run_merge_verify(sha, _merge_spec(), event_store=event_store)
+    return await runner.run_task_verify(
+        _task_spec(tip_sha=sha, task_id='6667'), task_id='6667', archive_root=None,
+        event_store=event_store,
+    )
+
+
+def _tag_mirror_events(store: RecordingEvents) -> list[dict[str, object]]:
+    return [data for data in store.of(EventType.runner_synced) if data['kind'] == 'project_tag_mirror']
+
+
+_PLAIN = 'refs/tags/*:refs/tags/*'
+_FORCED = '+refs/tags/*:refs/tags/*'
+
+
+@pytest.mark.asyncio
+class TestTagMirror:
+    @pytest.mark.parametrize('role', ['merge', 'task'])
+    async def test_a_local_tag_absent_on_the_remote_is_there_when_the_verify_starts(
+        self, tag_scene: _TagScene, role: str,
+    ):
+        """esc-9646-6: a test gating on a release tag saw it locally and not on the laptop."""
+        _annotated_tag(tag_scene.dispatcher, _TAG)
+        tag_scene.seed_remote_main()
+        store = RecordingEvents()
+
+        result = await _verify_as(role, tag_scene.runner(), tag_scene.head, event_store=store)
+
+        assert result == _green()
+        assert tag_scene.seen == [(0, _git(tag_scene.dispatcher, 'rev-parse', f'{_TAG}^{{commit}}'))]
+        assert tag_scene.tag_object(tag_scene.remote, _TAG) == tag_scene.tag_object(
+            tag_scene.dispatcher, _TAG,
+        )
+        assert tag_scene.tag_pushes() == [_PLAIN]
+        assert _tag_mirror_events(store) == [], 'a healthy remote never sees a force'
+
+    async def test_a_dispatcher_with_no_tags_dispatches_and_pushes_no_tags(
+        self, tag_scene: _TagScene,
+    ):
+        """A tag glob matching nothing makes git push exit 1, so none may be issued."""
+        tag_scene.seed_remote_main()
+
+        result = await tag_scene.runner().run_merge_verify(tag_scene.head, _merge_spec())
+
+        assert result == _green()
+        assert tag_scene.tag_pushes() == []
+
+    async def test_an_unreadable_local_tag_listing_is_skipped_not_fatal(
+        self, tag_scene: _TagScene, caplog: pytest.LogCaptureFixture,
+    ):
+        argvs: list[list[str]] = []
+
+        async def run(argv: list[str], *, cwd: object = None) -> tuple[int, str, str]:
+            argvs.append(list(argv))
+            if is_gate_publish(argv):
+                return (0, '', '')
+            if is_ensure(argv):
+                return (0, ensure_reply(), '')
+            if is_tag_listing(argv):
+                return (128, '', 'fatal: not a git repository')
+            return (0, '', '')
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.verify_runner'):
+            result = await tag_scene.runner(run=run).run_merge_verify('abc123', _merge_spec())
+
+        assert result == _green()
+        assert [spec for spec in map(tag_refspec, argvs) if spec is not None] == []
+        warnings = [
+            record.getMessage() for record in caplog.records
+            if record.name == 'orchestrator.verify_runner' and record.levelno == logging.WARNING
+        ]
+        assert len(warnings) == 1, warnings
+        assert "'laptop'" in warnings[0]
+        assert 'tag set was not mirrored' in warnings[0]
+
+    async def test_a_remote_tag_pointing_elsewhere_is_force_mirrored_and_announced(
+        self, tag_scene: _TagScene,
+    ):
+        """INV-2 mirror semantics: the dispatcher's tag set is the source of truth."""
+        second = _commit(tag_scene.dispatcher, 'second')
+        _annotated_tag(tag_scene.dispatcher, _TAG)
+        tag_scene.seed_remote_main()
+        _git(tag_scene.remote, 'update-ref', f'refs/tags/{_TAG}', tag_scene.first)
+        store = RecordingEvents()
+
+        result = await tag_scene.runner().run_merge_verify(
+            tag_scene.head, _merge_spec(), event_store=store,
+        )
+
+        assert result == _green()
+        assert tag_scene.seen == [(0, second)]
+        assert tag_scene.tag_object(tag_scene.remote, _TAG) == tag_scene.tag_object(
+            tag_scene.dispatcher, _TAG,
+        )
+        assert tag_scene.tag_pushes() == [_PLAIN, _PLAIN, _FORCED]
+        assert _tag_mirror_events(store) == [{
+            'runner': 'laptop', 'kind': 'project_tag_mirror',
+            'from_head': None, 'to_head': None, 'forced': True,
+        }]
+
+    async def test_a_remote_that_refuses_tags_benches_the_runner_before_any_verify(
+        self, tag_scene: _TagScene,
+    ):
+        """Synced before dispatch, or the runner is benched: no verify on a lagging tag set."""
+        _annotated_tag(tag_scene.dispatcher, _TAG)
+        tag_scene.seed_remote_main()
+        tag_scene.refuse_tags()
+
+        with pytest.raises(RunnerUnavailable) as excinfo:
+            await tag_scene.runner().run_merge_verify(tag_scene.head, _merge_spec())
+
+        assert excinfo.value.kind == 'gate'
+        assert tag_scene.seen == []
+        assert _git(tag_scene.remote, 'for-each-ref', 'refs/merge-verify') == ''
+
+    async def test_a_tag_push_transport_failure_is_transport_with_no_force_retry(
+        self, tag_scene: _TagScene,
+    ):
+        """The host was not reached, so forcing cannot help (publish_sha's rule)."""
+        argvs: list[list[str]] = []
+
+        async def run(argv: list[str], *, cwd: object = None) -> tuple[int, str, str]:
+            argvs.append(list(argv))
+            if is_gate_publish(argv):
+                return (0, '', '')
+            if is_ensure(argv):
+                return (0, ensure_reply(), '')
+            if is_tag_listing(argv):
+                return (0, f'{"a" * 40} refs/tags/v1', '')
+            if is_tag_push(argv):
+                return (
+                    128, '',
+                    'ssh: connect to host laptop.local port 22: Connection timed out\n'
+                    'fatal: Could not read from remote repository.',
+                )
+            return (0, '', '')
+
+        with pytest.raises(RunnerUnavailable) as excinfo:
+            await tag_scene.runner(run=run).run_merge_verify('abc123', _merge_spec())
+
+        assert excinfo.value.kind == 'transport'
+        assert [spec for spec in map(tag_refspec, argvs) if spec is not None] == [_PLAIN]
+        assert not any(':refs/merge-verify/' in ' '.join(argv) for argv in argvs)
+        assert tag_scene.seen == []
+
+    async def test_a_tag_the_remote_lost_after_a_mirror_is_restored_by_the_next_dispatch(
+        self, tag_scene: _TagScene,
+    ):
+        """The merge worker caches its runners; an unchanged LOCAL tag set says nothing of the remote's.
+
+        A re-cloned laptop checkout, a ``git tag -d`` or a ``fetch --prune-tags``
+        drops a tag the last mirror delivered, and the next verify must not run
+        without it.
+        """
+        _annotated_tag(tag_scene.dispatcher, _TAG)
+        tag_scene.seed_remote_main()
+        tagged = _git(tag_scene.dispatcher, 'rev-parse', f'{_TAG}^{{commit}}')
+        runner = tag_scene.runner(id_factory=iter(('rid-1', 'rid-2')).__next__)
+
+        await runner.run_merge_verify(tag_scene.head, _merge_spec())
+        _git(tag_scene.remote, 'update-ref', '-d', f'refs/tags/{_TAG}')
+        await runner.run_merge_verify(tag_scene.head, _merge_spec())
+
+        assert tag_scene.tag_pushes() == [_PLAIN, _PLAIN]
+        assert tag_scene.seen == [(0, tagged), (0, tagged)]
+
+    async def test_a_refused_mirror_is_pushed_again_once_the_host_accepts_tags(
+        self, tag_scene: _TagScene,
+    ):
+        """A refused mirror benches the host; the same runner, re-admitted, must not verify on the lagging set."""
+        _annotated_tag(tag_scene.dispatcher, _TAG)
+        tag_scene.seed_remote_main()
+        tagged = _git(tag_scene.dispatcher, 'rev-parse', f'{_TAG}^{{commit}}')
+        runner = tag_scene.runner(id_factory=iter(('rid-1', 'rid-2')).__next__)
+        tag_scene.refuse_tags()
+
+        with pytest.raises(RunnerUnavailable):
+            await runner.run_merge_verify(tag_scene.head, _merge_spec())
+        tag_scene.accept_tags()
+        refused = tag_scene.tag_pushes()
+        result = await runner.run_merge_verify(tag_scene.head, _merge_spec())
+
+        assert result == _green()
+        assert tag_scene.tag_pushes()[len(refused):] == [_PLAIN]
+        assert tag_scene.seen == [(0, tagged)]
+
+    async def test_a_plain_tag_push_losing_a_ref_lock_is_retried_plain_and_not_announced(
+        self, tag_scene: _TagScene,
+    ):
+        """Two roles creating one new tag collide on its ref lock; nothing diverged, so nothing is forced."""
+        _annotated_tag(tag_scene.dispatcher, _TAG)
+        tag_scene.seed_remote_main()
+        lock = tag_scene.remote / 'refs' / 'tags' / f'{_TAG}.lock'
+        lock.write_text('')
+        store = RecordingEvents()
+
+        async def run(argv: list[str], *, cwd: str | None = None) -> tuple[int, str, str]:
+            reply = await tag_scene.run(argv, cwd=cwd)
+            if is_tag_push(argv) and lock.exists():
+                assert reply[0] != 0 and 'failed to update ref' in reply[2], reply
+                lock.unlink()
+            return reply
+
+        result = await tag_scene.runner(run=run).run_merge_verify(
+            tag_scene.head, _merge_spec(), event_store=store,
+        )
+
+        assert result == _green()
+        assert tag_scene.tag_pushes() == [_PLAIN, _PLAIN]
+        assert _tag_mirror_events(store) == []
+        assert tag_scene.seen == [(0, _git(tag_scene.dispatcher, 'rev-parse', f'{_TAG}^{{commit}}'))]

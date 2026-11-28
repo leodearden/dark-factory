@@ -33,8 +33,9 @@ What remains here is what the boundary guard's escalation sink CALLS, plus the
 re-exports ``server/tools.py`` still imports:
 
 * :func:`emit_markup_storm_escalation` — one deduped record per burst (INV-4).
-* :func:`emit_markup_residue_escalation` — one record per unrepairable refusal,
-  deliberately NOT deduped, holding that caller's payload verbatim (INV-7).
+* :func:`emit_markup_residue_escalation` — one record per residue record of
+  either kind, deliberately NOT deduped, holding that caller's payload
+  verbatim (INV-7).
 * ``_MARKUP_STORM_THRESHOLD`` / ``_MARKUP_STORM_WINDOW_SECONDS`` — the ONE
   source for the tuning, read by the guard when it builds the middleware.
 * ``MARKUP_OVERRIDE_KEY``, ``markup_override_requested``,
@@ -55,7 +56,11 @@ import ast
 import logging
 from typing import Any
 
-from shared.mcp_markup_middleware import MARKUP_RECURRENCE_ROUTING
+from shared.markup_residue_custody import residue_prose
+from shared.mcp_markup_middleware import (
+    MARKUP_RECURRENCE_ROUTING,
+    residue_header_lines,
+)
 
 # markup_override_requested / strip_markup_override are RE-EXPORTS, not local
 # callers: server/tools.py imports both from this module (the write-path guards
@@ -461,7 +466,7 @@ def emit_markup_residue_escalation(
     *,
     anchor_task_id: str = _RESIDUE_ANCHOR_TASK_ID,
 ) -> str | None:
-    """Preserve the payload of ONE refused-as-unrepairable call (INV-7, B5).
+    """Preserve the payload of ONE residue record, of either kind (INV-7, B5).
 
     Returns the filed escalation id, or ``None`` when filing is impossible or
     fails. The id is what makes the caller-facing refusal HONEST: the shared
@@ -474,7 +479,8 @@ def emit_markup_residue_escalation(
     A TRANSLATOR, not a second escalation vocabulary (INV-5). The middleware
     already emits an escalation-SHAPED record — ``category``, ``level``,
     ``summary``, ``suggested_action``, plus the flat ``tool``/``field``/
-    ``matched_pattern``/``agent_id``/``project``/``raw_value`` fields — because
+    ``matched_pattern``/``raw_value`` fields and the header fields
+    ``residue_header_lines`` renders — because
     the record has to survive being routed to whichever queue a host server
     happens to own. This function moves those fields onto an
     :class:`escalation.models.Escalation` and writes it; it authors no prose of
@@ -483,9 +489,8 @@ def emit_markup_residue_escalation(
     DELIBERATELY NOT DEDUPED, which is the one place it diverges from
     :func:`emit_markup_storm_escalation`. That filer collapses a running leak
     into one open record because every burst summary says the same thing. Here
-    each record is the ONLY surviving copy of a DIFFERENT caller payload, so
-    folding two together would destroy data — the exact loss this record exists
-    to prevent. Volume during a burst is what the storm record is for: it
+    each record holds a DIFFERENT caller's payload, so folding two together
+    would destroy one of them. Volume during a burst is what the storm record is for: it
     summarises the incident once, while these hold the individual payloads.
 
     NEVER raises, for the same reason as its sibling: the refusal is already
@@ -493,24 +498,21 @@ def emit_markup_residue_escalation(
     plus a log line rather than changing the call's outcome.
     """
     raw_value = record.get('raw_value')
+    prose = residue_prose(record)
     detail = '\n'.join([
+        *residue_header_lines(record),
         f'tool={record.get("tool")!r}',
         f'field={record.get("field")!r}',
         f'matched_pattern={record.get("matched_pattern")!r}',
-        f'agent_id={record.get("agent_id")!r}',
-        f'project={record.get("project")!r}',
         f'owner={record.get("owner")!r}',
         '',
-        'The MCP boundary markup guard REFUSED this call: the argument below '
-        'absorbed raw MCP tool-call envelope markup whose own boundary cannot '
-        'be determined, so no repair was attempted and NOTHING was written. '
-        'Guessing a boundary would silently drop whatever arguments hide in the '
-        'residue.',
+        prose.outcome,
         '',
-        'The caller was told its payload is preserved here, so this record is '
-        'the only surviving copy: recover it for the caller if it is still '
-        'needed, then chase the harness serialization leak that produced it '
-        f'and {MARKUP_RECURRENCE_ROUTING}.',
+        prose.custody,
+        '',
+        'Recover the payload below for the caller if it is still needed, then '
+        'chase the harness serialization leak that produced it and '
+        f'{MARKUP_RECURRENCE_ROUTING}.',
         '',
         'raw_value (VERBATIM, the caller\'s own bytes):',
         str(raw_value),
@@ -524,14 +526,14 @@ def emit_markup_residue_escalation(
         severity='blocking',
         summary=str(
             record.get('summary')
-            or f'Unrepairable MCP envelope markup in {record.get("tool")}'
+            or f'MCP envelope markup residue from {record.get("tool")}'
         ),
         detail=detail,
         suggested_action=str(record.get('suggested_action') or ''),
         logger=logger,
         log_label='markup_tripwire',
         context=(
-            f'the unrepairable payload of {record.get("tool")}.'
+            f'the {record.get("error_type")!r} residue of {record.get("tool")}.'
             f'{record.get("field")} ({len(raw_value or "")} chars)'
         ),
         level=int(record.get('level') or _RESIDUE_LEVEL),

@@ -16,9 +16,12 @@ Contract (PRD Sec Contract) — derived per-invocation from the worktree path:
        ``logs/refs/heads/task/``, ``worktrees/<name>/``) derived by parsing
        ``<worktree>/.git``'s ``gitdir:`` line
   7. ``~/.cache/uv/``
-  8. ``~/.claude/fleet/`` (alpha1 FINAL-WRITABLE-LIST — see
+  8. ``~/.cache/tree-sitter/`` (task 3382) — the tree-sitter grammar-cache
+     SUBDIR specifically, never the ``~/.cache`` parent, which would hand
+     every sandboxed role write access to every other tool cache there
+  9. ``~/.claude/fleet/`` (alpha1 FINAL-WRITABLE-LIST — see
      ``plans/os-sandbox-claude-home-writer-audit.md``)
-  9-10. ``/tmp/``, ``/dev/``
+  10-11. ``/tmp/``, ``/dev/``
   12-13. conditional: ``<project_root>/.git/`` plus the narrowest grant per
          declared docs path (a directory grant only inside a top-level docs
          dir), present only when
@@ -29,9 +32,11 @@ Everything else is read-only. The common dir's ``rr-cache`` is deliberately
 not granted; sandboxed agents run with rerere off instead
 (``orchestrator/src/orchestrator/agents/sandbox_git_config.py``).
 ``compute_write_set`` is a PURE derivation —
-no filesystem side effects (no makedirs); existence/creation remains the
-backend's job. ``WriteSet.is_foreign_task_meta`` is the query plan-tools uses
-to flag a plan step naming another task's ``.task-meta`` (task 4825).
+no filesystem side effects (no makedirs). The backends skip a nonexistent
+writable path, so the carve-outs that must pre-exist are created outside the
+sandbox by ``ensure_sandbox_dirs``. ``WriteSet.is_foreign_task_meta`` is the
+query plan-tools uses to flag a plan step naming another task's
+``.task-meta`` (task 4825).
 """
 from __future__ import annotations
 
@@ -63,6 +68,7 @@ class WriteSet:
     git_task_reflogs: Path
     git_worktree_admin: Path
     uv_cache: Path
+    tree_sitter_cache: Path
     claude_fleet: Path
     tmp: Path
     dev: Path
@@ -96,6 +102,7 @@ class WriteSet:
             self.git_task_reflogs,
             self.git_worktree_admin,
             self.uv_cache,
+            self.tree_sitter_cache,
             self.claude_fleet,
             self.tmp,
             self.dev,
@@ -187,11 +194,11 @@ def compute_write_set(
     ``TaskArtifacts.task_root_for(worktree.parent, task_id)``.
 
     Pure: reads ``<worktree>/.git`` and resolves symlinks, but performs no
-    filesystem writes (no makedirs) — existence/creation remains the
-    backend's job (landlock_exec's ``_add_path`` already skips non-existent
-    dirs). Fails loudly (``ValueError``) on a missing/malformed/directory
-    ``.git``, and on a *task_id* ``TaskArtifacts.task_root_for`` refuses —
-    fail-closed-friendly, honoring the loud-over-silent norm.
+    filesystem writes; the carve-outs that must pre-exist are created by
+    ``ensure_sandbox_dirs``. Fails loudly (``ValueError``) on a
+    missing/malformed/directory ``.git``, and on a *task_id*
+    ``TaskArtifacts.task_root_for`` refuses — fail-closed-friendly, honoring
+    the loud-over-silent norm.
 
     ``home`` defaults to ``Path.home()``; tests should inject a hermetic
     tmp dir.
@@ -246,6 +253,9 @@ def _derive_write_set(
         git_task_reflogs=(main_git / 'logs' / 'refs' / 'heads' / 'task').resolve(),
         git_worktree_admin=admindir,
         uv_cache=(home / '.cache' / 'uv').resolve(),
+        # The tree-sitter grammar cache SUBDIR only — never the ~/.cache
+        # parent, which would grant every other tool cache living there.
+        tree_sitter_cache=(home / '.cache' / 'tree-sitter').resolve(),
         claude_fleet=(home / '.claude' / 'fleet').resolve(),
         tmp=Path('/tmp'),
         dev=Path('/dev'),
@@ -341,30 +351,36 @@ def _docs_shape_refusal(root: Path, target: Path, grant: Path) -> str | None:
     return None
 
 
-def ensure_claude_fleet_dir(write_set: WriteSet) -> bool:
-    """Best-effort, side-effecting pre-creation of ``write_set.claude_fleet``.
+def ensure_sandbox_dirs(write_set: WriteSet) -> list[Path]:
+    """Best-effort, side-effecting pre-creation of every carve-out that must
+    exist before the sandbox is built. The tuple below is the one list of them.
 
     ``compute_write_set`` is intentionally PURE (no makedirs — pinned by
-    ``test_purity_no_makedirs_side_effect``), yet the ``~/.claude/fleet``
-    carve-out is load-bearing and must EXIST on disk before the sandbox is
-    built: neither backend can grant a nonexistent writable path from INSIDE
-    the sandbox — bwrap ``build_bwrap_command`` binds a writable extra only if
-    it is an existing file or dir (sandbox.py), and landlock ``_add_path``
-    skips any other path (landlock_exec.py) — and the agent
-    cannot create it itself because the parent ``~/.claude`` is read-only under
-    both backends. So the orchestrator must materialize it OUTSIDE the sandbox,
-    once, before dispatch (task 2996). This helper is co-located with the
-    single-source ``WriteSet`` (PRD D11) but kept SEPARATE from the pure
-    derivation.
+    ``test_purity_no_makedirs_side_effect``), yet neither backend can grant a
+    nonexistent writable path: bwrap ``build_bwrap_command`` binds a writable
+    extra only if it is an existing file or dir (sandbox.py), and landlock
+    ``_add_path`` skips any other path (landlock_exec.py). Both merely warn and
+    drop the grant. The agent cannot create these dirs from inside either,
+    because their parents ``~/.claude`` and ``~/.cache`` are read-only under
+    both backends. So the orchestrator materializes them OUTSIDE the sandbox,
+    once, before dispatch. Kept SEPARATE from the pure derivation but
+    co-located with the single-source ``WriteSet`` (PRD D11).
 
-    Returns ``True`` when the directory exists after the call (created or
-    already present — ``exist_ok=True``), ``False`` when ``mkdir`` raises
-    ``OSError``. Does no logging: the caller
-    (``TaskWorkflow._ensure_sandbox_dirs``) owns the operator-facing warning
-    and the ``task_id`` triage context.
+    ``uv_cache`` is deliberately absent: ``uv`` itself runs outside the sandbox
+    (verify, cold pre-provisioning) and materializes ``~/.cache/uv`` there.
+    Tree-sitter grammar builds run INSIDE the sandbox, so nothing outside it
+    would ever create ``~/.cache/tree-sitter``.
+
+    Returns the paths whose ``mkdir`` raised ``OSError``; an empty list means
+    every carve-out exists after the call (created or already present). Each
+    path is attempted independently, so one failure never suppresses the
+    rest. Does no logging: the caller (``TaskWorkflow._ensure_sandbox_dirs``)
+    owns the operator-facing warning and the ``task_id`` triage context.
     """
-    try:
-        write_set.claude_fleet.mkdir(parents=True, exist_ok=True)
-        return True
-    except OSError:
-        return False
+    failed: list[Path] = []
+    for path in (write_set.claude_fleet, write_set.tree_sitter_cache):
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            failed.append(path)
+    return failed

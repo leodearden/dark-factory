@@ -19,12 +19,18 @@ from shared.cli_invoke import (
 from shared.config_dir import CONFIG_DIR_PREFIX
 from shared.transcript_archive import archive_before_delete, resolve_archive_root
 
+from fused_memory.models.invocation_ledger import (
+    InvocationLedger,
+    input_output_tokens,
+    ledger_invoke_kwargs,
+)
 from fused_memory.models.reconciliation import FINDING_SEVERITY_VALUES, StageAgentOutcome
 from fused_memory.reconciliation import (
-    _RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS,
     RECONCILIATION_CLI_ENV_OVERRIDES,
     RECONCILIATION_CLI_SETTING_SOURCES,
+    RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS,
 )
+from fused_memory.reconciliation.reserve_step_aside import RECONCILIATION_WORK_CLASS
 from fused_memory.reconciliation.sandbox_guard import (
     RemediationSandboxUnavailable,
     resolve_recon_sandbox_wrap,
@@ -569,11 +575,18 @@ class StageResult:
 
     ``outcome`` is ``declared_outcome`` when one is given, else derived from
     ``success``; only a successful agent is ever ``completed``.
+
+    ``tokens_used`` is the input plus output tokens of the stage's one CLI
+    invocation (``models/invocation_ledger.py::input_output_tokens``). Cache
+    reads and cache creations are carried in their own fields, never in that
+    sum. All three are 0 when the CLI reported none or no model ran.
     """
 
     report: dict = field(default_factory=dict)
     llm_calls: int = 0
     tokens_used: int = 0
+    cache_read_tokens: int = 0
+    cache_create_tokens: int = 0
     cost_usd: float = 0.0
     duration_ms: int = 0
     model: str = ''
@@ -844,6 +857,7 @@ async def run_stage_via_cli(
     output_schema: dict | None = None,
     session_id: str | None = None,
     config_dir: TaskConfigDir | None = None,
+    ledger: InvocationLedger | None = None,
 ) -> StageResult:
     """Invoke a reconciliation stage via Claude CLI with MCP tools.
 
@@ -862,6 +876,8 @@ async def run_stage_via_cli(
     extras so the CLI can actually write the transcript inside it. Setting
     ``config_dir`` without that grant is the 2026-07-18 defect — the CLI is told
     where to write and then denied the write, silently.
+
+    ``ledger`` is where the stage's invocations-ledger row lands; None writes none.
     """
     effective_model = model or config.agent_llm_model
     # Task 1989 (sweep verdict): kept at explore_codebase_root, NOT switched to
@@ -965,14 +981,16 @@ async def run_stage_via_cli(
             strict_mcp_config=True,
             setting_sources=list(RECONCILIATION_CLI_SETTING_SOURCES),
             env_overrides=dict(RECONCILIATION_CLI_ENV_OVERRIDES),
+            work_class=RECONCILIATION_WORK_CLASS,
             output_schema=output_schema,  # PRD γ: pass None straight through when caller opts out
             permission_mode='bypassPermissions',
             timeout_seconds=float(config.stage_timeout_seconds),
             startup_grace_secs=config.stage_startup_grace_secs,
-            cap_wait_sanity_secs=_RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS,
+            cap_wait_sanity_secs=RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS,
             sandbox_wrap=sandbox_wrap,
             session_id=session_id,
             config_dir=config_dir,
+            **ledger_invoke_kwargs(ledger),
         )
     except AllAccountsCappedException:
         logger.warning(
@@ -997,7 +1015,9 @@ async def run_stage_via_cli(
     return StageResult(
         report=report,
         llm_calls=agent_result.turns,
-        tokens_used=0,  # CLI doesn't expose token counts
+        tokens_used=input_output_tokens(agent_result),
+        cache_read_tokens=agent_result.cache_read_tokens or 0,
+        cache_create_tokens=agent_result.cache_create_tokens or 0,
         cost_usd=agent_result.cost_usd,
         duration_ms=duration_ms,
         model=effective_model,

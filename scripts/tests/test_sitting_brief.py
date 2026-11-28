@@ -109,7 +109,8 @@ def _payloads(item: OpenItem):
     ruling = Ruling(item.escalation_id or '', 'close_only', 'Leo: option C', 'leo', NOW)
     return (
         resolve_issue_payload(item.escalation_id or '', 'ruled: option C', 'close_only',
-                              resolved_by='leo', resolution_turns=1),
+                              resolved_by='leo', resolution_turns=1,
+                              resolution_class='actionable', ruled_by_human=True),
         update_task_payload('3881', '/src/dark-factory', ruling, existing='esc-5580-4 / Leo 2026-09-21: action D'),
     )
 
@@ -518,7 +519,8 @@ class TestMarkdownSafety:
     def test_a_payload_containing_a_fence_stays_one_block(self):
         item = _item()
         payload = resolve_issue_payload(item.escalation_id or '', 'quoted:\n```\nx\n```', 'close_only',
-                                        resolved_by='leo', resolution_turns=1)
+                                        resolved_by='leo', resolution_turns=1,
+                                        resolution_class='actionable', ruled_by_human=True)
 
         text = _render([mod.BriefEntry(3, item, _prep(item), _finding(item), (payload,))])
 

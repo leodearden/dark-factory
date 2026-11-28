@@ -1,6 +1,6 @@
 """Contract tests for ``conftest.py`` correctness.
 
-This module guards eight invariants that would silently regress under refactoring
+This module guards nine invariants that would silently regress under refactoring
 and are NOT already covered by other tests:
 
 1. **sys.path ordering / module resolution** — ``conftest.py`` must insert
@@ -46,15 +46,22 @@ and are NOT already covered by other tests:
 8. **The shared mock-derived stray-dir guard is bound** — see
    ``TestTheMockDerivedStrayDirGuardIsWired``.
 
+9. **No real roster file** — ``_isolate_orch_config`` pins ``ORCH_VERIFY_HOSTS_FILE`` absent, and refuses any load
+   that would still resolve the session's default ``verify-hosts.yaml`` (one that stripped the pin).
+
 Tests of plain attribute defaults (e.g. ``mock.usage_cap.enabled is False``)
 are deliberately omitted — they would just duplicate literals from
 ``conftest.py`` two lines away.
 """
 
+import os
 from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
+
+from orchestrator.config import load_config
+from orchestrator.verify_host_roster_file import roster_file_path
 
 
 def test_syspath_block_precedes_guarded_imports():
@@ -345,6 +352,47 @@ def test_no_test_inherits_a_cold_preprovision_command(tmp_path, monkeypatch):
     monkeypatch.setenv('ORCH_CONFIG_PATH', str(yaml_path))
 
     assert OrchestratorConfig().verify_cold_preprovision_command == ''
+
+
+def test_the_autouse_pin_hides_a_roster_at_the_default_path(tmp_path, monkeypatch):
+    """A roster at the default path never reaches load_config.
+
+    The roster names the yaml's project, and ORCH_VERIFY_RUNNERS stays at the
+    autouse '[]', so a read would load a runner rather than conflict.
+    """
+    monkeypatch.setenv('XDG_CONFIG_HOME', str(tmp_path / 'xdg'))
+    default_roster = tmp_path / 'xdg' / 'orchestrator' / 'verify-hosts.yaml'
+    default_roster.parent.mkdir(parents=True)
+    default_roster.write_text(
+        'hosts:\n'
+        '  box:\n'
+        '    ssh_host: verify-box\n'
+        '    df_checkout_path: /srv/box/dark-factory\n'
+        '    projects:\n'
+        '      p:\n'
+        '        git_remote: verify-box-p\n'
+    )
+    yaml_path = tmp_path / 'orch.yaml'
+    yaml_path.write_text('fused_memory: {project_id: p}\n')
+
+    assert load_config(yaml_path).verify_runners == []
+    assert roster_file_path(os.environ) != default_roster
+
+
+@pytest.mark.skipif(
+    not (os.environ.get('XDG_CONFIG_HOME') or os.environ.get('HOME')),
+    reason='the session locates no operator roster, so the guard has none to refuse',
+)
+def test_a_load_that_strips_the_pin_fails_rather_than_reading_the_operators_roster(
+    tmp_path, monkeypatch,
+):
+    """A test that rebuilds its environment without ORCH_VERIFY_HOSTS_FILE is refused."""
+    monkeypatch.delenv('ORCH_VERIFY_HOSTS_FILE')
+    yaml_path = tmp_path / 'orch.yaml'
+    yaml_path.write_text('fused_memory: {project_id: p}\n')
+
+    with pytest.raises(AssertionError, match="operator's roster file"):
+        load_config(yaml_path)
 
 
 def test_an_explicit_preprovision_command_still_wins():

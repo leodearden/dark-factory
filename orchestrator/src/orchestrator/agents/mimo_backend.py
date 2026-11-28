@@ -310,7 +310,9 @@ def parse_mimo_sessions(
             timed_out=run.timed_out,
         )
     steps = [message['info'] for export in exports for message in _assistant_messages(export)]
-    usage = sum((_Usage.of_step(step) for step in steps), _Usage())
+    step_usages = [_Usage.of_step(step) for step in steps]
+    usage = sum(step_usages, _Usage())
+    answered_steps = sum(1 for step_usage in step_usages if step_usage != _Usage())
     named_id = _stdout_session_id(run.stdout)
     root = _root_session(exports, named_id)
     root_steps = _assistant_messages(root) if root is not None else []
@@ -327,6 +329,7 @@ def parse_mimo_sessions(
         cost_basis=ProcessCostBasis.USAGE_ESTIMATE,
         duration_ms=run.duration_ms,
         turns=len(steps),
+        transcript_turns=answered_steps,
         session_id=named_id or str(_session_info(root or {}).get('id') or ''),
         subtype=subtype,
         stderr=run.stderr,

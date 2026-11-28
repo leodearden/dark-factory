@@ -227,7 +227,7 @@ class TestDeterministicRunnerScansRunOffLoop:
             probe, '99', category='milestone_gate',
             agent_role=DETERMINISTIC_AGENT_ROLE, level=2,
         )
-        probe.resolve(gate.id, 'human approved the gate', resolved_by='human')
+        probe.resolve(gate.id, 'human approved the gate', resolved_by='human', resolution_class='actionable')
         task = _det._gate_task(task_id='99', gate_escalated_at='2026-06-23T12:00:00+00:00')
         scheduler = _det._mock_scheduler(task)
         runner = DeterministicRunner(scheduler=scheduler, escalation_queue=probe)
@@ -252,7 +252,7 @@ class TestDeterministicRunnerScansRunOffLoop:
             probe, '600', category='infra_issue',
             agent_role=DETERMINISTIC_AGENT_ROLE, level=2,
         )
-        probe.resolve(failure.id, 'human verified the unit manually')
+        probe.resolve(failure.id, 'human verified the unit manually', resolution_class='actionable')
         task = _det._deploy_task(task_id='600', before_done_ran_at='2026-06-23T10:00:00+00:00')
         scheduler = _det._mock_scheduler(task)
         script_runner = AsyncMock(return_value=(0, 'ok'))

@@ -224,6 +224,8 @@ tasks:
       paths:
       - fused-memory/src/fused_memory/reconciliation/stages/memory_consolidator.py
       expect: present
+  # 2026-11-17: task 4916 was cancelled (esc-10244-1); the auto-consolidation
+  # executor is this block's only consumer.
   - name: flood-control-single-home
     binding: task 3136 binding amendment; shared with task 4916
     verdict: PASS

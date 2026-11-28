@@ -9,11 +9,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from _eval_diff_repo import repo_with_commit
 
-from orchestrator.config import PriceEntry
+from orchestrator.config import ModelsConfig, PriceEntry
 from orchestrator.evals.cell_sandbox import CellSandbox
-from orchestrator.evals.metrics import EvalMetrics, RoleUnderTest
+from orchestrator.evals.metrics import EndpointKind, EvalMetrics, RoleUnderTest
 from orchestrator.evals.runner import collect_metrics
 from orchestrator.implementer_brief_variant import ImplementerBriefVariant
+from orchestrator.routing import DispatchedRoute, RoutingDecision
 from orchestrator.verify import VerifyResult
 
 _RUNNER_LOGGER = 'orchestrator.evals.runner'
@@ -30,6 +31,8 @@ def _workflow() -> MagicMock:
         setattr(wf.metrics, name, 0)
     wf.metrics.total_cost_usd = 0.0
     wf.metrics.judge_cost_usd = 0.0
+    wf.metrics.dispatched_routes = []
+    wf.config.models = ModelsConfig()
     wf.config.env_overrides = {}
     wf.config.max_execute_iterations = 20
     wf.artifacts.read_plan.return_value = {'steps': []}
@@ -45,14 +48,17 @@ async def _collect(
     replay_frame: str | None = None,
     workflow: MagicMock | None = None,
     sandbox_backend: CellSandbox = 'landlock',
+    endpoint_kind: EndpointKind = EndpointKind.NATIVE_ANTHROPIC,
+    task_id: str = 't',
 ) -> EvalMetrics:
     verification = VerifyResult(
         passed=True, test_output='', lint_output='', type_output='', summary='',
     )
     with patch('orchestrator.verify.run_verification', AsyncMock(return_value=verification)):
         return await collect_metrics(
-            workflow or _workflow(), worktree, {'id': 't', 'pre_task_commit': base_commit},
+            workflow or _workflow(), worktree, {'id': task_id, 'pre_task_commit': base_commit},
             role=role, replay_frame=replay_frame, sandbox_backend=sandbox_backend,
+            endpoint_kind=endpoint_kind,
         )
 
 
@@ -80,6 +86,34 @@ async def test_collect_metrics_stamps_the_sandbox_backend(tmp_path: Path):
     m = await _collect(repo, base, sandbox_backend='bwrap')
 
     assert m.sandbox_backend == 'bwrap'
+
+
+@pytest.mark.asyncio
+async def test_collect_metrics_stamps_the_endpoint_kind(tmp_path: Path):
+    repo, base = repo_with_commit(tmp_path / 'repo', {})
+
+    m = await _collect(repo, base, endpoint_kind=EndpointKind.SELF_HOSTED_VLLM)
+
+    assert m.endpoint_kind is EndpointKind.SELF_HOSTED_VLLM
+
+
+@pytest.mark.asyncio
+async def test_the_cost_trust_flag_follows_the_env_not_the_endpoint_kind(tmp_path: Path):
+    repo, base = repo_with_commit(tmp_path / 'repo', {})
+    proxied = _workflow()
+    proxied.config.env_overrides = {
+        'ANTHROPIC_BASE_URL': 'https://token-plan-ams.xiaomimimo.com/anthropic',
+    }
+
+    proxied_native = await _collect(
+        repo, base, workflow=proxied, endpoint_kind=EndpointKind.NATIVE_ANTHROPIC,
+    )
+    unproxied_vllm = await _collect(repo, base, endpoint_kind=EndpointKind.SELF_HOSTED_VLLM)
+
+    assert proxied_native.cli_cost_untrusted is True
+    assert proxied_native.endpoint_kind is EndpointKind.NATIVE_ANTHROPIC
+    assert unproxied_vllm.cli_cost_untrusted is False
+    assert unproxied_vllm.endpoint_kind is EndpointKind.SELF_HOSTED_VLLM
 
 
 @pytest.mark.asyncio
@@ -217,3 +251,132 @@ class TestFalseGreenAtTheEnforcedCap:
         )
 
         assert m.tests_pass is True
+
+
+def _dispatched(
+    role: str, model: str, source_layer: str, rule_id: str | None, served: str,
+    *, rejected: tuple[str, ...] = (),
+) -> DispatchedRoute:
+    decision = RoutingDecision(
+        model=model, effort='high', budget_usd=5.0, max_turns=120,
+        source_layer=source_layer, rule_id=rule_id, rejected=rejected,
+    )
+    return DispatchedRoute(role, decision, served)
+
+
+_CAPACITY_EXHAUSTED = 'config:model-capacity-exhausted'
+
+_PINNED_SONNET = {
+    'model': 'sonnet', 'served_model_id': 'claude-sonnet-5-5',
+    'source_layer': 'config', 'rule_id': 'large-plan-steps',
+    'configured_model': 'sonnet', 'rejected': [],
+}
+
+_PINNED_JUDGE = {
+    'model': 'sonnet', 'served_model_id': 'claude-sonnet-5-5',
+    'source_layer': 'config', 'rule_id': None,
+    'configured_model': 'sonnet', 'rejected': [],
+}
+
+
+def _clean_routes() -> list[DispatchedRoute]:
+    sonnet = _dispatched('implementer', 'sonnet', 'config', 'large-plan-steps', 'claude-sonnet-5-5')
+    return [sonnet, _dispatched('judge', 'sonnet', 'config', None, 'claude-sonnet-5-5'), sonnet]
+
+
+def _seated_workflow(routes: list[DispatchedRoute]) -> MagicMock:
+    wf = _workflow()
+    wf.config.models = ModelsConfig(implementer='sonnet', judge='sonnet')
+    wf.metrics.dispatched_routes = routes
+    return wf
+
+
+@pytest.mark.asyncio
+class TestCollectMetricsRecordsDispatchedModels:
+    """collect_metrics persists the workflow's dispatched routes and warns on an
+    off-pin cell (task 8499)."""
+
+    async def test_a_pinned_cell_records_each_role_once_and_does_not_warn(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        repo, base = repo_with_commit(tmp_path / 'repo', {})
+        wf = _seated_workflow(_clean_routes())
+
+        with caplog.at_level(logging.WARNING, logger=_RUNNER_LOGGER):
+            m = await _collect(repo, base, workflow=wf)
+
+        assert m.dispatched_models == {'implementer': [_PINNED_SONNET], 'judge': [_PINNED_JUDGE]}
+        assert not _runner_warnings(caplog)
+
+    async def test_a_role_without_a_seat_on_its_default_does_not_warn(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        repo, base = repo_with_commit(tmp_path / 'repo', {})
+        wf = _seated_workflow([
+            *_clean_routes(),
+            _dispatched('resettled_adjudicator', 'opus', 'role_default', None, 'claude-opus-5-5'),
+        ])
+
+        with caplog.at_level(logging.WARNING, logger=_RUNNER_LOGGER):
+            m = await _collect(repo, base, workflow=wf)
+
+        assert m.dispatched_models is not None
+        assert m.dispatched_models['resettled_adjudicator'] == [{
+            'model': 'opus', 'served_model_id': 'claude-opus-5-5',
+            'source_layer': 'role_default', 'rule_id': None,
+            'configured_model': None, 'rejected': [],
+        }]
+        assert not _runner_warnings(caplog)
+
+    async def test_an_off_pin_cell_is_recorded_and_warned_once(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        repo, base = repo_with_commit(tmp_path / 'repo', {})
+        wf = _seated_workflow([
+            *_clean_routes(),
+            _dispatched('implementer', 'opus', 'policy_rule', 'large-plan-steps', 'claude-opus-5-5'),
+        ])
+
+        with caplog.at_level(logging.WARNING, logger=_RUNNER_LOGGER):
+            m = await _collect(repo, base, workflow=wf, task_id='df_task_8499')
+
+        assert m.dispatched_models is not None
+        assert m.dispatched_models['implementer'] == [
+            _PINNED_SONNET,
+            {
+                'model': 'opus', 'served_model_id': 'claude-opus-5-5',
+                'source_layer': 'policy_rule', 'rule_id': 'large-plan-steps',
+                'configured_model': 'sonnet', 'rejected': [],
+            },
+        ]
+        [warning] = [w for w in _runner_warnings(caplog) if 'df_task_8499' in w]
+        assert 'implementer' in warning
+        assert 'opus' in warning
+        assert 'judge' not in warning
+
+    async def test_a_capacity_fallback_to_the_role_default_warns_with_its_rejection(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        repo, base = repo_with_commit(tmp_path / 'repo', {})
+        wf = _seated_workflow([
+            _dispatched(
+                'implementer', 'opus', 'role_default', None, 'claude-opus-5-5',
+                rejected=(_CAPACITY_EXHAUSTED,),
+            ),
+        ])
+
+        with caplog.at_level(logging.WARNING, logger=_RUNNER_LOGGER):
+            await _collect(repo, base, workflow=wf, task_id='df_task_8499')
+
+        [warning] = [w for w in _runner_warnings(caplog) if 'df_task_8499' in w]
+        assert 'implementer' in warning
+        assert _CAPACITY_EXHAUSTED in warning
+
+    async def test_a_workflow_with_no_recorded_routes_records_an_empty_mapping(
+        self, tmp_path: Path,
+    ) -> None:
+        repo, base = repo_with_commit(tmp_path / 'repo', {})
+
+        m = await _collect(repo, base)
+
+        assert m.dispatched_models == {}

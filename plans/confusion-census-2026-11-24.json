@@ -1,0 +1,1419 @@
+{
+  "record_version": 2,
+  "run_id": "census-dark_factory-20261124",
+  "date": "2026-11-24",
+  "project_id": "dark_factory",
+  "project_root": "/home/leo/src/dark-factory",
+  "force": false,
+  "method": {
+    "run_id": "census-dark_factory-20261124",
+    "as_of_sha": "d575b86d667efce5b6fe883f20c6c4810729e9c0",
+    "since": "173059bd55507fdc8f527a7bb0aa435af2c2bf78",
+    "evidence": {
+      "window": [
+        "2026-10-25T00:00:00+00:00",
+        "2026-11-24T00:00:00+00:00"
+      ],
+      "sessions_enumerated": 24858,
+      "skipped_coded": 986,
+      "skipped_zero_signal": 17502,
+      "mined": 40,
+      "ledger_rows": 1056
+    },
+    "verification": {
+      "confirmed": 3,
+      "weakened": 0,
+      "refuted": 8,
+      "unverified": 0
+    },
+    "cost": {
+      "miner_calls": 40,
+      "verify_calls": 22,
+      "synthesis_calls": 1,
+      "probe_calls": 5,
+      "embedding_calls": 1,
+      "wall_clock_secs": 1204.745
+    },
+    "inputs_consumed": [
+      "review-dark_factory-20261009",
+      "hotspot-survey-dark_factory-20261009",
+      "review-all-dark_factory-20261008"
+    ],
+    "extra": {
+      "inputs_consumed_note": null,
+      "screened": {
+        "title": 0,
+        "session": 0,
+        "key": 0,
+        "cross_instrument": 0
+      },
+      "attached": 0,
+      "adjudicated": 18,
+      "ledger_created_this_run": false,
+      "ledger_state": "ok",
+      "ledger_pruned": 484,
+      "ledger_error": null,
+      "verify_normalisations": {
+        "anchor_rewritten": 0,
+        "anchor_from_remediation": 0,
+        "anchor_from_title": 0,
+        "tag_dropped": 0,
+        "severity_missing": 0,
+        "severity_substituted": 0,
+        "severity_reason_missing": 0,
+        "route_defaulted": 0,
+        "remediation_rejected": 0,
+        "reason_missing": 0
+      },
+      "reverify": {
+        "due": 11,
+        "offered": 11,
+        "gone": 5,
+        "present": 6,
+        "inconclusive": 0,
+        "deferred": 0
+      },
+      "slug_rejections": {
+        "count": 0,
+        "values": [],
+        "values_omitted": 0
+      }
+    }
+  },
+  "mining": {
+    "batch_stats": [
+      {
+        "index": 0,
+        "total": 20,
+        "succeeded": 20,
+        "failed": 0,
+        "dup_rate": 1.0,
+        "saturated": true,
+        "status": "ok"
+      },
+      {
+        "index": 1,
+        "total": 20,
+        "succeeded": 20,
+        "failed": 0,
+        "dup_rate": 0.95,
+        "saturated": true,
+        "status": "ok"
+      }
+    ],
+    "stop_reason": "saturated",
+    "max_batches": 50
+  },
+  "verify_coverage": {
+    "novel": 1,
+    "offered": 1,
+    "cap": 150
+  },
+  "mass_rejection": null,
+  "dropped_verdicts": [],
+  "matrix_md": "| origin \\ manifested | recon | unknown |\n| --- | --- | --- |\n| implement | 0 | 1 |\n| recon | 2 | 0 |\n| unknown | 1 | 2 |\n",
+  "synthesis": {
+    "outcome": "ok",
+    "calls": 1,
+    "reason": null,
+    "brief": {
+      "run_id": "census-dark_factory-20261124",
+      "new": [
+        {
+          "key": "fk-bb99b8dda638",
+          "entry_id": "entry-cand-20261122-3",
+          "title": "Escalation resolve_issue rejects project_root, a parameter the repo instructions teach for every task operation",
+          "cause": "CLAUDE.md tells agents to pass project_root on task operations, which are fused-memory tools. The escalation MCP server's resolve_issue takes no such keyword, so an agent carrying that habit across servers gets a pydantic unexpected_keyword_argument error. The call fails and the agent spends a turn working out the real signature. No guidance says which servers accept project_root.",
+          "area": "escalation",
+          "anchor": "escalation/src/escalation/server.py::resolve_issue",
+          "tags": [
+            "h10",
+            "h3",
+            "kind:confusion"
+          ],
+          "origin_phase": "unknown",
+          "manifested_phase": "unknown",
+          "sessions": [
+            "27f27d95-730e-4f1f-9d88-f35b8d1663c9/subagents/agent-acc07e68888a0a78d"
+          ],
+          "verdict": {
+            "severity": "low",
+            "severity_reason": "The failure is loud and costs one wasted turn. The cost is contained and recoverable.",
+            "reason": "Confirmed in the current tree. `escalation/src/escalation/server.py::resolve_issue` (line 2441) has no `project_root` parameter. Its parameters are escalation_id, resolution, action, resolved_by, resolution_turns, resolution_class, granted_files, acknowledge_declared_pins, escalate_model, recut and terminate. Other tools on the same server take an optional `project_root` and pass it through `ProjectRootGuard.check`: the tools at lines 2136, 2249, 3026 and 3206, `get_task_escalation_history` and `get_escalation`. `claim_warm_worktree` and `release_warm_worktree` take a required `project_root`. An agent that follows the repo habit of passing `project_root` can therefore succeed on sibling escalation tools and get an unexpected-keyword error on `resolve_issue`. I did not search the docs for guidance on which servers accept `project_root`, so that part of the claim is unchecked.",
+            "proposal": "Add an optional `project_root: str | None = None` parameter to `resolve_issue` and enforce it with `project_root_guard.check_off_loop`, as the sibling escalation tools do.",
+            "route": "mechanical"
+          }
+        },
+        {
+          "key": "fk-f1449a2f494f",
+          "entry_id": "entry-cand-20261122-2",
+          "title": "Recon agent repeatedly calls count_memories_by_metadata with undeclared 'metadata' argument instead of declared 'filters'",
+          "cause": "The agent passes a filter object under an argument name the fused-memory tool does not declare. The server rejects each call before execution with an error that lists the declared parameters, but the same wrong call shape recurs across three task IDs with no evidence of the correct shape being learned.",
+          "area": "repo",
+          "anchor": "slug:recon-count-memories-by-metadata-undeclared-arg",
+          "tags": [
+            "h10",
+            "kind:confusion"
+          ],
+          "origin_phase": "unknown",
+          "manifested_phase": "recon",
+          "sessions": [
+            "ce32c7a8-0614-44b5-bd11-cd7cba96eced",
+            "8936645c-c0e0-4549-84c4-c92036819e93",
+            "1ca2ffe0-ab7a-45be-b413-599b6b1d2aab"
+          ],
+          "verdict": {
+            "severity": "low",
+            "severity_reason": "The server rejects each bad call before it executes, so nothing is written. The cost is wasted agent turns.",
+            "reason": "The wrong call shape is a real, recurring failure. The tool declares only project_id and filters, and the server rejects `metadata` as unknown_argument. The cause is not in this tree. The stage prompts already teach the correct shape: fused-memory/src/fused_memory/reconciliation/prompts/stage2.py (lines 227, 238, 336) and stage1.py and stage3.py all write `count_memories_by_metadata(project_id=..., filters={...})`. The agent still guessed `metadata`, which points to the deferred tool schema not being loaded before the call. That is harness tooling, not a file here. The rejection is loud and no state is written. docs/flag-marker-sweep-recurring.md line 767 shows a `source=` kwarg shape, but it is an operator doc, not part of the recon prompts. The codebook already holds many near-duplicate entries.",
+            "proposal": null,
+            "route": "mechanical"
+          }
+        },
+        {
+          "key": "fk-7c4ee0eb5759",
+          "entry_id": "entry-cand-20261118-2",
+          "title": "Agent shell cwd left pointing at a worktree another session removed, failing subsequent commands until recovery",
+          "cause": "A worktree directory that the session's shell was using was removed by another process (the worktree named mut-10723 was deleted while the session worked in carry-10723). The agent's shell cwd then refers to a nonexistent directory, so every later Bash call fails with getcwd or no-such-directory errors, and the agent has to re-issue commands after the shell recovers.",
+          "area": "repo",
+          "anchor": "slug:shell-cwd-removed-worktree",
+          "tags": [
+            "h10",
+            "kind:confusion"
+          ],
+          "origin_phase": "unknown",
+          "manifested_phase": "unknown",
+          "sessions": [
+            "5f254cc9-5b29-4ec0-8bd5-38d2095e9580",
+            "25e6eb98-9f01-4455-b9b5-a3af90952172"
+          ],
+          "verdict": {
+            "severity": "low",
+            "severity_reason": "The harness recovers the shell cwd automatically and the agent only has to re-issue the command, so the cost is one retry.",
+            "reason": "The evidence is two harness-level messages. One says the working directory no longer exists and the shell cwd was recovered to the repo root. The other is a bash getcwd failure. Both are consistent with a worktree under .claude/worktrees (interactive-session worktrees) being deleted while a session's shell was inside it. The tree has no code that creates or removes .claude/worktrees/mut-* or carry-* directories. The only mention is a config.py comment about skipping nested checkouts when discovering modules. So the cause is in tooling outside this tree, and no specific existing file produces, teaches or fails to guard against it. I could not run shell checks, so I did not confirm which worktrees exist right now.",
+            "proposal": null,
+            "route": "mechanical"
+          }
+        }
+      ],
+      "re_observed": [
+        {
+          "key": "fk-a69ec55ddc08",
+          "entry_id": "entry-cand-20260918-18",
+          "title": "Digest 'User Corrections' bucket mislabels injected task context/briefing as a correction",
+          "cause": "Digest pipeline confuses task-instruction boilerplate (adjudication rubric, prior-round reference list, context) with actual user-provided feedback corrections",
+          "gained_sessions": [
+            "43c1b34c-efed-4f8b-b27e-7d5102169ca1"
+          ],
+          "standing": {
+            "severity": "medium",
+            "status": "open",
+            "origin_phase": "implement",
+            "manifested_phase": "review"
+          },
+          "verdict": null,
+          "adopted_from": null
+        },
+        {
+          "key": "fk-8dabfa972cc0",
+          "entry_id": "entry-cand-20261030-3",
+          "title": "Orchestrated-task sub-agent denied read-only Bash inspection in don't-ask mode, forcing blind guesses while diagnosing a verify failure",
+          "cause": "The orchestrated task runs with Claude Code in don't-ask permission mode, so the agent's Bash calls for read-only inspection (cat/head/grep on the suppression key and baseline files) are denied. The agent cannot read the gate's own baseline and key files while diagnosing a post-merge verify failure, and the one failed lookup is unrecoverable from inside the session.",
+          "gained_sessions": [
+            "0b81f333-731f-4ae5-965c-fde8cf269661/subagents/agent-a89bf01277cbf5f41"
+          ],
+          "standing": {
+            "severity": "low",
+            "status": "open",
+            "origin_phase": "architect",
+            "manifested_phase": "verify"
+          },
+          "verdict": null,
+          "adopted_from": null
+        }
+      ],
+      "unkeyed_re_observed": 5,
+      "invariant_counts": {},
+      "counts": {
+        "mined": 40,
+        "confirmed": 3,
+        "refuted": 8,
+        "screened_title": 0,
+        "screened_session": 0,
+        "screened_key": 0,
+        "screened_cross_instrument": 0,
+        "attached": 0,
+        "adjudicated": 18
+      }
+    },
+    "document": {
+      "new": [
+        {
+          "key": "fk-bb99b8dda638",
+          "observation": "In the current tree `escalation/src/escalation/server.py::resolve_issue` declares no `project_root` parameter, while sibling tools on the same server accept it: `get_task_escalation_history`, `get_escalation` and others take it as optional and pass it through `ProjectRootGuard.check`, and `claim_warm_worktree` and `release_warm_worktree` require it. One session passed `project_root` to `resolve_issue`, got a pydantic unexpected_keyword_argument error, and spent a turn recovering the real signature. Under heuristic 10 (clear invariants, informatively, redundantly, uniformly enforced), the project-root guard is not applied uniformly across this server's tools. Under heuristic 3 (carefully factored orthogonal dimensions of variability), the which-project axis is carried per tool rather than by one mechanism, so a caller cannot predict from one tool whether the next accepts it. The failure is loud and costs one turn. Whether any doc says which servers accept `project_root` was not checked by the verdict."
+        },
+        {
+          "key": "fk-f1449a2f494f",
+          "observation": "Three recon sessions called `count_memories_by_metadata` with a `metadata` argument. The tool declares only `project_id` and `filters`, and the server rejected each call before execution as unknown_argument, with an error listing the declared parameters. Nothing was written; the cost is wasted turns. The rejection is the informative half of heuristic 10 (clear invariants, informatively, redundantly, uniformly enforced) working as intended, yet the same wrong shape recurred across three task IDs. The recon stage prompts (`stage1.py`, `stage2.py`, `stage3.py` under `fused-memory/src/fused_memory/reconciliation/prompts/`) already write the correct `filters={...}` shape, so the verdict found no file in this tree that teaches the wrong one."
+        },
+        {
+          "key": "fk-7c4ee0eb5759",
+          "observation": "Two sessions received harness-level messages that the shell's working directory no longer existed: one a recovery of the cwd to the repo root, the other a bash getcwd failure. Each had to re-issue a command, so the cost is one retry. Both messages are consistent with a directory under `.claude/worktrees` being deleted while a shell was inside it. The verdict found no code in this tree that creates or removes `.claude/worktrees/mut-*` or `carry-*` directories, and it could not confirm which worktrees currently exist. The finding is tagged heuristic 10 (clear invariants, informatively, redundantly, uniformly enforced): the getcwd error does not name which directory vanished or what removed it, and no enforcement point for 'a worktree in use is not removed' was located in this tree."
+        }
+      ],
+      "re_observed": [
+        {
+          "key": "fk-a69ec55ddc08",
+          "sessions": [
+            "43c1b34c-efed-4f8b-b27e-7d5102169ca1"
+          ],
+          "changed": []
+        },
+        {
+          "key": "fk-8dabfa972cc0",
+          "sessions": [
+            "0b81f333-731f-4ae5-965c-fde8cf269661/subagents/agent-a89bf01277cbf5f41"
+          ],
+          "changed": []
+        }
+      ],
+      "phase_refinements": [
+        {
+          "key": "fk-bb99b8dda638",
+          "origin_phase": "implement",
+          "manifested_phase": "unknown",
+          "why": "The verdict confirms the cause lives in the current tree as the `resolve_issue` signature in `escalation/src/escalation/server.py`, which lacks the `project_root` parameter its sibling tools carry. That places the origin in implemented code rather than unknown. The brief does not identify the role or phase of the subagent session that hit the error, so the manifested phase stays unknown."
+        }
+      ],
+      "corrections": [],
+      "notes": [
+        {
+          "claim": "The verdict's explanation that the recon agent guessed `metadata` because the deferred tool schema was not loaded before the call is an inference, not a verified cause.",
+          "evidence": "The fk-f1449a2f494f verdict says the wrong shape 'points to' the deferred schema not being loaded and attributes it to harness tooling. No session evidence in the brief shows the schema's load state at call time.",
+          "verified": false
+        },
+        {
+          "claim": "`docs/flag-marker-sweep-recurring.md` may show a third call shape for `count_memories_by_metadata` (a `source=` kwarg) that differs from the declared `project_id` and `filters` parameters.",
+          "evidence": "The fk-f1449a2f494f verdict cites line 767 of that operator doc and notes it is not part of the recon prompts. Whether any recon session read it is not established.",
+          "verified": false
+        },
+        {
+          "claim": "The fk-f1449a2f494f finding may duplicate existing codebook entries.",
+          "evidence": "The verdict states the codebook already holds many near-duplicate entries, but the brief lists none and its counts show attached: 0.",
+          "verified": false
+        },
+        {
+          "claim": "The part of the fk-bb99b8dda638 cause saying no guidance tells agents which servers accept `project_root` is unchecked. The repo instructions' Task Routing wording appears to scope `project_root` to task operations through fused-memory MCP tools, without addressing the escalation server either way.",
+          "evidence": "The verdict says it did not search the docs for this. The CLAUDE.md text supplied with this request says to use `project_root` 'for all task operations on this repo' under a section about fused-memory MCP tools.",
+          "verified": false
+        },
+        {
+          "claim": "The fk-7c4ee0eb5759 attribution of the removal to another session or process, and the specific directories named (mut-10723 removed while the session worked in carry-10723), rest on the finding's cause text rather than on anything the verdict confirmed.",
+          "evidence": "The verdict found only two harness messages 'consistent with' a deleted worktree, found no in-tree code managing those directories, and could not run shell checks.",
+          "verified": false
+        },
+        {
+          "claim": "The proposed fix for fk-bb99b8dda638 would make the guard uniform on `resolve_issue` but would not by itself tell agents which other escalation tools accept `project_root`.",
+          "evidence": "The verdict's proposal covers `resolve_issue` only. The brief does not enumerate the full set of escalation tools with and without the parameter.",
+          "verified": false
+        }
+      ]
+    },
+    "applied": {
+      "clusters_refined": 1,
+      "entries_refined": 1,
+      "corrections_applied": 0,
+      "correction_skipped": 0,
+      "skipped_unknown_entry": 0
+    },
+    "standing": 90
+  },
+  "filing": {
+    "decisions": [
+      {
+        "entry_id": "entry-cand-20261122-3",
+        "finding_key": "fk-bb99b8dda638",
+        "title": "Escalation resolve_issue rejects project_root, a parameter the repo instructions teach for every task operation",
+        "project_root": "/home/leo/src/dark-factory",
+        "step": "curator",
+        "standing": "filed",
+        "ticket": "tkt_0RXBESWAC6KZRNAPJM1FQMF63B",
+        "task_id": 11553,
+        "resolution": "created",
+        "note": null,
+        "disposition": "filed:11553"
+      },
+      {
+        "entry_id": "entry-cand-20261122-2",
+        "finding_key": "fk-f1449a2f494f",
+        "title": "Recon agent repeatedly calls count_memories_by_metadata with undeclared 'metadata' argument instead of declared 'filters'",
+        "project_root": "/home/leo/src/dark-factory",
+        "step": "semantic",
+        "standing": "filed",
+        "ticket": null,
+        "task_id": 5968,
+        "resolution": "existing",
+        "note": null,
+        "disposition": "filed:5968"
+      },
+      {
+        "entry_id": "entry-cand-20261118-2",
+        "finding_key": "fk-7c4ee0eb5759",
+        "title": "Agent shell cwd left pointing at a worktree another session removed, failing subsequent commands until recovery",
+        "project_root": "/home/leo/src/dark-factory",
+        "step": "curator",
+        "standing": "filed",
+        "ticket": "tkt_0RXBESWRHS50VR4C793YPRE9PY",
+        "task_id": 11554,
+        "resolution": "created",
+        "note": null,
+        "disposition": "filed:11554"
+      },
+      {
+        "entry_id": "entry-cand-20260921-26",
+        "finding_key": "fk-c1df06e83aa5",
+        "title": "Spawned /team session hands the human a brief without enough context to follow the questions",
+        "project_root": "/home/leo/src/dark-factory",
+        "step": "curator",
+        "standing": "filed",
+        "ticket": "tkt_0RXBESWYBADD907JBVD0V8N0CW",
+        "task_id": 11555,
+        "resolution": "created",
+        "note": "\u00a78 step 1c: done task 7073 carries the key and the finding is still present",
+        "disposition": "filed:11555"
+      },
+      {
+        "entry_id": "entry-cand-20260911-28",
+        "finding_key": "fk-e18c7f482a29",
+        "title": "Interactive agent session with zero user turns contradicts session class",
+        "project_root": "/home/leo/src/dark-factory",
+        "step": "curator",
+        "standing": "filed",
+        "ticket": "tkt_0RXBESX4BCWVYFAAGYHXMZCV7N",
+        "task_id": 11556,
+        "resolution": "created",
+        "note": "\u00a78 step 1c: done task 7440 carries the key and the finding is still present",
+        "disposition": "filed:11556"
+      },
+      {
+        "entry_id": "entry-cand-20260916-1",
+        "finding_key": "fk-c2e12c9e2b12",
+        "title": "Digest 'User Corrections' bucket captures skill invocations and task notifications",
+        "project_root": "/home/leo/src/dark-factory",
+        "step": "curator",
+        "standing": "filed",
+        "ticket": "tkt_0RXBESXC06EWRRDVJ9WR7FMX81",
+        "task_id": 11557,
+        "resolution": "created",
+        "note": "\u00a78 step 1c: done task 7442 carries the key and the finding is still present",
+        "disposition": "filed:11557"
+      },
+      {
+        "entry_id": "entry-cand-20261002-10",
+        "finding_key": "fk-a6083fb7ed86",
+        "title": "Task worktree .task/metadata.json unavailable during post-merge verification",
+        "project_root": "/home/leo/src/dark-factory",
+        "step": "curator",
+        "standing": "filed",
+        "ticket": "tkt_0RXBESXHE29FQ7N49GP45ZGH8Y",
+        "task_id": 11558,
+        "resolution": "created",
+        "note": "\u00a78 step 1c: done task 8705 carries the key and the finding is still present",
+        "disposition": "filed:11558"
+      },
+      {
+        "entry_id": "entry-cand-20260825-12",
+        "finding_key": "fk-cef39957cd50",
+        "title": "MCP tool parameter contamination with XML envelope markup",
+        "project_root": "/home/leo/src/dark-factory",
+        "step": "curator",
+        "standing": "filed",
+        "ticket": "tkt_0RXBESXK1BWDA061S4ZSDC4TQS",
+        "task_id": 5055,
+        "resolution": "combined",
+        "note": "\u00a78 step 2 could not run: search_tasks: the call raised McpCallError: MCP tool search_tasks reply refused (IS_ERROR): {'content': [{'type': 'text', 'text': '{\"error\": \"Tool call refused: \\'query\\' carries raw MCP envelope markup whose own boundary cannot be determined, so no repair was attempted.\", \"error_type\": \"mcp",
+        "disposition": "filed:5055"
+      }
+    ],
+    "unfiled": [],
+    "unreachable": null,
+    "carried": [
+      {
+        "entry_id": "entry-cand-20261030-3",
+        "ticket": "tkt_0RWPNGV8JKNXD6N0J024SV0ANK",
+        "project_root": "/home/leo/src/dark-factory",
+        "status": "created",
+        "task_id": 8704,
+        "reason": "create: No existing task covers adding granted-tools guidance to the dry_run_unblock investigation prompt. Task 6203 is about git rules, not prompt wording. Create."
+      }
+    ],
+    "pending_tickets": [],
+    "budget_exhausted": false,
+    "errors": [],
+    "backfill": {
+      "linked": [],
+      "unmatched": [],
+      "error": null,
+      "done_in_run": "census-dark_factory-20261024"
+    },
+    "structural": []
+  },
+  "dispositions": {
+    "any_back_links": true,
+    "statuses_error": null,
+    "rows": [
+      {
+        "entry_id": "entry-cand-20260809-16",
+        "finding_key": null,
+        "project_root": "/home/leo/src/dark-factory",
+        "ticket": null,
+        "task_id": 3959,
+        "task_status": "done",
+        "outcome": "settled",
+        "detail": "fixed",
+        "disposition": "fixed:cd48063adec0e9f824e16e9577d1609b854a7e18"
+      },
+      {
+        "entry_id": "entry-cand-20260815-17",
+        "finding_key": null,
+        "project_root": "/home/leo/src/dark-factory",
+        "ticket": null,
+        "task_id": 4273,
+        "task_status": "done",
+        "outcome": "settled",
+        "detail": "fixed",
+        "disposition": "fixed:cd48063adec0e9f824e16e9577d1609b854a7e18"
+      },
+      {
+        "entry_id": "entry-cand-20260811-6",
+        "finding_key": null,
+        "project_root": "/home/leo/src/dark-factory",
+        "ticket": null,
+        "task_id": 4274,
+        "task_status": "done",
+        "outcome": "settled",
+        "detail": "fixed",
+        "disposition": "fixed:cd48063adec0e9f824e16e9577d1609b854a7e18"
+      },
+      {
+        "entry_id": "entry-cand-20260812-20",
+        "finding_key": null,
+        "project_root": "/home/leo/src/dark-factory",
+        "ticket": null,
+        "task_id": 4275,
+        "task_status": "done",
+        "outcome": "settled",
+        "detail": "fixed",
+        "disposition": "fixed:cd48063adec0e9f824e16e9577d1609b854a7e18"
+      },
+      {
+        "entry_id": "entry-cand-20260817-1",
+        "finding_key": null,
+        "project_root": "/home/leo/src/dark-factory",
+        "ticket": null,
+        "task_id": 4578,
+        "task_status": "done",
+        "outcome": "settled",
+        "detail": "fixed",
+        "disposition": "fixed:cd48063adec0e9f824e16e9577d1609b854a7e18"
+      },
+      {
+        "entry_id": "entry-cand-20260824-28",
+        "finding_key": null,
+        "project_root": "/home/leo/src/dark-factory",
+        "ticket": null,
+        "task_id": 4751,
+        "task_status": "done",
+        "outcome": "answered",
+        "detail": "re-verified present at cd48063adec0e9f824e16e9577d1609b854a7e18 in run census-dark_factory-20261024, but structural (contract \u00a76: not re-filed); not re-verified while this task decides the entry",
+        "disposition": "open"
+      },
+      {
+        "entry_id": "entry-cand-20260827-23",
+        "finding_key": null,
+        "project_root": "/home/leo/src/dark-factory",
+        "ticket": null,
+        "task_id": 4964,
+        "task_status": "done",
+        "outcome": "settled",
+        "detail": "fixed",
+        "disposition": "fixed:cd48063adec0e9f824e16e9577d1609b854a7e18"
+      },
+      {
+        "entry_id": "entry-cand-20260831-16",
+        "finding_key": null,
+        "project_root": "/home/leo/src/dark-factory",
+        "ticket": null,
+        "task_id": 5120,
+        "task_status": "cancelled",
+        "outcome": "abandoned",
+        "detail": "not sighted this run",
+        "disposition": "open"
+      },
+      {
+        "entry_id": "entry-cand-20260907-21",
+        "finding_key": null,
+        "project_root": "/home/leo/src/dark-factory",
+        "ticket": null,
+        "task_id": 5332,
+        "task_status": "done",
+        "outcome": "settled",
+        "detail": "fixed",
+        "disposition": "fixed:cd48063adec0e9f824e16e9577d1609b854a7e18"
+      },
+      {
+        "entry_id": "entry-cand-20260912-25",
+        "finding_key": null,
+        "project_root": "/home/leo/src/dark-factory",
+        "ticket": null,
+        "task_id": 5520,
+        "task_status": "cancelled",
+        "outcome": "abandoned",
+        "detail": "not sighted this run",
+        "disposition": "open"
+      },
+      {
+        "entry_id": "entry-cand-20260918-19",
+        "finding_key": null,
+        "project_root": "/home/leo/src/dark-factory",
+        "ticket": null,
+        "task_id": 5683,
+        "task_status": "done",
+        "outcome": "settled",
+        "detail": "fixed",
+        "disposition": "open"
+      },
+      {
+        "entry_id": "entry-cand-20260915-20",
+        "finding_key": null,
+        "project_root": "/home/leo/src/dark-factory",
+        "ticket": null,
+        "task_id": 5684,
+        "task_status": "done",
+        "outcome": "settled",
+        "detail": "fixed",
+        "disposition": "fixed:cd48063adec0e9f824e16e9577d1609b854a7e18"
+      },
+      {
+        "entry_id": "entry-cand-20260915-21",
+        "finding_key": null,
+        "project_root": "/home/leo/src/dark-factory",
+        "ticket": null,
+        "task_id": 5685,
+        "task_status": "done",
+        "outcome": "settled",
+        "detail": "fixed",
+        "disposition": "fixed:cd48063adec0e9f824e16e9577d1609b854a7e18"
+      },
+      {
+        "entry_id": "entry-cand-20260919-1",
+        "finding_key": null,
+        "project_root": "/home/leo/src/dark-factory",
+        "ticket": null,
+        "task_id": 5686,
+        "task_status": "done",
+        "outcome": "settled",
+        "detail": "fixed",
+        "disposition": "open"
+      },
+      {
+        "entry_id": "entry-cand-20260919-2",
+        "finding_key": null,
+        "project_root": "/home/leo/src/dark-factory",
+        "ticket": null,
+        "task_id": 5687,
+        "task_status": "done",
+        "outcome": "corrected",
+        "detail": null,
+        "disposition": "open"
+      },
+      {
+        "entry_id": "entry-cand-20260919-3",
+        "finding_key": null,
+        "project_root": "/home/leo/src/dark-factory",
+        "ticket": null,
+        "task_id": 5688,
+        "task_status": "done",
+        "outcome": "settled",
+        "detail": "fixed",
+        "disposition": "open"
+      },
+      {
+        "entry_id": "entry-cand-20260916-17",
+        "finding_key": null,
+        "project_root": "/home/leo/src/dark-factory",
+        "ticket": null,
+        "task_id": 5689,
+        "task_status": "done",
+        "outcome": "settled",
+        "detail": "fixed",
+        "disposition": "fixed:cd48063adec0e9f824e16e9577d1609b854a7e18"
+      },
+      {
+        "entry_id": "entry-cand-20260916-18",
+        "finding_key": null,
+        "project_root": "/home/leo/src/dark-factory",
+        "ticket": null,
+        "task_id": 5690,
+        "task_status": "done",
+        "outcome": "settled",
+        "detail": "fixed",
+        "disposition": "fixed:cd48063adec0e9f824e16e9577d1609b854a7e18"
+      },
+      {
+        "entry_id": "entry-cand-20260921-25",
+        "finding_key": null,
+        "project_root": "/home/leo/src/dark-factory",
+        "ticket": null,
+        "task_id": 5876,
+        "task_status": "done",
+        "outcome": "settled",
+        "detail": "fixed",
+        "disposition": "fixed:cd48063adec0e9f824e16e9577d1609b854a7e18"
+      },
+      {
+        "entry_id": "entry-cand-20260921-26",
+        "finding_key": "fk-c1df06e83aa5",
+        "project_root": "/home/leo/src/dark-factory",
+        "ticket": null,
+        "task_id": 7073,
+        "task_status": "done",
+        "outcome": "present",
+        "detail": 7073,
+        "disposition": "filed:11555"
+      },
+      {
+        "entry_id": "entry-cand-20260929-1",
+        "finding_key": "fk-282c6e761d54",
+        "project_root": "/home/leo/src/dark-factory",
+        "ticket": null,
+        "task_id": 7074,
+        "task_status": "done",
+        "outcome": "gone",
+        "detail": "d575b86d667efce5b6fe883f20c6c4810729e9c0",
+        "disposition": "fixed:d575b86d667efce5b6fe883f20c6c4810729e9c0"
+      },
+      {
+        "entry_id": "entry-cand-20261008-5",
+        "finding_key": "fk-9c36e1e93a30",
+        "project_root": "/home/leo/src/dark-factory",
+        "ticket": "tkt_0RW5FRBDGRGS9ZC4KJCHG6JN0B",
+        "task_id": 7438,
+        "task_status": "done",
+        "outcome": "gone",
+        "detail": "d575b86d667efce5b6fe883f20c6c4810729e9c0",
+        "disposition": "fixed:d575b86d667efce5b6fe883f20c6c4810729e9c0"
+      },
+      {
+        "entry_id": "entry-cand-20260922-3",
+        "finding_key": "fk-69414b6740fe",
+        "project_root": "/home/leo/src/dark-factory",
+        "ticket": "tkt_0RW5FRBTQM864TQ7K3NFHM6H5K",
+        "task_id": 7439,
+        "task_status": "done",
+        "outcome": "gone",
+        "detail": "d575b86d667efce5b6fe883f20c6c4810729e9c0",
+        "disposition": "fixed:d575b86d667efce5b6fe883f20c6c4810729e9c0"
+      },
+      {
+        "entry_id": "entry-cand-20260911-28",
+        "finding_key": "fk-e18c7f482a29",
+        "project_root": "/home/leo/src/dark-factory",
+        "ticket": "tkt_0RW5FRC08TTDX8HFPEYMBKZKDV",
+        "task_id": 7440,
+        "task_status": "done",
+        "outcome": "present",
+        "detail": 7440,
+        "disposition": "filed:11556"
+      },
+      {
+        "entry_id": "entry-cand-20260918-18",
+        "finding_key": "fk-a69ec55ddc08",
+        "project_root": "/home/leo/src/dark-factory",
+        "ticket": "tkt_0RW5FRC7ET51RZA763BVXH7ZAA",
+        "task_id": 7441,
+        "task_status": "done",
+        "outcome": "outranked",
+        "detail": 7442,
+        "disposition": "open"
+      },
+      {
+        "entry_id": "entry-cand-20260918-18",
+        "finding_key": "fk-a69ec55ddc08",
+        "project_root": "/home/leo/src/dark-factory",
+        "ticket": null,
+        "task_id": 7442,
+        "task_status": "done",
+        "outcome": "present-structural",
+        "detail": null,
+        "disposition": "open"
+      },
+      {
+        "entry_id": "entry-cand-20260916-1",
+        "finding_key": "fk-c2e12c9e2b12",
+        "project_root": "/home/leo/src/dark-factory",
+        "ticket": "tkt_0RW5FRCC10XP47EPHA3X9HRK50",
+        "task_id": 7442,
+        "task_status": "done",
+        "outcome": "present",
+        "detail": 7442,
+        "disposition": "filed:11557"
+      },
+      {
+        "entry_id": "entry-cand-20261030-3",
+        "finding_key": "fk-8dabfa972cc0",
+        "project_root": "/home/leo/src/dark-factory",
+        "ticket": null,
+        "task_id": 6203,
+        "task_status": "done",
+        "outcome": "held",
+        "detail": "ticket tkt_0RWPNGV8JKNXD6N0J024SV0ANK awaits the curator and may become the live task",
+        "disposition": "open"
+      },
+      {
+        "entry_id": "entry-cand-20261030-3",
+        "finding_key": "fk-8dabfa972cc0",
+        "project_root": null,
+        "ticket": "tkt_0RWPNGV8JKNXD6N0J024SV0ANK",
+        "task_id": null,
+        "task_status": null,
+        "outcome": "ticket",
+        "detail": "awaiting the curator",
+        "disposition": "open"
+      },
+      {
+        "entry_id": "entry-cand-20261002-10",
+        "finding_key": "fk-a6083fb7ed86",
+        "project_root": "/home/leo/src/dark-factory",
+        "ticket": null,
+        "task_id": 3160,
+        "task_status": "done",
+        "outcome": "outranked",
+        "detail": 8705,
+        "disposition": "filed:11558"
+      },
+      {
+        "entry_id": "entry-cand-20261002-10",
+        "finding_key": "fk-a6083fb7ed86",
+        "project_root": "/home/leo/src/dark-factory",
+        "ticket": "tkt_0RWPNGVF759WQH288G1WG14GA3",
+        "task_id": 8705,
+        "task_status": "done",
+        "outcome": "present",
+        "detail": 8705,
+        "disposition": "filed:11558"
+      },
+      {
+        "entry_id": "entry-cand-20260921-15",
+        "finding_key": "fk-3335098ac5e9",
+        "project_root": "/home/leo/src/dark-factory",
+        "ticket": null,
+        "task_id": 6123,
+        "task_status": "pending",
+        "outcome": "live",
+        "detail": null,
+        "disposition": "filed:6123"
+      },
+      {
+        "entry_id": "entry-cand-20260912-7",
+        "finding_key": "fk-f9b718ee0766",
+        "project_root": "/home/leo/src/dark-factory",
+        "ticket": "tkt_0RWPNGTE5V8SDX0JVH1Z4EZ55W",
+        "task_id": 5683,
+        "task_status": "done",
+        "outcome": "gone",
+        "detail": "d575b86d667efce5b6fe883f20c6c4810729e9c0",
+        "disposition": "fixed:d575b86d667efce5b6fe883f20c6c4810729e9c0"
+      },
+      {
+        "entry_id": "entry-cand-20260828-22",
+        "finding_key": "fk-534838662cfc",
+        "project_root": "/home/leo/src/dark-factory",
+        "ticket": "tkt_0RWPNGTRS39ZWPVWQQHMDH0MXA",
+        "task_id": 2761,
+        "task_status": "done",
+        "outcome": "gone",
+        "detail": "d575b86d667efce5b6fe883f20c6c4810729e9c0",
+        "disposition": "fixed:d575b86d667efce5b6fe883f20c6c4810729e9c0"
+      },
+      {
+        "entry_id": "entry-cand-20260825-12",
+        "finding_key": "fk-cef39957cd50",
+        "project_root": "/home/leo/src/dark-factory",
+        "ticket": "tkt_0RWPNGTWB2092RMRM1JP3SM9FK",
+        "task_id": 4696,
+        "task_status": "done",
+        "outcome": "present",
+        "detail": 4696,
+        "disposition": "filed:5055"
+      }
+    ],
+    "reverify": {
+      "due": 11,
+      "offered": 11,
+      "gone": 5,
+      "present": 6,
+      "inconclusive": 0,
+      "deferred": 0
+    },
+    "changes": [
+      {
+        "entry_id": "entry-cand-20260929-1",
+        "from_status": "open",
+        "to_status": "fixed",
+        "accepted_by": null,
+        "fixed_at_sha": "d575b86d667efce5b6fe883f20c6c4810729e9c0"
+      },
+      {
+        "entry_id": "entry-cand-20261008-5",
+        "from_status": "open",
+        "to_status": "fixed",
+        "accepted_by": null,
+        "fixed_at_sha": "d575b86d667efce5b6fe883f20c6c4810729e9c0"
+      },
+      {
+        "entry_id": "entry-cand-20260922-3",
+        "from_status": "open",
+        "to_status": "fixed",
+        "accepted_by": null,
+        "fixed_at_sha": "d575b86d667efce5b6fe883f20c6c4810729e9c0"
+      },
+      {
+        "entry_id": "entry-cand-20260912-7",
+        "from_status": "open",
+        "to_status": "fixed",
+        "accepted_by": null,
+        "fixed_at_sha": "d575b86d667efce5b6fe883f20c6c4810729e9c0"
+      },
+      {
+        "entry_id": "entry-cand-20260828-22",
+        "from_status": "open",
+        "to_status": "fixed",
+        "accepted_by": null,
+        "fixed_at_sha": "d575b86d667efce5b6fe883f20c6c4810729e9c0"
+      }
+    ],
+    "refiled": [
+      {
+        "entry_id": "entry-cand-20260921-26",
+        "supersedes_task": 7073,
+        "verified_present": true
+      },
+      {
+        "entry_id": "entry-cand-20260911-28",
+        "supersedes_task": 7440,
+        "verified_present": true
+      },
+      {
+        "entry_id": "entry-cand-20260916-1",
+        "supersedes_task": 7442,
+        "verified_present": true
+      },
+      {
+        "entry_id": "entry-cand-20261002-10",
+        "supersedes_task": 8705,
+        "verified_present": true
+      },
+      {
+        "entry_id": "entry-cand-20260825-12",
+        "supersedes_task": 4696,
+        "verified_present": true
+      }
+    ]
+  },
+  "screened": {
+    "counts": {
+      "title": 0,
+      "session": 0,
+      "key": 0,
+      "cross_instrument": 0
+    },
+    "inputs": {
+      "consumed": [
+        "review-dark_factory-20261009",
+        "hotspot-survey-dark_factory-20261009",
+        "review-all-dark_factory-20261008"
+      ],
+      "note": null
+    },
+    "screened": [],
+    "surfaced": [],
+    "attached": [],
+    "re_observed": []
+  },
+  "adjudication": {
+    "model": "text-embedding-3-small",
+    "thresholds": {
+      "attach_min_similarity": 0.9,
+      "cluster_min_similarity": 0.85
+    },
+    "max_clusters_per_run": 10,
+    "skipped": null,
+    "embedding": {
+      "requests": 1,
+      "embedded": 54,
+      "cached": 1072,
+      "pruned": 21
+    },
+    "queue_depth": {
+      "candidates": 1013,
+      "clusters": 1005
+    },
+    "processed": [
+      {
+        "representative": "cand-20261122-2",
+        "title": "Recon agent repeatedly calls count_memories_by_metadata with undeclared 'metadata' argument instead of declared 'filters'",
+        "members": [
+          "cand-20261117-5",
+          "cand-20261117-7",
+          "cand-20261122-2"
+        ],
+        "sessions": 3,
+        "outcome": "verified"
+      },
+      {
+        "representative": "cand-20261120-1",
+        "title": "Recon agent repeats get_task calls with an undeclared project_id after an explicit unknown_argument rejection and inline schema",
+        "members": [
+          "cand-20261120-1",
+          "cand-20261118-5"
+        ],
+        "sessions": 2,
+        "outcome": "rejected"
+      },
+      {
+        "representative": "cand-20261118-2",
+        "title": "Agent shell cwd left pointing at a worktree another session removed, failing subsequent commands until recovery",
+        "members": [
+          "cand-20261011-3",
+          "cand-20261118-2"
+        ],
+        "sessions": 2,
+        "outcome": "verified"
+      },
+      {
+        "representative": "cand-20260818-15",
+        "title": "Task worktree agents unaware of working directory context for repo-relative paths",
+        "members": [
+          "cand-20260818-5",
+          "cand-20260818-15"
+        ],
+        "sessions": 2,
+        "outcome": "rejected"
+      },
+      {
+        "representative": "cand-20260815-2",
+        "title": "Path-scope guard misconfig in worktree context",
+        "members": [
+          "cand-20260731-12",
+          "cand-20260815-2"
+        ],
+        "sessions": 2,
+        "outcome": "rejected"
+      },
+      {
+        "representative": "cand-20260812-8",
+        "title": "Supervisor rotation prompt mislabeled as User Correction in digest",
+        "members": [
+          "cand-20260801-1",
+          "cand-20260812-8"
+        ],
+        "sessions": 2,
+        "outcome": "rejected"
+      },
+      {
+        "representative": "cand-20260809-14",
+        "title": "Trickle-coder ReportFindings output produces double-wrapped findings with missing schema field",
+        "members": [
+          "cand-20260809-13",
+          "cand-20260809-14"
+        ],
+        "sessions": 2,
+        "outcome": "rejected"
+      },
+      {
+        "representative": "cand-20261123-2",
+        "title": "Plan asserts markup-check behavior on redo tasks without verifying the override-removal ordering, so the plan drops redos it should keep",
+        "members": [
+          "cand-20261123-2"
+        ],
+        "sessions": 1,
+        "outcome": "rejected"
+      },
+      {
+        "representative": "cand-20261123-1",
+        "title": "Ratchet baseline for gates.py growth is not surfaced to planners, so plans assume no baseline update is needed",
+        "members": [
+          "cand-20261123-1"
+        ],
+        "sessions": 1,
+        "outcome": "rejected"
+      },
+      {
+        "representative": "cand-20261122-1",
+        "title": "Lease-claim reports decision=acquired yet exits 2, so exit status cannot signal success",
+        "members": [
+          "cand-20261122-1"
+        ],
+        "sessions": 1,
+        "outcome": "rejected"
+      }
+    ],
+    "attached": [],
+    "inconclusive": null,
+    "mass_rejection": null
+  },
+  "dry_run": null,
+  "withheld": [],
+  "sighting_fit": [],
+  "findings": [
+    {
+      "id": "entry-cand-20261122-3",
+      "key": "fk-bb99b8dda638",
+      "area": "escalation",
+      "sub_area": null,
+      "anchor": "escalation/src/escalation/server.py::resolve_issue",
+      "tags": [
+        "h10",
+        "h3",
+        "kind:confusion"
+      ],
+      "severity": "low",
+      "evidence_source": [
+        "agent-transcripts",
+        "present-tree"
+      ],
+      "statement": "CLAUDE.md tells agents to pass project_root on task operations, which are fused-memory tools. The escalation MCP server's resolve_issue takes no such keyword, so an agent carrying that habit across servers gets a pydantic unexpected_keyword_argument error. The call fails and the agent spends a turn working out the real signature. No guidance says which servers accept project_root. Verifier: Confirmed in the current tree. `escalation/src/escalation/server.py::resolve_issue` (line 2441) has no `project_root` parameter. Its parameters are escalation_id, resolution, action, resolved_by, resolution_turns, resolution_class, granted_files, acknowledge_declared_pins, escalate_model, recut and terminate. Other tools on the same server take an optional `project_root` and pass it through `ProjectRootGuard.check`: the tools at lines 2136, 2249, 3026 and 3206, `get_task_escalation_history` and `get_escalation`. `claim_warm_worktree` and `release_warm_worktree` take a required `project_root`. An agent that follows the repo habit of passing `project_root` can therefore succeed on sibling escalation tools and get an unexpected-keyword error on `resolve_issue`. I did not search the docs for guidance on which servers accept `project_root`, so that part of the claim is unchecked.",
+      "proposal": "Add an optional `project_root: str | None = None` parameter to `resolve_issue` and enforce it with `project_root_guard.check_off_loop`, as the sibling escalation tools do.",
+      "verdict": "confirmed",
+      "disposition": "filed:11553",
+      "first_seen": "census-dark_factory-20261124",
+      "last_seen": [
+        "census-dark_factory-20261124"
+      ],
+      "supersedes": []
+    },
+    {
+      "id": "entry-cand-20261122-2",
+      "key": "fk-f1449a2f494f",
+      "area": "repo",
+      "sub_area": null,
+      "anchor": "slug:recon-count-memories-by-metadata-undeclared-arg",
+      "tags": [
+        "h10",
+        "kind:confusion"
+      ],
+      "severity": "low",
+      "evidence_source": [
+        "agent-transcripts",
+        "present-tree"
+      ],
+      "statement": "The agent passes a filter object under an argument name the fused-memory tool does not declare. The server rejects each call before execution with an error that lists the declared parameters, but the same wrong call shape recurs across three task IDs with no evidence of the correct shape being learned. Verifier: The wrong call shape is a real, recurring failure. The tool declares only project_id and filters, and the server rejects `metadata` as unknown_argument. The cause is not in this tree. The stage prompts already teach the correct shape: fused-memory/src/fused_memory/reconciliation/prompts/stage2.py (lines 227, 238, 336) and stage1.py and stage3.py all write `count_memories_by_metadata(project_id=..., filters={...})`. The agent still guessed `metadata`, which points to the deferred tool schema not being loaded before the call. That is harness tooling, not a file here. The rejection is loud and no state is written. docs/flag-marker-sweep-recurring.md line 767 shows a `source=` kwarg shape, but it is an operator doc, not part of the recon prompts. The codebook already holds many near-duplicate entries.",
+      "proposal": null,
+      "verdict": "confirmed",
+      "disposition": "filed:5968",
+      "first_seen": "census-dark_factory-20261124",
+      "last_seen": [
+        "census-dark_factory-20261124"
+      ],
+      "supersedes": []
+    },
+    {
+      "id": "entry-cand-20261118-2",
+      "key": "fk-7c4ee0eb5759",
+      "area": "repo",
+      "sub_area": null,
+      "anchor": "slug:shell-cwd-removed-worktree",
+      "tags": [
+        "h10",
+        "kind:confusion"
+      ],
+      "severity": "low",
+      "evidence_source": [
+        "agent-transcripts",
+        "present-tree"
+      ],
+      "statement": "A worktree directory that the session's shell was using was removed by another process (the worktree named mut-10723 was deleted while the session worked in carry-10723). The agent's shell cwd then refers to a nonexistent directory, so every later Bash call fails with getcwd or no-such-directory errors, and the agent has to re-issue commands after the shell recovers. Verifier: The evidence is two harness-level messages. One says the working directory no longer exists and the shell cwd was recovered to the repo root. The other is a bash getcwd failure. Both are consistent with a worktree under .claude/worktrees (interactive-session worktrees) being deleted while a session's shell was inside it. The tree has no code that creates or removes .claude/worktrees/mut-* or carry-* directories. The only mention is a config.py comment about skipping nested checkouts when discovering modules. So the cause is in tooling outside this tree, and no specific existing file produces, teaches or fails to guard against it. I could not run shell checks, so I did not confirm which worktrees exist right now.",
+      "proposal": null,
+      "verdict": "confirmed",
+      "disposition": "filed:11554",
+      "first_seen": "census-dark_factory-20261124",
+      "last_seen": [
+        "census-dark_factory-20261124"
+      ],
+      "supersedes": []
+    },
+    {
+      "id": "cand-20261120-1",
+      "key": "fk-17a8a0365263",
+      "area": "fused-memory",
+      "sub_area": null,
+      "anchor": "fused-memory/src/fused_memory/server/tools.py::get_task",
+      "tags": [
+        "h10",
+        "kind:confusion"
+      ],
+      "severity": "low",
+      "evidence_source": [
+        "agent-transcripts"
+      ],
+      "statement": "The agent passes a project_id argument that get_task does not declare, even though the rejection names the declared parameters and the inline schema lists only id, project_root and tag. It repeats the same rejected call across several turns instead of correcting the argument. Each rejection is loud and self-describing, so the failure comes from the agent's call shape, not from a silent or misleading tool contract. Verifier: The tool contract is accurate and loud. `fused-memory/src/fused_memory/server/tools.py::get_task` declares only id, project_root and tag. The rejection names the declared parameters and the closest match, project_root. The cluster itself says the failure comes from the agent's call shape. No file in this tree produces, teaches or fails to guard against it. Many sibling tools do take project_id, so the agent's habit is understandable, but the guard works as designed.",
+      "proposal": null,
+      "verdict": "refuted",
+      "disposition": "refuted",
+      "first_seen": "census-dark_factory-20261124",
+      "last_seen": [
+        "census-dark_factory-20261124"
+      ],
+      "supersedes": []
+    },
+    {
+      "id": "cand-20260818-15",
+      "key": "fk-1b24c833a286",
+      "area": "orchestrator",
+      "sub_area": null,
+      "anchor": "orchestrator/src/orchestrator/agents/bash_cwd_guidance.py::BASH_CWD_ANCHOR_GUIDANCE",
+      "tags": [
+        "h10",
+        "kind:confusion"
+      ],
+      "severity": "low",
+      "evidence_source": [
+        "agent-transcripts"
+      ],
+      "statement": "Orchestrated task agents run within `.worktrees/<id>` with cwd set to worktree root, but attempt to use repo-relative paths (e.g., `orchestrator/src/orchestrator/`) without adjusting for depth or incomplete checkout. No briefing context supplied regarding worktree structure, available sources, or required path adjustments. Verifier: The current tree already guards against this. `orchestrator/src/orchestrator/agents/bash_cwd_guidance.py::BASH_CWD_ANCHOR_GUIDANCE` is spliced into every Bash-capable role preamble at `harness_guidance.py` line 466. It states that the agent starts at the ROOT of its checkout, that a relative path can fail with 'No such file or directory' after a lingering `cd`, and that the fix is to anchor with `git rev-parse --show-toplevel` and to give Read, Grep and Glob absolute paths. `invoke.py::apply_bash_cwd_reset_env` adds a mechanical cwd reset, and `path_not_found_guidance.py` covers recovering a path that was not found. The root CLAUDE.md has the same guidance. Both sightings are from 2026-08-18. This guidance came later, from task 5971 and codebook entry cand-20260729-4, and the current tree shows it as in place. I could not confirm the sightings' cause, which may be a `cd` into a subdirectory. I did not check whether an incomplete worktree checkout contributes.",
+      "proposal": null,
+      "verdict": "refuted",
+      "disposition": "refuted",
+      "first_seen": "census-dark_factory-20261124",
+      "last_seen": [
+        "census-dark_factory-20261124"
+      ],
+      "supersedes": []
+    },
+    {
+      "id": "cand-20260815-2",
+      "key": "fk-48903ce02ba5",
+      "area": "fused-memory",
+      "sub_area": null,
+      "anchor": "fused-memory/src/fused_memory/middleware/path_scope_guard.py",
+      "tags": [
+        "h10",
+        "kind:confusion"
+      ],
+      "severity": "low",
+      "evidence_source": [
+        "agent-transcripts"
+      ],
+      "statement": "Scope guards designed/tested against main checkout paths do not account for ephemeral worktree subdirectories (.worktrees/<id>), causing systematic false-positive blocks on legitimate worktree operations early in task execution Verifier: The cluster's cause, that scope guards ignore .worktrees/<id> subdirectories, is not supported by the current tree. The guard behind DarkFactoryPathScopeViolation is fused-memory/src/fused_memory/middleware/path_scope_guard.py. It scans task or submission text for path tokens and matches them against a project prefix registry built from known_project_roots. It never reads the caller's cwd, and the file does not mention 'worktree' at all. So a worktree-path classification error is not a mechanism it can have. The trips themselves are already recorded. docs/legibility/confusion-codebook.yaml has the entry oneoff-2026-07-01 ('Path-scope guard prose-token matching ... Over-firing scope guards', fix task 2434). It already holds the 2026-08-15 session 78186d80 sighting (turns 3, 21, 33, 57, 87) and the 3106 worktree session. The cause there is prose-token over-firing, not worktree paths, so this cluster is a duplicate with an unverifiable root-cause claim. I did not check the guard's trip behaviour with worktree-prefixed paths in the text.",
+      "proposal": null,
+      "verdict": "refuted",
+      "disposition": "refuted",
+      "first_seen": "census-dark_factory-20261124",
+      "last_seen": [
+        "census-dark_factory-20261124"
+      ],
+      "supersedes": []
+    },
+    {
+      "id": "cand-20260812-8",
+      "key": "fk-a69ec55ddc08",
+      "area": "shared",
+      "sub_area": null,
+      "anchor": "scripts/legibility/reingestion.py::HARNESS_PROMPT_MARKERS",
+      "tags": [
+        "h11",
+        "kind:confusion"
+      ],
+      "severity": "low",
+      "evidence_source": [
+        "agent-transcripts"
+      ],
+      "statement": "Digest generator captures the supervisor-injected rotation limits prompt and categorizes it as a User Correction instead of recognizing it as harness-injected context. Verifier: The current tree no longer shows this confusion. scripts/legibility/reingestion.py::HARNESS_PROMPT_MARKERS contains 'you are running as an autonomous escalation watcher'. is_harness_injected_turn matches it by substring. The digest's gold-turn filter and dialogue carriers consult that function; scripts/legibility/digest.py documents this as rule 7, task 7441. scripts/tests/legibility_carrier_fixtures.py has a WATCHER_ROTATION_PROMPT fixture for this exact prompt. It also has a human-turn param that names the watcher without being injected. I did not run the digest or the tests. I also did not trace the exact filter call inside digest.py's user-corrections iterator, so the verdict rests on the marker, the fixture and digest.py's own description. The sightings are from 2026-08-01 and 2026-08-12, before the marker was added.",
+      "proposal": null,
+      "verdict": "refuted",
+      "disposition": "refuted",
+      "first_seen": "census-dark_factory-20261124",
+      "last_seen": [
+        "census-dark_factory-20261124"
+      ],
+      "supersedes": []
+    },
+    {
+      "id": "cand-20260809-14",
+      "key": "fk-75991adc483b",
+      "area": "fused-memory",
+      "sub_area": null,
+      "anchor": "fused-memory/src/fused_memory/reconciliation/judge.py::JUDGE_VERDICT_SCHEMA",
+      "tags": [
+        "h10",
+        "kind:confusion"
+      ],
+      "severity": "low",
+      "evidence_source": [
+        "agent-transcripts"
+      ],
+      "statement": "Trickle-coder invocation of ReportFindings generates {\"findings\": {\"findings\": [...]}} structure (parameter name matches schema key pattern) and omits required 'severity' field Verifier: The cluster is attributed to the trickle-coder, and I could not confirm that in the tree. `scripts/legibility/coder.py` has no `ReportFindings` or `StructuredOutput` use and no `--json-schema` call. Its output is validated by `codebook.validate_coding_record`, and a schema-invalid record is skipped and counted. The quoted error ('root: must have required property severity, /findings: must be array') matches `JUDGE_VERDICT_SCHEMA` in `fused-memory/src/fused_memory/reconciliation/judge.py`. That schema requires a root `severity` and a `findings` array, and the sessions were in the recon phase, so the sessions were more likely the reconciliation judge. In the tree the schema is correct and is derived from `VerdictSeverity`. The double-wrapped `{findings: {findings: [...]}}` output is a model-side mistake. I found no file in the tree that teaches or fails to guard against it. The tree does not show whether the schema-validation error is retried or surfaced.",
+      "proposal": null,
+      "verdict": "refuted",
+      "disposition": "refuted",
+      "first_seen": "census-dark_factory-20261124",
+      "last_seen": [
+        "census-dark_factory-20261124"
+      ],
+      "supersedes": []
+    },
+    {
+      "id": "cand-20261123-2",
+      "key": "fk-bfb605e0d3d7",
+      "area": "repo",
+      "sub_area": null,
+      "anchor": "slug:redo-markup-override-ordering",
+      "tags": [
+        "h10",
+        "kind:confusion"
+      ],
+      "severity": "low",
+      "evidence_source": [
+        "agent-transcripts"
+      ],
+      "statement": "The planning agent reasoned that the markup check could not reject a redo because the original's text had already passed it. It did not account for the allow_mcp_markup override being removed before the task is saved, so the premise was wrong and the agent had to correct it. Verifier: The underlying fact is true: the markup guard forwards allow_mcp_markup, and the tool bodies strip it before persistence (fused-memory/src/fused_memory/server/tools.py, submit_task and update_task docstrings and strip_markup_override calls). A redo of an original filed with the override can therefore be rejected. This is documented in tools.py, though. I found no redo-task pipeline in the tree that makes or relies on the claim that the markup check cannot reject a redo. The orchestrator's auto_eval_redo.py has no markup logic. The error was in the planning agent's own premise, and I found no existing file that teaches it or fails to guard against it.",
+      "proposal": null,
+      "verdict": "refuted",
+      "disposition": "refuted",
+      "first_seen": "census-dark_factory-20261124",
+      "last_seen": [
+        "census-dark_factory-20261124"
+      ],
+      "supersedes": []
+    },
+    {
+      "id": "cand-20261123-1",
+      "key": "fk-a228fbac9480",
+      "area": "orchestrator",
+      "sub_area": null,
+      "anchor": "orchestrator/tests/merge_lane_ratchet_baseline.json",
+      "tags": [
+        "h11",
+        "kind:confusion"
+      ],
+      "severity": "low",
+      "evidence_source": [
+        "agent-transcripts"
+      ],
+      "statement": "The plan assumed that growth in orchestrator/src/orchestrator/merge_lane/gates.py needed no change to the ratchet baseline. The agent had to correct this mid-session, and a Bash probe of merge_lane_ratchet_baseline.json then failed with exit 1. The ratchet baseline's coupling to file-size and complexity metrics is not visible from the plan's own text. Verifier: The ratchet's coupling to gates.py is documented in the tree. CONTRIBUTING.md section 4 describes the ratchet, the baseline path and the --write-baseline and --authorize-raise flow. The `_README` that scripts/merge_lane_ratchet.py freezes into the baseline spells out the same rules. The baseline lists gates.py with explicit lines, prose_lines and cognitive metrics, so growth there is visibly measured. The cluster's only evidence is one plan that misjudged this and was corrected mid-session. I found no existing file that produces the confusion or fails to guard against it. The Bash exit 1 is not tied to anything in the tree.",
+      "proposal": null,
+      "verdict": "refuted",
+      "disposition": "refuted",
+      "first_seen": "census-dark_factory-20261124",
+      "last_seen": [
+        "census-dark_factory-20261124"
+      ],
+      "supersedes": []
+    },
+    {
+      "id": "cand-20261122-1",
+      "key": "fk-9cfea71d75c0",
+      "area": "orchestrator",
+      "sub_area": null,
+      "anchor": "orchestrator/src/orchestrator/session_registry.py::main",
+      "tags": [
+        "h10",
+        "kind:confusion"
+      ],
+      "severity": "low",
+      "evidence_source": [
+        "agent-transcripts"
+      ],
+      "statement": "session_registry.py lease-claim prints a success decision (decision=acquired, lease acquired) but returns exit code 2, so an agent that trusts the exit code will misread a successful claim as a failure and may retry or abandon it. Verifier: In the current tree, `main()` in orchestrator/src/orchestrator/session_registry.py runs `_run_lease_claim`, which prints `decision=acquired` and returns normally. `main()` then returns 0. The only exit 2 on the lease verbs is `parser.error` for an underivable slug, and that fires before anything is printed. The `except Exception` branches also return 0. So lease-claim cannot print `decision=acquired` and then exit 2. The sighting's exit 2 most likely came from another command in the same compound Bash call, since the evidence starts with a `.worktrees/6701` path. That cause is outside this tree.",
+      "proposal": null,
+      "verdict": "refuted",
+      "disposition": "refuted",
+      "first_seen": "census-dark_factory-20261124",
+      "last_seen": [
+        "census-dark_factory-20261124"
+      ],
+      "supersedes": []
+    },
+    {
+      "id": "entry-cand-20260918-18",
+      "key": "fk-a69ec55ddc08",
+      "area": "shared",
+      "sub_area": null,
+      "anchor": "scripts/legibility/reingestion.py::HARNESS_PROMPT_MARKERS",
+      "tags": [
+        "h11",
+        "h12",
+        "h10",
+        "kind:confusion"
+      ],
+      "severity": "medium",
+      "evidence_source": [
+        "agent-transcripts"
+      ],
+      "statement": "Digest pipeline confuses task-instruction boilerplate (adjudication rubric, prior-round reference list, context) with actual user-provided feedback corrections",
+      "proposal": null,
+      "verdict": "unverified",
+      "disposition": "open",
+      "first_seen": "census-dark_factory-20261024",
+      "last_seen": [
+        "census-dark_factory-20261024",
+        "census-dark_factory-20261031",
+        "census-dark_factory-20261107",
+        "census-dark_factory-20261124"
+      ],
+      "supersedes": []
+    },
+    {
+      "id": "entry-cand-20261030-3",
+      "key": "fk-8dabfa972cc0",
+      "area": "orchestrator",
+      "sub_area": null,
+      "anchor": "orchestrator/src/orchestrator/dry_run_unblock.py::_ALLOWED_TOOLS",
+      "tags": [
+        "h10",
+        "h6",
+        "kind:confusion"
+      ],
+      "severity": "low",
+      "evidence_source": [
+        "agent-transcripts"
+      ],
+      "statement": "The orchestrated task runs with Claude Code in don't-ask permission mode, so the agent's Bash calls for read-only inspection (cat/head/grep on the suppression key and baseline files) are denied. The agent cannot read the gate's own baseline and key files while diagnosing a post-merge verify failure, and the one failed lookup is unrecoverable from inside the session.",
+      "proposal": null,
+      "verdict": "unverified",
+      "disposition": "open",
+      "first_seen": "census-dark_factory-20261031",
+      "last_seen": [
+        "census-dark_factory-20261031",
+        "census-dark_factory-20261124"
+      ],
+      "supersedes": []
+    }
+  ],
+  "area_map": {
+    "briefing": "review/briefing.yaml",
+    "areas": [
+      "dashboard",
+      "escalation",
+      "fused-memory",
+      "orchestrator",
+      "repo",
+      "sampler",
+      "shared"
+    ],
+    "overlay": ".claude/skills/review-all/project.md",
+    "rules": [
+      [
+        "scripts/legibility/**",
+        "shared"
+      ],
+      [
+        "scripts/**",
+        "repo"
+      ]
+    ],
+    "notes": []
+  },
+  "cost_note": "invoke calls: sonnet miner=40, sonnet verify=22, fable synthesis=1, haiku headroom-probe=5"
+}

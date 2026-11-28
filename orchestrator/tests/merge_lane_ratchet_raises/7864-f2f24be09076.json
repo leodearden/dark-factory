@@ -1,0 +1,24 @@
+{
+  "task_id": "7864",
+  "reason": "Net-additive feature (task 7864): the per-script dark-factory preference adds one branch to GitOps._warm_lane_script_candidates, the single search-order home, so resolution, the INFO origin line and the both-paths WARNING all derive from it (heuristic 11).",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/git_ops.py",
+      "baseline": 1567,
+      "current": 1568
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/git_ops.py::GitOps::_warm_lane_script_candidates",
+      "baseline": 0,
+      "current": 1
+    },
+    {
+      "measure": "total:cognitive",
+      "key": "<cluster>",
+      "baseline": 5358,
+      "current": 5359
+    }
+  ]
+}

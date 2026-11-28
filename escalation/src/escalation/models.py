@@ -135,9 +135,11 @@ Declared-dependency marker (default-empty; task 4377):
   being CLOSED.  This marker is protection AT RESOLUTION TIME, driven by
   an explicit declaration; the two are deliberately separate seams.
 
-  SOLE WRITER: `queue.declare_pin`.  Enforcement:
-  `escalation/declared_pins.py::blocking_pin_declarations` consulted by
-  `escalation/server.py::resolve_issue`.
+  WRITERS: a filer may construct a record already declared
+  (`orchestrator/src/orchestrator/deterministic_runner.py::curator_gate_pin`,
+  task 3346); after filing, `queue.declare_pin` is the only writer.
+  Enforcement: `escalation/declared_pins.py::blocking_pin_declarations`
+  consulted by `escalation/server.py::resolve_issue`.
 """
 
 from __future__ import annotations
@@ -146,7 +148,7 @@ import json
 import logging
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Literal, TypedDict
+from typing import TYPE_CHECKING, Literal, NotRequired, TypedDict
 
 if TYPE_CHECKING:
     from shared.task_metadata import TriggerChainSkill
@@ -380,6 +382,10 @@ class LateResolution(TypedDict):
     cannot be populated states a fact the entry does not hold; the coarse
     dismiss/resolve intent that `resolve()` genuinely receives is kept instead.
 
+    `ruled_by_human` is the late caller's assertion that a human ruled, kept
+    here because the record's own flag is terminal state and is not moved.
+    Entries captured before the key existed lack it.
+
     Shape mirrors the Amendment / EvidenceEntry / TrainState TypedDicts.
     TypedDict at runtime is a plain dict; existing from_dict / to_dict /
     asdict() paths are unaffected — round-trip fidelity is unchanged.  Stored
@@ -392,6 +398,7 @@ class LateResolution(TypedDict):
     resolved_by: str | None               # the incoming resolver attribution
     dismiss: bool                         # whether the incoming call asked to dismiss
     prior_resolution_class: str | None    # the stamp this capture superseded, or None
+    ruled_by_human: NotRequired[bool | None]  # the incoming human-ruling assertion
 
 
 # The instruction `escalate_blocker` appends to its response, telling the FILER
@@ -822,8 +829,10 @@ class Escalation:
     # why and is NOT itself a marker (a reason without a declarer blocks
     # nothing).
     #
-    # SOLE WRITER: `queue.declare_pin` (append-order, de-duplicating, blanks
-    # dropped).  Zero migration, same pattern as members / evidence /
+    # WRITERS: a filer may construct the record already declared
+    # (`orchestrator/src/orchestrator/deterministic_runner.py::curator_gate_pin`,
+    # task 3346); after filing, `queue.declare_pin` is the only writer
+    # (append-order, de-duplicating, blanks dropped).  Zero migration, same pattern as members / evidence /
     # train_state / the triage quad / granted_files / filing_claimant_run_id /
     # amendments / root_cause_variants above: legacy JSON without these keys
     # deserialises to []/'' via the from_dict __dataclass_fields__ filter
@@ -875,6 +884,11 @@ class Escalation:
     policy_class: str | None = None
     claimed_at: str | None = None
     claimed_by: str | None = None
+    # The resolver's human-ruling assertion (plans/instruments-honesty-prd.md
+    # decision 9). None = not asserted, which is every legacy record; True = a
+    # human ruled on this record or its sitting docket item. Written only at
+    # the resolve chokepoint. Zero migration via the from_dict filter.
+    ruled_by_human: bool | None = None
     # The merge-halt release marker (task 3876). Sole writer:
     # queue.release_merge_halt. A record carrying halt_released_at never
     # re-owns a merge-queue halt:
@@ -934,6 +948,23 @@ def recut_action_conflict(resolution_action: str | None, recut: bool) -> str | N
     if not recut or resolution_action == 'restart':
         return None
     return f"recut=True applies only to action='restart'; got action={resolution_action!r}"
+
+
+# The wire code of every refusal for a close that states no resolution_class.
+RESOLUTION_CLASS_REQUIRED_CODE: str = 'resolution_class_required'
+# Ladder levels whose close must carry a resolution_class
+# (plans/instruments-honesty-prd.md decision 8).
+CLASS_REQUIRED_LEVELS: frozenset[int] = frozenset({2})
+
+
+def resolution_class_missing(escalation: Escalation, stamped_class: str | None) -> str | None:
+    """Why *escalation* cannot close with *stamped_class*, a missing class, else None."""
+    if stamped_class is not None or escalation.level not in CLASS_REQUIRED_LEVELS:
+        return None
+    return (
+        f'escalation {escalation.id}: a level {escalation.level} close must state its '
+        'resolution_class; the record is unchanged'
+    )
 
 
 def note_to_file_class_conflict(escalation: Escalation, resolution_class: str | None) -> str | None:

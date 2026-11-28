@@ -356,7 +356,7 @@ class TestClaudeEndpointPriceTable:
             model=DEEPSEEK_MODEL,
             prices=table,
             cli_cost_usd=99999.0,  # deliberately wrong — must NOT be used
-            is_local_model=True,
+            cli_cost_untrusted=True,
         )
 
         assert cost_source == 'price_table'
@@ -424,7 +424,7 @@ class TestCacheAwareCandidatePricing:
             model=GLM_MODEL,
             prices=claude_endpoint_price_table(),
             cli_cost_usd=0.0,
-            is_local_model=True,
+            cli_cost_untrusted=True,
         )
 
         assert resolved == (pytest.approx(0.43232032), 'price_table')
@@ -438,7 +438,7 @@ class TestCacheAwareCandidatePricing:
             model=MIMO_PRO_MODEL,
             prices=claude_endpoint_price_table(),
             cli_cost_usd=0.0,
-            is_local_model=True,
+            cli_cost_untrusted=True,
         )
 
         assert cost_source == 'price_table_no_cache_rate'

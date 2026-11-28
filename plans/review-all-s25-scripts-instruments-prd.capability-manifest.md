@@ -84,7 +84,8 @@ dependency is wired.
 **ι — sidecar surface consumers (HELD)**
 - Shared sidecar surface: the producer is S20's C3 leaf, which is not yet filed. **OPEN**
 - The stamper calls `sidecar_for`. It derives the path inline in `_prd_bound_tasks` today. **PASS**
-- The three consumer suffix spellings are gone. They are present today. **PASS**
+- No suffix restatement is left in the stamper, either audit, `delivered_check_polarity` or the
+  corpus helper; task 10341 added the last two. Four are present today. **PASS**
 - DAG direction: θ and 6037 are upstream. S20's leaf is upstream once the release protocol wires it.
   **PASS**
 

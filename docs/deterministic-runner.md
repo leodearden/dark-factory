@@ -9,6 +9,16 @@ name is a member of `deterministic_runner.py`, except `ScriptTimeout`
 (`orchestrator/src/orchestrator/before_done_script.py`) and
 `summarize_predicate_output` (`orchestrator/src/orchestrator/predicate_output.py`).
 
+`run()` acts on the task row as the store holds it at entry, not the row the
+dispatch handed over (task 11430). `_store_row` re-reads it through the
+scheduler's `get_task`; when that read fails, `run()` falls back to the
+dispatched row. A row the store already holds done or cancelled returns DONE
+with no write and no escalation. The scheduler likewise re-reads and re-checks
+its dispatch winner after claiming it
+(`orchestrator/src/orchestrator/scheduler.py::Scheduler._confirm_claim`). So a
+write that lands mid-tick, such as a new dependency or a gate stamp, is seen
+before a gate is re-filed or its preconditions stamped.
+
 Phase β delivers the **pure-gate** pattern
 (`before_done=None`, `always_escalates=True`).
 
@@ -204,10 +214,14 @@ Phase γ **cross-unit** sub-path (`target_unit` ≠ own unit or `ORCH_UNIT` unse
   blocked — reporting the three facts the runner MEASURED and no others
   (task 4252): the budget it overran, the script's own exit code when the
   teardown found it already exited (else that none was produced), and
-  WHICH signal that teardown dispatched — which for the common
-  already-exited shape is none at all, leaving the script's children
-  running and the operator told to go find them.  Never a synthetic rc,
-  and never an assumed kill.
+  WHICH signal that teardown dispatched.  The common already-exited shape
+  gets a whole-group SIGKILL through the leader pidfd held from spawn
+  (task 10370).  When no signal is sent, the script's children are left
+  running and the operator is told to go find them: for example when the
+  script was reaped before that pidfd was taken, when the host lacks
+  pidfds or predates Linux 6.9, or when the group was already empty
+  because whatever still holds the output pipe had left it.  Never a
+  synthetic rc, and never an assumed kill.
 - Re-inspect and verify freshness (B7b), delegated to
   `proc_supervision.RestartPlan.execute()`'s `FreshPidVerify` check
   (task 2238/δ): when the pre-deploy baseline had a persistent MainPID
@@ -557,3 +571,19 @@ owned by a different subsystem — `curator_action` / `curator_justification` /
 curator would invite a reader of the Tier-A list, or a census consumer
 grouping by prefix, to conflate two unrelated actors.  The `human_curator_`
 prefix pairs the stamp unambiguously with its marker.
+
+UPSTREAM HALF (task 3346): rung (ii) acts only at dispatch, after a close.
+To stop the close itself, every curator-gate record is filed with the
+declared pin `task-<id>-human-curator-gate`
+(`shared/src/shared/human_curator_gate.py::curator_gate_declarer`) that
+`deterministic_runner.py::curator_gate_pin` builds. That covers the gate that
+`build_gate_escalation_fields` builds, for both the runner's filing and the
+harness strand re-file, and the `curator_adjudication_missing` re-ask.
+`resolve_issue` therefore refuses any non-park close from any caller,
+header-less connections included, unless `acknowledge_declared_pins` names
+the record. Acknowledge it only once the review is done and stamped, or when
+cancelling the gate, and only when no other declarer shares the record:
+acknowledgement is per record, so it would spend that declarer's pin too.
+Rung (ii) remains the dispatch-time backstop, including
+for closes that bypass `resolve_issue`. Records filed before task 3346 are
+unpinned.

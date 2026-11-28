@@ -366,7 +366,7 @@ fire-and-forget follow-up tasks via `submit_task` as they work.
 
 ### 3.3 Scheduler tick
 
-`Scheduler.acquire_next()` runs a **22-phase pipeline** every tick
+`Scheduler.acquire_next()` runs a **23-phase pipeline** every tick
 (`orchestrator/src/orchestrator/scheduler.py`, `_TICK_PHASE_ORDER`):
 
 ```
@@ -375,11 +375,15 @@ cooldown_gc → redispatch_stranded_blocked → external_dep_policy →
 delivered_check_gate → drain_park_eviction → park_gc → stamp_milestone →
 override_snapshot_gc → compute_priorities → reserve_now → override_diff →
 build_candidates → landed_outbox_gate → already_landed_gate → starvation →
-empty_candidate_gate → psi_gate → select_pins → select_scored
+empty_candidate_gate → psi_gate → select_pins → select_timed_gates →
+select_scored
 ```
 
 The first phase that short-circuits ends the tick early; otherwise
-`select_pins`/`select_scored` produce the next `TaskAssignment`. A task
+`select_pins`/`select_timed_gates`/`select_scored` produce the next
+`TaskAssignment`. A deterministic predicate or pure gate whose milestone has
+opened dispatches ahead of the tier-scored candidates
+(`orchestrator/src/orchestrator/timed_gates.py`). A task
 becomes dispatch-eligible only once every dependency gate is satisfied:
 
 - **Local dependencies** — must be `done`/`cancelled` (terminal); a
@@ -422,9 +426,21 @@ For a normal task, `TaskWorkflow._drive()`
 
 1. **Setup.** Pre-empt-race check → `set_task_status('in-progress', ...)` →
    `git_ops.create_worktree` (branch `task/<id>`, worktree
-   `.worktrees/<id>/`) → task artifacts (`.task/plan.json`, mirrored to a
-   durable `.task-meta/` sidecar so state survives an orchestrator restart).
-   A ghost-loop check (`_recover_if_already_merged`) sends an already-landed
+   `.worktrees/<id>/`) → task artifacts, kept outside the worktree so they
+   survive a worktree reset and an orchestrator restart. Task-lifetime state
+   (plan, iteration log, reviews, verdicts) lives in the task root
+   `.worktrees/.task-meta/task-<id>/`, and per-dispatch exits in the lane
+   root `.worktrees/.task-meta/<lane>/`. The two shapes are owned by
+   `orchestrator/src/orchestrator/artifacts.py::TaskArtifacts.task_root_for`
+   and `orchestrator/src/orchestrator/artifacts.py::TaskArtifacts.meta_root_for`,
+   and each artifact's root by the routing table
+   `orchestrator/src/orchestrator/artifacts.py::ARTIFACT_ROOTS`. The
+   worktree's `.task/plan.json` and `.task/iterations.jsonl` are absolute
+   symlinks into the task root
+   (`orchestrator/src/orchestrator/artifacts.py::LANE_SYMLINKED_ARTIFACTS`),
+   and each link dangles until its target is written: the plan link until
+   the architect creates the plan, the iterations link until the first
+   iteration is logged. A ghost-loop check (`_recover_if_already_merged`) sends an already-landed
    branch straight to `done`.
 2. **Simple-task fast path (optional).** If `metadata.complexity == 'simple'`
    and no hard-blocker token vetoes it (`migration`, `architecture`,
@@ -444,9 +460,20 @@ For a normal task, `TaskWorkflow._drive()`
    a plan.
 4. **EXECUTE.** `_execute_iterations()` runs `implementer` iteratively over
    the plan: RED test → GREEN implementation → commit → mark the step done.
-   After each iteration, a cheap, read-only `judge` agent verdicts whether
-   the diff actually represents substantive completion — deliberately
-   distrusting the plan's own step-done bookkeeping.
+   In evals only, a cheap, read-only `judge` agent verdicts after each
+   iteration whether the diff actually represents substantive completion —
+   deliberately distrusting the plan's own step-done bookkeeping — and a
+   substantive-completion verdict ends EXECUTE early. The eval runner turns
+   it on through `judge_after_each_iteration`
+   (`orchestrator/src/orchestrator/evals/runner.py::build_eval_orch_config`,
+   shadow cells included); production leaves it off, so no production task
+   is judged. Before EXECUTE, and
+   again before the implementer resumes after each escalation resolution,
+   the workflow checks that the lane `.task/plan.json` reads the task's plan
+   (`orchestrator/src/orchestrator/artifacts.py::TaskArtifacts.lane_plan_fault`).
+   It relinks once, and blocks the task as `infra_issue` if the link still
+   does not. The relink WARNING records the size and sha256 of any regular
+   file the relink replaces, and whether its bytes matched the plan.
 5. **VERIFY.** Scoped test/lint/typecheck commands are derived per-module
    and run through a `VerifyRunnerPool` (prefers a remote runner, falls back
    to local). A failure hands off to `debugger` to fix it and re-verify,
@@ -792,7 +819,7 @@ matter most for reasoning about safety:
 | `implementer` | EXECUTE | RED test → GREEN implementation → commit, per plan step; sandboxed | sonnet / xhigh / $10 / 80 (routed to opus above ~12 steps or ~3 modules) |
 | `debugger` | VERIFY failure loop | Fixes test/lint/typecheck failures with minimal changes; sandboxed | sonnet / xhigh / $5 / 50 |
 | `reviewer_comprehensive` | REVIEW | Sole reviewer: test quality, reuse, architecture, performance, robustness; read-only | opus / high / $5 / 30 (config resolves `reviewer_comprehensive` → the `reviewer` config key) |
-| `judge` | Post-EXECUTE-iteration | Read-only completion verdict on the diff vs. the plan | sonnet / medium / $0.50 / 15 |
+| `judge` | Post-EXECUTE-iteration, evals only (never in production) | Read-only completion verdict on the diff vs. the plan | sonnet / medium / $0.50 / 15 |
 | `merger` | Merge-conflict resolution | Conservative conflict resolution with a drop-aware protocol | opus / xhigh / $5 / 50 |
 | `steward` | ESCALATED (persistent, per task) | L0 escalation handling; the only role that may set task status | opus / high / $5 / 100 |
 | `deep_reviewer` | ReviewCheckpoint (every ~40 merges) | Cross-task integration review; can file its own tasks/escalations | opus / xhigh / $15 / 100 |

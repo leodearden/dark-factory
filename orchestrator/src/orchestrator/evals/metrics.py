@@ -7,12 +7,13 @@ from dataclasses import asdict, dataclass, fields
 from datetime import UTC, datetime
 from enum import StrEnum
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, TypedDict
 
 # The per-token cost formula and its primitives have a SINGLE home in
 # agents.token_pricing, a leaf module that invoke._estimate_cost prices through
 # too, so runtime and eval figures cannot drift apart.
 from orchestrator.agents.token_pricing import FALLBACK_PRICE, TokenUsage, price_tokens
+from orchestrator.routing import configured_model
 from orchestrator.shadow_types import ReferenceKind
 
 from .cell_sandbox import CellSandbox
@@ -20,13 +21,15 @@ from .measurement import UnmeasuredRecord
 from .plan_predicates import is_scorable_plan
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Iterable, Mapping
 
     # TYPE_CHECKING only, deliberately: this module must not gain a RUNTIME
     # import of orchestrator.artifacts. read_decline_artifacts below reaches
     # the readers by getattr, so it needs the NAME for the signature and
     # nothing at import time.
     from orchestrator.artifacts import TaskArtifacts
+    from orchestrator.config import ModelsConfig
+    from orchestrator.routing import DispatchedRoute
 
 logger = logging.getLogger(__name__)
 
@@ -71,10 +74,38 @@ class RoleUnderTest(StrEnum):
     END_TO_END = 'end_to_end'
 
 
+class EndpointKind(StrEnum):
+    """Who serves the candidate's model, as its config builder declares it.
+
+    Orthogonal to the harness, which ``EvalConfig.backend`` records.
+    """
+
+    NATIVE_ANTHROPIC = 'native_anthropic'
+    """Anthropic's own API serves the model."""
+    SELF_HOSTED_VLLM = 'self_hosted_vllm'
+    """A vLLM server we run, whether a workstation or a RunPod pod."""
+    VENDOR_CLOUD = 'vendor_cloud'
+    """A third-party model vendor's hosted API, metered or subscription, whichever harness drives it."""
+
+
 # The roles an OFAT candidate can vary; END_TO_END is a methodology stage.
 CANDIDATE_ROLES: frozenset[RoleUnderTest] = frozenset({
     RoleUnderTest.IMPLEMENTER, RoleUnderTest.ARCHITECT, RoleUnderTest.JUDGE,
 })
+
+
+class DispatchRecord(TypedDict):
+    """The persisted, JSON-safe form of one distinct route a role ran on."""
+
+    model: str
+    served_model_id: str | None
+    source_layer: str
+    rule_id: str | None
+    # The model the cell config seats for the role (routing.configured_model);
+    # None: the config seats none.
+    configured_model: str | None
+    # The decision's rejected reasons; forensic only, nothing parses them.
+    rejected: list[str]
 
 
 @dataclass
@@ -106,6 +137,17 @@ class EvalMetrics:
     # trustworthy native-cloud source) so a result JSON persisted before this
     # field existed reads back sanely.
     cost_source: str = 'cli'
+    # True when the role's env routed the Claude CLI to a non-Anthropic base URL
+    # (is_proxied_endpoint), so resolve_cost_usd never takes the CLI's own cost
+    # figure. Legacy cells stored this as 'is_local_model' (results.py legacy rule).
+    cli_cost_untrusted: bool = False
+    # The declared EvalConfig.endpoint_kind of the config whose env the cell's
+    # workflow ran under, which is not always the labelled candidate: run_eval's
+    # implementer config (on a judge cell, the pinned implementer, not the judge
+    # candidate), run_end_to_end's impl_config (not the architect), and the
+    # architect config on an architect cell. None for a cell recorded before
+    # task 9970.
+    endpoint_kind: EndpointKind | None = None
     workflow_duration_ms: int = 0
     turns_used: int = 0
     iterations: int = 0          # implementer re-invocations
@@ -142,11 +184,6 @@ class EvalMetrics:
 
     # Inference speed
     tokens_per_second: float = 0.0       # output_tokens / generation_seconds
-    # True when env_overrides has ANTHROPIC_BASE_URL — i.e. a PROXIED endpoint.
-    # Repurposed by Invariant P5 as the cost-source signal: a proxied endpoint's
-    # CLI cost is untrustworthy, so an unlisted model there resolves to
-    # 'unpriced_proxy' (see resolve_cost_usd) rather than the raw CLI number.
-    is_local_model: bool = False
 
     # Derived
     composite_score: float = 0.0
@@ -297,6 +334,11 @@ class EvalMetrics:
     # (evals/fixture_agent_env.py).
     sandbox_backend: CellSandbox | None = None
 
+    # Per role, the distinct routes its invocations ran on. None means not
+    # recorded (a cell before task 8499, or summarising the routes failed);
+    # off_pin_roles reads it.
+    dispatched_models: dict[str, list[DispatchRecord]] | None = None
+
     # Live shadow eval (plans/live-shadow-eval-prd.md C1/C4): the shadow_cells row
     # is the record's home and this is its pointer. None on every non-shadow cell
     # and on every result persisted before these fields existed.
@@ -306,6 +348,8 @@ class EvalMetrics:
     def __post_init__(self) -> None:
         if self.reference_kind is not None:
             self.reference_kind = ReferenceKind(self.reference_kind)
+        if self.endpoint_kind is not None:
+            self.endpoint_kind = EndpointKind(self.endpoint_kind)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -341,6 +385,48 @@ def terminal_kind_of(metrics: dict[str, Any]) -> str | None:
     Pure: no I/O, no mutation.
     """
     return metrics.get('terminal_kind')
+
+
+def dispatched_models(
+    routes: Iterable[DispatchedRoute], models: ModelsConfig,
+) -> dict[str, list[DispatchRecord]]:
+    """Per role, the distinct :class:`DispatchRecord` of *routes*, in first-dispatch
+    order, each stamped with the model *models* seats for that role."""
+    by_role: dict[str, list[DispatchRecord]] = {}
+    for route in routes:
+        record = DispatchRecord(
+            model=route.decision.model,
+            served_model_id=route.served_model_id,
+            source_layer=route.decision.source_layer,
+            rule_id=route.decision.rule_id,
+            configured_model=configured_model(route.role_name, models),
+            rejected=list(route.decision.rejected),
+        )
+        records = by_role.setdefault(route.role_name, [])
+        if record not in records:
+            records.append(record)
+    return by_role
+
+
+def off_pin_roles(dispatched: Mapping[str, list[DispatchRecord]] | None) -> list[str] | None:
+    """THE consumer accessor for :attr:`EvalMetrics.dispatched_models`.
+
+    In an eval cell the config pins a role's model only through its ModelsConfig
+    seat, so the off-pin roles are the sorted roles with a seat that ran any model
+    other than the seated one. A role with no seat (e.g.
+    workflow.py::_RESETTLED_ADJUDICATOR) runs its role default and is never
+    off-pin. ``None`` when the dispatches were not recorded.
+    """
+    if dispatched is None:
+        return None
+    return sorted(
+        role for role, records in dispatched.items()
+        if any(
+            record['configured_model'] is not None
+            and record['model'] != record['configured_model']
+            for record in records
+        )
+    )
 
 
 def _parse_terminal_stamp(value: object) -> datetime | None:
@@ -680,7 +766,7 @@ def resolve_cost_usd(
     model: str,
     prices: dict[str, Any] | None,
     cli_cost_usd: float,
-    is_local_model: bool,
+    cli_cost_untrusted: bool,
 ) -> tuple[float, str]:
     """Resolve ``(cost_usd, cost_source)`` for one invocation's *usage*, per Invariant P5.
 
@@ -696,10 +782,10 @@ def resolve_cost_usd(
       that nonzero cache tokens needed. Those tokens are priced at
       input_per_1m in place of the missing rate, and a WARNING names the
       missing keys.
-    - **cli** — a NATIVE cloud endpoint (``is_local_model=False``) whose model
+    - **cli** — a NATIVE cloud endpoint (``cli_cost_untrusted=False``) whose model
       is unlisted: the CLI's own ``cli_cost_usd`` is trustworthy for the real
       Anthropic API, so it is used verbatim.
-    - **unpriced_proxy** — a PROXIED endpoint (``is_local_model=True`` —
+    - **unpriced_proxy** — a PROXIED endpoint (``cli_cost_untrusted=True`` —
       ``ANTHROPIC_BASE_URL`` set) whose model is unlisted: the CLI cost is
       WRONG for a proxied endpoint, so emit a loud WARNING (mirroring task
       2459) and price the usage at the DEFINED ``FALLBACK_PRICE`` — never a
@@ -722,7 +808,7 @@ def resolve_cost_usd(
         )
         return priced.cost_usd, 'price_table_no_cache_rate'
 
-    if not is_local_model:
+    if not cli_cost_untrusted:
         # Native cloud endpoint — the CLI's own cost figure is trustworthy.
         return cli_cost_usd, 'cli'
 

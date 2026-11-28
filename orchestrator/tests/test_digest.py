@@ -5,6 +5,7 @@ Task 1327 — AFK hardening: Per-N-escalation digest + EWA escalation/done trip.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
 import re
@@ -847,11 +848,38 @@ class TestRenderDigestMarkdown:
         assert 'pending' in md
         assert 'dismissed' in md
 
-    def test_tasks_done_section(self) -> None:
-        """Tasks done in window count is rendered."""
+    def test_landings_section_renders_the_landing_count(self) -> None:
+        inputs = dataclasses.replace(_make_digest_inputs(), landings_count=3)
+        md = digest.render_digest_markdown(inputs)
+        assert '## Landings in window\n3\n' in md
+        assert '## Tasks done in window' not in md
+
+    def test_former_count_is_rendered_only_under_its_label_in_the_ewa_section(self) -> None:
+        inputs = dataclasses.replace(_make_digest_inputs(), landings_count=3)
+        md = digest.render_digest_markdown(inputs)
+        labelled = [line for line in md.splitlines() if digest.DONE_RUNS_LABEL in line]
+        assert len(labelled) == 1
+        assert labelled[0].rstrip().endswith(': 5')
+        ewa_section = md.split('## EWA\n', 1)[1].split('\n## ', 1)[0]
+        assert labelled[0] in ewa_section.splitlines()
+
+    def test_unreadable_landings_render_unavailable_never_zero(self) -> None:
         md = digest.render_digest_markdown(_make_digest_inputs())
-        assert '## Tasks done in window' in md
-        assert '## Tasks done in window\n5\n' in md  # done_count anchored to section header
+        section = md.split('## Landings in window\n', 1)[1].split('\n\n', 1)[0]
+        assert section.startswith('_unavailable')
+        assert section.strip() != '0'
+
+    def test_rollup_column_is_cost_per_done_run(self) -> None:
+        rollup = digest.ModelRoleRollup(rows=[digest.ModelRoleRow(
+            model='opus', role='implementer', invocation_count=1, done_count=1,
+            blocked_count=0, done_rate=1.0, blocked_rate=0.0, capped_count=0,
+            cap_hit_rate=0.0, total_cost_usd=2.5, cost_per_done=2.5,
+        )])
+        inputs = dataclasses.replace(_make_digest_inputs(), model_role_rollup=rollup)
+        md = digest.render_digest_markdown(inputs)
+        header = next(line for line in md.splitlines() if line.startswith('| model | role |'))
+        assert header.rstrip().endswith(f'| {digest.PER_DONE_RUN_LABEL} |')
+        assert '$/done' not in md
 
     def test_cost_section(self) -> None:
         """Cost section includes watcher and total figures for window and 24h."""

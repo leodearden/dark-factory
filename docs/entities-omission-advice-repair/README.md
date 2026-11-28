@@ -119,8 +119,8 @@ that way.
   separate from `census.json`'s. It re-ran the four census searches in all five
   projects. It adds a literal sweep: a read-only scroll of every Mem0 record in
   each project, with the text matched against the patterns it records.
-  `scan_memory_content` cannot do this, because it re-checks every hit with the
-  tool-call-leak detector. The sweep found nine targets that the top-20
+  `scan_memory_content` could not do this, because it re-checked every hit with
+  the tool-call-leak detector (task 4857 fixed this). The sweep found nine targets that the top-20
   searches missed. There are 18 targets in all (13 dark_factory, 5 reify) and
   13 reviewed non-targets. The census was committed before any record was
   changed.

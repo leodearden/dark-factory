@@ -8,6 +8,7 @@ to the worktree, simulating what real agents would do.
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import os
 from pathlib import Path
@@ -849,6 +850,7 @@ class ReplanningReviewStub(AgentStub):
         if self.replans == 0 and role == 'reviewer_comprehensive':
             review = _make_review(role, 'ISSUES_FOUND', [{
                 'severity': 'blocking',
+                'kind': 'test_quality',
                 'location': 'lib.py:5',
                 'category': 'missing_edge_case',
                 'description': 'No test for empty name',
@@ -5518,7 +5520,12 @@ class TestPlanDoneEarlyReturn:
         stub = AgentStub()
         workflow, scheduler = _build_workflow(config, git_ops, task_assignment, stub)
 
-        workflow._plan = AsyncMock(return_value=WorkflowOutcome.PLANNED)
+        async def plan_written(*args, **kwargs):
+            assert workflow.artifacts is not None
+            workflow.artifacts.write_plan(copy.deepcopy(PLAN))
+            return WorkflowOutcome.PLANNED
+
+        workflow._plan = AsyncMock(side_effect=plan_written)
 
         # run()'s SM-2 exit check reads scheduler.get_status back — the real
         # _execute_verify_review_loop body (which would persist 'blocked')

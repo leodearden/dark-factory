@@ -23,7 +23,7 @@ from shared.governed_exceptions import (
     TaskRef,
     governed_exceptions,
 )
-from shared.task_metadata import _BLESSED_METADATA_KEYS, _LEGACY_RETRY_LEDGER_COUNTER_KEYS
+from shared.task_metadata import _BLESSED_METADATA_KEYS
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
@@ -133,15 +133,6 @@ BLESSED_TASK_METADATA_KEYS = governed_exceptions(
     },
 )
 
-LEGACY_RETRY_LEDGER_COUNTER_KEYS = governed_exceptions(
-    'shared.task_metadata._LEGACY_RETRY_LEDGER_COUNTER_KEYS',
-    'A RetryLedger counter that legacy metadata blobs still carry as a top-level key '
-    'instead of nested under retry_ledger, tolerated rather than reported.',
-    list(_LEGACY_RETRY_LEDGER_COUNTER_KEYS),
-    default=Debt(TaskRef(7135)),
-    default_covers=2,
-)
-
 RUFF_CONFIG_SUPPRESSIONS = governed_exceptions(
     'workspace.pyproject_toml.ruff_ignores',
     'A ruff rule turned off in a workspace pyproject.toml, globally or for a file glob, '
@@ -149,7 +140,6 @@ RUFF_CONFIG_SUPPRESSIONS = governed_exceptions(
     ruff_suppression_keys(REPO_ROOT),
     dispositions={
         'tool.ruff.lint.ignore::E501': Policy('inv12-ruff-e501-line-length'),
-        'orchestrator/pyproject.toml::tool.ruff.lint.per-file-ignores::tests/**/*.py::F811': Debt(TaskRef(7137)),
         'orchestrator/pyproject.toml::tool.ruff.lint.per-file-ignores::src/**/*.py::TID251': Debt(TaskRef(8622)),
     },
 )

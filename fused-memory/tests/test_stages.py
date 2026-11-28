@@ -13,6 +13,8 @@ from unittest.mock import ANY, AsyncMock, MagicMock, patch
 import pytest
 import pytest_asyncio
 from _clip_assertions import assert_elided
+from _code_writer_links import assert_writes_c5
+from _count_call_spelling import non_keyword_count_calls
 from _flag_for_stage2_pool_fake import LiveFlagPool
 from _fm_git_repos import init_ab_commit_repo, init_merge_history_repo
 from _fm_helpers import (
@@ -35,6 +37,7 @@ from shared.task_claimant import DEFAULT_CLAIMANT_HEARTBEAT_TTL
 
 import fused_memory.reconciliation.stages.base as base_module
 from fused_memory.config.schema import ReconciliationConfig
+from fused_memory.models.invocation_ledger import InvocationLedger, LedgerRole
 from fused_memory.models.reconciliation import (
     EventSource,
     EventType,
@@ -1120,8 +1123,8 @@ class TestStage1LedgerPresenceWiring:
         )
 
     def test_stage1_prompt_checks_ledger_for_stage2_summary(self):
-        """The actionable Stage-2-summary reconstruct-trigger decision must be keyed
-        to stage='task_knowledge_sync' (the summary Stage 2 writes).
+        """The actionable Stage-2-summary presence decision must be keyed to
+        stage='task_knowledge_sync' (the summary Stage 2 writes).
 
         Asserts the semantic stage-key token rather than the full multi-line call
         signature, so harmless prompt rewording (whitespace, argument order,
@@ -1133,13 +1136,14 @@ class TestStage1LedgerPresenceWiring:
 
         assert "stage='task_knowledge_sync'" in STAGE1_SYSTEM_PROMPT, (
             "Stage 1 must key a presence check on stage='task_knowledge_sync' "
-            'for the Stage-2-summary reconstruct-trigger decision.'
+            'for the Stage-2-summary presence decision.'
         )
 
     def test_stage1_prompt_checks_ledger_for_own_prior_run_summary(self):
         """Stage 1 also audits its OWN prior-run summary (written deterministically
-        by write_stage1_cycle_summary, never LLM-reconstructed) via
-        stage='memory_consolidator' — a presence audit, not a reconstruction trigger.
+        by write_stage1_cycle_summary, never LLM-authored) via
+        stage='memory_consolidator' — a presence audit that only informs the cycle
+        report and never raises a finding.
 
         Asserts the semantic stage-key token rather than the full call signature
         (see test_stage1_prompt_checks_ledger_for_stage2_summary); the two distinct
@@ -2989,9 +2993,7 @@ class TestProactiveSampling:
 
     # --- Step 10: 'Your Task' section includes proactive step ---
 
-    @pytest.mark.asyncio
-    async def test_payload_your_task_includes_proactive_step(self, mock_deps, watermark):
-        """The 'Your Task' section in the payload includes a proactive spot-check instruction."""
+    async def _payload_with_active_tasks(self, mock_deps, watermark) -> str:
         stage = make_configured_task_knowledge_sync_stage(mock_deps, project_id='test_project', project_root='/tmp/test_project')
         mock_deps['taskmaster'].get_tasks.return_value = {
             'tasks': [
@@ -2999,8 +3001,12 @@ class TestProactiveSampling:
                 self._make_task(2, 'blocked'),
             ]
         }
+        return await stage.assemble_payload([], watermark, [])
 
-        payload = await stage.assemble_payload([], watermark, [])
+    @pytest.mark.asyncio
+    async def test_payload_your_task_includes_proactive_step(self, mock_deps, watermark):
+        """The 'Your Task' section in the payload includes a proactive spot-check instruction."""
+        payload = await self._payload_with_active_tasks(mock_deps, watermark)
 
         # The 'Your Task' section should instruct the agent to review the proactive sample
         assert 'Proactive Task Sample' in payload
@@ -3010,6 +3016,16 @@ class TestProactiveSampling:
         assert proactive_step_count >= 1, (
             "The 'Your Task' instruction section should reference the Proactive Task Sample"
         )
+
+    @pytest.mark.asyncio
+    async def test_payload_spells_count_gate_with_keyword_filters(self, mock_deps, watermark):
+        payload = await self._payload_with_active_tasks(mock_deps, watermark)
+
+        offending = non_keyword_count_calls(payload)
+        assert offending == [], (
+            f'Stage 2 payload spells count_memories_by_metadata positionally: {offending}'
+        )
+        assert 'count_memories_by_metadata(' in payload[payload.index('## Your Task'):]
 
     # --- Step: lazy iterable acceptance (task-709) ---
 
@@ -3327,6 +3343,63 @@ class TestRunIdValidation(BaseStageValidationTest):
             )
         assert 'payload' in captured_kwargs
         assert f'run_id: {run_id_value}' in captured_kwargs['payload']
+
+
+class TestStageInvocationLedger(BaseStageValidationTest):
+    """Each stage hands its run's ledger keys to its CLI call and reports its tokens (task 10414)."""
+
+    _STAGES = [
+        pytest.param(MemoryConsolidator, StageId.memory_consolidator, id='stage1'),
+        pytest.param(TaskKnowledgeSync, StageId.task_knowledge_sync, id='stage2'),
+        pytest.param(IntegrityCheck, StageId.integrity_check, id='stage3'),
+    ]
+
+    async def _run_capturing(self, stage) -> tuple[dict, StageReport]:
+        captured: dict = {}
+
+        async def capture_run_stage_via_cli(**kwargs):
+            captured.update(kwargs)
+            return StageResult(
+                success=True,
+                report={'summary': 'ok'},
+                tokens_used=1500,
+                cache_read_tokens=50000,
+                cache_create_tokens=4000,
+            )
+
+        with self._patch_stage(stage, cli_side_effect=capture_run_stage_via_cli):
+            report = await stage.run(
+                events=[],
+                watermark=Watermark(project_id=stage.project_id),
+                prior_reports=[],
+                run_id='run-l',
+            )
+        return captured, report
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(('stage_cls', 'stage_id'), _STAGES)
+    async def test_stage_passes_its_ledger_and_reports_its_tokens(
+        self, mock_deps, stage_cls, stage_id,
+    ):
+        store = MagicMock(name='cost_store')
+        stage = stage_cls(stage_id, **mock_deps, cost_store=store)
+
+        captured, report = await self._run_capturing(stage)
+
+        assert captured['ledger'] == InvocationLedger(
+            store, LedgerRole.for_stage(stage_id), 'run-l', stage.project_id,
+        )
+        assert report.tokens_used == 1500
+        assert report.cache_read_tokens == 50000
+        assert report.cache_create_tokens == 4000
+
+    @pytest.mark.asyncio
+    async def test_stage_without_store_passes_no_ledger(self, mock_deps):
+        stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
+
+        captured, _report = await self._run_capturing(stage)
+
+        assert captured['ledger'] is None
 
 
 class TestStage2GuardrailProjectIdGating:
@@ -4753,30 +4826,30 @@ class TestRunStageCapHandling:
 
 
 # ---------------------------------------------------------------------------
-# _RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS: canonical minutes-scale override
+# RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS: canonical minutes-scale override
 # forwarded to invoke_with_cap_retry (task 1401); single value pin lives here.
 # ---------------------------------------------------------------------------
 
 
 class TestCliStageRunnerCapWaitSanityBound:
-    """_RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS is the single canonical constant
+    """RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS is the single canonical constant
     imported by all three stage runners and forwarded to invoke_with_cap_retry;
     prevents stalling the reconciliation queue under cap."""
 
     def test_constant_importable_and_minutes_scale(self):
-        """(a) _RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS is importable from
+        """(a) RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS is importable from
         fused_memory.reconciliation and pinned to the documented 30-min policy."""
         from fused_memory.reconciliation import (
-            _RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS,
+            RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS,
         )
 
-        assert _RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS == 1800.0
+        assert RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS == 1800.0
 
     @pytest.mark.asyncio
     async def test_run_stage_via_cli_forwards_cap_wait_sanity_secs(self, tmp_path):
-        """(b) run_stage_via_cli forwards cap_wait_sanity_secs=_RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS."""
+        """(b) run_stage_via_cli forwards cap_wait_sanity_secs=RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS."""
         from fused_memory.reconciliation import (
-            _RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS,
+            RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS,
         )
 
         config = ReconciliationConfig(
@@ -4799,7 +4872,7 @@ class TestCliStageRunnerCapWaitSanityBound:
                 config=config,
                 mcp_config={'mcpServers': {}},
             )
-        assert mock.call_args.kwargs['cap_wait_sanity_secs'] == _RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS
+        assert mock.call_args.kwargs['cap_wait_sanity_secs'] == RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS
 
 
 # ---------------------------------------------------------------------------
@@ -10304,6 +10377,10 @@ class TestTrackFlagPersistence:
 
         assert result == {'flag-A': 3}  # 2 prior + 1 (this cycle)
         memory_service.add_memory.assert_awaited_once()
+        # C5: a flag marker has no subject task, and names no task status.
+        assert_writes_c5(
+            memory_service.add_memory.await_args.kwargs, project_id='reify', subject=None,
+        )
 
     @pytest.mark.asyncio
     async def test_count_called_with_metadata_filter_for_flag_id(self):
@@ -10447,6 +10524,8 @@ class TestWriteEscalationMarkers:
         assert meta.get('source') == 'stage2_escalation_marker'
         assert meta.get('flag_id') == 'flag-Y'
         assert meta.get('run_id') == 'run-7'
+        # C5: a flag marker has no subject task, and names no task status.
+        assert_writes_c5(call.kwargs, project_id='proj', subject=None)
 
     @pytest.mark.asyncio
     async def test_write_failure_logs_warning_does_not_raise(self, caplog):

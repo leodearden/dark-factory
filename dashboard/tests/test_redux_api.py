@@ -16,9 +16,14 @@ from dashboard.data.datum import (
 )
 from dashboard.data.escalation_corpus import EscalationView
 from dashboard.data.label_spans import labels_from_spans
-from dashboard.data.memory import WRITE_QUEUE_FRESHNESS_BOUND_SECONDS, write_queue_datum
-from dashboard.data.merge_queue import MergeAttempts, TrainThroughput
-from dashboard.data.performance import PerformanceCards, PerformanceListing
+from dashboard.data.memory import (
+    PLAN_ROUTE_FRESHNESS_BOUND_SECONDS,
+    WRITE_QUEUE_FRESHNESS_BOUND_SECONDS,
+    plan_route_datum,
+    write_queue_datum,
+)
+from dashboard.data.merge_queue import MergeAttempts, TrainThroughput, trailing_landing_rates
+from dashboard.data.performance import PerformanceCards, PerformanceHistory, PerformanceListing
 from dashboard.data.reconciliation import AgentActivity
 from dashboard.project_labels import ProjectLabels
 
@@ -221,7 +226,15 @@ def _queue_datum(*, pending=0, retry=0, dead=0, oldest=None, measured_at=_MEMORY
     )
 
 
+def _plan_route_reading(*, state='ok', measured_at=_MEMORY_SERVED_AT, **fields):
+    """A reachable plan-route reading, built by its real producer."""
+    return plan_route_datum(
+        {**_ONLINE_STATUS, 'plan_route': {'state': state, **fields}}, measured_at=measured_at,
+    )
+
+
 def _shape_memory(status, queue=None, **kwargs):
+    kwargs.setdefault('plan_route', _plan_route_reading())
     return redux_api.shape_memory(
         status,
         _queue_datum() if queue is None else queue,
@@ -288,6 +301,55 @@ def test_shape_memory_ages_a_queue_reading_past_its_bound():
     assert stats['state'] == 'stale'
     assert stats['value']['pending'] == 1
     assert 'freshness bound' in stats['reason']
+
+
+_CAPPED_ROUTE = {
+    'state': 'capped',
+    'capped_since': '2026-10-03T11:40:00+00:00',
+    'resets_at': '2026-10-03T16:00:00+00:00',
+    'next_probe_at': '2026-10-03T12:10:00+00:00',
+    'parked_items': 3,
+    'judge_fail_opens_since_latch': 2,
+    'escalation_id': 'esc-plan-route-capped-1',
+}
+
+
+@pytest.mark.parametrize('status', [_ONLINE_STATUS, _OFFLINE_STATUS], ids=['online', 'offline'])
+def test_shape_memory_serves_the_plan_route_on_both_branches(status):
+    """get_status's plan_route is one Datum served the same whether the stores answered."""
+    measured_at = _MEMORY_SERVED_AT - timedelta(seconds=5)
+    plan_route = _plan_route_reading(measured_at=measured_at, **_CAPPED_ROUTE)
+    body = _shape_memory(status, plan_route=plan_route)
+    served = body['MEMORY_STATUS']['plan_route']
+    assert served == plan_route.to_wire()
+    assert served['state'] == 'fresh'
+    assert served['value']['state'] == 'capped'
+    assert served['value']['parked_items'] == 3
+    assert served['as_of'] == measured_at.isoformat()
+
+
+@pytest.mark.parametrize('status', [_ONLINE_STATUS, _OFFLINE_STATUS], ids=['online', 'offline'])
+def test_shape_memory_serves_an_unmeasured_plan_route_as_unknown(status):
+    plan_route = unknown_datum('get_status reports no plan_route', PLAN_ROUTE_FRESHNESS_BOUND_SECONDS)
+    served = _shape_memory(status, plan_route=plan_route)['MEMORY_STATUS']['plan_route']
+    assert served['state'] == 'unknown'
+    assert served['value'] is None
+    assert served['reason'] == 'get_status reports no plan_route'
+
+
+def test_shape_memory_ages_a_plan_route_reading_past_its_bound():
+    measured_at = _MEMORY_SERVED_AT - timedelta(seconds=PLAN_ROUTE_FRESHNESS_BOUND_SECONDS + 30)
+    plan_route = _plan_route_reading(measured_at=measured_at, **_CAPPED_ROUTE)
+    served = _shape_memory(_ONLINE_STATUS, plan_route=plan_route)['MEMORY_STATUS']['plan_route']
+    assert served['state'] == 'stale'
+    assert served['value']['state'] == 'capped'
+    assert 'freshness bound' in served['reason']
+
+
+def test_shape_memory_refuses_a_plan_route_that_is_not_a_datum():
+    with pytest.raises(DatumContractError) as raised:
+        _shape_memory(_ONLINE_STATUS, plan_route={'state': 'ok'})
+    assert raised.value.invariant is DatumInvariant.DATUM_REQUIRED
 
 
 def test_shape_memory_payload_carries_served_at():
@@ -373,7 +435,7 @@ def _basic_status_and_queue():
 
 def test_shape_memory_wal_offline_when_wal_missing():
     status, queue = _basic_status_and_queue()
-    body = redux_api.shape_memory(status, queue, served_at=_MEMORY_SERVED_AT, wal=None)
+    body = _shape_memory(status, queue, wal=None)
     wal = body['MEMORY_STATUS']['wal']
     assert wal['status'] == 'offline'
     assert wal['rows'] == []
@@ -381,8 +443,8 @@ def test_shape_memory_wal_offline_when_wal_missing():
 
 def test_shape_memory_wal_offline_payload_propagates_error():
     status, queue = _basic_status_and_queue()
-    body = redux_api.shape_memory(
-        status, queue, served_at=_MEMORY_SERVED_AT, wal={'offline': True, 'error': 'unreachable'},
+    body = _shape_memory(
+        status, queue, wal={'offline': True, 'error': 'unreachable'},
     )
     wal = body['MEMORY_STATUS']['wal']
     assert wal['status'] == 'offline'
@@ -393,7 +455,7 @@ def test_shape_memory_wal_ok_when_all_rows_healthy():
     from datetime import UTC, datetime
     now_iso = datetime.now(UTC).isoformat()
     status, queue = _basic_status_and_queue()
-    body = redux_api.shape_memory(status, queue, served_at=_MEMORY_SERVED_AT, wal={
+    body = _shape_memory(status, queue, wal={
         'stores': {
             'http://srv': {
                 'task_backend': {'ts': now_iso, 'busy': 0, 'log': 12, 'checkpointed': 12,
@@ -415,7 +477,7 @@ def test_shape_memory_wal_red_on_busy_row():
     from datetime import UTC, datetime
     now_iso = datetime.now(UTC).isoformat()
     status, queue = _basic_status_and_queue()
-    body = redux_api.shape_memory(status, queue, served_at=_MEMORY_SERVED_AT, wal={
+    body = _shape_memory(status, queue, wal={
         'stores': {'http://srv': {
             'recon_journal': {'ts': now_iso, 'busy': 1, 'log': 200, 'checkpointed': 0,
                               'detail': None},
@@ -431,7 +493,7 @@ def test_shape_memory_wal_warn_on_log_frames_overflow():
     from datetime import UTC, datetime
     now_iso = datetime.now(UTC).isoformat()
     status, queue = _basic_status_and_queue()
-    body = redux_api.shape_memory(status, queue, served_at=_MEMORY_SERVED_AT, wal={
+    body = _shape_memory(status, queue, wal={
         'stores': {'http://srv': {
             'event_buffer': {'ts': now_iso, 'busy': 0, 'log': 10_000, 'checkpointed': 10_000,
                              'detail': None},
@@ -446,7 +508,7 @@ def test_shape_memory_wal_red_on_stale_ts():
     from datetime import UTC, datetime, timedelta
     old_iso = (datetime.now(UTC) - timedelta(hours=2)).isoformat()
     status, queue = _basic_status_and_queue()
-    body = redux_api.shape_memory(status, queue, served_at=_MEMORY_SERVED_AT, wal={
+    body = _shape_memory(status, queue, wal={
         'stores': {'http://srv': {
             'write_journal': {'ts': old_iso, 'busy': 0, 'log': 5, 'checkpointed': 5,
                               'detail': None},
@@ -468,7 +530,7 @@ def test_shape_wal_status_red_on_corrupt_ts(caplog):
 
     status, queue = _basic_status_and_queue()
     with caplog.at_level(logging.WARNING):
-        body = redux_api.shape_memory(status, queue, served_at=_MEMORY_SERVED_AT, wal={
+        body = _shape_memory(status, queue, wal={
             'stores': {'http://srv': {
                 'task_backend': {
                     'ts': 'not-a-date',
@@ -506,7 +568,7 @@ def test_shape_wal_status_ok_on_valid_recent_ts():
     from datetime import UTC, datetime
     now_iso = datetime.now(UTC).isoformat()
     status, queue = _basic_status_and_queue()
-    body = redux_api.shape_memory(status, queue, served_at=_MEMORY_SERVED_AT, wal={
+    body = _shape_memory(status, queue, wal={
         'stores': {'http://srv': {
             'task_backend': {'ts': now_iso, 'busy': 0, 'log': 0, 'checkpointed': 0,
                              'detail': None},
@@ -523,7 +585,7 @@ def test_shape_wal_status_benign_on_missing_ts(caplog):
 
     status, queue = _basic_status_and_queue()
     with caplog.at_level(logging.WARNING):
-        body = redux_api.shape_memory(status, queue, served_at=_MEMORY_SERVED_AT, wal={
+        body = _shape_memory(status, queue, wal={
             'stores': {'http://srv': {
                 'task_backend': {'ts': None, 'busy': 0, 'log': 0, 'checkpointed': 0,
                                  'detail': None},
@@ -693,9 +755,12 @@ _MQ_MEASURED_QUEUE = {
     'runs_db_present': True,
     'speculative': _mq_read({'hit_count': 0, 'discard_count': 0, 'total': 0, 'hit_rate': None}),
     'recent_total': _mq_read(0),
-    'depth_timeseries': _mq_read({'labels': [], 'values': [], 'bucket_minutes': 15}),
+    'depth_timeseries': _mq_read({'labels': [], 'values': []}),
     'attempts': _mq_read(MergeAttempts()),
     'train_throughput': _mq_read(_MQ_ZERO_THROUGHPUT),
+    'landing_rate': _mq_read({
+        'labels': [], 'values': [], 'trailing_minutes': 1440, 'window_mean_per_day': 0.0,
+    }),
 }
 """The queue fields the route resolves for every project: here, a measured empty queue."""
 
@@ -716,14 +781,14 @@ def test_shape_merge_queue_relabels_and_renames_depth():
             'recent': [_mq_titled('17')],
             'active': [],
             **_MQ_MEASURED_QUEUE,
-            'depth_timeseries': _mq_read({'labels': [0, 1], 'values': [3, 4], 'bucket_minutes': 60}),
+            'depth_timeseries': _mq_read({'labels': [0, 1], 'values': [3, 4]}),
         },
     }
     body = redux_api.shape_merge_queue(raw, served_at=MQ_SERVED_AT, labels=_BASENAME_LABELS)
     assert 'dark-factory' in body['MERGE_QUEUE']
     section = body['MERGE_QUEUE']['dark-factory']
     assert section['depth']['state'] == 'fresh'
-    assert section['depth']['value'] == {'labels': [0, 1], 'values': [3, 4], 'bucket_minutes': 60}
+    assert section['depth']['value'] == {'labels': [0, 1], 'values': [3, 4]}
     assert _task_ids(section['recent']) == ['17']
     # Default: no halt_status passed → offline fallback per project.
     assert section['halt'] == {'offline': True}
@@ -731,24 +796,65 @@ def test_shape_merge_queue_relabels_and_renames_depth():
 
 def test_shape_merge_queue_trims_the_depths_leading_zero_buckets():
     """Leading empty buckets are dropped; an interior zero is an activity gap and stays."""
-    series = {'labels': ['a', 'b', 'c', 'd'], 'values': [0, 3, 0, 4], 'bucket_minutes': 15}
+    series = {'labels': ['a', 'b', 'c', 'd'], 'values': [0, 3, 0, 4]}
 
     depth = _shaped(depth_timeseries=_mq_read(series))['depth']
 
-    assert depth['value'] == {'labels': ['b', 'c', 'd'], 'values': [3, 0, 4], 'bucket_minutes': 15}
-
-
-def test_shape_merge_queue_serves_no_width_for_a_depth_that_names_none():
-    """A depth series without bucket_minutes serves None for it, never a guessed width."""
-    depth = _shaped(depth_timeseries=_mq_read({'labels': [], 'values': []}))['depth']
-
-    assert depth['value'] == {'labels': [], 'values': [], 'bucket_minutes': None}
+    assert depth['value'] == {'labels': ['b', 'c', 'd'], 'values': [3, 0, 4]}
 
 
 def test_shape_merge_queue_serves_an_unread_depth_as_unknown():
     unread = unknown_datum('the merge_attempt depth series could not be read from runs.db', 30)
 
     assert _shaped(depth_timeseries=unread)['depth'] == unread.to_wire()
+
+
+def test_shape_merge_queue_serves_the_landing_rate_with_leading_zero_points_trimmed():
+    """Leading zero points are dropped; an interior zero is a measured lull and stays."""
+    series = {
+        'labels': ['a', 'b', 'c', 'd'], 'values': [0, 2.0, 0, 1.5],
+        'trailing_minutes': 1440, 'window_mean_per_day': 0.5,
+    }
+
+    rate = _shaped(landing_rate=_mq_read(series))['landing_rate']
+
+    assert rate['state'] == 'fresh'
+    assert rate['value'] == {
+        'labels': ['b', 'c', 'd'], 'values': [2.0, 0, 1.5],
+        'trailing_minutes': 1440, 'window_mean_per_day': 0.5,
+    }
+
+
+def test_shape_merge_queue_serves_a_trimmed_landing_rates_window_mean_as_landings_per_window_day():
+    """The served mean counts the whole window, not the points left after the leading-zero trim."""
+    now = MQ_SERVED_AT
+    series = trailing_landing_rates(
+        [now - timedelta(hours=49), now - timedelta(hours=1)], now=now, hours=168,
+    )
+
+    rate = _shaped(landing_rate=_mq_read(series))['landing_rate']
+
+    assert len(rate['value']['labels']) < len(series['labels'])
+    assert rate['value']['window_mean_per_day'] == pytest.approx(2 / 7)
+
+
+def test_shape_merge_queue_serves_a_never_landed_window_as_a_measured_empty_rate():
+    series = {
+        'labels': ['a', 'b'], 'values': [0, 0], 'trailing_minutes': 1440, 'window_mean_per_day': 0.0,
+    }
+
+    rate = _shaped(landing_rate=_mq_read(series))['landing_rate']
+
+    assert rate['state'] == 'fresh'
+    assert rate['value'] == {
+        'labels': [], 'values': [], 'trailing_minutes': 1440, 'window_mean_per_day': 0.0,
+    }
+
+
+def test_shape_merge_queue_serves_an_unread_landing_rate_as_unknown():
+    unread = unknown_datum('the landings could not be read from runs.db: OperationalError: boom', 30)
+
+    assert _shaped(landing_rate=unread)['landing_rate'] == unread.to_wire()
 
 
 def test_shape_merge_queue_carries_the_recent_window_total():
@@ -1005,11 +1111,9 @@ def _perf_listing(cards: dict[str, Datum[PerformanceCards]]) -> PerformanceListi
     return PerformanceListing(cards=cards, listed=listed)
 
 
-_PERF_HISTORY = {
-    'time_centiles_history': {'labels': ['2026-09-30T11:00'], 'p50': [60_000], 'p95': [90_000]},
-    'one_pass_history': {'labels': ['2026-09-30T11:00'], 'values': [100.0]},
-    'escalation_history': {'labels': ['2026-09-30T11:00'], 'values': [0.0]},
-}
+_PERF_HISTORY = PerformanceHistory(
+    labels=('2026-09-30T11:00',), p50=(60_000,), p95=(90_000,), one_pass=(100.0,), escalation=(0.0,),
+)
 
 
 def test_shape_performance_entry_is_the_cards_datum_beside_its_histories():
@@ -1021,10 +1125,15 @@ def test_shape_performance_entry_is_the_cards_datum_beside_its_histories():
         served_at=_PERF_SERVED_AT,
     )
     entry = body['PERFORMANCE']['p1']
-    assert set(entry) == {'cards', 'time_centiles_history', 'one_pass_history', 'escalation_history'}
+    assert set(entry) == {
+        'cards', 'history_labels', 'time_centiles_history', 'one_pass_history', 'escalation_history',
+    }
     assert entry['cards'] == cards.to_wire()
     assert entry['cards']['as_of'] == '2026-09-30T11:00:00+00:00'
-    assert entry['time_centiles_history'] == _PERF_HISTORY['time_centiles_history']
+    assert entry['history_labels'] == ['2026-09-30T11:00']
+    assert entry['time_centiles_history'] == {'p50': [60_000], 'p95': [90_000]}
+    assert entry['one_pass_history'] == {'values': [100.0]}
+    assert entry['escalation_history'] == {'values': [0.0]}
 
 
 def test_shape_performance_project_without_history_gets_empty_blocks():
@@ -1033,9 +1142,10 @@ def test_shape_performance_project_without_history_gets_empty_blocks():
         served_at=_PERF_SERVED_AT,
     )
     entry = body['PERFORMANCE']['p1']
-    assert entry['time_centiles_history'] == {'labels': [], 'p50': [], 'p95': []}
-    assert entry['one_pass_history'] == {'labels': [], 'values': []}
-    assert entry['escalation_history'] == {'labels': [], 'values': []}
+    assert entry['history_labels'] == []
+    assert entry['time_centiles_history'] == {'p50': [], 'p95': []}
+    assert entry['one_pass_history'] == {'values': []}
+    assert entry['escalation_history'] == {'values': []}
 
 
 def test_shape_performance_lists_exactly_the_projects_with_cards():
@@ -2236,9 +2346,12 @@ class TestShapeMergeQueueServedDatums:
         ('speculative', 'speculative',
          {'hit_count': 0, 'discard_count': 0, 'total': 0, 'hit_rate': 0.0}),
         ('recent_total', 'recent_total', 0),
-        ('depth_timeseries', 'depth', {'labels': [], 'values': [], 'bucket_minutes': 15}),
+        ('depth_timeseries', 'depth', {'labels': [], 'values': []}),
         ('attempts', 'attempts', MergeAttempts()),
         ('train_throughput', 'train_throughput', {}),
+        ('landing_rate', 'landing_rate', {
+            'labels': [], 'values': [], 'trailing_minutes': 1440, 'window_mean_per_day': 0.0,
+        }),
     ])
     def test_a_bare_value_is_a_wiring_bug(self, raw_key, wire_name, bare):
         with pytest.raises(DatumContractError) as excinfo:

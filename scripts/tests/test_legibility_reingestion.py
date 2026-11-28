@@ -181,7 +181,7 @@ class TestHarnessInjectedTurnFilter:
         # single-hash '# Context', while '## Context' + '## Conventions' is a
         # common human-authored markdown shape in this repo's own plans/ and
         # docs/ prose. Treating it as an anchor silently drops a genuine
-        # human correction from the gold user_corrections section -- the
+        # human correction from the gold user_turns section -- the
         # exact pathology the instrument exists to prevent.
         text = (
             '## Context\n\nWe are debugging the merge worker.\n\n'
@@ -239,7 +239,7 @@ class TestHarnessInjectedTurnFilter:
         # briefing anchor+corroborator rule cannot see it at all. Before
         # 3659 it was classified via that anchor; MERGER_HEADINGS is what
         # keeps merge-conflict dispatches (7 per 14 days, measured) out of
-        # the digest's gold user_corrections section.
+        # the digest's gold user_turns section.
         assert reingestion.is_harness_injected_turn(merger_prompt(tmp_path)) is True
 
     def test_steward_continuation_prompt_is_excluded_lockstep(self, tmp_path):

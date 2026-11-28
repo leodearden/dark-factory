@@ -115,3 +115,50 @@ def test_runs_db_path_and_make_runs_db_carry_one_schema(runs_db_path, make_runs_
     schema_sql = 'SELECT type, name, sql FROM sqlite_master ORDER BY name'
 
     assert _read(runs_db_path, schema_sql) == _read(make_runs_db(name='seeded.db'), schema_sql)
+
+
+def test_seed_task_result_round_trips_its_columns(runs_db, runs_db_path):
+    runs_db.seed_task_result(
+        task_id=42,
+        outcome='blocked',
+        completed_at='2026-11-01T10:00:00+00:00',
+        run_id='run-7',
+        project_id='reify',
+        review_cycles=2,
+        execute_iterations=3,
+    )
+
+    assert _read(
+        runs_db_path,
+        'SELECT run_id, task_id, project_id, outcome, review_cycles, '
+        'execute_iterations, completed_at FROM task_results',
+    ) == [('run-7', '42', 'reify', 'blocked', 2, 3, '2026-11-01T10:00:00+00:00')]
+
+
+def test_make_seeding_runs_db_opens_a_seeding_connection_on_the_directorys_runs_db(
+    make_seeding_runs_db, make_runs_db, tmp_path,
+):
+    directory = tmp_path / 'root' / 'data' / 'orchestrator'
+    directory.mkdir(parents=True)
+
+    conn = make_seeding_runs_db(directory)
+    conn.seed_event('2026-11-01T10:00:00+00:00', 'merge_verify', task_id='1')
+
+    (_, _, file_name), = conn.execute('PRAGMA database_list').fetchall()
+    schema_sql = 'SELECT type, name, sql FROM sqlite_master ORDER BY name'
+    assert Path(file_name) == directory / 'runs.db'
+    assert _read(directory / 'runs.db', schema_sql) == _read(
+        make_runs_db(name='reference.db'), schema_sql
+    )
+    assert _read(directory / 'runs.db', 'SELECT event_type FROM events') == [('merge_verify',)]
+
+
+def test_make_tasks_db_stores_a_given_candidate_key_and_leaves_it_null_when_omitted(
+    make_tasks_db,
+):
+    db_path = make_tasks_db([{'id': 1, 'candidate_key': 'ck-1'}, {'id': 2}])
+
+    assert _read(db_path, 'SELECT id, candidate_key FROM tasks ORDER BY id') == [
+        (1, 'ck-1'),
+        (2, None),
+    ]

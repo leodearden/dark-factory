@@ -12,10 +12,13 @@ from pydantic import HttpUrl, ValidationError
 
 from client_feed.contract import FileKind
 from client_feed.policy import (
+    FilerPolicy,
+    NoFilerBlock,
     Policy,
     PolicyError,
     PolicyProblem,
     TaskPriority,
+    load_filer_policy,
     load_policy,
     matches_any,
 )
@@ -460,3 +463,97 @@ def test_an_out_dir_owned_by_another_user_is_refused(
 
     assert refusal.problem is PolicyProblem.OUT_DIR_NOT_OWNED
     assert 'out_dir / ' in str(refusal)
+
+
+@pytest.mark.parametrize('field', ['out_dir', 'in_dir', 'project_root'])
+def test_a_state_dir_reaching_a_publisher_dir_through_a_symlink_is_refused_resolved(
+    tmp_path: Path, minimal: dict[str, Any], field: str
+) -> None:
+    Path(minimal[field]).mkdir()
+    (tmp_path / 'link').symlink_to(minimal[field])
+    policy = _policy(minimal, filer={'state_dir': str(tmp_path / 'link' / 'filer')})
+
+    with pytest.raises(ValueError) as caught:
+        policy.require_filer_state_dir_apart(resolved=True)
+
+    message = str(caught.value)
+    assert 'filer.state_dir' in message
+    assert field in message
+
+
+def test_a_state_dir_not_yet_made_and_reaching_nothing_stands_apart_resolved(
+    tmp_path: Path, minimal: dict[str, Any]
+) -> None:
+    policy = _policy(minimal, filer={'state_dir': str(tmp_path / 'state' / 'filer')})
+
+    policy.require_filer_state_dir_apart(resolved=True)
+
+
+def test_a_policy_without_a_filer_block_has_no_state_dir_to_refuse(minimal: dict[str, Any]) -> None:
+    _policy(minimal).require_filer_state_dir_apart(resolved=True)
+
+
+def test_require_filer_is_the_filer_block_or_the_one_refusal_naming_the_project(
+    tmp_path: Path, minimal: dict[str, Any]
+) -> None:
+    filer = FilerPolicy(state_dir=tmp_path / 'state')
+
+    assert _policy(minimal, filer=filer).require_filer() == filer
+    with pytest.raises(NoFilerBlock) as caught:
+        _policy(minimal).require_filer()
+    assert caught.value.project_id == 'acme'
+    assert str(caught.value) == 'the policy of acme has no filer block'
+
+
+def test_the_lexical_rule_keeps_its_refusal(minimal: dict[str, Any]) -> None:
+    state_dir = Path(minimal['out_dir']) / 'filer'
+    unchecked = Policy.model_construct(
+        **{**_policy(minimal).__dict__, 'filer': FilerPolicy(state_dir=state_dir)}
+    )
+
+    with pytest.raises(ValueError) as caught:
+        unchecked.require_filer_state_dir_apart(resolved=False)
+
+    assert str(caught.value) == f'filer.state_dir {state_dir} must lie outside out_dir {minimal["out_dir"]}'
+
+
+def _filer_refusal(config: Path) -> PolicyError:
+    with pytest.raises(PolicyError) as caught:
+        load_filer_policy(config)
+    assert caught.value.config == config
+    return caught.value
+
+
+def test_the_filer_loads_its_policy_with_no_git_and_no_out_dir_check(
+    tmp_path: Path, minimal: dict[str, Any], filer_block: dict[str, Any]
+) -> None:
+    Path(minimal['project_root']).mkdir()
+    mapping = {**minimal, 'filer': filer_block}
+
+    assert load_filer_policy(_config(tmp_path, mapping)) == Policy.model_validate(mapping)
+
+
+def test_the_filer_refuses_a_policy_without_a_filer_block(
+    tmp_path: Path, minimal: dict[str, Any]
+) -> None:
+    config = _config(tmp_path, minimal)
+
+    refusal = _filer_refusal(config)
+
+    assert refusal.problem is PolicyProblem.NO_FILER_BLOCK
+    assert refusal.detail == str(NoFilerBlock('acme'))
+
+
+def test_the_filer_refuses_an_unreadable_policy_as_the_publisher_does(tmp_path: Path) -> None:
+    assert _filer_refusal(tmp_path / 'absent.yaml').problem is PolicyProblem.UNREADABLE
+
+
+def test_the_filer_refuses_an_invalid_policy_as_the_publisher_does(
+    tmp_path: Path, minimal: dict[str, Any], filer_block: dict[str, Any]
+) -> None:
+    mapping = {**minimal, 'filer': {**filer_block, 'interval_seconds': 0}}
+
+    refusal = _filer_refusal(_config(tmp_path, mapping))
+
+    assert refusal.problem is PolicyProblem.INVALID
+    assert 'filer.interval_seconds' in refusal.detail

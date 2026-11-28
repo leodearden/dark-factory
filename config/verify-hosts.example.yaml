@@ -1,0 +1,47 @@
+# Example verify-host roster: the shape of the PRIVATE file that names this
+# workstation's remote merge-verify hosts (plans/verify-host-roster-and-rented-trial-prd.md §6.3).
+#
+# The real file lives at $XDG_CONFIG_HOME/orchestrator/verify-hosts.yaml
+# (~/.config/orchestrator/verify-hosts.yaml), or wherever ORCH_VERIFY_HOSTS_FILE
+# points. It is never tracked: it names machines, users and paths that belong to
+# one operator. Every name below is a placeholder.
+#
+# scripts/deploy/provision_verify_host.sh and scripts/deploy/check_verify_host.py
+# read it. Each orchestrator reads its own project's entries at start, as its
+# runner list. Setup walkthrough: SETUP.md §12.
+
+hosts:
+  example-verify-host:
+    ssh_host: example-verify-host
+    df_checkout_path: /home/<user>/src/dark-factory
+    # Optional; defaults to the dark-factory-gate sibling of df_checkout_path.
+    gate_checkouts_path: /home/<user>/src/dark-factory-gate
+    enabled: true
+    # Optional: overridable defaults rendered into this host's orchestrator
+    # wrapper. The place for a per-host held override.
+    wrapper_env:
+      ORCH_WATCHDOG_HEARTBEAT_TIMEOUT_SECS: "600"
+    projects:
+      dark_factory:
+        git_remote: example-verify-host
+        config_path: /home/<user>/.config/orchestrator/dark_factory-example-verify-host.yaml
+        trust: trusted
+        task_slots: 2
+        # Optional: free space the disk check requires, in GiB.
+        disk_footprint_gib: 40
+        # Rendered verbatim to config_path on the host.
+        host_config:
+          project_root: /home/<user>/src/dark-factory
+          verify_cgroup_memory:
+            max_gib: 16
+          git:
+            main_branch: main
+      example_project:
+        git_remote: example-verify-host
+        config_path: /home/<user>/.config/orchestrator/example_project-example-verify-host.yaml
+        host_config:
+          project_root: /home/<user>/src/example-project
+          verify_cgroup_memory:
+            max_gib: 8
+          git:
+            main_branch: main

@@ -17,7 +17,7 @@ from collections.abc import Callable, Iterator
 from datetime import UTC, datetime, timedelta
 
 import pytest
-from _fm_helpers import make_insufficient_quota_error
+from _fm_helpers import make_insufficient_quota_error, make_usage_limit_reached_error
 from shared.project_layout import escalation_queue_dir
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
@@ -136,6 +136,19 @@ class TestThePage:
         assert '(credit_balance_exhausted)' in record['summary']
         assert 'code=credit_balance_exhausted' in record['detail']
         assert '(insufficient_quota)' not in record['summary']
+
+
+class TestOnlyApiKeyCreditsPage:
+    @pytest.mark.asyncio
+    async def test_a_plan_cap_files_nothing(self, tmp_path):
+        plan_cap = classify_billing_exhaustion(make_usage_limit_reached_error())
+        assert plan_cap is not None
+        alarm = _alarm(tmp_path)
+
+        await alarm.record_exhausted(plan_cap, site='durable_queue:add_episode')
+
+        assert alarm.state() is None
+        assert _records(tmp_path) == []
 
 
 class TestAPageThatCouldNotBeFiled:
@@ -260,7 +273,9 @@ class TestRestart:
 def _close(tmp_path, page_id: str) -> None:
     from escalation.queue import EscalationQueue
 
-    EscalationQueue(escalation_queue_dir(tmp_path)).resolve(page_id, 'acknowledged, topping up')
+    EscalationQueue(escalation_queue_dir(tmp_path)).resolve(
+        page_id, 'acknowledged, topping up', resolution_class='actionable',
+    )
 
 
 @contextlib.contextmanager

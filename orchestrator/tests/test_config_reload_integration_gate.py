@@ -43,6 +43,7 @@ from orchestrator.harness import Harness
 from orchestrator.offline_lane import OfflineLaneWorker
 from orchestrator.run_store import RunStore
 from orchestrator.scheduler import TaskAssignment
+from orchestrator.verify_host_roster_file import ROSTER_FILE_ENV
 from orchestrator.workflow import TaskWorkflow
 
 # ---------------------------------------------------------------------------
@@ -566,3 +567,56 @@ class TestS9OfflineLaneThreadsIdentity:
             'GitOps instance captured at "startup" observes the reloaded '
             'value through the SAME object, not a stale copy'
         )
+
+
+# ---------------------------------------------------------------------------
+# The private verify-host roster file (task 11734, PRD
+# verify-host-roster-and-rented-trial-prd.md §6.3) is read by load_config, so
+# a reload re-reads it: an edit is restart-tier and a malformed file fails
+# closed.
+# ---------------------------------------------------------------------------
+
+
+def _roster_for(project_id: str) -> str:
+    return yaml.safe_dump({
+        'hosts': {
+            'box-a': {
+                'ssh_host': 'verify-a',
+                'df_checkout_path': '/srv/a/dark-factory',
+                'projects': {project_id: {'git_remote': 'verify-a-p'}},
+            },
+        },
+    })
+
+
+class TestRosterFileAtReload:
+    @pytest.mark.asyncio
+    async def test_a_roster_edit_at_reload_is_restart_required(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        roster_path = tmp_path / 'roster.yaml'
+        monkeypatch.setenv(ROSTER_FILE_ENV, str(roster_path))
+        harness, _ = _make_reload_harness(tmp_path, monkeypatch)
+        roster_path.write_text(_roster_for(harness.config.fused_memory.project_id))
+
+        report = await harness.reload_config()
+
+        assert report['reloaded'] is True
+        assert 'verify_runners' in report['restart_required']
+        assert harness.config.verify_runners == []
+
+    @pytest.mark.asyncio
+    async def test_a_malformed_roster_at_reload_keeps_the_live_config(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        roster_path = tmp_path / 'roster.yaml'
+        monkeypatch.setenv(ROSTER_FILE_ENV, str(roster_path))
+        harness, _ = _make_reload_harness(tmp_path, monkeypatch)
+        live_runners = list(harness.config.verify_runners)
+        roster_path.write_text('hosts: [unterminated\n')
+
+        report = await harness.reload_config()
+
+        assert report['reloaded'] is False
+        assert str(roster_path) in report['error']
+        assert harness.config.verify_runners == live_runners

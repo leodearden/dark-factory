@@ -10,6 +10,9 @@ contract:
   coarse resolver *tier* (human / cascade / auto-watcher / steward /
   reaper-sweep / unknown / other-auto). Used both for analytics grouping and
   to derive the per-path benign default (see ``default_resolution_class_for_resolver``).
+- ``resolver_tier`` — maps a closed record to its tier in ``RESOLVER_TIERS``,
+  splitting the human tier by the record's ``ruled_by_human`` flag into
+  human-ruled and attended-seat (plans/instruments-honesty-prd.md decision 10).
 - ``effective_benign`` — the stamp-first-with-proxy-fallback predicate that
   turns a resolved/dismissed ``Escalation`` record into a
   ``(class, provenance)`` pair, so aggregators can report the stamped-vs-
@@ -31,6 +34,7 @@ same resolver membership or benign/actionable logic independently.
 from __future__ import annotations
 
 from collections.abc import Set as AbstractSet
+from enum import StrEnum
 
 from escalation.authority import COORDINATOR_IDENTITY
 from escalation.models import HARNESS_SENTINEL_ROLE_PREFIXES, Escalation
@@ -59,7 +63,19 @@ _STEWARD_PREFIX = 'claude-task-'
 _STEWARD_SUFFIX = '-steward'
 
 
-def classify_resolver_tier(resolved_by: str | None) -> str:
+class SeatTier(StrEnum):
+    """The tier of the seat a ``resolved_by`` names, in display order."""
+
+    HUMAN = 'human'
+    CASCADE = 'cascade'
+    AUTO_WATCHER = 'auto-watcher'
+    STEWARD = 'steward'
+    REAPER_SWEEP = 'reaper-sweep'
+    UNKNOWN = 'unknown'
+    OTHER_AUTO = 'other-auto'
+
+
+def classify_resolver_tier(resolved_by: str | None) -> SeatTier:
     """Classify a ``resolved_by`` attribution string into a resolver tier.
 
     Order matters: exact human/auto-watcher/reaper-sweep membership checks
@@ -69,18 +85,46 @@ def classify_resolver_tier(resolved_by: str | None) -> str:
     is surfaced as its own chart segment).
     """
     if resolved_by is None:
-        return 'unknown'
+        return SeatTier.UNKNOWN
     if resolved_by in _HUMAN_RESOLVERS:
-        return 'human'
+        return SeatTier.HUMAN
     if resolved_by.startswith(_CASCADE_PREFIX):
-        return 'cascade'
+        return SeatTier.CASCADE
     if resolved_by in _AUTO_WATCHER_RESOLVERS:
-        return 'auto-watcher'
+        return SeatTier.AUTO_WATCHER
     if resolved_by.startswith(_STEWARD_PREFIX) and resolved_by.endswith(_STEWARD_SUFFIX):
-        return 'steward'
+        return SeatTier.STEWARD
     if resolved_by in _REAPER_SWEEP_RESOLVERS:
-        return 'reaper-sweep'
-    return 'other-auto'
+        return SeatTier.REAPER_SWEEP
+    return SeatTier.OTHER_AUTO
+
+
+# resolver_tier splits the human seat tier by the record's ruled_by_human flag.
+HUMAN_RULED = 'human-ruled'
+ATTENDED_SEAT = 'attended-seat'
+
+# The record-tier vocabulary resolver_tier returns, in display order: the human
+# split, then every other seat tier. The dashboard's frontend tier whitelists
+# mirror this tuple.
+RESOLVER_TIERS: tuple[str, ...] = (
+    HUMAN_RULED,
+    ATTENDED_SEAT,
+    *(tier.value for tier in SeatTier if tier is not SeatTier.HUMAN),
+)
+
+
+def resolver_tier(record: Escalation) -> str:
+    """The resolver tier of *record*: a human ruling first, then the seat that closed it.
+
+    A cascade member that inherited ``ruled_by_human=True`` is human-ruled, not
+    cascade: a ruling on a cluster is a ruling on each member.
+    """
+    if record.ruled_by_human is True:
+        return HUMAN_RULED
+    seat = classify_resolver_tier(record.resolved_by)
+    if seat is SeatTier.HUMAN:
+        return ATTENDED_SEAT
+    return seat.value
 
 
 def effective_benign(record: Escalation) -> tuple[str | None, str]:
@@ -129,7 +173,7 @@ def closed_by_non_sweep_resolver(record: Escalation) -> bool:
     """
     if record.status not in ('resolved', 'dismissed'):
         return False
-    return classify_resolver_tier(record.resolved_by) != 'reaper-sweep'
+    return classify_resolver_tier(record.resolved_by) is not SeatTier.REAPER_SWEEP
 
 
 def default_resolution_class_for_resolver(resolved_by: str | None) -> str | None:
@@ -144,7 +188,7 @@ def default_resolution_class_for_resolver(resolved_by: str | None) -> str | None
     unstamped so ``effective_benign``'s read-time proxy applies unless the
     caller passes an explicit ``resolution_class``.
     """
-    return 'benign' if classify_resolver_tier(resolved_by) == 'reaper-sweep' else None
+    return 'benign' if classify_resolver_tier(resolved_by) is SeatTier.REAPER_SWEEP else None
 
 
 # The orchestrator filer roles whose info-severity L0s are mechanical notices,

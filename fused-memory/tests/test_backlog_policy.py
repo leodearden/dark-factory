@@ -1314,6 +1314,26 @@ class TestOnJudgeUnhalt:
         assert persisted['status'] == 'resolved'
 
     @pytest.mark.asyncio
+    async def test_a_parked_halt_escalation_closes_with_a_resolution_class(
+        self, event_buffer, tmp_path,
+    ):
+        """A watcher's park promotes the record to level 2, whose close must be classified."""
+        from escalation.queue import EscalationQueue
+
+        policy, esc_dir, halt_id, _backlog_id, _other = await self._setup(
+            event_buffer, tmp_path,
+        )
+        queue = EscalationQueue(esc_dir)
+        queue.park(halt_id, 'parked for a human')
+
+        assert await policy.on_judge_unhalt('proj') == [halt_id]
+
+        closed = queue.get(halt_id)
+        assert closed is not None
+        assert closed.status != 'pending'
+        assert closed.resolution_class is not None
+
+    @pytest.mark.asyncio
     async def test_second_unhalt_is_idempotent(self, event_buffer, tmp_path):
         policy, _esc_dir, halt_id, _backlog_id, _other = await self._setup(
             event_buffer, tmp_path,

@@ -36,6 +36,7 @@ if TYPE_CHECKING:
     from escalation.queue import EscalationQueue
 
     from orchestrator.event_store import EventStore
+    from orchestrator.recovered_merge_holds import RecoveredMergeHolds
 
 logger = logging.getLogger(__name__)
 
@@ -123,6 +124,12 @@ class RecoveredMergeOwner:
       left to it: an attached workflow's own handler files the halt-owning record.
     - Transient (``superseded``): left to the stranded sweep.
     - Durable or unclassified failure: blocks the task and files one L1 under its block category.
+    - Restored hold: the file hold *holds* restored for the task at start-up
+      (task 10093) ends after the outcome is routed, and on a cancelled future.
+      Only the worker's shutdown outcome while *stopping* says the process is
+      stopping leaves it held, for the next start to restore; mid-run, that
+      outcome comes from a merger loop that restarts without re-reading the
+      journal, so the hold ends and the stranded sweep can re-pend the task.
 
     The merge worker's shutdown outcome is not terminal: the journal keeps the
     request and the next start restores and re-adopts it, so it is left alone.
@@ -133,6 +140,8 @@ class RecoveredMergeOwner:
     reconcile_landing: Callable[[str], Awaitable[str | None]]
     merge_halt: MergeHaltControl | None
     event_store: EventStore | None = None
+    holds: RecoveredMergeHolds | None = None
+    stopping: Callable[[], bool] = lambda: False
 
     def adopt(self, requests: Iterable[RecoveredRequest], *, schedule: ScheduleCoro) -> None:
         for request in requests:
@@ -150,6 +159,7 @@ class RecoveredMergeOwner:
     ) -> None:
         try:
             if fut.cancelled():
+                self._release_hold(request)
                 return
             exc = fut.exception()
             outcome = (
@@ -175,18 +185,37 @@ class RecoveredMergeOwner:
                 'Recovered merge request %s for task %s: settling outcome %s raised',
                 request.request_id, request.task_id, outcome.status, exc_info=True,
             )
-            return Settled.RAISED
-        logger.info(
-            'Recovered merge request %s for task %s finished %s: %s',
-            request.request_id, request.task_id, outcome.status, settled.value,
-        )
+            settled = Settled.RAISED
+        else:
+            logger.info(
+                'Recovered merge request %s for task %s finished %s: %s',
+                request.request_id, request.task_id, outcome.status, settled.value,
+            )
+        if settled is not Settled.WORKER_SHUTDOWN or not self.stopping():
+            self._release_hold(request)
         return settled
+
+    def _release_hold(self, request: RecoveredRequest) -> None:
+        if self.holds is None:
+            return
+        try:
+            self.holds.release(request.task_id, request.request_id)
+        except Exception:
+            logger.warning(
+                'Task %s: ending the hold restored for recovered merge request %s '
+                'raised', request.task_id, request.request_id, exc_info=True,
+            )
+
+    def _workflow_holds(self, request: RecoveredRequest) -> bool:
+        if self.holds is not None and self.holds.holds(request.task_id, request.request_id):
+            return False
+        return self.tasks.is_actively_held(request.task_id)
 
     async def _settle(self, request: RecoveredRequest, outcome: MergeOutcome) -> Settled:
         if is_merge_worker_shutdown(outcome):
             return Settled.WORKER_SHUTDOWN
         tid = request.task_id
-        if self.tasks.is_actively_held(tid):
+        if self._workflow_holds(request):
             return Settled.WORKFLOW_HELD
         if outcome.status in MERGE_HALT_STATUSES:
             return await self._own_halt(request, outcome)
@@ -215,7 +244,7 @@ class RecoveredMergeOwner:
         """Block the task unless another owner moved or holds it."""
         tid = request.task_id
         live = await self.tasks.get_status(tid)
-        if live not in _BLOCKABLE_STATUSES or self.tasks.is_actively_held(tid):
+        if live not in _BLOCKABLE_STATUSES or self._workflow_holds(request):
             return None
         try:
             await self.tasks.clear_claim_then_set_status(tid, TaskStatus.BLOCKED)

@@ -197,6 +197,18 @@ inputTokens". It maps `turns` to `usage.modelRequestCount`
 (`projection.turnCount` counts user turns and is always 1 for a single
 `--prompt`).
 
+A killed run has no turn count. Measured 2026-11-15 with zcode 0.17.1 against
+a local endpoint that never answers, killed at 12 s: under the backend's flat
+process-group kill stdout was empty, and under the claude SIGTERM-flush
+handling stdout was also empty and stderr read "Error: Turn was cancelled.".
+So a killed run reports no result object and no turn count, and
+`AgentResult.transcript_turns` stays None (unknown). The shared classifiers
+then treat a ZCode wall-clock kill as a no-progress timeout
+(`is_zero_output_timeout`'s legacy fallback). ZCode's sqlite session store at
+`<run home>/.zcode/cli/db/db.sqlite` (tables `session`/`message`/`part`)
+outlives the kill but is removed with the run home. Counting turns from it is
+not established; task 10154 owns that follow-up.
+
 ## Upstream caveat
 
 `apps/zcode-cli/docs/usage/13-automation.md` states that Linux and real

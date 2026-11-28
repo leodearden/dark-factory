@@ -84,6 +84,9 @@ EXIT_OK, EXIT_CONFIG, EXIT_ASK_BACK = 0, 2, 3
 CARVEOUT_ACTION = 'resume'
 """The usual C1 action for a carve-out close, per ``skills/escalation-watcher/SKILL.md::Ruled-elsewhere check (answered-but-unrecorded)``."""
 CARVEOUT_RESOLVED_BY = 'sitting-preparer'
+CARVEOUT_RULED_BY_HUMAN = True
+"""A carve-out close is a human ruling: gates ``ruling_is_leos_own`` and
+``ruling_names_this_record`` hold for every 'closeable' item, and the resolution quotes the ruling."""
 CARVEOUT_RESOLUTION_TURNS = 1
 """A carve-out close takes one preparer turn and no Leo turn."""
 OWNER_RELEASE_STATUSES: tuple[str, ...] = tuple(sorted(TERMINAL_TASK_STATUSES))
@@ -375,13 +378,14 @@ def _queueless(roots: Iterable[str]) -> list[Shortfall]:
     ]
 
 
-def _task_rows(roots: Mapping[str, Path]) -> Mapping[str, TaskRows]:
-    return MappingProxyType({project: ownership.load_task_rows(root) for project, root in roots.items()})
+def _task_rows(roots: Mapping[str, tuple[Path, ...]]) -> Mapping[str, TaskRows]:
+    return MappingProxyType({project: ownership.load_task_rows(project_roots[0])
+                             for project, project_roots in roots.items()})
 
 
-def _handovers(roots: Mapping[str, Path], override: HandoverOverride | None) -> Mapping[str, Path]:
-    found = {project: path for project, root in roots.items()
-             if (path := ownership.resolve_handover_path(root)) is not None}
+def _handovers(roots: Mapping[str, tuple[Path, ...]], override: HandoverOverride | None) -> Mapping[str, Path]:
+    found = {project: path for project, project_roots in roots.items()
+             if (path := ownership.resolve_handover_path(project_roots[0])) is not None}
     if override is not None:
         found[override.project] = override.path
     return MappingProxyType(found)
@@ -486,6 +490,7 @@ def _close_payloads(item: OpenItem, verdict: Verdict) -> tuple[ApplyPayload, ...
     resolve = payloads.resolve_issue_payload(
         item.escalation_id, resolution, CARVEOUT_ACTION,
         resolved_by=CARVEOUT_RESOLVED_BY, resolution_turns=CARVEOUT_RESOLUTION_TURNS,
+        resolution_class=payloads.SITTING_RULING_CLASS, ruled_by_human=CARVEOUT_RULED_BY_HUMAN,
     )
     return (resolve, close)
 

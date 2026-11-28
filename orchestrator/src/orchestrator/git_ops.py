@@ -80,6 +80,7 @@ from shared.proc_group import (
     scan_process_groups_under_path,
     snapshot_process_group,
 )
+from shared.process_identity import PROC_ROOT
 from shared.transcript_archive import archive_before_delete
 
 from orchestrator import branch_stack, rebase_recovery
@@ -102,7 +103,20 @@ from orchestrator.branch_stack import (
     foreign_commit_cut,
     rebase_own_delta,
 )
-from orchestrator.config import TASK_META_DIRNAME, GitConfig, TranscriptArchiveConfig
+from orchestrator.config import (
+    TASK_META_DIRNAME,
+    GitConfig,
+    TranscriptArchiveConfig,
+    WarmLaneWrapperScript,
+)
+from orchestrator.index_lock_liveness import (
+    GitProcessScan,
+    IndexLockHolderScanner,
+    IndexLockVerdict,
+    describe_holders,
+    diagnose_index_lock,
+    scan_index_lock_holders,
+)
 from orchestrator.lane_attach import (
     HeadRelation,
     branch_tip,
@@ -282,25 +296,46 @@ MERGE_PARK_REF = 'refs/dark-factory/merge-park'
 _INDEX_LOCK_POLL_INTERVAL_S = 1.0
 _INDEX_LOCK_WARN_INTERVAL_S = 30.0
 
-# Floor (seconds) an index.lock's PRE-wait age must clear before it may be
-# treated as a crashed-git LEFTOVER rather than a live commit.  This repo's
-# documented pre-commit budget (CLAUDE.md instructs `timeout: 300000` for a
-# commit that stages Python), so a lock older than this outlived the longest
-# legitimate hook run.
+# Minimum first-observed age (seconds) of an index.lock that a COMPLETE holder
+# scan found unowned before it counts as a crashed-git LEFTOVER (tasks 3060 and
+# 5229).  It is NOT a bound on how long a pre-commit hook runs (a reify one runs
+# 10-60+ minutes): a live holder is decided by the scan, at any age, and this
+# floor only covers a holder that just exited or that the scan cannot see.
 #
-# Single source of truth for two collaborating call sites, deliberately
-# defined HERE because the import direction is merge_gates -> git_ops and
-# never the reverse:
-#   * `GitOps._await_index_lock_clear` short-circuits its stand-off once the
-#     pre-wait age clears max(grace, this) — waiting cannot change a verdict
-#     that is already "leftover", it only costs the SERIALIZED merge worker
-#     the whole grace per queued task.
-#   * `merge_gates._map_advance_failure` (which aliases this as
-#     `_STALE_LOCK_FLOOR_S`) uses the SAME bar to decide whether to offer the
-#     destructive `rm -f <lock>` recovery.
-# They must never drift: a short-circuit at a lower bar than the advice bar
-# would skip the wait and then NOT explain why.
+# Both consumers pass it to
+# orchestrator/src/orchestrator/index_lock_liveness.py::diagnose_index_lock:
+#   * `GitOps._await_index_lock_clear` skips its stand-off only on
+#     CRASHED_LEFTOVER, and hands the side channel the very scan it decided on;
+#   * `merge_gates._map_advance_failure` (aliasing this as `_STALE_LOCK_FLOOR_S`)
+#     offers `rm -f <lock>` only on the same verdict, re-derived from that scan.
+# So a skipped wait's reason always carries the stand-off's own verdict.  After
+# a full wait the side channel carries a scan taken at the deadline instead.
+# Defined HERE because the import direction is merge_gates -> git_ops.
 _INDEX_LOCK_STALE_FLOOR_S = 300.0
+
+
+@dataclass(frozen=True)
+class IndexLockStandOff:
+    """How `GitOps._await_index_lock_clear`'s stand-off on a foreign index lock ended.
+
+    ``initial_age_s`` is the lock's age at the first probe, before any wait
+    (0.0 when no lock was held).  ``holder_scan`` is set exactly when the lock
+    was NOT cleared: the scan a skipped wait was decided on, or one taken at a
+    full wait's deadline.
+    """
+
+    cleared: bool
+    waited_s: float
+    initial_age_s: float
+    holder_scan: GitProcessScan | None
+
+    def __post_init__(self) -> None:
+        if (self.holder_scan is None) != self.cleared:
+            raise ValueError(
+                'an index-lock stand-off carries a holder scan exactly when the lock '
+                f'was NOT cleared; got cleared={self.cleared!r}, '
+                f'holder_scan={self.holder_scan!r}'
+            )
 
 
 # Bounded attempt budget for `git worktree add`, shared by the three sites
@@ -651,6 +686,14 @@ _SEED_WARM_LANE_LOCK_WAIT_SECS: int = 30
 # no env override), monkeypatchable in tests via the module global.
 _RESET_WARM_LANE_LOCK_WAIT_SECS: int = 30
 
+#: Bounded wait for a merge screen lane's flock. Short on purpose: a contended
+#: lane falls back to a cold ephemeral worktree rather than stalling the merger.
+SCREEN_LANE_LOCK_WAIT_SECS: float = 5.0
+
+#: What a screen lane keeps across resets, beyond the configured artifact dirs:
+#: the warmth that makes the lane cheaper than a cold worktree.
+SCREEN_LANE_RETAINED: tuple[str, ...] = ('.venv/', '__pycache__/')
+
 # flock's --conflict-exit-code (-E) for _SEED_WARM_LANE_LOCK_WAIT_SECS above.
 # Deliberately mirrors timeout(1)'s well-known 124 "command timed out"
 # convention so the sentinel is self-documenting in logs, and is chosen
@@ -890,7 +933,7 @@ PERSISTENT_OFFLINE_DEEP_WORKTREE_NAME: str = '_offline-deep'
 # GitOps.create_interactive_worktree below for the full contract.
 
 class WorktreeKind(Enum):
-    """Ephemeral main-tip probe/sweep worktree kinds minted by
+    """Ephemeral verify-worktree kinds minted by
     :meth:`GitOps.ephemeral_worktree` (task θ, verify-plan PRD).
 
     Each member's value IS both the directory-name prefix
@@ -903,6 +946,35 @@ class WorktreeKind(Enum):
 
     MAIN_PROBE = '_mainprobe-'
     MAIN_SWEEP = '_mainsweep-'
+    DRIFT_CHECK = '_driftcheck-'
+    MERGE_SCREEN = '_mergescreen-'
+
+
+class ScreenLane(Enum):
+    """The merge screen's persistent warm lanes, held through :meth:`GitOps.screen_lane`.
+
+    Each value is the lane's exact worktree name under ``worktree_base`` AND
+    its :data:`PROTECTED_PREFIXES` key, as with :class:`WorktreeKind`. Both
+    names stay outside the ``_merge-*`` band, so
+    :meth:`GitOps._iter_merge_worktrees`, :meth:`GitOps.prune_stale_merge_worktrees`
+    and the merge worker's ledger audits never see a lane.
+    """
+
+    MERGER = '_screen-merger'
+    CHAIN = '_screen-chain'
+
+
+class ScreenLaneUnavailable(RuntimeError):
+    """A screen lane's flock was not won within the wait; the lane is untouched."""
+
+    def __init__(self, lane: ScreenLane, lock_path: Path, wait_secs: float) -> None:
+        super().__init__(
+            f'merge screen lane {lane.value} is unavailable: its flock {lock_path} '
+            f'was not acquired within {wait_secs}s, so the lane was left untouched'
+        )
+        self.lane = lane
+        self.lock_path = lock_path
+        self.wait_secs = wait_secs
 
 
 # Band-ownership registry for worktree_base's ephemeral-worktree namespace
@@ -930,6 +1002,10 @@ PROTECTED_PREFIXES: dict[str, str] = {
     # CM's own naming (task θ).
     WorktreeKind.MAIN_PROBE.value: 'verify-main-probe',
     WorktreeKind.MAIN_SWEEP.value: 'verify-main-sweep',
+    WorktreeKind.DRIFT_CHECK.value: 'merge-drift-check',
+    ScreenLane.MERGER.value: 'merge-screen-lane',
+    ScreenLane.CHAIN.value: 'merge-screen-lane',
+    WorktreeKind.MERGE_SCREEN.value: 'merge-screen-fallback',
 }
 
 
@@ -1835,6 +1911,10 @@ class EphemeralWorktreeError(Exception):
     fail-safe behavior (e.g. the main-tip probes in verify.py return their
     established sentinel and log a warning).
     """
+
+
+class WarmSeedUnavailable(EphemeralWorktreeError):
+    """A warm-required ephemeral worktree could not be CoW-seeded; raised before the body runs, with the worktree already removed."""
 
 
 class WarmLaneRequeue(Exception):
@@ -3091,9 +3171,13 @@ class GitOps:
         warm_lane_pool_size: int = 0,
         merge_spec_warm_lane_pool_size: int = 0,
         transcript_archive: TranscriptArchiveConfig | None = None,
+        proc_root: Path = PROC_ROOT,
+        holder_scanner: IndexLockHolderScanner = scan_index_lock_holders,
     ):
         self.config = config
         self.project_root = project_root
+        self.proc_root = proc_root
+        self.holder_scanner = holder_scanner
         # Teardown-archival backstop config (task 2786,
         # agent-transcript-archival-prd β).  None at the 3 non-dispatch
         # construction sites (cli/recover/evals) so the cleanup_worktree
@@ -3455,7 +3539,7 @@ class GitOps:
                 below) after a successful add and BEFORE the body runs,
                 turning a cold from-scratch build into a warm incremental
                 one. Any non-zero seed rc (absent script, disk pressure,
-                generic fault) is logged and the CM proceeds COLD — a
+                generic fault) leaves the CM proceeding COLD — a
                 seed fault never breaks the probe (fail-soft, mirrors
                 :meth:`create_interactive_worktree`'s
                 seed-then-retain-cold-on-fault contract). The whole gate
@@ -3463,9 +3547,10 @@ class GitOps:
                 broad ``except Exception`` so this holds even if an
                 unexpected exception escapes those helpers. A
                 non-resolvable base (ABSENT/INDETERMINATE) skips the seed
-                subprocess, logged at INFO for a ``MAIN_SWEEP`` (its warm/cold
-                mode is a verdict input) and DEBUG for a hot-path
-                ``MAIN_PROBE``. Default ``False``: cold.
+                subprocess. Every cold fallback is logged with its reason,
+                at INFO for a ``MAIN_SWEEP`` (its warm/cold mode is a
+                verdict input) and DEBUG for a hot-path ``MAIN_PROBE``.
+                Default ``False``: cold.
 
         Yields:
             The minted worktree path, already checked out at *sha*.
@@ -3558,7 +3643,7 @@ class GitOps:
 
             try:
                 if warm_seed:
-                    await self._warm_seed_ephemeral_worktree(tmp_path, kind)
+                    await self._warm_seed_fail_soft(tmp_path, kind)
                 yield tmp_path
             finally:
                 await complete_despite_cancellation(
@@ -3579,35 +3664,68 @@ class GitOps:
             with contextlib.suppress(Exception):
                 os.close(lock_fd)
 
-    async def _warm_seed_ephemeral_worktree(self, path: Path, kind: WorktreeKind) -> None:
-        """CoW-seed *path*'s ``target/`` from the warm-lane base, proceeding COLD on any fault.
+    def _warm_base_unready_reason(self) -> str | None:
+        """Why no seed can run from the warm-lane base right now, or None when one can."""
+        health = self._warm_lane_base_resolvable()
+        return None if health is WarmBaseHealth.OK else f'warm base not resolvable ({health.name})'
 
-        ``HELD_BY_CALLER``: :meth:`ephemeral_worktree` holds ``<name>.lock`` for its lifetime.
+    async def _attempt_warm_seed(self, path: Path) -> str | None:
+        """CoW-seed *path*'s ``target/`` from the warm-lane base; never raises.
+
+        Returns None once seeded, else why *path* is unseeded; what an unseeded
+        tree means is the caller's decision.  ``HELD_BY_CALLER``: the caller
+        holds ``<name>.lock`` across the seed.
         """
         try:
-            if self._warm_lane_base_resolvable() is WarmBaseHealth.OK:
-                seed_rc = await self._seed_warm_lane(
-                    path, '--fresh-checkout',
-                    lane_lock=SeedLaneLock.HELD_BY_CALLER,
-                )
-                if seed_rc != 0:
-                    logger.info(
-                        'ephemeral_worktree(%s): warm seed failed (rc=%d) '
-                        'for %s — proceeding COLD (fail-soft)',
-                        kind.name, seed_rc, path,
-                    )
-            else:
-                logger.log(
-                    {WorktreeKind.MAIN_SWEEP: logging.INFO}.get(kind, logging.DEBUG),
-                    'ephemeral_worktree(%s): warm base not resolvable — '
-                    'skipping seed, proceeding COLD for %s', kind.name, path,
-                )
-        except Exception:
-            logger.warning(
-                'ephemeral_worktree(%s): warm-seed gate raised '
-                'unexpectedly for %s — proceeding COLD (fail-soft)',
-                kind.name, path, exc_info=True,
+            unready = self._warm_base_unready_reason()
+            if unready is not None:
+                return unready
+            seed_rc = await self._seed_warm_lane(
+                path, '--fresh-checkout', lane_lock=SeedLaneLock.HELD_BY_CALLER,
             )
+        except Exception as e:
+            logger.warning('warm-seed gate raised unexpectedly for %s', path, exc_info=True)
+            return f'warm-seed gate raised {e.__class__.__name__}: {e}'
+        return None if seed_rc == 0 else f'warm seed failed (rc={seed_rc})'
+
+    async def _warm_seed_fail_soft(self, path: Path, kind: WorktreeKind) -> None:
+        """:meth:`_attempt_warm_seed`, logging an unseeded *path* as a COLD fallback.
+
+        At INFO for a ``MAIN_SWEEP``, whose warm/cold mode is a verdict input,
+        and DEBUG for the hot-path ``MAIN_PROBE``.
+        """
+        reason = await self._attempt_warm_seed(path)
+        if reason is not None:
+            logger.log(
+                {WorktreeKind.MAIN_SWEEP: logging.INFO}.get(kind, logging.DEBUG),
+                'ephemeral_worktree(%s): %s for %s — proceeding COLD (fail-soft)',
+                kind.name, reason, path,
+            )
+
+    @contextlib.asynccontextmanager
+    async def warm_ephemeral_worktree(self, kind: WorktreeKind, sha: str) -> AsyncIterator[Path]:
+        """:meth:`ephemeral_worktree`, but CoW-seeded or not at all: never silently cold.
+
+        The lifecycle (lock, naming, guaranteed teardown) is
+        :meth:`ephemeral_worktree`'s; the seed runs under its held ``<name>.lock``.
+
+        Raises:
+            WarmSeedUnavailable: the seed did not happen and the body never ran.
+                An unresolvable warm base is refused before anything is minted;
+                a seed that fails leaves its minted tree already removed.
+        """
+        unready = self._warm_base_unready_reason()
+        if unready is not None:
+            raise WarmSeedUnavailable(
+                f'warm_ephemeral_worktree({kind.name}): {unready} at {sha[:8]}; nothing minted'
+            )
+        async with self.ephemeral_worktree(kind, sha) as path:
+            reason = await self._attempt_warm_seed(path)
+            if reason is not None:
+                raise WarmSeedUnavailable(
+                    f'warm_ephemeral_worktree({kind.name}): {reason} for {path} at {sha[:8]}'
+                )
+            yield path
 
     async def _remove_ephemeral_worktree(self, path: Path, kind: WorktreeKind) -> None:
         """Scoped ``git worktree remove --force``, never a prune (DD5), then ``remove_tree``; failures are WARNINGs."""
@@ -6066,29 +6184,38 @@ class GitOps:
         location (or a subdirectory layout) is one edit instead of two that
         must be kept in lockstep.
 
+        The order is project first, unless ``name`` is listed in
+        ``git.warm_lane_df_preferred_scripts`` (PRD D3 as amended by task
+        7864), which puts dark-factory's copy first. The list is read on every
+        call, so a config reload applies from the next one. A listed name
+        whose dark-factory copy is absent still falls through to the project
+        copy.
+
         Args:
             name: Bare script filename, e.g. ``'warm-lane-gc.sh'``.
 
         Returns:
             ``((path, origin), ...)`` in preference order.
         """
-        return (
-            (self.project_root / 'scripts' / name, 'project'),
-            (_df_warm_lane_script_dir() / name, 'dark-factory'),
-        )
+        project = (self.project_root / 'scripts' / name, 'project')
+        dark_factory = (_df_warm_lane_script_dir() / name, 'dark-factory')
+        if name in self.config.warm_lane_df_preferred_scripts:
+            return (dark_factory, project)
+        return (project, dark_factory)
 
     def _resolve_warm_lane_script(self, name: str) -> tuple[Path, str] | None:
-        """Locate warm-lane script ``name``, project override first.
+        """Locate warm-lane script ``name`` in :meth:`_warm_lane_script_candidates` order.
 
         Walks :meth:`_warm_lane_script_candidates` and returns the first entry
         that exists.  Resolution order (PRD
         ``warm-lane-infra-repatriation-prd.md`` design decision D3):
 
-        1. ``<project_root>/scripts/<name>`` — the PROJECT OVERRIDE. A project
-           that has invested in its own warm-lane tooling keeps it;
-           dark-factory's copy is the floor, not the ceiling. This is also
-           what makes leaf α a behavioural no-op for reify, whose own copies
-           still win at every call site.
+        1. ``<project_root>/scripts/<name>`` — the PROJECT OVERRIDE, unless
+           ``name`` is listed in ``git.warm_lane_df_preferred_scripts``, which
+           swaps steps 1 and 2. A project that has invested in its own
+           warm-lane tooling keeps it; dark-factory's copy is the floor, not
+           the ceiling. This is also what makes leaf α a behavioural no-op for
+           reify, whose own copies win wherever it lists nothing.
         2. :func:`_df_warm_lane_script_dir` ``/ <name>`` — dark-factory's own
            relocated copy under ``orchestrator/scripts/warm-lane/``.
         3. Neither → ``None``, so the caller emits a WARNING naming BOTH tried
@@ -6114,7 +6241,7 @@ class GitOps:
         return None
 
     def _resolve_warm_lane_script_logged(
-        self, name: str, method: str,
+        self, name: WarmLaneWrapperScript, method: str,
     ) -> tuple[Path, str] | None:
         """:meth:`_resolve_warm_lane_script`, plus the operator-facing log line.
 
@@ -6145,7 +6272,10 @@ class GitOps:
         call so a skip stays attributable to the real cause.
 
         Args:
-            name: Bare script filename, e.g. ``'warm-lane-gc.sh'``.
+            name: Bare script filename, e.g. ``'warm-lane-gc.sh'``. Typed
+                as the vocabulary ``git.warm_lane_df_preferred_scripts``
+                accepts, so a renamed or added wrapper cannot fall out
+                of the set an operator's yaml can name.
             method: Calling method name, prefixed onto both log lines.
 
         Returns:
@@ -6173,12 +6303,11 @@ class GitOps:
     async def _run_warm_lane_disk_guard(self) -> int:
         """Invoke ``warm-lane-disk-guard.sh check``.
 
-        Located via :meth:`_resolve_warm_lane_script`:
-        ``<project_root>/scripts/warm-lane-disk-guard.sh`` first, then
-        dark-factory's own copy under ``orchestrator/scripts/warm-lane/``. A
-        project that carries its own warm-lane tooling keeps it (PRD
-        ``warm-lane-infra-repatriation-prd.md`` D3); dark-factory's copy is
-        the floor, not the ceiling.
+        Located via :meth:`_resolve_warm_lane_script`, searching
+        ``<project_root>/scripts/warm-lane-disk-guard.sh`` and dark-factory's
+        own copy under ``orchestrator/scripts/warm-lane/`` in
+        :meth:`_warm_lane_script_candidates` order (PRD
+        ``warm-lane-infra-repatriation-prd.md`` D3).
 
         Mirrors the ``_seed_warm_lane``/``refresh_warm_base`` fail-soft helper
         pattern: no implementation at either location → 127 sentinel; any
@@ -6230,8 +6359,8 @@ class GitOps:
     async def _run_warm_lane_soft_guard(self) -> int:
         """Invoke ``warm-lane-disk-guard.sh check --soft``.
 
-        Located via :meth:`_resolve_warm_lane_script` — project override
-        first, then dark-factory's own copy (PRD D3); see
+        Located via :meth:`_resolve_warm_lane_script` in
+        :meth:`_warm_lane_script_candidates` order (PRD D3); see
         :meth:`_run_warm_lane_disk_guard`.
 
         θ (task 2443, §9.5): the proactive soft-floor counterpart to
@@ -6291,8 +6420,8 @@ class GitOps:
     async def _run_warm_lane_audit(self) -> str | None:
         """Invoke ``warm-lane-audit.sh --mount <worktree_base>``.
 
-        Located via :meth:`_resolve_warm_lane_script` — project override
-        first, then dark-factory's own copy (PRD D3); see
+        Located via :meth:`_resolve_warm_lane_script` in
+        :meth:`_warm_lane_script_candidates` order (PRD D3); see
         :meth:`_run_warm_lane_disk_guard`.
 
         α (task 2443, §9.5 inv.12): OBSERVABILITY-ONLY. This wrapper never
@@ -6392,8 +6521,8 @@ class GitOps:
     async def _run_warm_lane_gc_reclaim(self) -> int:
         """Invoke ``warm-lane-gc.sh reclaim``.
 
-        Located via :meth:`_resolve_warm_lane_script` — project override
-        first, then dark-factory's own copy (PRD D3); see
+        Located via :meth:`_resolve_warm_lane_script` in
+        :meth:`_warm_lane_script_candidates` order (PRD D3); see
         :meth:`_run_warm_lane_disk_guard`.
 
         **Seed-primitive passthrough (task 3072).** Passes ``--seed-script
@@ -6535,8 +6664,8 @@ class GitOps:
     async def warm_lane_ref_is_degenerate(self, task_id: str) -> bool:
         """Invoke ``warm-lane-degenerate-ref-check.sh`` for one task's ref.
 
-        Located via :meth:`_resolve_warm_lane_script` — project override
-        first, then dark-factory's own copy (PRD D3); see
+        Located via :meth:`_resolve_warm_lane_script` in
+        :meth:`_warm_lane_script_candidates` order (PRD D3); see
         :meth:`_run_warm_lane_disk_guard`.
 
         Task 2112: wraps reify's read-only classifier primitive (contract in
@@ -6594,8 +6723,8 @@ class GitOps:
     async def thin_warm_lane(self, lane_dir: Path) -> int:
         """Invoke ``thin-warm-lane.sh <lane_dir>``.
 
-        Located via :meth:`_resolve_warm_lane_script` — project override
-        first, then dark-factory's own copy (PRD D3); see
+        Located via :meth:`_resolve_warm_lane_script` in
+        :meth:`_warm_lane_script_candidates` order (PRD D3); see
         :meth:`_run_warm_lane_disk_guard`.
 
         Task 2442 (§9.5 η): fail-soft, never-raise wrapper around reify δ's
@@ -14501,57 +14630,10 @@ class GitOps:
                 holder_facts=_lane_lock_holder_facts(lock_path, holder_pids),
             )
         try:
-            if not await self._is_registered_worktree(warm_path):
-                # Create-once branch — self-heal a stale unregistered directory first.
-                # A previous run may have left the directory on disk without a git
-                # worktree registration (e.g. worktree metadata pruned after a crash).
-                # `git worktree add` refuses a non-empty directory, permanently
-                # wedging the warm path until manual cleanup.  Removing the orphaned
-                # directory here mirrors the stale-directory removal in create_worktree
-                # and makes the create-once path self-healing.
-                if warm_path.exists():
-                    logger.warning(
-                        'Persistent merge worktree path %s exists on disk but is not '
-                        'a registered git worktree; removing stale directory to allow '
-                        'fresh creation (self-heal)',
-                        warm_path,
-                    )
-                    await remove_tree(warm_path)
-                warm_path.parent.mkdir(parents=True, exist_ok=True)
-                rc, _, err = await _run(
-                    ['git', 'worktree', 'add', '--detach', str(warm_path), merge_commit],
-                    cwd=self.project_root,
-                )
-                if rc != 0:
-                    raise RuntimeError(
-                        f'Failed to create persistent merge worktree at {warm_path}: {err}'
-                    )
-                logger.info(
-                    'Created persistent merge worktree at %s (HEAD=%s)',
-                    warm_path, merge_commit[:8],
-                )
-            else:
-                # Reset-in-place branch (added in step-6)
-                rc, _, err = await _run(
-                    ['git', 'reset', '--hard', merge_commit],
-                    cwd=warm_path,
-                )
-                if rc != 0:
-                    raise RuntimeError(
-                        f'Failed to reset persistent merge worktree {warm_path} '
-                        f'to {merge_commit}: {err}'
-                    )
-                ok, err = await self._clean_lane_retaining_artifacts(
-                    warm_path, caller='reset_persistent_merge_worktree',
-                )
-                if not ok:
-                    raise RuntimeError(
-                        f'Failed to clean persistent merge worktree {warm_path}: {err}'
-                    )
-                logger.info(
-                    'Reset persistent merge worktree %s to HEAD=%s',
-                    warm_path, merge_commit[:8],
-                )
+            await self._create_or_reset_persistent_worktree(
+                warm_path, merge_commit,
+                label='persistent merge worktree', caller='reset_persistent_merge_worktree',
+            )
         finally:
             # Paired with the guarded acquire above (task 3081) so the
             # in-process held-fd registry stays symmetric — a hold this method
@@ -14586,58 +14668,99 @@ class GitOps:
         :meth:`reset_persistent_merge_worktree`).
         """
         warm_path = self.persistent_offline_deep_worktree_path
+        # The reset retains this worktree's OWN target/, never touching or
+        # seeding from the merge lane's target/ (C5).
+        await self._create_or_reset_persistent_worktree(
+            warm_path, merge_commit,
+            label='persistent offline-deep worktree',
+            caller='reset_persistent_offline_deep_worktree',
+        )
+        return warm_path
 
-        if not await self._is_registered_worktree(warm_path):
-            # Create-once branch — self-heal a stale unregistered directory first.
-            # See reset_persistent_merge_worktree for rationale (a previous run
-            # may have left the directory on disk without a git worktree
-            # registration, e.g. worktree metadata pruned after a crash).
-            if warm_path.exists():
-                logger.warning(
-                    'Persistent offline-deep worktree path %s exists on disk but '
-                    'is not a registered git worktree; removing stale directory '
-                    'to allow fresh creation (self-heal)',
-                    warm_path,
-                )
-                await remove_tree(warm_path)
-            warm_path.parent.mkdir(parents=True, exist_ok=True)
-            rc, _, err = await _run(
-                ['git', 'worktree', 'add', '--detach', str(warm_path), merge_commit],
-                cwd=self.project_root,
+    @contextlib.asynccontextmanager
+    async def screen_lane(
+        self, lane: ScreenLane, sha: str, *, lock_wait_secs: float = SCREEN_LANE_LOCK_WAIT_SECS,
+    ) -> AsyncIterator[Path]:
+        """Yield merge screen *lane* checked out at *sha*, holding its flock for the whole body.
+
+        The flock is the lane's ``<lane>.lock``
+        (:func:`~orchestrator.verify_cancel.lane_lock_path`), the one
+        warm-lane-gc and the seed scripts take, held across the body and not
+        just the reset, so nothing mutates the tree under test. The lane is
+        created once or reset in place to *sha*, keeping
+        :data:`SCREEN_LANE_RETAINED` warm across screens.
+
+        Raises :exc:`ScreenLaneUnavailable`, with the lane untouched, when the
+        flock is not won within *lock_wait_secs*: the caller falls back to
+        :meth:`ephemeral_worktree` with ``WorktreeKind.MERGE_SCREEN``. Raises
+        :exc:`RuntimeError` on a git failure.
+        """
+        path = self.worktree_base / lane.value
+        lock_path = lane_lock_path(path)
+        fd = await self._acquire_lane_flock_off_thread(lock_path, lock_wait_secs)
+        if fd is None:
+            raise ScreenLaneUnavailable(lane, lock_path, lock_wait_secs)
+        try:
+            await self._create_or_reset_persistent_worktree(
+                path, sha, label=f'merge screen lane {lane.value}', caller='screen_lane',
+                also_retain=SCREEN_LANE_RETAINED,
             )
-            if rc != 0:
-                raise RuntimeError(
-                    f'Failed to create persistent offline-deep worktree at {warm_path}: {err}'
-                )
-            logger.info(
-                'Created persistent offline-deep worktree at %s (HEAD=%s)',
-                warm_path, merge_commit[:8],
+            yield path
+        finally:
+            self._release_lane_flock(fd)
+
+    async def _create_or_reset_persistent_worktree(
+        self, path: Path, sha: str, *, label: str, caller: str, also_retain: tuple[str, ...] = (),
+    ) -> None:
+        """Create the persistent worktree at *path* once, or reset it in place, at *sha*.
+
+        Create-once: ``git worktree add --detach``. Reset-in-place:
+        ``git reset --hard`` then :meth:`_clean_lane_retaining_artifacts`
+        (its *caller* and *also_retain*), so the source is bit-identical to a
+        fresh checkout of *sha* while the artifact dirs stay warm (PRD §10
+        invariant 1). *label* names the worktree in log and error text.
+        Raises :exc:`RuntimeError` on a git failure. Callers own any locking.
+        """
+        if await self._is_registered_worktree(path):
+            await self._reset_persistent_worktree(
+                path, sha, label=label, caller=caller, also_retain=also_retain,
             )
         else:
-            # Reset-in-place branch — retains this worktree's OWN target/,
-            # never touching or seeding from the merge lane's target/ (C5).
-            rc, _, err = await _run(
-                ['git', 'reset', '--hard', merge_commit],
-                cwd=warm_path,
-            )
-            if rc != 0:
-                raise RuntimeError(
-                    f'Failed to reset persistent offline-deep worktree {warm_path} '
-                    f'to {merge_commit}: {err}'
-                )
-            ok, err = await self._clean_lane_retaining_artifacts(
-                warm_path, caller='reset_persistent_offline_deep_worktree',
-            )
-            if not ok:
-                raise RuntimeError(
-                    f'Failed to clean persistent offline-deep worktree {warm_path}: {err}'
-                )
-            logger.info(
-                'Reset persistent offline-deep worktree %s to HEAD=%s',
-                warm_path, merge_commit[:8],
-            )
+            await self._create_persistent_worktree(path, sha, label=label)
 
-        return warm_path
+    async def _create_persistent_worktree(self, path: Path, sha: str, *, label: str) -> None:
+        # Self-heal a stale unregistered directory first: a previous run may have
+        # left it on disk without a git worktree registration (e.g. worktree
+        # metadata pruned after a crash), and `git worktree add` refuses a
+        # non-empty directory, wedging the path until manual cleanup. Mirrors
+        # the stale-directory removal in create_worktree.
+        if path.exists():
+            logger.warning(
+                '%s path %s exists on disk but is not a registered git worktree; '
+                'removing stale directory to allow fresh creation (self-heal)',
+                label.capitalize(), path,
+            )
+            await remove_tree(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        rc, _, err = await _run(
+            ['git', 'worktree', 'add', '--detach', str(path), sha], cwd=self.project_root,
+        )
+        if rc != 0:
+            raise RuntimeError(f'Failed to create {label} at {path}: {err}')
+        logger.info('Created %s at %s (HEAD=%s)', label, path, sha[:8])
+
+    async def _reset_persistent_worktree(
+        self, path: Path, sha: str, *, label: str, caller: str, also_retain: tuple[str, ...],
+    ) -> None:
+        rc, _, err = await _run(['git', 'reset', '--hard', sha], cwd=path)
+        if rc != 0:
+            raise RuntimeError(f'Failed to reset {label} {path} to {sha}: {err}')
+        ok, err = await self._clean_lane_retaining_artifacts(
+            path, caller=caller, also_retain=also_retain,
+        )
+        if not ok:
+            raise RuntimeError(f'Failed to clean {label} {path}: {err}')
+        logger.info('Reset %s %s to HEAD=%s', label, path, sha[:8])
 
     async def _iter_merge_worktrees(self):
         """Yield ``(wt_path, wt_resolved)`` pairs for registered ``_merge-*`` worktrees.
@@ -15504,18 +15627,18 @@ class GitOps:
             # takes effect on the very next advance.  On the clean happy
             # path this costs exactly one stat().
             grace_s = float(self.config.merge_park_lock_grace_seconds)
-            cleared, waited, initial_age = await self._await_index_lock_clear(
+            standoff = await self._await_index_lock_clear(
                 timeout_s=grace_s,
                 context=f'advance_main for {branch or merge_sha[:8]}',
             )
-            if not cleared:
+            if not standoff.cleared:
                 lock_path = await self._index_lock_path()
                 _, lock_age = await self._index_lock_state()
                 logger.warning(
                     'Foreign git index lock still held in project_root after '
                     '%.1fs — standing off; the merge did NOT land and nothing '
                     'in project_root was modified. lock=%s age=%.1fs',
-                    waited, lock_path, lock_age,
+                    standoff.waited_s, lock_path, lock_age,
                 )
                 # Mirrors the _last_overlap_files / _last_stash_dirty_files
                 # side channels so _map_advance_failure can name the lock in
@@ -15537,14 +15660,18 @@ class GitOps:
                 # for an hour-old crashed leftover.  The latter predates the
                 # wait and is the only one a staleness verdict may key on.
                 # 'grace_seconds' travels alongside so the downstream mapper
-                # stays a pure function of this dict.
+                # stays a pure function of this dict.  'holder_scan' is the
+                # stand-off's own: the scan a skipped wait was decided on, so
+                # the reason's verdict is the stand-off's, or one taken at a
+                # full wait's deadline, naming whoever holds the lock then.
                 self._last_park_lock_info = {
                     'lock_path': str(lock_path),
                     'age_seconds': lock_age,
-                    'waited_seconds': waited,
-                    'initial_age_seconds': initial_age,
+                    'waited_seconds': standoff.waited_s,
+                    'initial_age_seconds': standoff.initial_age_s,
                     'grace_seconds': grace_s,
                     'dirty_files': [],
+                    'holder_scan': standoff.holder_scan,
                 }
                 return AdvanceOutcome('park_lock_contended')
 
@@ -15631,7 +15758,7 @@ class GitOps:
                         # therefore yields a NOT-stale verdict downstream,
                         # which is the correct answer for this shape: no
                         # destructive `rm -f` advice for a lock we watched
-                        # appear.
+                        # appear.  The holder scan names its owner.
                         self._last_park_lock_info = {
                             'lock_path': str(lock_path),
                             'age_seconds': lock_age,
@@ -15641,6 +15768,7 @@ class GitOps:
                                 self.config.merge_park_lock_grace_seconds,
                             ),
                             'dirty_files': sorted(dirty_tracked),
+                            'holder_scan': await self._scan_index_lock_holders(),
                         }
                         return AdvanceOutcome('park_lock_contended')
                     except MergeParkContentionError as e:
@@ -15793,8 +15921,8 @@ class GitOps:
                 # is to retry IN PLACE: stand off for the same bounded grace,
                 # then re-run the sync.  Re-probed first so a genuine
                 # (lock-free) read-tree fault is not silently delayed by a
-                # pointless retry; `_await_index_lock_clear` also short-
-                # circuits an already-stale lock, so the worst case is one
+                # pointless retry; `_await_index_lock_clear` also skips the
+                # wait for a proven crashed leftover, so the worst case is one
                 # grace, not an unbounded stall.
                 held, held_age = await self._index_lock_state()
                 if held:
@@ -15805,7 +15933,7 @@ class GitOps:
                         'leaving project_root stale. error=%s',
                         held_age, sync_err,
                     )
-                    cleared, waited, _pre_age = await self._await_index_lock_clear(
+                    standoff = await self._await_index_lock_clear(
                         timeout_s=float(
                             self.config.merge_park_lock_grace_seconds,
                         ),
@@ -15814,7 +15942,7 @@ class GitOps:
                             f'{branch or merge_sha[:8]}'
                         ),
                     )
-                    if cleared:
+                    if standoff.cleared:
                         sync_rc, _, sync_err = await _run(
                             ['git', 'read-tree', '-u', '--reset', 'HEAD'],
                             cwd=self.project_root,
@@ -15824,7 +15952,7 @@ class GitOps:
                                 'read-tree retry succeeded after waiting '
                                 '%.1fs for the foreign index lock to clear — '
                                 'project_root is in sync with the new HEAD.',
-                                waited,
+                                standoff.waited_s,
                             )
             if sync_rc != 0:
                 logger.error(
@@ -16157,10 +16285,9 @@ class GitOps:
     async def _index_lock_state(self) -> tuple[bool, float]:
         """Return ``(present, age_seconds)`` for project_root's index lock.
 
-        ``age_seconds`` is derived from the lock file's mtime and is what
-        distinguishes an in-flight pre-commit hook (young) from a crashed-git
-        leftover (older than the configured grace) in the operator-facing
-        reason.  Returns ``(False, 0.0)`` when absent; a ``stat`` race (the
+        ``age_seconds`` is derived from the lock file's mtime; it is the age
+        half of the crashed-leftover verdict, whose other half is the holder
+        scan (:meth:`_scan_index_lock_holders`).  Returns ``(False, 0.0)`` when absent; a ``stat`` race (the
         lock vanishing between ``exists`` and ``stat``) is treated as absent,
         which is the truth a moment later anyway.
         """
@@ -16174,14 +16301,23 @@ class GitOps:
             return (False, 0.0)
         return (True, max(0.0, time.time() - mtime))
 
+    async def _scan_index_lock_holders(self) -> GitProcessScan:
+        """The live git processes in project_root's work tree that could have
+        written its index lock, scanned off the event loop."""
+        return await asyncio.to_thread(
+            self.holder_scanner, await self._index_lock_path(), self.project_root,
+            proc_root=self.proc_root,
+        )
+
     async def _await_index_lock_clear(
         self, *, timeout_s: float, context: str,
-    ) -> tuple[bool, float, float]:
+    ) -> IndexLockStandOff:
         """Wait (bounded by *timeout_s*) for project_root's index lock to clear.
 
-        Returns ``(cleared, waited_seconds, initial_age_seconds)``.
+        A lock still held at the end returns with the holder scan its reason
+        must be rendered from (see :class:`IndexLockStandOff`).
 
-        ``initial_age_seconds`` is the lock's age measured BEFORE the
+        ``initial_age_s`` is the lock's age measured BEFORE the
         stand-off begins (0.0 when no lock was held).  It is the ONLY age that
         distinguishes a crashed-git leftover from a live commit, because any
         age read after the wait necessarily includes the wait: a lock created
@@ -16203,13 +16339,17 @@ class GitOps:
         Uses a MONOTONIC clock for the deadline so a wall-clock adjustment
         mid-wait cannot extend or truncate the budget.
 
-        An ALREADY-STALE lock (pre-wait age past
+        A PROVEN crashed-git leftover (a complete holder scan finding no live
+        git process that could have written the lock, and a pre-wait age past
         ``max(timeout_s, _INDEX_LOCK_STALE_FLOOR_S)``) short-circuits the wait
-        entirely — see the inline rationale below.
+        entirely — see the inline rationale below.  A held lock costs one
+        holder scan off the event loop, and a second at a timed-out deadline.
         """
         held, age = await self._index_lock_state()
         if not held:
-            return (True, 0.0, 0.0)
+            return IndexLockStandOff(
+                cleared=True, waited_s=0.0, initial_age_s=0.0, holder_scan=None,
+            )
 
         # Bind the pre-wait observation to a local the poll loop cannot
         # clobber — the loop rebinds `age` on every probe, which is exactly
@@ -16217,31 +16357,34 @@ class GitOps:
         initial_age = age
         lock_path = await self._index_lock_path()
 
-        # ── Already-stale short-circuit ──────────────────────────────
-        # Do not burn the grace on a lock downstream has already decided is a
-        # crashed-git leftover.  `merge_gates._map_advance_failure` renders
-        # its `rm -f` recovery advice from exactly this pre-wait age against
-        # exactly this threshold (_INDEX_LOCK_STALE_FLOOR_S, which it aliases
-        # as _STALE_LOCK_FLOOR_S), so once the bar is cleared no amount of
-        # waiting can change the verdict — it only costs the SERIALIZED merge
-        # worker the full grace for EVERY queued task until an operator clears
-        # the file, which is a slow-motion version of the stall this gate
-        # exists to remove.  The returned (False, 0.0, initial_age) drives the
-        # identical downstream verdict and advice, minus the dead wall-clock.
-        #
-        # Strictly `>` and keyed on the PRE-wait age, mirroring the mapper: a
-        # young lock (the ordinary docs-direct-commit-on-main window) always
-        # gets its full stand-off, which is the case the wait is FOR.
-        stale_floor = max(max(0.0, timeout_s), _INDEX_LOCK_STALE_FLOOR_S)
-        if initial_age > stale_floor:
+        # ── Proven-leftover short-circuit ────────────────────────────
+        # Waiting cannot clear a lock nobody holds; it only costs the
+        # SERIALIZED merge worker the full grace for EVERY queued task until an
+        # operator clears the file.  This very scan is returned, and
+        # `merge_gates._map_advance_failure` renders its `rm -f` advice from it
+        # through the same diagnose_index_lock and floor, so the wait is
+        # skipped only when the reason then says why.  Every other verdict gets
+        # the full stand-off: a live holder, however old its lock (the reify
+        # commit that looked an hour stale finished minutes after a 0s
+        # deferral), an unconfirmed scan, and a young lock.
+        scan = await self._scan_index_lock_holders()
+        diagnosis = diagnose_index_lock(
+            initial_age_s=initial_age,
+            grace_s=max(0.0, timeout_s),
+            stale_floor_s=_INDEX_LOCK_STALE_FLOOR_S,
+            scan=scan,
+        )
+        if diagnosis.verdict is IndexLockVerdict.CRASHED_LEFTOVER:
             logger.warning(
                 'Foreign git index lock in project_root is ALREADY %.0fs old '
-                '(past the %.0fs staleness floor) — skipping the stand-off, a '
-                'crashed-git leftover will not clear by waiting. lock=%s '
-                'context=%s',
-                initial_age, stale_floor, lock_path, context,
+                '(past the %.0fs staleness floor) and no live git process holds '
+                'it — skipping the stand-off, a crashed-git leftover will not '
+                'clear by waiting. lock=%s context=%s',
+                initial_age, diagnosis.stale_after_s, lock_path, context,
             )
-            return (False, 0.0, initial_age)
+            return IndexLockStandOff(
+                cleared=False, waited_s=0.0, initial_age_s=initial_age, holder_scan=scan,
+            )
 
         started = time.monotonic()
         deadline = started + max(0.0, timeout_s)
@@ -16253,8 +16396,10 @@ class GitOps:
 
         logger.warning(
             'Foreign git index lock held in project_root — standing off for '
-            'up to %.0fs before giving up. lock=%s age=%.1fs context=%s',
-            max(0.0, timeout_s), lock_path, age, context,
+            'up to %.0fs before giving up. lock=%s age=%.1fs verdict=%s '
+            'holders=[%s] context=%s',
+            max(0.0, timeout_s), lock_path, age, diagnosis.verdict,
+            describe_holders(diagnosis.holders), context,
         )
 
         while time.monotonic() < deadline:
@@ -16267,7 +16412,10 @@ class GitOps:
                     'with advance. lock=%s context=%s',
                     waited, lock_path, context,
                 )
-                return (True, waited, initial_age)
+                return IndexLockStandOff(
+                    cleared=True, waited_s=waited, initial_age_s=initial_age,
+                    holder_scan=None,
+                )
             now = time.monotonic()
             if now - last_warned >= _INDEX_LOCK_WARN_INTERVAL_S:
                 last_warned = now
@@ -16288,8 +16436,14 @@ class GitOps:
                 'with advance. lock=%s context=%s',
                 waited, lock_path, context,
             )
-            return (True, waited, initial_age)
-        return (False, waited, initial_age)
+            return IndexLockStandOff(
+                cleared=True, waited_s=waited, initial_age_s=initial_age,
+                holder_scan=None,
+            )
+        return IndexLockStandOff(
+            cleared=False, waited_s=waited, initial_age_s=initial_age,
+            holder_scan=await self._scan_index_lock_holders(),
+        )
 
     async def _park_wip_on_private_ref(self, label: str) -> None:
         """Park uncommitted WIP in project_root onto MERGE_PARK_REF.

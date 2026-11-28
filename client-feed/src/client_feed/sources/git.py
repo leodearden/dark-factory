@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import contextlib
 import itertools
+import math
 import os
 import re
+import select
 import subprocess
-import threading
+import time
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -28,6 +30,7 @@ _OBJECT_SHA: Final = re.compile(r'[0-9a-f]{40}|[0-9a-f]{64}')
 _COMMIT_MARK: Final = b'\x01'
 _FIRST_PARENT_DIFF: Final = '--diff-merges=first-parent'
 _PARSE_FAILURE: Final = 'output not understood'
+_REPLY_CHUNK_BYTES: Final = 64 * 1024
 
 # Mirrors df_pytest_isolation.py::_GIT_REDIRECT_ENV: the variables that make git act on a
 # repository or config other than the one at cwd.
@@ -190,6 +193,19 @@ def tree_entries(root: Path, commit: str) -> tuple[TreeEntry, ...]:
         return tuple(_tree_entry(record) for record in output.split(b'\0') if record)
 
 
+def path_entry(root: Path, commit: str, path: str) -> TreeEntry | None:
+    """The entry at `path` in `commit`'s tree; None when the tree holds no file, symlink or submodule there.
+
+    With -r a directory named `path` lists only the entries below it, so it reads as absent.
+    """
+    output = _run(
+        root, 'ls-tree', '-r', '-l', '-z', '--full-tree', _require_sha(commit), '--', path
+    ).stdout
+    with _parsing('ls-tree'):
+        entries = [_tree_entry(record) for record in output.split(b'\0') if record]
+    return next((entry for entry in entries if entry.path == path), None)
+
+
 def _cat_file_error(reason: str, process: subprocess.Popen[bytes]) -> GitError:
     return GitError(subcommand='cat-file', returncode=process.poll(), stderr=reason)
 
@@ -214,47 +230,52 @@ def _timed_out(session: _CatFile) -> GitError:
     )
 
 
-@contextlib.contextmanager
-def _deadline(session: _CatFile) -> Iterator[None]:
-    """The block, its session killed once it outlasts the timeout; a killed session's block is a timeout, whatever the pipe gave."""
-    expired = threading.Event()
+def _reply_chunks(session: _CatFile, *, deadline: float, sha: str) -> Iterator[bytes]:
+    """Each next run of bytes git writes, read straight from the fd so poll sees every byte still unread.
 
-    def expire() -> None:
-        expired.set()
-        session.process.kill()
-
-    timer = threading.Timer(session.timeout_secs, expire)
-    timer.start()
-    try:
-        yield
-    finally:
-        timer.cancel()
-        timer.join()
-        if expired.is_set():
+    Past `deadline` the session is killed, so no later read can take this read's reply, and the read is a timeout.
+    """
+    _, reply = _pipes(session.process)
+    descriptor = reply.fileno()
+    waiter = select.poll()
+    waiter.register(descriptor, select.POLLIN)
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 or not waiter.poll(math.ceil(remaining * 1000)):
+            session.process.kill()
             raise _timed_out(session)
+        chunk = os.read(descriptor, _REPLY_CHUNK_BYTES)
+        if not chunk:
+            raise _cat_file_error(f'output ended before object {sha} was read', session.process)
+        yield chunk
 
 
 def _read_blob(session: _CatFile, sha: str) -> bytes:
-    with _deadline(session):
-        return _exchange(session.process, sha)
-
-
-def _exchange(process: subprocess.Popen[bytes], sha: str) -> bytes:
-    request, reply = _pipes(process)
+    """One request and its whole reply, git given `session.timeout_secs` from the request to the reply's last byte."""
+    deadline = time.monotonic() + session.timeout_secs
+    process = session.process
+    request, _ = _pipes(process)
     try:
         request.write(_require_sha(sha).encode() + b'\n')
         request.flush()
     except OSError as exc:
         raise _cat_file_error(f'request for {sha} not accepted', process) from exc
-    header = reply.readline().split()
+    chunks = _reply_chunks(session, deadline=deadline, sha=sha)
+    reply = bytearray()
+    while b'\n' not in reply:
+        reply += next(chunks)
+    header_line, _, body = reply.partition(b'\n')
+    header = header_line.split()
     if len(header) != 3 or header[1] != b'blob':
         raise _cat_file_error(f'object {sha} is not a readable blob', process)
     with _parsing('cat-file', returncode=process.poll()):
         size = int(header[2])
-    content = reply.read(size)
-    if len(content) != size or reply.read(1) != b'\n':
-        raise _cat_file_error(f'object {sha} truncated', process)
-    return content
+    while len(body) <= size:
+        body += next(chunks)
+    if len(body) != size + 1 or body[size:] != b'\n':
+        raise _cat_file_error(f"object {sha}'s reply does not end in a newline right after its {size} bytes", process)
+    del body[size:]
+    return bytes(body)
 
 
 def _finish(session: _CatFile) -> None:

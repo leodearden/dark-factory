@@ -30,6 +30,7 @@ from orchestrator.git_ops import MergeResult
 from orchestrator.merge_lane.disposition import MergeFailureDisposition, SkewEvidence
 from orchestrator.merge_lane.outcome_facts import ConflictEvidence, MergeBlockCategory
 from orchestrator.merge_lane.reverify_gate_decision import GateClearance, ReverifyDispatch
+from orchestrator.merge_lane.tested_tree import TestedTree, TestedTreeViolation
 from orchestrator.merge_verify_facts import ChainDepthReason
 from orchestrator.remote_gate import GateIdentityPair, RunnerUnavailableKind
 from orchestrator.verify import VerifyResult, merge_verify_command_budget_secs
@@ -1563,6 +1564,9 @@ class ChainResult:
     build_ms: int | None = None
     link_request_ids: tuple[str, ...] = ()
     """The ``request_id`` of each link, parallel to ``links``."""
+    link_tips: tuple[str, ...] = ()
+    """The branch tip each link merged, the second parent of its merge commit,
+    parallel to ``links`` (PRD ``plans/merge-pool-batches-prd.md`` §6.1)."""
 
     @property
     def depth(self) -> int:
@@ -1664,6 +1668,7 @@ class OutcomeKind(StrEnum):
     cas_retry = 'cas_retry'
     gate_retry = 'gate_retry'
     post_merge_generation_chained = 'post_merge_generation_chained'
+    screen_failed = 'screen_failed'
 
     @property
     def is_terminal(self) -> bool:
@@ -2092,6 +2097,9 @@ class InflightEntry:
     verify_base_divergence: the :class:`VerifyBaseDivergence` recorded when
                      this entry's verify was dispatched off the frozen tip, or
                      ``None`` (task 5302).
+    tree           : the :class:`TestedTree` this entry verifies, published once
+                     through :meth:`InflightEntrySlot.publish_tree`; ``None`` for
+                     passthroughs and hand-built entries.
     """
 
     item: SpeculativeItem
@@ -2112,6 +2120,7 @@ class InflightEntry:
     gate: PendingGate | None = None
     verify_base_divergence: VerifyBaseDivergence | None = None
     verdict_host: str | None = None
+    tree: TestedTree | None = None
 
     @property
     def pending_task(self) -> asyncio.Task[object] | None:
@@ -2215,6 +2224,25 @@ class InflightEntrySlot:
             )
             return
         self.entry.verify_base = facts
+
+    def publish_tree(self, tree: TestedTree) -> None:
+        """Record the entry's tested tree, once (plans/merge-pool-batches-prd.md §6.1).
+
+        An empty slot warns and returns, as :meth:`publish_verify_base` does.
+        """
+        if self.entry is None:
+            logger.warning(
+                'tested tree %s not published: the entry slot was never filled',
+                tree.to_wire(),
+            )
+            return
+        if self.entry.tree is not None:
+            raise TestedTreeViolation(
+                'published once',
+                'the entry already has a tested tree',
+                f'task={self.entry.item.request.task_id!r}',
+            )
+        self.entry.tree = tree
 
 
 class VerifyInFlightKind(StrEnum):

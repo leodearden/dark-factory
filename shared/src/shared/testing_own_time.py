@@ -17,7 +17,9 @@ A wait reads the wall clock and its child, and sleeps, through a
 :class:`WaitHost`, by default :data:`LINUX_HOST`, so it is Linux-only:
 :data:`LINUX_HOST` reads ``/proc/PID/schedstat`` and ``/proc/PID/stat``.
 :func:`run_on_own_time` runs a command to its exit under such a wait, as
-``subprocess.run`` would with its output captured.
+``subprocess.run`` would with its output captured. An :class:`OwnTimeClock`
+reads the same own time on demand, for a bound a wait's one budget cannot
+express, such as one that restarts whenever the child makes progress.
 
 This is the sanctioned bound on a real child process under the
 timing-dependence lint (fused-memory/scripts/_timing_dependence.py): use
@@ -43,6 +45,7 @@ from typing import IO, Protocol
 __all__ = [
     "LINUX_HOST",
     "ChildSnapshot",
+    "OwnTimeClock",
     "OwnTimeExceeded",
     "Reading",
     "WaitHost",
@@ -205,6 +208,32 @@ class _OwnTimeMeter:
         )
 
 
+class OwnTimeClock:
+    """The own time the child *pid* has spent since this clock was made, in
+    seconds, each time the clock is called.
+
+    *pid* must be this process's child, and stay unreaped for as long as the
+    clock is read. The clock reads the child before it takes its start from
+    the wall clock, and the wall clock before the child at every reading, so a
+    stall of this process can only understate the child's own time.
+    """
+
+    def __init__(self, pid: int, *, host: WaitHost = LINUX_HOST) -> None:
+        self._pid = pid
+        self._host = host
+        self._meter = _OwnTimeMeter.starting_from(host.child(pid))
+        self._started = host.wall()
+
+    def reading(self) -> Reading:
+        """How the child has spent the time since this clock was made, read now."""
+        elapsed = self._host.wall() - self._started
+        self._meter = self._meter.after_reading(self._host.child(self._pid), elapsed=elapsed)
+        return self._meter.reading
+
+    def __call__(self) -> float:
+        return self.reading().own
+
+
 class OwnTimeExceeded(TimeoutError):
     """A wait that outlasted its budget of the child's own time.
 
@@ -259,11 +288,11 @@ def wait_on_own_time(
     *done* is checked after each poll's reading and before that reading is held
     against either limit, so a condition that comes true while this process is
     itself starved of a CPU never fails the wait. The wait reads and spends all
-    its time through *host*. It reads the child before it starts its clock, and
-    the clock before the child at every poll, so a stall of this process can
-    only understate the child's own time. It also leaves the *uncredited* bound
-    of the child's :class:`Reading` out of that time, so a queue stint the
-    kernel has not yet credited can only understate it too.
+    its time through *host*, and reads the child's own time on an
+    :class:`OwnTimeClock`, so a stall of this process can only understate it. It
+    also leaves the *uncredited* bound of the child's :class:`Reading` out of
+    that time, so a queue stint the kernel has not yet credited can only
+    understate it too.
 
     Raises:
         OwnTimeExceeded: *done* was still false once the child's own time
@@ -273,12 +302,9 @@ def wait_on_own_time(
     """
     if wall_limit is None:
         wall_limit = _DEFAULT_WALL_LIMIT_IN_BUDGETS * budget
-    meter = _OwnTimeMeter.starting_from(host.child(pid))
-    started = host.wall()
+    clock = OwnTimeClock(pid, host=host)
     while True:
-        elapsed = host.wall() - started
-        meter = meter.after_reading(host.child(pid), elapsed=elapsed)
-        reading = meter.reading
+        reading = clock.reading()
         if done():
             return
         if reading.own > budget:

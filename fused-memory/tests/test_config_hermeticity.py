@@ -83,15 +83,17 @@ INTERPOLATED_PATH_LEAVES = (
 #: directory that leaf's unpinned YAML default is anchored at, as ONE
 #: ``(name, reader, anchor)`` value per case: a fixture's ``params`` binds a
 #: single name, so a multi-value ``pytest.param`` would not fit every consumer.
-#: ``Path()`` is the CWD; ``reconciliation.data_dir`` is anchored at the
-#: checkout at load (``fused_memory/config/checkout_anchor.py``, task 5462).
+#: ``Path()`` is the CWD, now only ``taskmaster.project_root``'s anchor;
+#: ``queue.data_dir`` and ``reconciliation.data_dir`` are anchored at the
+#: checkout at load (``fused_memory/config/checkout_anchor.py``, tasks 5462
+#: and 10210).
 INTERPOLATION_VAR_LEAVES = (
     pytest.param(
         ('PROJECT_ROOT', lambda config: config.taskmaster.project_root, Path()),
         id='project-root',
     ),
     pytest.param(
-        ('QUEUE_DATA_DIR', lambda config: config.queue.data_dir, Path()),
+        ('QUEUE_DATA_DIR', lambda config: config.queue.data_dir, CHECKOUT_ROOT),
         id='queue-data-dir',
     ),
     pytest.param(
@@ -161,7 +163,8 @@ def test_the_pin_lays_out_tmp_path_as_the_tracked_config_does(interpolation, mon
     ``fused-memory/config/config.yaml`` is the home of that layout and
     ``conftest.py::_isolate_fm_config`` mirrors it under ``tmp_path``.  Read
     with the pin removed, the leaf is the YAML default under its case's
-    anchor (the CWD, or the checkout for ``reconciliation.data_dir``); read
+    anchor (the CWD, or the checkout for ``queue.data_dir`` and
+    ``reconciliation.data_dir``); read
     with it, the same relative path under ``tmp_path``.  A default edited in
     one place and not the other fails here instead of drifting silently.
     """

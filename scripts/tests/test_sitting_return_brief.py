@@ -11,16 +11,22 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import orchestrator_projects
 import pytest
 from escalation.authority import EXECUTOR_IDENTITY, policy_row
 from escalation.models import Escalation
+from escalation.shadow_ruling import ShadowRuling
+from fake_systemctl import install_fake_systemctl
+from landing_history import landing_repo
 from orchestrator.decision_registry import (
     AuditOutcome,
     AuditVerdict,
     DecisionRecord,
     normalize_escalations_dir,
 )
+from orchestrator.digest import PER_DONE_RUN_LABEL
 from shared.project_layout import KNOWN_PROJECT_ROOTS_ENV
+from shared.testing_landing_history import LandingRepo, record_merge_done, record_train
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 from sitting import apply as apply_mod
 from sitting import audits, brief, fleet_state, payloads
@@ -55,6 +61,10 @@ DONE_LINE = re.compile(
     r'^done \(decisions=(\w+), standing_policy=(\w+), landed=(\w+), stuck=(\w+), spend=(\w+), closes=(\w+)\)$'
 )
 EVIDENCE = 'Leo 2026-09-25: "take option A"\nquoted from esc-5580-4'
+DF_UNIT = 'orchestrator-dark-factory.service'
+REIFY_UNIT = 'orchestrator-reify.service'
+PAUSE_REASON = 'cost ceiling reached'
+INACTIVE_FOOTER = 'Inactive projects (not in sections 2–5):'
 
 
 @dataclass
@@ -86,6 +96,14 @@ class Env:
     def trigger_state(self) -> Path:
         return self.tmp / 'state' / 'trigger-last-run.json'
 
+    @property
+    def units_dir(self) -> Path:
+        return self.tmp / 'units'
+
+    def units(self) -> fleet_state.OrchestratorUnits:
+        return fleet_state.OrchestratorUnits(
+            orchestrator_projects.scan_units(self.units_dir), fleet_state.systemctl_active_state)
+
     def argv(self, *roots: Path) -> list[str]:
         return [
             *[arg for root in (roots or (self.df,)) for arg in ('--project-root', str(root))],
@@ -101,10 +119,11 @@ class Env:
             '--output', str(self.output),
             '--ledger-out', str(self.ledger_out),
             '--trigger-state', str(self.trigger_state),
+            '--units-dir', str(self.units_dir),
             '--now', NOW_ISO,
         ]
 
-    def build(self, *roots: Path) -> mod.ReturnBriefDocument:
+    def build(self, *roots: Path, units: fleet_state.OrchestratorUnits | None = None) -> mod.ReturnBriefDocument:
         return mod.build(
             project_roots=[str(root) for root in (roots or (self.df,))],
             roots_source='--project-root',
@@ -116,6 +135,7 @@ class Env:
             trigger_state_path=self.trigger_state,
             window=fleet_state.Window.trailing(NOW, days=1),
             now=NOW,
+            units=units or self.units(),
         )
 
 
@@ -163,6 +183,8 @@ def _runs_db(path: Path) -> None:
             completed_at TEXT NOT NULL);
         CREATE TABLE task_results (run_id TEXT NOT NULL, task_id TEXT NOT NULL, project_id TEXT NOT NULL, title TEXT,
             outcome TEXT NOT NULL, completed_at TEXT, PRIMARY KEY (run_id, task_id));
+        CREATE TABLE scheduler_state (project_id TEXT PRIMARY KEY, pause_reason TEXT NOT NULL, pause_at TEXT NOT NULL,
+            set_by_run_id TEXT NOT NULL, ewa_value REAL, pause_class TEXT, hold_owner TEXT, expires_at TEXT);
     """)
     conn.execute("INSERT INTO events (timestamp, run_id, task_id, event_type, data) "
                  "VALUES (?, 'r1', '120', 'task_completed', '{\"outcome\": \"done\"}')", (IN_WINDOW,))
@@ -174,17 +196,39 @@ def _runs_db(path: Path) -> None:
     conn.close()
 
 
+def _record_landings(runs_db: Path, repo: LandingRepo) -> None:
+    """A fast-forward and a two-member train in the window: 3 landed, beside 1 done run."""
+    conn = sqlite3.connect(runs_db)
+    try:
+        record_merge_done(conn, '120', repo.fast_forward('task 120'), IN_WINDOW)
+        record_train(conn, '122', ['121', '122'], repo.merge('task/121'), IN_WINDOW)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _install_unit(units_dir: Path, unit: str, root: Path) -> None:
+    units_dir.mkdir(parents=True, exist_ok=True)
+    (units_dir / unit).write_text(
+        '[Service]\n'
+        f'ExecStart=/usr/bin/python3 -m orchestrator --config {root}/dark-factory-orchestrator.yaml\n'
+    )
+
+
 @pytest.fixture
-def env(tmp_path, make_tasks_db, project_root_with_tasks_db) -> Env:
+def env(tmp_path, make_tasks_db, project_root_with_tasks_db, monkeypatch) -> Env:
     df = tmp_path / 'src' / 'dark-factory'
     e = Env(tmp_path, df, tmp_path / 'fleet', tmp_path / 'fleet' / 'sessions',
             tmp_path / 'state' / 'preparation.json', tmp_path / 'out')
+    _install_unit(e.units_dir, DF_UNIT, df)
+    install_fake_systemctl(tmp_path / 'fake-bin', monkeypatch, {DF_UNIT: 'active'})
     make_tasks_db([
         *({'id': n, 'status': 'blocked'} for n in range(101, 108)),
         {'id': 109, 'status': 'blocked', 'title': 'blocked behind nothing'},
         {'id': 120, 'status': 'done'},
     ], directory=project_root_with_tasks_db(df).parent)
     _runs_db(fleet_state.runs_db_path(df))
+    _record_landings(fleet_state.runs_db_path(df), landing_repo(df))
     for n in range(101, 107):
         _esc(e.queue, id=f'esc-{n}-1')
     _esc(e.queue, id='esc-107-1', pin_declared_by=['leo'])
@@ -285,11 +329,36 @@ class TestSections:
 
         assert fleet_state.SHADOW_ONLY in sections[TITLES[1]]
         assert f'1 in {brief.AUDIT_SAMPLE_EVERY}' in sections[TITLES[1]]
-        assert 'dark_factory' in sections[TITLES[2]] and '1 task' in sections[TITLES[2]]
+        assert 'dark_factory' in sections[TITLES[2]] and '3 landings on main' in sections[TITLES[2]]
+        assert 'done in the window' not in sections[TITLES[2]]
         assert fleet_state.NO_OPEN_ESCALATION in sections[TITLES[3]] and 'task 109' in sections[TITLES[3]]
         assert 'claude-opus' in sections[TITLES[4]] and '$2.50' in sections[TITLES[4]]
         assert EVIDENCE in sections[TITLES[5]] and 'dec-close-1' in sections[TITLES[5]]
         assert 'lifetime: 1' in sections[TITLES[5]]
+
+
+class TestAgreementTable:
+    def test_an_attended_seat_close_renders_in_the_not_human_ruled_column(self, env):
+        """A seat closing a stamped record without a ruling is counted, not compared
+        (plans/instruments-honesty-prd.md decision 10)."""
+        ruling = ShadowRuling(
+            ruling_class='risk_identified_branch_behind_main', proposed_action='close_only',
+            evidence='probe output quoted verbatim', confidence=0.8,
+        )
+        _esc(env.queue, id='esc-110-1', category='risk_identified',
+             agent_role='claude-task-110-implementer', status='dismissed',
+             resolved_at=IN_WINDOW, resolved_by='escalation-watcher', resolution_action='close_only',
+             resolution_class='actionable', triaged_by='watcher-a',
+             triage_note=f'probe: rc=0\n{ruling.to_note_line()}')
+
+        section = _sections(mod.render(env.build()))[TITLES[1]]
+
+        header = next(line for line in section.splitlines() if line.startswith('| class |'))
+        columns = [cell.strip() for cell in header.strip('|').split('|')]
+        row = next(line for line in section.splitlines() if line.startswith(f'| {ruling.ruling_class} |'))
+        cells = [cell.strip() for cell in row.strip('|').split('|')]
+        assert cells[columns.index('not human-ruled')] == '1'
+        assert cells[columns.index('agreed')] == '0'
 
 
 class TestAutonomousClosesSection:
@@ -382,7 +451,7 @@ class TestHandoverPerProject:
             project_roots=[str(env.df), str(reify)], roots_source='--project-root', decisions_root=env.fleet,
             sessions_root=env.sessions, handover_override=None, preparation_path=env.preparation,
             previous_ledger=env.ledger_out, trigger_state_path=env.trigger_state,
-            window=fleet_state.Window.trailing(NOW, days=1), now=NOW,
+            window=fleet_state.Window.trailing(NOW, days=1), now=NOW, units=env.units(),
         )
 
         key = escalation_key(normalize_escalations_dir(reify / 'data' / 'escalations'), 'esc-101-1')
@@ -534,24 +603,33 @@ class TestMain:
         match = DONE_LINE.match(out.splitlines()[-1])
         assert match is not None and match.group(6) == 'degraded'
 
-    def test_no_subprocess_and_no_network(self, env, capsys, monkeypatch):
-        calls: list[str] = []
+    def test_the_only_subprocesses_are_git_rev_list_and_systemctl_show(self, env, capsys, monkeypatch):
+        spawned: list[list[str]] = []
+        connected: list[str] = []
+        real_popen = subprocess.Popen
+
+        def recording_popen(args, *rest, **kwargs):
+            spawned.append([str(arg) for arg in args])
+            return real_popen(args, *rest, **kwargs)
 
         def forbid(name):
             def recorder(*args, **kwargs):
-                calls.append(name)
+                connected.append(name)
                 raise AssertionError(f'{name} called')
             return recorder
 
-        for name in ('run', 'Popen', 'call', 'check_call', 'check_output'):
-            monkeypatch.setattr(subprocess, name, forbid(f'subprocess.{name}'))
+        monkeypatch.setattr(subprocess, 'Popen', recording_popen)
         monkeypatch.setattr(socket, 'create_connection', forbid('socket.create_connection'))
         monkeypatch.setattr(socket.socket, 'connect', forbid('socket.connect'))
 
         rc, _ = _run(capsys, env.argv())
 
         assert rc == 0
-        assert calls == []
+        assert connected == []
+        assert spawned
+        assert {Path(argv[0]).name for argv in spawned} == {'git', 'systemctl'}
+        assert all('rev-list' in argv for argv in spawned if Path(argv[0]).name == 'git')
+        assert all('show' in argv for argv in spawned if Path(argv[0]).name == 'systemctl')
 
     def test_a_pinned_now_renders_byte_identical_files(self, env, capsys):
         _run(capsys, env.argv())
@@ -945,19 +1023,218 @@ class TestRootsStatement:
         line = _line_naming(_header(env.output.read_text()), 'project roots')
         assert 'default' in line and str(env.df) in line
 
-    def test_a_queue_reached_only_through_a_decision_record_is_named(self, env):
+    def test_a_queue_known_only_through_the_registry_gets_rows_in_sections_two_to_five(self, env):
         elsewhere = env.tmp / 'src' / 'elsewhere' / 'data' / 'escalations'
-        elsewhere.mkdir(parents=True)
+        _esc(elsewhere, id='esc-402-1', timestamp=IN_WINDOW)
         _closed_decision(env.fleet, 'dec-elsewhere', closed_at=CLOSED_IN_WINDOW,
                          escalations_dir=normalize_escalations_dir(elsewhere), escalation_id='esc-401-1')
 
-        header = _header(mod.render(env.build()))
+        document = env.build()
+        text = mod.render(document)
 
-        outside = _line_naming(header, 'outside those roots')
-        assert normalize_escalations_dir(elsewhere) in outside
+        assert 'elsewhere' in document.projects
+        sections = _sections(text)
+        for title in TITLES[1:5]:
+            assert '### elsewhere' in sections[title].splitlines(), title
+        assert _line_naming(_header(text), 'outside those roots').endswith(': none')
+
+    def test_a_queue_of_no_known_shape_is_listed_outside_and_not_measured(self, env):
+        odd = env.tmp / 'odd' / 'queue'
+        odd.mkdir(parents=True)
+        _closed_decision(env.fleet, 'dec-odd', closed_at=CLOSED_IN_WINDOW,
+                         escalations_dir=normalize_escalations_dir(odd), escalation_id='esc-403-1')
+
+        document = env.build()
+
+        outside = _line_naming(_header(mod.render(document)), 'outside those roots')
+        assert normalize_escalations_dir(odd) in outside
         assert normalize_escalations_dir(env.queue) not in outside
+        assert list(document.projects) == ['dark_factory']
+
+    def test_a_configured_root_holding_no_queue_is_measured_and_named(self, env):
+        reify = env.tmp / 'src' / 'reify'
+        reify.mkdir(parents=True)
+
+        document = env.build(env.df, reify)
+
+        header = _header(mod.render(document))
+        assert 'reify' in document.projects
+        assert str(reify) in _line_naming(header, 'project roots')
+        holding_none = _line_naming(header, 'configured roots holding no scanned queue')
+        assert str(reify) in holding_none and str(env.df) not in holding_none
+
+    def test_with_every_configured_root_holding_a_queue_none_holds_no_queue(self, env):
+        line = _line_naming(_header(mod.render(env.build())), 'configured roots holding no scanned queue')
+
+        assert line.endswith(': none')
+
+    def test_a_registry_queue_folding_onto_a_configured_project_leaves_the_configured_root_measured(self, env):
+        twin = env.tmp / 'elsewhere' / 'dark_factory'
+        queue = twin / 'data' / 'escalations'
+        queue.mkdir(parents=True)
+        _closed_decision(env.fleet, 'dec-twin', closed_at=CLOSED_IN_WINDOW,
+                         escalations_dir=normalize_escalations_dir(queue), escalation_id='esc-404-1')
+
+        state = env.build().projects['dark_factory']
+
+        assert state.root == str(env.df)
+        assert any(gap.source == 'project_root' and gap.path == str(twin) for gap in state.landed.shortfalls)
 
     def test_with_every_queue_under_a_measured_root_none_is_outside(self, env):
         outside = _line_naming(_header(mod.render(env.build())), 'outside those roots')
 
         assert outside.endswith(': none')
+
+
+def _pause(root: Path, project: str, reason: str) -> None:
+    conn = sqlite3.connect(fleet_state.runs_db_path(root))
+    try:
+        conn.execute("INSERT INTO scheduler_state (project_id, pause_reason, pause_at, set_by_run_id) "
+                     "VALUES (?, ?, ?, 'r1')", (project, reason, IN_WINDOW))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _idle_root(env: Env) -> Path:
+    """reify: a git repo whose runs.db records no landing, an empty queue, and an installed unit."""
+    reify = env.tmp / 'src' / 'reify'
+    landing_repo(reify)
+    (reify / 'data' / 'escalations').mkdir(parents=True)
+    _runs_db(fleet_state.runs_db_path(reify))
+    _install_unit(env.units_dir, REIFY_UNIT, reify)
+    return reify
+
+
+def _units(env: Env, states: dict[str, str]) -> fleet_state.OrchestratorUnits:
+    return fleet_state.OrchestratorUnits(orchestrator_projects.scan_units(env.units_dir), states.__getitem__)
+
+
+def _project_block(section: str, project: str) -> list[str]:
+    """The lines of *project*'s ``###`` block, heading excluded."""
+    lines = section.splitlines()
+    start = lines.index(f'### {project}') + 1
+    end = next((n for n in range(start, len(lines)) if lines[n].startswith('### ')), len(lines))
+    return lines[start:end]
+
+
+def _first_line(block: list[str]) -> str:
+    return next(line for line in block if line)
+
+
+class TestActivityRendering:
+    ACTIVE = {DF_UNIT: 'active'}
+    WITH_IDLE_REIFY = {DF_UNIT: 'active', REIFY_UNIT: 'inactive'}
+
+    def test_a_paused_active_project_keeps_its_rows_flagged_under_each_heading(self, env):
+        _pause(env.df, 'dark_factory', PAUSE_REASON)
+
+        sections = _sections(mod.render(env.build(units=_units(env, self.ACTIVE))))
+
+        for title in TITLES[1:5]:
+            block = _project_block(sections[title], 'dark_factory')
+            assert _first_line(block) == f'scheduler paused: {PAUSE_REASON}', title
+
+    def test_an_unpaused_project_carries_no_pause_flag(self, env):
+        text = mod.render(env.build(units=_units(env, self.ACTIVE)))
+
+        assert 'scheduler paused' not in text
+
+    def test_an_inactive_project_is_named_once_on_the_footer_and_has_no_rows(self, env):
+        reify = _idle_root(env)
+
+        document = env.build(env.df, reify, units=_units(env, self.WITH_IDLE_REIFY))
+        text = mod.render(document)
+
+        assert not document.projects['reify'].active
+        sections = _sections(text)
+        for title in TITLES[1:5]:
+            assert 'reify' not in sections[title], title
+            assert '### dark_factory' in sections[title].splitlines(), title
+        (naming,) = [line for line in sections[TITLES[5]].splitlines() if 'reify' in line]
+        assert naming.startswith(INACTIVE_FOOTER)
+        assert f'reify ({reify}): {fleet_state.INACTIVE_REASON}' in naming
+        assert 'dark_factory' not in naming
+
+    def test_an_unlistable_units_dir_keeps_a_quiet_project_listed_with_the_shortfall(self, env):
+        reify = _idle_root(env)
+        units = fleet_state.OrchestratorUnits(
+            orchestrator_projects.scan_units(env.tmp / 'no-such-units'), self.WITH_IDLE_REIFY.__getitem__)
+
+        text = mod.render(env.build(env.df, reify, units=units))
+
+        sections = _sections(text)
+        for title in TITLES[1:5]:
+            assert '### reify' in sections[title].splitlines(), title
+        assert any('cannot list units' in line for line in _project_block(sections[TITLES[2]], 'reify'))
+        assert 'reify' not in _line_naming(text, INACTIVE_FOOTER)
+
+    def test_with_no_inactive_project_the_footer_reads_none(self, env):
+        text = mod.render(env.build(units=_units(env, self.ACTIVE)))
+
+        assert _line_naming(text, INACTIVE_FOOTER) == f'{INACTIVE_FOOTER} none.'
+        assert text.rstrip('\n').splitlines()[-1] == f'{INACTIVE_FOOTER} none.'
+
+    def test_an_inactive_paused_project_is_footered_with_its_pause_flag(self, env):
+        reify = _idle_root(env)
+        _pause(reify, 'reify', PAUSE_REASON)
+
+        text = mod.render(env.build(env.df, reify, units=_units(env, self.WITH_IDLE_REIFY)))
+
+        footer = _line_naming(text, INACTIVE_FOOTER)
+        assert f'reify ({reify}): {fleet_state.INACTIVE_REASON}; scheduler paused: {PAUSE_REASON}' in footer
+
+    def test_landed_states_the_unit_and_the_new_escalations_beside_the_landings(self, env):
+        _esc(env.queue, id='esc-130-1', timestamp=IN_WINDOW, status='resolved', resolved_at=IN_WINDOW,
+             resolved_by='interactive')
+
+        document = env.build(units=_units(env, self.ACTIVE))
+        block = _project_block(_sections(mod.render(document))[TITLES[2]], 'dark_factory')
+
+        state = document.projects['dark_factory']
+        assert '3 landings on main' in '\n'.join(block)
+        assert 'orchestrator unit: active' in block
+        assert '1 new escalation filed in the window' in block
+        for measurement in (state.landed, state.unit_active, state.new_escalations):
+            assert f'measured {NOW_ISO} from {measurement.source} ({measurement.status})' in block
+        assert state.unit_active.source == f'systemctl --user show {DF_UNIT}'
+        assert block.index('orchestrator unit: active') < block.index('1 new escalation filed in the window')
+
+    def test_an_inactive_unit_with_activity_reads_inactive_and_stays_listed(self, env):
+        document = env.build(units=_units(env, {DF_UNIT: 'inactive'}))
+
+        block = _project_block(_sections(mod.render(document))[TITLES[2]], 'dark_factory')
+
+        assert document.projects['dark_factory'].active
+        assert 'orchestrator unit: inactive' in block
+
+    def test_the_spend_table_names_the_cost_per_done_run(self, env):
+        section = _sections(mod.render(env.build(units=_units(env, self.ACTIVE))))[TITLES[4]]
+
+        assert PER_DONE_RUN_LABEL in section
+        assert '$/done' not in section
+
+    def test_an_unreadable_activity_signal_degrades_landed_and_the_page_is_written(self, env):
+        def raising(unit: str) -> str:
+            raise subprocess.CalledProcessError(1, ['systemctl', 'show', unit])
+
+        healthy = env.build(units=_units(env, self.ACTIVE))
+        units = fleet_state.OrchestratorUnits(orchestrator_projects.scan_units(env.units_dir), raising)
+        document = env.build(units=units)
+
+        assert mod.section_statuses(healthy)['landed'] == 'ok'
+        assert mod.section_statuses(document)['landed'] == 'degraded'
+        text = mod.render(document)
+        assert list(_sections(text)) == list(HEADINGS)
+        assert '### dark_factory' in _sections(text)[TITLES[2]].splitlines()
+
+    def test_main_lists_the_project_whose_unit_systemctl_reports_active(self, env, capsys):
+        rc, out = _run(capsys, env.argv())
+
+        assert rc == 0
+        sections = _sections(env.output.read_text())
+        for title in TITLES[1:5]:
+            assert '### dark_factory' in sections[title].splitlines(), title
+        assert 'orchestrator unit: active' in sections[TITLES[2]]
+        match = DONE_LINE.match(out.splitlines()[-1])
+        assert match is not None and match.group(3) == 'ok'

@@ -21,6 +21,11 @@
 #     positional, so the calling forms above are unchanged; unset =
 #     inherit the spawner's default model. For other/extra claude flags use
 #     $CLAUDE_SPAWN_CLAUDE_ARGS (a raw passthrough, applied after --model).
+#   $CLAUDE_SPAWN_EFFORT — the session's reasoning effort, forwarded as
+#     `claude --effort <level>` right after --model: one of
+#     low|medium|high|xhigh|max (unset or empty = claude's default). On the
+#     t3 lane it becomes the thread's modelSelection effort option, and
+#     needs $CLAUDE_SPAWN_MODEL.
 #   $CLAUDE_SPAWN_CLAUDE_BIN — the executable the tmux and terminal-emulator
 #     lanes run in place of `claude`; see skills/spawn/SKILL.md.
 #
@@ -49,7 +54,10 @@
 #     false approval-required). The lane refuses (exit 145) any
 #     $CLAUDE_SPAWN_CLAUDE_ARGS; $CLAUDE_SPAWN_MODEL becomes the thread's
 #     model, on the instance resolve_t3_provider picks ($CLAUDE_SPAWN_T3_PROVIDER
-#     names one explicitly; a disabled one is refused, exit 145). Child mode
+#     names one explicitly; a disabled one is refused, exit 145), with
+#     $CLAUDE_SPAWN_EFFORT in its selection (refused without a model, exit
+#     145; a level T3 does not offer that model, or a thread T3 reports
+#     launched without it, exits 127). Child mode
 #     joins on the thread's result.md or archive, records spawn_t3_lane.py
 #     `wait`'s code as the session's exit and exits with it; a sibling spawn
 #     prints `record=<dir> t3_thread_id=<id>` on stdout, both values
@@ -83,16 +91,17 @@
 #            beyond its grace"
 #   127    — launcher itself failed (emulator exited before writing the sentinel,
 #            or the sentinel never settled to a numeric exit code within the launch grace;
-#            on the t3 lane, the thread launch failed or spawn_t3_lane.py faulted). On the
+#            on the t3 lane, the thread launch failed, the launched thread does not hold the
+#            requested effort (stderr names it), or spawn_t3_lane.py faulted). On the
 #            t3 lane also `wait`'s "the thread was deleted", and "join lost": `wait` faulted
 #            while the thread may still be running (stderr names the thread and record)
 #   129    — terminal window closed while the session was alive (SIGHUP)
 #   143    — the session's payload shell was sent SIGTERM
 #   144    — Claude never started within the started-grace window (registry marked failed-to-start)
 #   145    — the selected lane cannot honour an input (t3 lane only, today: claude CLI
-#            arguments, a disabled provider instance, a cwd in no live T3 project, or
+#            arguments, an effort without a model, a disabled provider instance, a cwd in no live T3 project, or
 #            a worktree T3 does not list for its project)
-#   2      — bad usage (including an unknown CLAUDE_SPAWN_T3_END, or one that contradicts
+#   2      — bad usage (including an unknown CLAUDE_SPAWN_EFFORT; an unknown CLAUDE_SPAWN_T3_END, or one that contradicts
 #            CLAUDE_SPAWN_SELF_EXIT=1 on the t3 lane)
 
 set -u
@@ -294,6 +303,15 @@ refuse_inputs_the_t3_lane_cannot_honour() {
     t3_lane_refuse "CLAUDE_SPAWN_CLAUDE_ARGS='$CLAUDE_SPAWN_CLAUDE_ARGS'" \
       "a T3 thread takes no claude CLI arguments; unset it, or set CLAUDE_SPAWN_BACKEND=tmux or wm"
   fi
+  if [ -n "${CLAUDE_SPAWN_EFFORT:-}" ] && [ -z "${CLAUDE_SPAWN_MODEL:-}" ]; then
+    refuse_t3_effort_without_model
+  fi
+}
+
+# Also spawn_t3_lane.py launch's `refused reason=effort-needs-model` backstop.
+refuse_t3_effort_without_model() {
+  t3_lane_refuse "CLAUDE_SPAWN_EFFORT='${CLAUDE_SPAWN_EFFORT:-}' without CLAUDE_SPAWN_MODEL" \
+    "t3 takes an effort only inside a model selection; set CLAUDE_SPAWN_MODEL too, or set CLAUDE_SPAWN_BACKEND=tmux or wm"
 }
 
 require_python3_for_the_t3_lane() {
@@ -337,8 +355,21 @@ resolve_end_of_work() {
   return 0
 }
 
+# The levels of orchestrator/src/orchestrator/spawn_effort.py::EffortLevel,
+# copied so the wm lane rejects a bad value without python3.
+require_a_known_effort() {
+  case "${CLAUDE_SPAWN_EFFORT:-}" in
+    ''|low|medium|high|xhigh|max) ;;
+    *)
+      echo "spawn-claude.sh: unknown CLAUDE_SPAWN_EFFORT='$CLAUDE_SPAWN_EFFORT' (expected low|medium|high|xhigh|max)" >&2
+      exit 2
+      ;;
+  esac
+}
+
 resolve_spawn_backend
 resolve_end_of_work
+require_a_known_effort
 if [ "$spawn_backend" = "t3" ]; then
   refuse_inputs_the_t3_lane_cannot_honour
   require_python3_for_the_t3_lane
@@ -682,6 +713,8 @@ flags=""
 # CLAUDE_SPAWN_CLAUDE_ARGS so a raw `--model` passed through that escape
 # hatch (the last --model on the argv) still wins if a caller sets both.
 [ -n "${CLAUDE_SPAWN_MODEL:-}" ] && flags="$flags --model $CLAUDE_SPAWN_MODEL"
+# The reasoning effort, a single token require_a_known_effort has checked.
+[ -n "${CLAUDE_SPAWN_EFFORT:-}" ] && flags="$flags --effort $CLAUDE_SPAWN_EFFORT"
 # Optional extra claude CLI args (e.g. CLAUDE_SPAWN_CLAUDE_ARGS='--model
 # claude-fable-5'). Baked into the payload string at construction time —
 # like $flags itself — so they reach claude even under daemon-owned
@@ -804,7 +837,7 @@ q_sentinel_tmp=$(printf %q "$sentinel.tmp")
 # ORDERING IS THE WHOLE CONTRACT, in both directions:
 #   - This invocation's inputs are ALREADY fully consumed by the time $inner
 #     is built -- $flags and the executable baked above
-#     (CLAUDE_SPAWN_MODEL/CLAUDE_ARGS/CLAUDE_BIN),
+#     (CLAUDE_SPAWN_MODEL/EFFORT/CLAUDE_ARGS/CLAUDE_BIN),
 #     spawn_mode read near the top, the `python3 ... launching` identity
 #     write (ROLE/PROJECT/TASK_ID/ESCALATION_ID) long since done in its own
 #     subprocess -- so the unset can never disturb them. Deliberate inputs
@@ -1007,12 +1040,11 @@ _failed_to_start_pending() {
 # Exit via the distinct failed-to-start code. Deliberately does NOT call the
 # session-registry `exit` subcommand (unlike finish()) -- that would
 # overwrite the failed-to-start status the watchdog already wrote with
-# EXITED, destroying the signal this whole mechanism exists to produce.
+# EXITED, destroying the signal this whole mechanism exists to produce. The
+# marker's existence is the whole signal; the code is EXIT_FAILED_TO_START.
 finish_failed_to_start() {
-  local code
-  code=$(cat "$fts_marker" 2>/dev/null || echo "$EXIT_FAILED_TO_START")
   rm -f "$fts_marker" "$sentinel" "$sentinel.tmp"
-  exit "$code"
+  exit "$EXIT_FAILED_TO_START"
 }
 
 # Mirror of orchestrator.session_registry.encode_cwd, THE canonical cwd
@@ -1097,7 +1129,7 @@ _started_evidence() {
 #
 # On grace-expiry with no evidence, flags failed-to-start: best-effort marks
 # the session-registry record, emits a loud caller-visible stderr line, and
-# writes the fts_marker so await_sentinel/resolve_* can break out of what
+# creates the fts_marker so await_sentinel/resolve_* can break out of what
 # would otherwise be an unbounded wait.
 mark_record_failed_to_start() {
   if [ -n "$SESSION_RECORD_DIR" ] && command -v python3 >/dev/null 2>&1; then
@@ -1145,7 +1177,7 @@ _started_watchdog() {
   # the same underlying cause (see _reconcile_started_flag_with_launcher_failure
   # below), so this process may ultimately exit 127, not EXIT_FAILED_TO_START.
   echo "spawn-claude.sh: FAILED-TO-START — claude never started within ${SPAWN_STARTED_GRACE_SECS}s (no transcript, no claude process); registry marked failed-to-start (a more specific launcher-failure verdict may still override this)." >&2
-  echo "$EXIT_FAILED_TO_START" > "$fts_marker"
+  : > "$fts_marker"
   return 0
 }
 
@@ -1303,6 +1335,7 @@ launch_t3_thread() {
   printf '%s' "$prompt" > "$t3_prompt_file"
   local -a args=(launch --cwd "$cwd" --title "$thread_title" --prompt-file "$t3_prompt_file" --record "$SESSION_RECORD_DIR")
   [ -n "${CLAUDE_SPAWN_MODEL:-}" ] && args+=(--model "$CLAUDE_SPAWN_MODEL")
+  [ -n "${CLAUDE_SPAWN_EFFORT:-}" ] && args+=(--effort "$CLAUDE_SPAWN_EFFORT")
   [ -n "$t3_provider" ] && args+=(--provider "$t3_provider")
   [ -n "${parent_of_child:-}" ] && args+=(--parent "$parent_of_child")
   [ "$skip_perms" = "true" ] && args+=(--skip-permissions)
@@ -1319,8 +1352,20 @@ launch_t3_thread() {
       echo "spawn-claude.sh: t3 lane: the thread launch failed -- $(verdict_text "$t3_verdict" detail)" >&2
       exit 127
       ;;
+    effort-unconfirmed) report_unconfirmed_t3_effort ;;
     *) t3_lane_unexpected launch ;;
   esac
+}
+
+# $t3_verdict is launch's `effort-unconfirmed thread_id=... asked=... got=...`:
+# the thread was launched and runs, but T3 does not report the asked effort.
+report_unconfirmed_t3_effort() {
+  local thread asked got
+  thread=$(verdict_text "$t3_verdict" thread_id)
+  asked=$(verdict_text "$t3_verdict" asked)
+  got=$(verdict_text "$t3_verdict" got)
+  echo "spawn-claude.sh: t3 lane: T3 thread $thread was launched with effort '$got', not the requested '$asked'; it is running (record: ${SESSION_RECORD_DIR:-none}) -- archive it in T3 or reconfigure it before relying on it" >&2
+  exit 127
 }
 
 # $t3_verdict is launch's `no-launcher reason=<word> [detail=...]`; only the
@@ -1347,6 +1392,7 @@ refuse_the_t3_launch() {
   detail=$(verdict_text "$t3_verdict" detail)
   case "$reason" in
     provider-disabled) refuse_disabled_t3_provider ;;
+    effort-needs-model) refuse_t3_effort_without_model ;;
     cwd-not-project-worktree)
       t3_lane_refuse "cwd=$cwd ($reason: $detail)" \
         "T3 does not list it as a worktree of its project; pass the project root or a worktree T3 lists, or set CLAUDE_SPAWN_BACKEND=tmux or wm"

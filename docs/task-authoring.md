@@ -866,20 +866,28 @@ local dependency edge, until a promotion removes that edge. The contract is
 `plans/follow-up-filing-shape-prd.md` §3 decisions 9–15 and §4.3. The one
 implementation is `fused-memory/src/fused_memory/middleware/followup_hold.py`.
 
-**The hold rule** (`followup_hold.py::hold_scope`). A task is held if all of
-these are true:
+**The hold rule** (`followup_hold.py::hold_scope`). A task is held if its
+priority is `low` or `polish`, its `task_kind` is `normal` or absent, it
+carries no `execution_class`, and one of two arms matches:
 
-- it was filed as a follow-up: `metadata.source == 'agent-followup'` or
-  `metadata.spawn_context == 'review_suggestions'`;
-- its priority is `low` or `polish`;
-- its `task_kind` is `normal` or absent;
-- it carries none of `execution_class`, `prd_path`, `x_finding_key` or
-  `human_decomposed`.
+- **an uncited follow-up**: it was filed as a follow-up
+  (`metadata.source == 'agent-followup'` or
+  `metadata.spawn_context == 'review_suggestions'`) and carries none of
+  `prd_path`, `x_finding_key` or `human_decomposed`;
+- **a finding-set member**: it carries `x_finding_key` and a valid
+  `metadata.finding_set_hold {ruling}`, whatever its `source`, `prd_path`
+  or `human_decomposed`. The marker records a ruling that a review-finding
+  cleanup set is not to be scheduled individually; `ruling` names who ruled,
+  when, and on which finding. A marker that holds nothing logs one WARNING
+  naming `finding_set_hold` and the task (the backfill names the task id; a
+  filing not yet created is named `None`). That covers a malformed marker
+  and a valid one on a task the rule refuses, such as a medium priority or a
+  missing `x_finding_key`, and the WARNING says which condition failed.
 
-Every planning-mode birth carries `human_decomposed`, so a PRD decompose is
-never held. Neither is a task that a finding cites. To keep a follow-up out
-of the hold, file it at a higher priority, or attach the finding key or PRD
-that makes it wanted.
+Every planning-mode birth carries `human_decomposed`, so the first arm never
+holds a PRD decompose, and neither arm holds a task that a finding cites
+unless it carries the marker. To keep a follow-up out of the hold, file it at
+a higher priority, or attach the finding key or PRD that makes it wanted.
 
 **Held means a dependency edge on the holder.** The edge decides whether a
 task is held now. `metadata.followup_hold`
@@ -896,7 +904,15 @@ its `followup_hold` record is written in the same `add_task`, so the
 scheduler never sees it ready. A `followup_held {task_id, holder_id}` event
 is journaled beside `task_created`, and the ticket's stored outcome
 (`result_json`) carries `held_by`, the holder's id; `resolve_ticket` does
-not return it. The holder is minted the first time a project needs one, and
+not return it. A `planning_mode` submission the rule matches, which can only
+be a marked finding-set member, is born `deferred` AND held the same way and
+journals the same `followup_held` event, so the set stays held after
+`commit_planning`. Its synchronous answer carries `held_by`, the holder's
+id, and an answer without `held_by` means the birth was not held. A failure
+of the hold, such as `DuplicateFollowupHolderError`, is answered like any
+failed planning insert, `{error, error_type}`, and the task is not created.
+Both paths share one helper,
+`followup_hold.py::hold_birth`. The holder is minted the first time a project needs one, and
 its mint journals a `task_created` event with `source:
 'followup-holder-mint'`, whether a filing or the backfill minted it.
 
@@ -964,18 +980,28 @@ write has landed (`followup_hold.py::promote_after_update`). It never writes
 contract is `plans/follow-up-filing-shape-prd.md` §3 decision 14 and §4.3.
 Every trigger runs under the project's write lock:
 
-- **An edge from a pending, unheld task** (`by: dependent`, `ref`: the
+- **An edge from a waiting, unheld task** (waiting: any active status but
+  `deferred`, the set the startup backfill uses,
+  `followup_hold.py::WAITING_STATUSES`; `by: dependent`, `ref`: the
   dependent's id): `add_dependency`, a task born with the edge through
   `submit_task`, or an `update_task` `dependencies` replacement. An edge
   between two held tasks promotes neither.
-- **A landing on `pending` from `deferred`** promotes the held tasks the
-  landing task depends on, the same way: `commit_planning` of a batch task,
-  a plain `set_task_status`, or the deferral-expiry sweep, which flips
-  through the same chokepoint. A held task landing back on `pending` stays
-  held.
+- **A landing that starts a task waiting**, from `deferred`, `done` or
+  `cancelled` into any waiting status (`followup_hold.py::starts_waiting`),
+  promotes the held tasks the landing task depends on, the same way:
+  `commit_planning` of a batch task, a plain `set_task_status` (including a
+  reopen, or a `deferred → blocked` landing), or the deferral-expiry sweep,
+  which flips through the same chokepoint. A held task landing back on
+  `pending` stays held.
 - **A citation** (`by: citation`, `ref`: the first finding key, else the PRD
   path): an `update_task` on a held task whose metadata payload carries
   `x_finding_key` or `prd_path`, the keys that keep a filing out of the hold.
+  A held task carrying `finding_set_hold` is the exception: its citation is
+  deferred before any registered guard runs, journaling
+  `followup_promotion_deferred` with `guard: finding_set_hold` and a reason
+  naming the ruling, and it stays held. Every other cause below promotes it
+  as usual; a human removal or the explicit release is how the set leaves the
+  hold.
 - **A combine** (`by: combine`, `ref`: the candidate's ticket id): the
   curator combining a candidate the hold rule does not match into a held
   target. A candidate the rule matches leaves its held target held.
@@ -1066,6 +1092,21 @@ token (`migration`, `architecture`, `integration test`, `design ... new`,
 
 **Hard escape:** `metadata.force_full_path = true` always forces the full
 architect path regardless of `complexity`.
+
+**Curator complexity hint:** on every `create` the curator judged as one, it
+stamps `metadata.x_curator_complexity_hint` (`"simple"` or null) from the
+criteria above. A degraded or fall-through create is not stamped, and neither
+is a `drop` or `combine` that pool state vetoed into a create
+(`CuratorDecision.vetoed_action`), so a null always means "judged, not simple".
+A task is declarable when the hint is `"simple"`, the filer set no
+`complexity`, and its non-empty `metadata.files` passes the
+`simple_task_files_error` guard. Both arms of a declarable task carry
+`metadata.x_routing_exp2_arm_key`, the `candidate_key` its arm was drawn from
+at create. On the treated arm of `routing-exp-2`,
+`split_bucket("routing-exp-2", candidate_key, 2) == 1`, a declarable task
+also gets `metadata.complexity = "simple"`. A filer's own `complexity` always wins, and
+`planning_mode` is untouched. The policy:
+`fused-memory/src/fused_memory/middleware/curator_complexity_hint.py::with_complexity_hint`.
 
 ### `execution_class` routes to a HUMAN — it is not "non-code work"
 
@@ -1319,12 +1360,16 @@ path.
 
 `metadata.milestone` is an orthogonal, time-based dispatch gate — **not**
 a new `task_kind`. Setting it holds a task out of dispatch until its time
-trigger fires; once fired, the task dispatches through its normal path
-unchanged. It is allowed on **both** `normal` and `deterministic` tasks
-(orthogonal to `task_kind`), so it can gate a normal LLM-agent task, a
-deterministic predicate check (below), or a pure human gate (a `dated`
-milestone on a deterministic task with `always_escalates=True` and no
-`before_done`).
+trigger fires. Once it fires, a deterministic predicate
+(`before_done.kind='predicate'`) or pure gate carrying it dispatches ahead
+of the tier-scored queue, whatever its `priority` (task 11330;
+`orchestrator/src/orchestrator/timed_gates.py::is_timed_gate`). Any other
+milestone task (a normal task, or a deploy) dispatches through its normal
+tier-scored path unchanged. A milestone is allowed on **both** `normal` and
+`deterministic` tasks (orthogonal to `task_kind`), so it can gate a normal
+LLM-agent task, a deterministic predicate check (below), or a pure human
+gate (a `dated` milestone on a deterministic task with
+`always_escalates=True` and no `before_done`).
 
 Two time modes:
 
@@ -1932,7 +1977,10 @@ writes them: the mint writes the marker, and the hold at filing and the
 startup backfill write the record. A held task's `followup_hold.promoted`
 (`by` one of `dependent`, `citation`, `combine`, `pack`, `rider`, `human`) is
 the history of its release. The dependency edge on the holder, not this
-record, decides whether the task is held now.
+record, decides whether the task is held now. `finding_set_hold` is a third
+registered submodel (`shared/src/shared/followup_hold_records.py::FindingSetHold`,
+cardinality dict), written by the filing instrument at filing and not by
+`followup_hold.py`, which only reads it (§3.4).
 
 `claimant_exception` is the machine ledger entry
 `{claimant_run_id, target_status, agent_id, tag, stamped_at}`. The
@@ -2612,7 +2660,14 @@ are paged: follow `pagination.has_more` with `offset += returned`.
 48,000 B page budget
 (`fused-memory/src/fused_memory/server/tools.py::RESULT_BYTE_BUDGET`);
 a single row over that budget comes back alone with `truncated_value: true`
-and its value elided, so read that task with `get_task`. `tasks_with_key`
+and its value elided, so read that task with `get_task`.
+`include_rows=True` adds each row's whole `metadata` object and its
+`dependencies` (integer ids, ascending, `[]` when none), under the same
+48,000 B page budget; a single row over that budget comes back alone with
+`truncated_row: true` and its `metadata` elided, so read that task with
+`get_task`. `description` is not returned. The response always echoes
+`include_rows`, so a stdlib client can tell a server that honoured the
+argument from one that dropped it. `tasks_with_key`
 counts the tasks in the searched statuses that carry the key, so without a
 `statuses` filter `tasks_with_key == 0` means no task carries it at all (a
 misspelt key, or no producer has written it yet). An unknown status is

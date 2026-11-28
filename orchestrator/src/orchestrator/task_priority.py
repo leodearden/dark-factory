@@ -122,17 +122,29 @@ def anchor_from_epoch(epoch: float) -> datetime | None:
         return None
 
 
+def tier_order(p: TaskPriority) -> tuple[int, int]:
+    """*p*'s place in the one tier order; smaller is higher. An unknown tier ranks as medium."""
+    rank = gate_rank(p.tier)
+    return (_UNKNOWN_TIER_RANK if rank is None else rank, p.pin_order or 0)
+
+
+def outranks(a: TaskPriority, b: TaskPriority) -> bool:
+    """*a* is strictly higher than *b*: a pin above every tier, the lower pin order between pins.
+
+    Age never counts.
+    """
+    return tier_order(a) < tier_order(b)
+
+
 def order_key(
     p: TaskPriority, *, now: datetime, waited_secs: float,
     promote_after_secs: float | None, fallback_anchor: datetime | None,
 ) -> tuple[int, int, float]:
     """*p*'s sort key at a later gate; smaller sorts first. Never raises."""
-    rank = gate_rank(p.tier)
-    promoted = _promoted_rank(
-        _UNKNOWN_TIER_RANK if rank is None else rank, waited_secs, promote_after_secs,
-    )
+    rank, pin_order = tier_order(p)
+    promoted = _promoted_rank(rank, waited_secs, promote_after_secs)
     age = task_age(p, now=now, fallback_anchor=fallback_anchor)
-    return (promoted, p.pin_order or 0, -age.secs)
+    return (promoted, pin_order, -age.secs)
 
 
 def _promoted_rank(rank: int, waited_secs: float, promote_after_secs: float | None) -> int:

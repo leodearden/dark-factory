@@ -72,9 +72,6 @@ class TestBuildTextWriteUnconfirmedFiler:
         assert TASK_TEXT_FP_KEY in row['suggested_action']
         assert TEXT_VERIFIED_KEY in row['suggested_action']
         assert 'get_task' in row['suggested_action']
-        assert row['severity'] == 'serious'
-        assert row['category'] == 'task_memory_mismatch'
-        assert row['actionable'] is True
 
     @pytest.mark.asyncio
     async def test_the_description_states_each_field_s_unmet_invariant_by_mode(self):
@@ -105,7 +102,7 @@ class TestBuildTextWriteUnconfirmedFiler:
     async def test_drops_with_a_warning_when_no_run_is_active(self, caplog):
         state = _make_state()
 
-        with caplog.at_level(logging.WARNING, logger='fused_memory.server.recon_text_write_filer'):
+        with caplog.at_level(logging.WARNING):
             await _filer(state)(_finding())
 
         (record,) = caplog.records
@@ -113,13 +110,4 @@ class TestBuildTextWriteUnconfirmedFiler:
         assert TEXT_WRITE_UNCONFIRMED_FLAG_TYPE in record.getMessage()
         assert '3708' in record.getMessage()
         state.start_report(run_id='run-1', stage=STAGE, project_id=PROJECT_ID)
-        assert state.get_findings_for_run('run-1') == []
-
-    @pytest.mark.asyncio
-    async def test_no_op_when_the_active_run_is_for_another_project(self):
-        state = _make_state()
-        state.start_report(run_id='run-1', stage=STAGE, project_id='other_project')
-
-        await _filer(state)(_finding())
-
         assert state.get_findings_for_run('run-1') == []

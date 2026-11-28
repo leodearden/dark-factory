@@ -13,8 +13,9 @@ Task epsilon adds ``resolve_route`` -- the single layered authority for
 docstring for the layer precedence.
 
 Kept import-light at module top (stdlib, plus the stdlib-only
-``orchestrator.implementer_brief_variant``) so ``config.py`` can
-``from orchestrator.routing import DEFAULT_ALLOWED_MODELS`` with no circular
+``orchestrator.implementer_brief_variant`` and ``shared.routing_split``) so
+``config.py`` can ``from orchestrator.routing import DEFAULT_ALLOWED_MODELS``
+with no circular
 import; heavier imports (e.g. ``shared.cli_invoke.invoke_claude_agent``) are
 deferred to inside the functions that need them. ``OrchestratorConfig`` is
 imported under ``TYPE_CHECKING`` only (never at runtime) for the same
@@ -30,6 +31,8 @@ import os
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
+from shared.routing_split import split_bucket
+
 from orchestrator.implementer_brief_variant import invocation_bounds
 
 if TYPE_CHECKING:
@@ -39,7 +42,7 @@ if TYPE_CHECKING:
     from shared.cli_invoke import AgentResult
     from shared.config_models import AccountConfig
 
-    from orchestrator.config import OrchestratorConfig, RoutingRule
+    from orchestrator.config import ModelsConfig, OrchestratorConfig, RoutingRule
 
 logger = logging.getLogger(__name__)
 
@@ -371,6 +374,16 @@ class RoutingDecision:
     rejected: tuple[str, ...] = ()
 
 
+@dataclass(frozen=True)
+class DispatchedRoute:
+    """The route one returned invocation ran on, plus the model id the CLI
+    reported serving (None: not reported)."""
+
+    role_name: str
+    decision: RoutingDecision
+    served_model_id: str | None
+
+
 def _config_key(role_name: str) -> str:
     """Collapse any ``reviewer*`` variant to the shared ``'reviewer'`` config key.
 
@@ -380,6 +393,12 @@ def _config_key(role_name: str) -> str:
     invariant 3).
     """
     return 'reviewer' if role_name.startswith('reviewer') else role_name
+
+
+def configured_model(role_name: str, models: ModelsConfig) -> str | None:
+    """The model *models* seats for *role_name* (resolve_route's layer 3),
+    or None when ModelsConfig has no seat for the role."""
+    return getattr(models, _config_key(role_name), None)
 
 
 def _task_simple_saturated(task_metadata: Mapping[str, Any]) -> bool:
@@ -405,7 +424,8 @@ def _rule_matches(rule: RoutingRule, inputs: RouteInputs) -> bool:
     task_metadata``), ``plan_min_steps``/``plan_min_modules``/
     ``module_prefix`` (plan-shape conditions -- a ``None`` plan_shape fails
     ANY of these three), ``min_routing_tier``, ``min_dispatch_count``,
-    ``simple_saturated``. When both ``module_prefix`` and
+    ``simple_saturated``, ``split`` (the task id's ``split_bucket`` arm
+    equals ``split.bucket``; an empty task id is in no arm). When both ``module_prefix`` and
     ``plan_min_modules`` are present, ``plan_min_modules`` counts only the
     prefix-matched modules (not the total) -- this is what reproduces the
     pre-epsilon Rust heuristic (``_select_model_for_role``) exactly.
@@ -435,6 +455,12 @@ def _rule_matches(rule: RoutingRule, inputs: RouteInputs) -> bool:
     if (
         match.simple_saturated is not None
         and _task_simple_saturated(inputs.task_metadata) != match.simple_saturated
+    ):
+        return False
+    split = match.split
+    if split is not None and (
+        not inputs.task_id
+        or split_bucket(split.salt, inputs.task_id, split.buckets) != split.bucket
     ):
         return False
 
@@ -596,8 +622,8 @@ def resolve_route(inputs: RouteInputs, config: OrchestratorConfig) -> RoutingDec
     # Layer 3: static per-role config. Only `model` is fail-safe validated
     # (invariants 2/6) -- effort/budget_usd/max_turns apply unconditionally,
     # they carry no allowlist/ceiling concept.
-    if hasattr(config.models, key):
-        candidate = getattr(config.models, key)
+    candidate = configured_model(inputs.role_name, config.models)
+    if candidate is not None:
         reason = (
             _model_rejection_reason(
                 candidate, config, inputs.spend_by_model, inputs.scope_capacity,

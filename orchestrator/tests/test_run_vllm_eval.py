@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import socket
 import subprocess
 import sys
@@ -19,6 +20,7 @@ import pytest
 import yaml
 
 from orchestrator.evals.results import CellName, ResultStore
+from orchestrator.evals.runner import WORKFLOW_CELL_TIMEOUT_MINUTES
 
 # Stub out runpod_toolkit BEFORE importing the launcher. The real package has
 # a transitive paramiko dependency that's not installed in the orchestrator
@@ -123,7 +125,7 @@ def _make_args(**overrides) -> argparse.Namespace:
         gpu_type=None,
         concurrency=5,
         verify_baseline_clean="strict",
-        task_timeout_min=70,
+        task_timeout_min=None,
         orch_timeout_min=None,
         stop_on_first_failure=False,
         pod_id=None,
@@ -443,12 +445,27 @@ class _FakeTunnel:
         return 0 if self.terminated else None
 
 
+def _seed_fake_credentials(monkeypatch) -> None:
+    """Give a run every credential it asks for, so none is read from a real ``.env`` or home.
+
+    ``PROJECT_ROOT`` is the launcher's own checkout, which holds no ``.env``
+    in a worktree or on a verify host, so the RunPod key and a pool OAuth
+    token come from the environment. The pod's public key is stubbed
+    because ``~/.ssh/id_runpod.pub`` exists only on the operator's machine.
+    """
+    monkeypatch.setenv("RUNPOD_API_KEY", "rpa_test_fake_key")
+    for letter in "ABCDEFGH":
+        monkeypatch.setenv(f"CLAUDE_OAUTH_TOKEN_{letter}", f"fake-pool-token-{letter}")
+    monkeypatch.setattr(launcher, "read_ssh_pubkey", lambda: "ssh-ed25519 fake-pod-key")
+
+
 def _patch_pod_infra(monkeypatch, *, vllm_healthy_first=True):
-    """Patch RunPodClient + SSH tunnel + wait_for_vllm so bring_up_pod returns fast.
+    """Patch credentials, RunPodClient, SSH tunnel and wait_for_vllm so bring_up_pod returns fast.
 
     Real ``subprocess.Popen`` is preserved for everything other than the SSH
     tunnel command, so preflight_baseline's git calls still work end-to-end.
     """
+    _seed_fake_credentials(monkeypatch)
     fake_client = _FakeClient()
     monkeypatch.setattr(launcher, "RunPodClient", lambda config: fake_client)
     monkeypatch.setattr(
@@ -473,8 +490,13 @@ def _patch_pod_infra(monkeypatch, *, vllm_healthy_first=True):
     return fake_client
 
 
-def _patch_subprocess_run_success(monkeypatch, results_dir: Path):
-    """Patch subprocess.run so 'orchestrator eval' calls write a fake result file."""
+def _patch_subprocess_run_success(monkeypatch, results_dir: Path) -> dict[str, Any]:
+    """Patch subprocess.run so 'orchestrator eval' calls write a fake result file.
+
+    Returns a dict holding the last eval command (``cmd``) and the subprocess
+    timeout it ran under (``timeout``).
+    """
+    recorded: dict[str, Any] = {}
     real_run = subprocess.run
 
     def fake_run(cmd, *args, **kwargs):
@@ -490,10 +512,12 @@ def _patch_subprocess_run_success(monkeypatch, results_dir: Path):
             results_dir.mkdir(parents=True, exist_ok=True)
             run_id = f"r{int(time.time() * 1000) % 100000000:08d}"
             _write_result(results_dir, task_id, config_name, run_id)
+            recorded.update(cmd=cmd, timeout=kwargs.get("timeout"))
             return SimpleNamespace(returncode=0)
         return real_run(cmd, *args, **kwargs)
 
     monkeypatch.setattr(launcher.subprocess, "run", fake_run)
+    return recorded
 
 
 class TestPodLifecycle:
@@ -646,6 +670,7 @@ class TestPodLifecycle:
         monkeypatch.setattr(launcher, "TASKS_DIR", fake_tasks)
 
         # Patch infra so wait_for_vllm fails (simulates vLLM never becoming healthy)
+        _seed_fake_credentials(monkeypatch)
         fake_client = _FakeClient()
         monkeypatch.setattr(launcher, "RunPodClient", lambda config: fake_client)
         monkeypatch.setattr(
@@ -742,6 +767,96 @@ class TestPodLifecycle:
         assert rc == 0
         assert eval_calls["n"] == 1
         assert fake_client.terminate_calls == ["pod-fake-1"]
+
+
+def _flag_value(cmd: list[str], flag: str) -> str | None:
+    """The argument following ``flag`` in ``cmd``, or None when ``flag`` is absent."""
+    return cmd[cmd.index(flag) + 1] if flag in cmd else None
+
+
+class TestOuterTimeoutPairing:
+    """The launcher's kill deadline outlasts the ceiling the cell runs under,
+    so the orchestrator hits its own ceiling first and writes a result file.
+    """
+
+    def _run_launcher(
+        self, monkeypatch, tmp_path, *, extra_argv: list[str], spec_extra: dict | None = None
+    ) -> tuple[int, dict[str, Any]]:
+        results, _ = _setup_launcher_fixture(
+            monkeypatch, tmp_path, ["df_task_12"], spec_extra=spec_extra
+        )
+        monkeypatch.setenv("RUNPOD_API_KEY", "rpa_test_fake_key")
+        recorded = _patch_subprocess_run_success(monkeypatch, results)
+
+        rc = launcher.main(
+            [
+                "--config",
+                "reap-139b-nvfp4-new",
+                "--task",
+                "df_task_12",
+                "--verify-baseline-clean",
+                "skip",
+                "--concurrency",
+                "1",
+                *extra_argv,
+            ]
+        )
+        return rc, recorded
+
+    @pytest.mark.parametrize(
+        ("extra_argv", "spec_extra", "inner_minutes", "forwarded_timeout"),
+        [
+            ([], None, WORKFLOW_CELL_TIMEOUT_MINUTES, None),
+            (["--orch-timeout-min", "360"], None, 360, "360"),
+            ([], {"timeout_minutes": 240}, 240, None),
+        ],
+        ids=["workflow-default", "orch-timeout-flag", "fixture-ceiling"],
+    )
+    def test_the_default_kill_deadline_outlasts_the_cells_own_ceiling(
+        self, monkeypatch, tmp_path, extra_argv, spec_extra, inner_minutes, forwarded_timeout
+    ):
+        rc, recorded = self._run_launcher(
+            monkeypatch, tmp_path, extra_argv=extra_argv, spec_extra=spec_extra
+        )
+
+        assert rc == 0
+        assert recorded["timeout"] > inner_minutes * 60
+        assert _flag_value(recorded["cmd"], "--timeout") == forwarded_timeout
+
+    def test_an_explicit_kill_deadline_past_the_ceiling_is_honoured_quietly(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        rc, recorded = self._run_launcher(
+            monkeypatch, tmp_path, extra_argv=["--task-timeout-min", "240"]
+        )
+
+        assert rc == 0
+        assert recorded["timeout"] == 240 * 60
+        assert "--task-timeout-min" not in capsys.readouterr().out
+
+    def test_an_explicit_kill_deadline_within_the_ceiling_is_honoured_with_a_warning(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        rc, recorded = self._run_launcher(
+            monkeypatch, tmp_path, extra_argv=["--task-timeout-min", "90"]
+        )
+
+        assert rc == 0
+        assert recorded["timeout"] == 90 * 60
+        [warning] = [
+            line for line in capsys.readouterr().out.splitlines() if "--task-timeout-min" in line
+        ]
+        assert "WARNING" in warning
+        assert "90" in warning
+        assert f"{WORKFLOW_CELL_TIMEOUT_MINUTES} min" in warning
+
+    def test_the_help_states_the_default_ceiling_and_margin_in_minutes(self, capsys):
+        with pytest.raises(SystemExit):
+            launcher.parse_args(["--help"])
+
+        help_text = " ".join(capsys.readouterr().out.split())
+        assert f"{WORKFLOW_CELL_TIMEOUT_MINUTES} min" in help_text
+        assert f"{launcher.OUTER_TIMEOUT_MARGIN_MIN} min" in help_text
 
 
 # ---------------------------------------------------------------------------
@@ -1040,7 +1155,9 @@ def _release_on_summary(monkeypatch, task_id: str) -> threading.Event:
     return event
 
 
-def _write_n_task_specs(fake_tasks: Path, task_ids: list[str]) -> None:
+def _write_n_task_specs(
+    fake_tasks: Path, task_ids: list[str], spec_extra: dict | None = None
+) -> None:
     fake_tasks.mkdir(parents=True, exist_ok=True)
     for tid in task_ids:
         (fake_tasks / f"{tid}.json").write_text(
@@ -1049,16 +1166,18 @@ def _write_n_task_specs(fake_tasks: Path, task_ids: list[str]) -> None:
                     "id": tid,
                     "pre_task_commit": "deadbeef",
                     "verify_commands": {"lint": "true", "typecheck": "true"},
+                    **(spec_extra or {}),
                 }
             )
         )
 
 
-def _setup_concurrent_fixture(
-    monkeypatch, tmp_path: Path, task_ids: list[str]
+def _setup_launcher_fixture(
+    monkeypatch, tmp_path: Path, task_ids: list[str], *, spec_extra: dict | None = None
 ) -> tuple[Path, _FakeClient]:
     """Shared RESULT_STORE / EVAL_LOG_DIR / TASKS_DIR / pod-infra wiring for
-    the ordering-sensitive TestConcurrentLoop tests below.
+    tests that drive launcher.main() over fake task specs, each carrying
+    ``spec_extra`` on top of the minimal spec.
 
     Returns ``(results_dir, fake_client)``.
     """
@@ -1067,7 +1186,7 @@ def _setup_concurrent_fixture(
     monkeypatch.setattr(launcher, "EVAL_LOG_DIR", tmp_path / "logs")
 
     fake_tasks = tmp_path / "tasks"
-    _write_n_task_specs(fake_tasks, task_ids)
+    _write_n_task_specs(fake_tasks, task_ids, spec_extra)
     monkeypatch.setattr(launcher, "TASKS_DIR", fake_tasks)
 
     fake_client = _patch_pod_infra(monkeypatch)
@@ -1324,7 +1443,7 @@ class TestConcurrentLoop:
         incidental effect of the ordering fixture itself.
         """
         task_ids = ["df_task_10", "df_task_11", "df_task_12", "df_task_13", "df_task_14"]
-        results, fake_client = _setup_concurrent_fixture(monkeypatch, tmp_path, task_ids)
+        results, fake_client = _setup_launcher_fixture(monkeypatch, tmp_path, task_ids)
         captured = _capture_summaries(monkeypatch)
 
         # Force the adverse order: df_task_11 cannot even start its body
@@ -1386,7 +1505,7 @@ class TestConcurrentLoop:
         bug.
         """
         task_ids = ["df_task_10", "df_task_11", "df_task_12", "df_task_13", "df_task_14"]
-        results, fake_client = _setup_concurrent_fixture(monkeypatch, tmp_path, task_ids)
+        results, fake_client = _setup_launcher_fixture(monkeypatch, tmp_path, task_ids)
         captured = _capture_summaries(monkeypatch)
 
         # Two chained gates, not one. df_task_11 waits for df_task_10's
@@ -1443,7 +1562,7 @@ class TestConcurrentLoop:
     def test_concurrent_stop_on_first_failure_drains(self, monkeypatch, tmp_path):
         """Failing task stops the queue but in-flight tasks finish."""
         task_ids = ["df_task_10", "df_task_11", "df_task_12", "df_task_13", "df_task_14"]
-        results, fake_client = _setup_concurrent_fixture(monkeypatch, tmp_path, task_ids)
+        results, fake_client = _setup_launcher_fixture(monkeypatch, tmp_path, task_ids)
         captured = _capture_summaries(monkeypatch)
 
         # Load-bearing happens-before (task 3805): see _release_on_summary's
@@ -2208,12 +2327,11 @@ class TestBuildEvalEnvSharedPool:
         """A tmp PROJECT_ROOT holding a shared pool config and a ``.env``.
 
         THE ``PROJECT_ROOT`` MONKEYPATCH IS HERMETICITY, NOT EVIDENCE OF
-        DYNAMISM. ``launcher.PROJECT_ROOT`` is a module constant hardcoded
-        to the main checkout; it is redirected here only so a test reads a
-        roster and a ``.env`` it owns instead of the real ones. Nothing in
-        this class should be read as a claim that the launcher resolves its
-        root at runtime — it does not, and ``build_eval_env``'s docstring
-        says so.
+        DYNAMISM. ``launcher.PROJECT_ROOT`` is a module constant fixed at
+        import to the launcher's own checkout; it is redirected here only so
+        a test reads a roster and a ``.env`` it owns instead of that
+        checkout's. Nothing in this class should be read as a claim that the
+        launcher resolves its root per call — it does not.
 
         A pool credential is seeded by default because ``build_eval_env``
         now ABORTS when the roster resolves none (see
@@ -2414,3 +2532,60 @@ class TestBuildEvalEnvSharedPool:
             "states the roster for the run it is launching, and the ambient "
             f"value here rosters the retired interactive account: {env['USAGE_ACCOUNTS_FILE']!r}"
         )
+
+
+LAUNCHER_IMPORT_TIMEOUT_SECONDS = 120
+
+_FAKE_TOOLKIT_MODULES = {
+    "__init__.py": "",
+    "compute.py": "class PodStatus:\n    RUNNING = 'RUNNING'\n\n\nclass RunPodClient:\n    pass\n",
+    "config.py": "class RunPodConfig:\n    pass\n",
+}
+
+_IMPORT_THEN_READ_THE_PUBLIC_KEY = """\
+import run_vllm_eval as launcher
+print(launcher.PROJECT_ROOT)
+try:
+    launcher.read_ssh_pubkey()
+except RuntimeError as exc:
+    print(exc)
+"""
+
+
+def test_the_launcher_imports_on_a_host_with_nothing_in_the_operators_home(tmp_path: Path) -> None:
+    """Importing reads no home file; the pod's public key is read only when asked for."""
+    home = tmp_path / "home"
+    home.mkdir()
+    toolkit = tmp_path / "toolkit"
+    (toolkit / "runpod_toolkit").mkdir(parents=True)
+    for name, text in _FAKE_TOOLKIT_MODULES.items():
+        (toolkit / "runpod_toolkit" / name).write_text(text)
+    proc = subprocess.run(
+        [sys.executable, "-c", _IMPORT_THEN_READ_THE_PUBLIC_KEY],
+        cwd=_SCRIPTS,
+        env={"HOME": str(home), "RUNPOD_TOOLKIT_PATH": str(toolkit), "PATH": os.environ["PATH"]},
+        capture_output=True,
+        text=True,
+        timeout=LAUNCHER_IMPORT_TIMEOUT_SECONDS,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    project_root, key_error = proc.stdout.splitlines()
+    assert Path(project_root) == Path(__file__).resolve().parents[2]
+    assert str(home / ".ssh" / "id_runpod.pub") in key_error
+
+
+def test_a_launcher_without_its_toolkit_names_the_variable_to_set(tmp_path: Path) -> None:
+    """From a checkout with no runpod-toolkit sibling the import says how to point at one."""
+    proc = subprocess.run(
+        [sys.executable, "-c", "import run_vllm_eval"],
+        cwd=_SCRIPTS,
+        env={"HOME": str(tmp_path), "RUNPOD_TOOLKIT_PATH": str(tmp_path), "PATH": os.environ["PATH"]},
+        capture_output=True,
+        text=True,
+        timeout=LAUNCHER_IMPORT_TIMEOUT_SECONDS,
+        check=False,
+    )
+    assert proc.returncode != 0
+    assert "ModuleNotFoundError" in proc.stderr
+    assert "RUNPOD_TOOLKIT_PATH" in proc.stderr

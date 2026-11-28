@@ -101,6 +101,13 @@ _ESC_6670_1_CLAIM = (
 )
 
 
+# Verbatim from dark_factory esc-unverified-claim-9007-1: 10625 asked that 9007 be cancelled, pending when written.
+_ESC_9007_1_CLAIM = (
+    'Task 10625 (info-l0-router, esc-6646-3) asked only that task 9007 be cancelled or folded '
+    'into task 9631, which is a task-store disposition with no code left to change'
+)
+
+
 def _extract(text: str, default_project_id: str = 'reify') -> list[CompletionClaim]:
     return extract_completion_claims(
         text,
@@ -228,6 +235,102 @@ class TestModalFormsAreNotClaims:
     )
     def test_a_modal_elsewhere_leaves_the_claim(self, text):
         assert _triples(text) == [('applied_work', 'task', '5422')]
+
+    @pytest.mark.parametrize(
+        ('text', 'project'),
+        [
+            pytest.param(_ESC_9007_1_CLAIM, 'dark_factory', id='esc-unverified-claim-9007-1'),
+            pytest.param('requested that task 5422 be merged', 'reify', id='requested-merged'),
+            pytest.param(
+                'proposed that task 5422 be closed as duplicate', 'reify', id='proposed-closed-as',
+            ),
+            pytest.param('let task 5422 be merged first', 'reify', id='let-complement'),
+            pytest.param(
+                'asked that it be filed as tkt_0RRRC5AASJ9Z630VP4PCN9H376', 'reify',
+                id='asked-filed-as-ticket',
+            ),
+            pytest.param(
+                'PREREQUISITES: task 208 and task 762 must both be merged to main first.',
+                'solar_challenge_platform', id='solar-must-both-be-merged',
+            ),
+        ],
+    )
+    def test_a_marker_after_a_bare_be_is_not_a_claim(self, text, project):
+        assert _triples(text, project) == []
+
+    @pytest.mark.parametrize(
+        ('text', 'claim'),
+        [
+            pytest.param(
+                'asked that task 5422 be cancelled; task 5423 was cancelled',
+                ('disposition', 'task', '5423'),
+                id='indicative-clause-still-claims',
+            ),
+            pytest.param(
+                'task 5422 has been cancelled', ('disposition', 'task', '5422'),
+                id='been-is-not-be',
+            ),
+            pytest.param(
+                "task 5422's BE landed", ('applied_work', 'task', '5422'),
+                id='upper-case-BE-is-an-acronym',
+            ),
+            pytest.param(
+                'task 5422 BE merged into main', ('applied_work', 'task', '5422'),
+                id='upper-case-BE-before-the-marker',
+            ),
+        ],
+    )
+    def test_a_bare_be_elsewhere_leaves_the_claim(self, text, claim):
+        assert _triples(text) == [claim]
+
+    @pytest.mark.parametrize(
+        'text',
+        [
+            pytest.param("it'll be when task 5422 has landed", id='contracted-will-when'),
+            pytest.param(
+                "the next step'll be after task 5422 has merged", id='contracted-will-after',
+            ),
+            pytest.param(
+                "the question'll be whether task 5422 has landed", id='contracted-will-whether',
+            ),
+            pytest.param("that'd be once #5422 has shipped", id='contracted-would-once'),
+            pytest.param("it'd be when task 5422 has landed", id='contracted-would-when'),
+            pytest.param('let it be if task 5422 has landed', id='let-if'),
+            pytest.param('let the rollout be after task 5422 has landed', id='let-after'),
+            pytest.param('the right moment would be once task 5422 has landed', id='modal-once'),
+            pytest.param('the plan was to be after task 5422 has landed', id='to-be-after'),
+            pytest.param(
+                "it'll be as soon as task 5422 has landed", id='multi-word-as-soon-as',
+            ),
+            pytest.param("it'll be in case task 5422 has landed", id='multi-word-in-case'),
+        ],
+    )
+    def test_a_mood_cue_after_be_keeps_its_scope(self, text):
+        assert _triples(text) == []
+
+    @pytest.mark.parametrize(
+        'text',
+        [
+            pytest.param("it'd be after task 5422 landed", id='would-after-simple-past'),
+            pytest.param("it'll be once task 5422 landed", id='will-once-simple-past'),
+        ],
+    )
+    def test_a_past_tense_cue_scope_after_be_still_claims(self, text):
+        assert _triples(text) == [('applied_work', 'task', '5422')]
+
+    @pytest.mark.parametrize(
+        'text',
+        [
+            pytest.param('if we let it be and task 5423 was merged', id='let-be-and'),
+            pytest.param('whether the plan be and task 5423 was merged', id='subjunctive-be-and'),
+            pytest.param('if it be while task 5423 has merged', id='subjunctive-be-while'),
+            pytest.param('if it be rather than task 5423 merged', id='be-rather-than'),
+            pytest.param('if it be - task 5423 was merged', id='be-spaced-dash'),
+            pytest.param('if it should be and task 5423 was merged', id='modal-be-and'),
+        ],
+    )
+    def test_a_barrier_after_be_still_ends_the_scope(self, text):
+        assert _triples(text) == [('applied_work', 'task', '5423')]
 
 
 class TestNonAssertiveScopes:

@@ -43,6 +43,7 @@ from orchestrator.config import (
     RoutingRule,
     RuleMatch,
     RuleSet,
+    SplitMatch,
     apply_reload,
     load_config,
 )
@@ -94,6 +95,31 @@ class TestValidRoutingRulesReloadApplies:
         assert live.routing.rules[-1] == new_rule
         assert live.routing.ladder == [*live_ladder_before, 'opus-extra']
         assert live.routing.per_model_daily_ceiling_usd == {'opus': 25.0}
+
+
+class TestSplitRuleReloadApplies:
+    """A rule carrying a split condition reloads like any other rule field."""
+
+    def test_split_rule_applies_in_place(self):
+        live = OrchestratorConfig()
+        split = SplitMatch(salt='routing-exp-1', buckets=2, bucket=0)
+        fresh = OrchestratorConfig(
+            routing=RoutingConfig(
+                rules=[
+                    *live.routing.rules,
+                    RoutingRule(
+                        id='split-arm-0',
+                        match=RuleMatch(role=['implementer'], split=split),
+                        set=RuleSet(model='opus'),
+                    ),
+                ],
+            ),
+        )
+
+        report = apply_reload(live, fresh)
+
+        assert 'routing.rules' in report['applied']
+        assert live.routing.rules[-1].match.split == split
 
 
 class TestUnknownRuleKeyFailsClosedBeforeApply:
@@ -148,3 +174,42 @@ class TestUnknownRuleKeyFailsClosedBeforeApply:
 
         # apply_reload was never called -- live is untouched by construction.
         assert live.routing.rules == live_rules_before
+
+
+class TestMalformedSplitFailsClosedAtLoad:
+    """A malformed split in an operator YAML edit raises ValidationError
+    naming the field at load, so a reload never reaches apply_reload."""
+
+    @staticmethod
+    def _write_split_rule(tmp_path, split):
+        path = tmp_path / 'bad-split.yaml'
+        path.write_text(yaml.dump({
+            'routing': {
+                'rules': [
+                    {
+                        'id': 'split-rule',
+                        'match': {'role': ['implementer'], 'split': split},
+                        'set': {'model': 'opus'},
+                    },
+                ],
+            },
+        }))
+        return path
+
+    @pytest.mark.parametrize(
+        ('split', 'field'),
+        [
+            ({'salt': 'x', 'buckets': 1, 'bucket': 0}, 'buckets'),
+            ({'salt': 'x', 'buckets': 2, 'bucket': 2}, 'bucket'),
+        ],
+    )
+    def test_load_raises_naming_the_split_field(self, tmp_path, split, field):
+        path = self._write_split_rule(tmp_path, split)
+
+        with pytest.raises(ValidationError) as exc_info:
+            load_config(path)
+
+        assert any(
+            error['loc'][-1] == field and 'split' in error['loc']
+            for error in exc_info.value.errors()
+        )

@@ -1,0 +1,24 @@
+{
+  "task_id": "11048",
+  "reason": "Review amendment to \u03b11 (plans/merge-pool-batches-prd.md): VerifyDispatcher._base_on_main now reads main containment through git_read.is_ancestor_or_raise and logs a WARNING with git's reason before failing open, replacing a silent contextlib.suppress; the one added except is the cost of making that failure visible",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/verify_dispatch.py",
+      "baseline": 45,
+      "current": 46
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/verify_dispatch.py::VerifyDispatcher::_base_on_main",
+      "baseline": 3,
+      "current": 4
+    },
+    {
+      "measure": "total:cognitive",
+      "key": "<cluster>",
+      "baseline": 5396,
+      "current": 5397
+    }
+  ]
+}

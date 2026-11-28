@@ -1,6 +1,10 @@
-"""B37: the inbox contract's third member, defect_ruled (PRD §14.2 decision 14, §14.3), against hand-written lines; the portal's vendored in-v3 fixture arrives with σ3 (task 7407)."""
+"""B37: the inbox contract's third member, defect_ruled (PRD §14.2 decision 14, §14.3), against the portal's vendored in-v3 fixture.
+
+The report and ruling every case starts from are lines of that fixture, not hand-written ones.
+"""
 
 import json
+import shutil
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -12,9 +16,12 @@ from _publisher_pass import REVEALABLE_PATH, inbox_offset, reveal_answers, revea
 from client_feed.contract import (
     INBOX_FILENAME,
     ContractViolation,
+    DefectReported,
     DefectRuled,
+    RevealRequested,
     RulingKind,
     parse_inbox_line,
+    split_jsonl,
 )
 from client_feed.feed_io import OutDir
 from client_feed.inbox import read_inbox
@@ -26,24 +33,10 @@ T0 = datetime(2026, 11, 3, 9, 0, tzinfo=UTC)
 NOW = datetime(2026, 11, 3, 13, 0, tzinfo=UTC)
 AT = '2026-11-03T12:00:00Z'
 
-RULED: dict[str, Any] = {
-    'seq': 3,
-    'at': AT,
-    'type': 'defect_ruled',
-    'block': 2,
-    'report': 1,
-    'kind': 'not_a_defect',
-}
-REPORTED: dict[str, Any] = {
-    'seq': 2,
-    'at': AT,
-    'type': 'defect_reported',
-    'block': 2,
-    'report': 1,
-    'criterion_id': 'C-12',
-    'restater': {'prompt_version': 'restate-v1'},
-    'outcome': {'kind': 'restated', 'observed': 'o', 'expected': 'e', 'steps': ['s']},
-}
+IN_V3 = Path(__file__).parent / 'fixtures' / 'in-v3'
+VENDORED = split_jsonl((IN_V3 / INBOX_FILENAME).read_text())
+REPORTED: dict[str, Any] = json.loads(VENDORED[1])
+RULED: dict[str, Any] = json.loads(VENDORED[2])
 
 
 def requested(seq: int, path: str) -> dict[str, Any]:
@@ -111,6 +104,48 @@ def test_a_ruled_line_is_read_beside_requests_and_reports_in_inbox_order(in_dir:
     assert [(ruling.block, ruling.report, ruling.kind) for ruling in read.rulings] == [
         (2, 1, RulingKind.NOT_A_DEFECT)
     ]
+    assert read.offset == inbox.stat().st_size
+
+
+def test_every_vendored_in_v3_line_is_a_valid_inbox_line_and_reads_in_order(in_dir: Path) -> None:
+    parsed = [parse_inbox_line(text, line_no=n) for n, text in enumerate(VENDORED, 1)]
+
+    assert [type(line) for line in parsed] == [
+        RevealRequested,
+        DefectReported,
+        DefectRuled,
+        DefectReported,
+        DefectReported,
+        RevealRequested,
+        DefectRuled,
+        DefectRuled,
+        RevealRequested,
+    ]
+    rulings = [line for line in parsed if isinstance(line, DefectRuled)]
+    assert [(ruling.block, ruling.report, ruling.kind) for ruling in rulings] == [
+        (2, 1, RulingKind.NOT_A_DEFECT),
+        (2, 2, RulingKind.NOT_COVERED),
+        (2, 3, RulingKind.CHANGE_REQUEST),
+    ]
+    for ruling in rulings:
+        earlier = parsed[: parsed.index(ruling)]
+        assert any(
+            isinstance(line, DefectReported) and (line.block, line.report) == (ruling.block, ruling.report)
+            for line in earlier
+        )
+
+    inbox = in_dir / INBOX_FILENAME
+    shutil.copyfile(IN_V3 / INBOX_FILENAME, inbox)
+    read = read_inbox(in_dir, offset=0)
+
+    assert [request.path for request in read.requests] == [
+        'src/ledger.py',
+        'src/reports.py',
+        'src/export.py',
+    ]
+    assert [(report.block, report.report) for report in read.reports] == [(2, 1), (2, 2), (2, 3)]
+    assert list(read.rulings) == rulings
+    assert read.rejected == ()
     assert read.offset == inbox.stat().st_size
 
 

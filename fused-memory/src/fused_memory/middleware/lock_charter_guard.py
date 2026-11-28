@@ -19,10 +19,11 @@ implementation here and reify's Bash ``_is_file_path`` in
 equivalent *by construction*: same extension allowlist, same extension-less
 filename allowlist, same strip/segment/ext algorithm.
 
-The drift-guard test in ``tests/test_lock_charter_guard.py`` pins
-``sorted(FILE_EXTENSIONS)`` to the shared α/γ canonical vector printed by
-``lock-charter-guard.sh --list-extensions``, so divergence is caught at CI
-time.
+The drift guards in ``tests/test_lock_charter_guard.py`` pin both vectors to
+canonical literals and to ``shared.locking``'s copy.  Agreement with reify's
+``lock-charter-guard.sh`` is checked OFF the merge gate: the nightly
+``scripts/check_lock_charter_drift.py`` reports a divergence and files one
+heal task for it (task 11623; ``OPERATIONS.md`` section 9a).
 
 STATUS — cross-repo agreement on the extension-less vector (#3248)
 -------------------------------------------------------------------
@@ -35,14 +36,9 @@ script — the two vectors are identical, and ``classify hooks/project-checks``
 returns ACCEPT, not REJECT.  So this change CONVERGED the seam rather than
 opening one; no reify follow-up is owed.
 
-The extension-half Tier-2 drift guard
-(``test_extension_drift_guard_vs_reify_script``) compares
-``sorted(FILE_EXTENSIONS)`` against ``--list-extensions``, i.e. an EXTENSION
-vector only, and is structurally blind to this frozenset.  That gap is closed
-by its extension-less sibling
-(``test_extensionless_drift_guard_vs_reify_script``), which pins this vector
-against ``--list-extensionless`` so three-way α/γ/bash agreement is ENFORCED
-rather than merely asserted in prose.
+Comparing ``--list-extensions`` alone, an EXTENSION vector, would be blind to
+this frozenset, so the nightly check compares ``--list-extensionless`` too, and
+three-way α/γ/bash agreement is checked rather than merely asserted in prose.
 
 Extension allowlist rationale (reify PRD §11 Q2):
 - PRD-explicit: rs ri toml cpp c h hpp md json yaml yml lock py sh ts tsx js txt step stl
@@ -141,7 +137,7 @@ FILE_EXTENSIONS: frozenset[str] = frozenset({
     'lock', 'log',
     'manifest', 'md', 'mjs', 'mts',
     'npmrc', 'png', 'py', 'python-version',
-    'ri', 'rs', 'scss', 'service', 'sh', 'step', 'stl', 'svg',
+    'ri', 'rs', 'scss', 'service', 'sh', 'stderr', 'step', 'stl', 'svg',
     'template', 'timer', 'tombstones', 'toml', 'ts', 'tsv', 'tsx', 'txt', 'typed',
     'yaml', 'yml',
 })
@@ -159,7 +155,8 @@ FILE_EXTENSIONS: frozenset[str] = frozenset({
 # to the 2026-07-31 measurement) — every tracked path whose final segment
 # contains no '.'.  dark-factory contributes Dockerfile LICENSE pre-commit
 # pre-merge-commit project-checks; reify adds cargo cargo-audit-orphans
-# reference-transaction.  Union = the 8 below.
+# reference-transaction, and sccache (scripts/canon-bin/guard/sccache, reify
+# task 10232, measured on reify main 2026-11-23).  Union = the 9 below.
 #
 # GITLINK EXCLUSION — load-bearing, and a deliberate decision rather than an
 # accident of the sweep: `git ls-files -s` entries with mode 160000 are submodule
@@ -182,9 +179,10 @@ FILE_EXTENSIONS: frozenset[str] = frozenset({
 # CROSS-PROJECT SCOPE — the limitation this enumeration knowingly accepts, and
 # the reason the admission rule above is stricter than it looks.  Members are
 # matched as BARE FINAL SEGMENTS and several are generic: `cargo`, `Dockerfile`,
-# `LICENSE`, `pre-commit`.  The collision guard that bounds this risk
-# (test_no_canonical_extensionless_name_is_also_a_directory) sweeps only the
-# dark-factory and reify checkouts — but this predicate governs lock charters
+# `LICENSE`, `pre-commit`.  The collision checks that bound this risk
+# (test_no_canonical_extensionless_name_is_also_a_directory on the gate, and
+# scripts/check_lock_charter_drift.py::check_extensionless nightly) sweep only
+# the dark-factory and reify checkouts — but this predicate governs lock charters
 # for EVERY project the orchestrator targets.  In a third project containing
 # `tools/cargo/` or `docker/Dockerfile/` as a real DIRECTORY, that directory now
 # classifies as a FILE: directory_locks stops rejecting it and derive_modules
@@ -198,8 +196,8 @@ FILE_EXTENSIONS: frozenset[str] = frozenset({
 # Drift guard (this γ copy): fused-memory/tests/test_lock_charter_guard.py::test_extensionless_drift_guard
 # Drift guard (shared copy in shared/locking.py): shared/tests/test_locking.py::TestExtensionlessFilenamesDriftGuard
 # Self-audit (both copies): test_every_tracked_extensionless_file_is_allowlisted
-#   sweeps both repos' tracked corpora, so the 9th extension-less file surfaces
-#   as a red test rather than as another LockCharterViolation incident.
+#   sweeps both repos' tracked corpora, so a newly tracked extension-less file
+#   surfaces as a red test rather than as another LockCharterViolation incident.
 # ---------------------------------------------------------------------------
 
 EXTENSIONLESS_FILENAMES: frozenset[str] = frozenset({
@@ -211,6 +209,7 @@ EXTENSIONLESS_FILENAMES: frozenset[str] = frozenset({
     'pre-merge-commit',
     'project-checks',
     'reference-transaction',
+    'sccache',
 })
 
 
@@ -333,14 +332,15 @@ def extract_files(metadata: str | dict[str, Any] | None) -> list[str]:
     return [f for f in files if isinstance(f, str)]
 
 
-def _allowlist_lockstep(vector: str, reify_var: str, reify_flag: str, test_vector: str) -> str:
+def _allowlist_lockstep(vector: str, reify_var: str, test_vector: str) -> str:
     """Name every home of the allowlist *vector*, which must all change together."""
     return (
         f'{vector} in BOTH shared/src/shared/locking.py and '
         'fused-memory/src/fused_memory/middleware/lock_charter_guard.py, '
         f'AND to reify scripts/lock-charter-guard.sh {reify_var} (all three '
-        f'must agree — the Tier-2 {reify_flag} drift guard goes RED '
-        f'otherwise), plus the {test_vector} vector in both test copies.'
+        'must agree — the nightly scripts/check_lock_charter_drift.py reports '
+        f'a mismatch and files the heal task), plus the {test_vector} vector '
+        'in both test copies.'
     )
 
 
@@ -360,7 +360,7 @@ _DIRECTORY_HINT = (
     'EXTENSIONLESS_FILENAMES. If it is a genuinely new extension-less '
     'tracked file, add its name to '
     + _allowlist_lockstep(
-        'EXTENSIONLESS_FILENAMES', '_EXTLESS', '--list-extensionless', '_CANONICAL_EXTENSIONLESS',
+        'EXTENSIONLESS_FILENAMES', '_EXTLESS', '_CANONICAL_EXTENSIONLESS',
     )
 )
 
@@ -395,7 +395,7 @@ def _unrecognised_extension_hint(paths: list[str]) -> str:
         'Whatever the task_kind, leave a gitignored path out of '
         'metadata.files: this check classifies it as a directory either way. '
         'If it is instead a TRACKED file, add its extension to '
-        + _allowlist_lockstep('FILE_EXTENSIONS', '_EXTS', '--list-extensions', '_CANONICAL_EXTENSIONS')
+        + _allowlist_lockstep('FILE_EXTENSIONS', '_EXTS', '_CANONICAL_EXTENSIONS')
     )
 
 

@@ -203,6 +203,16 @@ class TestReleaseDropsTheRelation:
         assert table.successor_relation('D') == RELATION
         assert table.try_acquire_additional('P', ['a.py'])
 
+    def test_withdrawing_an_acquire_keeps_the_relation(self):
+        table = _table()
+        assert table.try_acquire('P', ['a.py', 'b.py'])
+        assert table.try_acquire_as_successor('D', ['a.py'], predecessor='P')
+
+        assert table.withdraw_acquire('P') == ['a.py', 'b.py']
+
+        assert not table.is_held('P')
+        assert table.successor_relation('D') == RELATION
+
 
 class TestDeclarationGuards:
     """Invariant 1: a predecessor has at most one successor, a successor one predecessor."""

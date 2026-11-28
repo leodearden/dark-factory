@@ -18,12 +18,16 @@ import pytest
 from _fm_polling import poll_until, poll_until_dead
 from _parked_queue_fixtures import Exhausted, RecordingParkPolicy
 from _queued_write_fixtures import queued
+from shared.testing_fake_clock import FakeClock
 from shared.write_queue_statuses import CLAIMABLE, WriteQueueStatus
 
 from fused_memory.services.durable_queue import DurableWriteQueue
 from fused_memory.services.queued_writes import QueueCallback, QueuedWrite
 
 _MAX_ATTEMPTS = 3
+_PROBE_AHEAD_SECONDS = 600.0
+_PROBE_BEHIND_SECONDS = 3600.0
+_CLOCK_START = 1_800_000_000.0
 
 
 def _queue(tmp_path, execute_write, **overrides) -> DurableWriteQueue:
@@ -147,6 +151,86 @@ class TestParking:
             await poll_until(_status_is(tmp_path, healthy, 'completed'), timeout=10.0)
             assert _row(tmp_path, parked)['status'] == 'parked'
             assert len(policy.parked) == 1
+        finally:
+            await q.close()
+
+
+class TestTheProbeTimeAParkNames:
+    @pytest.mark.asyncio
+    async def test_a_named_probe_time_becomes_every_parked_rows_horizon(self, tmp_path):
+        clock = FakeClock(start=_CLOCK_START)
+        probe_at = clock() + _PROBE_AHEAD_SECONDS
+        policy = RecordingParkPolicy()
+        execute = AsyncMock(side_effect=Exhausted('capped'))
+        q = _queue(tmp_path, execute, park_policy=policy, clock=clock)
+        await q.initialize()
+        try:
+            first = await q.enqueue(_write('first', group_id='proj1'))
+            await poll_until(_status_is(tmp_path, first, 'parked'))
+            policy.retry_at = lambda: probe_at
+
+            second = await q.enqueue(_write('second', group_id='proj2'))
+            await poll_until(_status_is(tmp_path, second, 'parked'))
+
+            row = _row(tmp_path, second)
+            assert row['next_retry_at'] == probe_at
+            assert row['attempts'] == 0
+            assert _row(tmp_path, first)['next_retry_at'] == probe_at
+        finally:
+            await q.close()
+
+    @pytest.mark.asyncio
+    async def test_a_probe_time_in_the_past_is_clamped_to_now(self, tmp_path):
+        clock = FakeClock(start=_CLOCK_START)
+        retry_ats = iter([clock() - _PROBE_BEHIND_SECONDS])
+        horizons: list[float] = []
+        policy = RecordingParkPolicy(
+            retry_at=lambda: next(retry_ats, clock() + _PROBE_AHEAD_SECONDS),
+            observe=lambda event: horizons.append(_row(tmp_path, event.item_id)['next_retry_at']),
+        )
+        execute = AsyncMock(side_effect=Exhausted('capped'))
+        q = _queue(tmp_path, execute, park_policy=policy, clock=clock)
+        await q.initialize()
+        try:
+            item_id = await q.enqueue(_write('clamped'))
+            await poll_until(
+                lambda: execute.await_count >= 2,
+                message='a row parked with a past probe time was not claimable at once',
+            )
+            await poll_until(lambda: len(horizons) >= 2)
+
+            assert horizons == [_CLOCK_START, _CLOCK_START + _PROBE_AHEAD_SECONDS]
+            assert _row(tmp_path, item_id)['status'] == 'parked'
+            assert _row(tmp_path, item_id)['attempts'] == 0
+        finally:
+            await q.close()
+
+
+class TestTheQueuesClock:
+    @pytest.mark.asyncio
+    async def test_parking_and_landing_follow_the_injected_clock(self, tmp_path):
+        start = _CLOCK_START
+        clock = FakeClock(start=start)
+        policy = RecordingParkPolicy(retry_at=lambda: clock() + _PROBE_AHEAD_SECONDS)
+        execute = AsyncMock(side_effect=[Exhausted('capped'), None])
+        q = _queue(tmp_path, execute, park_policy=policy, clock=clock)
+        await q.initialize()
+        try:
+            item_id = await q.enqueue(_write('on the fake clock'))
+            await poll_until(_status_is(tmp_path, item_id, 'parked'))
+
+            row = _row(tmp_path, item_id)
+            assert row['created_at'] == start
+            assert row['next_retry_at'] == start + _PROBE_AHEAD_SECONDS
+
+            clock.advance(_PROBE_AHEAD_SECONDS)
+            await poll_until(_status_is(tmp_path, item_id, 'completed'))
+
+            assert _row(tmp_path, item_id)['completed_at'] == start + _PROBE_AHEAD_SECONDS
+            await poll_until(
+                lambda: policy.cleared == 1,
+                message='on_cleared runs after the completion commits and was never reported',
+            )
         finally:
             await q.close()
 

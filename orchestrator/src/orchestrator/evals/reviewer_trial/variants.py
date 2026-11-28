@@ -7,11 +7,13 @@ the production baseline (5x sonnet specialists).
 from __future__ import annotations
 
 import dataclasses
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+from types import MappingProxyType
 
 from orchestrator.agents.review_briefing import ReviewBriefing
 from orchestrator.agents.roles import AgentRole, build_reviewer_role
+from orchestrator.config import OrchestratorConfig
 
 # ---------------------------------------------------------------------------
 # Spec + config types
@@ -24,7 +26,7 @@ class ReviewerSpec:
     name: str
     model: str                 # "opus" | "sonnet" | cross-family model id (e.g. "gpt-5.4")
     specialization: str        # combined specialization prompt text
-    budget: float = 2.0
+    budget: float | None = 2.0                    # USD; None takes production's budgets.reviewer
     effort: str = 'high'
     # Cross-family dispatch (default-off keeps every existing spec byte-identical):
     backend: str = 'claude'                        # 'claude' | 'codex' | 'gemini'
@@ -60,29 +62,67 @@ def campaign_arms(
 # Trial reviewer role builder
 # ---------------------------------------------------------------------------
 
-_JCODEMUNCH_TOOLS = ['mcp__jcodemunch__*']
+def trial_reviewer_max_turns(override: int | None = None) -> int:
+    """*override*, or production's reviewer turn cap when it is None; never below 1.
+
+    Production resolves a reviewer's cap through ``routing.resolve_route``'s
+    config layer, ``max_turns.reviewer``, which no shipped routing rule
+    overrides for a reviewer.
+    """
+    turns = OrchestratorConfig().max_turns.reviewer if override is None else override
+    if turns < 1:
+        raise ValueError(f'a reviewer turn cap must be at least 1, got {turns}')
+    return turns
+
+
+def trial_production_budget(override: float | None = None) -> float:
+    """*override*, or production's reviewer budget when it is None; always positive.
+
+    Production dispatches its reviewer at ``budgets.reviewer``.
+    """
+    budget = OrchestratorConfig().budgets.reviewer if override is None else override
+    if budget <= 0:
+        raise ValueError(f'a reviewer budget must be positive, got {budget}')
+    return float(budget)
+
+
+def trial_reviewer_budget(spec: ReviewerSpec, production_budget: float | None = None) -> float:
+    """*spec*'s pinned budget, or production's (``trial_production_budget``) when it pins none."""
+    if spec.budget is not None:
+        return spec.budget
+    return trial_production_budget(production_budget)
+
+
+def panel_budgets(variant: VariantConfig, production_budget: float | None = None) -> tuple[float, ...]:
+    """Each of *variant*'s reviewers' budgets, in reviewer order."""
+    return tuple(trial_reviewer_budget(spec, production_budget) for spec in variant.reviewers)
 
 
 def build_trial_reviewer_role(
-    spec_in: ReviewerSpec, briefing: ReviewBriefing = ReviewBriefing.DIFF_ONLY,
+    spec_in: ReviewerSpec,
+    briefing: ReviewBriefing = ReviewBriefing.DIFF_ONLY,
+    max_turns: int | None = None,
+    *,
+    production_budget: float | None = None,
 ) -> AgentRole:
     """The production ``reviewer_<name>`` role of the *briefing* generation, set up for a trial.
 
     The system prompt, verdict-tools transport, harness version and
     ``reviewer_<name>`` identity are production's, so the trial measures the
     prompt production dispatches; the verdict-tools server checks the emitted
-    ``reviewer`` field against ``role.name``. The trial adds jcodemunch to the
-    read-only tools and takes model and budget from the spec; the runner
-    passes ``spec_in.effort`` itself, since AgentRole has no effort field.
+    ``reviewer`` field against ``role.name``. The trial takes the model from
+    the spec; the budget is the spec's pin, or production's unless
+    *production_budget* overrides it; the turn cap is production's unless
+    *max_turns* overrides it. The runner passes ``spec_in.effort`` itself,
+    since AgentRole has no effort field.
     """
     role = build_reviewer_role(spec_in.name, spec_in.specialization, briefing)
     return dataclasses.replace(
         role,
-        allowed_tools=[*role.allowed_tools, *_JCODEMUNCH_TOOLS],
         disallowed_tools=['Edit', 'Write'],
         default_model=spec_in.model,
-        default_budget=spec_in.budget,
-        default_max_turns=30,
+        default_budget=trial_reviewer_budget(spec_in, production_budget),
+        default_max_turns=trial_reviewer_max_turns(max_turns),
     )
 
 
@@ -157,7 +197,7 @@ VARIANT_A = VariantConfig(
             name='comprehensive_reviewer',
             model='opus',
             specialization=_SPEC_COMPREHENSIVE,
-            budget=5.0,
+            budget=None,
             effort='high',
         ),
     ],
@@ -305,9 +345,10 @@ EFFORT_SWEEP_VARIANTS = [VARIANT_A_MEDIUM, VARIANT_A, VARIANT_A_MAX]
 #
 # Isolate the MODEL as the sole independent variable: each candidate mirrors
 # VARIANT_A's single comprehensive-generalist structure (effort='high',
-# budget=5.0, _SPEC_COMPREHENSIVE), swapping ONLY model/backend, so quality
-# and cost deltas are attributable to the model rather than panel shape. The
-# incumbent is VARIANT_A itself (the Apr-8 trial winner + production reviewer).
+# _SPEC_COMPREHENSIVE), swapping ONLY model/backend, so quality deltas are
+# attributable to the model rather than panel shape. Each candidate keeps its
+# pinned budget; since task 11912 the incumbent takes production's budget.
+# The incumbent is VARIANT_A itself (the Apr-8 trial winner + production reviewer).
 # Deliberately NOT added to ALL_VARIANTS so `full`/`sweep` stay unchanged.
 # ---------------------------------------------------------------------------
 
@@ -373,7 +414,7 @@ VARIANT_A_XHIGH = VariantConfig(
             name='comprehensive_reviewer',
             model='opus',
             specialization=_SPEC_COMPREHENSIVE,
-            budget=5.0,
+            budget=None,
             effort='xhigh',
         ),
     ],
@@ -388,3 +429,44 @@ FABLE_EVIDENCE_VARIANTS = [
     VARIANT_CROSS_FAMILY,
     VARIANT_A_XHIGH,
 ]
+
+
+# ---------------------------------------------------------------------------
+# d2 reviewer campaign round 2 (Leo 2026-11-25, consumer task 11727): a
+# Fable 5.2 and a GPT-6.2 Sol generalist in the incumbent's shape. A
+# candidate's name embeds its model id and is never re-pointed at another.
+# ---------------------------------------------------------------------------
+
+VARIANT_FABLE52_SOLO = VariantConfig(
+    name='variant_fable52_solo',
+    description='1x Fable 5.2 generalist — model swap vs the 1x opus incumbent',
+    reviewers=[
+        ReviewerSpec(
+            name='comprehensive_reviewer',
+            model='claude-fable-5-2',
+            specialization=_SPEC_COMPREHENSIVE,
+            budget=10.0,
+            effort='high',
+        ),
+    ],
+)
+
+VARIANT_CODEX_SOL62 = VariantConfig(
+    name='variant_codex_sol62',
+    description='1x codex generalist (GPT-6.2 Sol, ChatGPT login) — cross-family model swap vs the 1x opus incumbent',
+    reviewers=[
+        ReviewerSpec(
+            name='comprehensive_reviewer',
+            model='gpt-6.2-sol',
+            specialization=_SPEC_COMPREHENSIVE,
+            budget=5.0,
+            effort='high',
+            backend='codex',
+        ),
+    ],
+)
+
+# Every arm `campaign --arms` can name, keyed by its name.
+CAMPAIGN_VARIANTS: Mapping[str, VariantConfig] = MappingProxyType({
+    v.name: v for v in (*FABLE_EVIDENCE_VARIANTS, VARIANT_FABLE52_SOLO, VARIANT_CODEX_SOL62)
+})

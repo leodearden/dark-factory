@@ -23,6 +23,7 @@ from orchestrator.event_store import EventStore
 from orchestrator.merge_lane.dead_base_ledger import DeadBaseSite, VoidPoint
 from orchestrator.merge_lane.main_health_probe import MainHealthProbeHandles
 from orchestrator.merge_lane.remerge_base import RemergeClaim
+from orchestrator.merge_lane.tested_tree import TestedTree
 from orchestrator.merge_lane.types import (
     CapPermit,
     DeepPlacement,
@@ -84,6 +85,8 @@ class VerifyFrontier:
     """``(stacked_on, rebased_heads)`` of the frozen verify frontier."""
     verify_base_divergence: Callable[[SpeculativeItem, str], VerifyBaseDivergence | None]
     """The frozen-tip detector: it observes, logs and escalates, never refuses."""
+    live_trees: Callable[[], tuple[TestedTree, ...]]
+    """The tested trees of the frozen in-flight entries, those already published."""
 
 
 @dataclass(frozen=True)

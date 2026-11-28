@@ -60,11 +60,11 @@ they are short and they are the law:
 
 - `fused-memory/src/fused_memory/config/schema.py`, `Mem0UpdateConfig` — since
   2026-08-12 the `curator-` grant is the **schema default**: both arms'
-  `default_factory` lists are `['recon-stage-', 'curator-']`. In
-  `config.yaml`'s `mem0_update:` block only the metadata-patch list is active
-  (it adds `link-heal-` for the link-heal executor, task 6181); the
-  content-amend list stays at the schema default (an active override of it
-  trips a deliberate tripwire test).
+  `default_factory` lists carry `recon-stage-` and `curator-`, and the
+  metadata arm's also carries `link-heal-` (the link-heal executor, tasks
+  6181 and 6431). `config.yaml`'s `mem0_update:` block is fully commented
+  out, so both lists are the schema default (an active override of the
+  content-amend list trips a deliberate tripwire test).
   The field descriptions record Leo's ruling (b) on esc-3524-1 and why **both**
   arms must carry `curator-`: retain-and-tag needs the preserving half, not
   just the destructive half.
@@ -367,7 +367,21 @@ For each gate with real work, in this order:
    `update_task`'s append semantics resend the whole field, and a transcription
    slip silently loses text.
 3. **Close the gate by RESOLVING ITS ESCALATION — never by `set_task_status`**:
-   `resolve_issue(escalation_id=<gate esc>, action='resume', ...)`. Measured
+   first stamp the content-adjudication proof,
+   `update_task(id=<gate>, project_root=<absolute project root>, metadata={'human_curator_adjudicated_at': '<ISO-8601 now>'}, metadata_mode='merge')`;
+   without it the runner re-blocks the gate with `curator_adjudication_missing`
+   on resume (task 3341). Then
+   `resolve_issue(escalation_id=<gate esc>, action='resume', resolution_class='actionable', ...)`,
+   with no acknowledgement. A curator gate's escalation is filed with a
+   declared pin (task 3346), so expect `declared_pin_refused`; read its
+   `declared_pins`. If the only `declared_by` entry is the runner's own,
+   `task-<gate>-human-curator-gate`
+   (`shared/src/shared/human_curator_gate.py::curator_gate_declarer`), your
+   review is what that pin waits for: re-issue the same call adding
+   `acknowledge_declared_pins=[<gate esc>]`. Any other declarer is a separate
+   dependency on the same record, and acknowledging the record would spend it
+   unread, so stop and consult what it names first. A record filed before task
+   3346 carries no pin, and the first call closes it. Measured
    2026-09-03: `set_task_status(id=<gate>, status='done')` REFUSES with
    `error=done_provenance_required` (`reconciliation.require_done_provenance` is
    enabled), and the hint offers only `merged` / `found_on_main` — both false for

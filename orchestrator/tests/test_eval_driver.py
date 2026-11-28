@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import functools
 import json
+from collections.abc import Iterable, Iterator
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -47,8 +48,9 @@ from _campaign_gate_helpers import (
 )
 
 from orchestrator.evals.configs import EvalConfig
-from orchestrator.evals.metrics import EvalMetrics, RoleUnderTest
+from orchestrator.evals.metrics import EvalMetrics, RoleUnderTest, dispatched_models, off_pin_roles
 from orchestrator.evals.results import EvalResult, ResultStore
+from orchestrator.routing import DispatchedRoute, PlanShape, RoutingDecision
 from orchestrator.workflow import WorkflowOutcome
 
 
@@ -66,14 +68,17 @@ def _judge_cfg() -> EvalConfig:
 
 
 def _fake_collect_metrics(collect_side_effect: BaseException | None) -> AsyncMock:
-    """A collect_metrics stand-in that honours its role/replay_frame/sandbox_backend keywords."""
+    """A collect_metrics stand-in that honours its executor-stamp keywords."""
 
-    async def fake_collect(_wf, _wt, _task, *, role, replay_frame=None, sandbox_backend=None):
+    async def fake_collect(
+        _wf, _wt, _task, *, role, replay_frame=None, sandbox_backend=None, endpoint_kind=None,
+    ):
         if collect_side_effect is not None:
             raise collect_side_effect
         return EvalMetrics(
             composite_score=0.9, tests_pass=True,
             role_under_test=role, replay_frame=replay_frame, sandbox_backend=sandbox_backend,
+            endpoint_kind=endpoint_kind,
         )
 
     return AsyncMock(side_effect=fake_collect)
@@ -162,7 +167,7 @@ def _off_allowlist_judge_cfg() -> EvalConfig:
     return EvalConfig('judge-fable', 'claude', 'claude-fable-5', 'medium', role=RoleUnderTest.JUDGE)
 
 
-def _route(cfg, role_name: str):
+def _route(cfg, role_name: str, *, plan_shape: PlanShape | None = None, routing_tier: int = 0):
     from orchestrator.routing import RoleDefaults, RouteInputs, resolve_route
 
     return resolve_route(
@@ -170,8 +175,8 @@ def _route(cfg, role_name: str):
             role_name=role_name,
             task_id='shadow_1_a',
             task_metadata={},
-            plan_shape=None,
-            routing_tier=0,
+            plan_shape=plan_shape,
+            routing_tier=routing_tier,
             dispatch_count=0,
             role_defaults=RoleDefaults('sonnet', 'high', 5.0, 50),
         ),
@@ -226,6 +231,106 @@ class TestBuildEvalOrchConfigAdmitsCandidateModel:
         cfg = build_eval_orch_config(codex, {}, base)
 
         assert cfg.routing.allowed_models == base.routing.allowed_models
+
+
+# ---------------------------------------------------------------------------
+# task 8499 — the cell's routing pins every role's model against the policy
+# rules it inherits from the base (large-plan-steps, the large-plan-modules
+# split pair, retry-tier-up), while the same rule still matches and still
+# supplies its non-model set fields.
+# ---------------------------------------------------------------------------
+
+_LARGE_BY_STEPS = PlanShape(20, ('pkg/a.py',))
+_LARGE_BY_MODULES = PlanShape(3, ('a/x.py', 'b/y.py', 'c/z.py', 'd/w.py'))
+
+
+def _assert_pinned_against_base_rule(base, cfg, role_name: str, **route_inputs) -> None:
+    base_decision = _route(base, role_name, **route_inputs)
+    model_setting_rules = {r.id for r in base.routing.rules if r.set.model is not None}
+    assert base_decision.rule_id in model_setting_rules
+
+    decision = _route(cfg, role_name, **route_inputs)
+    assert decision.model == getattr(cfg.models, role_name)
+    assert decision.source_layer == 'config'
+    assert decision.rejected == ()
+    assert decision.rule_id == base_decision.rule_id
+    assert decision.max_turns == base_decision.max_turns
+
+
+class TestCellRoutingPinsEveryRoleModel:
+    @pytest.mark.parametrize('role_name', ['implementer', 'debugger'])
+    @pytest.mark.parametrize(
+        'plan_shape', [_LARGE_BY_STEPS, _LARGE_BY_MODULES], ids=['by-steps', 'by-modules'],
+    )
+    def test_large_plan_rule_keeps_the_candidate_model(
+        self, tmp_path: Path, plan_shape: PlanShape, role_name: str,
+    ):
+        from orchestrator.evals.runner import build_eval_orch_config
+
+        base = _base_config(tmp_path)
+        cfg = build_eval_orch_config(_impl_cfg(), {}, base)
+
+        assert _route(base, role_name, plan_shape=plan_shape).model == 'opus'
+        _assert_pinned_against_base_rule(base, cfg, role_name, plan_shape=plan_shape)
+
+    @pytest.mark.parametrize(
+        ('role_name', 'build_kwargs'),
+        [
+            ('implementer', lambda: {'config': _impl_cfg()}),
+            ('implementer', lambda: {'config': _endpoint_impl_cfg()}),
+            ('architect', lambda: {'config': _impl_cfg(), 'architect_config': _arch_cfg()}),
+        ],
+        ids=['implementer', 'off-ladder-implementer', 'architect'],
+    )
+    def test_retry_tier_rule_keeps_the_candidate_model(
+        self, tmp_path: Path, role_name: str, build_kwargs,
+    ):
+        from orchestrator.evals.runner import build_eval_orch_config
+
+        base = _base_config(tmp_path)
+        cfg = build_eval_orch_config(task={}, base_config=base, **build_kwargs())
+
+        _assert_pinned_against_base_rule(base, cfg, role_name, routing_tier=1)
+
+    def test_non_claude_candidate_on_a_large_plan_keeps_its_model(self, tmp_path: Path):
+        from orchestrator.evals.configs import get_config_by_name
+        from orchestrator.evals.runner import build_eval_orch_config
+
+        codex = get_config_by_name('codex-gpt6-astra')
+        assert codex is not None and codex.backend != 'claude'
+        cfg = build_eval_orch_config(codex, {}, _base_config(tmp_path))
+
+        decision = _route(cfg, 'implementer', plan_shape=_LARGE_BY_STEPS)
+        assert decision.model == codex.model
+        assert decision.model != 'opus'
+
+    def test_building_a_cell_leaves_base_and_rule_table_intact(self, tmp_path: Path):
+        from orchestrator.evals.runner import build_eval_orch_config
+
+        base = _base_config(tmp_path)
+        cfg = build_eval_orch_config(_impl_cfg(), {}, base)
+
+        base_by_id = {r.id: r for r in base.routing.rules}
+        assert base_by_id['large-plan-steps'].set.model == 'opus'
+        assert [r.id for r in cfg.routing.rules] == [r.id for r in base.routing.rules]
+        assert [r.match for r in cfg.routing.rules] == [r.match for r in base.routing.rules]
+        for rule in cfg.routing.rules:
+            assert rule.set.model is None
+            assert rule.set.model_dump(exclude={'model'}) == (
+                base_by_id[rule.id].set.model_dump(exclude={'model'})
+            )
+
+    def test_a_role_without_a_seat_on_its_default_is_not_off_pin(self, tmp_path: Path):
+        from orchestrator.evals.runner import build_eval_orch_config
+
+        cfg = build_eval_orch_config(_impl_cfg(), {}, _base_config(tmp_path))
+        names = ('implementer', 'reviewer_comprehensive', 'resettled_adjudicator')
+        decisions = {name: _route(cfg, name, plan_shape=_LARGE_BY_STEPS) for name in names}
+
+        assert decisions['resettled_adjudicator'].source_layer == 'role_default'
+        assert decisions['resettled_adjudicator'].rejected == ()
+        routes = [DispatchedRoute(name, decision, None) for name, decision in decisions.items()]
+        assert off_pin_roles(dispatched_models(routes, cfg.models)) == []
 
 
 # ---------------------------------------------------------------------------
@@ -507,6 +612,7 @@ async def _run_eval_hermetic(
     run_side_effect: BaseException | None = None,
     collect_side_effect: BaseException | None = None,
     worktree_path: Path | None = None,
+    dispatched_routes: Iterable[DispatchedRoute] = (),
 ):
     """Drive run_eval with the worktree/workflow/metrics boundaries mocked.
 
@@ -535,6 +641,9 @@ async def _run_eval_hermetic(
     / ``collect_metrics`` raise, the two ways a cell can fail after the gate is
     resolved — which is what proves the owned teardown really is in a
     ``finally``.
+
+    The fake workflow carries the cell config build_workflow received and
+    ``dispatched_routes=`` as the routes its invocations ran on.
     """
     from orchestrator.evals import eval_gate, runner
 
@@ -545,9 +654,11 @@ async def _run_eval_hermetic(
     fake_wf.run = AsyncMock(
         return_value=SimpleNamespace(outcome=outcome), side_effect=run_side_effect,
     )
+    fake_wf.metrics.dispatched_routes = dispatched_routes
 
     def fake_build_workflow(**kwargs):
         captured['build_workflow'] = kwargs
+        fake_wf.config = kwargs['config']
         return fake_wf
 
     mock_collect = _fake_collect_metrics(collect_side_effect)
@@ -652,6 +763,7 @@ async def _run_end_to_end_hermetic(
     injected_gate=_NO_INJECTED_GATE,
     run_side_effect: BaseException | None = None,
     collect_side_effect: BaseException | None = None,
+    dispatched_routes: Iterable[DispatchedRoute] = (),
 ):
     """Drive run_end_to_end with the worktree/workflow/metrics boundaries mocked.
 
@@ -661,9 +773,9 @@ async def _run_end_to_end_hermetic(
     ``owned_usage_gate`` was bound to.
 
     The gate knobs (``gate`` / ``injected_gate`` / ``run_side_effect`` /
-    ``collect_side_effect``) mean exactly what they mean in
-    :func:`_run_eval_hermetic` — see its docstring for why the builder is
-    replaced unconditionally.
+    ``collect_side_effect``) and ``dispatched_routes`` mean exactly what they
+    mean in :func:`_run_eval_hermetic` — see its docstring for why the builder
+    is replaced unconditionally.
     """
     from orchestrator.evals import eval_gate, runner
 
@@ -674,9 +786,11 @@ async def _run_end_to_end_hermetic(
     fake_wf.run = AsyncMock(
         return_value=SimpleNamespace(outcome=outcome), side_effect=run_side_effect,
     )
+    fake_wf.metrics.dispatched_routes = dispatched_routes
 
     def fake_build_workflow(**kwargs):
         captured['build_workflow'] = kwargs
+        fake_wf.config = kwargs['config']
         return fake_wf
 
     mock_collect = _fake_collect_metrics(collect_side_effect)
@@ -943,6 +1057,45 @@ class TestWorkflowCellContract:
         assert result.run_id == run_id
         assert result.worktree_path == str(worktree)
         assert result.wall_clock_ms >= 0
+
+    async def test_a_failed_collection_still_records_the_dispatched_models(
+        self, drive, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        decision = RoutingDecision(
+            model='sonnet', effort='max', budget_usd=10.0, max_turns=120,
+            source_layer='config', rule_id=None,
+        )
+        route = DispatchedRoute('implementer', decision, 'claude-sonnet-5-5')
+
+        result, _captured = await drive(
+            tmp_path, monkeypatch, dispatched_routes=[route],
+            collect_side_effect=RuntimeError('x'),
+        )
+
+        assert result.metrics['dispatched_models'] == {'implementer': [{
+            'model': 'sonnet', 'served_model_id': 'claude-sonnet-5-5',
+            'source_layer': 'config', 'rule_id': None,
+            'configured_model': 'sonnet', 'rejected': [],
+        }]}
+
+    async def test_an_unreadable_dispatch_record_still_saves_the_failed_cell(
+        self, drive, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        result, captured = await drive(
+            tmp_path, monkeypatch, dispatched_routes=_UnreadableRoutes(),
+            collect_side_effect=RuntimeError('x'),
+        )
+
+        assert captured['save'].call_args.args[0] is result
+        assert result.metrics['dispatched_models'] is None
+        assert 'role_under_test' in result.metrics
+
+
+class _UnreadableRoutes:
+    """A dispatched-route record that raises when read."""
+
+    def __iter__(self) -> Iterator[DispatchedRoute]:
+        raise RuntimeError('unreadable')
 
 
 @pytest.mark.asyncio
@@ -1769,7 +1922,7 @@ class TestBuildEvalOrchConfigAutoSeedsProxiedPrices:
             model=cfg.models.implementer,
             prices=cfg.prices,
             cli_cost_usd=999.0,           # deliberately wrong CLI figure —
-            is_local_model=True,          # must be IGNORED once price_table hits
+            cli_cost_untrusted=True,          # must be IGNORED once price_table hits
         )
         assert source == 'price_table'
         assert cost != 999.0

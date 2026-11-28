@@ -168,10 +168,19 @@ MERGE_PATH_CONFIG_READS: Mapping[str, Classified] = MappingProxyType({
     ),
     'verify_cache': Classified(
         Fidelity.MERGE_NEUTRAL,
-        "Task 5653: the host's verify-result cache mode. A run joins the cache only through a "
-        'CacheAccess its caller passes, and the remote leg reaches it only as CacheAccess.on_runner(), '
-        'whose missing registry makes every unit UNAVAILABLE, so every leg still runs. The mode also '
-        'stamps the off-wire VerifyResult.cache_record, which never reaches the verdict.',
+        "Tasks 5653 and 9123: the host's verify-result cache mode never decides the verdict. A "
+        "shipped view's mode replaces the host's for the merge role (_spec_field_overrides), and "
+        'without a view CacheAccess.on_runner() holds no registry, so every unit is UNAVAILABLE '
+        'and every leg runs. The dispatcher backs every replay the runner reports before it counts. '
+        "A module's verify_cache rides VerifyCommand (task 9123), so a runner never replays or admits "
+        'a never-cache module, and RemoteCache.settle refuses its replays and greens again on the dispatcher.',
+    ),
+    'defect_tests': Classified(
+        Fidelity.MERGE_NEUTRAL,
+        "Task 7045: read only as injects_plugin, which decides whether the test leg gets the observe-only "
+        '-p _df_defect_plugin and its PYTHONPATH entry. The plugin registers markers and writes sidecar '
+        'maps; its makereport hookwrapper never replaces a result. A host that skips it can only fail a '
+        'strict-marker project closed. The I5 gates the mode also governs are not on the merge path.',
     ),
     'verify_admission_background_promote_secs': Classified(Fidelity.MERGE_NEUTRAL, _ADMISSION),
     'verify_admission_enabled': Classified(Fidelity.MERGE_NEUTRAL, _ADMISSION),

@@ -67,6 +67,8 @@ class _Rig:
     overrides: OverrideStore
     live_status: dict[str, str]
     status_faults: list[Exception]
+    # Seconds both clocks advance after each task read: the phases that delay the watchdog.
+    read_lag: list[float]
     live_holders: set[str] = field(default_factory=set)
     _low_seq: list[int] = field(default_factory=lambda: [1000])
 
@@ -76,6 +78,10 @@ class _Rig:
 
     def set_tasks(self, tasks: list[dict]) -> None:
         self.tasks[:] = tasks
+
+    def slow_ticks_past_the_claimant_ttl(self) -> None:
+        """From now on the watchdog runs a claimant TTL and a second after each task read."""
+        self.read_lag[0] = self.scheduler.config.claimant_liveness_ttl_secs + 1
 
     def fresh_low(self, **metadata: Any) -> dict:
         self._low_seq[0] += 1
@@ -174,6 +180,7 @@ def _rig(
     config.fairness.skip_threshold = 9999
     wall = wall if wall is not None else [T0]
     mono = [0.0]
+    read_lag = [0.0]
     warn, resolve = AsyncMock(), AsyncMock()
     task_list: list[dict] = tasks if tasks is not None else []
     events_db = tmp_path / 'runs.db'
@@ -192,7 +199,10 @@ def _rig(
 
     async def get_tasks(*, statuses: Any = None, **_: Any) -> list[dict]:
         wanted = None if statuses is None else set(statuses)
-        return [dict(t) for t in task_list if wanted is None or t['status'] in wanted]
+        snapshot = [dict(t) for t in task_list if wanted is None or t['status'] in wanted]
+        wall[0] += timedelta(seconds=read_lag[0])
+        mono[0] += read_lag[0]
+        return snapshot
 
     live_status: dict[str, str] = {}
     status_faults: list[Exception] = []
@@ -214,7 +224,7 @@ def _rig(
     scheduler.finish_startup()
     return _Rig(
         scheduler, task_list, wall, mono, warn, resolve, events_db, overrides,
-        live_status, status_faults,
+        live_status, status_faults, read_lag,
     )
 
 
@@ -1076,12 +1086,33 @@ async def test_a_live_holder_caps_the_cohort_without_an_l1(tmp_path: Path) -> No
 
 
 @pytest.mark.asyncio
-async def test_a_holder_that_stops_heartbeating_files_one_cap_l1(tmp_path: Path) -> None:
+async def test_a_heartbeating_holder_reads_live_however_long_the_tick_runs_after_its_task_read(
+    tmp_path: Path,
+) -> None:
     rig = _rig(tmp_path, **CAP_OF_TWO)
     rig.live_holders.add('0')
     queue = await _three_starve_behind_a_cap_of_two(rig)
     assert queue.get_by_task(AUTO_PIN_CAP_SENTINEL) == []
 
+    rig.slow_ticks_past_the_claimant_ttl()
+    await rig.tick_with_low_winner()
+    await rig.tick_with_low_winner()
+
+    assert queue.get_by_task(AUTO_PIN_CAP_SENTINEL) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('slow_ticks', [False, True], ids=['prompt-ticks', 'slow-ticks'])
+async def test_a_holder_that_stops_heartbeating_files_one_cap_l1(
+    tmp_path: Path, slow_ticks: bool,
+) -> None:
+    rig = _rig(tmp_path, **CAP_OF_TWO)
+    rig.live_holders.add('0')
+    queue = await _three_starve_behind_a_cap_of_two(rig)
+    assert queue.get_by_task(AUTO_PIN_CAP_SENTINEL) == []
+
+    if slow_ticks:
+        rig.slow_ticks_past_the_claimant_ttl()
     rig.live_holders.discard('0')
     rig.advance(rig.scheduler.config.claimant_liveness_ttl_secs + 1)
     await rig.tick_with_low_winner()

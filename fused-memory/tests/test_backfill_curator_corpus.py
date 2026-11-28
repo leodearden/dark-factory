@@ -2,18 +2,29 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
+import logging
+import re
 import uuid
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
-from _curator_helpers import curator_double
+from _curator_helpers import curator_double, in_memory_corpus_curator, make_config
+from qdrant_client import AsyncQdrantClient
+from qdrant_client.http.exceptions import UnexpectedResponse
+from qdrant_client.models import PointsList, UpdateResult
 
 from fused_memory.config.schema import CuratorConfig, FusedMemoryConfig
 from fused_memory.middleware.curator_types import DEFAULT_PRIORITY
 from fused_memory.middleware.task_curator import (
     _PRIORITY_RANK,
+    BACKFILL_DEFAULT_CONCURRENCY,
+    BACKFILL_MAX_CONSECUTIVE_FAILED_BATCHES,
+    BACKFILL_UPSERT_ATTEMPTS,
+    BACKFILL_UPSERT_BATCH_SIZE,
     BackfillResult,
     TaskCurator,
 )
@@ -46,6 +57,102 @@ def _make_task(
 
 def _expected_point_id(project_id: str, task_id: str) -> str:
     return str(uuid.uuid5(uuid.NAMESPACE_URL, f'{project_id}/{task_id}'))
+
+
+QDRANT_DEFAULT_MAX_REQUEST_BYTES = 32 * 2**20
+"""Qdrant's default ``service.max_request_size_mb``, in bytes."""
+
+_CURATOR_LOGGER = 'fused_memory.middleware.task_curator'
+
+
+class RecordingQdrant(AsyncQdrantClient):
+    """An in-memory Qdrant that records each upsert's point count and refuses some upserts.
+
+    An upsert is refused with the 400 Qdrant answers to an oversized body when
+    its serialised body exceeds *max_request_bytes*, or when its 0-based call
+    index is in *fail_calls*. A refused upsert writes nothing.
+    """
+
+    def __init__(
+        self,
+        *,
+        max_request_bytes: int | None = None,
+        fail_calls: frozenset[int] = frozenset(),
+    ) -> None:
+        super().__init__(location=':memory:')
+        self._max_request_bytes = max_request_bytes
+        self._fail_calls = fail_calls
+        self.upsert_sizes: list[int] = []
+
+    async def upsert(
+        self, collection_name: str, points: Any, *args: Any, **kwargs: Any,
+    ) -> UpdateResult:
+        call_index = len(self.upsert_sizes)
+        point_list = list(points)
+        self.upsert_sizes.append(len(point_list))
+        body_bytes = len(PointsList(points=point_list).model_dump_json())
+        oversized = self._max_request_bytes is not None and body_bytes > self._max_request_bytes
+        if oversized or call_index in self._fail_calls:
+            raise UnexpectedResponse(
+                status_code=400,
+                reason_phrase='Bad Request',
+                content=f'JSON payload ({body_bytes} bytes) refused'.encode(),
+                headers=httpx.Headers(),
+            )
+        return await super().upsert(collection_name, point_list, *args, **kwargs)
+
+
+class RecordingEmbedder:
+    """A corpus embedder that counts its calls and the most calls it ever had in flight.
+
+    Each call yields to the event loop once while in flight, so concurrent
+    calls overlap with no wall-clock wait. A text containing *fail_marker*
+    raises. A text containing *abort_marker* raises ``asyncio.CancelledError``,
+    as an operator's Ctrl-C under ``asyncio.run`` does. Every component has a
+    worst-case-length float repr, so a point serialises as large as a real
+    embedding's can.
+    """
+
+    def __init__(
+        self, *, fail_marker: str | None = None, abort_marker: str | None = None,
+    ) -> None:
+        self._vector = [-0.0123456789012345] * make_config().embedder.dimensions
+        self._fail_marker = fail_marker
+        self._abort_marker = abort_marker
+        self.calls = 0
+        self.in_flight = 0
+        self.peak = 0
+
+    async def create(self, input_data: str) -> list[float]:
+        self.calls += 1
+        self.in_flight += 1
+        self.peak = max(self.peak, self.in_flight)
+        try:
+            await asyncio.sleep(0)
+            if self._abort_marker is not None and self._abort_marker in input_data:
+                raise asyncio.CancelledError(f'run interrupted at {self._abort_marker!r}')
+            if self._fail_marker is not None and self._fail_marker in input_data:
+                raise RuntimeError(f'embedder refused a text containing {self._fail_marker!r}')
+            return self._vector
+        finally:
+            self.in_flight -= 1
+
+
+def _every_attempt_from(first_call: int) -> frozenset[int]:
+    """The upsert call indices of every attempt at a batch first tried as call *first_call*."""
+    return frozenset(range(first_call, first_call + BACKFILL_UPSERT_ATTEMPTS))
+
+
+def _titled_tasks(count: int, *, title_chars: int = 20, description_chars: int = 20) -> list[dict]:
+    """*count* titled tasks with distinct ids and padded title and description texts."""
+    return [
+        _make_task(
+            str(i),
+            title=f'Task {i} '.ljust(title_chars, 't'),
+            description=f'Description {i} '.ljust(description_chars, 'd'),
+        )
+        for i in range(count)
+    ]
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -222,6 +329,213 @@ class TestBackfillEdgeCases:
         assert result.errors == 1
         assert result.upserted == 2
         assert result.skipped == 0
+
+
+class TestBackfillBatching:
+    @pytest.mark.asyncio
+    async def test_project_over_qdrant_request_limit_lands_in_bounded_batches(self):
+        """1,200 worst-case points are about 36.8 MiB as one body, over Qdrant's 32 MiB limit."""
+        qdrant = RecordingQdrant(max_request_bytes=QDRANT_DEFAULT_MAX_REQUEST_BYTES)
+        curator = in_memory_corpus_curator(RecordingEmbedder(), qdrant_client=qdrant)
+        tasks = _titled_tasks(1200, title_chars=200, description_chars=1000)
+        try:
+            result = await curator.backfill_corpus(tasks, 'proj')
+
+            assert result == BackfillResult(upserted=1200, skipped=0, errors=0)
+            assert await curator.corpus_count('proj') == 1200
+            assert len(qdrant.upsert_sizes) > 1
+            assert max(qdrant.upsert_sizes) <= BACKFILL_UPSERT_BATCH_SIZE
+        finally:
+            await curator.close()
+
+    @staticmethod
+    async def _backfill_batched(
+        tasks: list[dict],
+        embedder: RecordingEmbedder,
+        qdrant: RecordingQdrant,
+        *,
+        batch_size: int = 3,
+    ) -> tuple[BackfillResult, int]:
+        """Backfill *tasks* over *qdrant*, *batch_size* points a batch.
+
+        Returns the result and the persisted corpus count.
+        """
+        curator = in_memory_corpus_curator(embedder, qdrant_client=qdrant)
+        try:
+            result = await curator.backfill_corpus(tasks, 'proj', batch_size=batch_size)
+            return result, await curator.corpus_count('proj')
+        finally:
+            await curator.close()
+
+    @pytest.mark.asyncio
+    async def test_refused_middle_batch_costs_only_its_own_points(self):
+        embedder = RecordingEmbedder()
+        qdrant = RecordingQdrant(fail_calls=_every_attempt_from(1))
+        result, persisted = await self._backfill_batched(_titled_tasks(7), embedder, qdrant)
+
+        assert result == BackfillResult(upserted=4, skipped=0, errors=3)
+        assert persisted == 4
+        assert qdrant.upsert_sizes == [3, *[3] * BACKFILL_UPSERT_ATTEMPTS, 1]
+        assert embedder.calls == 7
+
+    @pytest.mark.asyncio
+    async def test_transient_upsert_failure_is_retried_without_re_embedding(self):
+        embedder = RecordingEmbedder()
+        qdrant = RecordingQdrant(fail_calls=frozenset({1}))
+        result, persisted = await self._backfill_batched(_titled_tasks(7), embedder, qdrant)
+
+        assert result == BackfillResult(upserted=7, skipped=0, errors=0)
+        assert persisted == 7
+        assert qdrant.upsert_sizes == [3, 3, 3, 1]
+        assert embedder.calls == 7
+
+    @staticmethod
+    def _failed_batches_then_two_more() -> list[dict]:
+        """Enough 3-task batches to reach the stop threshold, then two batches more."""
+        return _titled_tasks(3 * (BACKFILL_MAX_CONSECUTIVE_FAILED_BATCHES + 2))
+
+    @pytest.mark.asyncio
+    async def test_systemic_upsert_refusal_stops_the_run_unembedded(self, caplog):
+        tasks = self._failed_batches_then_two_more()
+        embedder = RecordingEmbedder()
+        qdrant = RecordingQdrant(max_request_bytes=0)
+        with caplog.at_level(logging.ERROR, logger=_CURATOR_LOGGER):
+            result, persisted = await self._backfill_batched(tasks, embedder, qdrant)
+
+        failed_batches = BACKFILL_MAX_CONSECUTIVE_FAILED_BATCHES
+        attempted = 3 * failed_batches
+        assert result == BackfillResult(upserted=0, skipped=0, errors=len(tasks))
+        assert persisted == 0
+        assert embedder.calls == attempted
+        assert qdrant.upsert_sizes == [3] * (failed_batches * BACKFILL_UPSERT_ATTEMPTS)
+        errors = [
+            record for record in caplog.records
+            if record.name == _CURATOR_LOGGER and record.levelno == logging.ERROR
+        ]
+        assert len(errors) == 1
+        message = errors[0].getMessage()
+        assert 'project=proj' in message
+        assert 'stopped' in message
+        assert f'{len(tasks) - attempted} tasks not attempted' in message
+
+    @pytest.mark.asyncio
+    async def test_embedder_outage_stops_the_run_too(self):
+        tasks = self._failed_batches_then_two_more()
+        embedder = RecordingEmbedder(fail_marker='Task')
+        qdrant = RecordingQdrant()
+        result, persisted = await self._backfill_batched(tasks, embedder, qdrant)
+
+        assert result == BackfillResult(upserted=0, skipped=0, errors=len(tasks))
+        assert persisted == 0
+        assert embedder.calls == 3 * BACKFILL_MAX_CONSECUTIVE_FAILED_BATCHES
+        assert qdrant.upsert_sizes == []
+
+    @pytest.mark.asyncio
+    async def test_failed_batches_short_of_the_threshold_in_a_row_do_not_stop_the_run(self):
+        run = [*['failing'] * (BACKFILL_MAX_CONSECUTIVE_FAILED_BATCHES - 1), 'landing']
+        tasks = [
+            _make_task(str(i), title=f'{kind.upper()} task {i}')
+            for i, kind in enumerate(run * 2)
+        ]
+        embedder = RecordingEmbedder(fail_marker='FAILING')
+        result, persisted = await self._backfill_batched(
+            tasks, embedder, RecordingQdrant(), batch_size=1,
+        )
+
+        assert result == BackfillResult(upserted=2, skipped=0, errors=len(tasks) - 2)
+        assert persisted == 2
+        assert embedder.calls == len(tasks)
+
+    @pytest.mark.asyncio
+    async def test_run_interrupted_in_the_last_batch_keeps_the_batches_before_it(self):
+        tasks = [*_titled_tasks(6), _make_task('abort', title='ABORT-RUN task')]
+        qdrant = RecordingQdrant()
+        curator = in_memory_corpus_curator(
+            RecordingEmbedder(abort_marker='ABORT-RUN'), qdrant_client=qdrant,
+        )
+        try:
+            with pytest.raises(asyncio.CancelledError):
+                await curator.backfill_corpus(tasks, 'proj', batch_size=3)
+
+            assert await curator.corpus_count('proj') == 6
+            assert qdrant.upsert_sizes == [3, 3]
+        finally:
+            await curator.close()
+
+    @pytest.mark.asyncio
+    async def test_batch_failure_counts_compose_with_skips_and_embed_failures(self):
+        tasks = [
+            _make_task('untitled', title=''),
+            _make_task('refused', title='EMBED-REFUSED task'),
+            *_titled_tasks(5),
+        ]
+        qdrant = RecordingQdrant(fail_calls=_every_attempt_from(0))
+        result, persisted = await self._backfill_batched(
+            tasks, RecordingEmbedder(fail_marker='EMBED-REFUSED'), qdrant,
+        )
+
+        assert result.skipped == 1
+        assert result.upserted + result.errors == 6
+        assert result.errors == 1 + qdrant.upsert_sizes[0]
+        assert persisted == result.upserted
+
+    @pytest.mark.asyncio
+    async def test_refused_batch_logs_one_warning_naming_it(self, caplog):
+        with caplog.at_level(logging.WARNING, logger=_CURATOR_LOGGER):
+            await self._backfill_batched(
+                _titled_tasks(7), RecordingEmbedder(),
+                RecordingQdrant(fail_calls=_every_attempt_from(1)),
+            )
+
+        warnings = [
+            record for record in caplog.records
+            if record.name == _CURATOR_LOGGER and record.levelno == logging.WARNING
+        ]
+        assert len(warnings) == 1
+        message = warnings[0].getMessage()
+        assert 'project=proj' in message
+        assert 'batch 2/3' in message
+        assert '3 points' in message
+        assert warnings[0].exc_info is not None
+
+
+class TestBackfillConcurrency:
+    @staticmethod
+    async def _backfill(
+        embedder: RecordingEmbedder, tasks: list[dict], **knobs: int,
+    ) -> BackfillResult:
+        curator = in_memory_corpus_curator(embedder)
+        try:
+            return await curator.backfill_corpus(tasks, 'proj', **knobs)
+        finally:
+            await curator.close()
+
+    @pytest.mark.asyncio
+    async def test_peak_in_flight_embeds_equal_the_concurrency(self):
+        embedder = RecordingEmbedder()
+        result = await self._backfill(embedder, _titled_tasks(10), concurrency=3)
+
+        assert embedder.peak == 3
+        assert result.upserted == 10
+
+    @pytest.mark.asyncio
+    async def test_default_concurrency_is_ten(self):
+        embedder = RecordingEmbedder()
+        await self._backfill(embedder, _titled_tasks(12))
+
+        assert BACKFILL_DEFAULT_CONCURRENCY == 10
+        assert embedder.peak == BACKFILL_DEFAULT_CONCURRENCY
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('knob', 'value'), [('concurrency', 0), ('concurrency', -1), ('batch_size', 0)],
+    )
+    async def test_non_positive_knob_is_refused_before_any_embed(self, knob: str, value: int):
+        embedder = RecordingEmbedder()
+        with pytest.raises(ValueError, match=f'{knob}.*{re.escape(str(value))}'):
+            await self._backfill(embedder, _titled_tasks(3), **{knob: value})
+
+        assert embedder.calls == 0
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -522,6 +836,27 @@ class TestBackfillPointIdConsistency:
         )
 
 
+class TestBackfillManager:
+    @pytest.mark.asyncio
+    async def test_backfill_carries_concurrency_to_the_curator(self):
+        from fused_memory.maintenance.backfill_curator_corpus import BackfillManager
+
+        taskmaster = AsyncMock()
+        taskmaster.get_tasks = AsyncMock(return_value={'tasks': _titled_tasks(8)})
+        embedder = RecordingEmbedder()
+        curator = in_memory_corpus_curator(embedder)
+        manager = BackfillManager(config=make_config(), taskmaster=taskmaster, curator=curator)
+        try:
+            report = await manager.backfill('/fake/proj', concurrency=2)
+
+            assert embedder.peak == 2
+            assert report.upserted == 8
+            assert report.errors == 0
+            assert await curator.corpus_count(report.project_id) == 8
+        finally:
+            await curator.close()
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Step 8: run_backfill() orchestration
 # ──────────────────────────────────────────────────────────────────────────────
@@ -611,6 +946,21 @@ class TestRunBackfill:
         assert result.upserted == 3
 
     @pytest.mark.asyncio
+    async def test_run_backfill_passes_concurrency_to_curator(self):
+        from fused_memory.maintenance.backfill_curator_corpus import run_backfill
+
+        with self._run_backfill_context() as (mock_curator, mock_tm_cls):
+            mock_curator.backfill_corpus = AsyncMock(return_value=BackfillResult(upserted=1))
+            mock_tm_instance = AsyncMock()
+            mock_tm_instance.get_tasks = AsyncMock(return_value={'tasks': _titled_tasks(1)})
+            mock_tm_cls.return_value = mock_tm_instance
+
+            await run_backfill(config_path=None, project_root='/fake/project', concurrency=4)
+
+        mock_curator.backfill_corpus.assert_awaited_once()
+        assert mock_curator.backfill_corpus.call_args.kwargs['concurrency'] == 4
+
+    @pytest.mark.asyncio
     async def test_run_backfill_closes_curator(self):
         """run_backfill() calls curator.close() after a successful backfill."""
         from fused_memory.maintenance.backfill_curator_corpus import run_backfill
@@ -655,6 +1005,62 @@ class TestRunBackfill:
                 await run_backfill(config_path=None, project_root=project_root)
 
         mock_curator.close.assert_awaited_once()
+
+
+class TestBackfillCli:
+    def test_concurrency_defaults_to_the_curator_default(self):
+        from fused_memory.maintenance.backfill_curator_corpus import build_parser
+
+        args = build_parser().parse_args(['--project-root', '/x'])
+
+        assert args.concurrency == BACKFILL_DEFAULT_CONCURRENCY
+
+    def test_concurrency_is_parsed_as_an_int(self):
+        from fused_memory.maintenance.backfill_curator_corpus import build_parser
+
+        args = build_parser().parse_args(['--project-root', '/x', '--concurrency', '4'])
+
+        assert args.concurrency == 4
+
+    @pytest.mark.parametrize('text', ['0', '-1', 'abc'])
+    def test_non_positive_or_non_int_concurrency_is_a_usage_error(self, text: str, capsys):
+        from fused_memory.maintenance.backfill_curator_corpus import build_parser
+
+        with pytest.raises(SystemExit) as exit_info:
+            build_parser().parse_args(['--project-root', '/x', '--concurrency', text])
+
+        assert exit_info.value.code == 2
+        assert '--concurrency' in capsys.readouterr().err
+
+    def test_main_runs_the_backfill_with_the_parsed_concurrency(self, monkeypatch, capsys):
+        from fused_memory.maintenance import backfill_curator_corpus
+
+        received: list[dict[str, Any]] = []
+
+        async def fake_run_backfill(**kwargs: Any) -> BackfillResult:
+            received.append(kwargs)
+            return BackfillResult(upserted=5, skipped=1, errors=0)
+
+        monkeypatch.setattr(backfill_curator_corpus, 'run_backfill', fake_run_backfill)
+
+        status = backfill_curator_corpus.main(['--project-root', '/x', '--concurrency', '3'])
+
+        assert status == 0
+        assert received == [{'config_path': None, 'project_root': '/x', 'concurrency': 3}]
+        assert 'Backfill complete: upserted=5 skipped=1 errors=0' in capsys.readouterr().out
+
+    def test_main_exits_non_zero_when_any_task_failed_to_land(self, monkeypatch, capsys):
+        from fused_memory.maintenance import backfill_curator_corpus
+
+        async def fake_run_backfill(**kwargs: Any) -> BackfillResult:
+            return BackfillResult(upserted=5, skipped=0, errors=1)
+
+        monkeypatch.setattr(backfill_curator_corpus, 'run_backfill', fake_run_backfill)
+
+        status = backfill_curator_corpus.main(['--project-root', '/x'])
+
+        assert status == 1
+        assert 'errors=1' in capsys.readouterr().out
 
 
 # ──────────────────────────────────────────────────────────────────────────────

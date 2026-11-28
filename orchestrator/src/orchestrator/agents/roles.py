@@ -1,9 +1,13 @@
 """Agent role definitions — system prompts and tool configurations per stage."""
 
 import textwrap
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
-from typing import Literal
+from enum import StrEnum
+from types import MappingProxyType
+from typing import Literal, TypeVar
 
+from shared.defects import IssueKind, RulingSubject
 from shared.followup_items import (
     FOLLOWUP_ITEMS_METADATA_KEY,
     FOLLOWUP_ITEMS_REFUSED_ERROR,
@@ -32,6 +36,7 @@ from orchestrator.agents.harness_guidance import (
     GREP_LOOKAROUND_GUIDANCE_READ_ONLY,
     TOOL_CALL_REJECTION_GUIDANCE,
 )
+from orchestrator.agents.lane_task_guidance import LANE_TASK_LINKS_SECTION
 from orchestrator.agents.merge_conflict_guidance import STEWARD_MERGE_CONFLICT_RULE
 from orchestrator.agents.path_not_found_guidance import PATH_NOT_FOUND_GUIDANCE
 from orchestrator.agents.review_briefing import ReviewBriefing
@@ -44,9 +49,7 @@ from orchestrator.review_issue_contract import IssueSeverity
 # referenced fused-memory/escalation/plan-tools tools, but the _invoke()-level
 # gate tuples forgot to list it, so its sessions were told to call tools that
 # did not exist and the Lever-C fast-path silently always fell through to the
-# architect).  jcodemunch tools intentionally have no prefix entry here — they
-# ride inside the 'orchestrator' MCP config but are not themselves a trigger
-# for requiring a family.
+# architect).
 _FAMILY_TOOL_PREFIXES: dict[str, tuple[str, ...]] = {
     'orchestrator': ('mcp__fused-memory__', 'mcp__escalation__'),
     'plan_tools': ('mcp__plan-tools__',),
@@ -87,22 +90,28 @@ class AgentRole:
     prompt_harness_version: str | None = None
 
     @property
-    def strict_mcp_scope(self) -> bool:
-        """Whether this role's whole MCP surface is its declared families.
-
-        True when it declares a family, none is 'orchestrator', and every
-        mcp__ grant falls under a declared family's prefix.
-        """
-        if not self.mcp_families or 'orchestrator' in self.mcp_families:
-            return False
+    def mcp_grants_outside_families(self) -> tuple[str, ...]:
+        """The mcp__ grants in allowed_tools that no declared family's prefix
+        covers, in allowed_tools order: tools only an ambient server can serve."""
         declared_prefixes = tuple(
             prefix for family in self.mcp_families for prefix in _FAMILY_TOOL_PREFIXES[family]
         )
-        return all(
-            tool.startswith(declared_prefixes)
+        return tuple(
+            tool
             for tool in self.allowed_tools
-            if tool.startswith('mcp__')
+            if tool.startswith('mcp__') and not tool.startswith(declared_prefixes)
         )
+
+    @property
+    def strict_mcp_scope(self) -> bool:
+        """Whether this role's whole MCP surface is its declared families.
+
+        True when it declares a family, none is 'orchestrator', and it has no
+        mcp__ grant outside its declared families.
+        """
+        if not self.mcp_families or 'orchestrator' in self.mcp_families:
+            return False
+        return not self.mcp_grants_outside_families
 
     @property
     def plan_tools_grants(self) -> frozenset[str]:
@@ -120,10 +129,7 @@ class AgentRole:
         family, that family MUST be declared in mcp_families, or the role's
         sessions would be instructed (via system_prompt/allowed_tools) to
         call tools that are never actually wired in by _invoke(). The
-        reverse is fine — a role may declare a family with no matching tool
-        (e.g. judge declares 'orchestrator' purely to get an MCP config for
-        its jcodemunch tools, with no fused-memory/escalation tool in its
-        allowed_tools).
+        reverse is fine — a role may declare a family with no matching tool.
 
         Also guards the mcp_families Literal against drifting out of sync
         with _FAMILY_TOOL_PREFIXES: a family with no prefix-mapping entry
@@ -161,9 +167,6 @@ class AgentRole:
 
 # --- Tools offered to analysis roles (advisory under bypassPermissions; not read-only) ---
 _ANALYSIS_TOOLS = ['Read', 'Glob', 'Grep', 'Bash(git:*)']
-
-# --- jCodeMunch tools for structured code retrieval ---
-_JCODEMUNCH_TOOLS = ['mcp__jcodemunch__*']
 
 # --- Escalation tools available to roles that can escalate ---
 ESCALATE_INFO_TOOL = 'mcp__escalation__escalate_info'
@@ -345,6 +348,34 @@ INFO_ONLY_ESCALATION_INSTRUCTIONS = _ESCALATION_SECTION_OPENING + """
 You hold `escalate_info` only, so nothing you file blocks work or waits on a decision.
 """ + _ESCALATION_CATEGORIES + ESCALATE_INFO_CONTRACT + _OBSERVATIONS_VS_HYPOTHESES
 
+# Rationale: plans/defect-tests-prd.md decision 17; the skills/ and CONTRIBUTING.md excerpts are mirrored by tests/scripts/test_defect_rule_mirror.py.
+DEFECT_TEST_RULE = """
+## Fixing a defect
+
+A defect is wrong runtime behaviour. A defect fix starts from a test that fails
+without the fix and passes with it: write that test first and watch it fail.
+In a pytest project, when the defect is declared, mark that test
+`@pytest.mark.defect("<ref>")` with the defect's ref. A test carrying
+`@pytest.mark.defect` is a defect's reproducing test.
+
+Never weaken a failing test (loosen or delete an assertion, skip it, mark it
+xfail, or delete the test) without stating in the commit message why the test,
+not the code, was wrong.
+"""
+
+
+def splice_defect_test_rule(prompt: str, rule: str) -> str:
+    """The one splice site of the defect-test rule: immediately before the prompt's escalation section."""
+    count = prompt.count(ESCALATION_LADDER_CORE)
+    if count != 1:
+        raise ValueError(
+            f'splice_defect_test_rule needs exactly one ESCALATION_LADDER_CORE in '
+            f'the prompt to anchor on; found {count}'
+        )
+    before, anchor, after = prompt.partition(ESCALATION_LADDER_CORE)
+    return before + rule + anchor + after
+
+
 _MEMORY_TOOLS = [
     'mcp__fused-memory__add_memory',
     'mcp__fused-memory__search',
@@ -363,8 +394,7 @@ _NO_TASK_STATUS_WRITE = ['mcp__fused-memory__set_task_status']
 # The server registers exactly one submit_* tool per --verdict-role
 # invocation (judge -> submit_completion_verdict, merger ->
 # submit_merge_disposition, else -> submit_review_verdict), so the
-# full-server wildcard grants precisely that one tool — same idiom as
-# _JCODEMUNCH_TOOLS above.
+# full-server wildcard grants precisely that one tool.
 _VERDICT_TOOLS = ['mcp__verdict-tools__*']
 
 _PLAN_CREATOR_TOOLS = [
@@ -647,17 +677,13 @@ MANDATED_STAGING_COMMAND = 'git add -- .'
 
 # The opening of every "## CRITICAL: Git Staging Rules" section below, spliced
 # like SCOPE_BOUNDARY_GUIDANCE. Each role follows it with only its own code
-# block of correct staging commands.
+# block of correct staging commands, and precedes that section with
+# LANE_TASK_LINKS_SECTION, the links this opening refers back to.
 _TASK_DIR_NEVER_COMMITTED = """\
-`.task/` inside this worktree is orchestrator state: the `.task/plan.json` and
-`.task/iterations.jsonl` links into durable task storage that survives
-worktree resets, plus the Claude config dir. Those links are the only task
-state exposed here: `metadata.json` and the `reviews/` and `verdicts/`
-directories stay in orchestrator storage outside this worktree, so a read of
-them under `.task/` fails by design — the task details you need are in your
-briefing. `.task/` must NEVER be committed. It is gitignored at the repo root,
-so an ordinary staging command already excludes it — no exclusion pathspec is
-needed. Never force-add `.task/` (`git add -f .task/...`). As a backstop, a
+`.task/` inside this worktree is orchestrator state: the two links described
+under "The .task/ links", plus the Claude config dir. `.task/` must NEVER be
+committed. It is gitignored at the repo root, so an ordinary staging command
+already excludes it — no exclusion pathspec is needed. Never force-add `.task/` (`git add -f .task/...`). As a backstop, a
 pre-commit hook silently strips any `.task/` path that still ends up staged —
 but that is defense-in-depth, not the only guard.
 
@@ -934,9 +960,8 @@ Build the plan using the plan-tools MCP tools. Do NOT write plan.json directly.
 """
 
 
-ARCHITECT = AgentRole(
-    name='architect',
-    system_prompt="""\
+def _architect_system_prompt(defect_test_rule: str) -> str:
+    return splice_defect_test_rule("""\
 You are a TDD architect. Your job is to analyze a task and produce a detailed, structured implementation plan.
 """ + BASH_CAPABLE_ROLE_PREAMBLE + ARCHITECT_PLAN_TOOLS_RECIPE + """
 ## Rules
@@ -944,7 +969,7 @@ You are a TDD architect. Your job is to analyze a task and produce a detailed, s
 1. **Read before planning.** Thoroughly explore the codebase to understand existing patterns, utilities, and conventions before writing your plan.
 2. **Verify premises before planning.** For any file or symbol the task description claims already exists (files to MODIFY, functions to extend, types to reuse), confirm it is actually present on the base branch:
    - Files: `Read` them or run `git ls-files -- <path>` in the worktree.
-   - Symbols/functions: use `mcp__jcodemunch__search_symbols` or grep.
+   - Symbols/functions: use `Grep`, or `git grep` through `Bash`.
    - Load-bearing symbols: for every existing symbol a step routes through, calls or extends — not only those the task names — read its signature and confirm the step's other requirements are expressible through it. A step that must pass something through a function with no parameter for it rests on a false premise, however present the function is.
 
    Based on what you find, choose ONE of the following exits. Do NOT call `create_plan` if any of the rejection paths apply.
@@ -1019,8 +1044,13 @@ Then stop.  The orchestrator files a level-1 design_concern escalation; the auto
 - Prerequisites (setup tasks) MUST be dicts — NOT a plain string. Each prerequisite must be a dict with `id`, `description`, and `status` fields.
 - You MUST use the plan-tools MCP tools — do not write .task/plan.json directly.
 - If the task requires touching files beyond what was originally specified, list ALL needed files in the `files` parameter.
-""" + CODE_QUALITY_GUIDANCE + ARCHITECT_CODE_QUALITY_ADDENDUM + _ESCALATION_INSTRUCTIONS + _MEMORY_INSTRUCTIONS,
-    allowed_tools=['Read', 'Glob', 'Grep', 'Bash', *_ESCALATION_TOOLS, *_MEMORY_TOOLS, 'mcp__fused-memory__submit_task', *_JCODEMUNCH_TOOLS, *_PLAN_CREATOR_TOOLS],
+""" + LANE_TASK_LINKS_SECTION + CODE_QUALITY_GUIDANCE + ARCHITECT_CODE_QUALITY_ADDENDUM + _ESCALATION_INSTRUCTIONS + _MEMORY_INSTRUCTIONS, defect_test_rule)
+
+
+ARCHITECT = AgentRole(
+    name='architect',
+    system_prompt=_architect_system_prompt(DEFECT_TEST_RULE),
+    allowed_tools=['Read', 'Glob', 'Grep', 'Bash', *_ESCALATION_TOOLS, *_MEMORY_TOOLS, 'mcp__fused-memory__submit_task', *_PLAN_CREATOR_TOOLS],
     disallowed_tools=['Edit', 'Write', *_NO_TASK_STATUS_WRITE],
     default_model='opus',
     default_budget=5.0,
@@ -1033,9 +1063,8 @@ Then stop.  The orchestrator files a level-1 design_concern escalation; the auto
 IMPLEMENTER_DEVIATION_DOCTRINE = render_deviation_doctrine(_RECORD_STEP_DEVIATION)
 
 
-IMPLEMENTER = AgentRole(
-    name='implementer',
-    system_prompt="""\
+def _implementer_system_prompt(defect_test_rule: str) -> str:
+    return splice_defect_test_rule("""\
 You are a TDD implementer. You execute a structured plan by writing code, step by step.
 """ + BASH_CAPABLE_ROLE_PREAMBLE + """
 ## Session Startup Protocol
@@ -1052,7 +1081,7 @@ You are a TDD implementer. You execute a structured plan by writing code, step b
 3. **Commit each step.** After completing a step, stage ONLY your code changes (not `.task/` files) and commit. Then call `mark_step_done(step_id, commit_sha)` to record the step as complete.
 4. **Stop at logical boundaries.** Don't exhaust your context trying to complete everything. Complete a logical chunk of steps, commit, mark done, and stop. The next iteration will continue from where you left off.
 5. **Never edit plan.json directly.** Use the `mark_step_done` MCP tool to update step status. Never change the plan structure, descriptions, or add new steps.
-
+""" + LANE_TASK_LINKS_SECTION + """
 ## CRITICAL: Git Staging Rules
 
 """ + _TASK_DIR_NEVER_COMMITTED + """
@@ -1072,8 +1101,13 @@ The workflow for each step is:
 
 - Run tests frequently to verify your work.
 - Prefer minimal, targeted changes. Don't refactor surrounding code.
-""" + IMPLEMENTER_DEVIATION_DOCTRINE + _ESCALATION_INSTRUCTIONS + _MEMORY_INSTRUCTIONS,
-    allowed_tools=['Read', 'Edit', 'Write', 'Bash', 'Glob', 'Grep', *_ESCALATION_TOOLS, *_MEMORY_TOOLS, 'mcp__fused-memory__submit_task', *_JCODEMUNCH_TOOLS, *_PLAN_STATUS_TOOLS, *_PLAN_DEVIATION_TOOLS, *_SCOPE_REQUEST_TOOLS],
+""" + IMPLEMENTER_DEVIATION_DOCTRINE + _ESCALATION_INSTRUCTIONS + _MEMORY_INSTRUCTIONS, defect_test_rule)
+
+
+IMPLEMENTER = AgentRole(
+    name='implementer',
+    system_prompt=_implementer_system_prompt(DEFECT_TEST_RULE),
+    allowed_tools=['Read', 'Edit', 'Write', 'Bash', 'Glob', 'Grep', *_ESCALATION_TOOLS, *_MEMORY_TOOLS, 'mcp__fused-memory__submit_task', *_PLAN_STATUS_TOOLS, *_PLAN_DEVIATION_TOOLS, *_SCOPE_REQUEST_TOOLS],
     disallowed_tools=[*_NO_TASK_STATUS_WRITE],
     default_model='opus',
     default_budget=10.0,
@@ -1083,9 +1117,8 @@ The workflow for each step is:
 )
 
 
-DEBUGGER = AgentRole(
-    name='debugger',
-    system_prompt="""\
+def _debugger_system_prompt(defect_test_rule: str) -> str:
+    return splice_defect_test_rule("""\
 You are a debugger. You fix test, lint, and type-check failures.
 """ + BASH_CAPABLE_ROLE_PREAMBLE + """
 ## Context
@@ -1102,7 +1135,7 @@ You will be given:
 2. **Minimal targeted fixes.** Fix only what's broken. Don't refactor or "improve" surrounding code.
 3. **Don't change test expectations** unless the test itself is wrong (testing the wrong behavior, not just failing).
 4. **Commit your fixes** with a descriptive message like "fix: resolve type error in X" or "fix: correct test assertion for Y".
-
+""" + LANE_TASK_LINKS_SECTION + """
 ## CRITICAL: Git Staging Rules
 
 """ + _TASK_DIR_NEVER_COMMITTED + """
@@ -1115,8 +1148,13 @@ git add -- .
 
 - Read the failing test/code carefully before making changes.
 - If the failure reveals a fundamental design issue, note it and stop rather than applying band-aids.
-""" + _ESCALATION_INSTRUCTIONS + _MEMORY_INSTRUCTIONS,
-    allowed_tools=['Read', 'Edit', 'Write', 'Bash', 'Glob', 'Grep', *_ESCALATION_TOOLS, *_MEMORY_TOOLS, *_JCODEMUNCH_TOOLS, *_PLAN_STATUS_TOOLS, *_PLAN_DEVIATION_TOOLS, *_SCOPE_REQUEST_TOOLS],
+""" + _ESCALATION_INSTRUCTIONS + _MEMORY_INSTRUCTIONS, defect_test_rule)
+
+
+DEBUGGER = AgentRole(
+    name='debugger',
+    system_prompt=_debugger_system_prompt(DEFECT_TEST_RULE),
+    allowed_tools=['Read', 'Edit', 'Write', 'Bash', 'Glob', 'Grep', *_ESCALATION_TOOLS, *_MEMORY_TOOLS, *_PLAN_STATUS_TOOLS, *_PLAN_DEVIATION_TOOLS, *_SCOPE_REQUEST_TOOLS],
     disallowed_tools=[*_NO_TASK_STATUS_WRITE],
     default_model='opus',
     default_budget=5.0,
@@ -1133,7 +1171,8 @@ git add -- .
 #
 # _REVIEWER_CONTRACT_TEMPLATE is the FROZEN machine contract: the
 # submit_review_verdict tool-call instruction and the verdict-field schema
-# (the reviewer_{name} identity literal, and the verdict/severity enums) —
+# (the reviewer_{name} identity literal, and the verdict/severity/kind and
+# ruling-subject enums) —
 # everything the verdict-tools server + read_verdict parse. It is
 # un-editable by construction: a pinned artifact only ever supplies the
 # heuristics argument to compose_prompt, never the contract (see
@@ -1160,7 +1199,32 @@ git add -- .
 # specialization footer always follows the whole contract.
 # ----------------------------------------------------------------------
 
-_SEVERITY_CHOICES = ' or '.join(f'`"{severity}"`' for severity in IssueSeverity)
+_Choice = TypeVar('_Choice', bound=StrEnum)
+
+
+def _quoted_choices(vocabulary: type[StrEnum]) -> str:
+    *rest, last = (f'`"{member}"`' for member in vocabulary)
+    return f'{", ".join(rest)} or {last}' if rest else last
+
+
+def _choice_meanings(vocabulary: type[_Choice], meanings: Mapping[_Choice, str]) -> str:
+    return ''.join(f'  - `"{member}"`: {meanings[member]}\n' for member in vocabulary)
+
+
+_ISSUE_KIND_MEANINGS: Mapping[IssueKind, str] = MappingProxyType({
+    IssueKind.DEFECT: 'wrong runtime behaviour: the code does the wrong thing when it runs.',
+    IssueKind.TEST_QUALITY: 'a finding about the tests themselves, not the code they test.',
+    IssueKind.DOCS: 'a documentation, prompt or comment finding.',
+    IssueKind.PROCESS: (
+        'any other finding that is not wrong runtime behaviour, such as a '
+        'code-quality heuristic, a lint or type error, scope, plan or commit hygiene.'
+    ),
+})
+
+_RULING_SUBJECT_MEANINGS: Mapping[RulingSubject, str] = MappingProxyType({
+    RulingSubject.CLOSURE: "an exemption or withdrawal declared for one of this task's defects.",
+    RulingSubject.RETIREMENT: 'a defect test this change removes.',
+})
 
 _REVIEWER_CONTRACT_TEMPLATE = """\
 You are a code reviewer specializing in: **{specialization}**
@@ -1177,9 +1241,13 @@ Call `submit_review_verdict` with these fields:
 - **reviewer**: the literal string `"reviewer_{name}"` — it MUST match
   this exactly, or your verdict is rejected.
 - **verdict**: `"PASS"` or `"ISSUES_FOUND"`.
-- **issues**: a list of objects, each with `severity` (""" + _SEVERITY_CHOICES + """),
+- **issues**: a list of objects, each with `severity` (""" + _quoted_choices(IssueSeverity) + """),
+  `kind` (""" + _quoted_choices(IssueKind) + """),
   `location` (e.g. `"src/foo.py:42"`), `category`, a `description`, and a
-  `suggested_fix`. Empty when `verdict` is `"PASS"`.
+  `suggested_fix`. Empty when `verdict` is `"PASS"`. The `kind` is:
+""" + _choice_meanings(IssueKind, _ISSUE_KIND_MEANINGS) + """\
+  Every issue MUST carry one. An issue without a valid `kind` is refused and
+  nothing is written, so call `submit_review_verdict` again with it.
 - **summary**: a one-paragraph summary of the review.
 - **note_dispositions**: one object per id listed under
   `{notes_heading}` in your briefing, each with
@@ -1188,6 +1256,12 @@ Call `submit_review_verdict` with these fields:
   note describes, and you verified it), `"no_action"` (a pure observation,
   nothing to do) or `"work"` (follow-up work this branch does not do; it
   becomes a task). Omit it when the briefing lists no notes.
+- **defect_rulings**: one object per pending defect closure or defect-test
+  retirement your briefing asks you to rule on, each with `ref` (exactly as
+  the briefing gives it), `subject` (""" + _quoted_choices(RulingSubject) + """) and
+  `accepted` (`true` or `false`). The `subject` is:
+""" + _choice_meanings(RulingSubject, _RULING_SUBJECT_MEANINGS) + """\
+  Omit it when the briefing lists none.
 """
 
 REVIEWER_INV12_BLOCKERS = """
@@ -1276,11 +1350,11 @@ _REVIEWER_HEURISTICS_TEMPLATES: dict[ReviewBriefing, str] = {
 # outdated contract assumption (mirrors _CURATOR_PROMPT_HARNESS_VERSION).
 # Each generation has its own, so a pinned incumbent artifact can never
 # resolve for the context-complete role, whose prompt_id is the same.
-_REVIEWER_PROMPT_HARNESS_VERSION = 'reviewer-v2'
+_REVIEWER_PROMPT_HARNESS_VERSION = 'reviewer-v3'
 
 _REVIEWER_PROMPT_HARNESS_VERSIONS: dict[ReviewBriefing, str] = {
     ReviewBriefing.DIFF_ONLY: _REVIEWER_PROMPT_HARNESS_VERSION,
-    ReviewBriefing.CONTEXT_COMPLETE: 'reviewer-d2-v2',
+    ReviewBriefing.CONTEXT_COMPLETE: 'reviewer-d2-v3',
 }
 
 
@@ -1432,17 +1506,14 @@ Submit your verdict by calling submit_completion_verdict(complete,
 reasoning, uncovered_plan_steps, substantive_work). Do not print the
 verdict as prose or JSON — the tool call is how your verdict is recorded.
 """,
-    allowed_tools=[*_ANALYSIS_TOOLS, *_JCODEMUNCH_TOOLS, *_VERDICT_TOOLS],
+    allowed_tools=[*_ANALYSIS_TOOLS, *_VERDICT_TOOLS],
     disallowed_tools=['Edit', 'Write', *_NO_TASK_STATUS_WRITE],
     default_model='sonnet',
     default_budget=0.50,
     default_max_turns=15,
-    # No fused-memory/escalation tool in allowed_tools — 'orchestrator' is
-    # declared purely so _invoke() attaches an MCP config for the
-    # jcodemunch tools above (one-way lower bound, see __post_init__).
     # 'verdict_tools' is declared because of the submit_completion_verdict
     # grant above (PRD task β, task 2482).
-    mcp_families=frozenset({'orchestrator', 'verdict_tools'}),
+    mcp_families=frozenset({'verdict_tools'}),
 )
 
 
@@ -1505,7 +1576,7 @@ which main has split into one file per entry under
 `git add -A orchestrator/tests`: it writes each entry as its file and deletes the
 array. Never `git rm` the array (that silently drops this branch's entries) and
 never keep it.
-
+""" + LANE_TASK_LINKS_SECTION + """
 ## CRITICAL: Git Staging Rules
 
 """ + _TASK_DIR_NEVER_COMMITTED + """
@@ -1518,7 +1589,7 @@ git add -- .
 - Read both sides of every conflict carefully.
 - If the conflict involves architectural changes where both sides restructured the same code differently, call `submit_merge_disposition(blocked=true, reason="<why>")` — don't attempt a creative merge.
 """ + _ESCALATION_INSTRUCTIONS,
-    allowed_tools=['Read', 'Edit', 'Write', 'Bash', 'Glob', 'Grep', *_ESCALATION_TOOLS, *_JCODEMUNCH_TOOLS, *_VERDICT_TOOLS],
+    allowed_tools=['Read', 'Edit', 'Write', 'Bash', 'Glob', 'Grep', *_ESCALATION_TOOLS, *_VERDICT_TOOLS],
     disallowed_tools=[*_NO_TASK_STATUS_WRITE],
     default_model='opus',
     default_budget=5.0,
@@ -1790,9 +1861,9 @@ _STEWARD_MEMORY_TOOLS = [
     'mcp__fused-memory__set_task_status',
 ]
 
-STEWARD = AgentRole(
-    name='steward',
-    system_prompt="""\
+
+def _steward_system_prompt(defect_test_rule: str) -> str:
+    return splice_defect_test_rule("""\
 You are a task steward — an autonomous escalation handler with a persistent session.
 """ + BASH_CAPABLE_ROLE_PREAMBLE + """
 ## Context
@@ -1894,7 +1965,7 @@ wording differs.
 5. **For raw suggestions:** Read the code at each location, search memory and tasks for
    duplicates, then classify and act. Maximum 50 tasks per triage batch.
 """ + MERGE_HALT_SAFETY_RULE + STEWARD_MERGE_CONFLICT_RULE + STEWARD_GUARD_INTENT_RULE
-    + STEWARD_SUPPRESSION_RULES + """
+    + STEWARD_SUPPRESSION_RULES + LANE_TASK_LINKS_SECTION + """
 ## CRITICAL: Git Staging Rules
 
 """ + _TASK_DIR_NEVER_COMMITTED + """
@@ -2027,7 +2098,12 @@ convert it into a task candidate and then close it:
       ticket id (or the created/combined task id) so the same note is not swept
       again on a later session. An info-note that describes NO actionable work
       is left as-is — only work-describing notes become candidates.
-""" + ESCALATION_LADDER_CORE,
+""" + ESCALATION_LADDER_CORE, defect_test_rule)
+
+
+STEWARD = AgentRole(
+    name='steward',
+    system_prompt=_steward_system_prompt(DEFECT_TEST_RULE),
     allowed_tools=[
         'Read', 'Edit', 'Write', 'Bash', 'Glob', 'Grep',
         *_ESCALATION_TOOLS,
@@ -2048,7 +2124,6 @@ convert it into a task candidate and then close it:
         # permission denial, with the fetch fallback already forbidden.
         'mcp__escalation__merge_status',
         *_STEWARD_MEMORY_TOOLS,
-        *_JCODEMUNCH_TOOLS,
     ],
     default_model='opus',
     default_budget=5.0,
@@ -2168,7 +2243,6 @@ or expired tickets as a follow-up escalation):
         'Read', 'Glob', 'Grep', 'Bash',
         *_DEEP_REVIEW_TOOLS,
         ESCALATE_INFO_TOOL,
-        *_JCODEMUNCH_TOOLS,
     ],
     disallowed_tools=['Edit', 'Write', *_NO_TASK_STATUS_WRITE],
     default_model='opus',
@@ -2243,16 +2317,15 @@ dispatch.
 """
 
 
-SIMPLE_TASK = AgentRole(
-    name='simple_task',
-    system_prompt="""\
+def _simple_task_system_prompt(defect_test_rule: str) -> str:
+    return splice_defect_test_rule("""\
 You are a SIMPLE_TASK agent. The orchestrator routed this task here because
 its author declared complexity='simple' — a single coherent, mechanically
 simple change. A simple task may be high-priority and may span several
 files/modules; the declaration means the *change* is simple, not that the
 task is trivial. You replace the usual architect+implementer pair with a
 single explore-then-plan-then-implement session.
-""" + BASH_CAPABLE_ROLE_PREAMBLE + SIMPLE_TASK_WORKFLOW + """
+""" + BASH_CAPABLE_ROLE_PREAMBLE + SIMPLE_TASK_WORKFLOW + LANE_TASK_LINKS_SECTION + """
 ## CRITICAL: Git Staging Rules
 
 """ + _TASK_DIR_NEVER_COMMITTED + """
@@ -2260,12 +2333,16 @@ single explore-then-plan-then-implement session.
 git add path/to/file.py
 git add -- .
 ```
-""" + BRANCH_HISTORY_GUIDANCE + SCOPE_BOUNDARY_GUIDANCE_SIMPLE + _ESCALATION_INSTRUCTIONS + _MEMORY_INSTRUCTIONS,
+""" + BRANCH_HISTORY_GUIDANCE + SCOPE_BOUNDARY_GUIDANCE_SIMPLE + _ESCALATION_INSTRUCTIONS + _MEMORY_INSTRUCTIONS, defect_test_rule)
+
+
+SIMPLE_TASK = AgentRole(
+    name='simple_task',
+    system_prompt=_simple_task_system_prompt(DEFECT_TEST_RULE),
     allowed_tools=[
         'Read', 'Glob', 'Grep', 'Edit', 'Write', 'Bash',
         *_ESCALATION_TOOLS,
         *_MEMORY_TOOLS,
-        *_JCODEMUNCH_TOOLS,
         *_PLAN_CREATOR_TOOLS,
         *_PLAN_STATUS_TOOLS,
     ],
@@ -2305,3 +2382,14 @@ ROLES = {
     'judge': JUDGE,
     'simple_task': SIMPLE_TASK,
 }
+
+# The roles that fix code, each mapped to the base of its system prompt as a function of the defect-test rule
+# (PRD decision 17); the sentinel guard drives it. ARCHITECT's and IMPLEMENTER's dispatched prompts are longer:
+# the `+= _FOLLOWUP_FILING_INSTRUCTIONS` appends above extend that base after construction.
+FIXING_ROLE_PROMPT_BUILDERS: Mapping[str, Callable[[str], str]] = MappingProxyType({
+    ARCHITECT.name: _architect_system_prompt,
+    IMPLEMENTER.name: _implementer_system_prompt,
+    SIMPLE_TASK.name: _simple_task_system_prompt,
+    DEBUGGER.name: _debugger_system_prompt,
+    STEWARD.name: _steward_system_prompt,
+})

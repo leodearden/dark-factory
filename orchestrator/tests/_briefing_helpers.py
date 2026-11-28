@@ -1,10 +1,10 @@
-"""Shared fixtures and wire-shape builders for the briefing test files.
+"""Shared wire-shape builders for the briefing test files.
 
 One home (SPOT) for what ``test_briefing.py``, ``test_briefing_project_scope.py``
-and ``test_memory_recall.py`` share: an assembler to drive, the ``search`` and
-``get_entity`` reply shapes to answer it with, and the read-back of what it
+and ``test_memory_recall.py`` share: the ``search`` and ``get_entity`` reply
+shapes to answer a briefing assembler with, and the read-back of what it
 asked. Hand-copies of these between files had already diverged before they
-were gathered here.
+were gathered here. The assembler itself is ``conftest.py::briefing``.
 
 A module rather than ``conftest.py`` for the same reason ``_orch_helpers.py``
 is: a uniquely-named sibling can be imported by name from a test file
@@ -19,26 +19,6 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from unittest.mock import patch
-
-import pytest
-
-from orchestrator.agents.briefing import BriefingAssembler
-from orchestrator.config import GitConfig, OrchestratorConfig
-
-
-@pytest.fixture
-def briefing(tmp_path: Path) -> BriefingAssembler:
-    config = OrchestratorConfig(
-        project_root=tmp_path,
-        git=GitConfig(
-            main_branch='main',
-            branch_prefix='task/',
-            remote='origin',
-            worktree_dir='.worktrees',
-        ),
-    )
-    return BriefingAssembler(config)
-
 
 MEMORY_TRANSPORT = 'orchestrator.agents.memory_recall.mcp_call'
 """The one patch target for answering briefing memory recall in a test.

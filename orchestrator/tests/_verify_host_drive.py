@@ -9,6 +9,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from _gate_fixtures import TEST_DEPLOYED_SHA
 from _merge_lane_fakes import FakeVerifier
 from _merge_worker_drive import make_merge_request
 from _verify_result_doubles import real_verify_result
@@ -20,6 +21,7 @@ from orchestrator.merge_lane.types import (
     RealMergeItem,
 )
 from orchestrator.merge_lane.worker import SpeculativeMergeWorker
+from orchestrator.remote_gate import EnsureReport, local_gate_identity
 from orchestrator.verify import VerifyResult
 from orchestrator.verify_runner import HostLease, RunnerUnavailable
 
@@ -65,8 +67,9 @@ def merge_request_for_verify(
 
 
 def git_ops_mock_for_verify() -> MagicMock:
-    """Build a minimal async mock for GitOps."""
+    """Build a minimal async mock for a GitOps with no warm-lane pool configured."""
     mock = MagicMock()
+    mock.pool_in_use = MagicMock(return_value=False)
     mock.get_main_sha = AsyncMock(return_value='main-sha')
     mock.get_free_disk_bytes = AsyncMock(return_value=100 * 1024 ** 3)  # plenty of disk
     mock.cleanup_merge_worktree = AsyncMock()
@@ -80,20 +83,30 @@ def runner_double(
     is_local: bool,
     result: VerifyResult | None = None,
     error: BaseException | None = None,
+    gate_built: bool = False,
+    ensure_error: BaseException | None = None,
 ) -> MagicMock:
     """A verify host that reports *result*, or raises *error* when dispatched.
 
     The pool and the drift detector ask a runner only for ``name``,
-    ``is_local``, ``health()`` and ``run_merge_verify()``, and the reprobe
-    sweep reaps its idle gates — so a host is an injectable collaborator and
-    no module attribute has to be substituted to decide what a verify on it
-    does.
+    ``is_local``, ``health()`` and ``run_merge_verify()``, the reprobe
+    sweep reaps its idle gates, and a preflight ensures its gate first — so a
+    host is an injectable collaborator and no module attribute has to be
+    substituted to decide what a verify on it does.  ``ensure_gate()``
+    reports a gate of ``TEST_DEPLOYED_SHA``, *gate_built* when it had to
+    build one, or raises *ensure_error*.
     """
     runner = MagicMock()
     runner.name = name
     runner.is_local = is_local
     runner.health = AsyncMock(return_value=True)
     runner.reap_idle_gates = AsyncMock()
+    if ensure_error is not None:
+        runner.ensure_gate = AsyncMock(side_effect=ensure_error)
+    else:
+        runner.ensure_gate = AsyncMock(return_value=EnsureReport(
+            built=gate_built, identity=local_gate_identity(TEST_DEPLOYED_SHA.sha),
+        ))
     if error is not None:
         runner.run_merge_verify = AsyncMock(side_effect=error)
     else:

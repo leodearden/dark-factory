@@ -62,6 +62,7 @@ import _checkout as _checkout
 import check_consolidation_closure as closure_cli
 from _task_db_scan import decode_metadata, tasks_db_path
 from escalation.categories import EscalationCategory
+from escalation.declared_pins import normalise_declarers
 from escalation.queue import EscalationQueue
 from fused_memory.canonical_marker import is_canonical
 from fused_memory.reconciliation.consolidation_auto import (
@@ -99,13 +100,15 @@ from fused_memory.utils.store_mutation_preflight import (
     assert_store_mutation_allowed,
 )
 from fused_memory.utils.validation import is_full_uuid
+from shared.human_curator_gate import declares_only_the_curator_gate_pin, is_human_curator_gate
 from shared.project_id import project_id_for_root
 from shared.project_layout import CheckoutRootError, default_project_root, escalation_queue_dir
-from shared.task_metadata import HUMAN_CURATOR_ADJUDICATED_AT_KEY, HUMAN_CURATOR_GATE_KEY
+from shared.task_metadata import HUMAN_CURATOR_ADJUDICATED_AT_KEY
 from shared.task_statuses import ACTIVE
 from shared.tasks_db_readonly import TaskDbUnreadable, connect_ro
 
 if TYPE_CHECKING:
+    from escalation.models import Escalation
     from fused_memory.config.schema import ConsolidationAutoConfig
 
 logger = logging.getLogger('migrate_open_consolidation_gates')
@@ -586,35 +589,53 @@ async def gate_closure(ctx: RunContext, gate: OpenGate, topic: str) -> ClosureVe
 
 
 def _with_next_calls(ctx: RunContext, gate: OpenGate, report: GateReport) -> GateReport:
-    """PRD D9: a human-curator gate is stamped first, or its runner re-blocks it on resume."""
+    """PRD D9: a human-curator gate is stamped first, or its runner re-blocks it on resume.
+
+    The resume acknowledges the record's curator-gate pin only when no other
+    declarer shares the record: acknowledgement is per record, so it would
+    spend that declarer's pin unread.
+    """
     calls: list[ToolCall] = []
-    if gate.metadata.get(HUMAN_CURATOR_GATE_KEY) is True:
+    curator = is_human_curator_gate(gate.metadata)
+    if curator:
         calls.append(ToolCall('update_task', {
             'id': gate.task_id,
             'project_root': ctx.project_root,
             'metadata': {HUMAN_CURATOR_ADJUDICATED_AT_KEY: ctx.now.isoformat()},
             'metadata_mode': 'merge',
         }))
-    escalation_id = pending_gate_escalation_id(ctx.project_root, gate.task_id)
-    if escalation_id is None:
+    escalation = pending_gate_escalation(ctx.project_root, gate.task_id)
+    if escalation is None:
         return replace(
             report,
             next_calls=tuple(calls),
             note=f'no pending milestone_gate escalation for task {gate.task_id}, so there is nothing to resume yet',
         )
     verdict = report.verdict.value if report.verdict is not None else '-'
-    calls.append(ToolCall('resolve_issue', {
-        'escalation_id': escalation_id,
+    resume: dict[str, Any] = {
+        'escalation_id': escalation.id,
         'resolution': (
             f'Migrated by scripts/migrate_open_consolidation_gates.py run {ctx.run_id}: '
             f'{verdict}; evaluate_closure closed'
         ),
         'action': 'resume',
-    }))
-    return replace(report, next_calls=tuple(calls))
+        'resolution_class': 'actionable',
+    }
+    note = None
+    if curator and declares_only_the_curator_gate_pin(escalation.pin_declared_by, gate.task_id):
+        resume['acknowledge_declared_pins'] = [escalation.id]
+    elif curator:
+        declarers = ', '.join(normalise_declarers(escalation.pin_declared_by))
+        note = (
+            f'{escalation.id} is pinned by {declarers}, not only by its curator gate: '
+            'the listed resume does not acknowledge it, so consult what each names first'
+        )
+    calls.append(ToolCall('resolve_issue', resume))
+    report = replace(report, next_calls=tuple(calls))
+    return replace(report, note=note) if note else report
 
 
-def pending_gate_escalation_id(project_root: str, task_id: str) -> str | None:
+def pending_gate_escalation(project_root: str, task_id: str) -> Escalation | None:
     """The newest pending ``milestone_gate`` escalation for the task, as its runner cites it."""
     queue_dir = escalation_queue_dir(project_root)
     if not queue_dir.is_dir():
@@ -624,7 +645,7 @@ def pending_gate_escalation_id(project_root: str, task_id: str) -> str | None:
         for record in EscalationQueue(queue_dir).get_by_task(task_id, status='pending')
         if record.category == EscalationCategory.MILESTONE_GATE
     ]
-    return max(records, key=lambda record: record.timestamp).id if records else None
+    return max(records, key=lambda record: record.timestamp) if records else None
 
 
 # --------------------------------------------------------------------------- #

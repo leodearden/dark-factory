@@ -1,7 +1,7 @@
 """What promotes a held follow-up, through the public tools (plans/follow-up-filing-shape-prd.md §4.3).
 
-Boundary rows 8-13 and 15: an edge from a pending unheld task, every landing on pending, a
-citation, a combine, a human removal or replacement of the holder edge and the explicit release. Every scenario
+Boundary rows 8-13 and 15: an edge from a waiting unheld task, every landing that starts a task
+waiting, a citation, a combine, a human removal or replacement of the holder edge and the explicit release. Every scenario
 files through ``submit_task`` / ``resolve_ticket`` on the real submit stack and reads back through
 ``get_task`` and the journaled events.
 """
@@ -98,6 +98,21 @@ async def test_an_edge_from_a_pending_task_promotes_the_held_task(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('status', ['in-progress', 'blocked'])
+async def test_an_edge_from_an_unheld_task_that_is_not_pending_promotes_the_held_task(
+    stack: Stack, curator_creates: list[PreparedCandidate], status: str,
+) -> None:
+    held = await _file_held(stack, 'The retry loop swallows the timeout')
+    dependent = await stack.seed('Ship the retry budget', {'files': [_FILE]}, status=status)
+
+    _ok(await stack.call('add_dependency', id=dependent, depends_on=held))
+    await _assert_promoted(stack, held, by='dependent', ref=dependent)
+    _ok(await stack.call('set_task_status', id=dependent, status='pending'))
+
+    assert await _promoted_events(stack) == [{'task_id': held, 'by': 'dependent', 'ref': dependent}]
+
+
+@pytest.mark.asyncio
 async def test_a_task_born_depending_on_a_held_task_promotes_it(
     stack: Stack, curator_creates: list[PreparedCandidate],
 ) -> None:
@@ -146,6 +161,43 @@ async def test_a_dependent_landing_on_pending_promotes_the_held_task(
         ))
 
     assert (await stack.row(planned))['status'] == 'pending'
+    await _assert_promoted(stack, held, by='dependent', ref=planned)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('status', ['done', 'cancelled'])
+async def test_a_settled_dependent_reopened_to_pending_promotes_the_held_task(
+    stack: Stack, curator_creates: list[PreparedCandidate], status: str,
+) -> None:
+    held = await _file_held(stack, 'The retry loop swallows the timeout')
+    dependent = await stack.seed('Ship the retry budget', {'files': [_FILE]}, status=status)
+    _ok(await stack.call('add_dependency', id=dependent, depends_on=held))
+    await _assert_held(stack, held)
+    assert await _promoted_events(stack) == []
+
+    _ok(await stack.call(
+        'set_task_status', id=dependent, status='pending', reopen_reason='reopened: the retry budget regressed',
+    ))
+
+    assert (await stack.row(dependent))['status'] == 'pending'
+    await _assert_promoted(stack, held, by='dependent', ref=dependent)
+
+
+@pytest.mark.asyncio
+async def test_a_deferred_dependent_landing_on_blocked_promotes_the_held_task(
+    stack: Stack, curator_creates: list[PreparedCandidate],
+) -> None:
+    held = await _file_held(stack, 'The retry loop swallows the timeout')
+    planned = await stack.file_planned(
+        title='PRD leaf: name the retry budget', description='A planning-mode task.',
+        priority='medium', metadata={'files': [_FILE]},
+    )
+    _ok(await stack.call('add_dependency', id=planned, depends_on=held))
+    await _assert_held(stack, held)
+
+    _ok(await stack.call('set_task_status', id=planned, status='blocked'))
+
+    assert (await stack.row(planned))['status'] == 'blocked'
     await _assert_promoted(stack, held, by='dependent', ref=planned)
 
 
@@ -264,6 +316,33 @@ async def test_citing_a_held_task_promotes_it(
 
     await _assert_promoted(stack, held, by='citation', ref=ref)
     assert await _promoted_events(stack) == [{'task_id': held, 'by': 'citation', 'ref': ref}]
+
+
+@pytest.mark.asyncio
+async def test_citing_a_held_finding_set_member_leaves_it_held_until_a_human_releases_it(
+    stack: Stack, curator_creates: list[PreparedCandidate],
+) -> None:
+    held = await stack.file_normal(
+        title='Switch judge.py to the public name',
+        description='Switch judge.py to the public name: one member of a finding set.',
+        priority='low',
+        metadata={
+            'source': 'review-all', 'x_finding_key': ['fk-1'],
+            'finding_set_hold': {'ruling': 'Leo 2026-11-12 on fk-1'}, 'files': [_FILE],
+        },
+    )
+    assert await _holder_edge(stack, held), held
+
+    _ok(await stack.call('update_task', id=held, metadata={'x_finding_key': ['fk-1', 'fk-2']}, metadata_mode='additive'))
+
+    await _assert_held(stack, held)
+    assert await _promoted_events(stack) == []
+    [deferred] = await stack.events(EventType.followup_promotion_deferred)
+    assert (deferred['guard'], deferred['by']) == ('finding_set_hold', 'citation')
+
+    _ok(await stack.call('remove_dependency', id=held, depends_on=await _holder(stack)))
+
+    await _assert_promoted(stack, held, by='human', ref='remove_dependency')
 
 
 @pytest.mark.asyncio

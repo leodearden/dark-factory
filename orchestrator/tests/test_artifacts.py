@@ -2,6 +2,7 @@
 
 import copy
 import errno
+import hashlib
 import json
 import os
 import re
@@ -15,11 +16,13 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+from _defect_ruling_fixtures import RULED_REF, SECOND_RULED_REF, contract_ruling
 from _plan_model_helpers import read_model
 from _review_fixtures import review_aggregation, review_issue
 from _review_payloads import blocking_review, pass_review
 from escalation.disposition import ReviewerDisposition
 from shared import safe_io
+from shared.defects import IssueKind, IssueKindFlag, RulingSubject
 
 from orchestrator.artifacts import (
     LANE_SYMLINKED_ARTIFACTS,
@@ -27,6 +30,9 @@ from orchestrator.artifacts import (
     PLAN_SCHEMA_VERSION,
     PLAN_TASK_TEXT_FP_KEY,
     ArtifactWriteError,
+    LanePlanFault,
+    LanePlanFaultKind,
+    LanePlanOccupant,
     PlanConfirmation,
     PlanMutexNotHeld,
     PlanState,
@@ -34,11 +40,12 @@ from orchestrator.artifacts import (
     ReviewsRootMissing,
     TaskArtifacts,
     _normalize_plan,
+    format_issue_section,
     iteration_entry_written_by_orchestrator,
     plan_task_text_fp,
 )
 from orchestrator.mcp.verdict_tools import _submit_review_verdict
-from orchestrator.review_payload import NoteDisposition, ReviewPayloadError
+from orchestrator.review_payload import DefectRuling, NoteDisposition, ReviewPayloadError
 
 
 @pytest.fixture
@@ -1461,6 +1468,35 @@ class TestReviews:
         agg = self._aggregation([])
         assert agg.format_for_escalation() == agg.format_for_replan()
 
+    @staticmethod
+    def _kind_line(text: str) -> str:
+        [line] = [line for line in text.splitlines() if line.startswith('**Kind:**')]
+        return line
+
+    def test_an_issue_kind_is_rendered_as_written(self):
+        issue = {**review_issue('alpha', 'blocking'), 'kind': IssueKind.DOCS.value}
+
+        text = format_issue_section('# Feedback\n', [issue])
+
+        assert self._kind_line(text) == f'**Kind:** {IssueKind.DOCS.value}'
+
+    @pytest.mark.parametrize(
+        ('kind', 'flag'),
+        [
+            pytest.param(None, IssueKindFlag.MISSING, id='missing'),
+            pytest.param('bug', IssueKindFlag.UNRECOGNISED, id='unrecognised'),
+        ],
+    )
+    def test_a_kind_read_fail_closed_is_rendered_with_its_flag(self, kind, flag):
+        issue = review_issue('alpha', 'blocking')
+        if kind is not None:
+            issue['kind'] = kind
+
+        line = self._kind_line(review_aggregation([issue], []).format_for_replan())
+
+        assert line.startswith(f'**Kind:** {IssueKind.DEFECT.value}')
+        assert flag.value in line
+
     def test_format_for_replan_stays_blocking_only(self):
         agg = self._aggregation(['alpha', 'beta'])
         text = agg.format_for_replan()
@@ -1593,6 +1629,74 @@ class TestReviewNoteDispositions:
         )
 
         assert aggregation.note_dispositions == ()
+
+
+_RETIREMENT_RULING = contract_ruling(
+    ref=SECOND_RULED_REF, subject=RulingSubject.RETIREMENT.value, accepted=False,
+)
+_TYPED_RULINGS = (
+    DefectRuling(RULED_REF, RulingSubject.CLOSURE, True),
+    DefectRuling(SECOND_RULED_REF, RulingSubject.RETIREMENT, False),
+)
+
+
+class TestReviewDefectRulings:
+    def test_mirrored_review_rulings_reach_the_aggregation_in_order(
+        self, artifacts: TaskArtifacts,
+    ):
+        artifacts.write_review('reviewer_comprehensive', {
+            'reviewer': 'reviewer_comprehensive',
+            'verdict': 'PASS',
+            'issues': [],
+            'summary': 'OK',
+            'defect_rulings': [contract_ruling(), dict(_RETIREMENT_RULING)],
+        })
+
+        assert artifacts.aggregate_reviews().defect_rulings == _TYPED_RULINGS
+
+    def test_an_error_review_contributes_no_rulings(self, artifacts: TaskArtifacts):
+        artifacts.write_review('reviewer_comprehensive', {
+            'reviewer': 'reviewer_comprehensive',
+            'verdict': 'ERROR',
+            'issues': [],
+            'summary': 'Reviewer error',
+            'defect_rulings': [contract_ruling()],
+        })
+
+        assert artifacts.aggregate_reviews().defect_rulings == ()
+
+    def test_a_review_without_the_key_gives_none(self, artifacts: TaskArtifacts):
+        artifacts.write_review('reviewer_comprehensive', {
+            'reviewer': 'reviewer_comprehensive',
+            'verdict': 'PASS',
+            'issues': [],
+            'summary': 'OK',
+        })
+
+        assert artifacts.aggregate_reviews().defect_rulings == ()
+
+    def test_rulings_survive_the_verdict_tool_to_mirror_round_trip(
+        self, artifacts: TaskArtifacts,
+    ):
+        role = 'reviewer_comprehensive'
+        result = _submit_review_verdict(
+            artifacts, role, 'sid', role, 'PASS', [], 'OK',
+            defect_rulings=[contract_ruling(), dict(_RETIREMENT_RULING)],
+        )
+        assert result['status'] == 'ok'
+        envelope = artifacts.read_verdict(role)
+        assert envelope is not None
+
+        artifacts.write_review(role, envelope['verdict'])
+
+        assert artifacts.aggregate_reviews().defect_rulings == _TYPED_RULINGS
+
+    def test_a_directly_built_aggregation_carries_no_rulings(self):
+        aggregation = ReviewAggregation(
+            has_blocking_issues=False, blocking_issues=[], suggestions=[], reviews={},
+        )
+
+        assert aggregation.defect_rulings == ()
 
 
 class TestBlockingDependency:
@@ -2998,6 +3102,140 @@ class TestDualRootRouting(_DualRootLayout):
     def test_unheld_mutex_claim_names_the_task_plan(self, arts, task):
         with pytest.raises(PlanMutexNotHeld, match=re.escape(str(task / 'plan.json'))):
             arts.write_plan(copy.deepcopy(_PLAN), mutex_held=True)
+
+
+def _other_task_plan(wt: Path) -> Path:
+    other = TaskArtifacts.task_root_for(wt.parent, '43') / 'plan.json'
+    other.parent.mkdir(parents=True, exist_ok=True)
+    other.write_text(json.dumps(_PLAN))
+    return other
+
+
+def _lane_entry_absent(lane_plan: Path, wt: Path) -> Path:
+    lane_plan.unlink(missing_ok=True)
+    return lane_plan
+
+
+def _lane_entry_regular_file(lane_plan: Path, wt: Path) -> Path:
+    content = lane_plan.read_bytes()
+    lane_plan.unlink()
+    lane_plan.write_bytes(content)
+    return lane_plan
+
+
+def _lane_entry_stray_dir(lane_plan: Path, wt: Path) -> Path:
+    lane_plan.unlink()
+    lane_plan.mkdir()
+    (lane_plan / 'junk.txt').write_text('stray')
+    return lane_plan
+
+
+def _lane_entry_other_task(lane_plan: Path, wt: Path) -> Path:
+    other = _other_task_plan(wt)
+    lane_plan.unlink(missing_ok=True)
+    os.symlink(other, lane_plan)
+    return other
+
+
+_LANE_SABOTAGE = {
+    'absent': (_lane_entry_absent, LanePlanFaultKind.NOT_A_LINK, False),
+    'regular_file': (_lane_entry_regular_file, LanePlanFaultKind.NOT_A_LINK, True),
+    'stray_dir': (_lane_entry_stray_dir, LanePlanFaultKind.NOT_A_LINK, False),
+    'other_task': (_lane_entry_other_task, LanePlanFaultKind.WRONG_TARGET, False),
+}
+"""Each way a linked, planned lane's ``.task/plan.json`` is broken: the breakage, which
+returns where the lane then resolves; the kind it reads as; whether it holds a regular file."""
+
+
+class TestLanePlanFault(_DualRootLayout):
+    """``lane_plan_fault()`` reports whether the agent-facing ``.task/plan.json``
+    reads this task's durable plan, without changing anything (task 3608)."""
+
+    @pytest.fixture
+    def lane_plan(self, wt: Path) -> Path:
+        return wt / '.task' / 'plan.json'
+
+    @pytest.fixture
+    def planned(self, arts: TaskArtifacts) -> TaskArtifacts:
+        arts.ensure_lane_symlinks()
+        arts.write_plan(copy.deepcopy(_PLAN))
+        return arts
+
+    def test_linked_planned_lane_has_no_fault(self, planned):
+        assert planned.lane_plan_fault() is None
+
+    @pytest.mark.parametrize('sabotage', sorted(_LANE_SABOTAGE))
+    def test_each_broken_lane_entry_reads_as_its_kind(self, planned, lane_plan, wt, sabotage):
+        breaks, kind, holds_a_file = _LANE_SABOTAGE[sabotage]
+        resolves_to = breaks(lane_plan, wt)
+
+        fault = planned.lane_plan_fault()
+
+        assert isinstance(fault, LanePlanFault)
+        assert fault.kind is kind
+        assert fault.resolved_path == Path(os.path.realpath(resolves_to))
+        assert (fault.occupant is not None) is holds_a_file
+
+    @pytest.mark.parametrize(
+        ('edit', 'matches_plan'), [(None, True), (b'{"steps": "edited in the lane"}', False)],
+        ids=['plan_bytes', 'edited_bytes'],
+    )
+    def test_a_regular_file_in_the_lane_is_fingerprinted(self, planned, lane_plan, wt, edit, matches_plan):
+        _lane_entry_regular_file(lane_plan, wt)
+        if edit is not None:
+            lane_plan.write_bytes(edit)
+        held = lane_plan.read_bytes()
+
+        fault = planned.lane_plan_fault()
+
+        assert fault.kind is LanePlanFaultKind.NOT_A_LINK
+        assert fault.occupant == LanePlanOccupant(len(held), hashlib.sha256(held).hexdigest(), matches_plan)
+        assert fault.occupant.sha256 in fault.describe()
+
+    def test_link_to_an_unwritten_plan_is_empty(self, arts):
+        arts.ensure_lane_symlinks()
+        assert arts.lane_plan_fault().kind is LanePlanFaultKind.EMPTY
+
+    def test_link_to_a_truncated_plan_is_empty(self, planned, task):
+        (task / 'plan.json').write_bytes(b'')
+        assert planned.lane_plan_fault().kind is LanePlanFaultKind.EMPTY
+
+    def test_legacy_single_root_reads_its_own_plan(self, wt):
+        legacy = TaskArtifacts(wt)
+        legacy.init('42', 'Legacy', 'desc')
+        fault = legacy.lane_plan_fault()
+        assert fault is not None
+        assert fault.kind is LanePlanFaultKind.EMPTY
+
+        legacy.write_plan(copy.deepcopy(_PLAN))
+
+        assert legacy.lane_plan_fault() is None
+
+    @pytest.mark.parametrize('kind', list(LanePlanFaultKind))
+    def test_fault_names_the_lane_and_plan_paths(self, arts, lane_plan, wt, kind):
+        if kind is not LanePlanFaultKind.EMPTY:
+            arts.write_plan(copy.deepcopy(_PLAN))
+        if kind is not LanePlanFaultKind.NOT_A_LINK:
+            arts.ensure_lane_symlinks()
+        if kind is LanePlanFaultKind.WRONG_TARGET:
+            _lane_entry_other_task(lane_plan, wt)
+
+        fault = arts.lane_plan_fault()
+
+        assert fault.kind is kind
+        assert fault.lane_path == lane_plan
+        assert fault.plan_path == arts.artifact_path('plan.json')
+        assert str(fault.lane_path) in fault.describe()
+        assert str(fault.plan_path) in fault.describe()
+
+    @pytest.mark.parametrize('sabotage', sorted(_LANE_SABOTAGE))
+    def test_relinking_heals_every_link_fault(self, planned, lane_plan, wt, sabotage):
+        breaks, _kind, _holds_a_file = _LANE_SABOTAGE[sabotage]
+        breaks(lane_plan, wt)
+
+        planned.ensure_lane_symlinks()
+
+        assert planned.lane_plan_fault() is None
 
 
 class TestClearReviews(_DualRootLayout):

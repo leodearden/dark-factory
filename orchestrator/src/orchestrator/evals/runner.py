@@ -8,7 +8,7 @@ import logging
 import re
 import threading
 import time
-from collections.abc import Awaitable, Callable, Iterable
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -27,6 +27,7 @@ from orchestrator.config import (
     OrchestratorConfig,
     PriceEntry,
     RoutingConfig,
+    RoutingRule,
 )
 from orchestrator.git_ops import GitOps
 from orchestrator.implementer_brief_variant import execute_iteration_cap
@@ -73,12 +74,16 @@ from .hermeticity import (
     writers_held_by,
 )
 from .metrics import (
+    DispatchRecord,
+    EndpointKind,
     EvalMetrics,
     RoleUnderTest,
     compute_composite,
+    dispatched_models,
     is_false_green,
     is_null_work,
     is_proxied_endpoint,
+    off_pin_roles,
     resolve_cost_usd,
 )
 from .profile import apply_eval_profile
@@ -135,12 +140,12 @@ def load_task(task_path: Path) -> dict:
     return task
 
 
-def _admit_claude_role_models(
-    routing: RoutingConfig,
+def _admitted_claude_role_models(
+    allowed_models: list[str],
     models: ModelsConfig,
     backends: BackendsConfig,
-) -> RoutingConfig:
-    """Return *routing* with every claude-backend role's model in ``allowed_models``.
+) -> list[str]:
+    """*allowed_models* extended with every claude-backend role's model.
 
     Restores, for one eval cell, the invariant
     ``orchestrator/config.py::OrchestratorConfig._validate_models_in_allowlist``
@@ -148,15 +153,44 @@ def _admit_claude_role_models(
     model outside the project allowlist (a proxied-endpoint implementer, a
     fable architect) is rejected by ``resolve_route``'s allowlist layer and
     the cell silently dispatches the role default under the candidate's label.
-    Only ``allowed_models`` changes; the ladder, ceilings and rules are kept.
     """
     claude_role_models = [
         getattr(models, role)
         for role in type(models).model_fields
         if getattr(backends, role, 'claude') == 'claude'
     ]
-    admitted = list(dict.fromkeys([*routing.allowed_models, *claude_role_models]))
-    return routing.model_copy(update={'allowed_models': admitted})
+    return list(dict.fromkeys([*allowed_models, *claude_role_models]))
+
+
+def _without_rule_models(rules: list[RoutingRule]) -> list[RoutingRule]:
+    """*rules* in the same order, each with ``set.model`` cleared and all else kept."""
+    return [
+        rule.model_copy(update={'set': rule.set.model_copy(update={'model': None})})
+        for rule in rules
+    ]
+
+
+def _cell_routing(
+    routing: RoutingConfig,
+    models: ModelsConfig,
+    backends: BackendsConfig,
+) -> RoutingConfig:
+    """The eval cell's routing: *models* is the only source of every role's model.
+
+    Every claude-backend role's model is admitted into ``allowed_models``, and
+    every policy rule loses its ``set.model``. A rule keeps its id, match, list
+    position and other set fields, so the cell resolves effort, budget and
+    max_turns exactly as production does (a large plan keeps its rule's
+    max_turns), first-match-wins picks the same rule, and ``rule_id`` still
+    records it. A rule-set model would make the cell measure a model its label
+    does not name, and a non-claude backend would receive the rule's literal
+    unvalidated. See
+    ``orchestrator/tests/test_eval_driver.py::TestCellRoutingPinsEveryRoleModel``.
+    """
+    return routing.model_copy(update={
+        'allowed_models': _admitted_claude_role_models(routing.allowed_models, models, backends),
+        'rules': _without_rule_models(routing.rules),
+    })
 
 
 def build_eval_orch_config(
@@ -176,6 +210,7 @@ def build_eval_orch_config(
     via 594658fbe3 / 2c26a30bca).
     Only the implementer varies per eval config, and the implementer candidate's
     ``harness_variant`` becomes the cell's ``implementer_brief_variant``.
+    The cell's routing pins every role's model to these settings (see ``_cell_routing``).
 
     ``architect_config`` (eval-revival μ) drives the both-live end-to-end matrix
     /confirm runs (``run_end_to_end``): when supplied, the architect's
@@ -316,7 +351,7 @@ def build_eval_orch_config(
         'type_check_command': task.get('verify_commands', {}).get('typecheck', base.type_check_command),
         'env_overrides': config.env_overrides,
         'implementer_brief_variant': config.harness_variant,
-        'routing': _admit_claude_role_models(profiled.routing, models, backends),
+        'routing': _cell_routing(profiled.routing, models, backends),
     }
     # BUG 2a: pin the eval verify interpreter to the target's own
     # .python-version (via verify_env['UV_PYTHON']) so `uv run pytest/ruff/
@@ -350,7 +385,7 @@ def build_eval_orch_config(
     # claude_endpoint_price_table() into config.prices whenever THIS
     # candidate runs against a PROXIED endpoint — the SAME predicate
     # collect_metrics and run_architect_eval read before calling
-    # resolve_cost_usd(..., is_local_model=...), which is why it has one home
+    # resolve_cost_usd(..., cli_cost_untrusted=...), which is why it has one home
     # (metrics.is_proxied_endpoint) instead of three inline env reads: the
     # table that gets seeded and the flag that decides whether to trust the CLI
     # figure must never disagree. Without this, an operator who forgets to seed
@@ -393,6 +428,18 @@ class CellProfile:
 
 def _corpus_profile() -> CellProfile:
     return CellProfile(build_eval_orch_config, fixture_task_gate)
+
+
+WORKFLOW_CELL_TIMEOUT_MINUTES = 180
+"""A workflow cell verifies cold, and on a loaded host completed cells took 74 to 106 min."""
+
+ARCHITECT_CELL_TIMEOUT_MINUTES = 60
+"""A plan-only architect cell runs no verify."""
+
+
+def cell_timeout_minutes(task: dict, timeout_override: float | None, default: float) -> float:
+    """The cell's wall-clock ceiling: the caller's override, else the fixture's timeout_minutes, else *default*."""
+    return timeout_override or task.get('timeout_minutes', default)
 
 
 async def run_eval(
@@ -443,6 +490,7 @@ async def run_eval(
         ),
         label=judge_config.name if judge_config is not None else config.name,
         role=RoleUnderTest.JUDGE if judge_config is not None else RoleUnderTest.IMPLEMENTER,
+        endpoint_kind=config.endpoint_kind,
         initial_plan=initial_plan,
         replay_framed=False,
         worktree=worktree_path,
@@ -484,6 +532,7 @@ async def run_architect_eval(
             'where an injected deps persists the cell'
         )
     task = load_task(task_path)
+    timeout_minutes = cell_timeout_minutes(task, timeout_override, ARCHITECT_CELL_TIMEOUT_MINUTES)
     deps = deps or ArchitectEvalDeps(store=store or ResultStore.packaged())
     label = cell_label(task, config)
     logger.info(f'Starting architect eval: {label} (trial {trial})')
@@ -494,7 +543,7 @@ async def run_architect_eval(
             config, task, base_config, memory_endpoint=memory_endpoint,
         ),
         usage_gate=usage_gate,
-        timeout_minutes=timeout_override or task.get('timeout_minutes', 60),
+        timeout_minutes=timeout_minutes,
     )
     reference_diff = await read_reference_diff(task, deps)
     scoring = classify_attempt(attempt)
@@ -513,6 +562,7 @@ async def run_architect_eval(
         wall_clock_ms=wall_clock_ms,
         run_id=attempt.address.run_id,
         trial=trial,
+        timeout_minutes=timeout_minutes,
     )
     deps.store.save(result)
     log_architect_cell(label, scoring, metrics, wall_clock_ms)
@@ -553,6 +603,7 @@ async def run_end_to_end(
         ),
         label=f'{arch_config.name}+{impl_config.name}',
         role=RoleUnderTest.END_TO_END,
+        endpoint_kind=impl_config.endpoint_kind,
         initial_plan=None,
         replay_framed=True,
         worktree=None,
@@ -570,6 +621,7 @@ async def _run_workflow_cell(
     *,
     label: str,
     role: RoleUnderTest,
+    endpoint_kind: EndpointKind,
     initial_plan: dict | None,
     replay_framed: bool,
     worktree: Path | None,
@@ -588,6 +640,7 @@ async def _run_workflow_cell(
     (docs/eval-replay-frame.md). The wall clock includes worktree setup.
     """
     cell = f'{task["id"]} × {label}'
+    timeout_minutes = cell_timeout_minutes(task, timeout_override, WORKFLOW_CELL_TIMEOUT_MINUTES)
     logger.info(f'Starting eval: {cell} (trial {trial})')
     start_ms = int(time.monotonic() * 1000)
     worktree, run_id = await _open_cell_worktree(task, worktree)
@@ -600,13 +653,11 @@ async def _run_workflow_cell(
             task, orch_config, worktree, initial_plan,
             replay_framed=replay_framed, usage_gate=gate, task_gate=task_gate,
         )
-        outcome = await _await_outcome(
-            workflow, timeout_override or task.get('timeout_minutes', 60), cell,
-        )
+        outcome = await _await_outcome(workflow, timeout_minutes, cell)
         wall_clock_ms = int(time.monotonic() * 1000) - start_ms
         metrics = await _cell_metrics(
             workflow, worktree, task, role=role, replay_frame=replay_frame,
-            sandbox_backend=sandbox_backend,
+            sandbox_backend=sandbox_backend, endpoint_kind=endpoint_kind,
         )
         result = EvalResult(
             task_id=address.task_id,
@@ -617,6 +668,7 @@ async def _run_workflow_cell(
             wall_clock_ms=wall_clock_ms,
             run_id=address.run_id,
             trial=trial,
+            timeout_minutes=timeout_minutes,
         )
         store.save(result)
     logger.info(
@@ -694,18 +746,33 @@ def _cell_workflow(
     return workflow
 
 
-async def _await_outcome(workflow: TaskWorkflow, timeout_minutes: int, cell: str) -> str:
-    """The workflow's terminal outcome; a timeout or a raise becomes the cell's outcome."""
+async def _await_outcome(workflow: TaskWorkflow, timeout_minutes: float, cell: str) -> str:
+    """The workflow's terminal outcome, where a ceiling that fired or a raise becomes the cell's outcome.
+
+    A workflow can absorb the deadline's cancellation and return CANCELLED, or
+    raise while finalising it, so a fired ceiling is read from the scope and
+    not only from a TimeoutError.
+    """
+    deadline = asyncio.timeout(timeout_minutes * 60)
     try:
-        report = await asyncio.wait_for(workflow.run(), timeout=timeout_minutes * 60)
+        async with deadline:
+            report = await workflow.run()
     except TimeoutError:
-        logger.error(f'Eval {cell} timed out after {timeout_minutes}m')
-        return 'timeout'
+        return _timed_out(cell, timeout_minutes)
     except Exception as e:
+        if deadline.expired():
+            return _timed_out(cell, timeout_minutes)
         logger.error(f'Eval {cell} failed: {e}')
         return WorkflowOutcome.BLOCKED.value
+    if deadline.expired():
+        return _timed_out(cell, timeout_minutes)
     outcome = report.outcome
     return outcome.value if isinstance(outcome, WorkflowOutcome) else str(outcome)
+
+
+def _timed_out(cell: str, timeout_minutes: float) -> str:
+    logger.error(f'Eval {cell} timed out after {timeout_minutes}m')
+    return 'timeout'
 
 
 async def _cell_metrics(
@@ -716,20 +783,31 @@ async def _cell_metrics(
     role: RoleUnderTest,
     replay_frame: str | None,
     sandbox_backend: CellSandbox,
+    endpoint_kind: EndpointKind,
 ) -> dict[str, Any]:
     """The cell's metrics; a collection that raised leaves only the stamps the executor knows."""
     try:
         metrics = await collect_metrics(
             workflow, worktree, task, role=role, replay_frame=replay_frame,
-            sandbox_backend=sandbox_backend,
+            sandbox_backend=sandbox_backend, endpoint_kind=endpoint_kind,
         )
     except Exception as e:
         logger.warning(f'Metric collection failed: {e}')
         return {
             'role_under_test': role, 'replay_frame': replay_frame,
-            'sandbox_backend': sandbox_backend,
+            'sandbox_backend': sandbox_backend, 'endpoint_kind': endpoint_kind,
+            'dispatched_models': _dispatched_models_or_none(workflow),
         }
     return metrics.to_dict()
+
+
+def _dispatched_models_or_none(workflow: TaskWorkflow) -> dict[str, list[DispatchRecord]] | None:
+    """The workflow's dispatched models, or None (not recorded) when summarising them raised."""
+    try:
+        return dispatched_models(workflow.metrics.dispatched_routes, workflow.config.models)
+    except Exception as e:
+        logger.warning(f'Dispatched-model summary failed: {e}')
+        return None
 
 
 async def collect_metrics(
@@ -740,8 +818,9 @@ async def collect_metrics(
     role: RoleUnderTest,
     replay_frame: str | None = None,
     sandbox_backend: CellSandbox,
+    endpoint_kind: EndpointKind,
 ) -> EvalMetrics:
-    """Collect metrics from a completed workflow run, stamped with *role*, *replay_frame* and *sandbox_backend*."""
+    """Collect metrics from a completed workflow run, stamped with *role*, *replay_frame*, *sandbox_backend* and *endpoint_kind*."""
     wf_metrics = workflow.metrics
 
     # Plan completion
@@ -770,7 +849,7 @@ async def collect_metrics(
     # Via the shared predicate, NOT an inline env read: the same signal decides
     # whether build_eval_orch_config seeds the proxied price table, so the two
     # must not be able to drift apart (see is_proxied_endpoint).
-    is_local = is_proxied_endpoint(workflow.config.env_overrides)
+    cli_cost_untrusted = is_proxied_endpoint(workflow.config.env_overrides)
 
     # Cost provenance (Invariant P5): the CLI's own cost figure is wrong for a
     # proxied endpoint, so resolve cost from the config price table by the run's
@@ -795,8 +874,9 @@ async def collect_metrics(
         model=run_model,
         prices=workflow.config.prices,
         cli_cost_usd=wf_metrics.total_cost_usd,
-        is_local_model=is_local,
+        cli_cost_untrusted=cli_cost_untrusted,
     )
+    dispatched = dispatched_models(wf_metrics.dispatched_routes, workflow.config.models)
 
     m = EvalMetrics(
         tests_pass=verification.passed if verification else False,
@@ -822,11 +902,14 @@ async def collect_metrics(
         lines_changed=lines_changed,
         files_changed=files_changed,
         tokens_per_second=round(tps, 2),
-        is_local_model=is_local,
+        cli_cost_untrusted=cli_cost_untrusted,
         role_under_test=role,
         replay_frame=replay_frame,
         sandbox_backend=sandbox_backend,
+        endpoint_kind=endpoint_kind,
+        dispatched_models=dispatched,
     )
+    _warn_off_pin_dispatch(task.get('id', '?'), dispatched)
     # False-green guard — catches the 404-bug signature so the same class of
     # silent failure doesn't need manual quarantine in future runs.
     enforced_cap = execute_iteration_cap(
@@ -883,6 +966,26 @@ async def collect_metrics(
         )
 
     return m
+
+
+def _warn_off_pin_dispatch(task_id: str, dispatched: Mapping[str, list[DispatchRecord]]) -> None:
+    """One WARNING naming every role whose config seats one model and that ran another."""
+    roles = off_pin_roles(dispatched)
+    if not roles:
+        return
+    logger.warning(
+        'Eval cell %s ran models other than the ones its config seats: %s',
+        task_id,
+        '; '.join(
+            f'{role}: ' + ', '.join(
+                f"{r['model']} (configured_model={r['configured_model']}, "
+                f"source_layer={r['source_layer']}, rule_id={r['rule_id']}, "
+                f"served_model_id={r['served_model_id']}, rejected={r['rejected']})"
+                for r in dispatched[role]
+            )
+            for role in roles
+        ),
+    )
 
 
 async def _git_diff_stats(worktree: Path, base_commit: str) -> tuple[int, int]:

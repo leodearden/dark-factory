@@ -1,0 +1,22 @@
+[Unit]
+Description=Nightly timer for the cross-repo lock-charter drift check (task 11623)
+
+[Timer]
+# Nightly at 01:45 local time, between the 01:30 timeout-headroom self-check
+# and the 02:00 repack on this machine's staggered ladder:
+#
+#   01:30  timeout-headroom-selfcheck
+#   01:45  this job
+#   02:00  shared-repo-git-maintenance
+#   ...
+#
+# The drift no longer blocks any merge, so daily bounds the heal latency to a
+# day; the job takes seconds. Persistent=true catches up a night missed to a
+# sleeping laptop; the randomized delay avoids a thundering herd. See
+# OPERATIONS.md §12 for the ladder as a whole.
+OnCalendar=*-*-* 01:45:00
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target

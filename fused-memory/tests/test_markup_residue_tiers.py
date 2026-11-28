@@ -34,6 +34,7 @@ from _markup_guard_harness import (
     _payload,
 )
 from fastmcp.exceptions import ToolError
+from shared.markup_residue_custody import RESIDUE_UNPRESERVED_LOG_EVENT
 from shared.mcp_markup_middleware import MARKUP_RECURRENCE_ROUTING
 from shared.toolcall_markup import CANONICAL_OPENER_PREFIX, closer_for
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
@@ -746,3 +747,29 @@ class TestTheLastTierLogLineIsHonest:
 
         assert _unrepairable('one') in outcome['message']
         assert MARKUP_RECURRENCE_ROUTING in outcome['message']
+
+    @pytest.mark.asyncio
+    async def test_a_queue_that_cannot_take_it_leaves_the_record_as_data(
+        self, caplog, tmp_path
+    ):
+        """A resolved project whose queue dir is a regular FILE: root-safe, unlike chmod."""
+        server, _ = _build_guarded_server(
+            'add_system_record',
+            known_projects={_PROJECT_ID: str(tmp_path)},
+            residue_floor=None,
+        )
+        (tmp_path / 'data').mkdir()
+        (tmp_path / 'data' / 'escalations').write_text('occupied')
+
+        with caplog.at_level('ERROR', logger=_GUARD_LOGGER):
+            payload = await _refuse_unrepairable(server, 'blocked')
+
+        assert payload['escalation_id'] is None
+        assert 'residue_spool_path' not in payload
+        [outcome] = [
+            o for o in _residue_outcomes(caplog) if o['residue_tier'] == ResidueTier.UNPRESERVED
+        ]
+        assert outcome['residue_record']['raw_value'] == _unrepairable('blocked')
+        assert RESIDUE_UNPRESERVED_LOG_EVENT in outcome['message']
+        assert repr(_unrepairable('blocked')) in outcome['message']
+        assert 'refused an unrepairable' not in outcome['message']

@@ -332,10 +332,27 @@ There was simply no way to ask "which memories contain this substring."
 
 That is now `scan_memory_content` (WORK b): a **literal** substring scan over
 Qdrant payload text. It uses a server-side `MatchText` prefilter for speed and
-then re-verifies **every** returned record in Python with the shared detector,
-which is the authoritative verdict. `exhaustive=True` skips the prefilter
-entirely and paginates the whole collection — that is the mode for an
-incidence-rate claim, so the number rests on nothing but the detector.
+then judges **every** walked record in Python, which is the authoritative
+verdict. With the default sentinels that verdict is the shared detector. With
+caller-supplied `needles` it is the needles themselves: a literal,
+case-sensitive substring match over the record text (task 4857; before that,
+a record containing a custom needle was never reported). `exhaustive=True`
+skips the prefilter, and nothing else, and paginates the whole collection —
+that is the mode for an incidence-rate claim, so the number rests on nothing
+but the Python verdict. The prefilter reads only the `data` key, so a complete
+literal enumeration, one that also sees text under the `memory`/`content`
+fallbacks, passes `needles` with `exhaustive=True, limit=None`; that is also
+the mode that does not depend on `data` staying un-indexed (§7). `scanned` is
+the number of records walked: the prefilter population, or the whole
+collection when exhaustive.
+
+The MCP tool defaults to `limit=1000` and returns each match's `metadata`
+without its text keys. `excerpt` is a fixed-width window of the text centred
+where the earliest matched fragment begins, with `…` on each elided side, so a
+tail leak or a deep needle is visible in it; `get_memory_by_id` gives the full
+body. `MemoryService.scan_memory_content` and
+`Mem0Backend.scan_payload_text` keep no default limit and return the full raw
+payload, because the in-process sweep (§5) repairs from it.
 
 Pagination is mandatory in both modes. A silently-capped scan would answer
 "what is the true incidence rate" *wrongly*, which is the same silent-wrong-value
@@ -369,6 +386,14 @@ restored and named in `recovered_params`. `mcp_markup_unrepairable` refuses
 without one. Opt-out: `metadata={'allow_mcp_markup': True}` — load-bearing
 rather than theoretical, since this task's own description quotes every
 sentinel verbatim and this document could not otherwise be filed as a task.
+Send `metadata` as the FIRST argument, ahead of the string that carries the
+markup. A leak swallows only the parameters that follow the leaking one, so an
+override sent after it arrives inside the leaked value. The guard never honours
+an override found there, because finding it there proves the leak is real. It
+reports it as `override_swallowed: true` on the refusal and on the residue
+record, and its hint repeats the metadata-first remedy (task 5055). A
+`repaired_call` restores the swallowed `metadata` without the flag, so
+resubmitting it verbatim is guarded again.
 
 When this section was first written, the guard was task 3141's
 `fused_memory/server/markup_tripwire.py`, returning
@@ -708,10 +733,69 @@ behind (unlike the Mem0 path, which must delete-then-re-add to re-embed). It
 refuses loudly on a blank replacement, on a replacement that itself still
 carries a leak, and on an absent uuid — a typo can never read as a success.
 
-Graphiti-side **discovery** (enumerating which episodes across a graph carry a
-leak) is deliberately not provided: it needs a full episode scan with no
-payload index to lean on. Tracked as follow-up work. `redact_episode_content`
-is the remediation primitive for an episode you have already identified.
+### Discovery: finding which episodes carry a leak (task 3233)
+
+`MemoryService.scan_episode_toolcall_leaks(project_id)` delegates to
+`GraphitiBackend.scan_episode_toolcall_leaks`, which runs
+`fused-memory/src/fused_memory/backends/episode_toolcall_leak_scan.py::read_episode_toolcall_leaks`
+and applies the shared `apply_incompleteness_policy` to it. The read works in
+four parts:
+
+- **A server-side prefilter that cannot miss a leak.** FalkorDB keeps only the
+  group's episodes whose `content` CONTAINS one of `PREFILTER_NEEDLES`, which
+  are bound as a list parameter. Every match of the shared detector begins
+  with one of those literal closing tags, and CONTAINS is an exact,
+  case-sensitive substring test. So the prefilter is a superset of the
+  detector's matches, and unlike the Qdrant `MatchText` caveat in §7, no index
+  can change that. The server still reads every episode; only the transfer is
+  narrowed, which is why there is no `--exhaustive` mode.
+- **The shared detector as the verdict.** Each candidate is re-checked with
+  `find_toolcall_xml_leak`, and only confirmed leaks come back.
+- **A paged, census-proven read.** Candidates are paged in `uuid` order
+  against a `count(*)` over the identical match. A short read is reported as
+  incomplete, not passed off as a clean group, and a structural refusal raises
+  `IncompleteEnumerationError`.
+- **A denominator.** A census of all the group's episodes comes back as
+  `episodes_in_group`, so the result is an incidence rate.
+
+The operator entry point is `fused-memory/scripts/sweep_episode_toolcall_xml_leak.py`.
+It classifies each leak with the shared `classify_leak_shape`, the same rule
+the Mem0 sweep uses.
+
+- A dry run is the default. It mutates nothing, opens the service for reads
+  only, and exits 0.
+- `--apply` first runs the store-mutation preflight. It then redacts each
+  `repairable_tail` and `repairable_duplicate` episode in place through
+  `redact_episode_content`, writing exactly the repaired body. It never
+  deletes, and it never touches `manual_review` episodes.
+- Under `--apply` the exit code is 1 when something is left for a human: any
+  `manual_review` episode, an incomplete scan, a failed redaction
+  (`record_error`), or content that changed between the scan and its
+  redaction (`content_changed_since_scan`). A `content_changed_since_scan`
+  record carries the text the redaction overwrote as `replaced_content`,
+  beside the scanned `content`. The write journal does not hold that text: it
+  stores only a truncated `new_content`. The printed `--apply` report is the
+  only full copy, so redirect it to a file before adjudicating.
+- Exit 2 means the run aborted. The partial report is printed first. An
+  interrupt (Ctrl-C) prints the partial report too, then propagates.
+
+**Measured 2026-11-25** with read-only queries against production graph
+`dark_factory`:
+
+- 14,456 episodes have `group_id = 'dark_factory'`. The prefilter returned 12
+  candidates in 13-19 ms.
+- Known positives `4d88a40f`, `72c293b3` and `1f588c77` are present. Each
+  content ends with a closing content tag, a newline and a bare closing
+  invoke tag, which is the `repairable_tail` shape.
+- `d12b0eb4` is no longer in the `dark_factory` graph: a uuid lookup returned
+  no row.
+
+**Scope.** The scan covers episodes whose `group_id` equals the graph's
+project. It does not cover cross-graph residue: episodes whose `group_id`
+names another project (76 in the `dark_factory` graph on that date).
+`redact_episode_content` matches on uuid *and* group_id, so it could not
+reach them, and the cross-graph migration owns them. An incidence rate from
+this scan describes the project's own episodes only.
 
 ---
 
@@ -730,18 +814,31 @@ to tokenized word-matching.** A silent semantic flip is precisely the failure
 class this task exists to kill, so the design does not depend on it:
 
 - The prefilter is only ever a **speed optimisation**. Every returned record is
-  re-verified in Python by the shared detector, which is the authoritative
-  verdict.
-- The flip fails **safe**. Tokenized matching is strictly *more* permissive for
-  these needles (text containing `&#60;parameter name=` necessarily contains
-  the tokens `parameter` and `name`), so the prefilter remains a superset and
-  the answer stays exact. Only speed degrades.
-- `exhaustive=True` bypasses the prefilter entirely.
+  judged in Python, which is the authoritative verdict: the shared detector for
+  the default sentinels, and the caller's `needles` as a literal, case-sensitive
+  substring match otherwise (task 4857). The verdict can only discard what the
+  prefilter returned, never recover what it skipped, so a prefiltered answer is
+  exact only while the prefilter is a superset of the verdict's matches.
+- For the **default sentinels** the flip fails **safe**. Tokenized matching is
+  strictly *more* permissive for them (text containing `&#60;parameter name=`
+  necessarily contains the tokens `parameter` and `name`), so the prefilter
+  remains a superset and the answer stays exact. Only speed degrades.
+- For **custom `needles`** the flip is **not** safe. A needle that is not a
+  whole token is a literal substring but no token match (the tripwire's
+  mid-word `econciliatio` is the counter-example), so an indexed prefilter
+  would silently skip records the verdict would report: false absence. A
+  prefiltered custom-needle scan is exact only under un-indexed substring
+  semantics.
+- `exhaustive=True` bypasses the prefilter entirely, so it is the
+  index-independent path for either verdict.
 
 The tripwire is
 `TestMem0BackendScanPayloadTextIntegration::test_matchtext_prefilter_is_a_literal_substring_match`
 in `fused-memory/tests/test_mem0_client.py` — a `qdrant_skipif`-gated
-integration test that fails **loudly** if the semantics ever change.
+integration test that fails **loudly** if the semantics ever change. It runs
+against its own test collection, so it cannot see an index created on a
+production collection; a custom-needle hunt whose completeness matters uses
+`exhaustive=True`.
 
 ---
 

@@ -909,6 +909,7 @@ class TestRetryTierBumpAcrossDispatches:
             'role': 'implementer', 'model': 'sonnet', 'effort': 'high',
             'budget_usd': 10.0, 'max_turns': 80, 'source_layer': 'config',
             'rule_id': None, 'rejected': [], 'routing_tier': 0, 'decided_at': None,
+            'plan_steps': 5, 'plan_modules': 1,
         }
         return {
             'files': ['lib'],
@@ -1908,7 +1909,7 @@ class TestRollupRendersRigProducedRows:
 
             assert '## Per-(model×role) rollup' in rendered
             assert (
-                '| model | role | invocations | done% | blocked% | cap-hit% | $/done |'
+                '| model | role | invocations | done% | blocked% | cap-hit% | $ per done run |'
                 in rendered
             )
             expected_stock_line = (

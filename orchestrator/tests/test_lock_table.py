@@ -1326,6 +1326,29 @@ class TestRelease:
         assert _lt().release('nobody') == []
 
 
+class TestWithdrawAcquire:
+    """``withdraw_acquire`` undoes a ``try_acquire`` whose dispatch never happened (task 11430)."""
+
+    def test_a_keyless_acquire_is_withdrawn(self):
+        lt = _lt()
+        assert lt.try_acquire('G', [])
+        assert lt.is_held('G')
+
+        assert lt.withdraw_acquire('G') == []
+        assert not lt.is_held('G')
+
+    def test_a_keyed_acquire_is_withdrawn_and_its_keys_are_free_again(self):
+        lt = _lt()
+        assert lt.try_acquire('T', ['b', 'a'])
+
+        assert lt.withdraw_acquire('T') == ['a', 'b']
+        assert not lt.is_held('T')
+        assert lt.try_acquire('U', ['a'])
+
+    def test_withdrawing_for_a_task_holding_nothing_returns_empty(self):
+        assert _lt().withdraw_acquire('nobody') == []
+
+
 class TestModuleBoundary:
     """The lock table is its own module: it loads no scheduler, and the
     scheduler does not re-export it."""

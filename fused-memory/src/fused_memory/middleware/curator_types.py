@@ -19,6 +19,7 @@ from shared.followup_items import (
     FollowupItem,
     read_items,
 )
+from shared.task_complexity import SIMPLE_COMPLEXITY
 from shared.task_statuses import TaskStatus
 
 from fused_memory.middleware.curation_deferral import DeferReason, deferral_justification
@@ -242,9 +243,10 @@ class CuratorDecision:
     pool_sizes: dict[str, int] = field(default_factory=dict)
     latency_ms: int = 0
     cost_usd: float = 0.0
-    # Set only by TaskCurator.curate_prepared when a candidate is a duplicate
-    # of another candidate in the same batch (neither yet materialised as a task).
-    # The worker substitutes the sibling's resulting task_id at dispatch time.
+    # Set only by TaskCurator.curate_prepared on a batch edge: a drop or combine
+    # of a candidate onto another candidate in the same batch (neither yet
+    # materialised as a task). The worker substitutes the sibling's resulting
+    # task_id at dispatch time.
     batch_target_index: int | None = None
     # True for a fail-open create that no dedupe judgement stands behind: the
     # response itself was unusable, or the curator never got one. False for a
@@ -260,6 +262,13 @@ class CuratorDecision:
     # The corpus streams whose read failed for this candidate: see
     # PoolWithheld.unavailable_streams.
     unavailable_streams: tuple[str, ...] = ()
+    # The curator's fast-path hint for a create (judging the candidate) or a
+    # combine (judging the rewrite). Applied to a created task's metadata by
+    # fused_memory/middleware/curator_complexity_hint.py.
+    complexity_hint: Literal['simple'] | None = None
+    # The drop or combine the LLM chose when POOL STATE vetoed it into this
+    # create, so the curator never judged the candidate as a create.
+    vetoed_action: Literal['drop', 'combine'] | None = None
 
     def __post_init__(self) -> None:
         if (self.action == 'defer') != (self.defer_reason is not None):
@@ -268,6 +277,28 @@ class CuratorDecision:
                 f'action={self.action!r} defer_reason={self.defer_reason!r}'
             )
         _require_pool_streams(self.unavailable_streams, 'CuratorDecision')
+        if self.complexity_hint not in (None, SIMPLE_COMPLEXITY):
+            raise ValueError(
+                f'CuratorDecision.complexity_hint must be None or {SIMPLE_COMPLEXITY!r}, '
+                f'got complexity_hint={self.complexity_hint!r}'
+            )
+        if self.vetoed_action is not None and (
+            self.vetoed_action not in ('drop', 'combine') or self.action != 'create' or self.degraded
+        ):
+            raise ValueError(
+                "CuratorDecision.vetoed_action must be None, or 'drop' or 'combine' on a "
+                f'non-degraded create, got vetoed_action={self.vetoed_action!r} '
+                f'action={self.action!r} degraded={self.degraded!r}'
+            )
+
+    def is_usable_create_verdict(self) -> bool:
+        """True iff a usable verdict, not a fail-open path or a fall-through, decided the candidate be created.
+
+        A create pool state vetoed from a drop or combine counts, as does
+        ``route_deterministic``. A degraded create does not, nor does a drop or
+        combine that fell through to create at dispatch.
+        """
+        return not self.degraded and self.action in ('create', 'route_deterministic')
 
     @classmethod
     def deferred(
@@ -296,6 +327,8 @@ class CuratorDecision:
             'cost_usd': self.cost_usd,
             'defer_reason': self.defer_reason,
             'unavailable_streams': list(self.unavailable_streams),
+            'complexity_hint': self.complexity_hint,
+            'vetoed_action': self.vetoed_action,
         }
 
 
@@ -576,8 +609,26 @@ def item_count_of(metadata: Mapping[str, Any]) -> int:
     return len(followup_items_of(metadata))
 
 
+# text-embedding-3-* accept 8,192 tokens, and a byte-level BPE token covers at
+# least one UTF-8 byte, so text of at most this many bytes is at most this many
+# tokens whatever it contains.
+EMBEDDING_INPUT_MAX_BYTES: Final = 8_000
+
+
+def clip_for_embedding(text: str) -> str:
+    """Cut *text* to at most ``EMBEDDING_INPUT_MAX_BYTES`` UTF-8 bytes, never splitting a character.
+
+    The one bound every curator embedding input goes through: stored and query
+    vectors are comparable only if both sides are cut alike. Never raises, and
+    always drops a lone surrogate, which UTF-8 cannot encode and the OpenAI
+    client refuses before sending, however short the text.
+    """
+    encoded = text.encode('utf-8', 'ignore')
+    return encoded[:EMBEDDING_INPUT_MAX_BYTES].decode('utf-8', 'ignore')
+
+
 def embedding_text(title: str, description: str, files_to_modify: list[str]) -> str:
-    """Compose the text every curator corpus embedding is computed over.
+    """Compose the text every curator corpus embedding is computed over, bounded by :func:`clip_for_embedding`.
 
     Single owner: a caller comparing cosine scores against stored tasks must
     compose its query with this, or the scores are not comparable.
@@ -587,7 +638,7 @@ def embedding_text(title: str, description: str, files_to_modify: list[str]) -> 
         parts.append(description)
     if files_to_modify:
         parts.append('\n'.join(files_to_modify))
-    return '\n\n'.join(parts)
+    return clip_for_embedding('\n\n'.join(parts))
 
 
 def clip_for_prompt(text: str, cap: int) -> str:

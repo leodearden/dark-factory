@@ -1,18 +1,7 @@
 """Whether a lock blocker's holder is live, following parks to their owner's own blockers.
 
-A HELD module's owner must be a slot this scheduler process has dispatched and
-not yet released; a lock outside every slot is a leak.  An in-flight owner with
-a live claimant (the dispatch gate's claimant/heartbeat liveness and TTL) is
-live: a workflow heartbeats for its whole slot, merge phase included.  Without
-one it is non-live when in-progress or blocked, and live when pending (dispatched,
-not yet claimed), terminal or gone from the task read (unwinding to its
-release).  A PARKED module's owner is a pending task waiting for its own
-modules; it is followed to those modules' blockers, at most
-``PARK_FOLLOW_DEPTH`` parks deep.  A park owner whose modules are all free
-waits only for a run slot, which is not a wedge.
-
-plans/scheduler-dispatch-scoring-and-lock-layer-prd.md C4 "Cap L1" records why
-the walk stops where it does.
+plans/scheduler-dispatch-scoring-and-lock-layer-prd.md C4 "Cap L1" *Liveness*
+states the rule and records why the walk stops where it does.
 """
 
 from __future__ import annotations
@@ -23,14 +12,12 @@ from datetime import datetime, timedelta
 from enum import StrEnum
 from typing import Any
 
-from shared.task_claimant import has_live_claimant
+from shared.task_claimant import carries_claimant, is_stranded_any_status, is_stranded_blocked
 from shared.task_statuses import TERMINAL, TaskStatus
 
 from orchestrator.pin_reservation import Blocker, BlockerKind
 
 PARK_FOLLOW_DEPTH = 3
-
-_UNCLAIMED_SLOT_STATUSES = TERMINAL | {TaskStatus.PENDING}
 
 
 class HolderState(StrEnum):
@@ -46,11 +33,14 @@ class HolderState(StrEnum):
 
 @dataclass(frozen=True)
 class LockWorld:
-    """One tick's view: active task records, each task's blockers, and the slots in flight."""
+    """One tick's view: active task records, each task's blockers, and the slots in flight.
+
+    ``as_of`` is the instant ``tasks`` was read, which every claimant heartbeat is judged as of.
+    """
 
     tasks: Mapping[str, Mapping[str, Any]]
     blockers_of: Callable[[str], Sequence[Blocker]]
-    now: datetime
+    as_of: datetime
     claimant_ttl: timedelta
     in_flight: frozenset[str]
 
@@ -94,14 +84,19 @@ def _held_owner_state(
 ) -> HolderState | None:
     if owner not in world.in_flight:
         return HolderState.LOCK_WITHOUT_SLOT
-    if record is None or has_live_claimant(record, world.now, world.claimant_ttl):
+    if record is None or _awaiting_claim_or_release(record):
         return None
-    status = record.get('status')
-    if status == TaskStatus.BLOCKED:
+    if is_stranded_blocked(record, world.as_of, world.claimant_ttl):
         return HolderState.BLOCKED
-    if status in _UNCLAIMED_SLOT_STATUSES:
-        return None
-    return HolderState.NO_LIVE_CLAIMANT
+    if is_stranded_any_status(record, world.as_of, world.claimant_ttl):
+        return HolderState.NO_LIVE_CLAIMANT
+    return None
+
+
+def _awaiting_claim_or_release(record: Mapping[str, Any]) -> bool:
+    """Terminal, or pending with no claimant: dispatched and not yet claimed, or unwinding to its slot release."""
+    status = record.get('status')
+    return status in TERMINAL or (status == TaskStatus.PENDING and not carries_claimant(record))
 
 
 def _active(record: Mapping[str, Any] | None) -> bool:

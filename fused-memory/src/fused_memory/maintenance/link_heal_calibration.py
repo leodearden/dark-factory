@@ -495,7 +495,8 @@ async def run_calibration(
 
     Every question is asked before the run row exists. A pair the adjudicator
     gave no verdict on is unanswered: counted, never ledgered. The report files
-    are dated by *now*'s UTC day, which must be timezone-aware.
+    are dated by *now*'s UTC day, which must be timezone-aware. The run row names
+    the invocations-ledger run its adjudicator's calls were written under.
     """
     if now.tzinfo is None:
         raise ValueError(f'a report is dated by a timezone-aware now; got {now.isoformat()}')
@@ -505,7 +506,9 @@ async def run_calibration(
         for item, verdict in zip(population, verdicts, strict=True)
         if not verdict.failed
     }
-    run_id = ledger.start_run(RunSource.CALIBRATION, writes=False)
+    run_id = ledger.start_run(
+        RunSource.CALIBRATION, writes=False, invocation_run_id=adjudicate.invocation_run_id,
+    )
     ledger.add_adjudications(run_id, list(answered.values()))
     result = assess_calibration(
         population,
