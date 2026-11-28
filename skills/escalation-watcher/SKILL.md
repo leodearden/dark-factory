@@ -1998,7 +1998,9 @@ whichever applies.
 
 - Stay recommend-only for the first two sittings.
 - Leave the trial only at 90% or more agreement AND a 60% or greater fall in sitting time, read from
-  `summary --ledger <ledger>` and the return brief's trial line.
+  `summary --ledger <ledger>` and the return brief's trial line. The 90% bar reads the trial line's
+  14-day figure, and only once that window holds at least 10 resolved records; below 10 the trial
+  stays in. The lifetime figure is context, not the bar (Leo, 2026-11-28, esc-12053-1).
 - One wrong autonomous close in 50 reverts to recommend-only: stop passing `--apply-closes`.
 
 ### Sitting markers: `x_prepared` and `x_agreed`
