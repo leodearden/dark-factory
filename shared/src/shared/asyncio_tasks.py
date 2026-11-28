@@ -159,9 +159,11 @@ async def _cancel_twice(
 
     A task can survive one ``cancel()``: an inner ``except CancelledError``
     that awaits again, or asyncio's subprocess transport cancelled between
-    spawning a child and connecting its pipes. The second cancel ends it. The
-    tasks that outlive both windows are returned; the exceptions of those that
-    ended are consumed.
+    spawning a child and connecting its pipes. The second cancel ends it,
+    except for a task awaiting :func:`gather_unwound`, which deliberately does
+    not end until its children have unwound and so may come back as still
+    running. The tasks that outlive both windows are returned; the exceptions
+    of those that ended are consumed.
     """
     pending = set(tasks)
     for window_secs in (first_window_secs, second_window_secs):
@@ -184,23 +186,52 @@ async def gather_unwound(*aws: Awaitable[_Gathered]) -> list[_Gathered]:
 
     A plain gather raises at its first cancelled or failed child, so a sibling
     still unwinding, for instance still killing its subprocess, would outlive
-    the call that gathered it. Here, as in a ``TaskGroup``, the other children are cancelled
-    and then awaited, and cancelling the caller again meanwhile does not cut
-    that wait short. The exception raised is the one the gather raised, unless
-    the caller was cancelled during the wait: that cancel is raised instead, so
-    it is never swallowed. A child already asked to cancel (a cancelled gather
-    asks every child) is not asked again, which would interrupt the kill it is
-    awaiting.
+    the call that gathered it. Here the other children are cancelled and then
+    awaited, as in a ``TaskGroup``, and cancelling the caller again meanwhile
+    does not cut that wait short. The exception raised is the one the gather
+    raised, unless the caller was cancelled: that cancel is raised instead, so
+    it is never swallowed, with the gather's exception as its context if the
+    gather had raised by then. Unlike a ``TaskGroup``, only that one exception
+    propagates: any other child failure, for instance a kill that failed while
+    unwinding from the caller's cancel, is logged at WARNING rather than
+    dropped. Cancelling the caller, once or repeatedly, asks each child to
+    cancel at most once, and never a child already cancelling: asking again
+    would interrupt the kill it is awaiting.
     """
     children = [asyncio.ensure_future(aw) for aw in aws]
+    gathered = asyncio.gather(*children)
+    gathered.add_done_callback(_consume_outcome)
     try:
-        return await asyncio.gather(*children)
-    except BaseException:
+        await asyncio.wait((gathered,))
+        return gathered.result()
+    except BaseException as raised:
         for child in children:
             if not (isinstance(child, asyncio.Task) and child.cancelling()):
                 child.cancel()
-        await _await_all_through_cancels(children)
+        try:
+            await _await_all_through_cancels(children)
+        finally:
+            _log_failures_other_than(raised, children)
         raise
+
+
+def _consume_outcome(gathered: asyncio.Future) -> None:
+    """Retrieve *gathered*'s exception, which nothing else retrieves once the caller has stopped waiting for it."""
+    if not gathered.cancelled():
+        gathered.exception()
+
+
+def _log_failures_other_than(raised: BaseException, children: Sequence[asyncio.Future]) -> None:
+    """Log each ended child's failure that is neither a cancel nor *raised*, which reaches the caller anyway."""
+    for child in children:
+        failure = None if child.cancelled() else child.exception()
+        if failure is None or failure is raised or isinstance(failure, asyncio.CancelledError):
+            continue
+        logger.warning(
+            'gather_unwound child %r failed, but its caller sees another exception, so the failure is logged here',
+            child,
+            exc_info=failure,
+        )
 
 
 async def _await_all_through_cancels(children: Sequence[asyncio.Future]) -> None:

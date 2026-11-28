@@ -465,6 +465,55 @@ async def _unwinds_slowly(label: str, started: asyncio.Event, record: list[str],
         record.append(f'{label}-unwound')
 
 
+async def _unwinds_once_released(
+    label: str, started: asyncio.Event, unwinding: asyncio.Event, release: asyncio.Event, record: list[str],
+) -> None:
+    started.set()
+    try:
+        await asyncio.Event().wait()
+    except asyncio.CancelledError:
+        unwinding.set()
+        try:
+            await release.wait()
+        except asyncio.CancelledError:
+            record.append(f'{label}-unwind-interrupted')
+            raise
+        record.append(f'{label}-unwound')
+        raise
+
+
+async def _gather_cancelled_twice_mid_unwind(record: list[str]) -> tuple[asyncio.Task, list[list[str]]]:
+    """Cancel a two-child gather, then cancel it again once both children are unwinding.
+
+    Returns the gather's still-running task, and what *record* held when it ended.
+    """
+    a_started, b_started, a_unwinding, b_unwinding, release = (asyncio.Event() for _ in range(5))
+    outer = asyncio.create_task(gather_unwound(
+        _unwinds_once_released('a', a_started, a_unwinding, release, record),
+        _unwinds_once_released('b', b_started, b_unwinding, release, record),
+    ))
+    await _all_started(a_started, b_started)
+    at_return = _record_at_return(outer, record)
+
+    outer.cancel()
+    await _all_started(a_unwinding, b_unwinding)
+    outer.cancel()
+    release.set()
+    return outer, at_return
+
+
+class _UnwindFailed(Exception):
+    pass
+
+
+async def _fails_while_unwinding(started: asyncio.Event) -> None:
+    started.set()
+    try:
+        await asyncio.Event().wait()
+    except asyncio.CancelledError:
+        raise _UnwindFailed('raised while unwinding from a cancel') from None
+
+
 async def _raises_boom_after_siblings_start(started: asyncio.Event, *siblings_started: asyncio.Event) -> None:
     started.set()
     await _all_started(*siblings_started)
@@ -518,6 +567,48 @@ class TestGatherUnwound:
                 await outer
 
         assert at_return == [['a-unwound']]
+
+    async def test_a_second_outer_cancel_before_any_child_has_ended_interrupts_no_unwind(self):
+        record: list[str] = []
+        outer, at_return = await _gather_cancelled_twice_mid_unwind(record)
+
+        with pytest.raises(asyncio.CancelledError):
+            await outer
+
+        assert [sorted(snapshot) for snapshot in at_return] == [['a-unwound', 'b-unwound']]
+
+    async def test_cancelling_the_caller_twice_mid_unwind_leaves_no_exception_unretrieved(self):
+        with _recorded_loop_errors() as errors:
+            outer, _at_return = await _gather_cancelled_twice_mid_unwind([])
+            with pytest.raises(asyncio.CancelledError):
+                await outer
+            await asyncio.sleep(0)
+            outer_ref = weakref.ref(outer)
+            del outer
+            _collect_and_confirm_gone(outer_ref)
+
+        assert errors == []
+
+    @pytest.mark.parametrize('failing_child_first', [True, False], ids=['failing-child-first', 'failing-child-last'])
+    async def test_a_child_failing_while_unwinding_from_a_caller_cancel_is_logged_not_raised(
+        self, caplog, failing_child_first,
+    ):
+        failing_started, sibling_started = asyncio.Event(), asyncio.Event()
+        children = [_fails_while_unwinding(failing_started), _parked(sibling_started)]
+        if not failing_child_first:
+            children.reverse()
+        outer = asyncio.create_task(gather_unwound(*children))
+        await _all_started(failing_started, sibling_started)
+
+        with caplog.at_level(logging.WARNING, logger='shared.asyncio_tasks'), _recorded_loop_errors() as errors:
+            outer.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await outer
+
+        assert errors == []
+        logged_failures = [record.exc_info[1] for record in caplog.records if record.exc_info is not None]
+        assert len(logged_failures) == 1
+        assert isinstance(logged_failures[0], _UnwindFailed)
 
     async def test_a_cancel_while_unwinding_after_a_failure_is_not_swallowed(self):
         record: list[str] = []
