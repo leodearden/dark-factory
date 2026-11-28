@@ -2404,7 +2404,7 @@ async def _serve_primary_and_recon(
     except BaseException:
         for task in tasks:
             task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
+        await asyncio.wait(tasks)
         raise
     finally:
         for stopped_server, task in serving:
