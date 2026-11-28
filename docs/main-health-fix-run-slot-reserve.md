@@ -112,8 +112,15 @@ From `docs/code-quality.md`:
   is halted for the heal. That holder cannot finish before the heal lands, and
   nothing may preempt it. Today only the starvation watchdog's `park_blocked`
   L1 names it for a human, after `park_blocked_age_secs` (default 4 h). Raising
-  that case at once for a main-health fix is filed as a follow-up (ticket
-  `tkt_0RXGKM3ZHJM1P4T50NG5AWKG1J`).
+  that case at once for a main-health fix is task 12013.
+- With `pin_reservation_max_active` above 1, a pin the fix moved back off the
+  head keeps the pin-rank parks it already holds. Those parks still rank as
+  `PinOrder(1)`, because
+  `orchestrator/src/orchestrator/lock_table.py::ModuleLockTable.unparked_modules`
+  treats a better existing rank as covering and nothing re-ranks it. On a
+  shared module that stale rank ties the fix's, and the park key's id
+  tie-break decides who takes it first. Two fixes tie in the same way. At the
+  default of 1 the demoted pin's reservation is released, so no tie arises.
 - Resolved by task 10600: an admitted fix is exempt from the PSI admission
   gate's hold on every tick, in both dispatch loops. The rationale and the load
   bound are DA-D10 of `docs/prds/dispatch-admission-load-cap.md`.
@@ -150,9 +157,17 @@ Ownership rules:
 
 - An operator's row for the task stands. It is never written.
 - An operator's unpin of the fix stands. The owner's unpinned row is left as it
-  is.
+  is. Only `clear_task_priority_override(field='pinned')` leaves that row. The
+  tool's default whole-row clear deletes it, so the next adoption of a
+  still-pending fix pins it at the head again. In the same way, an operator's
+  `field='reserve_now'` clear is re-armed at the next grant: the store cannot
+  tell it from the scheduler consuming the flag. To keep a fix off the head,
+  clear `pinned`.
 - A starvation-watchdog row is taken over and its TTL dropped, so
   `clear_expired` cannot later remove the fix's pin.
+- A row of any other source raises `ValueError` and writes nothing. A new
+  `OverrideSource` must be given its rule in
+  `orchestrator/src/orchestrator/overrides.py::_write_main_health_fix_pin`.
 
 Why the in-process store, not the `set_task_priority_override` MCP tool: both
 write `scheduler_overrides.db`, but the tool stamps `source='operator'`, so a
@@ -163,9 +178,10 @@ Lock precedence: the fix parks behind a held lock and never preempts it.
 "Preemption / force-release of a HELD lock" is explicitly rejected in
 `plans/scheduler-dispatch-scoring-and-lock-layer-prd.md` §7.
 
-- As pin head, a lock-blocked fix reserves its modules at pin rank, so it takes
-  a released module ahead of every operator pin, tier park and critical
-  candidate.
+- As pin head, a lock-blocked fix reserves its modules at pin rank. At the
+  default `pin_reservation_max_active` of 1, it therefore takes a released
+  module ahead of every operator pin, tier park and critical candidate. A
+  higher cap leaves a rank tie (§6).
 - `Scheduler._bound_pin_reservations` keeps the first
   `pin_reservation_max_active` reservation owners in queue order. The fix is
   first, so it is kept ahead of a PSI-deferred operator head, which removes the
