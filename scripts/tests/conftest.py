@@ -635,12 +635,13 @@ class SeedingConnection(sqlite3.Connection):
         project_id='dark_factory',
         review_cycles=0,
         execute_iterations=0,
+        verify_attempts=0,
     ):
         """Insert one `task_results` row: one task's outcome within one run."""
         self.execute(
             'INSERT INTO task_results (run_id, task_id, project_id, outcome, '
-            'review_cycles, execute_iterations, completed_at) '
-            'VALUES (?, ?, ?, ?, ?, ?, ?)',
+            'review_cycles, execute_iterations, verify_attempts, completed_at) '
+            'VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
             (
                 run_id,
                 str(task_id),
@@ -648,6 +649,7 @@ class SeedingConnection(sqlite3.Connection):
                 outcome,
                 review_cycles,
                 execute_iterations,
+                verify_attempts,
                 completed_at,
             ),
         )

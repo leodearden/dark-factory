@@ -4,7 +4,7 @@
 Contract: plans/routing-experiment-substrate-prd.md §"The readout (β)". Strictly
 read-only: every store is opened with a ``mode=ro`` URI.
 
-Exit codes:
+Exit codes of the metric readout (and of --aa):
   0  report printed
   1  --aa: a headline metric's |observed arm difference| exceeds its null p99
   2  usage error (argparse)
@@ -12,11 +12,20 @@ Exit codes:
   4  unproven: an --expect-rule id is absent from the window, --subset has no
      plan-shape producer row, or an --aa headline metric has too few eligible
      tasks in an arm
+
+--throughput is a separate mode with its own options (``--throughput --help``):
+landed-per-dollar by arm over a first-dispatch cohort, computed by
+routing_throughput.py. It prints three ruled tables and ends with one JSON
+line. Its exit codes:
+  0  report printed
+  2  usage error (argparse)
+  3  COMPLIANCE FAILURE: a treated task was dispatched at the control effort
+  4  unproven: no routing_decision carries --rule-prefix, so since is unknown
+  5  a runs.db, its landing datum or main's git history could not be read
 """
 from __future__ import annotations
 
 import argparse
-import itertools
 import json
 import math
 import os
@@ -38,16 +47,34 @@ from typing import Protocol, TypeVar
 
 import _checkout as _checkout
 from _task_db_scan import UNREADABLE_STORE_ERRORS, decode_metadata
-from shared.project_layout import KNOWN_PROJECT_ROOTS_ENV, known_project_roots, runs_db, tasks_db
+from routing_throughput import (
+    BLOCKED_OUTCOMES,
+    ThroughputOptions,
+    ThroughputUnavailable,
+    Unavailable,
+    summary_record,
+    throughput_report,
+)
+from routing_throughput import render_text as render_throughput_text
+from shared.project_layout import (
+    KNOWN_PROJECT_ROOTS_ENV,
+    default_project_root,
+    known_project_roots,
+    runs_db,
+    tasks_db,
+)
 from shared.routing_split import split_bucket
 from shared.sqlite_readonly import connect_readonly
 from shared.tasks_db_readonly import TaskDbUnreadable, connect_ro
+from split_resampling import null_cuts, permuted_arms
 from systemd_unit_environment import SystemdUnanswered, UnitNotLoaded, inspect_unit
 
 EXIT_OK = 0  # report printed
 EXIT_AA_SKEWED = 1  # --aa: a headline metric's |diff| exceeds its null p99
 EXIT_NOTHING_READ = 3  # no root resolved, or no runs.db readable
 EXIT_UNPROVEN = 4  # a producer or eligibility precondition of the claim is unmet
+EXIT_COMPLIANCE_FAILURE = 3  # --throughput: a treated task dispatched at the control effort
+EXIT_UNREADABLE = 5  # --throughput: a runs.db, landing datum or git history unreadable
 
 DEFAULT_SEED = 20261103  # seat N's prototype seed
 DEFAULT_RESAMPLES = 4000  # the PRD's A/A null size
@@ -166,7 +193,6 @@ def read_fused_memory_unit_environment() -> UnitRead:
 # plus experiment 1's large-plan-modules-4 (plans/routing-experiment-substrate-prd.md
 # §"Experiment 1"). Matched by membership, never by prefix.
 LARGE_PLAN_RULE_IDS = frozenset({'large-plan-steps', 'large-plan-modules', 'large-plan-modules-4'})
-BLOCKED_OUTCOMES = frozenset({'blocked', 'escalated'})
 LANDED_OUTCOME = 'done'
 IMPLEMENTER_ROLE = 'implementer'
 CURATOR_HINT_KEY = 'x_curator_complexity_hint'
@@ -807,22 +833,16 @@ def _null_diffs(
 ) -> dict[tuple[int, int], list[float]]:
     """Signed differences per (arm, metric index) under random relabelling of the pooled tasks.
 
-    Each resample draws one random ordering of all but the last arm's worth of
-    tasks; every metric reads that same draw, sliced into consecutive arms of
-    the observed sizes, with the last arm as its complement. That is a
-    permutation of the observed labels at half a shuffle's cost. A resample in
-    which an arm has no eligible task is skipped for that metric.
+    Every metric reads the same split_resampling.permuted_arms draw, with the
+    last arm as its complement. A resample in which an arm has no eligible task
+    is skipped for that metric.
     """
     diffs: dict[tuple[int, int], list[float]] = {pair: [] for pair in testable}
     if not testable:
         return diffs
-    population = range(sum(sizes))
-    bounds = list(itertools.accumulate(sizes[:-1], initial=0))
     indices = sorted({index for _, index in testable})
     totals = {index: columns[index].totals() for index in indices}
-    for _ in range(resamples):
-        order = rng.sample(population, bounds[-1])
-        drawn_arms = [order[low:high] for low, high in itertools.pairwise(bounds)]
+    for drawn_arms in permuted_arms(sizes, resamples, rng):
         sums = {
             index: _resampled_arm_sums(columns[index], totals[index], drawn_arms)
             for index in indices
@@ -837,8 +857,8 @@ def _null_diffs(
 def _null_band(diffs: Sequence[float]) -> NullBand | None:
     if len(diffs) < 2:
         return None
-    cuts = statistics.quantiles([abs(diff) for diff in diffs], n=100, method='inclusive')
-    return NullBand(p95=cuts[94], p99=cuts[98], mde=_MDE_Z * statistics.stdev(diffs))
+    p95, p99 = null_cuts([abs(diff) for diff in diffs])
+    return NullBand(p95=p95, p99=p99, mde=_MDE_Z * statistics.stdev(diffs))
 
 
 def _metric_row(
@@ -962,7 +982,103 @@ def _parser() -> argparse.ArgumentParser:
         help='a routing rule id that must appear in the window (repeatable)',
     )
     parser.add_argument('--json', action='store_true')
+    parser.add_argument(
+        '--throughput', action='store_true',
+        help='the landed-per-dollar mode, with its own options: see --throughput --help',
+    )
     return parser
+
+
+def _mode_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument('--throughput', action='store_true')
+    return parser
+
+
+THROUGHPUT_RESAMPLES = 10000
+
+
+def _interval_level(text: str) -> float:
+    level = float(text)
+    if not 0 < level < 1:
+        raise argparse.ArgumentTypeError(f'lies strictly between 0 and 1, got {level}')
+    return level
+
+
+def _names(text: str) -> tuple[str, ...]:
+    return tuple(name.strip() for name in text.split(',') if name.strip())
+
+
+def _root_list(text: str) -> tuple[Path, ...]:
+    roots = _distinct(_roots_listed(text))
+    if not roots:
+        raise argparse.ArgumentTypeError(f'names no root: {text!r}')
+    return roots
+
+
+def _throughput_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog='routing_experiment_readout.py --throughput',
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument('--salt', required=True, help="the experiment's split salt")
+    parser.add_argument(
+        '--rule-prefix', required=True,
+        help='the prefix of every treated routing rule id; its first dispatch dates since',
+    )
+    parser.add_argument('--buckets', type=_bucket_count, default=2)
+    parser.add_argument('--treated-bucket', type=int, default=1)
+    parser.add_argument(
+        '--roles', type=_names, default=('implementer', 'debugger'),
+        help='comma-separated roles whose first dispatch admits a task (default implementer,debugger)',
+    )
+    parser.add_argument('--treated-effort', default='high')
+    parser.add_argument('--control-effort', default='xhigh')
+    parser.add_argument(
+        '--since', type=_utc_instant, default=None,
+        help='cohort start, ISO-8601 with a UTC offset (default: the first prefixed dispatch)',
+    )
+    parser.add_argument(
+        '--cohort-days', type=_positive_int, default=None,
+        help='cohort length in days (default: the cohort runs to --read-at)',
+    )
+    parser.add_argument(
+        '--read-at', type=_utc_instant, default=None,
+        help='nothing at or after it counts, ISO-8601 with a UTC offset (default: now)',
+    )
+    parser.add_argument(
+        '--roots', type=_root_list, default=None,
+        help='comma-separated project roots (default: the dark-factory main checkout only)',
+    )
+    parser.add_argument('--interval-level', type=_interval_level, default=0.90)
+    parser.add_argument('--seed', type=int, default=DEFAULT_SEED)
+    parser.add_argument('--resamples', type=_positive_int, default=THROUGHPUT_RESAMPLES)
+    return parser
+
+
+def throughput_options(argv: Sequence[str]) -> ThroughputOptions:
+    """The --throughput mode's options from *argv* (without --throughput); a bad value exits 2."""
+    parser = _throughput_parser()
+    args = parser.parse_args(argv)
+    try:
+        return ThroughputOptions(
+            salt=args.salt,
+            buckets=args.buckets,
+            treated_bucket=args.treated_bucket,
+            roles=args.roles,
+            rule_prefix=args.rule_prefix,
+            treated_effort=args.treated_effort,
+            control_effort=args.control_effort,
+            since=args.since,
+            cohort_days=args.cohort_days,
+            read_at=args.read_at or datetime.now(UTC),
+            roots=args.roots or (default_project_root(),),
+            interval_level=args.interval_level,
+            seed=args.seed,
+            resamples=args.resamples,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
 
 
 @dataclass(frozen=True)
@@ -1235,12 +1351,34 @@ def _settings(args: argparse.Namespace) -> Settings:
     )
 
 
+_UNAVAILABLE_EXIT = {
+    Unavailable.NO_TREATED_DISPATCH: EXIT_UNPROVEN,
+    Unavailable.STORE_UNREADABLE: EXIT_UNREADABLE,
+    Unavailable.HISTORY_UNREADABLE: EXIT_UNREADABLE,
+}
+
+
+def _throughput_main(argv: Sequence[str]) -> int:
+    options = throughput_options(argv)
+    try:
+        report = throughput_report(options)
+    except ThroughputUnavailable as exc:
+        _warn(str(exc))
+        return _UNAVAILABLE_EXIT[exc.kind]
+    sys.stdout.write(render_throughput_text(report))
+    sys.stdout.write(json.dumps(summary_record(report)) + '\n')
+    return EXIT_COMPLIANCE_FAILURE if report.compliance.failures else EXIT_OK
+
+
 def main(
     argv: Sequence[str] | None = None,
     *,
     environ: Mapping[str, str] = os.environ,
     unit_environment: Callable[[], UnitRead] = read_fused_memory_unit_environment,
 ) -> int:
+    mode, rest = _mode_parser().parse_known_args(argv)
+    if mode.throughput:
+        return _throughput_main(rest)
     args = _parser().parse_args(argv)
     selection = resolve_roots(args.roots, environ, unit_environment)
     if not selection.roots:

@@ -135,6 +135,21 @@ def test_seed_task_result_round_trips_its_columns(runs_db, runs_db_path):
     ) == [('run-7', '42', 'reify', 'blocked', 2, 3, '2026-11-01T10:00:00+00:00')]
 
 
+def test_seed_task_result_stores_a_given_verify_attempts_and_zero_when_omitted(
+    runs_db, runs_db_path,
+):
+    runs_db.seed_task_result(
+        task_id=1, outcome='done', completed_at='2026-11-01T10:00:00+00:00', verify_attempts=3,
+    )
+    runs_db.seed_task_result(
+        task_id=2, outcome='done', completed_at='2026-11-01T11:00:00+00:00',
+    )
+
+    assert _read(
+        runs_db_path, 'SELECT task_id, verify_attempts FROM task_results ORDER BY task_id',
+    ) == [('1', 3), ('2', 0)]
+
+
 def test_make_seeding_runs_db_opens_a_seeding_connection_on_the_directorys_runs_db(
     make_seeding_runs_db, make_runs_db, tmp_path,
 ):

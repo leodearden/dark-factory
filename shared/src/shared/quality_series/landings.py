@@ -21,11 +21,13 @@ __all__ = [
     'LandingBatch',
     'LandingSource',
     'LinesBase',
+    'RecordedLanding',
     'UnrecognisedTrainEvent',
     'landings',
     'parse_utc',
     'recorded_landing_instants',
     'recorded_landing_keys',
+    'recorded_landings',
 ]
 
 
@@ -159,6 +161,19 @@ class LandingBatch:
 
 
 @dataclass(frozen=True)
+class RecordedLanding:
+    """One landing as runs.db records it: the task, the sha it landed under, when, and which event said so.
+
+    landed_at is timezone-aware.
+    """
+
+    task_id: str
+    merge_sha: str
+    landed_at: datetime
+    source: LandingSource
+
+
+@dataclass(frozen=True)
 class _Recorded:
     landed: datetime
     merge_sha: str
@@ -245,6 +260,14 @@ def recorded_landing_keys(
         (recorded.merge_sha, recorded.task_id)
         for recorded in _recorded_history(runs_db)
         if recorded_after is None or recorded.landed > recorded_after
+    )
+
+
+def recorded_landings(runs_db: sqlite3.Connection) -> tuple[RecordedLanding, ...]:
+    """Each landing runs.db records, earliest per (merge_sha, task_id), oldest first; reads runs.db, never git."""
+    return tuple(
+        RecordedLanding(recorded.task_id, recorded.merge_sha, recorded.landed, recorded.source)
+        for recorded in _recorded_history(runs_db)
     )
 
 
