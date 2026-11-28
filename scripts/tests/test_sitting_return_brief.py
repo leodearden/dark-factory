@@ -44,6 +44,8 @@ NOW = datetime(2026, 9, 26, 5, 30, tzinfo=UTC)
 NOW_ISO = NOW.isoformat()
 IN_WINDOW = '2026-09-25T18:00:00+00:00'
 BEFORE_WINDOW = '2026-09-20T18:00:00+00:00'
+THREE_DAYS_AGO = (NOW - timedelta(days=3)).isoformat()
+TWENTY_DAYS_AGO = (NOW - timedelta(days=20)).isoformat()
 CLOSED_IN_WINDOW = '2026-09-25T20:00:00+00:00'
 NIGHT_TWO = (NOW + timedelta(days=1)).isoformat()
 NIGHT_THREE = (NOW + timedelta(days=2)).isoformat()
@@ -277,6 +279,10 @@ def _header(text: str) -> str:
     return text.split('\n## ', 1)[0]
 
 
+def _trial_line(header: str, project: str) -> str:
+    return next(line for line in header.splitlines() if line.startswith(f'  - {project}: '))
+
+
 def _run(capsys, argv: list[str]) -> tuple[int, str]:
     rc = mod.main(argv)
     return rc, capsys.readouterr().out
@@ -414,6 +420,31 @@ class TestHeader:
         trial = next(line for line in header.splitlines() if 'dark_factory' in line and 'agreement' in line)
         assert 'agreement 1/1' in trial and 'resolution_turns n=1' in trial and 'median 1' in trial
         assert 'recommend-only' in header
+        intro = next(line for line in header.splitlines() if line.startswith('- preparer trial'))
+        assert f'trailing {fleet_state.TRIAL_WINDOW_DAYS} days' in intro and 'lifetime' in intro
+
+    def test_the_trial_line_states_the_trailing_and_lifetime_agreement_and_window_turns(self, env):
+        _esc(env.queue, id='esc-130-1', status='resolved', resolved_at=THREE_DAYS_AGO, resolved_by='interactive',
+             triage_note=_trial_note(), resolution_turns=4)
+        _esc(env.queue, id='esc-131-1', status='resolved', resolved_at=TWENTY_DAYS_AGO, resolved_by='interactive',
+             triage_note=_trial_note(), resolution_turns=6)
+
+        trial = _trial_line(_header(mod.render(env.build())), 'dark_factory')
+
+        assert f'{fleet_state.TRIAL_WINDOW_DAYS}-day agreement 2/2 (100%) over n=2 prepared' in trial
+        assert 'lifetime agreement 3/3 (100%) over n=3 prepared' in trial
+        assert 'resolution_turns n=1 of 1 resolved L2s in the window' in trial and 'median 1' in trial
+
+    def test_a_queue_with_no_marker_stamped_record_renders_zero_of_zero_for_both_windows(self, env):
+        reify = env.tmp / 'src' / 'reify'
+        _esc(reify / 'data' / 'escalations', id='esc-140-1', status='resolved', resolved_at=IN_WINDOW,
+             resolved_by='interactive')
+
+        trial = _trial_line(_header(mod.render(env.build(env.df, reify))), 'reify')
+
+        assert f'{fleet_state.TRIAL_WINDOW_DAYS}-day agreement 0/0 over n=0 prepared' in trial
+        assert 'lifetime agreement 0/0 over n=0 prepared' in trial
+        assert 'not measured' not in trial
 
     def test_no_preparation_recorded_is_stated(self, env):
         env.preparation.unlink()

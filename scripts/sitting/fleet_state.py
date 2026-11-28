@@ -72,6 +72,7 @@ SHADOW_ONLY = (
 
 _LANDINGS_UNREADABLE = (GitUnavailable, GitTimeout, GitObjectMissing, UnrecognisedTrainEvent)
 ACTIVE_UNIT_STATES = frozenset({'active', 'reloading', 'activating'})
+TRIAL_WINDOW_DAYS = 14
 
 T = TypeVar('T')
 Refusal = tuple[Status, Shortfall]
@@ -230,8 +231,8 @@ class TurnsDistribution:
 
 
 @dataclass(frozen=True)
-class PreparerTrial:
-    """How often Leo's answer matched the prepared recommendation, over records resolved in the window.
+class TrialAgreement:
+    """How often Leo's answer matched the prepared recommendation, over one population of resolved records.
 
     ``n`` counts records whose ``x_prepared`` marker is readable. The rate's
     denominator is the subset that recommended an option and whose last
@@ -246,11 +247,19 @@ class PreparerTrial:
     no_lean: int
     unanswered: int
     rejected: int
-    resolution_turns: TurnsDistribution
 
     @property
     def rate(self) -> float | None:
         return self.numerator / self.denominator if self.denominator else None
+
+
+@dataclass(frozen=True)
+class PreparerTrial:
+    """Agreement over the trailing TRIAL_WINDOW_DAYS and over every resolved record held; turns over the page window."""
+
+    trailing: TrialAgreement
+    lifetime: TrialAgreement
+    resolution_turns: TurnsDistribution
 
 
 @dataclass(frozen=True)
@@ -457,12 +466,14 @@ def standing_policy_rulings(
 
 
 def preparer_trial(queue_dirs: Iterable[str], window: Window, *, now: datetime) -> Measurement[PreparerTrial]:
-    """The recommend-only trial's agreement and attention instruments, over records resolved in *window*."""
-    def measure(queues: Sequence[str]) -> tuple[PreparerTrial, tuple[Shortfall, ...]]:
-        resolved, shortfalls = _resolved_in_window(queues, window)
-        return _trial(resolved), shortfalls
+    """The recommend-only trial's agreement instruments over its own windows, and its attention instrument over *window*."""
+    trailing = Window.trailing(now, days=TRIAL_WINDOW_DAYS)
 
-    return _over_queues(queue_dirs, _trial(()), measure, now)
+    def measure(queues: Sequence[str]) -> tuple[PreparerTrial, tuple[Shortfall, ...]]:
+        resolved, shortfalls = _records(queues, lambda esc: esc.status != 'pending')
+        return _trial(resolved, page=window, trailing=trailing), shortfalls
+
+    return _over_queues(queue_dirs, _no_trial(), measure, now)
 
 
 def measure_projects(
@@ -604,7 +615,7 @@ def _measure_project(
         spend=guarded('runs_db', str(runs_db), (), lambda: spend_and_cap_hits(runs_db, window, now=now)),
         standing_policy=guarded('escalation_queue', queue_source, StandingPolicyRulings(_fold_reports((), window)),
                                 lambda: standing_policy_rulings(queues, window, now=now)),
-        trial=guarded('escalation_queue', queue_source, _trial(()), lambda: preparer_trial(queues, window, now=now)),
+        trial=guarded('escalation_queue', queue_source, _no_trial(), lambda: preparer_trial(queues, window, now=now)),
         unit_active=guarded('orchestrator_units', str(root), False, lambda: unit_active(root, units, now=now)),
         pause_reason=guarded('runs_db', str(runs_db), None, lambda: scheduler_pause(runs_db, now=now)),
         new_escalations=guarded('escalation_queue', queue_source, 0,
@@ -692,30 +703,34 @@ def _records(
     return kept, tuple(shortfalls)
 
 
-def _resolved_in_window(queues: Sequence[str], window: Window) -> tuple[list[Escalation], tuple[Shortfall, ...]]:
-    return _records(
-        queues, lambda esc: esc.status != 'pending' and window.holds(inventory.parse_stamp(esc.resolved_at)),
+def _no_trial() -> PreparerTrial:
+    return PreparerTrial(trailing=_agreement(()), lifetime=_agreement(()), resolution_turns=_turns(()))
+
+
+def _trial(resolved: Sequence[Escalation], *, page: Window, trailing: Window) -> PreparerTrial:
+    def held_in(window: Window) -> list[Escalation]:
+        return [esc for esc in resolved if window.holds(inventory.parse_stamp(esc.resolved_at))]
+
+    return PreparerTrial(
+        trailing=_agreement(held_in(trailing)),
+        lifetime=_agreement(resolved),
+        resolution_turns=_turns([esc for esc in held_in(page) if esc.level == 2]),
     )
 
 
-def _trial(resolved: Iterable[Escalation]) -> PreparerTrial:
+def _agreement(resolved: Iterable[Escalation]) -> TrialAgreement:
     outcomes: Counter[TrialOutcome] = Counter()
-    level_two: list[Escalation] = []
     for esc in resolved:
         outcome = _trial_outcome(esc.triage_note if isinstance(esc.triage_note, str) else '')
         if outcome is not None:
             outcomes[outcome] += 1
-        if esc.level == 2:
-            level_two.append(esc)
-    counted = sum(outcomes.values()) - outcomes['rejected']
-    return PreparerTrial(
-        n=counted,
+    return TrialAgreement(
+        n=sum(outcomes.values()) - outcomes['rejected'],
         numerator=outcomes['agreed'],
         denominator=outcomes['agreed'] + outcomes['disagreed'],
         no_lean=outcomes['no_lean'],
         unanswered=outcomes['unanswered'],
         rejected=outcomes['rejected'],
-        resolution_turns=_turns(level_two),
     )
 
 

@@ -6871,6 +6871,21 @@ new escalations. So the render runs one `git rev-list` per measured root and
 one `systemctl --user show` per orchestrator unit naming one. It makes no
 network call.
 
+**The preparer trial line.** The header carries one trial line per measured
+project, of the form `<project>: 14-day agreement a/b (r%) over n=N prepared
+(...); lifetime agreement ...; resolution_turns ... in the window`.
+Agreement counts Leo choosing the prepared recommendation, read from the
+`x_prepared` and `x_agreed` markers (`skills/escalation-watcher/SKILL.md`,
+"Sitting markers"). The 14-day figure covers records resolved in the
+trailing 14 days, whatever `--window-days` is
+(`scripts/sitting/fleet_state.py::TRIAL_WINDOW_DAYS`). Lifetime covers every
+resolved record the project's queues still hold, in the root tier and the
+archive. It therefore reaches back only as far as
+`escalation/src/escalation/archive.py::prune_archive` keeps archive subdirs.
+`resolution_turns` stays on the page window. The trial's exit criterion reads
+its agreement from this line (`skills/escalation-watcher/SKILL.md`, "Trial
+and kill criteria").
+
 **Adding a project.** The brief measures every project root that holds a
 queue the night scanned: each configured root's own queues, plus every queue
 the decision registry has recorded. So a project appears once the registry
