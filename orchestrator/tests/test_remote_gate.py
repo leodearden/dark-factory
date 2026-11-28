@@ -45,6 +45,7 @@ from orchestrator.deployed_sha import DeployedSha
 from orchestrator.event_store import EventType
 from orchestrator.remote_gate import (
     GATE_ROOT_MARKER,
+    REAP_STAMP,
     EnsureReport,
     GateIdentity,
     GateIdentityPair,
@@ -1630,12 +1631,43 @@ def test_the_reaper_applies_the_seven_day_rule_to_the_minute(gate_root: Path):
     assert just_short.exists()
 
 
+def test_a_completed_reap_stamps_the_gate_root(gate_root: Path):
+    _dir(gate_root, '1' * 40, days=8)
+    before = time.time()
+
+    result = _reap(gate_root)
+
+    assert result.returncode == 0, result.stderr
+    stamp = gate_root / REAP_STAMP
+    assert stamp.is_file()
+    assert stamp.stat().st_mtime >= before - 1
+
+
+def test_a_reap_that_fails_leaves_no_stamp(gate_root: Path):
+    if os.geteuid() == 0:
+        pytest.skip('root empties a read-only dir')
+    old_trash = _dir(gate_root, '.trash-old', days=2)
+    locked = old_trash / 'locked'
+    locked.mkdir()
+    (locked / 'file').write_text('x')
+    _age(old_trash, 2)
+    locked.chmod(0o500)
+    try:
+        result = _reap(gate_root)
+    finally:
+        locked.chmod(0o700)
+
+    assert result.returncode != 0
+    assert not (gate_root / REAP_STAMP).exists()
+
+
 def test_the_reaper_leaves_an_unmarked_root_alone(gate_root: Path):
     (gate_root / GATE_ROOT_MARKER).unlink()
     idle = _dir(gate_root, '1' * 40, days=30)
 
     assert _reap(gate_root).returncode == 0
     assert idle.exists()
+    assert not (gate_root / REAP_STAMP).exists()
 
 
 def test_the_reaper_skips_a_sha_whose_build_lock_is_held(gate_root: Path):
