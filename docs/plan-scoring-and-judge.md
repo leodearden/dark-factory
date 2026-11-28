@@ -1180,8 +1180,8 @@ turns the trial role used until task 11728 (code:
 `reviewer_trial/runner.py::LEGACY_PANEL_MAX_TURNS`), and at its arm's pinned
 budget. An arm that now takes production's budget ran at
 `reviewer_trial/runner.py::LEGACY_PRODUCTION_BUDGET_USD` ($5).
-`variant_fable52_solo`, unpinned by task 11964, postdates the run key, so it
-has no keyless panels for this rule to misread. The rule's one
+An arm added after the run key (task 6741), such as `variant_fable52_solo`,
+has no keyless panels, so this rule never applies to it. The rule's one
 home is `reviewer_trial/runner.py::_ran_like_legacy`. At any other cap or
 budget, production's defaults included, the panel is re-run into the keyed
 file and the legacy one is left in place. Each hit and each pass-over is

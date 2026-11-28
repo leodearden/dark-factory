@@ -279,5 +279,6 @@ attempts included:
 enforces neither ceiling
 (`shared/src/shared/cli_invoke.py::classify_cap_kill`).
 
-Task 11727's pre-registration states each arm's budget and turn cap. Leo's go
-on its cost estimate covers this choice.
+Task 11727's pre-registration must state each arm's budget and turn cap, and
+must name this change (`variant_fable52_solo`, from a $10 pin to production's
+$12, task 11964), so that Leo's go on its cost estimate covers this choice.
