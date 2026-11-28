@@ -50,13 +50,16 @@ from orchestrator.remote_gate import (
     GateIdentity,
     GateIdentityPair,
     GateReplyError,
+    ReapStamp,
     classify_remote_exit,
     ensure_script_text,
     local_gate_identity,
     off_wire_field,
     parse_ensure_report,
     parse_gate_identity,
+    parse_reap_stamp,
     reap_script_text,
+    reap_stamp_script_text,
     wire_classes,
     wire_fields,
     wire_fingerprint,
@@ -1728,6 +1731,89 @@ def test_the_reaper_rejects_a_relative_root(gate_root: Path):
 def test_reap_script_text_is_the_packaged_script():
     packaged = Path(__file__).parents[1] / 'src/orchestrator/remote_gate/reap-gates.sh'
     assert reap_script_text() == packaged.read_text()
+
+
+# ---------------------------------------------------------------------------
+# reap-stamp.sh against real directories (task 8520)
+# ---------------------------------------------------------------------------
+
+
+def _run_stamp_probe(root: Path | str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ['bash', '-c', reap_stamp_script_text(), 'reap-stamp'],
+        env={'PATH': os.environ['PATH'], 'GATE_ROOT': str(root)},
+        capture_output=True, text=True, timeout=60,
+    )
+
+
+def _read_stamp(root: Path) -> ReapStamp:
+    result = _run_stamp_probe(root)
+    assert result.returncode == 0, result.stderr
+    return parse_reap_stamp(result.stdout, path=str(root / REAP_STAMP))
+
+
+def test_an_unmarked_or_missing_root_reads_as_no_gate_root(gate_root: Path, tmp_path: Path):
+    (gate_root / GATE_ROOT_MARKER).unlink()
+    missing = tmp_path / 'absent'
+
+    assert _read_stamp(gate_root) == ReapStamp(
+        path=str(gate_root / REAP_STAMP), gate_root=False, age_secs=None,
+    )
+    assert _read_stamp(missing) == ReapStamp(
+        path=str(missing / REAP_STAMP), gate_root=False, age_secs=None,
+    )
+
+
+def test_a_marked_root_never_reaped_reads_no_age(gate_root: Path):
+    assert _read_stamp(gate_root) == ReapStamp(
+        path=str(gate_root / REAP_STAMP), gate_root=True, age_secs=None,
+    )
+
+
+def test_a_stamp_reads_its_age_on_the_hosts_clock(gate_root: Path):
+    stamp = gate_root / REAP_STAMP
+    stamp.touch()
+    _age(stamp, 1 / 24)
+
+    reading = _read_stamp(gate_root)
+
+    assert reading.gate_root
+    assert reading.age_secs is not None and 3600 <= reading.age_secs <= 3660
+
+
+def test_the_stamp_probe_rejects_a_relative_root():
+    assert _run_stamp_probe('gates').returncode == 64
+
+
+@pytest.mark.parametrize('stdout', [
+    'nope',
+    '{}',
+    '{"gate_root": true}',
+    '{"gate_root": true, "age_secs": true}',
+    '{"gate_root": true, "age_secs": "42"}',
+    '{"gate_root": 1, "age_secs": 42}',
+    '{"gate_root": true, "age_secs": 42, "extra": 1}',
+])
+def test_parse_reap_stamp_rejects_anything_else(stdout: str):
+    with pytest.raises(GateReplyError):
+        parse_reap_stamp(stdout, path='/gates/.last-reap')
+
+
+@pytest.mark.parametrize(('gate_root', 'age_secs', 'window', 'shows'), [
+    (False, None, 0, True),
+    (False, None, 1e9, True),
+    (True, None, 1e9, False),
+    (True, 100, 100, True),
+    (True, 100, 99, False),
+])
+def test_a_reading_shows_a_run_within_a_window(gate_root, age_secs, window, shows):
+    reading = ReapStamp(path='/gates/.last-reap', gate_root=gate_root, age_secs=age_secs)
+    assert reading.shows_a_run_within(window) is shows
+
+
+def test_reap_stamp_script_text_is_the_packaged_script():
+    packaged = Path(__file__).parents[1] / 'src/orchestrator/remote_gate/reap-stamp.sh'
+    assert reap_stamp_script_text() == packaged.read_text()
 
 
 @pytest.mark.asyncio
