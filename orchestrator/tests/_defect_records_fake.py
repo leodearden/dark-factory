@@ -13,16 +13,18 @@ are the real tools' shapes, wrapped as the JSON-RPC body dispatch_tool returns.
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import Any
+from typing import Any, TypeVar
 
 from _orch_helpers import mcp_tool_envelope
 from pydantic import ValidationError
 from shared.defects import (
     DEFECT_TEST_RETIREMENTS_METADATA_KEY,
     DEFECTS_METADATA_KEY,
+    DeclareEvent,
     DeclareRetirement,
     DefectDeclaration,
     IllegalDefectTransition,
+    OutcomeEvent,
     Retirement,
     Rule,
     RulingSubject,
@@ -40,7 +42,7 @@ TRANSITION_REFUSED = 'defect_transition_refused'
 EVENT_INVALID = 'defect_event_invalid'
 REF_MISMATCH = 'defect_ref_mismatch'
 
-_PARSERS: dict[str, Callable[[object], Any]] = {
+_PARSERS: dict[str, Callable[[object], DeclareEvent | OutcomeEvent]] = {
     DECLARE_DEFECT: parse_declare_event,
     RECORD_DEFECT_OUTCOME: parse_outcome_event,
 }
@@ -59,14 +61,14 @@ def _is_retirement_event(event: object) -> bool:
     )
 
 
-_Record = DefectDeclaration | Retirement
+_Record = TypeVar('_Record', DefectDeclaration, Retirement)
 
 
 def _folded(
     stored: list[Any],
-    model: type[DefectDeclaration] | type[Retirement],
-    event: Any,
-    apply: Callable[[Any, Any], _Record],
+    model: type[_Record],
+    event: DeclareEvent | OutcomeEvent,
+    apply: Callable[[_Record | None, DeclareEvent | OutcomeEvent], _Record],
 ) -> list[dict[str, Any]]:
     records: list[_Record] = [model.model_validate(entry) for entry in stored]
     index = next((i for i, record in enumerate(records) if record.ref == event.ref), None)
@@ -135,7 +137,9 @@ class FakeDefectRecords:
                 ref=named_ref, event_ref=event.ref,
             )
         if _is_retirement_event(event):
-            key, model, apply = DEFECT_TEST_RETIREMENTS_METADATA_KEY, Retirement, apply_retirement_event
+            key = DEFECT_TEST_RETIREMENTS_METADATA_KEY
+            folded = _folded(metadata.get(key, []), Retirement, event, apply_retirement_event)
         else:
-            key, model, apply = DEFECTS_METADATA_KEY, DefectDeclaration, apply_event
-        return {**metadata, key: _folded(metadata.get(key, []), model, event, apply)}
+            key = DEFECTS_METADATA_KEY
+            folded = _folded(metadata.get(key, []), DefectDeclaration, event, apply_event)
+        return {**metadata, key: folded}
