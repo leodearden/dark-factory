@@ -739,6 +739,7 @@ class RedPathLane:
         command_name: str,
         lock_path: Path,
         hooks: Sequence[PassOutcomeHook],
+        stopping: bool = False,
     ) -> None:
         self.config = config
         self.git = git_ops
@@ -749,6 +750,7 @@ class RedPathLane:
         self.command_name = command_name
         self.lock_path = lock_path
         self.hooks = tuple(hooks)
+        self.stopping = stopping
         self.advances = 0
         self.worker = self.build_worker()
 
@@ -762,8 +764,12 @@ class RedPathLane:
         git_overrides: Mapping[str, Any] | None = None,
         hooks: Sequence[PassOutcomeHook] = (),
         legacy: LegacyLeg | None = None,
+        stopping: bool = False,
     ) -> RedPathLane:
-        """A lane running *command*, or with *legacy* only that legacy leg, whose script is committed to main."""
+        """A lane running *command*, or with *legacy* only that legacy leg, whose script is committed to main.
+
+        *stopping* is what the worker's stop predicate answers, as the harness's drain flag would.
+        """
         repo = seed_repo(tmp_path / 'repo', LANE_SEED)
         stub = LaneStub(tmp_path / 'stub')
         stub.put_on_path(monkeypatch)
@@ -788,6 +794,7 @@ class RedPathLane:
             command_name=command_name,
             lock_path=tmp_path / 'offline_lane.lock',
             hooks=hooks,
+            stopping=stopping,
         )
 
     @property
@@ -831,6 +838,7 @@ class RedPathLane:
             escalation_queue=self.queue,
             pass_outcome_hooks=self.hooks,
             now=self.clock,
+            stopping=lambda: self.stopping,
         )
 
     async def head(self) -> str:

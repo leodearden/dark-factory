@@ -2310,6 +2310,15 @@ class Harness:
         self._lock_file: IO | None = None
 
     @property
+    def draining(self) -> bool:
+        """True once run()'s finally has begun draining in-flight slots: the host is stopping.
+
+        The one read of the drain fact for a component that must tell the host's own stop
+        from any other cause, such as a child a signal ended (task 11974).
+        """
+        return self._draining
+
+    @property
     def _filing_claimant_run_id(self) -> str | None:
         """This harness process's identity, stamped on every ``Escalation`` it files.
 
@@ -12746,6 +12755,7 @@ class Harness:
             task_client=SchedulerChronicFlakeTaskClient(self.scheduler, self.config.project_root),
             escalation_queue=self._escalation_queue,
             pass_outcome_hooks=lane_pass_outcome_hooks(self.config, self._escalation_queue),
+            stopping=lambda: self.draining,
         )
         if not worker.acquire_lock():
             logger.warning(
@@ -13806,7 +13816,7 @@ class Harness:
             merge_halt=self._merge_worker,
             event_store=self.event_store,
             holds=holds,
-            stopping=lambda: self._draining,
+            stopping=lambda: self.draining,
         ).adopt(requests, schedule=self._schedule_coro_threadsafe)
         await holds.restore(requests)
         logger.info(
