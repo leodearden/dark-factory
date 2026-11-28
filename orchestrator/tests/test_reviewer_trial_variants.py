@@ -21,6 +21,7 @@ from orchestrator.evals.reviewer_trial.variants import (
     VARIANT_CODEX_SOL62,
     VARIANT_CROSS_FAMILY,
     VARIANT_D,
+    VARIANT_FABLE51_SOLO,
     VARIANT_FABLE52_SOLO,
     VARIANT_SONNET5_SOLO,
     ReviewerSpec,
@@ -334,7 +335,7 @@ class TestD2Round2Variants:
         assert len(VARIANT_FABLE52_SOLO.reviewers) == 1
         reviewer = VARIANT_FABLE52_SOLO.reviewers[0]
         assert (reviewer.name, reviewer.model, reviewer.backend, reviewer.effort, reviewer.budget) == (
-            'comprehensive_reviewer', 'claude-fable-5-2', 'claude', 'high', 10.0,
+            'comprehensive_reviewer', 'claude-fable-5-2', 'claude', 'high', None,
         )
         assert reviewer.specialization == _SPEC_COMPREHENSIVE
         assert reviewer.oauth_token_env is None
@@ -423,6 +424,14 @@ class TestTrialReviewerBudget:
                 role = build_trial_reviewer_role(arm.reviewers[0], arm.briefing)
                 assert role.default_budget == 12.0
 
+    @pytest.mark.usefixtures('code_default_config')
+    def test_the_fable_5_2_candidate_runs_at_the_incumbent_s_budget(self) -> None:
+        """Candidate and incumbent differ only in model, so the budget never varies with the arm."""
+        for arm in (VARIANT_FABLE52_SOLO, with_briefing(VARIANT_FABLE52_SOLO, ReviewBriefing.CONTEXT_COMPLETE)):
+            assert build_trial_reviewer_role(arm.reviewers[0], arm.briefing).default_budget == 12.0
+        assert panel_budgets(VARIANT_FABLE52_SOLO) == panel_budgets(VARIANT_A) == (12.0,)
+        assert panel_budgets(VARIANT_FABLE52_SOLO, 7.5) == panel_budgets(VARIANT_A, 7.5) == (7.5,)
+
     def test_the_budget_follows_production_s_reviewer_config(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv('ORCH_BUDGETS__REVIEWER', '7.5')
 
@@ -446,7 +455,7 @@ class TestTrialReviewerBudget:
     ) -> None:
         monkeypatch.setenv('ORCH_BUDGETS__REVIEWER', '7.5')
 
-        fable = build_trial_reviewer_role(VARIANT_FABLE52_SOLO.reviewers[0], production_budget=6.0)
+        fable = build_trial_reviewer_role(VARIANT_FABLE51_SOLO.reviewers[0], production_budget=6.0)
         sol = build_trial_reviewer_role(VARIANT_CODEX_SOL62.reviewers[0], production_budget=6.0)
 
         assert fable.default_budget == 10.0
