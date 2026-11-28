@@ -529,6 +529,11 @@ def _is_transient_architect_glitch(result: AgentResult, *, plan_on_disk: bool) -
     return result.turns <= 2 and result.cost_usd < 0.20 and not plan_on_disk
 
 
+def _is_server_error_zero_output(result: AgentResult) -> bool:
+    """γ's transient-requeue shape: a zero-output kill whose flushed result carries a 5xx."""
+    return is_zero_output_timeout(result) and is_server_error_status(result.api_error_status)
+
+
 def _is_gating_escalation(e: Escalation) -> bool:
     """Return True if *e* should gate workflow progress (PRD C7 / decisions D4, D8).
 
@@ -5461,36 +5466,39 @@ class TaskWorkflow:
         )
         return WorkflowOutcome.REQUEUED
 
-    async def _requeue_on_server_error(self, result: AgentResult) -> WorkflowOutcome:
-        """Requeue a zero-output execute iteration attributed to a provider
-        5xx (PRD `plans/server-side-api-error-handling-prd.md` task γ,
-        contract C2 requeue-not-block invariant).
+    async def _requeue_on_server_error(
+        self, result: AgentResult, *, activity: str, iteration: int,
+    ) -> WorkflowOutcome | None:
+        """Requeue a zero-output agent session attributed to a provider 5xx
+        (PRD `plans/server-side-api-error-handling-prd.md` tasks γ and ι,
+        contract C2 requeue-not-block invariant). *activity* names the work
+        that failed in the reason (``f'{activity} failed: ...'``) and
+        *iteration* is that loop's own counter.
 
-        Called from ``_execute_iterations``'s zero-output branch BEFORE
-        ``consecutive_zero_output`` increments (the guard sits at the very
-        top of that branch) — so this class of result never touches the
-        zero-output wedge breaker. A watchdog SIGTERM kill flushes the CLI's
-        result JSON with ``api_error_status`` set, and ``is_zero_output_timeout``
-        is shape-only (PRD decision 2: ``timed_out`` + ``transcript_turns==0``,
-        consulting neither status nor subtype) — so without this guard a
-        provider outage is indistinguishable from a genuine local wedge and
-        eventually trips the breaker into a `blocked`/L0/steward chain
+        Both callers gate on :func:`_is_server_error_zero_output`: the execute
+        loop (``_execute_iterations``, ahead of its zero-output breaker, so
+        this class of result never touches ``consecutive_zero_output``) and
+        the debugfix loop (``_verify_debugfix_loop``, after the debugger, so
+        a debugger outage never spends the verify budget). A watchdog SIGTERM
+        kill flushes the CLI's result JSON with ``api_error_status`` set, and
+        ``is_zero_output_timeout`` is shape-only (PRD decision 2:
+        ``timed_out`` + ``transcript_turns==0``, consulting neither status nor
+        subtype) — so without this guard a provider outage is
+        indistinguishable from a genuine local wedge and eventually trips the
+        breaker into a `blocked`/L0/steward chain
         (2026-07-29 incident). Exits on the FIRST occurrence rather than
         retrying in-loop: in-loop retries have no pacing, and the scheduler's
         transient-requeue lane already owns cooldown/counters/cap (PRD
         decisions 3 and 6) — so this method's only job is to get the row back
         onto the queue with the right evidence attached, not to retry it here.
 
-        Exits via :meth:`_repend_for_requeue` so the REQUEUED return is
-        TRUTHFUL (the row is written ``pending`` before the harness slot is
-        released). A terminal row observed out-of-band during that write is
-        returned INSTEAD of REQUEUED — but the two terminals then diverge at
-        the caller, so neither reading generalises: a ``cancelled`` row wins
-        over the requeue intent and ends the dispatch, while a ``done`` row is
-        returned as DONE, which :meth:`_execute_verify_review_loop`
-        deliberately reads with its ordinary ``_execute_iterations`` meaning
-        (execution finished, continue to VERIFY) rather than as a terminal
-        exit.
+        Exits via :meth:`_exit_requeued` so the REQUEUED return is TRUTHFUL
+        (the row is written ``pending`` before the harness slot is released).
+        A terminal row observed out-of-band during that write wins over the
+        requeue intent: a ``cancelled`` row returns CANCELLED, which ends the
+        dispatch. A ``done`` row returns ``None``: the requeue was dropped and
+        nothing exited the slot, so the caller decides what its own loop does
+        next.
         """
         cls = classify_agent_failure(result)
         # Compose the `agent API error: HTTP <status>` marker into the reason
@@ -5513,22 +5521,23 @@ class TaskWorkflow:
         # api_error_status field routes correctly either way (INV-1).
         marker = f'agent API error: HTTP {result.api_error_status}'
         summary = cls.summary if marker in cls.summary else f'{marker} — {cls.summary}'
-        reason = f'Execution failed: {summary}'
+        reason = f'{activity} failed: {summary}'
         detail = (
-            f'iteration={self.metrics.execute_iterations} '
+            f'iteration={iteration} '
             f'api_error_status={result.api_error_status} '
             f'policy=transient-requeue (exit-on-first, no in-loop retry — PRD '
             f'decisions 3 and 6)\n'
             f'{cls.diagnostic_detail}'
         )
         logger.warning(
-            'Task %s: server-side API error (HTTP %s) on execute iteration %s — '
+            'Task %s: server-side API error (HTTP %s) during %s, iteration %s — '
             'requeueing (transient, exit-on-first)',
-            self.task_id, result.api_error_status, self.metrics.execute_iterations,
+            self.task_id, result.api_error_status, activity.lower(), iteration,
         )
-        return await self._exit_requeued(
+        outcome = await self._exit_requeued(
             reason, detail=detail, api_error_status=result.api_error_status,
         )
+        return None if outcome is WorkflowOutcome.DONE else outcome
 
     async def _exit_requeued(
         self, reason: str, *, detail: str, api_error_status: int | None,
@@ -9226,6 +9235,10 @@ class TaskWorkflow:
                 verify_outcome = await self._verify_debugfix_loop()
                 if verify_outcome == WorkflowOutcome.ESCALATED:
                     return WorkflowOutcome.ESCALATED
+                # The debugfix 5xx requeue (PRD ι): same reasons as the
+                # EXECUTE arm's REQUEUED/CANCELLED returns above.
+                if verify_outcome in (WorkflowOutcome.REQUEUED, WorkflowOutcome.CANCELLED):
+                    return verify_outcome
                 if verify_outcome == WorkflowOutcome.BLOCKED:
                     # Infra hold takes priority: route to infra_issue with
                     # escalate_to_human so the open L1 keeps this branch OUT of
@@ -9951,31 +9964,37 @@ class TaskWorkflow:
                     f'{self.metrics.execute_iterations} failed'
                 )
 
+            # A watchdog SIGTERM kill flushes the CLI's result JSON with
+            # api_error_status set BEFORE the wall-clock timeout is
+            # distinguished from a genuine pre-first-token wedge — and
+            # is_zero_output_timeout is shape-only (timed_out +
+            # transcript_turns==0), consulting neither status nor
+            # subtype, so a provider outage satisfies it exactly like a
+            # real wedge.  A genuine local wedge carries NO HTTP status
+            # (api_error_status is None), so this guard exits BEFORE the
+            # breaker's counter increment below — the class never touches the
+            # wedge breaker — and requeues on the FIRST occurrence
+            # (PRD `plans/server-side-api-error-handling-prd.md` task γ,
+            # contract C2; decisions 3 and 6: in-loop retries have no
+            # pacing, and blocked for this class is reachable only via
+            # transient-cap exhaust in the scheduler).  2026-07-29
+            # incident: an unclassified 5xx fed this breaker and produced
+            # a blocked/L0/steward storm.
+            if _is_server_error_zero_output(result):
+                self._capture_zero_output_evidence(result, self.metrics.execute_iterations)
+                outcome = await self._requeue_on_server_error(
+                    result, activity='Execution', iteration=self.metrics.execute_iterations,
+                )
+                # A done row dropped the requeue: execution reads as finished,
+                # which _execute_verify_review_loop adjudicates from VERIFY on.
+                return WorkflowOutcome.DONE if outcome is None else outcome
+
             # --- Zero-output hang circuit breaker ---
             # Detect consecutive fresh-invocation CLI hangs (reify-4429 pattern):
             # the subprocess produced ZERO output for the full timeout, meaning
             # the CLI never started real work.  Retrying identically burns time
             # (~20 min/iteration × threshold) with no chance of progress.
             if is_zero_output_timeout(result):
-                # A watchdog SIGTERM kill flushes the CLI's result JSON with
-                # api_error_status set BEFORE the wall-clock timeout is
-                # distinguished from a genuine pre-first-token wedge — and
-                # is_zero_output_timeout is shape-only (timed_out +
-                # transcript_turns==0), consulting neither status nor
-                # subtype, so a provider outage satisfies it exactly like a
-                # real wedge.  A genuine local wedge carries NO HTTP status
-                # (api_error_status is None), so this guard exits BEFORE the
-                # counter increment below — the class never touches the
-                # wedge breaker — and requeues on the FIRST occurrence
-                # (PRD `plans/server-side-api-error-handling-prd.md` task γ,
-                # contract C2; decisions 3 and 6: in-loop retries have no
-                # pacing, and blocked for this class is reachable only via
-                # transient-cap exhaust in the scheduler).  2026-07-29
-                # incident: an unclassified 5xx fed this breaker and produced
-                # a blocked/L0/steward storm.
-                if is_server_error_status(result.api_error_status):
-                    self._capture_zero_output_evidence(result, self.metrics.execute_iterations)
-                    return await self._requeue_on_server_error(result)
                 consecutive_zero_output += 1
                 # Capture forensic evidence for every zero-output timeout (best-effort;
                 # the helper suppresses all I/O errors internally).
@@ -11638,6 +11657,14 @@ class TaskWorkflow:
             blocking = [e for e in self._check_escalations() if _is_gating_escalation(e)]
             if blocking:
                 return WorkflowOutcome.ESCALATED
+
+            if _is_server_error_zero_output(debug_result):
+                outcome = await self._requeue_on_server_error(
+                    debug_result, activity='Debug fix', iteration=verify_attempt,
+                )
+                # None: a done row dropped the requeue, and the loop goes on.
+                if outcome is not None:
+                    return outcome
 
             if not debug_result.success:
                 logger.warning(f'Task {self.task_id}: debugger failed')

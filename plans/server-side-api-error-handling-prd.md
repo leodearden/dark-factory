@@ -48,8 +48,9 @@ incident bypassed it end-to-end:
   (classifier), route the implementer zero-output-5xx shape to REQUEUED (no blocked write, no
   steward, no park-stop count), add jittered exponential backoff to the transient requeue lane,
   and land the observability fixes (evidence JSON, steward prompt, stale comments).
-- **Phase 2 (coverage):** the same requeue-not-block treatment for review, planning, and
-  simple_task paths; transient-cap-exhaust escalation names the provider outage.
+- **Phase 2 (coverage):** the same requeue-not-block treatment for review, planning,
+  simple_task, and verify/debugfix paths; transient-cap-exhaust escalation names the provider
+  outage.
 - **Phase 3 (breaker + watchdog):** a process-wide `ApiHealthGate` (rate-windowed 5xx breaker
   with probe-driven close), dispatch throttling + steward/watcher suppression while open, a
   single auto-resolving `api_degraded` fleet escalation, evidence-gated park-stop auto-resume,
@@ -61,7 +62,7 @@ incident bypassed it end-to-end:
 |---|---|---|
 | M1 | `is_server_error_status()` helper + `ServerError` `InvocationOutcome` variant + `classify_agent_failure` 5xx rule above `timed_out` | existing transient lane (scheduler.py:407-428); `invoke_with_cap_retry` cap-net guard; escalation summaries read by operators/stewards |
 | M2 | `TerminalReport.api_error_status` structured field → `record_requeue` field-first routing | scheduler transient-bucket routing (replaces regex-over-prose as primary; INV-1) |
-| M3 | REQUEUED-from-execute/review/planning/simple_task for 5xx-attributed failures (via existing `_requeue` path) | scheduler requeue lane (existing, harness.py:7487→8276→scheduler.py:7226); park-stop protection is a consequence (no `blocked` write) |
+| M3 | REQUEUED-from-execute/review/planning/simple_task/debugfix for 5xx-attributed failures (via existing `_requeue` path) | scheduler requeue lane (existing, harness.py:7487→8276→scheduler.py:7226); park-stop protection is a consequence (no `blocked` write) |
 | M4 | Jittered exponential transient cooldown | existing `_requeue_until` dispatch-eligibility reader (scheduler.py:4478-4480) |
 | M5 | Evidence/forensics: `api_error_status` + output tail in `zero_output_evidence-*.json`; steward-prompt API_ERROR guidance fix; stale-comment fixes; OPERATIONS.md row update | operator forensics; steward behaviour; maintainers |
 | M6 | `ApiHealthGate` (Phase 3) + `api_error` account-event row | scheduler dispatch throttle; workflow steward-spawn gate; harness watcher-rotation gate; `api_degraded` escalation lifecycle; park-stop auto-resolve; dashboard provider-health strip |
@@ -218,6 +219,7 @@ owned by this PRD.
 | 11 | Breaker trip + recovery (Phase 3) | injected 5xx storm ≥ thresholds, then recovery | exactly 1 `api_degraded` escalation filed then auto-resolved; dispatch throttled to probe trickle while open; steward spawns suppressed; full dispatch resumes on close |
 | 12 | Park-stop auto-resume (Phase 3) | park-stop tripped with ≥50% 5xx-attributed blocks; gate closes | sentinel L1 resolved with evidence note; scheduler resumes within settle window; non-5xx park-stop pauses never auto-resume |
 | 13 | Watchdog two-regime (Phase 3) | (a) startup-complete then silent stall; (b) pre-startup wedge | (a) survives 120s, killed at extended bound, classified per C1; (b) killed at 120s as today |
+| 14 | Debugfix: 529-killed debugger | verify fails; debugger AgentResult timed_out=True, transcript_turns=0, api_error_status=529 | verify/debugfix loop returns REQUEUED with marker/field on the FIRST such result; no further verify attempts; no `Verification attempts exhausted` block; no L0/steward; a done/cancelled row seen by the re-pend is never turned into a green verify |
 
 ## Decomposition plan (G2 signals; Greek labels → task ids at decompose)
 
@@ -263,10 +265,16 @@ owned by this PRD.
   tail. *Signal*: simulated 529 planning invocation → task `pending` with transient count 1, no
   steward invocation recorded, no L0 in the escalation store (product read paths: `get_task`,
   escalation list); boundary row 6 text assertion green. *Prereqs*: α, β.
+- **ι — verify/debugfix loop: requeue-not-block** (`orchestrator`; task 5434, added after
+  decompose from task 3316's amendment pass): the first 5xx-attributed zero-output debugger
+  result → REQUEUED through γ's own predicate and requeue exit, with marker+field; exit-on-first
+  per decision 3 (no in-loop retry-burn skip); no L0/steward. *Signal*: boundary row 14 green in
+  an orchestrator integration test driving `TaskWorkflow.run()` with an injected verify failure
+  and a 529-killed debugger. *Prereqs*: γ.
 - **κ — Phase-2 integration gate** (leaf, `orchestrator`): cross-phase e2e — 529s injected at
-  planning/review/simple paths all requeue transiently; cap exhaust yields exactly one
-  `retry_cap_exhausted` L1 per task naming the outage. *Signal*: boundary rows 6-8 green at
-  harness level. *Prereqs*: η, θ, ζ.
+  planning/review/simple/debugfix paths all requeue transiently; cap exhaust yields exactly one
+  `retry_cap_exhausted` L1 per task naming the outage. *Signal*: boundary rows 6-8 and 14 green
+  at harness level. *Prereqs*: η, θ, ι, ζ.
 
 **Phase 3 — breaker + watchdog**
 
