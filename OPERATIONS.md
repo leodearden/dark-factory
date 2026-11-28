@@ -6836,9 +6836,9 @@ trailing 14 days, whatever `--window-days` is
 resolved record the project's queues still hold, in the root tier and the
 archive. It therefore reaches back only as far as
 `escalation/src/escalation/archive.py::prune_archive` keeps archive subdirs.
-`resolution_turns` stays on the page window. These are the agreement figures
-the trial's exit criterion reads (`skills/escalation-watcher/SKILL.md`,
-"Trial and kill criteria").
+`resolution_turns` stays on the page window. The trial's exit criterion reads
+its agreement from this line (`skills/escalation-watcher/SKILL.md`, "Trial
+and kill criteria").
 
 **Adding a project.** The brief measures every project root that holds a
 queue the night scanned: each configured root's own queues, plus every queue

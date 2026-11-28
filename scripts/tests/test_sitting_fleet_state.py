@@ -610,6 +610,19 @@ class TestPreparerTrial:
         assert (trial.trailing.n, trial.trailing.denominator, trial.trailing.rate) == (0, 0, None)
         assert (trial.lifetime.n, trial.lifetime.numerator, trial.lifetime.denominator) == (1, 1, 1)
 
+    def test_the_trailing_window_reaches_back_trial_window_days(self, tmp_path):
+        queue = tmp_path / 'data' / 'escalations'
+        bound = NOW - timedelta(days=mod.TRIAL_WINDOW_DAYS)
+        _resolved(queue, 'esc-1-1', resolved_at=(bound + timedelta(hours=1)).isoformat(),
+                  triage_note=_note(_prepared('A'), _agreed('A', True)))
+        _resolved(queue, 'esc-2-1', resolved_at=(bound - timedelta(hours=1)).isoformat(),
+                  triage_note=_note(_prepared('A'), _agreed('B', False)))
+
+        trial = mod.preparer_trial([str(queue)], WINDOW, now=NOW).value
+
+        assert (trial.trailing.n, trial.trailing.numerator, trial.trailing.denominator) == (1, 1, 1)
+        assert (trial.lifetime.n, trial.lifetime.numerator, trial.lifetime.denominator) == (2, 1, 2)
+
     def test_a_resolved_record_with_no_parsable_resolved_at_counts_in_lifetime_only(self, tmp_path):
         queue = tmp_path / 'data' / 'escalations'
         _resolved(queue, 'esc-1-1', resolved_at='', triage_note=_note(_prepared('A'), _agreed('A', True)))
