@@ -21,6 +21,7 @@ import pytest
 
 from shared.claude_endpoint import ClaudeEndpoint
 from shared.cli_invoke import invoke_claude_agent, resolve_claude_binary
+from shared.secret_env import is_secret_env_name
 
 _SUCCESS_JSON = json.dumps({
     'result': 'ok',
@@ -37,10 +38,6 @@ POOL_B = 'pool-b-' + 'B' * 41
 AMBIENT_SESSION_TOKEN = 'ambient-' + 'm' * 40
 SELECTED_TOKEN = 'selected-' + 's' * 39
 PROXY = ClaudeEndpoint(base_url='http://127.0.0.1:8317', auth_token='proxy-key-' + 'p' * 38)
-
-
-def _credential_shaped(name: str) -> bool:
-    return name.startswith('CLAUDE_OAUTH_TOKEN_') or name.endswith(('_API_KEY', '_TOKEN'))
 
 
 @pytest.fixture
@@ -66,6 +63,7 @@ def child_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Callable[[], d
     monkeypatch.setenv('CLAUDE_OAUTH_TOKEN_B', POOL_B)
     monkeypatch.setenv('OPENAI_API_KEY', 'openai-' + 'o' * 41)
     monkeypatch.setenv('ANTHROPIC_API_KEY', 'anthropic-' + 'k' * 38)
+    monkeypatch.setenv('OPENAI_PLAN_PROXY_KEY', 'plan-proxy-' + 'k' * 37)
     monkeypatch.setenv('CLAUDE_CODE_OAUTH_TOKEN', AMBIENT_SESSION_TOKEN)
 
     assert resolve_claude_binary() == str(script), 'the fake must be the CLI that runs'
@@ -104,9 +102,10 @@ async def test_child_inherits_only_its_session_credential(
 
     assert [k for k in env if k.startswith('CLAUDE_OAUTH_TOKEN_')] == []
     assert 'OPENAI_API_KEY' not in env
+    assert 'OPENAI_PLAN_PROXY_KEY' not in env
     assert 'ANTHROPIC_API_KEY' not in env
     assert env['CLAUDE_CODE_OAUTH_TOKEN'] == expected_credential
-    assert {k for k in env if _credential_shaped(k)} == {'CLAUDE_CODE_OAUTH_TOKEN'}
+    assert {k for k in env if is_secret_env_name(k)} == {'CLAUDE_CODE_OAUTH_TOKEN'}
     assert os.environ['CLAUDE_OAUTH_TOKEN_A'] == POOL_A, 'the parent keeps its pool'
 
 
@@ -126,7 +125,7 @@ async def test_an_endpoint_is_the_childs_only_route_and_credential(child_env, tm
 
     assert env['ANTHROPIC_BASE_URL'] == PROXY.base_url, 'the child talks to the endpoint, not a bridge'
     assert env['ANTHROPIC_AUTH_TOKEN'] == PROXY.auth_token
-    assert {k for k in env if _credential_shaped(k)} == {'ANTHROPIC_AUTH_TOKEN'}
+    assert {k for k in env if is_secret_env_name(k)} == {'ANTHROPIC_AUTH_TOKEN'}
 
 
 async def test_an_inherited_endpoint_never_reaches_the_child(child_env, tmp_path, monkeypatch):
