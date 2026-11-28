@@ -107,6 +107,11 @@ def _unanswered(exc: 'ResponseHandlingException') -> bool:
     return isinstance(exc.source, httpx.ReadTimeout)
 
 
+def _cause(exc: 'ResponseHandlingException') -> str:
+    """The transport failure underneath *exc*, as 'Type: message'."""
+    return f'{type(exc.source).__name__}: {exc.source}'
+
+
 def _run_meta_op(
     request: Callable[[], Any],
     *,
@@ -126,17 +131,6 @@ def _run_meta_op(
     """
     from qdrant_client.http.exceptions import ResponseHandlingException
 
-    def observe() -> _SettleCheck:
-        try:
-            return check()
-        except ResponseHandlingException as err:
-            if not _unanswered(err):
-                raise
-            return _SettleCheck(
-                settled=False,
-                seen=f'no answer to the state read ({type(err.source).__name__}: {err.source})',
-            )
-
     try:
         request()
     except ResponseHandlingException as exc:
@@ -146,7 +140,12 @@ def _run_meta_op(
 
         def settled() -> bool:
             nonlocal last_seen
-            observed = observe()
+            try:
+                observed = check()
+            except ResponseHandlingException as err:
+                if not _unanswered(err):
+                    raise
+                observed = _SettleCheck(settled=False, seen=f'no answer to the state read ({_cause(err)})')
             last_seen = observed.seen
             return observed.settled
 
@@ -154,8 +153,7 @@ def _run_meta_op(
             poll_until_sync(settled, timeout=timeout, interval=0.05)
         except AssertionError:
             raise AssertionError(
-                f'{describe}: the client stopped waiting for the answer '
-                f'({type(exc.source).__name__}: {exc.source}), and the '
+                f'{describe}: the client stopped waiting for the answer ({_cause(exc)}), and the '
                 f'collection was not {expected} {timeout}s later; last seen: {last_seen}'
             ) from exc
 
