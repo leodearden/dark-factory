@@ -351,13 +351,11 @@ class TestWireForms:
         assert metadata == {'files': FILES}
 
 
-@pytest.mark.parametrize('shape', [
-    {},
-    {'files': FILES},
-    {'complexity': 'simple', 'files': FILES},
-], ids=['empty', 'files', 'simple-with-files'])
-def test_the_hint_key_does_not_change_what_the_submit_gate_accepts(shape):
-    assert simple_task_files_error({**shape, HINT: 'simple'}) is None
+def test_the_hint_key_does_not_satisfy_the_submit_gates_files_requirement():
+    error = simple_task_files_error({'complexity': 'simple', HINT: 'simple'})
+
+    assert error is not None
+    assert error['error_type'] == 'SimpleTaskFilesRequired'
 
 
 _DESCRIPTION = 'One-line wording fix.'
