@@ -60,7 +60,17 @@ const RECEIVED_AT = 1_800_000_000_000;
 const RECEIPT = Object.freeze({ servedAt: SERVED_AT, receivedAt: RECEIVED_AT });
 
 function counts(overrides) {
-  return { pending: 0, retry: 0, dead: 0, oldest_pending_age_seconds: null, ...overrides };
+  return {
+    pending: 0, retry: 0, parked: 0, dead: 0, awaiting_operator: 0,
+    oldest_pending_age_seconds: null, ...overrides,
+  };
+}
+
+// The value a dashboard process predating parked rows still serves until it
+// restarts: it has neither a parked nor an awaiting_operator count.
+function countsPredatingParkedRows(overrides) {
+  const { parked, awaiting_operator, ...value } = counts(overrides);
+  return value;
 }
 
 // A served queue.stats Datum, honouring datum.py's unknown triad.
@@ -164,10 +174,17 @@ test('writeQueue: a delivered payload with no queue.stats is a hole naming the /
   assert.match(q.reason, /\/memory payload/);
 });
 
-test('queueCountsText: pending, retry and dead in one line', () => {
+test('queueCountsText: pending, retry, parked and dead in one line', () => {
   assert.equal(
-    queueCountsText(counts({ pending: 4, retry: 1, dead: 0, oldest_pending_age_seconds: 9 })),
-    '4 pending · 1 retry · 0 dead',
+    queueCountsText(counts({ pending: 4, retry: 1, parked: 2, oldest_pending_age_seconds: 9 })),
+    '4 pending · 1 retry · 2 parked · 0 dead',
+  );
+});
+
+test('queueCountsText: an unmeasured parked count is a hole, never a fabricated 0', () => {
+  assert.equal(
+    queueCountsText(countsPredatingParkedRows({ pending: 4, retry: 1 })),
+    '4 pending · 1 retry · ' + EM_DASH + ' parked · 0 dead',
   );
 });
 
@@ -177,16 +194,38 @@ test('queueHint: the oldest pending age when measured, idle when nothing waits, 
   assert.equal(queueHint(writeQueue(memoryData(queueStats('unknown')))), null);
 });
 
+test('queueHint: a parked backlog explains the climbing oldest age', () => {
+  const served = counts({ parked: 111, oldest_pending_age_seconds: 86400 });
+  assert.equal(queueHint(writeQueue(memoryData(queueStats('fresh', served)))), '111 parked · 86400s oldest');
+});
+
 test('queueHealth: an unmeasured queue is amber, never green-ok and never red', () => {
   assert.deepEqual(queueHealth(writeQueue(memoryData(queueStats('unknown')))), { ok: true, warn: true });
 });
 
 test('queueHealth: a fresh queue follows the Overview rule', () => {
   const health = c => queueHealth(writeQueue(memoryData(queueStats('fresh', counts(c)))));
-  assert.equal(health({ dead: 1 }).ok, false);
+  assert.equal(health({ dead: 1, awaiting_operator: 1 }).ok, false);
+  assert.equal(health({ parked: 111, awaiting_operator: 111 }).ok, false);
   assert.equal(health({ pending: 6 }).warn, true);
   assert.equal(health({ retry: 1 }).warn, true);
   assert.deepEqual(health({}), { ok: true, warn: false });
+});
+
+test('queueHealth: red follows the served awaiting_operator count, not a client-side partition', () => {
+  const health = c => queueHealth(writeQueue(memoryData(queueStats('fresh', counts(c)))));
+  assert.equal(health({ awaiting_operator: 2 }).ok, false);
+  assert.equal(health({ parked: 3, awaiting_operator: 0 }).ok, true);
+});
+
+test('queueHealth: a fresh queue with no measured parked count is amber, not green', () => {
+  const health = queueHealth(writeQueue(memoryData(queueStats('fresh', countsPredatingParkedRows()))));
+  assert.deepEqual(health, { ok: true, warn: true });
+});
+
+test('queueHealth: a value predating parked rows still paints its dead letters red', () => {
+  const served = countsPredatingParkedRows({ dead: 1 });
+  assert.deepEqual(queueHealth(writeQueue(memoryData(queueStats('fresh', served)))), { ok: false, warn: true });
 });
 
 test('queueHealth: a stale queue always warns', () => {

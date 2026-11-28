@@ -1559,13 +1559,14 @@ class ReconciliationHarness:
             return {}
 
     async def _check_graphiti_queue_health(self, project_id: ProjectId) -> dict | None:
-        """Read the Graphiti async-queue dead-letter count for project_id.
+        """Read the Graphiti async-queue health (dead and parked counts) for project_id.
 
         Uses DurableWriteQueue.get_stats(group_id=project_id) to classify the
-        queue state via summarize_graphiti_queue_health.  When dead_count > 0,
-        emits a WARNING-level log carrying per-operation attribution
-        (dead_by_operation) — this is the observable signal for the silent
-        drop that add_memory's success=True at enqueue time hides.
+        queue state via summarize_graphiti_queue_health.  While the queue is
+        unhealthy, emits one WARNING-level log covering both kinds of write
+        that wait on an operator: dead letters, the silent drop that
+        add_memory's success=True at enqueue time hides (attributed per
+        operation by dead_by_operation), and parked writes (parked_count).
 
         Args:
             project_id: Project identifier, used as the queue group_id.
@@ -1587,6 +1588,7 @@ class ReconciliationHarness:
                         'project_id': project_id,
                         'dead_count': health['dead_count'],
                         'pending_count': health['pending_count'],
+                        'parked_count': health['parked_count'],
                         'oldest_pending_age_seconds': health['oldest_pending_age_seconds'],
                         'dead_by_operation': health['dead_by_operation'],
                     },

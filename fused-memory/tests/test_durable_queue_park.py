@@ -12,52 +12,22 @@ import asyncio
 import contextlib
 import dataclasses
 import sqlite3
-from collections.abc import Callable
-from dataclasses import dataclass, field
 from unittest.mock import AsyncMock
 
 import pytest
 from _fm_polling import poll_until, poll_until_dead
+from _parked_queue_fixtures import Exhausted, RecordingParkPolicy
 from _queued_write_fixtures import queued
 from shared.testing_fake_clock import FakeClock
+from shared.write_queue_statuses import CLAIMABLE, WriteQueueStatus
 
-from fused_memory.services.durable_queue import DurableWriteQueue, ParkDecision, ParkedWriteEvent
+from fused_memory.services.durable_queue import DurableWriteQueue
 from fused_memory.services.queued_writes import QueueCallback, QueuedWrite
 
 _MAX_ATTEMPTS = 3
 _PROBE_AHEAD_SECONDS = 600.0
 _PROBE_BEHIND_SECONDS = 3600.0
 _CLOCK_START = 1_800_000_000.0
-
-
-class _Exhausted(Exception):
-    """Stands in for a refusal that only a human can clear."""
-
-
-@dataclass
-class _RecordingParkPolicy:
-    parked: list[ParkedWriteEvent] = field(default_factory=list)
-    cleared: int = 0
-    raise_on_parked: bool = False
-    raise_on_cleared: bool = False
-    retry_at: Callable[[], float | None] = lambda: None
-    observe: Callable[[ParkedWriteEvent], None] = lambda event: None
-
-    def park_decision(self, exc: BaseException) -> ParkDecision | None:
-        if not isinstance(exc, _Exhausted):
-            return None
-        return ParkDecision('test-park', retry_at=self.retry_at())
-
-    async def on_parked(self, event: ParkedWriteEvent) -> None:
-        self.parked.append(event)
-        self.observe(event)
-        if self.raise_on_parked:
-            raise RuntimeError('on_parked hook failed')
-
-    async def on_cleared(self) -> None:
-        self.cleared += 1
-        if self.raise_on_cleared:
-            raise RuntimeError('on_cleared hook failed')
 
 
 def _queue(tmp_path, execute_write, **overrides) -> DurableWriteQueue:
@@ -98,9 +68,9 @@ def _status_is(tmp_path, item_id: int, status: str):
 class TestParking:
     @pytest.mark.asyncio
     async def test_a_parkable_failure_parks_and_never_dies(self, tmp_path):
-        policy = _RecordingParkPolicy()
+        policy = RecordingParkPolicy()
         on_dead_letter = AsyncMock()
-        execute = AsyncMock(side_effect=_Exhausted('no credits remaining'))
+        execute = AsyncMock(side_effect=Exhausted('no credits remaining'))
         q = _queue(tmp_path, execute, park_policy=policy, on_dead_letter=on_dead_letter)
         await q.initialize()
         try:
@@ -121,7 +91,7 @@ class TestParking:
             assert (event.item_id, event.group_id, event.operation, event.reason) == (
                 item_id, 'proj1', 'add_episode', 'test-park',
             )
-            assert isinstance(event.exc, _Exhausted)
+            assert isinstance(event.exc, Exhausted)
             for event_field in dataclasses.fields(event):
                 with pytest.raises(dataclasses.FrozenInstanceError):
                     setattr(event, event_field.name, 'other')
@@ -130,8 +100,8 @@ class TestParking:
 
     @pytest.mark.asyncio
     async def test_parking_rearms_every_parked_row_to_one_horizon(self, tmp_path):
-        policy = _RecordingParkPolicy()
-        execute = AsyncMock(side_effect=_Exhausted('no credits remaining'))
+        policy = RecordingParkPolicy()
+        execute = AsyncMock(side_effect=Exhausted('no credits remaining'))
         q = _queue(tmp_path, execute, park_policy=policy, retry_max_delay_seconds=30.0)
         await q.initialize()
         try:
@@ -149,8 +119,8 @@ class TestParking:
 
     @pytest.mark.asyncio
     async def test_parked_rows_are_counted_and_age_as_pending(self, tmp_path):
-        policy = _RecordingParkPolicy()
-        execute = AsyncMock(side_effect=_Exhausted('no credits remaining'))
+        policy = RecordingParkPolicy()
+        execute = AsyncMock(side_effect=Exhausted('no credits remaining'))
         q = _queue(tmp_path, execute, park_policy=policy, retry_max_delay_seconds=30.0)
         await q.initialize()
         try:
@@ -165,11 +135,11 @@ class TestParking:
 
     @pytest.mark.asyncio
     async def test_a_raising_on_parked_hook_does_not_stop_the_worker(self, tmp_path):
-        policy = _RecordingParkPolicy(raise_on_parked=True)
+        policy = RecordingParkPolicy(raise_on_parked=True)
 
         async def execute(value: QueuedWrite) -> dict:
             if getattr(value, 'content', '') == 'parks':
-                raise _Exhausted('no credits remaining')
+                raise Exhausted('no credits remaining')
             return {'episode_uuid': 'ep-1'}
 
         q = _queue(tmp_path, execute, park_policy=policy, retry_max_delay_seconds=30.0)
@@ -190,8 +160,8 @@ class TestTheProbeTimeAParkNames:
     async def test_a_named_probe_time_becomes_every_parked_rows_horizon(self, tmp_path):
         clock = FakeClock(start=_CLOCK_START)
         probe_at = clock() + _PROBE_AHEAD_SECONDS
-        policy = _RecordingParkPolicy()
-        execute = AsyncMock(side_effect=_Exhausted('capped'))
+        policy = RecordingParkPolicy()
+        execute = AsyncMock(side_effect=Exhausted('capped'))
         q = _queue(tmp_path, execute, park_policy=policy, clock=clock)
         await q.initialize()
         try:
@@ -214,11 +184,11 @@ class TestTheProbeTimeAParkNames:
         clock = FakeClock(start=_CLOCK_START)
         retry_ats = iter([clock() - _PROBE_BEHIND_SECONDS])
         horizons: list[float] = []
-        policy = _RecordingParkPolicy(
+        policy = RecordingParkPolicy(
             retry_at=lambda: next(retry_ats, clock() + _PROBE_AHEAD_SECONDS),
             observe=lambda event: horizons.append(_row(tmp_path, event.item_id)['next_retry_at']),
         )
-        execute = AsyncMock(side_effect=_Exhausted('capped'))
+        execute = AsyncMock(side_effect=Exhausted('capped'))
         q = _queue(tmp_path, execute, park_policy=policy, clock=clock)
         await q.initialize()
         try:
@@ -241,8 +211,8 @@ class TestTheQueuesClock:
     async def test_parking_and_landing_follow_the_injected_clock(self, tmp_path):
         start = _CLOCK_START
         clock = FakeClock(start=start)
-        policy = _RecordingParkPolicy(retry_at=lambda: clock() + _PROBE_AHEAD_SECONDS)
-        execute = AsyncMock(side_effect=[_Exhausted('capped'), None])
+        policy = RecordingParkPolicy(retry_at=lambda: clock() + _PROBE_AHEAD_SECONDS)
+        execute = AsyncMock(side_effect=[Exhausted('capped'), None])
         q = _queue(tmp_path, execute, park_policy=policy, clock=clock)
         await q.initialize()
         try:
@@ -268,7 +238,7 @@ class TestTheQueuesClock:
 class TestWhatDoesNotPark:
     @pytest.mark.asyncio
     async def test_a_failure_the_policy_does_not_name_dies_as_today(self, tmp_path):
-        policy = _RecordingParkPolicy()
+        policy = RecordingParkPolicy()
         on_dead_letter = AsyncMock()
         execute = AsyncMock(side_effect=RuntimeError('boom'))
         q = _queue(tmp_path, execute, park_policy=policy, on_dead_letter=on_dead_letter)
@@ -287,11 +257,11 @@ class TestWhatDoesNotPark:
     async def test_a_post_execute_failure_is_never_parked(self, tmp_path):
         """A retry re-runs the write; parking one that already LANDED would
         duplicate it on every probe."""
-        policy = _RecordingParkPolicy()
+        policy = RecordingParkPolicy()
         execute = AsyncMock(return_value={'episode_uuid': 'ep-1'})
 
         async def exhausted_callback(_value, _result):
-            raise _Exhausted('no credits remaining')
+            raise Exhausted('no credits remaining')
 
         q = _queue(tmp_path, execute, park_policy=policy)
         q.register_callback(QueueCallback.DUAL_WRITE_EPISODE, exhausted_callback)
@@ -307,7 +277,7 @@ class TestWhatDoesNotPark:
 
     @pytest.mark.asyncio
     async def test_without_a_policy_the_same_failure_dies_as_today(self, tmp_path):
-        execute = AsyncMock(side_effect=_Exhausted('no credits remaining'))
+        execute = AsyncMock(side_effect=Exhausted('no credits remaining'))
         q = _queue(tmp_path, execute)
         await q.initialize()
         try:
@@ -315,6 +285,41 @@ class TestWhatDoesNotPark:
             await poll_until_dead(q, group_id='proj1', expected_dead=1)
 
             assert execute.await_count == _MAX_ATTEMPTS
+        finally:
+            await q.close()
+
+
+class TestStatusVocabulary:
+    @pytest.mark.asyncio
+    async def test_every_status_get_stats_reports_is_in_the_shared_vocabulary(self, tmp_path):
+        async def execute(value: QueuedWrite) -> dict:
+            if value.written_text == 'parks':
+                raise Exhausted('no credits remaining')
+            if value.written_text == 'dies':
+                raise RuntimeError('boom')
+            return {'episode_uuid': 'ep-1'}
+
+        q = _queue(
+            tmp_path, execute, park_policy=RecordingParkPolicy(), retry_max_delay_seconds=60.0,
+        )
+        await q.initialize()
+        try:
+            for content in ('parks', 'dies', 'lands'):
+                await q.enqueue(_write(content))
+
+            async def one_of_each():
+                stats = await q.get_stats()
+                counts = stats['counts']
+                settled = (counts.get('parked'), counts.get('dead'), counts.get('completed'))
+                return stats if settled == (1, 1, 1) else None
+
+            stats = await poll_until(one_of_each)
+
+            assert {WriteQueueStatus(key) for key in stats['counts']} == {
+                WriteQueueStatus.PARKED, WriteQueueStatus.DEAD, WriteQueueStatus.COMPLETED,
+            }
+            assert [s for s in CLAIMABLE if stats['counts'].get(s)] == [WriteQueueStatus.PARKED]
+            assert stats['oldest_pending_age_seconds'] is not None
         finally:
             await q.close()
 
@@ -336,7 +341,7 @@ class _Switchable:
 
     async def __call__(self, value: QueuedWrite) -> dict:
         if not self.succeeding:
-            raise _Exhausted('no credits remaining')
+            raise Exhausted('no credits remaining')
         self.landed.append(value.written_text)
         return {'episode_uuid': 'ep-1'}
 
@@ -375,7 +380,7 @@ class TestUnparking:
         """The probe that lands proves the cause is gone, so nothing else
         waits out another period. A long cadence makes the drain observable:
         only the first row's period is let elapse."""
-        policy = _RecordingParkPolicy(raise_on_cleared=on_cleared_raises)
+        policy = RecordingParkPolicy(raise_on_cleared=on_cleared_raises)
         execute = _Switchable()
         q = _queue(tmp_path, execute, park_policy=policy, retry_max_delay_seconds=30.0)
         await q.initialize()
@@ -397,7 +402,7 @@ class TestUnparking:
         """The landed probe is settled before the release is attempted, so a
         release the database refuses only delays the other parked rows to
         their own horizon; it never re-runs the write that landed."""
-        policy = _RecordingParkPolicy()
+        policy = RecordingParkPolicy()
         execute = _Switchable()
         q = _queue(tmp_path, execute, park_policy=policy, retry_max_delay_seconds=30.0)
         await q.initialize()
@@ -432,7 +437,7 @@ class TestUnparking:
 
     @pytest.mark.asyncio
     async def test_a_never_parked_write_landing_clears_nothing(self, tmp_path):
-        policy = _RecordingParkPolicy()
+        policy = RecordingParkPolicy()
         q = _queue(tmp_path, AsyncMock(return_value={'episode_uuid': 'ep-1'}), park_policy=policy)
         await q.initialize()
         try:
@@ -446,7 +451,7 @@ class TestUnparking:
     @pytest.mark.asyncio
     async def test_parked_rows_survive_a_restart_and_drain(self, tmp_path):
         execute = _Switchable()
-        q = _queue(tmp_path, execute, park_policy=_RecordingParkPolicy())
+        q = _queue(tmp_path, execute, park_policy=RecordingParkPolicy())
         await q.initialize()
         try:
             parked = [
@@ -459,7 +464,7 @@ class TestUnparking:
             await q.close()
 
         execute.succeeding = True
-        restarted = _queue(tmp_path, execute, park_policy=_RecordingParkPolicy())
+        restarted = _queue(tmp_path, execute, park_policy=RecordingParkPolicy())
         await restarted.initialize()
         try:
             for item_id in parked:
@@ -470,7 +475,7 @@ class TestUnparking:
     @pytest.mark.asyncio
     async def test_a_dead_letter_from_before_parking_stays_replayable(self, tmp_path):
         failing = AsyncMock(side_effect=RuntimeError('boom'))
-        q = _queue(tmp_path, failing, park_policy=_RecordingParkPolicy())
+        q = _queue(tmp_path, failing, park_policy=RecordingParkPolicy())
         await q.initialize()
         try:
             item_id = await q.enqueue(_write('dies'))

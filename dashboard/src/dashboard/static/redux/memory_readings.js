@@ -23,6 +23,7 @@
 const {
   servedDatum: servedMemoryDatum,
   datumView: viewOfMemoryDatum,
+  EM_DASH: MEMORY_EM_DASH,
 } = window.DF_DATUM;
 
 const MEMORY_ENDPOINT = '/api/v2/dashboard/memory';
@@ -44,24 +45,49 @@ function writeQueue(data) {
   );
 }
 
+// null when the value was served by a dashboard process predating the count.
+function servedQueueCount(counts, key) {
+  return typeof counts[key] === 'number' ? counts[key] : null;
+}
+
+// The SERVER counts the writes waiting on a human (data/memory.py::write_queue_datum),
+// so the client holds no copy of which statuses wait. A value predating that
+// count measured only its dead letters.
+function awaitingOperatorCount(counts) {
+  const served = servedQueueCount(counts, 'awaiting_operator');
+  return served === null ? counts.dead : served;
+}
+
 function queueCountsText(counts) {
-  return counts.pending + ' pending · ' + counts.retry + ' retry · ' + counts.dead + ' dead';
+  const parked = servedQueueCount(counts, 'parked');
+  return (
+    counts.pending + ' pending · ' +
+    counts.retry + ' retry · ' +
+    (parked === null ? MEMORY_EM_DASH : parked) + ' parked · ' +
+    counts.dead + ' dead'
+  );
 }
 
 function queueHint(queue) {
   if (viewOfMemoryDatum(queue).isHole) return null;
+  const parked = servedQueueCount(queue.value, 'parked');
   const oldest = queue.value.oldest_pending_age_seconds;
-  return oldest === null || oldest === undefined ? 'idle' : oldest + 's oldest';
+  const age = oldest === null || oldest === undefined ? 'idle' : oldest + 's oldest';
+  return parked > 0 ? parked + ' parked · ' + age : age;
 }
 
-// Red is a MEASURED fault (dead letters); amber is anything short of a fresh,
-// clean reading — an unmeasured queue included, which is never painted green.
+// Red is a MEASURED fault: a write waiting on a human. Amber is anything short
+// of a fresh, clean reading — an unmeasured queue or parked count included,
+// which is never painted green.
 function queueHealth(queue) {
   if (viewOfMemoryDatum(queue).isHole) return { ok: true, warn: true };
-  const { pending, retry, dead } = queue.value;
+  const { pending, retry } = queue.value;
   return {
-    ok: dead === 0,
-    warn: queue.state !== 'fresh' || pending > 5 || retry > 0,
+    ok: awaitingOperatorCount(queue.value) === 0,
+    warn: (
+      queue.state !== 'fresh' || servedQueueCount(queue.value, 'parked') === null ||
+      pending > 5 || retry > 0
+    ),
   };
 }
 

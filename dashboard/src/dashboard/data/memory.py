@@ -18,6 +18,7 @@ import anyio
 import httpx
 from shared.mcp_idempotency import maybe_inject_client_op_id
 from shared.mcp_post import MCP_POST_HEADERS, decode_mcp_response_body, mcp_endpoint_url
+from shared.write_queue_statuses import AWAITING_OPERATOR, CLAIMABLE, WriteQueueStatus
 
 from dashboard.config import DashboardConfig
 from dashboard.data.datum import Datum, DatumState, unknown_datum
@@ -445,16 +446,23 @@ so the routine slow path does not serve its own probe stale — the same
 reasoning as ``merge_queue.py::LIVE_QUEUE_FRESHNESS_BOUND_SECONDS``.
 """
 
+#: The rows the queue still owes plus the ones it abandoned; in_flight and
+#: completed are not shown.
+_SHOWN_QUEUE_STATUSES = (*CLAIMABLE, WriteQueueStatus.DEAD)
+
 
 def write_queue_datum(
     stats: Mapping[str, Any], *, measured_at: datetime,
 ) -> Datum[dict[str, Any]]:
     """The write queue as one Datum: the one normaliser of a get_queue_stats answer.
 
-    A reachable answer is a fresh ``{pending, retry, dead,
-    oldest_pending_age_seconds}``, a missing count reading 0. An offline one
-    is ``unknown`` carrying the probe's own error verbatim: an unmeasured
-    queue is a hole, never a row of zeros.
+    A reachable answer is a fresh ``{pending, retry, parked, dead,
+    awaiting_operator, oldest_pending_age_seconds}``, its counts following
+    ``shared.write_queue_statuses`` and a missing count reading 0.
+    ``awaiting_operator`` sums the ``AWAITING_OPERATOR`` rows, so the client
+    never decides which rows wait on a human. An offline one is ``unknown``
+    carrying the probe's own error verbatim: an unmeasured queue is a hole,
+    never a row of zeros.
     """
     if stats.get('offline'):
         return unknown_datum(
@@ -464,9 +472,8 @@ def write_queue_datum(
     counts = stats.get('counts') or {}
     return Datum(
         {
-            'pending': counts.get('pending', 0),
-            'retry': counts.get('retry', 0),
-            'dead': counts.get('dead', 0),
+            **{status.value: counts.get(status, 0) for status in _SHOWN_QUEUE_STATUSES},
+            'awaiting_operator': sum(counts.get(status, 0) for status in AWAITING_OPERATOR),
             'oldest_pending_age_seconds': stats.get('oldest_pending_age_seconds'),
         },
         measured_at,

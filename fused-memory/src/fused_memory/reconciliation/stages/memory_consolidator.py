@@ -700,6 +700,7 @@ class MemoryConsolidator(BaseStage):
                         'project_id': self.project_id,
                         'run_id': run_id,
                         'dead_count': self.graphiti_queue_health.get('dead_count'),
+                        'parked_count': self.graphiti_queue_health.get('parked_count'),
                     },
                 )
         if self.index_health is not None:

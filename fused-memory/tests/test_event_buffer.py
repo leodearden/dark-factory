@@ -9,7 +9,9 @@ from typing import get_type_hints
 import aiosqlite
 import pytest
 import pytest_asyncio
+from _parked_queue_fixtures import queue_holding_parked_rows
 from reconciliation.legacy_drains import drain_unattributed
+from shared.write_queue_statuses import WriteQueueStatus
 
 from fused_memory.models.reconciliation import (
     EventSource,
@@ -364,71 +366,18 @@ async def test_not_quiescent_when_bursting(tmp_path):
         await buf.close()
 
 
-@pytest.mark.asyncio
-async def test_not_quiescent_when_queue_active(tmp_path):
-    """165 events + pending queue items → no conditional trigger."""
-    async def mock_queue_stats():
-        return {'counts': {'pending': 3, 'retry': 0, 'in_flight': 0}, 'oldest_pending_age_seconds': None}
-
+async def _trigger_after_165_events(db_path: Path, queue_stats_fn) -> tuple[bool, str]:
     buf = EventBuffer(
-        db_path=tmp_path / 'no_q_queue.db',
+        db_path=db_path,
         buffer_size_threshold=500,
         conditional_trigger_ratio=0.33,
-        queue_stats_fn=mock_queue_stats,
+        queue_stats_fn=queue_stats_fn,
     )
     await buf.initialize()
     try:
         for _ in range(165):
             await buf.push(_make_event())
-
-        should, reason = await buf.should_trigger('test-project')
-        assert not should
-    finally:
-        await buf.close()
-
-
-@pytest.mark.asyncio
-async def test_not_quiescent_when_queue_has_in_flight(tmp_path):
-    """165 events + in-flight queue items → no conditional trigger."""
-    async def mock_queue_stats():
-        return {'counts': {'in_flight': 1}, 'oldest_pending_age_seconds': None}
-
-    buf = EventBuffer(
-        db_path=tmp_path / 'no_q_inflight.db',
-        buffer_size_threshold=500,
-        conditional_trigger_ratio=0.33,
-        queue_stats_fn=mock_queue_stats,
-    )
-    await buf.initialize()
-    try:
-        for _ in range(165):
-            await buf.push(_make_event())
-
-        should, reason = await buf.should_trigger('test-project')
-        assert not should
-    finally:
-        await buf.close()
-
-
-@pytest.mark.asyncio
-async def test_not_quiescent_when_queue_has_retries(tmp_path):
-    """165 events + retry queue items → no conditional trigger."""
-    async def mock_queue_stats():
-        return {'counts': {'retry': 2}, 'oldest_pending_age_seconds': 10.0}
-
-    buf = EventBuffer(
-        db_path=tmp_path / 'no_q_retry.db',
-        buffer_size_threshold=500,
-        conditional_trigger_ratio=0.33,
-        queue_stats_fn=mock_queue_stats,
-    )
-    await buf.initialize()
-    try:
-        for _ in range(165):
-            await buf.push(_make_event())
-
-        should, reason = await buf.should_trigger('test-project')
-        assert not should
+        return await buf.should_trigger('test-project')
     finally:
         await buf.close()
 
@@ -436,49 +385,34 @@ async def test_not_quiescent_when_queue_has_retries(tmp_path):
 @pytest.mark.asyncio
 async def test_quiescent_when_queue_truly_empty(tmp_path):
     """165 events + empty queue → conditional trigger fires."""
-    async def mock_queue_stats():
+    async def empty_queue():
         return {'counts': {}, 'oldest_pending_age_seconds': None}
 
-    buf = EventBuffer(
-        db_path=tmp_path / 'q_empty.db',
-        buffer_size_threshold=500,
-        conditional_trigger_ratio=0.33,
-        queue_stats_fn=mock_queue_stats,
-    )
-    await buf.initialize()
-    try:
-        for _ in range(165):
-            await buf.push(_make_event())
+    decision = await _trigger_after_165_events(tmp_path / 'q_empty.db', empty_queue)
 
-        should, reason = await buf.should_trigger('test-project')
-        assert should
-        assert reason == 'quiescent:165'
-    finally:
-        await buf.close()
+    assert decision == (True, 'quiescent:165')
 
 
 @pytest.mark.asyncio
-async def test_quiescent_when_queue_all_completed(tmp_path):
-    """165 events + only completed items in queue → conditional trigger fires."""
-    async def mock_queue_stats():
-        return {'counts': {'completed': 50}, 'oldest_pending_age_seconds': None}
+async def test_parked_rows_do_not_hold_reconciliation_off(tmp_path):
+    async with queue_holding_parked_rows(tmp_path, rows=3) as q:
+        decision = await _trigger_after_165_events(tmp_path / 'q_parked.db', q.get_stats)
 
-    buf = EventBuffer(
-        db_path=tmp_path / 'q_completed.db',
-        buffer_size_threshold=500,
-        conditional_trigger_ratio=0.33,
-        queue_stats_fn=mock_queue_stats,
-    )
-    await buf.initialize()
-    try:
-        for _ in range(165):
-            await buf.push(_make_event())
+    assert decision == (True, 'quiescent:165')
 
-        should, reason = await buf.should_trigger('test-project')
-        assert should
-        assert reason == 'quiescent:165'
-    finally:
-        await buf.close()
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('status', list(WriteQueueStatus), ids=str)
+async def test_only_rows_the_workers_will_finish_hold_reconciliation_off(tmp_path, status):
+    async def one_row_of(status=status):
+        return {'counts': {status.value: 1}}
+
+    should, _ = await _trigger_after_165_events(tmp_path / 'q_status.db', one_row_of)
+
+    lets_reconciliation_run = {
+        WriteQueueStatus.PARKED, WriteQueueStatus.DEAD, WriteQueueStatus.COMPLETED,
+    }
+    assert should is (status in lets_reconciliation_run)
 
 
 @pytest.mark.asyncio

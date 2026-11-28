@@ -21,6 +21,8 @@ from __future__ import annotations
 
 import logging
 
+from shared.write_queue_statuses import AWAITING_OPERATOR, CLAIMABLE, WriteQueueStatus
+
 logger = logging.getLogger(__name__)
 
 
@@ -80,10 +82,12 @@ def summarize_graphiti_queue_health(stats: dict) -> dict:
             dead_count (int): Number of dead-lettered writes (the silent-drop signal).
             pending_count (int): Writes waiting to be processed.
             retry_count (int): Writes being retried after a transient failure.
-            oldest_pending_age_seconds (float | None): Age of the oldest pending/retry item.
+            parked_count (int): Writes parked until an operator clears their cause.
+            oldest_pending_age_seconds (float | None): Age of the oldest claimable
+                item (pending, retry or parked).
             dead_by_operation (dict[str, int]): Dead writes per operation, {} when
                 none or absent.
-            healthy (bool): True when dead_count == 0.
+            healthy (bool): False while any write is dead or parked.
 
     Emits a WARNING log when *stats* is malformed (not a dict, or a 'counts' or
     'dead_by_operation' key present but not a dict or holding a non-integer
@@ -105,13 +109,12 @@ def summarize_graphiti_queue_health(stats: dict) -> dict:
     dead_by_operation, breakdown_malformed = _optional_counts(stats, 'dead_by_operation')
     malformed = stats_malformed or counts_malformed or breakdown_malformed
 
-    dead_count = counts.get('dead', 0)
+    awaiting_operator = any(counts.get(status, 0) for status in AWAITING_OPERATOR)
 
     return {
-        'dead_count': dead_count,
-        'pending_count': counts.get('pending', 0),
-        'retry_count': counts.get('retry', 0),
+        'dead_count': counts.get(WriteQueueStatus.DEAD, 0),
+        **{f'{status}_count': counts.get(status, 0) for status in CLAIMABLE},
         'oldest_pending_age_seconds': stats.get('oldest_pending_age_seconds'),
         'dead_by_operation': dead_by_operation,
-        'healthy': (dead_count == 0) and not malformed,
+        'healthy': not malformed and not awaiting_operator,
     }
