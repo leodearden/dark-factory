@@ -1778,12 +1778,14 @@ def test_a_marked_root_never_reaped_reads_no_age(gate_root: Path):
 def test_a_stamp_reads_its_age_on_the_hosts_clock(gate_root: Path):
     stamp = gate_root / REAP_STAMP
     stamp.touch()
+    aged_at = time.time()
     _age(stamp, 1 / 24)
 
     reading = _read_stamp(gate_root)
 
     assert reading.gate_root
-    assert reading.age_secs is not None and 3600 <= reading.age_secs <= 3660
+    assert reading.age_secs is not None
+    assert 3600 <= reading.age_secs <= 3600 + math.ceil(time.time() - aged_at) + 1
 
 
 def test_the_stamp_probe_rejects_a_relative_root():
@@ -1854,6 +1856,11 @@ async def test_a_reap_stamp_reply_that_does_not_parse_reads_unreadable_with_sshs
     assert not reading.shows_a_run_within(math.inf)
 
 
+# A hang guard: the detached reaper finishes in well under a second, so a
+# passing test never waits this out.
+_DETACHED_REAP_HANG_CEILING_SECS = 120
+
+
 @pytest.mark.asyncio
 async def test_reap_idle_gates_reads_the_stamp_of_the_run_it_launched_before(
     gate_scene: _GateScene,
@@ -1868,12 +1875,15 @@ async def test_reap_idle_gates_reads_the_stamp_of_the_run_it_launched_before(
     first = await runner.reap_idle_gates()
 
     assert first == ReapStamp(path=str(stamp), gate_root=True, age_secs=None)
-    assert await asyncio.to_thread(_holds_within, stamp.exists, 10)
+    assert await asyncio.to_thread(_holds_within, stamp.exists, _DETACHED_REAP_HANG_CEILING_SECS)
     assert not idle.exists()
 
     first_run = stamp.stat().st_mtime_ns
     second = await runner.reap_idle_gates()
 
     assert isinstance(second, ReapStamp) and second.gate_root
-    assert second.age_secs is not None and 0 <= second.age_secs <= 30
-    assert await asyncio.to_thread(_holds_within, lambda: stamp.stat().st_mtime_ns > first_run, 10)
+    assert second.age_secs is not None
+    assert 0 <= second.age_secs <= math.ceil(time.time() - first_run / 1e9) + 1
+    assert await asyncio.to_thread(
+        _holds_within, lambda: stamp.stat().st_mtime_ns > first_run, _DETACHED_REAP_HANG_CEILING_SECS,
+    )

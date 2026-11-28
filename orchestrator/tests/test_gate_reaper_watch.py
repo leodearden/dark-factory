@@ -127,14 +127,14 @@ def test_an_alarm_left_by_an_earlier_process_resolves_at_the_first_completed_jud
 
 
 def test_a_failed_launch_is_judged_against_the_last_real_launch(queue: EscalationQueue):
-    _feed(_watch(queue), [_stamp(0), None, _stamp(7000)])
+    _feed(_watch(queue), [_stamp(0), _NEVER_REAPED, None, _stamp(7000)])
 
     assert _pending(queue) == []
 
 
 def test_a_failed_launch_neither_counts_as_a_miss_nor_resets_the_streak(queue: EscalationQueue):
     uncounted = _watch(queue)
-    _feed(uncounted, [_NEVER_REAPED, _NEVER_REAPED, None, _stamp(7000)])
+    _feed(uncounted, [_NEVER_REAPED, _NEVER_REAPED, None, _JUST_REAPED])
     assert _pending(queue) == []
 
     unreset = _watch(queue)
