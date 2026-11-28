@@ -365,11 +365,12 @@ class TestEnsureFreshCollectionOutlastsAnAbandonedCreate:
         client.collection_cluster_info.side_effect = unanswered
 
         with pytest.raises(AssertionError) as excinfo:
-            ensure_fresh_collection(client, 'c', size=8, settle_timeout=0.2)
+            ensure_fresh_collection(client, 'c', size=8, settle_timeout=0)
 
         assert 'last seen: no answer to the state read (ReadTimeout' in str(excinfo.value)
         assert "'c'" in str(excinfo.value)
         assert client.create_collection.call_count == 1
+        assert client.collection_cluster_info.call_count == 1
 
     def test_a_settle_read_that_cannot_reach_the_server_propagates(self):
         from _fm_qdrant_live import ensure_fresh_collection
