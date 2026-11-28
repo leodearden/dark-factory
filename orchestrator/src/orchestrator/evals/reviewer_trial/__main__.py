@@ -966,7 +966,8 @@ def _parse_arms(
 @click.option('--max-turns', default=None, type=click.IntRange(min=1),
               help="Reviewer turn cap (default: production's max_turns.reviewer; 30 reproduces the D6/D7 campaign)")
 @click.option('--production-budget', default=None, type=click.FloatRange(min=0, min_open=True),
-              help="USD budget per reviewer for the arms that take production's (variant_a, variant_a_xhigh); "
+              help="USD budget per reviewer for every arm that pins none of its own "
+                   "(a ReviewerSpec budget of None in variants.py); "
                    "default: production's budgets.reviewer; 5 reproduces the D6/D7 campaign")
 @click.option('--max-parallel', default=3, type=int, help='Max concurrent panel runs')
 @click.option('--pool/--no-pool', default=True,

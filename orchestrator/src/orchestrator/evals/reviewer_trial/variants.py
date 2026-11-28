@@ -435,6 +435,8 @@ FABLE_EVIDENCE_VARIANTS = [
 # d2 reviewer campaign round 2 (Leo 2026-11-25, consumer task 11727): a
 # Fable 5.2 and a GPT-6.2 Sol generalist in the incumbent's shape. A
 # candidate's name embeds its model id and is never re-pointed at another.
+# Fable 5.2 takes production's budget, as the incumbent does, so the model is
+# the only variable (measured basis: plans/d2-reviewer-campaign-rerun.md §8).
 # ---------------------------------------------------------------------------
 
 VARIANT_FABLE52_SOLO = VariantConfig(
@@ -445,7 +447,7 @@ VARIANT_FABLE52_SOLO = VariantConfig(
             name='comprehensive_reviewer',
             model='claude-fable-5-2',
             specialization=_SPEC_COMPREHENSIVE,
-            budget=10.0,
+            budget=None,
             effort='high',
         ),
     ],

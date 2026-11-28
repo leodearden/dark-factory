@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import dataclasses
+
 import pytest
 
 from orchestrator.agents.review_briefing import ReviewBriefing
@@ -21,6 +23,7 @@ from orchestrator.evals.reviewer_trial.variants import (
     VARIANT_CODEX_SOL62,
     VARIANT_CROSS_FAMILY,
     VARIANT_D,
+    VARIANT_FABLE51_SOLO,
     VARIANT_FABLE52_SOLO,
     VARIANT_SONNET5_SOLO,
     ReviewerSpec,
@@ -334,7 +337,7 @@ class TestD2Round2Variants:
         assert len(VARIANT_FABLE52_SOLO.reviewers) == 1
         reviewer = VARIANT_FABLE52_SOLO.reviewers[0]
         assert (reviewer.name, reviewer.model, reviewer.backend, reviewer.effort, reviewer.budget) == (
-            'comprehensive_reviewer', 'claude-fable-5-2', 'claude', 'high', 10.0,
+            'comprehensive_reviewer', 'claude-fable-5-2', 'claude', 'high', None,
         )
         assert reviewer.specialization == _SPEC_COMPREHENSIVE
         assert reviewer.oauth_token_env is None
@@ -412,16 +415,27 @@ class TestTrialReviewerTurnCap:
 
 
 class TestTrialReviewerBudget:
-    """The incumbent arms run at production's reviewer budget unless told otherwise."""
+    """An arm that pins no budget runs at production's reviewer budget unless told otherwise.
+
+    A pinned arm keeps its pin.
+    """
 
     @pytest.mark.usefixtures('code_default_config')
-    def test_the_incumbent_arms_built_with_no_override_carry_production_s_12_dollars(self) -> None:
+    def test_the_unpinned_arms_built_with_no_override_carry_production_s_12_dollars(self) -> None:
         assert trial_production_budget() == 12.0
-        for variant in (VARIANT_A, VARIANT_A_XHIGH):
+        for variant in (VARIANT_A, VARIANT_A_XHIGH, VARIANT_FABLE52_SOLO):
             for arm in (variant, with_briefing(variant, ReviewBriefing.CONTEXT_COMPLETE)):
                 assert arm.reviewers[0].budget is None
                 role = build_trial_reviewer_role(arm.reviewers[0], arm.briefing)
                 assert role.default_budget == 12.0
+
+    @pytest.mark.usefixtures('code_default_config')
+    def test_the_fable_5_2_candidate_runs_at_the_incumbent_s_budget(self) -> None:
+        """Candidate and incumbent differ only in model, so the budget never varies with the arm."""
+        candidate = VARIANT_FABLE52_SOLO.reviewers[0]
+        assert dataclasses.replace(VARIANT_A.reviewers[0], model=candidate.model) == candidate
+        assert panel_budgets(VARIANT_FABLE52_SOLO) == panel_budgets(VARIANT_A) == (12.0,)
+        assert panel_budgets(VARIANT_FABLE52_SOLO, 7.5) == panel_budgets(VARIANT_A, 7.5) == (7.5,)
 
     def test_the_budget_follows_production_s_reviewer_config(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv('ORCH_BUDGETS__REVIEWER', '7.5')
@@ -446,7 +460,7 @@ class TestTrialReviewerBudget:
     ) -> None:
         monkeypatch.setenv('ORCH_BUDGETS__REVIEWER', '7.5')
 
-        fable = build_trial_reviewer_role(VARIANT_FABLE52_SOLO.reviewers[0], production_budget=6.0)
+        fable = build_trial_reviewer_role(VARIANT_FABLE51_SOLO.reviewers[0], production_budget=6.0)
         sol = build_trial_reviewer_role(VARIANT_CODEX_SOL62.reviewers[0], production_budget=6.0)
 
         assert fable.default_budget == 10.0
