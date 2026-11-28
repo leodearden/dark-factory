@@ -907,7 +907,7 @@ class _Scripted:
             'verify': (0, result_to_json(_VERDICT), ''),
             'cancel': (0, '', ''),
             'probe': (1, '', ''),
-            'reap': (0, '', ''),
+            'reap': (0, '{"gate_root": true, "age_secs": 0}', ''),
             'other': (0, '', ''),
             **replies,
         }

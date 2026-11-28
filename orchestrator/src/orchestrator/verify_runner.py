@@ -70,16 +70,20 @@ from orchestrator.merge_verify_facts import MergeVerifyDispatchFacts, RunnerReas
 from orchestrator.narrow_gate_plan import NarrowGateDecision
 from orchestrator.remote_gate import (
     ENSURE_CLIENT_TIMEOUT_SECS,
+    REAP_STAMP,
     SHIM_REMEDY,
     EnsureReport,
     GateIdentityPair,
     GateReplyError,
+    ReapStamp,
     RunnerUnavailableKind,
     classify_remote_exit,
     ensure_script_text,
     local_gate_identity,
     parse_ensure_report,
+    parse_reap_stamp,
     reap_script_text,
+    reap_stamp_script_text,
     shim_suspected,
     wire_fields,
 )
@@ -1700,27 +1704,40 @@ class RemoteRunner:
             await asyncio.sleep(_REFUSED_PUSH_RETRY_DELAY_SECS)
             await self._push(target, refspec, cwd=self._code_checkout)
 
-    async def reap_idle_gates(self) -> None:
-        """Launch ``remote_gate/reap-gates.sh`` detached on the remote; never raises.
+    async def reap_idle_gates(self) -> ReapStamp | None:
+        """Read the remote's reap stamp, then launch ``remote_gate/reap-gates.sh`` detached; never raises.
 
-        Only the launch is awaited: the script runs on after ssh returns, so no
-        lease or verify ever waits on it.  A failed launch is logged and the
-        caller's next periodic call retries.
+        Both happen in one ssh round trip, the stamp probe first, so the
+        reading is of the run the PREVIOUS launch started.  Only the launch is
+        awaited: the script runs on after ssh returns, so no lease or verify
+        ever waits on it.  None means the launch or the reading failed; it is
+        logged and the caller's next periodic call retries.
         """
-        script = ' '.join(shlex.quote(a) for a in (
-            'env', f'GATE_ROOT={self._gate_root}', 'bash', '-c', reap_script_text(), 'reap-gates',
-        ))
-        remote_cmd = f'{REMOTE_TOOL_PATH_PRELUDE} nohup {script} </dev/null >/dev/null 2>&1 &'
+        probe = self._gate_root_command(reap_stamp_script_text(), 'reap-stamp')
+        script = self._gate_root_command(reap_script_text(), 'reap-gates')
+        # `;`, never `&&`: `a && b &` backgrounds the whole list in a subshell
+        # that keeps ssh's stdout open, so ssh would wait for the reaper.
+        remote_cmd = f'{probe}; {REMOTE_TOOL_PATH_PRELUDE} nohup {script} </dev/null >/dev/null 2>&1 &'
         try:
             async with asyncio.timeout(_SSH_PROBE_TIMEOUT_SECS):
-                rc, _, stderr = await self._run(['ssh', *_SSH_BASE_OPTS, self._ssh_host, remote_cmd])
+                rc, stdout, stderr = await self._run(['ssh', *_SSH_BASE_OPTS, self._ssh_host, remote_cmd])
         except OSError as exc:
             logger.warning('RemoteRunner %r: gate reaper launch failed: %r', self.name, exc)
-            return
+            return None
         if rc != 0:
             logger.warning(
                 'RemoteRunner %r: gate reaper launch exited %d: %s', self.name, rc, stderr,
             )
+            return None
+        try:
+            return parse_reap_stamp(stdout, path=posixpath.join(self._gate_root, REAP_STAMP))
+        except GateReplyError as exc:
+            logger.warning('RemoteRunner %r: gate reap stamp unreadable: %s', self.name, exc)
+            return None
+
+    def _gate_root_command(self, script_text: str, name: str) -> str:
+        """The remote words running *script_text* as ``$0`` *name* against this runner's gate root."""
+        return shlex.join(['env', f'GATE_ROOT={self._gate_root}', 'bash', '-c', script_text, name])
 
     async def _push(self, target: str, *push_args: str, cwd: str | Path) -> None:
         """``git push <target> <push_args...>`` over the bounded ssh transport, or raise RunnerUnavailable.
