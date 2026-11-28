@@ -15,12 +15,17 @@ from shared.defects import (
     DefectOrigin,
     DefectStatus,
     IssueKind,
+    Rule,
+    RuledBy,
+    Ruling,
+    RulingSubject,
     Sighting,
     issue_kind_of,
     mint_review_ref,
 )
 
 from orchestrator.review_issue_contract import IssueField
+from orchestrator.review_payload import DefectRuling
 
 _UNNAMED_REVIEWER = 'reviewer'
 
@@ -76,3 +81,26 @@ def review_defect_declarations(
             status=DefectStatus.OPEN,
         )))
     return tuple(events)
+
+
+def review_ruling_events(
+    rulings: Sequence[DefectRuling], *, verdict_cycle: int,
+) -> tuple[Rule, ...]:
+    """One reviewer Rule per (ref, subject), accepted only if every ruling on it accepted.
+
+    A panel's rulings are folded first so that a split panel rejects rather
+    than letting its first accept win. Rules come in order of first appearance.
+    """
+    accepted_by_subject: dict[tuple[str, RulingSubject], bool] = {}
+    for ruling in rulings:
+        key = (ruling.ref, ruling.subject)
+        accepted_by_subject[key] = accepted_by_subject.get(key, True) and ruling.accepted
+    return tuple(
+        Rule(ref=ref, ruling=Ruling(
+            subject=subject,
+            accepted=accepted,
+            ruled_by=RuledBy.REVIEWER,
+            verdict_cycle=verdict_cycle,
+        ))
+        for (ref, subject), accepted in accepted_by_subject.items()
+    )
