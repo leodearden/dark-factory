@@ -305,11 +305,12 @@ async def _adopt(
         )
         return FixOwner(sig, task_id), status
     spawn_context = _spawn_context_of(task)
+    owner = FixOwner(sig, task_id, spawn_context=spawn_context)
     if spawn_context is not None and owner_liveness(status) is OwnerLiveness.DEFERRED:
         logger.info('main-health fix owner: completing the half-filed task %s', task_id)
         await tasks.commit_planning([task_id])
-        status = await _read_status(tasks, task_id)
-    return FixOwner(sig, task_id, spawn_context=spawn_context), status
+        return owner, await _read_status(tasks, task_id)
+    return owner, status
 
 
 async def _read_status(tasks: SchedulerChronicFlakeTaskClient, task_id: str) -> str | None:
