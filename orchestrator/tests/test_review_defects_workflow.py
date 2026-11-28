@@ -23,6 +23,7 @@ from _replanning_review_stub import ReplanningReviewStub
 from _workflow_helpers import (
     PLAN,
     AgentStub,
+    FakeBriefing,
     _build_workflow_with_escalation,
     _init_repo,
     _make_git_ops,
@@ -55,8 +56,9 @@ from shared.defects import (
 )
 from shared.governed_exceptions import Debt, TicketRef
 
-from orchestrator.agents.review_briefing import ReviewBriefing
+from orchestrator.agents.review_briefing import ReviewBriefing, ReviewSubject
 from orchestrator.agents.roles import REVIEWER_COMPREHENSIVE
+from orchestrator.escalation_rulings import Ruling as EscalationRuling
 from orchestrator.review_defects import RECORD_DEFECT_OUTCOME_TOOL
 from orchestrator.scheduler import TaskAssignment
 from orchestrator.workflow import WorkflowOutcome
@@ -355,3 +357,117 @@ class TestReviewerRulingsAreApplied:
         (entry,) = await run.defects()
         assert entry.status is DefectStatus.PENDING
         assert run.outcome_tools_called() == []
+
+
+class _TaskRecordingBriefing(FakeBriefing):
+    """Records a copy of the task every reviewer is briefed with, then answers as FakeBriefing does.
+
+    A copy, because the workflow later replaces its own task's metadata in place.
+    """
+
+    def __init__(self) -> None:
+        self.briefed_tasks: list[Mapping[str, object] | None] = []
+
+    async def build_reviewer_prompt(
+        self, reviewer_type: str, diff: str, context: str | None = None,
+        *, amendment_suggestions: list[dict] | None = None,
+        task: dict | None = None,
+        open_info_notes: Sequence | None = None,
+        rulings: Sequence[EscalationRuling] = (),
+    ) -> str:
+        self.briefed_tasks.append(copy.deepcopy(task))
+        return await super().build_reviewer_prompt(
+            reviewer_type, diff, context, amendment_suggestions=amendment_suggestions,
+            task=task, open_info_notes=open_info_notes, rulings=rulings,
+        )
+
+    async def build_context_complete_reviewer_prompt(
+        self, reviewer_type: str, subject: ReviewSubject, context: str | None = None,
+        *, amendment_suggestions: list[dict] | None = None,
+        open_info_notes: Sequence | None = None,
+        rulings: Sequence[EscalationRuling] = (),
+    ) -> str:
+        self.briefed_tasks.append(copy.deepcopy(dict(subject.task)))
+        return await super().build_context_complete_reviewer_prompt(
+            reviewer_type, subject, context, amendment_suggestions=amendment_suggestions,
+            open_info_notes=open_info_notes, rulings=rulings,
+        )
+
+
+def _briefed_defects(task: Mapping[str, object] | None) -> list[DefectDeclaration]:
+    assert task is not None
+    metadata = task['metadata']
+    assert isinstance(metadata, Mapping)
+    return [DefectDeclaration.model_validate(entry) for entry in metadata.get(DEFECTS_METADATA_KEY, [])]
+
+
+@pytest.mark.asyncio
+class TestReviewerIsBriefedFromLiveRecords:
+    """The store holds a closure awaiting a ruling that the dispatch task never carried."""
+
+    def _run(self, tmp_path, monkeypatch, briefing: ReviewBriefing) -> tuple[_DefectRun, _TaskRecordingBriefing]:
+        run = _DefectRun(tmp_path, monkeypatch, AgentStub(), max_review_cycles=2, briefing=briefing)
+        recorder = _TaskRecordingBriefing()
+        run.workflow.briefing = recorder
+        run.seed(defects=[_exemption_awaiting_ruling(RULED_REF)])
+        return run, recorder
+
+    @pytest.mark.parametrize('briefing', [ReviewBriefing.DIFF_ONLY, ReviewBriefing.CONTEXT_COMPLETE])
+    async def test_every_reviewer_sees_the_closure_beside_the_dispatch_fields(
+        self, tmp_path, monkeypatch, briefing,
+    ):
+        run, recorder = self._run(tmp_path, monkeypatch, briefing)
+
+        assert await run.run() == WorkflowOutcome.DONE
+
+        assert recorder.briefed_tasks
+        dispatched = _dispatched().task
+        for task in recorder.briefed_tasks:
+            assert task is not None
+            assert task['title'] == dispatched['title']
+            metadata = task['metadata']
+            assert isinstance(metadata, Mapping)
+            assert metadata['files'] == dispatched['metadata']['files']
+            (entry,) = _briefed_defects(task)
+            assert entry.ref == RULED_REF
+            assert entry.status is DefectStatus.PENDING
+
+    async def test_an_unreadable_store_briefs_the_dispatch_task(self, tmp_path, monkeypatch):
+        run, recorder = self._run(tmp_path, monkeypatch, ReviewBriefing.DIFF_ONLY)
+        outage = _StoreDownUntilBriefed(run, recorder)
+        monkeypatch.setattr(run.scheduler, 'get_task', outage.get_task)
+        monkeypatch.setattr('orchestrator.workflow.run_scoped_verification', outage.verify)
+
+        assert await run.run() == WorkflowOutcome.DONE
+
+        assert outage.refused_reads >= 1
+        assert recorder.briefed_tasks
+        dispatched = _dispatched().task
+        for task in recorder.briefed_tasks:
+            assert task is not None
+            assert task['title'] == dispatched['title']
+            assert _briefed_defects(task) == []
+
+
+class _StoreDownUntilBriefed:
+    """The task store refuses every read from the moment verification passes until a reviewer is briefed.
+
+    The merge phase reads the task too and needs the store back, so the
+    outage covers the review round's own read and nothing after it.
+    """
+
+    def __init__(self, run: _DefectRun, recorder: _TaskRecordingBriefing) -> None:
+        self._read = run.scheduler.get_task
+        self._recorder = recorder
+        self._verified = False
+        self.refused_reads = 0
+
+    async def verify(self, *_args, **_kwargs):
+        self._verified = True
+        return PASSED
+
+    async def get_task(self, task_id: str) -> dict | None:
+        if self._verified and not self._recorder.briefed_tasks:
+            self.refused_reads += 1
+            raise OSError('store unreachable')
+        return await self._read(task_id)
