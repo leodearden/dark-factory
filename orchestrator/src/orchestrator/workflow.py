@@ -11909,10 +11909,11 @@ class TaskWorkflow:
         self.artifacts.clear_reviews()
         briefing = self.config.review.reviewer_briefing
         roster = reviewers_for(briefing)
+        review_task = await self._task_with_live_defect_records()
         subject = None
         if briefing is ReviewBriefing.CONTEXT_COMPLETE:
             try:
-                subject = await self._context_complete_review_subject()
+                subject = await self._context_complete_review_subject(task=review_task)
             except Exception as exc:
                 return self._review_inputs_unavailable(roster, exc)
             diff = subject.change.diff
@@ -11931,7 +11932,7 @@ class TaskWorkflow:
                 await asyncio.sleep(idx * stagger)
             return await self._run_reviewer(
                 role, diff, amendment_suggestions=amendment_suggestions, subject=subject,
-                rulings=rulings,
+                rulings=rulings, task=review_task,
             )
 
         tasks = [_staggered(i, r) for i, r in enumerate(roster)]
@@ -11951,7 +11952,7 @@ class TaskWorkflow:
                     results[i] = await self._run_reviewer(
                         roster[i], diff,
                         amendment_suggestions=amendment_suggestions,
-                        subject=subject, rulings=rulings,
+                        subject=subject, rulings=rulings, task=review_task,
                     )
                 except Exception as exc:
                     results[i] = exc
@@ -12015,12 +12016,15 @@ class TaskWorkflow:
             )
             return None
 
-    async def _context_complete_review_subject(self) -> ReviewSubject:
-        """The context-complete reviewer's inputs, from the worktree at its own-work base."""
+    async def _context_complete_review_subject(self, *, task: dict | None = None) -> ReviewSubject:
+        """The context-complete reviewer's inputs, from the worktree at its own-work base.
+
+        *task* is the task record to brief with; the dispatch snapshot when omitted.
+        """
         assert self.worktree is not None and self.artifacts is not None
         return await gather_review_subject(
             self.worktree, await self._own_work_base(),
-            task=self.task,
+            task=self.task if task is None else task,
             plan=self.artifacts.read_plan() or None,
             plan_absent_reason='this task has no plan.json (a simple-task run writes none)',
             conventions_relpath=self.config.review.briefing_path,
@@ -12119,6 +12123,7 @@ class TaskWorkflow:
         amendment_suggestions: list[dict] | None = None,
         *, subject: ReviewSubject | None = None,
         rulings: Sequence[Ruling] = (),
+        task: dict | None = None,
     ) -> dict:
         """Run a single reviewer and read its verdict artifact.
 
@@ -12126,7 +12131,9 @@ class TaskWorkflow:
         scope section into the reviewer prompt (task 2750). *subject*, when
         set, briefs the context-complete generation from it instead of *diff*.
         *rulings* are every ruling on the task, read once per review round by
-        ``_review``.
+        ``_review``. *task* briefs the diff-only generation; the dispatch
+        snapshot when omitted (``_review`` passes the task with its live
+        defect records).
         """
         assert self.worktree is not None and self.artifacts is not None
         notes = self._reviewer_notes()
@@ -12135,7 +12142,7 @@ class TaskWorkflow:
             build_prompt = partial(
                 self.briefing.build_reviewer_prompt,
                 role.name, diff, amendment_suggestions=amendment_suggestions,
-                task=self.task, open_info_notes=notes, rulings=rulings,
+                task=self.task if task is None else task, open_info_notes=notes, rulings=rulings,
             )
         else:
             build_prompt = partial(
