@@ -10,6 +10,7 @@ import dataclasses
 import hashlib
 import json
 import random
+import re
 import sys
 from dataclasses import dataclass
 from datetime import datetime
@@ -250,6 +251,28 @@ def test_invalid_arguments_are_usage_errors(bad_arguments):
         readout.main(['--salt', 's', *bad_arguments], environ={}, unit_environment=_unit_naming_no_roots)
 
     assert raised.value.code == 2
+
+
+@pytest.mark.parametrize(
+    ('start', 'end'),
+    [('2026-11-20T00:00:00+00:00', '2026-11-10T00:00:00+00:00'), (UNTIL, UNTIL)],
+    ids=['start-after-end', 'empty'],
+)
+def test_a_window_whose_start_is_not_before_its_end_is_refused_naming_both_bounds(start, end):
+    message = f'window start {start} is not before its end {end}'
+
+    with pytest.raises(ValueError, match=f'^{re.escape(message)}$'):
+        readout.Window(datetime.fromisoformat(start), datetime.fromisoformat(end))
+
+
+def test_main_names_both_bounds_of_a_since_not_before_its_until(capsys):
+    with pytest.raises(SystemExit):
+        readout.main(
+            ['--salt', 's', '--since', UNTIL, '--until', UNTIL],
+            environ={}, unit_environment=_unit_naming_no_roots,
+        )
+
+    assert f'window start {UNTIL} is not before its end {UNTIL}' in capsys.readouterr().err
 
 
 # --- ledger load -----------------------------------------------------------

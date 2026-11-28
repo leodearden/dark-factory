@@ -1410,7 +1410,7 @@ def main(
     if not selection.roots:
         _warn(_no_roots_message(selection))
         return EXIT_NOTHING_READ
-    load =load_fleet(selection.roots, settings.window, settings.salt, settings.buckets, settings.key)
+    load = load_fleet(selection.roots, settings.window, settings.salt, settings.buckets, settings.key)
     _warn_unread_stores(load.roots)
     if not any(status.read for status in load.roots):
         _warn(
