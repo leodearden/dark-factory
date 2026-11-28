@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import logging
 from datetime import UTC, datetime
 
 import pytest
 from _defect_ruling_fixtures import RULED_REF, SECOND_RULED_REF
+from _orch_helpers import mcp_tool_envelope
 from shared.defects import (
     Declare,
     DefectOrigin,
@@ -17,9 +19,16 @@ from shared.defects import (
     RulingSubject,
     Sighting,
     mint_review_ref,
+    parse_declare_event,
+    parse_outcome_event,
 )
 
-from orchestrator.review_defects import review_defect_declarations, review_ruling_events
+from orchestrator.review_defects import (
+    DefectWrite,
+    review_defect_declarations,
+    review_ruling_events,
+    send_defect_events,
+)
 from orchestrator.review_payload import DefectRuling
 
 TASK_NUMBER = 42
@@ -172,3 +181,108 @@ class TestReviewRulingEvents:
 
     def test_no_rulings_is_no_rules(self):
         assert _rule_events() == ()
+
+
+PROJECT_ROOT = '/srv/project'
+TASK_ID = '42'
+SUCCESS_REPLY = mcp_tool_envelope({'success': True, 'id': TASK_ID, 'message': 'recorded'})
+REFUSAL_REPLY = mcp_tool_envelope({
+    'success': False, 'error': 'defect_transition_refused', 'task_id': TASK_ID,
+    'detail': 'a declare event is refused from open',
+})
+
+
+class _RecordingDispatch:
+    """A SchedulerFacade.dispatch_tool double: records each call, answers from *replies* in turn."""
+
+    def __init__(self, *replies: dict | Exception) -> None:
+        self.calls: list[tuple[str, dict]] = []
+        self._replies = list(replies)
+
+    async def __call__(self, name: str, arguments: dict, *, timeout: float = 15) -> dict:
+        self.calls.append((name, arguments))
+        reply = self._replies.pop(0) if self._replies else SUCCESS_REPLY
+        if isinstance(reply, Exception):
+            raise reply
+        return reply
+
+
+def _declare_event(description: str = DESCRIPTION) -> Declare:
+    (event,) = _declarations(_issue(description=description))
+    assert isinstance(event, Declare)
+    return event
+
+
+async def _send(dispatch: _RecordingDispatch, *events: Declare | Sighting | Rule):
+    return await send_defect_events(
+        dispatch, project_root=PROJECT_ROOT, task_id=TASK_ID, events=events,
+    )
+
+
+@pytest.mark.asyncio
+class TestSendDefectEvents:
+    async def test_declarations_and_sightings_go_to_declare_defect(self):
+        declare = _declare_event()
+        sighting = Sighting(ref=declare.ref)
+        dispatch = _RecordingDispatch()
+
+        await _send(dispatch, declare, sighting)
+
+        assert [name for name, _ in dispatch.calls] == ['declare_defect', 'declare_defect']
+        for (_, arguments), event in zip(dispatch.calls, (declare, sighting), strict=True):
+            assert arguments == {
+                'project_root': PROJECT_ROOT, 'task_id': TASK_ID,
+                'event': event.model_dump(mode='json'),
+            }
+            assert parse_declare_event(arguments['event']) == event
+
+    async def test_a_rule_goes_to_record_defect_outcome_with_its_ref(self):
+        rule = _reviewer_rule(RULED_REF, RulingSubject.CLOSURE, accepted=True)
+        dispatch = _RecordingDispatch()
+
+        await _send(dispatch, rule)
+
+        ((name, arguments),) = dispatch.calls
+        assert name == 'record_defect_outcome'
+        assert arguments == {
+            'project_root': PROJECT_ROOT, 'task_id': TASK_ID, 'ref': RULED_REF,
+            'event': rule.model_dump(mode='json'),
+        }
+        assert parse_outcome_event(arguments['event']) == rule
+
+    async def test_a_successful_reply_is_a_write_without_failure(self):
+        declare = _declare_event()
+
+        writes = await _send(_RecordingDispatch(SUCCESS_REPLY), declare)
+
+        assert writes == (DefectWrite(tool='declare_defect', ref=declare.ref, failure=None),)
+
+    async def test_a_refusal_is_a_logged_failure_and_later_events_are_still_sent(self, caplog):
+        refused = _declare_event()
+        later = _declare_event(description='another defect')
+        dispatch = _RecordingDispatch(REFUSAL_REPLY, SUCCESS_REPLY)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.review_defects'):
+            first, second = await _send(dispatch, refused, later)
+
+        assert first.failure is not None
+        assert 'defect_transition_refused' in first.failure
+        assert second.failure is None
+        assert len(dispatch.calls) == 2
+        (record,) = [r for r in caplog.records if r.name == 'orchestrator.review_defects']
+        assert record.levelno == logging.WARNING
+        assert record.ref == refused.ref
+        assert record.tool == 'declare_defect'
+
+    async def test_a_dispatch_that_raises_is_a_failure_not_an_exception(self):
+        declare = _declare_event()
+
+        (write,) = await _send(_RecordingDispatch(TimeoutError('no reply')), declare)
+
+        assert write.failure is not None
+        assert 'no reply' in write.failure
+
+    async def test_a_body_that_is_not_a_tool_reply_is_a_failure(self):
+        (write,) = await _send(_RecordingDispatch({'unexpected': 'shape'}), _declare_event())
+
+        assert write.failure is not None
