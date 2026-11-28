@@ -19,6 +19,7 @@ from shared.followup_items import (
     FollowupItem,
     read_items,
 )
+from shared.task_complexity import SIMPLE_COMPLEXITY
 from shared.task_statuses import TaskStatus
 
 from fused_memory.middleware.curation_deferral import DeferReason, deferral_justification
@@ -261,6 +262,10 @@ class CuratorDecision:
     # The corpus streams whose read failed for this candidate: see
     # PoolWithheld.unavailable_streams.
     unavailable_streams: tuple[str, ...] = ()
+    # The curator's fast-path hint for a create (judging the candidate) or a
+    # combine (judging the rewrite). Applied to a created task's metadata by
+    # fused_memory/middleware/curator_complexity_hint.py.
+    complexity_hint: Literal['simple'] | None = None
 
     def __post_init__(self) -> None:
         if (self.action == 'defer') != (self.defer_reason is not None):
@@ -269,6 +274,11 @@ class CuratorDecision:
                 f'action={self.action!r} defer_reason={self.defer_reason!r}'
             )
         _require_pool_streams(self.unavailable_streams, 'CuratorDecision')
+        if self.complexity_hint not in (None, SIMPLE_COMPLEXITY):
+            raise ValueError(
+                f'CuratorDecision.complexity_hint must be None or {SIMPLE_COMPLEXITY!r}, '
+                f'got complexity_hint={self.complexity_hint!r}'
+            )
 
     @classmethod
     def deferred(
@@ -297,6 +307,7 @@ class CuratorDecision:
             'cost_usd': self.cost_usd,
             'defer_reason': self.defer_reason,
             'unavailable_streams': list(self.unavailable_streams),
+            'complexity_hint': self.complexity_hint,
         }
 
 

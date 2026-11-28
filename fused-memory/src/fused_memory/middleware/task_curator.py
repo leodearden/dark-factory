@@ -77,6 +77,7 @@ from shared.locking import files_to_modules
 from shared.neutral_cwd import neutral_cli_cwd
 from shared.prompt_artifact import PromptArtifactStore, PromptSpec, default_artifacts_root
 from shared.streak import KeyedStreaks
+from shared.task_complexity import SIMPLE_COMPLEXITY, is_simple_complexity
 from shared.task_fields import dependency_ids as _task_dependencies
 from shared.task_metadata_wire import coerce_task_metadata
 from shared.task_statuses import ACTIVE
@@ -291,6 +292,9 @@ def _salvageable_verdict(
     return evidence.accepted_schema_payload
 
 
+# The fast-path hint on a create or combine decision; shared by both output schemas.
+_COMPLEXITY_HINT_SCHEMA: dict[str, Any] = {'type': ['string', 'null'], 'enum': ['simple', None]}
+
 # JSON schema for the curator's structured output — used by invoke_with_cap_retry
 # to constrain the LLM's response.  See also CURATOR_BATCH_OUTPUT_SCHEMA below.
 CURATOR_OUTPUT_SCHEMA: dict[str, Any] = {
@@ -317,6 +321,7 @@ CURATOR_OUTPUT_SCHEMA: dict[str, Any] = {
                 'priority': {'type': 'string'},
             },
         },
+        'complexity_hint': _COMPLEXITY_HINT_SCHEMA,
     },
 }
 
@@ -350,6 +355,7 @@ CURATOR_BATCH_OUTPUT_SCHEMA: dict[str, Any] = {
                     'target_fingerprint': {'type': ['string', 'null']},
                     'justification': {'type': 'string'},
                     'rewritten_task': _REWRITTEN_TASK_SCHEMA,
+                    'complexity_hint': _COMPLEXITY_HINT_SCHEMA,
                 },
             },
         },
@@ -434,6 +440,7 @@ def _corpus_failed_deferral(
 # TestCuratorPromptSplit's superset tests in test_task_curator.py.
 # ----------------------------------------------------------------------
 
+# The complexity-hint criteria are the fast path's own: docs/task-authoring.md §4.
 _CURATOR_CONTRACT = """\
 You are the task curator for the dark-factory orchestrator. For each candidate \
 task a reviewer or agent wants to create, you decide ONE of three actions:
@@ -470,6 +477,16 @@ if it does not match, the combine is refused and the candidate is created fresh 
 instead of silently clobbering an unrelated task. Copy the title character-for-\
 character — do not shorten, summarize, or reformat it. For "drop" and "create", \
 leave `target_fingerprint` null.
+
+## Complexity hint (create and combine)
+
+On every "create" and "combine", set `complexity_hint` to "simple" when the task \
+is a single coherent edit (docs or comments, a rename, a localized \
+behaviour-preserving refactor, a typo or wording fix, a one-spot bug fix) that \
+needs no new abstraction and no cross-module design, and whose target files are \
+named. For "create", judge the candidate as filed; for "combine", judge the \
+rewritten task. Set it to null when unsure, and always null on "drop". The hint \
+never changes which action you choose.
 """
 
 _CURATOR_HEURISTICS = """\
@@ -552,7 +569,7 @@ additional rules for duplicates and combines that exist WITHIN the batch:
 # stale per-(prompt, model, harness) pinned artifact stops resolving and
 # falls back to the (new) in-code baseline instead of pairing new heuristics
 # with an outdated contract assumption.
-_CURATOR_PROMPT_HARNESS_VERSION = 'curator-v2'
+_CURATOR_PROMPT_HARNESS_VERSION = 'curator-v3'
 
 CURATOR_SINGLE_SPEC = PromptSpec(
     prompt_id='curator_single', contract=_CURATOR_CONTRACT, baseline_heuristics=_CURATOR_HEURISTICS,
@@ -3744,6 +3761,9 @@ def _parse_decision_dict(
         latency_ms=latency_ms,
         cost_usd=cost_usd,
         batch_target_index=batch_target_index if is_batch_edge else None,
+        complexity_hint=(
+            SIMPLE_COMPLEXITY if is_simple_complexity(raw.get('complexity_hint')) else None
+        ),
     )
 
 
