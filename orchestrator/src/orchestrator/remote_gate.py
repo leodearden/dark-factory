@@ -44,6 +44,10 @@ ENSURE_CLIENT_TIMEOUT_SECS = 600
 # under a root that carries it.
 GATE_ROOT_MARKER = '.dark-factory-gate-root'
 
+# The file reap-gates.sh touches under the root as the last step of a run that
+# completed.
+REAP_STAMP = '.last-reap'
+
 _FULL_SHA = re.compile(r'[0-9a-f]{40}')
 _SHA256_HEX = re.compile(r'[0-9a-f]{64}')
 
@@ -280,8 +284,9 @@ def reap_script_text() -> str:
 
     Its contract: env ``GATE_ROOT`` (absolute).  Under a root carrying
     :data:`GATE_ROOT_MARKER` it deletes sha dirs idle for 7 days, each with
-    its build lock, and trash older than a day; elsewhere it does nothing.
-    Run detached: it prints nothing and its outcome is not awaited.
+    its build lock, and trash older than a day, then touches
+    :data:`REAP_STAMP` as its last step; elsewhere it does nothing.  Run
+    detached: it prints nothing and its outcome is not awaited.
     """
     return _packaged_script('reap-gates.sh')
 

@@ -11,6 +11,9 @@
 # trash first so an interrupted reap never leaves a half-dir at a sha path, and
 # is aged by its mtime, to the minute, which every ensure refreshes.
 #
+# A run that completed touches $GATE_ROOT/.last-reap as its last step; the name
+# must match remote_gate.py::REAP_STAMP.
+#
 # Build lock protocol, binding on every locker of $GATE_ROOT/.build-<sha>.lock
 # (this script, ensure-gate.sh and any future one): this script unlinks a reaped
 # sha's lock and ensure-gate.sh unlinks its lock when it fails, each under that
@@ -48,3 +51,5 @@ done < <(find "$GATE_ROOT" -mindepth 1 -maxdepth 1 -type d \
 
 find "$GATE_ROOT" -mindepth 1 -maxdepth 1 -name '.trash-*' -mmin +1440 \
 	-exec rm -rf {} +
+
+touch "$GATE_ROOT/.last-reap"
