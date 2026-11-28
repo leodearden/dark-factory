@@ -84,6 +84,7 @@ from sitting.fleet_state import (
     ProjectState,
     StandingPolicyRulings,
     StuckRow,
+    TrialAgreement,
     Window,
 )
 from sitting.inventory import (
@@ -411,7 +412,9 @@ def _header(document: ReturnBriefDocument) -> str:
         f'- configured roots holding no scanned queue: {", ".join(document.roots.configured_only) or "none"}',
         f'- queues scanned outside those roots: {", ".join(document.roots.outside) or "none"}',
         f'- preparation: {_freshness_text(document.preparation, document.generated_at)}',
-        '- preparer trial (recommend-only; agreement counts Leo choosing the recommended option):',
+        ('- preparer trial (recommend-only; agreement counts Leo choosing the recommended option, over records '
+         f'resolved in the trailing {fleet_state.TRIAL_WINDOW_DAYS} days and over every resolved record the queues '
+         'still hold (lifetime); resolution_turns over the window):'),
         *(trial_lines or ['  - no project root was measured']),
         f'- sitting trigger: {_trigger_text(document.trigger, document.generated_at)}',
         f'- supersedes `{SUPERSEDED_DIGEST}`: this page is the pull-on-return surface.',
@@ -461,13 +464,18 @@ def _hours_apart(stamp: str, generated_at: str) -> str:
 def _trial_text(project: str, measurement: Measurement[PreparerTrial]) -> str:
     if not measurement.ok:
         return f'{project}: not measured — {_flag_text(measurement)}'
-    trial, turns = measurement.value.trailing, measurement.value.resolution_turns
-    rate = f' ({trial.rate:.0%})' if trial.rate is not None else ''
+    trial, turns = measurement.value, measurement.value.resolution_turns
     median = 'n/a' if turns.median is None else f'{turns.median:g}'
-    return (f'{project}: agreement {trial.numerator}/{trial.denominator}{rate} over n={trial.n} prepared '
-            f'(no lean {trial.no_lean}, unanswered {trial.unanswered}, rejected {trial.rejected}); '
-            f'resolution_turns n={turns.with_turns} of {turns.resolved} resolved L2s, median {median}, '
+    return (f'{project}: {fleet_state.TRIAL_WINDOW_DAYS}-day {_agreement_text(trial.trailing)}; '
+            f'lifetime {_agreement_text(trial.lifetime)}; '
+            f'resolution_turns n={turns.with_turns} of {turns.resolved} resolved L2s in the window, median {median}, '
             f'total {turns.total}; measured {measurement.measured_at}')
+
+
+def _agreement_text(agreement: TrialAgreement) -> str:
+    rate = f' ({agreement.rate:.0%})' if agreement.rate is not None else ''
+    return (f'agreement {agreement.numerator}/{agreement.denominator}{rate} over n={agreement.n} prepared '
+            f'(no lean {agreement.no_lean}, unanswered {agreement.unanswered}, rejected {agreement.rejected})')
 
 
 def _decisions_section(sitting: Sitting, heading: str) -> str:
