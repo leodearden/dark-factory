@@ -20,7 +20,6 @@ from unittest.mock import AsyncMock
 
 import pytest
 from _park_test_helpers import ParkWorld, event_data_for, make_task, park_world
-from _recording_event_store import _RecordingEventStore
 
 from orchestrator.config import OrchestratorConfig, PsiAdmissionConfig
 from orchestrator.main_health_fix_owner import SIGNATURE_KEY
@@ -47,7 +46,9 @@ def _drop(w: ParkWorld, *task_ids: str) -> None:
     """Release each holder's lock and remove it from the task list."""
     for tid in task_ids:
         w.scheduler.lock_table.release(tid)
-    tasks = w.scheduler.get_tasks.return_value  # type: ignore[attr-defined]
+    board = w.scheduler.get_tasks
+    assert isinstance(board, AsyncMock)
+    tasks = board.return_value
     _board(w, [t for t in tasks if t['id'] not in task_ids])
 
 
@@ -150,7 +151,7 @@ async def test_pin_survives_dispatch_and_clears_when_the_fix_lands_or_is_cancell
 @pytest.mark.asyncio
 async def test_grant_without_an_override_store_returns_none(tmp_path):
     config = OrchestratorConfig(project_root=tmp_path)
-    scheduler = Scheduler(config, event_store=_RecordingEventStore())  # type: ignore[arg-type]
+    scheduler = Scheduler(config)
 
     assert await scheduler.grant_main_health_fix_precedence('F') is None
 
