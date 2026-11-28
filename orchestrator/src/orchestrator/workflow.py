@@ -122,6 +122,7 @@ from orchestrator.completion_record import completion_record_metadata
 from orchestrator.config import EscalationConfig, ModuleConfig, OrchestratorConfig
 from orchestrator.curator_submit import SubmitBatchResult, submit_task_batch
 from orchestrator.decision_note import decision_note_fields
+from orchestrator.defect_records import awaits_a_ruling
 from orchestrator.delivered_checks import (
     DeliveredChecksBlock,
     gate_mark_done_on_delivered_checks,
@@ -210,6 +211,14 @@ from orchestrator.resume_resolution import (
     render_carried_resolutions,
     render_issue_context,
     select_carried_resolutions,
+)
+from orchestrator.review_defects import (
+    declared_refs,
+    reports_a_defect,
+    review_defect_declarations,
+    review_ruling_events,
+    send_defect_events,
+    with_live_defect_records,
 )
 from orchestrator.review_inputs import gather_review_subject
 from orchestrator.review_lineage import (
@@ -9266,6 +9275,9 @@ class TaskWorkflow:
             # review rather than short-circuit to a stale verdict the new
             # config never produced.
             #
+            # Nor is a hit honoured while a defect closure or retirement on
+            # the task awaits its ruling: only a review can rule on it.
+            #
             # Fail-safe: a None tree hash (git error), a None fingerprint
             # (config unreadable), or a cache miss / stale fingerprint all
             # fall through to a normal review — the strictest safe direction
@@ -9292,6 +9304,7 @@ class TaskWorkflow:
                             and review_fingerprint is not None
                             and cached.get('reviewer_fingerprint')
                             == review_fingerprint
+                            and not await self._defect_records_await_a_ruling()
                         ):
                             logger.info(
                                 'Task %s: REVIEW skipped — cached %s verdict '
@@ -9328,6 +9341,7 @@ class TaskWorkflow:
                         api_error_status=triage.api_error_status,
                     )
                 return await self._mark_blocked(triage.reason, detail=triage.detail)
+            await self._apply_review_defect_rulings(reviews, verdict_cycle=review_cycle + 1)
             if not reviews.has_blocking_issues:
                 reviews = await self._scope_review_suggestions(
                     reviews, used_ctx, amendment_round,
@@ -9471,6 +9485,7 @@ class TaskWorkflow:
                     shutil.copytree(reviews_dir, archive_dir)
                     logger.info('Task %s: archived reviews to %s', self.task_id, archive_dir.name)
 
+            await self._declare_review_defects(reviews)
             if review_cycle >= self.config.max_review_cycles:
                 return await self._exit_review_cycles_exhausted(
                     reviews, used_ctx, amendment_round,
@@ -11899,10 +11914,11 @@ class TaskWorkflow:
         self.artifacts.clear_reviews()
         briefing = self.config.review.reviewer_briefing
         roster = reviewers_for(briefing)
+        review_task = await self._task_with_live_defect_records()
         subject = None
         if briefing is ReviewBriefing.CONTEXT_COMPLETE:
             try:
-                subject = await self._context_complete_review_subject()
+                subject = await self._context_complete_review_subject(task=review_task)
             except Exception as exc:
                 return self._review_inputs_unavailable(roster, exc)
             diff = subject.change.diff
@@ -11921,7 +11937,7 @@ class TaskWorkflow:
                 await asyncio.sleep(idx * stagger)
             return await self._run_reviewer(
                 role, diff, amendment_suggestions=amendment_suggestions, subject=subject,
-                rulings=rulings,
+                rulings=rulings, task=review_task,
             )
 
         tasks = [_staggered(i, r) for i, r in enumerate(roster)]
@@ -11941,7 +11957,7 @@ class TaskWorkflow:
                     results[i] = await self._run_reviewer(
                         roster[i], diff,
                         amendment_suggestions=amendment_suggestions,
-                        subject=subject, rulings=rulings,
+                        subject=subject, rulings=rulings, task=review_task,
                     )
                 except Exception as exc:
                     results[i] = exc
@@ -12005,12 +12021,15 @@ class TaskWorkflow:
             )
             return None
 
-    async def _context_complete_review_subject(self) -> ReviewSubject:
-        """The context-complete reviewer's inputs, from the worktree at its own-work base."""
+    async def _context_complete_review_subject(self, *, task: dict | None = None) -> ReviewSubject:
+        """The context-complete reviewer's inputs, from the worktree at its own-work base.
+
+        *task* is the task record to brief with; the dispatch snapshot when omitted.
+        """
         assert self.worktree is not None and self.artifacts is not None
         return await gather_review_subject(
             self.worktree, await self._own_work_base(),
-            task=self.task,
+            task=self.task if task is None else task,
             plan=self.artifacts.read_plan() or None,
             plan_absent_reason='this task has no plan.json (a simple-task run writes none)',
             conventions_relpath=self.config.review.briefing_path,
@@ -12109,6 +12128,7 @@ class TaskWorkflow:
         amendment_suggestions: list[dict] | None = None,
         *, subject: ReviewSubject | None = None,
         rulings: Sequence[Ruling] = (),
+        task: dict | None = None,
     ) -> dict:
         """Run a single reviewer and read its verdict artifact.
 
@@ -12116,7 +12136,9 @@ class TaskWorkflow:
         scope section into the reviewer prompt (task 2750). *subject*, when
         set, briefs the context-complete generation from it instead of *diff*.
         *rulings* are every ruling on the task, read once per review round by
-        ``_review``.
+        ``_review``. *task* briefs the diff-only generation; the dispatch
+        snapshot when omitted (``_review`` passes the task with its live
+        defect records).
         """
         assert self.worktree is not None and self.artifacts is not None
         notes = self._reviewer_notes()
@@ -12125,7 +12147,7 @@ class TaskWorkflow:
             build_prompt = partial(
                 self.briefing.build_reviewer_prompt,
                 role.name, diff, amendment_suggestions=amendment_suggestions,
-                task=self.task, open_info_notes=notes, rulings=rulings,
+                task=self.task if task is None else task, open_info_notes=notes, rulings=rulings,
             )
         else:
             build_prompt = partial(
@@ -19575,6 +19597,67 @@ class TaskWorkflow:
             apply_reviewer_disposition(
                 note, ports, task_id=self.task_id, enabled=self.config.info_l0_router_enabled,
             )
+
+    async def _task_with_live_defect_records(self) -> dict:
+        """The dispatch task with its defect records as the store holds them now, else as dispatched."""
+        fresh: object = None
+        try:
+            fresh = await self.scheduler.get_task(self.task_id)
+            unreadable = None if isinstance(fresh, dict) else f'the read returned {type(fresh).__name__}'
+        except Exception as exc:
+            unreadable = f'{type(exc).__name__}: {exc}'
+        if unreadable is not None:
+            logger.warning(
+                'Task %s: could not re-read its defect records (%s); using the dispatch snapshot',
+                self.task_id, unreadable,
+            )
+        return with_live_defect_records(self.task, fresh)
+
+    async def _defect_records_await_a_ruling(self) -> bool:
+        """Whether the live task holds a defect closure or retirement that only a review can rule on (PRD B8, B23)."""
+        metadata = (await self._task_with_live_defect_records()).get('metadata')
+        awaiting = awaits_a_ruling(metadata if isinstance(metadata, dict) else {})
+        if awaiting:
+            logger.info(
+                'Task %s: a defect record awaits a reviewer ruling, so the cached verdict is not reused',
+                self.task_id,
+            )
+        return awaiting
+
+    async def _apply_review_defect_rulings(
+        self, reviews: ReviewAggregation, *, verdict_cycle: int,
+    ) -> None:
+        """Record a complete panel's defect rulings as reviewer Rules (PRD B8, B23)."""
+        if not reviews.defect_rulings:
+            return
+        await send_defect_events(
+            self.scheduler.dispatch_tool, project_root=str(self.config.project_root),
+            task_id=self.task_id,
+            events=review_ruling_events(reviews.defect_rulings, verdict_cycle=verdict_cycle),
+        )
+
+    async def _declare_review_defects(self, reviews: ReviewAggregation) -> None:
+        """Declare the round's blocking ``kind=defect`` issues on the task (PRD decision 16, B6)."""
+        if not reports_a_defect(reviews.blocking_issues):
+            return
+        task_number = int(self.task_id) if self.task_id.isdecimal() else 0
+        if task_number < 1:
+            logger.warning(
+                'Task %s: no review defect ref can be minted for a non-numeric task id; '
+                'its blocking defects are not declared', self.task_id,
+            )
+            return
+        live = await self._task_with_live_defect_records()
+        metadata = live.get('metadata')
+        events = review_defect_declarations(
+            task_number, reviews.blocking_issues,
+            known_refs=declared_refs(metadata if isinstance(metadata, dict) else {}),
+            declared_at=datetime.now(UTC),
+        )
+        await send_defect_events(
+            self.scheduler.dispatch_tool, project_root=str(self.config.project_root),
+            task_id=self.task_id, events=events,
+        )
 
     def _steward_work_outstanding(self) -> bool:
         """Whether there is anything for :meth:`_await_steward_completion` to
