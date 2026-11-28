@@ -77,6 +77,7 @@ if TYPE_CHECKING:
     from fused_memory.reconciliation.journal import ReconciliationJournal
     from fused_memory.reconciliation.recon_ledger import ReconLedgerStore
     from fused_memory.reconciliation.sqlite_watchdog import SqliteWatchdog
+    from fused_memory.server.embedded_uvicorn import EmbeddedUvicornServer
     from fused_memory.server.topic_cluster_store import TopicClusterStore
     from fused_memory.services.consolidation_ops import MemoryUpdater
     from fused_memory.services.journal_growth_alarm import JournalGrowthAlarm
@@ -526,16 +527,6 @@ class _ASGIExceptionShield:
             # other BaseException escape here is exactly what wedged the
             # server overnight.
             return
-
-
-def configure_uvicorn_logging():
-    for logger_name in ['uvicorn', 'uvicorn.error', 'uvicorn.access']:
-        uv_logger = logging.getLogger(logger_name)
-        uv_logger.handlers.clear()
-        handler = logging.StreamHandler(sys.stderr)
-        handler.setFormatter(logging.Formatter(LOG_FORMAT, datefmt=DATE_FORMAT))
-        uv_logger.addHandler(handler)
-        uv_logger.propagate = False
 
 
 def _require_http_transport_for_reconciliation(config: Any) -> None:
@@ -1218,19 +1209,16 @@ async def run_server():
     logger.info(f'Starting MCP server with transport: {transport}')
 
     # recon_report_state already initialized above (PRD γ, task 1546 step-12)
-    server: Any | None = None  # primary uvicorn.Server
-    recon_server: Any | None = None  # uvicorn.Server for the 2nd port
     try:
         if transport == 'stdio':
             await mcp.run_stdio_async()
         elif transport == 'sse':
             await mcp.run_sse_async()
         elif transport == 'http':
-            import uvicorn
+            from fused_memory.server.embedded_uvicorn import EmbeddedUvicornServer
 
             display_host = 'localhost' if config.server.host == '0.0.0.0' else config.server.host
             logger.info(f'  MCP Endpoint: http://{display_host}:{config.server.port}/mcp/')  # mcp-url-sweep: allow display string in a startup log line, never fetched
-            configure_uvicorn_logging()
             starlette_app = mcp.streamable_http_app()
 
             # Return JSON (not plain-text) for 404s so that MCP SDK
@@ -1249,7 +1237,7 @@ async def run_server():
                 graceful_shutdown_timeout=config.server.graceful_shutdown_timeout,
                 keepalive_timeout=config.server.keepalive_timeout,
             )
-            server = uvicorn.Server(uv_config)
+            server = EmbeddedUvicornServer(uv_config)
             primary_socket = _claim_listener(systemd_listeners, config.server.port)
             if systemd_listeners:
                 logger.warning(
@@ -1278,14 +1266,12 @@ async def run_server():
                     task_interceptor=task_interceptor,
                     known_projects=_known_projects_map,
                 )
-            recon_server = uvicorn.Server(_pre_recon_uv_config)
-            recon_server.install_signal_handlers = lambda: None  # type: ignore[attr-defined]
+            recon_server = EmbeddedUvicornServer(_pre_recon_uv_config)
 
-            # Take ownership of SIGTERM/SIGINT before uvicorn's serve() can
-            # install its own handlers. We need to differentiate operator-stop
+            # EmbeddedUvicornServer leaves SIGTERM/SIGINT to
+            # _install_operator_stop_handler, which differentiates operator-stop
             # (clean exit 0, do not restart) from cascade-shutdown (exit 1, do
             # restart) — uvicorn's default handlers don't expose that distinction.
-            server.install_signal_handlers = lambda: None  # type: ignore[attr-defined]  # uvicorn stubs don't declare this as writable
             _install_operator_stop_handler(
                 _make_operator_stop_callback(server, recon_server),
             )
@@ -1311,18 +1297,6 @@ async def run_server():
             )
 
             _sd_notify('READY=1')
-            # Wrap both serve() coroutines in named tasks so that a failure in
-            # one (e.g. port-already-bound on the recon port) automatically
-            # cancels the other rather than leaving it running unmanaged.
-            # asyncio.gather() with bare coroutines wraps them in Tasks internally
-            # but does NOT cancel the sibling on first failure — the surviving
-            # Task would continue serving while the finally block runs, emitting
-            # "Task was destroyed but it is pending!" on loop teardown.
-            _primary_task = asyncio.create_task(
-                server.serve(sockets=[primary_socket] if primary_socket else None),
-                name='fused_memory_primary',
-            )
-            _recon_task = asyncio.create_task(recon_server.serve(), name='fused_memory_recon_report')
 
             # Signal the harness once the recon-report server is accepting connections.
             # Polls uvicorn's server.started flag (set inside serve() after startup()).
@@ -1338,16 +1312,11 @@ async def run_server():
 
                 asyncio.create_task(_watch_recon_server_ready(), name='recon_server_readiness_watcher')
 
-            try:
-                await asyncio.gather(_primary_task, _recon_task)
-            except BaseException:
-                # Cancel whichever task is still running to prevent orphaned tasks.
-                _primary_task.cancel()
-                _recon_task.cancel()
-                # Await with return_exceptions=True so CancelledErrors are collected
-                # as values rather than re-raised; the outer finally handles shutdown.
-                await asyncio.gather(_primary_task, _recon_task, return_exceptions=True)
-                raise
+            await _serve_primary_and_recon(
+                server,
+                recon_server,
+                primary_sockets=[primary_socket] if primary_socket else None,
+            )
         else:
             raise ValueError(f'Unsupported transport: {transport}')
     finally:
@@ -1362,17 +1331,6 @@ async def run_server():
         if topic_cluster_store is not None:
             with contextlib.suppress(BaseException):
                 topic_cluster_store.close()
-        # Symmetrically tear down both servers so that a failure in either
-        # (e.g. recon_server port-already-bound) doesn't leave the primary
-        # server serving while the rest of the app shuts down.
-        if server is not None:
-            server.should_exit = True
-            with contextlib.suppress(BaseException):
-                await server.shutdown()
-        if recon_server is not None:
-            recon_server.should_exit = True
-            with contextlib.suppress(BaseException):
-                await recon_server.shutdown()
         _stop_watchdog_thread()
         if janitor_task is not None:
             janitor_task.cancel()
@@ -2297,7 +2255,7 @@ def _build_uvicorn_config(
     graceful_shutdown_timeout: int,
     keepalive_timeout: int | None = None,
 ) -> Any:  # uvicorn.Config
-    """Construct a uvicorn.Config with a bounded graceful-shutdown wait.
+    """Construct a uvicorn.Config with a bounded graceful-shutdown wait that leaves process logging alone.
 
     Single tested seam for both uvicorn.Config construction sites (primary
     server and recon-report server) so timeout_graceful_shutdown is always
@@ -2306,21 +2264,23 @@ def _build_uvicorn_config(
     in-flight request hang server.shutdown() indefinitely and starve the
     downstream _graceful_shutdown cleanup and force-exit watchdog.
 
+    The config is built by embedded_uvicorn_config, so uvicorn's records
+    propagate to this module's logging.basicConfig handler.
+
     keepalive_timeout is optional: when omitted, uvicorn's own
     timeout_keep_alive default applies unchanged (matches the pre-existing
     recon-report site, which never set it).
     """
-    import uvicorn
+    from fused_memory.server.embedded_uvicorn import embedded_uvicorn_config
 
     kwargs: dict[str, Any] = {
         'host': host,
         'port': port,
-        'log_level': 'info',
         'timeout_graceful_shutdown': graceful_shutdown_timeout,
     }
     if keepalive_timeout is not None:
         kwargs['timeout_keep_alive'] = keepalive_timeout
-    return uvicorn.Config(app, **kwargs)
+    return embedded_uvicorn_config(app, **kwargs)
 
 
 def _claim_listener(listeners: dict[int, socket.socket], port: int) -> socket.socket | None:
@@ -2420,6 +2380,40 @@ def _build_recon_report_components(
     return state, mcp, uv_config
 
 
+async def _serve_primary_and_recon(
+    server: EmbeddedUvicornServer,
+    recon_server: EmbeddedUvicornServer,
+    *,
+    primary_sockets: list[socket.socket] | None,
+) -> None:
+    """Serve both servers until both stop; a failure in either cancels the other.
+
+    Each serve() runs in its own task, because a bare gather leaves the
+    survivor of a failure serving unmanaged. A serve() that returned has run
+    uvicorn's own shutdown, and a second one would log it all again, so only a
+    server whose serve() was cancelled or raised is shut down here. Contract
+    pinned by fused-memory/tests/test_operator_signal_handler.py::TestServePrimaryAndRecon.
+    """
+    serving = [
+        (server, asyncio.create_task(server.serve(sockets=primary_sockets), name='fused_memory_primary')),
+        (recon_server, asyncio.create_task(recon_server.serve(), name='fused_memory_recon_report')),
+    ]
+    tasks = [task for _, task in serving]
+    try:
+        await asyncio.gather(*tasks)
+    except BaseException:
+        for task in tasks:
+            task.cancel()
+        await asyncio.wait(tasks)
+        raise
+    finally:
+        for stopped_server, task in serving:
+            if not (task.done() and not task.cancelled() and task.exception() is None):
+                stopped_server.should_exit = True
+                with contextlib.suppress(BaseException):
+                    await stopped_server.shutdown()
+
+
 def _make_operator_stop_callback(
     *servers: Any,
     clock: Callable[[], float] = time.monotonic,
@@ -2431,7 +2425,7 @@ def _make_operator_stop_callback(
     arriving within ``repeat_window_secs`` of the FIRST signal is the same stop
     delivered twice and is ignored. A later signal also sets ``force_exit``,
     keeping uvicorn's deliberate-second-Ctrl-C escape hatch, which is otherwise
-    lost because ``install_signal_handlers`` is neutered. Contract pinned by
+    lost because EmbeddedUvicornServer disables uvicorn's signal capture. Contract pinned by
     fused-memory/tests/test_operator_signal_handler.py::TestOperatorStopCallbackForceExit.
     """
     first_signal_at: float | None = None
@@ -2471,9 +2465,10 @@ def _install_operator_stop_handler(on_operator_stop: Callable[[], None]) -> None
     Mirrors :func:`_register_drain_signal_handler`'s loop / signal.signal
     fallback pattern.
 
-    Must be called BEFORE ``uvicorn.Server.serve()`` and uvicorn's
-    ``install_signal_handlers`` must be neutered, otherwise uvicorn replaces
-    our handlers from inside ``serve()`` and we never observe SIGTERM.
+    The servers must be EmbeddedUvicornServer instances, which disable
+    uvicorn's signal capture: a plain ``uvicorn.Server.serve()`` replaces
+    these handlers for its lifetime and re-raises each caught signal when
+    it returns.
     """
     try:
         loop = asyncio.get_running_loop()

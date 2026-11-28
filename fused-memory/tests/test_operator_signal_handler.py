@@ -9,13 +9,19 @@ flag set by the SIGTERM/SIGINT handler.
 import asyncio
 import os
 import signal
+import socket
+import subprocess
 import sys
+from collections.abc import Awaitable, Callable
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
+from starlette.applications import Starlette
 
 import fused_memory.server.main as main_mod
+from fused_memory.server.embedded_uvicorn import EmbeddedUvicornServer, embedded_uvicorn_config
 from fused_memory.server.main import _install_operator_stop_handler, _make_operator_stop_callback
 
 
@@ -177,6 +183,89 @@ class TestInstallOperatorStopHandlerIntegration:
         assert s2.force_exit is False
 
 
+@pytest.mark.skipif(
+    sys.platform == 'win32',
+    reason='os.kill SIGTERM semantics differ on Windows',
+)
+class TestOneStopSignalStopsBothServersCleanly:
+    """Task 10067: one SIGTERM to a process serving two uvicorn servers is delivered
+    to the operator-stop handler once, and each server's shutdown is logged once,
+    through main.py's own logging. The real signal goes to a child process, never to
+    the pytest worker; the driver serves and tears down through run_server's own
+    _serve_primary_and_recon.
+    """
+
+    _DRIVER = Path(__file__).with_name('_two_server_operator_stop.py')
+
+    def test_one_sigterm_one_delivery_and_two_logged_shutdowns(self, tmp_path):
+        child = subprocess.run(
+            [sys.executable, '-I', str(self._DRIVER)],
+            cwd=tmp_path,
+            capture_output=True,
+            text=True,
+        )
+        lines = child.stderr.splitlines()
+
+        assert child.returncode == 0, child.stderr
+        assert sum('Received SIGTERM — initiating operator shutdown' in line for line in lines) == 1, child.stderr
+        assert not [
+            line for line in lines if 'Repeat stop signal' in line or 'Second stop signal' in line
+        ], child.stderr
+        for shutdown_line in ('Shutting down', 'Application shutdown complete.'):
+            assert sum(line.endswith(f' - uvicorn.error - INFO - {shutdown_line}') for line in lines) == 2, (
+                child.stderr
+            )
+
+
+class _ScriptedServer(EmbeddedUvicornServer):
+    """A server whose serve() runs *serve_behaviour* instead of uvicorn, and which counts its shutdown() calls."""
+
+    def __init__(self, serve_behaviour: Callable[[], Awaitable[None]]) -> None:
+        super().__init__(embedded_uvicorn_config(Starlette()))
+        self._serve_behaviour = serve_behaviour
+        self.shutdown_calls = 0
+
+    async def serve(self, sockets: list[socket.socket] | None = None) -> None:
+        await self._serve_behaviour()
+
+    async def shutdown(self, sockets: list[socket.socket] | None = None) -> None:
+        self.shutdown_calls += 1
+
+
+async def _returns() -> None:
+    return None
+
+
+async def _serves_until_cancelled() -> None:
+    await asyncio.get_running_loop().create_future()
+
+
+async def _fails_to_bind() -> None:
+    raise OSError('address already in use')
+
+
+class TestServePrimaryAndRecon:
+    """main.py::_serve_primary_and_recon shuts down only a server whose serve() did not return (task 10067)."""
+
+    @pytest.mark.asyncio
+    async def test_a_server_whose_serve_returned_is_not_shut_down_again(self):
+        primary, recon = _ScriptedServer(_returns), _ScriptedServer(_returns)
+
+        await main_mod._serve_primary_and_recon(primary, recon, primary_sockets=None)
+
+        assert (primary.shutdown_calls, recon.shutdown_calls) == (0, 0)
+
+    @pytest.mark.asyncio
+    async def test_a_failed_serve_cancels_the_other_and_both_are_shut_down(self):
+        primary, recon = _ScriptedServer(_fails_to_bind), _ScriptedServer(_serves_until_cancelled)
+
+        with pytest.raises(OSError, match='address already in use'):
+            await main_mod._serve_primary_and_recon(primary, recon, primary_sockets=None)
+
+        assert (primary.shutdown_calls, recon.shutdown_calls) == (1, 1)
+        assert primary.should_exit and recon.should_exit
+
+
 class TestMainExitCode:
     """main() must exit 0 when the operator-stop flag is set, exit 1 otherwise.
 
@@ -262,7 +351,7 @@ class TestOperatorStopCallbackForceExit:
     """The first stop signal drains; a repeat inside the window is the same stop
     delivered twice (task 9493); a later second signal still forces exit, which
     is uvicorn's deliberate-second-Ctrl-C escape hatch, lost otherwise because
-    ``install_signal_handlers`` is neutered.
+    EmbeddedUvicornServer disables uvicorn's signal capture.
 
     The policy tests pass an explicit window, so they pin the behaviour rather
     than the production value; the ``default`` tests pin that value.
