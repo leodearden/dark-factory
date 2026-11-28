@@ -18,7 +18,11 @@ from shared.followup_items import FOLLOWUP_ITEMS_METADATA_KEY, FollowupItem, par
 from shared.task_text_fingerprint import TaskTextDrift
 
 from orchestrator.agents.branch_history_guidance import BRANCH_HISTORY_HEADING
-from orchestrator.agents.defect_briefing import format_declared_defects
+from orchestrator.agents.defect_briefing import (
+    format_closures_awaiting_ruling,
+    format_declared_defects,
+    format_defect_test_retirements,
+)
 from orchestrator.agents.harness_guidance import WAIT_PATTERN_REMINDER
 from orchestrator.agents.landed_sha_searches import LandedShaSearches, already_merged_step
 from orchestrator.agents.memory_recall import MemoryRecall
@@ -130,6 +134,16 @@ def _open_info_note_entry(note: Escalation, detail_chars: int) -> str:
 
 {quoted}
 """
+
+
+def _task_metadata(task: Mapping[str, object] | None) -> Mapping[str, Any]:
+    metadata = (task or {}).get('metadata')
+    return metadata if isinstance(metadata, Mapping) else {}
+
+
+def _with_blocks(prompt: str, *blocks: str) -> str:
+    """*prompt* with each non-empty block appended; no non-empty block leaves it byte-identical."""
+    return '\n\n'.join([prompt, *(block for block in blocks if block)])
 
 
 def _with_review_rulings(prompt: str, rulings: Sequence[Ruling]) -> str:
@@ -1456,7 +1470,9 @@ This task holds locks for the following modules:
         *open_info_notes* lists the task's open info notes for the reviewer to
         disposition; none leaves the prompt byte-identical. *rulings* are
         rendered by ``orchestrator/escalation_rulings.py`` for the REVIEW
-        audience, ahead of the notes.
+        audience, ahead of the notes. The task's defect records come before
+        them: its declared defects (this prompt has no task block), the
+        closures awaiting a ruling and its defect-test retirements.
         """
         if context is None:
             context = await self._get_memory_context(BriefingScope.from_task(task), 'reviewer')
@@ -1482,6 +1498,13 @@ This task holds locks for the following modules:
         if amendment_suggestions:
             prompt += '\n' + amendment_scope_section(amendment_suggestions)
 
+        metadata = _task_metadata(task)
+        prompt = _with_blocks(
+            prompt,
+            format_declared_defects(metadata),
+            format_closures_awaiting_ruling(metadata),
+            format_defect_test_retirements(metadata),
+        )
         prompt = _with_review_rulings(prompt, rulings)
         return self._with_open_info_notes(prompt, reviewer_type, open_info_notes)
 
@@ -1496,7 +1519,9 @@ This task holds locks for the following modules:
         Memory is scoped to the task exactly as :meth:`build_reviewer_prompt`
         scopes it; the rendering lives in ``agents/review_briefing.py``.
         *open_info_notes* and *rulings* are appended exactly as
-        :meth:`build_reviewer_prompt` appends them.
+        :meth:`build_reviewer_prompt` appends them, after the closures awaiting
+        a ruling and the defect-test retirements; the task block already lists
+        the declared defects.
         """
         if context is None:
             context = await self._get_memory_context(BriefingScope.from_task(subject.task), 'reviewer')
@@ -1506,6 +1531,10 @@ This task holds locks for the following modules:
             context=context,
             task_block=self._format_task(subject.task, include_test_strategy=True),
             amendment_suggestions=amendment_suggestions,
+        )
+        metadata = _task_metadata(subject.task)
+        prompt = _with_blocks(
+            prompt, format_closures_awaiting_ruling(metadata), format_defect_test_retirements(metadata),
         )
         prompt = _with_review_rulings(prompt, rulings)
         return self._with_open_info_notes(prompt, reviewer_type, open_info_notes)
