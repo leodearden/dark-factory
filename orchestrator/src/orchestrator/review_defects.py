@@ -12,7 +12,10 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
+from pydantic import ValidationError
 from shared.defects import (
+    DEFECT_TEST_RETIREMENTS_METADATA_KEY,
+    DEFECTS_METADATA_KEY,
     Declare,
     DefectDeclaration,
     DefectOrigin,
@@ -193,3 +196,40 @@ async def send_defect_events(
             )
         writes.append(write)
     return tuple(writes)
+
+
+_LIVE_METADATA_KEYS = (DEFECTS_METADATA_KEY, DEFECT_TEST_RETIREMENTS_METADATA_KEY)
+
+
+def with_live_defect_records(task: Mapping[str, Any], fresh: object) -> dict[str, Any]:
+    """*task* with its two defect-record keys as a fresh read of the task holds them now.
+
+    Only ``metadata.defects`` and ``metadata.defect_test_retirements`` come from
+    *fresh*; a key it lacks is dropped. Every other field stays as *task* has
+    it. An unreadable *fresh* (not a dict, or metadata not a dict) leaves
+    *task* as it is. *task* is never mutated.
+    """
+    fresh_metadata = fresh.get('metadata') if isinstance(fresh, Mapping) else None
+    if not isinstance(fresh_metadata, Mapping):
+        return dict(task)
+    dispatch_metadata = task.get('metadata')
+    kept = dispatch_metadata.items() if isinstance(dispatch_metadata, Mapping) else ()
+    live_metadata = {key: value for key, value in kept if key not in _LIVE_METADATA_KEYS}
+    live_metadata.update(
+        (key, fresh_metadata[key]) for key in _LIVE_METADATA_KEYS if key in fresh_metadata
+    )
+    return {**task, 'metadata': live_metadata}
+
+
+def declared_refs(metadata: Mapping[str, Any]) -> frozenset[str]:
+    """The refs of the readable ``metadata.defects`` entries; malformed entries are skipped."""
+    entries = metadata.get(DEFECTS_METADATA_KEY)
+    if not isinstance(entries, list):
+        return frozenset()
+    refs: set[str] = set()
+    for entry in entries:
+        try:
+            refs.add(DefectDeclaration.model_validate(entry).ref)
+        except ValidationError:
+            continue
+    return frozenset(refs)
