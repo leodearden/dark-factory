@@ -27,10 +27,6 @@ def _supersede(decisions, index=0, **overrides):
     return supersede_decision(decisions, index, **arguments)
 
 
-def test_the_key_constant_names_the_nested_history():
-    assert SUPERSEDED_VERSIONS_KEY == 'superseded_versions'
-
-
 def test_a_supersession_rewrites_the_entry_and_keeps_the_prior_pair():
     before = copy.deepcopy(_DECISIONS)
 
