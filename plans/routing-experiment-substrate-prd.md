@@ -153,9 +153,10 @@ time η anchors on. So δ runs as soon as γ lands, and the A/A window's end and
 taken from γ's landing on main (or, per unit, its first `large-plan-modules-4`
 `routing_decision`), never from δ's reload time. `scripts/routing_experiment_arm.sh` takes γ's
 landing as the commit time of the earliest first-parent commit on main from which the rules file
-has carried every experiment rule id: it ends the `--aa` window there (`--until`) and records that
-time as `treatment_from`, beside `armed_at`, in `data/orchestrator/routing_experiments.jsonl`, and
-η reads experiment 1 with the readout's `--since <treatment_from>`.
+has carried every experiment rule id and the experiment's split salt: it ends the `--aa` window
+there (`--until`) and records that time as `treatment_from`, beside `armed_at`, in
+`data/orchestrator/routing_experiments.jsonl`, and η reads experiment 1 with the readout's
+`--since <treatment_from>`.
 
 ### Experiment 2: the curator hint (ε)
 
