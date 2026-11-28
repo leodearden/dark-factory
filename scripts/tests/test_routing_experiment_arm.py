@@ -3,8 +3,8 @@ code, stderr and flip record.
 
 Each test copies the script into a temp git repo whose `main` commits the
 fixture files, beside a recorded readout (conftest `fake_recorder`). Most runs
-have the readout exit 4, its "unproven" code, so the script stops after step 2.
-The tests that drive steps 3 and 4 have it exit 0 and also write a stub
+have the readout exit 4, its "unproven" code, so the script stops after step 3.
+The tests that drive steps 4 and 5 have it exit 0 and also write a stub
 `_config_reload_gate` beside the script, which records each port it is asked to
 reload and opens no socket. Every run names fixture units on ports 1 and 2,
 which no fleet unit listens on, so even a stub mistake cannot reach the live
