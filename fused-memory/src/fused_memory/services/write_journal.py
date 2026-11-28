@@ -412,17 +412,25 @@ LIMIT ?
 
 
 def _backend_result_summary(
-    result_summary: dict | str | None, llm_tokens: LlmTokenUsage | None
+    result_summary: dict | str | None,
+    llm_tokens: LlmTokenUsage | None,
+    llm_tokens_by_model: Mapping[str, LlmTokenUsage] | None = None,
 ) -> dict | str | None:
     """The persisted ``result_summary``: nested under ``result`` beside the
-    ``tokens`` block ``OPERATOR_TELEMETRY_QUERY`` reads, when tokens were measured."""
+    ``tokens`` block ``OPERATOR_TELEMETRY_QUERY`` reads, when tokens were measured.
+    A non-empty per-model split rides in that block as ``by_model``."""
     if llm_tokens is None:
         return result_summary
     if not isinstance(llm_tokens, LlmTokenUsage):
         raise TypeError(
             f'llm_tokens must be an LlmTokenUsage or None, got {type(llm_tokens).__name__}'
         )
-    return {'result': result_summary, 'tokens': llm_tokens.as_journal_dict()}
+    tokens: dict[str, Any] = llm_tokens.as_journal_dict()
+    if llm_tokens_by_model:
+        tokens['by_model'] = {
+            model: usage.as_journal_dict() for model, usage in llm_tokens_by_model.items()
+        }
+    return {'result': result_summary, 'tokens': tokens}
 
 
 @dataclass(frozen=True)
@@ -764,10 +772,11 @@ class WriteJournal:
         error: str | None = None,
         duration_ms: float | None = None,
         llm_tokens: LlmTokenUsage | None = None,
+        llm_tokens_by_model: Mapping[str, LlmTokenUsage] | None = None,
     ) -> None:
         """Log a Layer 2 backend dispatch. Fire-and-forget — never raises."""
         try:
-            summary = _backend_result_summary(result_summary, llm_tokens)
+            summary = _backend_result_summary(result_summary, llm_tokens, llm_tokens_by_model)
             async with self._require_access().write() as db:
                 await db.execute(
                     """INSERT INTO backend_ops

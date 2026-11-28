@@ -11,7 +11,7 @@ import re
 import time
 import uuid
 from collections import Counter
-from collections.abc import Awaitable, Iterable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, TypedDict, TypeVar
@@ -72,8 +72,12 @@ from fused_memory.backends.graph_access import (
     paged_ro_query,
 )
 from fused_memory.backends.llm_clients import (
+    CategoryRoutedLLMClient,
+    ExplicitEffortOpenAIClient,
     ForceJsonObjectOpenAIGenericClient,
     TokenRecordingOpenAIGenericClient,
+    extraction_category_scope,
+    wrapped_llm_clients,
 )
 from fused_memory.backends.llm_token_usage import (
     AttributingTokenUsageTracker,
@@ -113,7 +117,12 @@ from fused_memory.backends.sdk_client_lifecycle import close_wrapped_sdk_clients
 from fused_memory.backends.sdk_request_timeout import bounded_openai_embedder
 from fused_memory.backends.timeout_budget import await_within
 from fused_memory.config.env_precedence import warn_if_ambient_base_url_is_overridden
-from fused_memory.config.schema import FusedMemoryConfig, OpenAIProviderConfig
+from fused_memory.config.schema import (
+    ExtractionRouteConfig,
+    FusedMemoryConfig,
+    OpenAIProviderConfig,
+)
+from fused_memory.models.enums import MemoryCategory, routes_to_graphiti
 from fused_memory.models.scope import configured_known_projects_map
 from fused_memory.utils.async_utils import gather_or_raise
 from fused_memory.utils.toolcall_xml_leak import has_toolcall_xml_leak
@@ -210,7 +219,9 @@ def check_openai_responses_api() -> None:
 
 
 def build_llm_client(
-    cfg: FusedMemoryConfig, *, http_client: httpx.AsyncClient | None = None,
+    cfg: FusedMemoryConfig,
+    *,
+    gated_http_client_for: Callable[[str], httpx.AsyncClient | None] | None = None,
 ) -> LLMClient | None:
     """Construct the graphiti LLM client from unified config, or None.
 
@@ -235,13 +246,81 @@ def build_llm_client(
     here once rather than per arm, so ``measure_llm_tokens`` can attribute its
     spend on whichever arm is configured.
 
-    ``http_client``, when given, carries every request of an OpenAI-shaped arm
-    (the plan route's gated client, task 9944); the anthropic arm ignores it.
+    ``gated_http_client_for`` maps a base URL to the gated client that carries
+    its calls, or None when that URL is not gated (MemoryService binds
+    ``PlanRoute.http_client_for`` to ``PlanRouteSite.GRAPHITI``, task 9944). An
+    OpenAI-shaped default arm rides the gated client for its own api_url; the
+    anthropic arm ignores it. A caller that passes no gate builds no extraction
+    routes, silently: the overreach shadow, the arm harness and the scripts
+    never ride the plan. A caller that passes a gate gets one WARNING per route
+    it cannot build (_build_extraction_route).
     """
-    llm_client = _construct_llm_client(cfg, http_client=http_client)
-    if llm_client is not None:
-        llm_client.token_tracker = AttributingTokenUsageTracker()
-    return llm_client
+    routed = _extraction_route_categories(cfg)
+    llm_client = _construct_llm_client(cfg, gated_http_client_for=gated_http_client_for)
+    if llm_client is None:
+        return None
+    llm_client.token_tracker = AttributingTokenUsageTracker(model=cfg.llm.model)
+    if gated_http_client_for is None:
+        return llm_client
+    routes = {
+        category: client for category, route in routed.items()
+        if (client := _build_extraction_route(cfg, category, route, gated_http_client_for)) is not None
+    }
+    return CategoryRoutedLLMClient(llm_client, routes) if routes else llm_client
+
+
+def _extraction_route_categories(cfg: FusedMemoryConfig) -> dict[MemoryCategory, ExtractionRouteConfig]:
+    """``cfg.llm.extraction_routes`` keyed by category; a key that is no graphiti-routed category raises."""
+    routed: dict[MemoryCategory, ExtractionRouteConfig] = {}
+    for key, route in cfg.llm.extraction_routes.items():
+        refusal = ValueError(f'llm.extraction_routes key {key!r} is not a graphiti-routed memory category')
+        try:
+            category = MemoryCategory(key)
+        except ValueError:
+            raise refusal from None
+        if not routes_to_graphiti(category, dual_write=False):
+            raise refusal
+        routed[category] = route
+    return routed
+
+
+def _build_extraction_route(
+    cfg: FusedMemoryConfig,
+    category: MemoryCategory,
+    route: ExtractionRouteConfig,
+    gated_http_client_for: Callable[[str], httpx.AsyncClient | None],
+) -> LLMClient | None:
+    """*category*'s extraction client on the gated plan proxy, or None (logged) when it cannot be built.
+
+    Only the route's own api_url and api_key are used, never llm.providers.openai's.
+    """
+    if cfg.llm.provider != 'openai':
+        reason = f'llm.provider is {cfg.llm.provider!r}'
+    elif route.api_url is None or route.api_key is None:
+        reason = 'its api_url and api_key are not both set'
+    elif (http_client := gated_http_client_for(route.api_url)) is None:
+        reason = f'{route.api_url} is not the gated plan proxy (plan_route.proxy_url)'
+    else:
+        check_openai_responses_api()
+        built = OpenAIClient(
+            config=GraphitiLLMConfig(
+                api_key=route.api_key, model=route.model, small_model=route.model,
+                max_tokens=cfg.llm.max_tokens, base_url=route.api_url,
+            ),
+            client=AsyncOpenAI(api_key=route.api_key, base_url=route.api_url, http_client=http_client),
+            max_tokens=cfg.llm.max_tokens,
+        )
+        built.token_tracker = AttributingTokenUsageTracker(model=route.model)
+        logger.info(
+            f'Graphiti LLM: route {category.value} extract_nodes/extract_edges -> {route.model} '
+            f'(effort {route.reasoning_effort}) at {route.api_url} via the plan route'
+        )
+        return ExplicitEffortOpenAIClient(built, route.reasoning_effort)
+    logger.warning(
+        f'Graphiti LLM: extraction route {category.value} is OFF: {reason}. Its '
+        f'extract_nodes/extract_edges calls stay on {cfg.llm.model}.'
+    )
+    return None
 
 
 def build_embedder(cfg: FusedMemoryConfig) -> OpenAIEmbedder | None:
@@ -268,7 +347,7 @@ def build_embedder(cfg: FusedMemoryConfig) -> OpenAIEmbedder | None:
 
 
 def _construct_llm_client(
-    cfg: FusedMemoryConfig, *, http_client: httpx.AsyncClient | None,
+    cfg: FusedMemoryConfig, *, gated_http_client_for: Callable[[str], httpx.AsyncClient | None] | None,
 ) -> LLMClient | None:
     # LLMConfig rejects this at load; a config mutated afterwards is not re-validated.
     if cfg.llm.structured_output_mode != 'auto' and cfg.llm.client_class != 'openai_generic':
@@ -292,6 +371,10 @@ def _construct_llm_client(
                 temperature=cfg.llm.temperature or 0.0,
                 max_tokens=cfg.llm.max_tokens,
                 base_url=cfg.llm.providers.openai.api_url,
+            )
+            http_client = (
+                gated_http_client_for(cfg.llm.providers.openai.api_url)
+                if gated_http_client_for is not None else None
             )
             sdk_client = (
                 AsyncOpenAI(api_key=api_key, base_url=llm_config.base_url, http_client=http_client)
@@ -1644,8 +1727,13 @@ class GraphitiBackend:
         uuid: str | None = None,
         temporal_context: str | None = None,
         unverified_claim: bool = False,
+        *,
+        extraction_category: MemoryCategory | None = None,
     ) -> Any:
         """Add an episode to Graphiti and return the result.
+
+        ``extraction_category`` selects the extraction route of the backend's
+        LLM client (llm_clients.py::CategoryRoutedLLMClient).
 
         ``unverified_claim`` (task 3142) prefixes ``source_description`` with
         ``'[unverified_claim] '``, exactly as ``temporal_context`` prefixes it
@@ -1683,19 +1771,20 @@ class GraphitiBackend:
         if unverified_claim:
             source_description = f'[unverified_claim] {source_description}'
         try:
-            return await self._timed_write(
-                client.add_episode(
-                    name=name,
-                    episode_body=content,
-                    source=source,
-                    group_id=group_id,
-                    source_description=source_description,
-                    reference_time=ref_time,
-                    entity_types=entity_types,
-                    uuid=uuid,
-                ),
-                'add_episode',
-            )
+            with extraction_category_scope(extraction_category):
+                return await self._timed_write(
+                    client.add_episode(
+                        name=name,
+                        episode_body=content,
+                        source=source,
+                        group_id=group_id,
+                        source_description=source_description,
+                        reference_time=ref_time,
+                        entity_types=entity_types,
+                        uuid=uuid,
+                    ),
+                    'add_episode',
+                )
         except GraphitiCoreNodeNotFoundError as exc:
             # Translate only a not-found provably about the caller's own uuid —
             # graphiti_core raises the same class from entity/edge resolution
@@ -5656,8 +5745,11 @@ class GraphitiBackend:
         """
         graphitis = [g for g in (self.client, *self._group_clients.values()) if g is not None]
         return [
-            self._llm_client,
+            *wrapped_llm_clients(self._llm_client),
             self._embedder,
             self._cross_encoder,
-            *(sub for g in graphitis for sub in (g.llm_client, g.embedder, g.cross_encoder)),
+            *(
+                sub for g in graphitis
+                for sub in (*wrapped_llm_clients(g.llm_client), g.embedder, g.cross_encoder)
+            ),
         ]

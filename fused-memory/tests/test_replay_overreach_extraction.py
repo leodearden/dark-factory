@@ -36,7 +36,6 @@ from fused_memory.backends.falkor_string_bounds import exact_string_upper_bound
 from fused_memory.backends.llm_token_usage import (
     AttributingTokenUsageTracker,
     LlmTokenUsage,
-    measure_llm_tokens,
 )
 from fused_memory.config.schema import FusedMemoryConfig, OpenAIProviderConfig
 
@@ -328,30 +327,20 @@ class TestTheResult:
         }
 
 
-class _Answer(BaseModel):
-    answer: str
-
-
 class _RecordingSdk:
-    """A fake AsyncOpenAI: records the kwargs of every Responses and chat call it is sent, and
-    answers each Responses call with the JSON *answers* holds for its text_format."""
+    """A fake AsyncOpenAI: records the kwargs of every Responses call it is sent, and answers
+    each with the JSON EXTRACTION_ANSWERS holds for its text_format."""
 
-    def __init__(self, answers: dict[type[BaseModel], dict[str, Any]] | None = None) -> None:
-        self.answers = answers if answers is not None else {_Answer: {'answer': 'yes'}}
+    def __init__(self) -> None:
         self.sent: list[dict[str, Any]] = []
         self.responses = SimpleNamespace(parse=self._parse)
-        self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
 
     async def _parse(self, **kwargs: Any) -> Any:
         self.sent.append(kwargs)
         return SimpleNamespace(
-            output_text=json.dumps(self.answers[kwargs['text_format']]),
+            output_text=json.dumps(EXTRACTION_ANSWERS[kwargs['text_format']]),
             usage=SimpleNamespace(input_tokens=11, output_tokens=7),
         )
-
-    async def _create(self, **kwargs: Any) -> Any:
-        self.sent.append(kwargs)
-        raise AssertionError('a JSON-mode chat completion cannot carry the effort')
 
 
 EFFORT_MAX_TOKENS = 4096
@@ -369,84 +358,33 @@ EXTRACTION_ANSWERS: dict[type[BaseModel], dict[str, Any]] = {
 }
 
 
-def _effort_client(
-    effort: str = 'low', sdk: _RecordingSdk | None = None,
-) -> tuple[Any, _RecordingSdk, OpenAIClient]:
-    """An OpenAIClient as build_llm_client builds one for O6_MODEL, wrapped at *effort*."""
-    sdk = sdk if sdk is not None else _RecordingSdk()
+def _arm_effort_client(effort: str = 'low') -> tuple[Any, _RecordingSdk]:
+    """An OpenAIClient as build_llm_client builds one for O6_MODEL, wrapped at *effort* as build_arm_llm wraps it.
+
+    The class-level wire pins of llm_clients.ExplicitEffortOpenAIClient live in
+    test_explicit_effort_openai_client.py; these tests pin what the script adds.
+    """
+    sdk = _RecordingSdk()
     built = OpenAIClient(
         config=GraphitiLLMConfig(api_key='test', model=mod.O6_MODEL, small_model=mod.O6_MODEL, temperature=0.0),
         client=sdk, max_tokens=EFFORT_MAX_TOKENS,
     )
     built.token_tracker = AttributingTokenUsageTracker()
-    return mod.ExplicitEffortOpenAIClient(built, effort), sdk, built
+    return mod.ArmEffortClient(built, effort), sdk
 
 
-async def _structured_call(client: Any, response_model: type[BaseModel] | None = _Answer) -> Any:
-    messages = [Message(role='system', content='extract'), Message(role='user', content='the record')]
-    return await client.generate_response(
-        messages, response_model=response_model, prompt_name='extract_nodes.extract_text',
-    )
-
-
-class TestTheExplicitEffortClient:
-    @pytest.mark.asyncio
-    async def test_it_sends_the_effort_and_no_other_sampling_control(self) -> None:
-        client, sdk, _ = _effort_client('low')
-        assert await _structured_call(client) == {'answer': 'yes'}
-        (sent,) = sdk.sent
-        assert 'temperature' not in sent and 'text' not in sent
-        assert sent['reasoning'] == {'effort': 'low'}
-        assert sent['model'] == mod.O6_MODEL
-        assert sent['max_output_tokens'] == client.max_tokens == EFFORT_MAX_TOKENS
-        assert set(sent) == {'model', 'input', 'max_output_tokens', 'text_format', 'reasoning'}
-
-    @pytest.mark.asyncio
-    async def test_it_keeps_the_built_clients_token_tracker_so_the_call_is_attributed(self) -> None:
-        client, _, built = _effort_client()
-        assert client.token_tracker is built.token_tracker
-        async with measure_llm_tokens(client) as measured:
-            await _structured_call(client)
-        assert measured.usage == LlmTokenUsage(input_tokens=11, output_tokens=7, llm_calls=1)
-
+class TestTheArmEffortClient:
     @pytest.mark.parametrize('effort', ['low', 'medium'])
-    def test_it_declares_the_effort_it_sends(self, effort: str) -> None:
-        client, _, _ = _effort_client(effort)
-        assert client.reasoning_effort == effort
+    def test_the_script_reads_the_effort_it_declares(self, effort: str) -> None:
+        client, _ = _arm_effort_client(effort)
         assert mod.client_reasoning_effort(client) == effort
-
-    @pytest.mark.asyncio
-    async def test_a_json_mode_call_is_refused_before_anything_is_sent(self) -> None:
-        """A JSON-mode chat completion cannot carry reasoning.effort, so it is never sent without it."""
-        client, sdk, _ = _effort_client()
-        with pytest.raises(NotImplementedError, match='reasoning.effort'):
-            await _structured_call(client, response_model=None)
-        assert sdk.sent == []
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize('message', [
-        {'role': 'assistant', 'content': 'an earlier answer'},
-        {'role': 'user', 'content': [{'type': 'text', 'text': 'a content part'}]},
-    ])
-    async def test_a_message_graphiti_never_emits_is_refused_before_anything_is_sent(self, message: Any) -> None:
-        """graphiti's message conversion emits only system and user text, so through
-        generate_response this is unreachable; the hook graphiti calls is where it is refused."""
-        client, sdk, _ = _effort_client()
-        messages: list[Any] = [{'role': 'system', 'content': 'extract'}, message]
-        with pytest.raises(TypeError, match='is not Responses input'):
-            await client._create_structured_completion(
-                model=mod.O6_MODEL, messages=messages, temperature=None,
-                max_tokens=EFFORT_MAX_TOKENS, response_model=_Answer,
-            )
-        assert sdk.sent == []
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize('effort', ['low', 'medium'])
     async def test_graphitis_own_extraction_sends_the_effort_and_each_stages_cap(self, effort: str) -> None:
         """design.md §2.2: both stages go through the structured path, so both carry the effort and
         no temperature, and each carries its own output cap."""
-        sdk = _RecordingSdk(EXTRACTION_ANSWERS)
-        client, _, _ = _effort_client(effort, sdk)
+        client, sdk = _arm_effort_client(effort)
         result = await mod.replay_episode(client, _input(), mod.ARMS[f'o6-{effort}'])
         assert [sent['text_format'] for sent in sdk.sent] == [ExtractedEntities, ExtractedEdges]
         assert [sent['max_output_tokens'] for sent in sdk.sent] == [EFFORT_MAX_TOKENS, EXTRACT_EDGES_MAX_TOKENS]
@@ -484,7 +422,7 @@ class TestBuildArmLlm:
     def test_a_set_effort_wraps_the_built_client_in_the_effort_client(self, mock_config: FusedMemoryConfig) -> None:
         before = mock_config.llm.model
         client = mod.build_arm_llm(mock_config, mod.ExtractionLlm(mod.O6_MODEL, 'medium'))
-        assert isinstance(client, mod.ExplicitEffortOpenAIClient)
+        assert isinstance(client, mod.ArmEffortClient)
         assert (client.model, client.small_model) == (mod.O6_MODEL, mod.O6_MODEL)
         assert client.reasoning_effort == 'medium'
         assert isinstance(client.token_tracker, AttributingTokenUsageTracker)
@@ -522,7 +460,7 @@ class TestThePlanProxyEndpoint:
     def test_a_plan_proxy_llm_builds_the_effort_client_on_the_proxy(self, mock_config: FusedMemoryConfig) -> None:
         before = mock_config.model_dump()
         client = mod.build_arm_llm(mock_config, mod.ARMS['luna-low'].llm)
-        assert isinstance(client, mod.ExplicitEffortOpenAIClient)
+        assert isinstance(client, mod.ArmEffortClient)
         assert (client.model, client.reasoning_effort) == (mod.LUNA_MODEL, 'low')
         assert _sdk_endpoint(client) == (PROXY_URL, PROXY_KEY)
         assert mod.client_endpoint(client) == 'plan_proxy'

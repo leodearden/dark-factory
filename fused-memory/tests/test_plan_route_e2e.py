@@ -37,10 +37,16 @@ from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.backends.falkor_server_settings import FalkorServerSettings
 from fused_memory.backends.graphiti_client import build_llm_client
+from fused_memory.backends.llm_clients import (
+    CategoryRoutedLLMClient,
+    extraction_category_scope,
+    wrapped_llm_clients,
+)
 from fused_memory.backends.sdk_client_lifecycle import close_wrapped_sdk_clients
 from fused_memory.config.schema import (
     EmbedderConfig,
     EmbedderProvidersConfig,
+    ExtractionRouteConfig,
     FusedMemoryConfig,
     LLMConfig,
     LLMProvidersConfig,
@@ -128,7 +134,7 @@ async def _graphiti_llm(endpoints: _Endpoints, route: PlanRoute) -> AsyncIterato
     http_client = route.http_client_for(endpoints.proxy.base_url, site=PlanRouteSite.GRAPHITI)
     assert http_client is not None
     try:
-        client = build_llm_client(endpoints.config(), http_client=http_client)
+        client = build_llm_client(endpoints.config(), gated_http_client_for=lambda _url: http_client)
         assert client is not None
         yield client
     finally:
@@ -170,6 +176,56 @@ class TestGraphitisLLMRidesThePlanRoute:
         assert endpoints.api_llm_requests() == []
 
 
+class TestTheDecisionsRouteRidesThePlanRoute:
+    """The decisions extraction route (task 9943): a capped plan parks, never reaching the API key."""
+
+    @staticmethod
+    def _routed_config(endpoints: _Endpoints) -> FusedMemoryConfig:
+        cfg = endpoints.config()
+        cfg.llm.providers.openai = OpenAIProviderConfig(api_key='api-key', api_url=endpoints.api.base_url)
+        cfg.llm.extraction_routes = {
+            'decisions_and_rationale': ExtractionRouteConfig(
+                model='gpt-6.1-sol', reasoning_effort='low',
+                api_url=endpoints.proxy.base_url, api_key='plan-key',
+            ),
+        }
+        return cfg
+
+    @pytest.mark.asyncio
+    async def test_a_capped_plan_raises_once_and_never_falls_back(
+        self, endpoints: _Endpoints,
+    ) -> None:
+        endpoints.proxy.set_response_sequence('/responses', [(429, _USAGE_LIMIT)])
+        route = endpoints.route()
+        client = build_llm_client(
+            self._routed_config(endpoints),
+            gated_http_client_for=lambda url: route.http_client_for(url, site=PlanRouteSite.GRAPHITI),
+        )
+        assert isinstance(client, CategoryRoutedLLMClient)
+        try:
+            with extraction_category_scope(MemoryCategory.decisions_and_rationale):
+                with pytest.raises(GraphitiRateLimitError) as first:
+                    await self._extract_edges(client)
+                assert len(endpoints.proxy.requests_to('/responses')) == 1
+                with pytest.raises(GraphitiRateLimitError):
+                    await self._extract_edges(client)
+        finally:
+            await close_wrapped_sdk_clients(wrapped_llm_clients(client))
+
+        exhaustion = classify_billing_exhaustion(first.value)
+        assert exhaustion is not None
+        assert exhaustion.source is BillingSource.PLAN_CAP
+        assert len(endpoints.proxy.requests_to('/responses')) == 1
+        assert endpoints.api_llm_requests() == []
+
+    @staticmethod
+    async def _extract_edges(client: Any) -> Any:
+        return await client.generate_response(
+            [Message(role='user', content='Alice knows Bob.')], response_model=_Extraction,
+            prompt_name='extract_edges.edge',
+        )
+
+
 _CLOCK_START = datetime(2026, 11, 24, 12, 0, tzinfo=UTC).timestamp()
 _CAPPED = 'plan_route_capped'
 
@@ -183,7 +239,7 @@ async def _extract_on_the_plan_route(svc: MemoryService) -> None:
     http_client = svc.plan_route.http_client_for(provider.api_url, site=PlanRouteSite.GRAPHITI)
     assert http_client is not None
     try:
-        await _extract(build_llm_client(svc.config, http_client=http_client))
+        await _extract(build_llm_client(svc.config, gated_http_client_for=lambda _url: http_client))
     finally:
         await http_client.aclose()
 

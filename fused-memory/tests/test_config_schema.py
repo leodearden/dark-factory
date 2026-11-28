@@ -22,6 +22,7 @@ from fused_memory.config.schema import (
     CuratorConfig,
     EmbedderConfig,
     EntityMintConfig,
+    ExtractionRouteConfig,
     FusedMemoryConfig,
     GraphitiBackendConfig,
     LLMConfig,
@@ -316,6 +317,76 @@ class TestLLMConfigClientClass:
         cfg2 = FusedMemoryConfig()
         assert cfg2.llm.providers.openai is not None
         assert cfg2.llm.providers.openai.api_url == 'http://127.0.0.1:1234/v1'
+
+
+class TestLLMConfigExtractionRoutes:
+    """llm.extraction_routes: one route leaf per graphiti-routed category (task 9943)."""
+
+    FM_CONFIG_YAML = Path(__file__).resolve().parent.parent / 'config' / 'config.yaml'
+
+    ROUTE = {
+        'model': 'gpt-6.1-sol', 'reasoning_effort': 'low',
+        'api_url': 'http://127.0.0.1:8317/v1', 'api_key': 'k',
+    }
+
+    def test_no_route_by_default(self):
+        assert LLMConfig().extraction_routes == {}
+
+    def test_a_route_parses_into_its_leaf(self):
+        cfg = LLMConfig.model_validate({'extraction_routes': {'decisions_and_rationale': self.ROUTE}})
+        route = cfg.extraction_routes['decisions_and_rationale']
+        assert isinstance(route, ExtractionRouteConfig)
+        assert (route.model, route.reasoning_effort, route.api_url, route.api_key) == (
+            'gpt-6.1-sol', 'low', 'http://127.0.0.1:8317/v1', 'k',
+        )
+
+    @pytest.mark.parametrize('missing', ['model', 'reasoning_effort'])
+    def test_a_route_without_model_or_effort_is_refused(self, missing):
+        route = {k: v for k, v in self.ROUTE.items() if k != missing}
+        with pytest.raises(ValidationError):
+            LLMConfig.model_validate({'extraction_routes': {'decisions_and_rationale': route}})
+
+    def test_an_unknown_effort_is_refused(self):
+        with pytest.raises(ValidationError):
+            LLMConfig.model_validate({'extraction_routes': {
+                'decisions_and_rationale': self.ROUTE | {'reasoning_effort': 'extreme'},
+            }})
+
+    @pytest.mark.parametrize('misspelt', ['base_url', 'key'])
+    def test_an_unknown_route_leaf_is_refused_by_name(self, misspelt):
+        with pytest.raises(ValidationError, match=misspelt):
+            LLMConfig.model_validate({'extraction_routes': {
+                'decisions_and_rationale': self.ROUTE | {misspelt: 'x'},
+            }})
+
+    @pytest.mark.parametrize('blank', ['', '   '])
+    def test_a_blank_url_or_key_reads_as_unset(self, blank):
+        route = ExtractionRouteConfig(
+            model='gpt-6.1-sol', reasoning_effort='low', api_url=blank, api_key=blank,
+        )
+        assert (route.api_url, route.api_key) == (None, None)
+
+    def test_the_deployed_config_routes_decisions_onto_the_plan_proxy(self, monkeypatch):
+        monkeypatch.setenv('CONFIG_PATH', str(self.FM_CONFIG_YAML))
+        monkeypatch.setenv('OPENAI_PLAN_PROXY_URL', 'http://127.0.0.1:9999/v1')
+        monkeypatch.setenv('OPENAI_PLAN_PROXY_KEY', 'plan-key')
+
+        routes = FusedMemoryConfig().llm.extraction_routes
+
+        assert set(routes) == {'decisions_and_rationale'}
+        route = routes['decisions_and_rationale']
+        assert (route.model, route.reasoning_effort, route.api_url, route.api_key) == (
+            'gpt-6.1-sol', 'low', 'http://127.0.0.1:9999/v1', 'plan-key',
+        )
+
+    def test_the_deployed_route_loads_unset_without_the_plan_env(self, monkeypatch):
+        monkeypatch.setenv('CONFIG_PATH', str(self.FM_CONFIG_YAML))
+        monkeypatch.delenv('OPENAI_PLAN_PROXY_URL', raising=False)
+        monkeypatch.delenv('OPENAI_PLAN_PROXY_KEY', raising=False)
+
+        route = FusedMemoryConfig().llm.extraction_routes['decisions_and_rationale']
+
+        assert (route.model, route.api_url, route.api_key) == ('gpt-6.1-sol', None, None)
 
 
 class TestEmbedderConfigProvider:

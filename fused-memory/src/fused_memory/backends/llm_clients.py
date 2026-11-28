@@ -1,17 +1,32 @@
 """Thin graphiti-core LLM client subclasses owned by fused-memory.
 
+It also holds the category router, CategoryRoutedLLMClient, which sends the
+extraction prompts made inside an extraction_category_scope to that
+category's route.
+
 Kept out of the already-large ``graphiti_client.py``, following the
 ``backends/falkor_fulltext.py`` convention for focused helpers.
 """
 
+import contextlib
 import json
+from collections.abc import Iterator, Mapping
 from contextvars import ContextVar
+from types import MappingProxyType
 from typing import Any
 
+from graphiti_core.llm_client.client import LLMClient
 from graphiti_core.llm_client.config import DEFAULT_MAX_TOKENS, ModelSize
+from graphiti_core.llm_client.openai_client import OpenAIClient
 from graphiti_core.llm_client.openai_generic_client import OpenAIGenericClient
 from graphiti_core.prompts.models import Message
+from openai.types.chat import ChatCompletionMessageParam
+from openai.types.responses import EasyInputMessageParam, ResponseInputParam
+from openai.types.shared import ReasoningEffort
+from openai.types.shared_params import Reasoning
 from pydantic import BaseModel
+
+from fused_memory.models.enums import MemoryCategory
 
 # Prefixed to the inlined schema. Phrased as an instruction rather than a bare
 # schema dump because the model is being asked to honour it without any
@@ -232,3 +247,147 @@ class ForceJsonObjectOpenAIGenericClient(TokenRecordingOpenAIGenericClient):
         # that silently read it as empty.
         response_model.model_validate(result)
         return result
+
+
+def _responses_input(messages: list[ChatCompletionMessageParam]) -> ResponseInputParam:
+    """graphiti's converted messages as Responses input. graphiti emits only system and user
+    messages with text content, so anything else is a defect, refused before it is sent."""
+    converted: ResponseInputParam = []
+    for message in messages:
+        role, content = message['role'], message.get('content')
+        if role not in ('system', 'user') or not isinstance(content, str):
+            raise TypeError(f'a {role} message with {type(content).__name__} content is not Responses input')
+        converted.append(EasyInputMessageParam(role=role, content=content))
+    return converted
+
+
+class ExplicitEffortOpenAIClient(OpenAIClient):
+    """graphiti's OpenAIClient for a reasoning model graphiti_core 0.28.2 does not recognise by name.
+
+    graphiti treats only gpt-5, o1 and o3 names as reasoning models: any other
+    model is sent temperature and never sent reasoning, and gpt-6.1-sol answers
+    a temperature with HTTP 400. This client sends no temperature, and exactly
+    the chosen reasoning effort (esc-9065-2). It wraps an already-built client,
+    reusing its SDK client, config, max_tokens and token tracker. graphiti's own
+    ``reasoning`` stays at its default and is never read: ``reasoning_effort``
+    is the one copy.
+    """
+
+    def __init__(self, built: OpenAIClient, effort: ReasoningEffort) -> None:
+        if effort is None:
+            raise ValueError('an effort client sends a chosen effort; build the configured client instead')
+        super().__init__(config=built.config, client=built.client, max_tokens=built.max_tokens)
+        self.token_tracker = built.token_tracker
+        self._reasoning_effort: ReasoningEffort = effort
+
+    @property
+    def reasoning_effort(self) -> ReasoningEffort:
+        """The effort every structured call sends."""
+        return self._reasoning_effort
+
+    async def _create_structured_completion(
+        self, model: str, messages: list[ChatCompletionMessageParam], temperature: float | None,
+        max_tokens: int, response_model: type[BaseModel], reasoning: str | None = None,
+        verbosity: str | None = None,
+    ) -> Any:
+        return await self.client.responses.parse(
+            model=model, input=_responses_input(messages), max_output_tokens=max_tokens,
+            text_format=response_model, reasoning=Reasoning(effort=self._reasoning_effort),
+        )
+
+    async def _create_completion(
+        self, model: str, messages: list[ChatCompletionMessageParam], temperature: float | None,
+        max_tokens: int, response_model: type[BaseModel] | None = None, reasoning: str | None = None,
+        verbosity: str | None = None,
+    ) -> Any:
+        raise NotImplementedError(
+            'a JSON-mode chat completion cannot carry reasoning.effort, so it is never sent without it',
+        )
+
+
+EXTRACTION_PROMPT_NAMES: frozenset[str] = frozenset({
+    'extract_nodes.extract_message',
+    'extract_nodes.extract_text',
+    'extract_nodes.extract_json',
+    'extract_edges.edge',
+})
+"""graphiti_core 0.28.2's node_operations.py::_call_extraction_llm and edge_operations.py::extract_edges prompts."""
+
+_EXTRACTION_CATEGORY: ContextVar[MemoryCategory | None] = ContextVar('extraction_category', default=None)
+
+
+@contextlib.contextmanager
+def extraction_category_scope(category: MemoryCategory | None) -> Iterator[None]:
+    """Route the extraction calls made inside this scope, and in tasks it spawns, by *category*."""
+    reset_token = _EXTRACTION_CATEGORY.set(category)
+    try:
+        yield
+    finally:
+        _EXTRACTION_CATEGORY.reset(reset_token)
+
+
+class CategoryRoutedLLMClient(LLMClient):
+    """Sends a scoped category's extraction prompts to that category's route, everything else to the default.
+
+    The category is the one extraction_category_scope set for the calling
+    context. The default's token tracker is the router's, so a measured window
+    over the router credits every inner client whose tracker attributes.
+    """
+
+    def __init__(self, default: LLMClient, routes: Mapping[MemoryCategory, LLMClient]) -> None:
+        super().__init__(config=default.config)
+        self.token_tracker = default.token_tracker
+        self._default = default
+        self._routes: Mapping[MemoryCategory, LLMClient] = MappingProxyType(dict(routes))
+
+    @property
+    def default(self) -> LLMClient:
+        return self._default
+
+    @property
+    def routes(self) -> Mapping[MemoryCategory, LLMClient]:
+        return self._routes
+
+    def client_for(self, prompt_name: str | None) -> LLMClient:
+        if prompt_name in EXTRACTION_PROMPT_NAMES and (category := _EXTRACTION_CATEGORY.get()) is not None:
+            return self._routes.get(category, self._default)
+        return self._default
+
+    async def generate_response(
+        self,
+        messages: list[Message],
+        response_model: type[BaseModel] | None = None,
+        max_tokens: int | None = None,
+        model_size: ModelSize = ModelSize.medium,
+        group_id: str | None = None,
+        prompt_name: str | None = None,
+    ) -> dict[str, Any]:
+        return await self.client_for(prompt_name).generate_response(
+            messages,
+            response_model=response_model,
+            max_tokens=max_tokens,
+            model_size=model_size,
+            group_id=group_id,
+            prompt_name=prompt_name,
+        )
+
+    async def _generate_response(
+        self,
+        messages: list[Message],
+        response_model: type[BaseModel] | None = None,
+        max_tokens: int = DEFAULT_MAX_TOKENS,
+        model_size: ModelSize = ModelSize.medium,
+    ) -> dict[str, Any]:
+        raise NotImplementedError('generate_response delegates whole calls to an inner client')
+
+    def set_tracer(self, tracer: Any) -> None:
+        super().set_tracer(tracer)
+        for client in (self._default, *self._routes.values()):
+            client.set_tracer(tracer)
+
+
+def wrapped_llm_clients(client: LLMClient | None) -> tuple[LLMClient | None, ...]:
+    """The clients that actually send *client*'s calls: a router's default then its routes, else *client*."""
+    if isinstance(client, CategoryRoutedLLMClient):
+        return (client.default, *client.routes.values())
+    return (client,)

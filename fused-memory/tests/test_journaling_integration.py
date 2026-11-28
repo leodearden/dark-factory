@@ -689,6 +689,56 @@ async def test_failed_graphiti_write_still_persists_the_tokens_it_recorded(
     assert json.loads(row['result_summary'])['tokens']['total_tokens'] == 12
 
 
+@pytest.fixture
+def model_bound_client(service) -> SimpleNamespace:
+    """As llm_tracked_client, with the tracker bound to the model its client calls (task 9943)."""
+    client = SimpleNamespace(token_tracker=AttributingTokenUsageTracker(model='gpt-6.1-sol'))
+    service.graphiti.token_probe = lambda: measure_llm_tokens(client)
+    return client
+
+
+@pytest.mark.asyncio
+async def test_graphiti_write_names_the_model_that_spent_its_tokens(
+    service, write_journal, model_bound_client
+):
+    async def _add_episode(**_kwargs):
+        model_bound_client.token_tracker.record('extract_edges.edge', 120, 45)
+        return _EPISODE_RESULT
+
+    service.graphiti.add_episode = _add_episode
+    wid = str(uuid.uuid4())
+
+    await service._execute_graphiti_write(
+        queued('add_episode', _graphiti_write_payload(str(uuid.uuid4()), wid))
+    )
+
+    [row] = await write_journal.get_backend_ops_for_write_op(wid)
+    assert json.loads(row['result_summary'])['tokens']['by_model'] == {
+        'gpt-6.1-sol': {'input_tokens': 120, 'output_tokens': 45, 'total_tokens': 165, 'llm_calls': 1},
+    }
+
+
+@pytest.mark.asyncio
+async def test_failed_graphiti_write_names_the_model_that_spent_its_tokens(
+    service, write_journal, model_bound_client
+):
+    async def _add_episode(**_kwargs):
+        model_bound_client.token_tracker.record('extract_edges.edge', 10, 2)
+        raise RuntimeError('extraction failed after an LLM call')
+
+    service.graphiti.add_episode = _add_episode
+    wid = str(uuid.uuid4())
+
+    with pytest.raises(RuntimeError, match='extraction failed'):
+        await service._execute_graphiti_write(
+            queued('add_episode', _graphiti_write_payload(str(uuid.uuid4()), wid))
+        )
+
+    [row] = await write_journal.get_backend_ops_for_write_op(wid)
+    assert row['success'] == 0
+    assert set(json.loads(row['result_summary'])['tokens']['by_model']) == {'gpt-6.1-sol'}
+
+
 @pytest.mark.asyncio
 async def test_mem0_backend_row_keeps_its_plain_string_result_summary(
     service, write_journal, llm_tracked_client

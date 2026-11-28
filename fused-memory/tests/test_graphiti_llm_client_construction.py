@@ -11,11 +11,23 @@ structurally unreachable from these tests rather than merely monkeypatched
 away. No FalkorDriver, no Graphiti client, no real graph is touched here.
 """
 
+import functools
 import json
 import logging
+from collections.abc import AsyncIterator, Iterator
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _mock_openai_server import MockOpenAIServer, mock_openai_server, responses_body
+from _recording_llm_client import (
+    PLAN_KEY,
+    ROUTE_MODEL,
+    decisions_routed_to,
+    scrub_ambient_openai_base_url,
+)
 from graphiti_core.llm_client import OpenAIClient
 from graphiti_core.llm_client.config import LLMConfig as GraphitiLLMConfig
 from graphiti_core.llm_client.openai_generic_client import OpenAIGenericClient
@@ -24,6 +36,17 @@ from pydantic import BaseModel, ValidationError
 
 import fused_memory.backends.graphiti_client as graphiti_client_module
 from fused_memory.backends.graphiti_client import build_llm_client
+from fused_memory.backends.llm_clients import (
+    CategoryRoutedLLMClient,
+    ExplicitEffortOpenAIClient,
+    extraction_category_scope,
+    wrapped_llm_clients,
+)
+from fused_memory.backends.llm_token_usage import LlmTokenUsage, measure_llm_tokens
+from fused_memory.backends.sdk_client_lifecycle import close_wrapped_sdk_clients
+from fused_memory.config.schema import AnthropicProviderConfig, FusedMemoryConfig, PlanRouteConfig
+from fused_memory.models.enums import MemoryCategory
+from fused_memory.services.plan_route import PlanRoute, PlanRouteSite
 
 
 def _record_llm_config(monkeypatch) -> list[dict]:
@@ -795,3 +818,224 @@ class TestBuildLLMClientBranchPreservation:
         )
 
         assert build_llm_client(mock_config) is None
+
+
+# --------------------------------------------------------------------------- #
+# Extraction routes (task 9943)
+# --------------------------------------------------------------------------- #
+
+_DECISIONS = MemoryCategory.decisions_and_rationale
+
+
+class _Item(BaseModel):
+    name: str
+
+
+_ITEM = json.dumps({'name': 'Alice'})
+
+
+@dataclass
+class _RouteRig:
+    cfg: FusedMemoryConfig
+    proxy: MockOpenAIServer
+    api: MockOpenAIServer
+    route: PlanRoute
+
+    def gate(self) -> Any:
+        return functools.partial(self.route.http_client_for, site=PlanRouteSite.GRAPHITI)
+
+    def set_route(self, **changes: Any) -> None:
+        route = self.cfg.llm.extraction_routes['decisions_and_rationale']
+        self.cfg.llm.extraction_routes['decisions_and_rationale'] = route.model_copy(update=changes)
+
+    def proxy_saw_nothing(self) -> bool:
+        return self.proxy.requests == []
+
+    def nothing_carried_the_route_model(self) -> bool:
+        bodies = [r['json_body'] or {} for r in (*self.proxy.requests, *self.api.requests)]
+        return all(body.get('model') != ROUTE_MODEL for body in bodies)
+
+
+@pytest.fixture
+def rig(mock_config, monkeypatch) -> Iterator[_RouteRig]:
+    scrub_ambient_openai_base_url(monkeypatch)
+    with mock_openai_server() as proxy, mock_openai_server() as api:
+        for server, tokens in ((proxy, (30, 10)), (api, (5, 1))):
+            server.set_response(
+                '/responses', responses_body(_ITEM, input_tokens=tokens[0], output_tokens=tokens[1]),
+            )
+        mock_config.llm.model = 'gpt-4o-mini'
+        mock_config.llm.providers.openai.api_url = api.base_url
+        mock_config.llm.extraction_routes = decisions_routed_to(proxy.base_url)
+        yield _RouteRig(mock_config, proxy, api, PlanRoute(PlanRouteConfig(proxy_url=proxy.base_url)))
+
+
+@asynccontextmanager
+async def _built(cfg: FusedMemoryConfig, **kwargs: Any) -> AsyncIterator[Any]:
+    client = build_llm_client(cfg, **kwargs)
+    try:
+        yield client
+    finally:
+        await close_wrapped_sdk_clients(wrapped_llm_clients(client))
+
+
+async def _call(client: Any, prompt_name: str) -> Any:
+    return await client.generate_response(
+        [Message(role='user', content='the record')], response_model=_Item, prompt_name=prompt_name,
+    )
+
+
+def _authorization(request: dict) -> str | None:
+    return {k.lower(): v for k, v in request['headers'].items()}.get('authorization')
+
+
+class TestAnExtractionRouteIsBuiltOnTheGatedPlanProxy:
+    @pytest.mark.asyncio
+    async def test_the_router_holds_an_effort_client_for_the_category(self, rig: _RouteRig) -> None:
+        async with _built(rig.cfg, gated_http_client_for=rig.gate()) as client:
+            assert isinstance(client, CategoryRoutedLLMClient)
+            route = client.routes[_DECISIONS]
+            assert isinstance(route, ExplicitEffortOpenAIClient)
+            assert (route.reasoning_effort, route.model, route.max_tokens) == (
+                'low', ROUTE_MODEL, rig.cfg.llm.max_tokens,
+            )
+            assert type(client.default) is OpenAIClient
+            assert client.default.model == 'gpt-4o-mini'
+
+    @pytest.mark.asyncio
+    async def test_a_scoped_extraction_call_lands_on_the_proxy_with_the_plan_key(
+        self, rig: _RouteRig,
+    ) -> None:
+        async with _built(rig.cfg, gated_http_client_for=rig.gate()) as client:
+            with extraction_category_scope(_DECISIONS):
+                assert await _call(client, 'extract_edges.edge') == {'name': 'Alice'}
+
+        [sent] = rig.proxy.requests_to('/responses')
+        body = sent['json_body']
+        assert body['model'] == ROUTE_MODEL
+        assert body['reasoning'] == {'effort': 'low'}
+        assert 'temperature' not in body
+        assert _authorization(sent) == f'Bearer {PLAN_KEY}'
+        assert rig.api.requests_to('/responses') == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('scoped, prompt_name', [
+        (True, 'dedupe_edges.resolve_edge'),
+        (False, 'extract_edges.edge'),
+    ])
+    async def test_every_other_call_stays_on_the_api_key(
+        self, rig: _RouteRig, scoped: bool, prompt_name: str,
+    ) -> None:
+        async with _built(rig.cfg, gated_http_client_for=rig.gate()) as client:
+            if scoped:
+                with extraction_category_scope(_DECISIONS):
+                    await _call(client, prompt_name)
+            else:
+                await _call(client, prompt_name)
+
+        [sent] = rig.api.requests_to('/responses')
+        assert sent['json_body']['model'] == 'gpt-4o-mini'
+        assert _authorization(sent) == 'Bearer test-key'
+        assert rig.proxy_saw_nothing()
+
+    @pytest.mark.asyncio
+    async def test_the_active_route_is_logged_without_its_key(self, rig: _RouteRig, caplog) -> None:
+        with caplog.at_level(logging.INFO, logger=graphiti_client_module.logger.name):
+            async with _built(rig.cfg, gated_http_client_for=rig.gate()):
+                pass
+
+        [line] = [
+            r.getMessage() for r in caplog.records
+            if r.getMessage().startswith('Graphiti LLM:') and 'decisions_and_rationale' in r.getMessage()
+        ]
+        assert ROUTE_MODEL in line
+        assert 'effort low' in line
+        assert rig.proxy.base_url in line
+        assert PLAN_KEY not in line
+
+    @pytest.mark.asyncio
+    async def test_each_clients_tokens_are_credited_to_its_model(self, rig: _RouteRig) -> None:
+        async with _built(rig.cfg, gated_http_client_for=rig.gate()) as client, measure_llm_tokens(client) as m:
+            with extraction_category_scope(_DECISIONS):
+                await _call(client, 'extract_edges.edge')
+                await _call(client, 'dedupe_edges.resolve_edge')
+
+        assert m.by_model == {
+            'gpt-4o-mini': LlmTokenUsage(5, 1, 1),
+            ROUTE_MODEL: LlmTokenUsage(30, 10, 1),
+        }
+
+
+def _route_warnings(caplog) -> list[str]:
+    return [
+        r.getMessage() for r in caplog.records
+        if r.levelno == logging.WARNING and 'decisions_and_rationale' in r.getMessage()
+    ]
+
+
+class TestAnUnbuildableRouteIsOff:
+    @staticmethod
+    async def _assert_off(rig: _RouteRig, caplog, **kwargs: Any) -> None:
+        with caplog.at_level(logging.WARNING, logger=graphiti_client_module.logger.name):
+            async with _built(rig.cfg, **kwargs) as client:
+                assert type(client) is OpenAIClient
+                with extraction_category_scope(_DECISIONS):
+                    await _call(client, 'extract_edges.edge')
+
+        warnings = _route_warnings(caplog)
+        assert len(warnings) == 1, warnings
+        assert rig.proxy_saw_nothing()
+        assert rig.nothing_carried_the_route_model()
+
+    @pytest.mark.asyncio
+    async def test_on_the_anthropic_arm(self, rig: _RouteRig, caplog) -> None:
+        rig.cfg.llm.provider = 'anthropic'
+        rig.cfg.llm.providers.anthropic = AnthropicProviderConfig(api_key='anthropic-test-key')
+
+        with caplog.at_level(logging.WARNING, logger=graphiti_client_module.logger.name):
+            async with _built(rig.cfg, gated_http_client_for=rig.gate()) as client:
+                assert client is not None
+                assert not isinstance(client, CategoryRoutedLLMClient)
+
+        [warning] = _route_warnings(caplog)
+        assert "'anthropic'" in warning
+        assert rig.proxy_saw_nothing()
+
+    @pytest.mark.asyncio
+    async def test_when_the_gate_does_not_gate_the_routes_url(self, rig: _RouteRig, caplog) -> None:
+        rig.set_route(api_url='http://127.0.0.1:9/v1')
+        await self._assert_off(rig, caplog, gated_http_client_for=rig.gate())
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('unset', ['api_url', 'api_key'])
+    async def test_without_its_url_or_key(self, rig: _RouteRig, caplog, unset: str) -> None:
+        rig.set_route(**{unset: None})
+        await self._assert_off(rig, caplog, gated_http_client_for=rig.gate())
+
+
+class TestACallerWithoutAGateBuildsNoRoute:
+    @pytest.mark.asyncio
+    async def test_it_gets_the_default_client_and_no_route_log(self, rig: _RouteRig, caplog) -> None:
+        with caplog.at_level(logging.DEBUG):
+            async with _built(rig.cfg) as client:
+                assert type(client) is OpenAIClient
+                with extraction_category_scope(_DECISIONS):
+                    await _call(client, 'extract_edges.edge')
+
+        [sent] = rig.api.requests_to('/responses')
+        assert sent['json_body']['model'] == 'gpt-4o-mini'
+        assert rig.proxy_saw_nothing()
+        assert [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING] == []
+        assert [r.getMessage() for r in caplog.records if 'is OFF' in r.getMessage()] == []
+
+
+class TestARouteKeyMustBeAGraphitiCategory:
+    @pytest.mark.parametrize('gated', [True, False])
+    @pytest.mark.parametrize('key', ['not_a_category', 'procedural_knowledge'])
+    def test_any_other_key_is_refused_by_name(self, rig: _RouteRig, key: str, gated: bool) -> None:
+        route = rig.cfg.llm.extraction_routes.pop('decisions_and_rationale')
+        rig.cfg.llm.extraction_routes[key] = route
+        gate = {'gated_http_client_for': rig.gate()} if gated else {}
+
+        with pytest.raises(ValueError, match=key):
+            build_llm_client(rig.cfg, **gate)

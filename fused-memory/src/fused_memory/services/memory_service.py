@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import dataclasses
+import functools
 import hashlib
 import json
 import logging
@@ -16,7 +17,6 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar, assert_never, cast
 
-import httpx
 from graphiti_core.errors import EdgeNotFoundError
 from graphiti_core.nodes import EpisodeType
 from shared.streak import KeyedStreaks
@@ -2481,21 +2481,16 @@ class MemoryService:
             parked_items=parked_items, escalation_id=self._plan_cap_alarm.escalation_id(),
         )
 
-    def _graphiti_plan_route_client(self) -> httpx.AsyncClient | None:
-        provider = self.config.llm.providers.openai
-        if self.config.llm.provider != 'openai' or provider is None or not provider.api_url:
-            return None
-        return self.plan_route.http_client_for(provider.api_url, site=PlanRouteSite.GRAPHITI)
-
     async def initialize(self) -> None:
         """Initialize backends and the durable write queue."""
-        plan_client = self._graphiti_plan_route_client()
-        if plan_client is None:
-            await self.graphiti.initialize()
-        else:
-            await self.graphiti.initialize(
-                llm_client=build_llm_client(self.config, http_client=plan_client),
-            )
+        await self.graphiti.initialize(
+            llm_client=build_llm_client(
+                self.config,
+                gated_http_client_for=functools.partial(
+                    self.plan_route.http_client_for, site=PlanRouteSite.GRAPHITI,
+                ),
+            ),
+        )
 
         qcfg = self.config.queue
 
@@ -2715,6 +2710,7 @@ class MemoryService:
                     error=f'{type(e).__name__}: {e}',
                     duration_ms=_elapsed_ms_since(started),
                     llm_tokens=measurement.usage,
+                    llm_tokens_by_model=measurement.by_model,
                 )
             raise
         duration_ms = _elapsed_ms_since(started)
@@ -2731,6 +2727,7 @@ class MemoryService:
                 success=True,
                 duration_ms=duration_ms,
                 llm_tokens=measurement.usage,
+                llm_tokens_by_model=measurement.by_model,
             )
         return result
 
@@ -6066,6 +6063,7 @@ class MemoryService:
                     temporal_context=temporal_context,
                     reference_time=reference_time,
                     unverified_claim=value.unverified_claim,
+                    extraction_category=memory_category,
                 ),
                 # The only LLM-bearing graphiti path. Deletes and edge updates
                 # spend no LLM, so they stay unprobed rather than journaling a
