@@ -130,6 +130,12 @@ class Window:
     start: datetime
     end: datetime
 
+    def __post_init__(self) -> None:
+        if not self.start < self.end:
+            raise ValueError(
+                f'window start {self.start.isoformat()} is not before its end {self.end.isoformat()}'
+            )
+
     @classmethod
     def trailing(cls, end: datetime, days: int) -> Window:
         return cls(end - timedelta(days=days), end)
@@ -957,7 +963,15 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument('--salt', required=True, help="the experiment's split salt")
     parser.add_argument('--buckets', type=_bucket_count, default=2)
-    parser.add_argument('--days', type=_positive_int, default=30)
+    window_start = parser.add_mutually_exclusive_group()
+    window_start.add_argument('--days', type=_positive_int, default=30)
+    window_start.add_argument(
+        '--since',
+        type=_utc_instant,
+        default=None,
+        help='window start, ISO-8601 with a UTC offset: the window is [--since, --until); '
+        'not with --days',
+    )
     parser.add_argument(
         '--until',
         type=_utc_instant,
@@ -1337,9 +1351,16 @@ def _no_roots_message(selection: RootSelection) -> str:
     )
 
 
+def _window(args: argparse.Namespace) -> Window:
+    end = args.until or datetime.now(UTC)
+    if args.since is not None:
+        return Window(args.since, end)
+    return Window.trailing(end, args.days)
+
+
 def _settings(args: argparse.Namespace) -> Settings:
     return Settings(
-        window=Window.trailing(args.until or datetime.now(UTC), args.days),
+        window=_window(args),
         salt=args.salt,
         buckets=args.buckets,
         key=args.key,
@@ -1379,13 +1400,17 @@ def main(
     mode, rest = _mode_parser().parse_known_args(argv)
     if mode.throughput:
         return _throughput_main(rest)
-    args = _parser().parse_args(argv)
+    parser = _parser()
+    args = parser.parse_args(argv)
+    try:
+        settings = _settings(args)
+    except ValueError as exc:
+        parser.error(str(exc))
     selection = resolve_roots(args.roots, environ, unit_environment)
     if not selection.roots:
         _warn(_no_roots_message(selection))
         return EXIT_NOTHING_READ
-    settings = _settings(args)
-    load = load_fleet(selection.roots, settings.window, settings.salt, settings.buckets, settings.key)
+    load =load_fleet(selection.roots, settings.window, settings.salt, settings.buckets, settings.key)
     _warn_unread_stores(load.roots)
     if not any(status.read for status in load.roots):
         _warn(
