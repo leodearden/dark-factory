@@ -9,11 +9,15 @@ from __future__ import annotations
 
 import copy
 import json
+from collections.abc import Mapping, Sequence
 from dataclasses import replace
+from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
+from _defect_ruling_fixtures import RULED_REF, SECOND_RULED_REF, contract_ruling
 from _info_l0_router_fixtures import PASSED, TASK_ID, assignment, run_config
 from _replanning_review_stub import ReplanningReviewStub
 from _workflow_helpers import (
@@ -27,15 +31,33 @@ from _workflow_helpers import (
 )
 from shared.cli_invoke import AgentResult
 from shared.defects import (
+    DEFECT_TEST_RETIREMENTS_METADATA_KEY,
     DEFECTS_METADATA_KEY,
+    Declare,
+    DeclareClosure,
+    DeclareRetirement,
     DefectDeclaration,
     DefectOrigin,
     DefectStatus,
+    Exemption,
+    ExemptionReason,
     IssueKind,
+    Retirement,
+    RetirementCode,
+    RetirementReason,
+    RetirementState,
+    RuledBy,
+    Ruling,
+    RulingSubject,
+    apply_event,
+    apply_retirement_event,
     mint_review_ref,
 )
+from shared.governed_exceptions import Debt, TicketRef
 
 from orchestrator.agents.review_briefing import ReviewBriefing
+from orchestrator.agents.roles import REVIEWER_COMPREHENSIVE
+from orchestrator.review_defects import RECORD_DEFECT_OUTCOME_TOOL
 from orchestrator.scheduler import TaskAssignment
 from orchestrator.workflow import WorkflowOutcome
 
@@ -138,13 +160,35 @@ class _DefectRun:
         categories = [esc.category for esc in self.queue.get_by_task(TASK_ID)]
         assert 'review_issues' in categories
 
-    async def defects(self) -> list[DefectDeclaration]:
+    def seed(
+        self, *, defects: Sequence[DefectDeclaration] = (), retirements: Sequence[Retirement] = (),
+    ) -> None:
+        """Store *defects* and *retirements* on the task, where the workflow reads them live."""
+        metadata = self.scheduler.task_data[TASK_ID]['metadata']
+        metadata[DEFECTS_METADATA_KEY] = [entry.model_dump(mode='json') for entry in defects]
+        metadata[DEFECT_TEST_RETIREMENTS_METADATA_KEY] = [
+            record.model_dump(mode='json') for record in retirements
+        ]
+
+    async def metadata(self) -> dict[str, Any]:
         task = await self.scheduler.get_task(TASK_ID)
         assert task is not None
+        return task['metadata']
+
+    async def defects(self) -> list[DefectDeclaration]:
         return [
             DefectDeclaration.model_validate(entry)
-            for entry in task['metadata'].get(DEFECTS_METADATA_KEY, [])
+            for entry in (await self.metadata()).get(DEFECTS_METADATA_KEY, [])
         ]
+
+    async def retirements(self) -> list[Retirement]:
+        return [
+            Retirement.model_validate(record)
+            for record in (await self.metadata()).get(DEFECT_TEST_RETIREMENTS_METADATA_KEY, [])
+        ]
+
+    def outcome_tools_called(self) -> list[str]:
+        return [name for name, _ in self.scheduler.defect_records.calls if name == RECORD_DEFECT_OUTCOME_TOOL]
 
 
 @pytest.mark.asyncio
@@ -195,3 +239,119 @@ class TestReviewDefectsAreDeclared:
         await run.run_to_the_review_cap()
 
         assert await run.defects() == []
+
+
+SEEDED_AT = datetime(2026, 11, 28, 9, 0, tzinfo=UTC)
+EXEMPTION = Exemption(
+    reason=ExemptionReason.NEEDS_EXTERNAL_SYSTEM, owner=Debt(TicketRef('tkt_0RW782Z6RY3X8W8Q3NX8J1EKD0')),
+)
+
+
+def _open_defect(ref: str) -> DefectDeclaration:
+    return apply_event(None, Declare(declaration=DefectDeclaration(
+        ref=ref, origin=DefectOrigin.REVIEW, summary='x is wrong', declared_at=SEEDED_AT,
+        declared_by=REVIEWER_COMPREHENSIVE.name, status=DefectStatus.OPEN,
+    )))
+
+
+def _exemption_awaiting_ruling(ref: str) -> DefectDeclaration:
+    return apply_event(_open_defect(ref), DeclareClosure(ref=ref, closure=EXEMPTION))
+
+
+def _retirement_awaiting_ruling(ref: str) -> Retirement:
+    return apply_retirement_event(None, DeclareRetirement(retirement=Retirement(
+        ref=ref, reason=RetirementReason(reason=RetirementCode.FEATURE_REMOVED),
+    )))
+
+
+def _reviewer_ruling(subject: RulingSubject, *, accepted: bool, verdict_cycle: int) -> Ruling:
+    return Ruling(subject=subject, accepted=accepted, ruled_by=RuledBy.REVIEWER, verdict_cycle=verdict_cycle)
+
+
+class _RulingReviewerStub(AgentStub):
+    """The comprehensive reviewer's verdict carries *defect_rulings*, beside any blocking *issues*."""
+
+    def __init__(
+        self, rulings: Sequence[Mapping[str, object]], *, issues: Sequence[Mapping[str, str]] = (),
+    ) -> None:
+        super().__init__()
+        self._rulings = [dict(ruling) for ruling in rulings]
+        self._issues = [dict(issue) for issue in issues]
+
+    def _reviewer(self, role: str, output_schema: dict | None) -> AgentResult:
+        verdict = 'ISSUES_FOUND' if self._issues else 'PASS'
+        review = _make_review(role, verdict, [dict(issue) for issue in self._issues])
+        review['defect_rulings'] = [dict(ruling) for ruling in self._rulings]
+        return AgentResult(
+            success=True, output=json.dumps(review), structured_output=review, cost_usd=0.10,
+        )
+
+
+@pytest.mark.asyncio
+class TestReviewerRulingsAreApplied:
+    async def test_an_accepted_exemption_is_exempted_by_the_reviewer_in_cycle_one(self, tmp_path, monkeypatch):
+        run = _DefectRun(tmp_path, monkeypatch, _RulingReviewerStub([contract_ruling()]), max_review_cycles=2)
+        run.seed(defects=[_exemption_awaiting_ruling(RULED_REF)])
+
+        assert await run.run() == WorkflowOutcome.DONE
+
+        (entry,) = await run.defects()
+        assert entry.status is DefectStatus.EXEMPTED
+        assert entry.ruling == _reviewer_ruling(RulingSubject.CLOSURE, accepted=True, verdict_cycle=1)
+
+    async def test_a_rejected_exemption_reopens_the_defect(self, tmp_path, monkeypatch):
+        stub = _RulingReviewerStub([contract_ruling(accepted=False)])
+        run = _DefectRun(tmp_path, monkeypatch, stub, max_review_cycles=2)
+        run.seed(defects=[_exemption_awaiting_ruling(RULED_REF)])
+
+        assert await run.run() == WorkflowOutcome.DONE
+
+        (entry,) = await run.defects()
+        assert entry.status is DefectStatus.OPEN
+        assert entry.ruling == _reviewer_ruling(RulingSubject.CLOSURE, accepted=False, verdict_cycle=1)
+
+    async def test_an_accepted_retirement_rules_its_record_and_leaves_the_defects_alone(
+        self, tmp_path, monkeypatch,
+    ):
+        ruling = contract_ruling(ref=SECOND_RULED_REF, subject=RulingSubject.RETIREMENT.value)
+        run = _DefectRun(tmp_path, monkeypatch, _RulingReviewerStub([ruling]), max_review_cycles=2)
+        run.seed(defects=[_open_defect(RULED_REF)], retirements=[_retirement_awaiting_ruling(SECOND_RULED_REF)])
+        seeded_defects = copy.deepcopy((await run.metadata())[DEFECTS_METADATA_KEY])
+
+        assert await run.run() == WorkflowOutcome.DONE
+
+        (record,) = await run.retirements()
+        assert record.state is RetirementState.ACCEPTED
+        assert record.ruling == _reviewer_ruling(RulingSubject.RETIREMENT, accepted=True, verdict_cycle=1)
+        assert (await run.metadata())[DEFECTS_METADATA_KEY] == seeded_defects
+
+    async def test_a_ruling_on_the_blocking_round_is_applied_before_the_cap_exit(self, tmp_path, monkeypatch):
+        stub = _RulingReviewerStub([contract_ruling()], issues=[_blocking_issue(IssueKind.TEST_QUALITY)])
+        run = _DefectRun(tmp_path, monkeypatch, stub, max_review_cycles=1)
+        run.seed(defects=[_exemption_awaiting_ruling(RULED_REF)])
+
+        await run.run_to_the_review_cap()
+
+        (entry,) = await run.defects()
+        assert entry.status is DefectStatus.EXEMPTED
+        assert entry.ruling == _reviewer_ruling(RulingSubject.CLOSURE, accepted=True, verdict_cycle=1)
+
+    async def test_a_panel_with_an_errored_reviewer_rules_nothing(self, tmp_path, monkeypatch):
+        """The silent reviewer submits no verdict of its own, so the panel is incomplete.
+
+        The stub answers every reviewer session as reviewer_comprehensive, so
+        only that role's verdict is ever submitted.
+        """
+        silent = replace(REVIEWER_COMPREHENSIVE, name='reviewer_silent')
+        monkeypatch.setattr(
+            'orchestrator.workflow.reviewers_for', lambda briefing: [REVIEWER_COMPREHENSIVE, silent],
+        )
+        run = _DefectRun(tmp_path, monkeypatch, _RulingReviewerStub([contract_ruling()]), max_review_cycles=2)
+        run.workflow.config.max_reviewer_retries = 0
+        run.seed(defects=[_exemption_awaiting_ruling(RULED_REF)])
+
+        assert await run.run() == WorkflowOutcome.BLOCKED
+
+        (entry,) = await run.defects()
+        assert entry.status is DefectStatus.PENDING
+        assert run.outcome_tools_called() == []
