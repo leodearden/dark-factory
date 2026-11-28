@@ -293,7 +293,9 @@ def _salvageable_verdict(
 
 
 # The fast-path hint on a create or combine decision; shared by both output schemas.
-_COMPLEXITY_HINT_SCHEMA: dict[str, Any] = {'type': ['string', 'null'], 'enum': ['simple', None]}
+_COMPLEXITY_HINT_SCHEMA: dict[str, Any] = {
+    'type': ['string', 'null'], 'enum': [SIMPLE_COMPLEXITY, None],
+}
 
 # JSON schema for the curator's structured output — used by invoke_with_cap_retry
 # to constrain the LLM's response.  See also CURATOR_BATCH_OUTPUT_SCHEMA below.
