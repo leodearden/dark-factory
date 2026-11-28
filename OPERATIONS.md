@@ -2258,9 +2258,15 @@ judges the run the previous launch started
 (`orchestrator/src/orchestrator/merge_lane/gate_reaper_watch.py::GateReaperWatch`).
 After two consecutive launches whose previous run never completed, it files one
 L1: category `gate_reaper_stale`, sentinel `__gate_reaper_stale__<host>`. The
-L1 resolves itself at the next completed run. A launch that failed to reach the
-host neither counts nor resets the streak, and the first reading after an
-orchestrator restart is not judged.
+L1 resolves itself at the next completed run. A reply the host gave but that
+does not parse counts as a launch with no completed run, so a probe that keeps
+failing raises the same L1; its detail carries the parse error and ssh's
+stderr, since ssh exits with the launch's status rather than the probe's. A
+launch that failed to reach the host neither counts nor resets the streak (an
+unreachable host has its own `verify_host_unreachable` alarm), and the first
+reading after an orchestrator restart is not judged. A failure of the
+escalation queue itself is logged and retried at the next launch; it never
+stops another host's reaper launch.
 
 To see why a run fails, run the script in the foreground, from a dark-factory
 checkout, with the `bash -s <` recipe the L1's detail gives:

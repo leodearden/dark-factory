@@ -7,21 +7,27 @@ apart, as the reprobe sweep's gate reap is.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Iterable
 from pathlib import Path
+from typing import Any
 
 import pytest
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 
 from orchestrator.merge_lane.gate_reaper_watch import GateReaperWatch
-from orchestrator.remote_gate import ReapStamp
+from orchestrator.remote_gate import ReapReading, ReapStamp, ReapStampUnreadable
 
 _HOST = 'laptop'
 _OTHER = 'desktop'
 _HOUR = 3600.0
 _NEVER_REAPED = ReapStamp(path='/gates/.last-reap', gate_root=True, age_secs=None)
 _JUST_REAPED = ReapStamp(path='/gates/.last-reap', gate_root=True, age_secs=0)
+_UNREADABLE = ReapStampUnreadable(
+    path='/gates/.last-reap', error='reply is not one JSON document',
+    stderr='reap-stamp: stat: invalid option -- c\n',
+)
 
 
 def _stamp(age: int | None) -> ReapStamp:
@@ -37,8 +43,18 @@ def _watch(queue: EscalationQueue | None) -> GateReaperWatch:
     return GateReaperWatch(escalation_queue=lambda: queue)
 
 
+class _FailingQueue(EscalationQueue):
+    """An escalation queue whose every read and write fails, as an unwritable store does."""
+
+    def get_by_task(self, *_: Any, **__: Any) -> Any:
+        raise OSError('escalation store unwritable')
+
+    def has_open_l1(self, *_: Any, **__: Any) -> Any:
+        raise OSError('escalation store unwritable')
+
+
 def _feed(
-    watch: GateReaperWatch, readings: Iterable[ReapStamp | None], *,
+    watch: GateReaperWatch, readings: Iterable[ReapReading | None], *,
     host: str = _HOST, start_hour: int = 0,
 ) -> None:
     """Observe *readings* for *host*, one launch an hour apart from *start_hour*."""
@@ -124,6 +140,46 @@ def test_a_failed_launch_neither_counts_as_a_miss_nor_resets_the_streak(queue: E
     unreset = _watch(queue)
     _feed(unreset, [_NEVER_REAPED, _NEVER_REAPED, None, _NEVER_REAPED], host=_OTHER)
     assert len(_pending(queue, _OTHER)) == 1
+
+
+def test_unreadable_replies_count_as_misses_and_say_why(queue: EscalationQueue):
+    _feed(_watch(queue), [_JUST_REAPED, _UNREADABLE, _UNREADABLE])
+
+    [record] = _pending(queue)
+    assert 'unreadable' in record.summary
+    assert 'reply is not one JSON document' in record.detail
+    assert 'stat: invalid option -- c' in record.detail
+    assert 'reap-stamp.sh' in record.detail
+
+
+def test_an_unreadable_reply_and_a_stale_stamp_make_one_streak(queue: EscalationQueue):
+    _feed(_watch(queue), [_JUST_REAPED, _UNREADABLE, _NEVER_REAPED])
+
+    assert len(_pending(queue)) == 1
+
+
+def test_a_failing_escalation_queue_is_logged_never_raised(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture,
+):
+    watch = _watch(_FailingQueue(tmp_path / 'escalations'))
+
+    with caplog.at_level(logging.ERROR, logger='orchestrator.merge_lane'):
+        _feed(watch, [_NEVER_REAPED] * 3 + [_JUST_REAPED])
+
+    failures = [r for r in caplog.records if r.exc_info and 'escalation queue failed' in r.getMessage()]
+    assert len(failures) == 2
+
+
+def test_a_failed_alarm_is_filed_at_the_next_miss(tmp_path: Path):
+    real = EscalationQueue(tmp_path / 'escalations')
+    queues: list[EscalationQueue] = [_FailingQueue(tmp_path / 'broken'), real]
+    watch = GateReaperWatch(escalation_queue=lambda: queues[0])
+
+    _feed(watch, [_NEVER_REAPED] * 3)
+    queues.pop(0)
+    _feed(watch, [_NEVER_REAPED], start_hour=3)
+
+    assert len(_pending(real)) == 1
 
 
 def test_an_unmarked_root_never_files(queue: EscalationQueue):

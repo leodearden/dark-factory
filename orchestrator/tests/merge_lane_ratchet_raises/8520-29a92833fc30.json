@@ -1,0 +1,18 @@
+{
+  "task_id": "8520",
+  "reason": "Net-additive review amendments for task 8520: GateReaperWatch gains a third reading kind, ReapStampUnreadable (a host reply that does not parse now counts as a miss instead of vanishing as None), and its two isinstance checks in _last_run_text and _unreadable_text add cognitive 2. The new _on_queue fault isolation of escalation-queue calls nets 0: its except and None check replace the None checks _resolve and _alarm each carried. No other path or function rose; host_quarantine.py and HostQuarantine::_reap_idle_gates are unchanged.",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/gate_reaper_watch.py",
+      "baseline": 10,
+      "current": 12
+    },
+    {
+      "measure": "total:cognitive",
+      "key": "<cluster>",
+      "baseline": 5424,
+      "current": 5426
+    }
+  ]
+}

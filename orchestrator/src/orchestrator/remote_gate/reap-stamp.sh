@@ -10,6 +10,9 @@
 # age_secs is null when no run has completed there (no .last-reap). The age is
 # this host's clock minus the stamp's mtime on this host, so the dispatcher's
 # clock never enters.
+#
+# The names must match remote_gate.py::REAP_STAMP (.last-reap, which
+# reap-gates.sh touches) and remote_gate.py::GATE_ROOT_MARKER.
 set -euo pipefail
 
 [[ ${GATE_ROOT:-} == /* ]] || {

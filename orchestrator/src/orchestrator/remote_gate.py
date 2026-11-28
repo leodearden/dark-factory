@@ -131,6 +131,26 @@ class ReapStamp:
         return not self.gate_root or (self.age_secs is not None and self.age_secs <= secs)
 
 
+@dataclass(frozen=True)
+class ReapStampUnreadable:
+    """A reading of the reap stamp at ``path`` whose reply is not reap-stamp.sh's.
+
+    ``error`` is :func:`parse_reap_stamp`'s complaint; ``stderr`` is the ssh
+    round trip's, where a failing probe's own message lands.
+    """
+
+    path: str
+    error: str
+    stderr: str
+
+    def shows_a_run_within(self, secs: float) -> bool:
+        """Never: a reply that cannot be read shows no completed run."""
+        return False
+
+
+ReapReading = ReapStamp | ReapStampUnreadable
+
+
 _WIRE_METADATA_KEY = 'df_wire'
 
 _FieldValue = typing.TypeVar('_FieldValue')

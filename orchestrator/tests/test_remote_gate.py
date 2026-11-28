@@ -17,6 +17,7 @@ import contextlib
 import dataclasses
 import fcntl
 import json
+import math
 import os
 import shlex
 import shutil
@@ -51,6 +52,7 @@ from orchestrator.remote_gate import (
     GateIdentityPair,
     GateReplyError,
     ReapStamp,
+    ReapStampUnreadable,
     classify_remote_exit,
     ensure_script_text,
     local_gate_identity,
@@ -1835,9 +1837,21 @@ async def test_reap_idle_gates_launches_the_reaper_detached():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('reply', [(255, '', 'unreachable'), OSError('no ssh'), (0, 'not json', '')])
-async def test_reap_idle_gates_never_raises(reply):
+@pytest.mark.parametrize('reply', [(255, '', 'unreachable'), OSError('no ssh')])
+async def test_a_reap_launch_that_never_reached_the_host_reads_none(reply):
     assert await _scripted_runner(_Scripted(reap=reply)).reap_idle_gates() is None
+
+
+@pytest.mark.asyncio
+async def test_a_reap_stamp_reply_that_does_not_parse_reads_unreadable_with_sshs_stderr():
+    transport = _Scripted(reap=(0, '', 'stat: invalid option -- c\n'))
+
+    reading = await _scripted_runner(transport).reap_idle_gates()
+
+    assert isinstance(reading, ReapStampUnreadable)
+    assert reading.path == '/gates/.last-reap'
+    assert reading.stderr == 'stat: invalid option -- c\n'
+    assert not reading.shows_a_run_within(math.inf)
 
 
 @pytest.mark.asyncio
@@ -1860,6 +1874,6 @@ async def test_reap_idle_gates_reads_the_stamp_of_the_run_it_launched_before(
     first_run = stamp.stat().st_mtime_ns
     second = await runner.reap_idle_gates()
 
-    assert second is not None and second.gate_root
+    assert isinstance(second, ReapStamp) and second.gate_root
     assert second.age_secs is not None and 0 <= second.age_secs <= 30
     assert await asyncio.to_thread(_holds_within, lambda: stamp.stat().st_mtime_ns > first_run, 10)

@@ -75,7 +75,8 @@ from orchestrator.remote_gate import (
     EnsureReport,
     GateIdentityPair,
     GateReplyError,
-    ReapStamp,
+    ReapReading,
+    ReapStampUnreadable,
     RunnerUnavailableKind,
     classify_remote_exit,
     ensure_script_text,
@@ -1704,14 +1705,16 @@ class RemoteRunner:
             await asyncio.sleep(_REFUSED_PUSH_RETRY_DELAY_SECS)
             await self._push(target, refspec, cwd=self._code_checkout)
 
-    async def reap_idle_gates(self) -> ReapStamp | None:
+    async def reap_idle_gates(self) -> ReapReading | None:
         """Read the remote's reap stamp, then launch ``remote_gate/reap-gates.sh`` detached; never raises.
 
         Both happen in one ssh round trip, the stamp probe first, so the
         reading is of the run the PREVIOUS launch started.  Only the launch is
         awaited: the script runs on after ssh returns, so no lease or verify
-        ever waits on it.  None means the launch or the reading failed; it is
-        logged and the caller's next periodic call retries.
+        ever waits on it.  None means the round trip itself failed, so the host
+        gave no reply.  ssh's exit status is the launch's, not the probe's, so
+        a probe that failed shows only as a reply that does not parse: that is
+        a :class:`ReapStampUnreadable` carrying ssh's stderr.  Both are logged.
         """
         probe = self._gate_root_command(reap_stamp_script_text(), 'reap-stamp')
         script = self._gate_root_command(reap_script_text(), 'reap-gates')
@@ -1729,11 +1732,15 @@ class RemoteRunner:
                 'RemoteRunner %r: gate reaper launch exited %d: %s', self.name, rc, stderr,
             )
             return None
+        path = posixpath.join(self._gate_root, REAP_STAMP)
         try:
-            return parse_reap_stamp(stdout, path=posixpath.join(self._gate_root, REAP_STAMP))
+            return parse_reap_stamp(stdout, path=path)
         except GateReplyError as exc:
-            logger.warning('RemoteRunner %r: gate reap stamp unreadable: %s', self.name, exc)
-            return None
+            logger.warning(
+                'RemoteRunner %r: gate reap stamp unreadable: %s; ssh stderr: %s',
+                self.name, exc, stderr.strip() or '(empty)',
+            )
+            return ReapStampUnreadable(path=path, error=str(exc), stderr=stderr)
 
     def _gate_root_command(self, script_text: str, name: str) -> str:
         """The remote words running *script_text* as ``$0`` *name* against this runner's gate root."""

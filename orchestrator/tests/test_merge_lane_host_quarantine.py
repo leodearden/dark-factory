@@ -295,6 +295,25 @@ async def test_the_sweep_files_an_l1_when_a_hosts_gate_reaper_stops_completing_r
     assert scene.escalations.get_by_task('__gate_reaper_stale__laptop', status='pending') == []
 
 
+class _UnwritableEscalations(EscalationQueue):
+    def has_open_l1(self, *_: Any, **__: Any) -> bool:
+        raise OSError('escalation store unwritable')
+
+
+@pytest.mark.asyncio
+async def test_a_failing_gate_reaper_alarm_costs_no_other_host_its_reap(tmp_path: Path) -> None:
+    scene = _Scene(tmp_path, hosts=(_HOST, _OTHER))
+    scene.escalations = _UnwritableEscalations(tmp_path / 'unwritable')
+    for remote in scene.remotes.values():
+        remote.reap_reading = ReapStamp(path='/gates/.last-reap', gate_root=True, age_secs=None)
+
+    await scene.sweep()
+    for _ in range(2):
+        await scene.sweep(advance=HostQuarantine.GATE_REAP_INTERVAL_SECS)
+
+    assert (scene.remotes[_HOST].reaps, scene.remotes[_OTHER].reaps) == (3, 3)
+
+
 # ---------------------------------------------------------------------------
 # (d) The sticky skew bench
 # ---------------------------------------------------------------------------
