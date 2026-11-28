@@ -31,6 +31,8 @@ NOW = datetime(2026, 9, 26, 5, 30, tzinfo=UTC)
 WINDOW = mod.Window(NOW - timedelta(days=1), NOW)
 IN_WINDOW = '2026-09-25T18:00:00+00:00'
 BEFORE_WINDOW = '2026-09-20T18:00:00+00:00'
+THREE_DAYS_AGO = (NOW - timedelta(days=3)).isoformat()
+TWENTY_DAYS_AGO = (NOW - timedelta(days=20)).isoformat()
 UNIT = 'orchestrator-dark-factory.service'
 NO_UNITS = mod.OrchestratorUnits(
     scan=orchestrator_projects.UnitScan(roots={}, problems=()), active_state=lambda _unit: 'inactive')
@@ -573,23 +575,60 @@ class TestPreparerTrial:
 
         trial = measurement.value
         assert measurement.status == 'ok'
-        assert (trial.n, trial.denominator, trial.numerator) == (5, 3, 2)
-        assert trial.rate == pytest.approx(2 / 3)
-        assert (trial.no_lean, trial.unanswered, trial.rejected) == (1, 1, 2)
+        trailing = trial.trailing
+        assert (trailing.n, trailing.denominator, trailing.numerator) == (6, 4, 3)
+        assert trailing.rate == pytest.approx(3 / 4)
+        assert (trailing.no_lean, trailing.unanswered, trailing.rejected) == (1, 1, 2)
+        assert trial.lifetime == trailing
 
     def test_resolution_turns_distribution_over_resolved_l2s_in_the_window(self, queue):
         turns = mod.preparer_trial([str(queue)], WINDOW, now=NOW).value.resolution_turns
 
         assert (turns.resolved, turns.with_turns, turns.median, turns.total) == (8, 4, 2.5, 11)
 
-    def test_an_empty_window_has_no_rate_rather_than_zero(self, tmp_path):
+    def test_a_record_resolved_three_days_ago_counts_in_the_trailing_and_lifetime_agreement_not_the_turns(
+        self, tmp_path,
+    ):
         queue = tmp_path / 'data' / 'escalations'
-        queue.mkdir(parents=True)
+        _resolved(queue, 'esc-1-1', resolved_at=THREE_DAYS_AGO,
+                  triage_note=_note(_prepared('A'), _agreed('A', True)), resolution_turns=4)
 
         trial = mod.preparer_trial([str(queue)], WINDOW, now=NOW).value
 
-        assert (trial.n, trial.denominator, trial.rate) == (0, 0, None)
-        assert (trial.resolution_turns.with_turns, trial.resolution_turns.median) == (0, None)
+        assert (trial.trailing.n, trial.trailing.numerator, trial.trailing.denominator) == (1, 1, 1)
+        assert (trial.lifetime.n, trial.lifetime.numerator, trial.lifetime.denominator) == (1, 1, 1)
+        turns = trial.resolution_turns
+        assert (turns.resolved, turns.with_turns, turns.median, turns.total) == (0, 0, None, 0)
+
+    def test_a_record_resolved_twenty_days_ago_counts_in_lifetime_only(self, tmp_path):
+        queue = tmp_path / 'data' / 'escalations'
+        _resolved(queue, 'esc-1-1', resolved_at=TWENTY_DAYS_AGO,
+                  triage_note=_note(_prepared('A'), _agreed('A', True)))
+
+        trial = mod.preparer_trial([str(queue)], WINDOW, now=NOW).value
+
+        assert (trial.trailing.n, trial.trailing.denominator, trial.trailing.rate) == (0, 0, None)
+        assert (trial.lifetime.n, trial.lifetime.numerator, trial.lifetime.denominator) == (1, 1, 1)
+
+    def test_a_resolved_record_with_no_parsable_resolved_at_counts_in_lifetime_only(self, tmp_path):
+        queue = tmp_path / 'data' / 'escalations'
+        _resolved(queue, 'esc-1-1', resolved_at='', triage_note=_note(_prepared('A'), _agreed('A', True)))
+
+        trial = mod.preparer_trial([str(queue)], WINDOW, now=NOW).value
+
+        assert trial.trailing.n == 0
+        assert trial.lifetime.n == 1
+
+    def test_a_queue_with_no_marker_stamped_record_reads_zero_of_zero_in_both_windows(self, tmp_path):
+        queue = tmp_path / 'data' / 'escalations'
+        _resolved(queue, 'esc-1-1', resolution_turns=2)
+        _resolved(queue, 'esc-2-1', resolved_at=TWENTY_DAYS_AGO)
+
+        measurement = mod.preparer_trial([str(queue)], WINDOW, now=NOW)
+
+        assert measurement.status == 'ok'
+        for agreement in (measurement.value.trailing, measurement.value.lifetime):
+            assert (agreement.n, agreement.denominator, agreement.rate) == (0, 0, None)
 
     def test_no_existing_queue_is_flagged(self, tmp_path):
         measurement = mod.preparer_trial([str(tmp_path / 'nowhere')], WINDOW, now=NOW)
