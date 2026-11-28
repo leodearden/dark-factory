@@ -553,8 +553,9 @@ calls are queue-file writes, so in-flight requests finish well inside it."""
 
 _ESCALATION_SERVER_STOP_BOUND_SECS = 2 * _ESCALATION_SERVER_GRACE_SECS
 """How long :meth:`ReconciliationHarness._stop_escalation_server` waits for a
-clean uvicorn shutdown before cancelling; well inside
-``fused_memory/server/main.py::_HARNESS_CANCEL_TIMEOUT``."""
+clean uvicorn shutdown before cancelling; it must stay below
+``fused_memory/server/main.py::_HARNESS_CANCEL_TIMEOUT``, as
+``fused-memory/tests/reconciliation/test_escalation_server_lifecycle.py`` pins."""
 
 
 class UnknownProjectError(ValueError):
@@ -2603,29 +2604,37 @@ class ReconciliationHarness:
         escalation_url = f'http://{host}:{port}/mcp'
         self._escalation_url = escalation_url
 
-    async def _stop_escalation_server(self) -> None:
+    async def _stop_escalation_server(
+        self, *, stop_bound_secs: float = _ESCALATION_SERVER_STOP_BOUND_SECS
+    ) -> None:
         """Stop the escalation server: a started one through uvicorn's own shutdown, otherwise by cancelling it.
 
         Cancelling a live uvicorn server leaves its lifespan pending, which
-        logs a CancelledError traceback at loop teardown.
+        logs a CancelledError traceback at loop teardown. A started server
+        still running after *stop_bound_secs*, or when this stop is itself
+        cancelled, is cancelled.
         """
         task, server = self._escalation_task, self._escalation_server
         if task is None:
             return
+        self._escalation_task = None
+        self._escalation_server = None
         if server is not None and server.started:
             server.should_exit = True
-            await asyncio.wait({task}, timeout=_ESCALATION_SERVER_STOP_BOUND_SECS)
+            try:
+                await asyncio.wait({task}, timeout=stop_bound_secs)
+            except asyncio.CancelledError:
+                task.cancel()
+                raise
             if not task.done():
                 logger.warning(
-                    'Reconciliation escalation server did not shut down within %d s; cancelling it',
-                    _ESCALATION_SERVER_STOP_BOUND_SECS,
+                    'Reconciliation escalation server did not shut down within %s s; cancelling it',
+                    stop_bound_secs,
                 )
         if not task.done():
             task.cancel()
             with suppress(asyncio.CancelledError):
                 await task
-        self._escalation_task = None
-        self._escalation_server = None
         logger.info('Reconciliation escalation server stopped')
 
     async def _shutdown_usage_gate(self) -> None:
