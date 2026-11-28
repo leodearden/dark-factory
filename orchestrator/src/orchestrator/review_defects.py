@@ -65,6 +65,15 @@ def _summary(location: str, description: str, reviewer: str) -> str:
     )
 
 
+def _is_defect(issue: Mapping[str, object]) -> bool:
+    return issue_kind_of(issue).kind is IssueKind.DEFECT
+
+
+def reports_a_defect(blocking_issues: Sequence[Mapping[str, object]]) -> bool:
+    """Whether any of a round's blocking issues reads as ``kind=defect`` (fail-closed)."""
+    return any(_is_defect(issue) for issue in blocking_issues)
+
+
 def review_defect_declarations(
     task_id: int,
     blocking_issues: Sequence[Mapping[str, object]],
@@ -80,7 +89,7 @@ def review_defect_declarations(
     seen = set(known_refs)
     events: list[Declare | Sighting] = []
     for issue in blocking_issues:
-        if issue_kind_of(issue).kind is not IssueKind.DEFECT:
+        if not _is_defect(issue):
             continue
         location = _text(issue, IssueField.LOCATION)
         description = _text(issue, IssueField.DESCRIPTION)

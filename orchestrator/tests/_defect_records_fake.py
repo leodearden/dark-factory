@@ -16,7 +16,7 @@ from collections.abc import Callable
 from typing import Any
 
 from _orch_helpers import mcp_tool_envelope
-from pydantic import BaseModel, ValidationError
+from pydantic import ValidationError
 from shared.defects import (
     DEFECT_TEST_RETIREMENTS_METADATA_KEY,
     DEFECTS_METADATA_KEY,
@@ -59,10 +59,16 @@ def _is_retirement_event(event: object) -> bool:
     )
 
 
+_Record = DefectDeclaration | Retirement
+
+
 def _folded(
-    stored: list[Any], model: type[BaseModel], event: Any, apply: Callable[[Any, Any], BaseModel],
+    stored: list[Any],
+    model: type[DefectDeclaration] | type[Retirement],
+    event: Any,
+    apply: Callable[[Any, Any], _Record],
 ) -> list[dict[str, Any]]:
-    records = [model.model_validate(entry) for entry in stored]
+    records: list[_Record] = [model.model_validate(entry) for entry in stored]
     index = next((i for i, record in enumerate(records) if record.ref == event.ref), None)
     try:
         updated = apply(None if index is None else records[index], event)

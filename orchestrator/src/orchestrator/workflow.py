@@ -211,6 +211,13 @@ from orchestrator.resume_resolution import (
     render_issue_context,
     select_carried_resolutions,
 )
+from orchestrator.review_defects import (
+    declared_refs,
+    reports_a_defect,
+    review_defect_declarations,
+    send_defect_events,
+    with_live_defect_records,
+)
 from orchestrator.review_inputs import gather_review_subject
 from orchestrator.review_lineage import (
     RetiredReview,
@@ -9471,6 +9478,7 @@ class TaskWorkflow:
                     shutil.copytree(reviews_dir, archive_dir)
                     logger.info('Task %s: archived reviews to %s', self.task_id, archive_dir.name)
 
+            await self._declare_review_defects(reviews)
             if review_cycle >= self.config.max_review_cycles:
                 return await self._exit_review_cycles_exhausted(
                     reviews, used_ctx, amendment_round,
@@ -19575,6 +19583,44 @@ class TaskWorkflow:
             apply_reviewer_disposition(
                 note, ports, task_id=self.task_id, enabled=self.config.info_l0_router_enabled,
             )
+
+    async def _task_with_live_defect_records(self) -> dict:
+        """The dispatch task with its defect records as the store holds them now, else as dispatched."""
+        fresh: object = None
+        try:
+            fresh = await self.scheduler.get_task(self.task_id)
+            unreadable = None if isinstance(fresh, dict) else f'the read returned {type(fresh).__name__}'
+        except Exception as exc:
+            unreadable = f'{type(exc).__name__}: {exc}'
+        if unreadable is not None:
+            logger.warning(
+                'Task %s: could not re-read its defect records (%s); using the dispatch snapshot',
+                self.task_id, unreadable,
+            )
+        return with_live_defect_records(self.task, fresh)
+
+    async def _declare_review_defects(self, reviews: ReviewAggregation) -> None:
+        """Declare the round's blocking ``kind=defect`` issues on the task (PRD decision 16, B6)."""
+        if not reports_a_defect(reviews.blocking_issues):
+            return
+        task_number = int(self.task_id) if self.task_id.isdecimal() else 0
+        if task_number < 1:
+            logger.warning(
+                'Task %s: no review defect ref can be minted for a non-numeric task id; '
+                'its blocking defects are not declared', self.task_id,
+            )
+            return
+        live = await self._task_with_live_defect_records()
+        metadata = live.get('metadata')
+        events = review_defect_declarations(
+            task_number, reviews.blocking_issues,
+            known_refs=declared_refs(metadata if isinstance(metadata, dict) else {}),
+            declared_at=datetime.now(UTC),
+        )
+        await send_defect_events(
+            self.scheduler.dispatch_tool, project_root=str(self.config.project_root),
+            task_id=self.task_id, events=events,
+        )
 
     def _steward_work_outstanding(self) -> bool:
         """Whether there is anything for :meth:`_await_steward_completion` to
