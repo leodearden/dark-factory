@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, Protocol
@@ -174,9 +174,6 @@ class MainFixTaskStore(Protocol):
     async def grant_main_health_fix_precedence(self, task_id: str) -> int | None: ...
 
 
-GrantPrecedence = Callable[[str], Awaitable[None]]
-
-
 class MainFixTaskFiler:
     """Ensures one open fix-main task per signature.
 
@@ -202,28 +199,31 @@ class MainFixTaskFiler:
 
         Never raises.  A failed lookup files nothing: an unreadable store is
         not evidence that no owner exists, and the next break retries.
+        Precedence is granted here and only here, to an owner whose last-read
+        status is pending: the one owner the scheduler can dispatch next.
         """
         sig = brk.signature
         tasks = SchedulerChronicFlakeTaskClient(self._store, project_root)
         async with self._locks.setdefault(sig, asyncio.Lock()):
-            async def grant(task_id: str) -> None:
-                await self._grant_precedence(task_id, sig)
-
             try:
                 hit = await self._find_open(sig, project_root)
                 if hit is not None:
-                    return await _adopt(tasks, sig, *hit, grant=grant)
-                arguments = build_main_fix_task_arguments(
-                    brk, project_root=project_root,
-                    spawn_context=spawn_context, escalation_id=escalation_id,
-                )
-                return await _file(tasks, sig, arguments, spawn_context, grant=grant)
+                    owner, status = await _adopt(tasks, sig, *hit)
+                else:
+                    arguments = build_main_fix_task_arguments(
+                        brk, project_root=project_root,
+                        spawn_context=spawn_context, escalation_id=escalation_id,
+                    )
+                    owner, status = await _file(tasks, sig, arguments, spawn_context)
             except Exception:
                 logger.warning(
                     'main-health fix owner: could not ensure a fix-main task for '
                     'signature %s', sig, exc_info=True,
                 )
                 return FixOwner(sig)
+            if owner.task_id is not None and status == TaskStatus.PENDING:
+                await self._grant_precedence(owner.task_id, sig)
+            return owner
 
     async def _grant_precedence(self, task_id: str, sig: str) -> None:
         """Pin *task_id* at the queue head; a failure is logged and never reaches ``ensure``'s handler."""
@@ -258,38 +258,36 @@ async def _file(
     sig: str,
     arguments: dict,
     spawn_context: FixSpawnContext,
-    *,
-    grant: GrantPrecedence,
-) -> FixOwner:
+) -> tuple[FixOwner, str | None]:
+    """File the owner for *sig*; return it with its status as last read.
+
+    The commit of a filed task can fail without raising, leaving it
+    ``deferred``, so its status is read back rather than assumed.
+    """
     outcome = await tasks.submit_task({**arguments, 'planning_mode': True})
     match outcome:
         case SubmittedTask(task_id=task_id, combined=False):
             await tasks.commit_planning([task_id])
-            await grant(task_id)
-            return FixOwner(sig, task_id, filed=True, spawn_context=spawn_context)
+            owner = FixOwner(sig, task_id, filed=True, spawn_context=spawn_context)
+            return owner, await _read_status(tasks, task_id)
         case SubmittedTask(task_id=task_id, status=status) if (
             status is not None and status not in TERMINAL
         ):
-            if status == TaskStatus.PENDING:
-                await grant(task_id)
-            return FixOwner(sig, task_id)
+            return FixOwner(sig, task_id), status
     logger.warning(
         'main-health fix owner: filing a fix-main task for signature %s did '
         'not yield an open task: %r', sig, outcome,
     )
-    return FixOwner(sig)
+    return FixOwner(sig), None
 
 
 async def _adopt(
     tasks: SchedulerChronicFlakeTaskClient, sig: str, task_id: str, status: str,
-    *,
-    grant: GrantPrecedence,
-) -> FixOwner:
+) -> tuple[FixOwner, str | None]:
     """Adopt the open owner *task_id*, releasing it first when it is half-filed.
 
-    Precedence is granted only to an owner the scheduler can dispatch next: a
-    pending one, or a half-filed one once a re-read shows the re-run commit
-    released it.
+    Returns the owner with its status as last read: the looked-up one, or,
+    for a half-filed owner, the one read back after its commit is re-run.
 
     A ``deferred`` owner this filer created is the ``deferred`` arm of
     ``orchestrator/src/orchestrator/flake_ledger.py::_ensure_owner_task``: its
@@ -299,30 +297,25 @@ async def _adopt(
     any hold but the planning one it stamped at birth
     (``fused-memory/src/fused_memory/middleware/deferral_gate.py::_not_planning_refusal``).
     """
-    if status == TaskStatus.PENDING:
-        await grant(task_id)
     task, read_error = await tasks.get_task(task_id)
     if task is None:
         logger.warning(
             'main-health fix owner: could not read owner %s (%s); adopting it '
             'unread', task_id, read_error,
         )
-        return FixOwner(sig, task_id)
+        return FixOwner(sig, task_id), status
     spawn_context = _spawn_context_of(task)
     if spawn_context is not None and owner_liveness(status) is OwnerLiveness.DEFERRED:
         logger.info('main-health fix owner: completing the half-filed task %s', task_id)
         await tasks.commit_planning([task_id])
-        await _grant_if_released(tasks, task_id, grant)
-    return FixOwner(sig, task_id, spawn_context=spawn_context)
+        status = await _read_status(tasks, task_id)
+    return FixOwner(sig, task_id, spawn_context=spawn_context), status
 
 
-async def _grant_if_released(
-    tasks: SchedulerChronicFlakeTaskClient, task_id: str, grant: GrantPrecedence,
-) -> None:
-    """Grant *task_id* once it reads back pending; a refused commit leaves a hand carry deferred and ungranted."""
+async def _read_status(tasks: SchedulerChronicFlakeTaskClient, task_id: str) -> str | None:
+    """*task_id*'s status as read now, or ``None`` when the read fails."""
     task, _read_error = await tasks.get_task(task_id)
-    if task is not None and task.get('status') == TaskStatus.PENDING:
-        await grant(task_id)
+    return None if task is None else task.get('status')
 
 
 def _spawn_context_of(task: dict) -> FixSpawnContext | None:

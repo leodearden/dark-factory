@@ -85,6 +85,7 @@ class FakeTaskStore:
         self.submit_fails = submit_fails
         self.commit_fails = commit_fails
         self.grant_fails = grant_fails
+        self.combine_into: str | None = None
 
     def add(self, *, status: str, metadata: dict) -> str:
         task_id = str(9000 + len(self.tasks))
@@ -135,6 +136,8 @@ class FakeTaskStore:
         self.submits.append(arguments)
         if self.submit_fails:
             return SubmitFailed('submit refused')
+        if self.combine_into is not None:
+            return SubmittedTask(self.combine_into, self.tasks[self.combine_into]['status'], combined=True)
         if arguments.get('planning_mode'):
             metadata = {**arguments['metadata'], 'deferral': {'kind': 'planning'}}
             return SubmittedTask(self.add(status='deferred', metadata=metadata), 'deferred')
@@ -378,17 +381,32 @@ class TestMainFixTaskFiler:
 
         assert store.precedence_grants == ([(existing, 'pending')] if granted else [])
 
-    def test_a_half_filed_owner_is_granted_again_once_released(self) -> None:
+    def test_a_half_filed_owner_is_granted_only_once_released(self) -> None:
         store = FakeTaskStore(commit_fails=True)
         filer = MainFixTaskFiler(store)
         first = _ensure(store, TEST_BREAK, filer).task_id
         assert first is not None
-        assert store.precedence_grants == [(first, 'deferred')]
+        assert store.precedence_grants == []
         store.commit_fails = False
 
         _ensure(store, TEST_BREAK, filer)
 
-        assert store.precedence_grants == [(first, 'deferred'), (first, 'pending')]
+        assert store.precedence_grants == [(first, 'pending')]
+
+    @pytest.mark.parametrize(
+        ('status', 'granted'),
+        [('pending', True), ('in-progress', False), ('blocked', False)],
+    )
+    def test_an_owner_the_curator_combined_into_is_granted_only_when_pending(
+        self, status: str, granted: bool,
+    ) -> None:
+        store = FakeTaskStore()
+        store.combine_into = store.add(status=status, metadata={})
+
+        owner = _ensure(store, TEST_BREAK)
+
+        assert owner.task_id == store.combine_into and not owner.filed
+        assert store.precedence_grants == ([(owner.task_id, 'pending')] if granted else [])
 
     def test_a_hand_carried_deferral_is_not_granted_precedence(self) -> None:
         store = FakeTaskStore()
