@@ -5,16 +5,22 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 import pytest
+from _defect_ruling_fixtures import RULED_REF, SECOND_RULED_REF
 from shared.defects import (
     Declare,
     DefectOrigin,
     DefectStatus,
     IssueKind,
+    Rule,
+    RuledBy,
+    Ruling,
+    RulingSubject,
     Sighting,
     mint_review_ref,
 )
 
-from orchestrator.review_defects import review_defect_declarations
+from orchestrator.review_defects import review_defect_declarations, review_ruling_events
+from orchestrator.review_payload import DefectRuling
 
 TASK_NUMBER = 42
 REVIEWER = 'reviewer_comprehensive'
@@ -101,3 +107,68 @@ class TestReviewDefectDeclarations:
 
         assert isinstance(event, Declare)
         assert REVIEWER in event.declaration.summary
+
+
+VERDICT_CYCLE = 3
+
+
+def _reviewer_rule(ref: str, subject: RulingSubject, *, accepted: bool) -> Rule:
+    return Rule(ref=ref, ruling=Ruling(
+        subject=subject, accepted=accepted, ruled_by=RuledBy.REVIEWER, verdict_cycle=VERDICT_CYCLE,
+    ))
+
+
+def _rule_events(*rulings: DefectRuling) -> tuple[Rule, ...]:
+    return review_ruling_events(rulings, verdict_cycle=VERDICT_CYCLE)
+
+
+class TestReviewRulingEvents:
+    def test_an_accepted_closure_ruling_is_one_reviewer_rule(self):
+        assert _rule_events(DefectRuling(RULED_REF, RulingSubject.CLOSURE, True)) == (
+            _reviewer_rule(RULED_REF, RulingSubject.CLOSURE, accepted=True),
+        )
+
+    def test_a_retirement_ruling_keeps_its_subject(self):
+        assert _rule_events(DefectRuling(RULED_REF, RulingSubject.RETIREMENT, True)) == (
+            _reviewer_rule(RULED_REF, RulingSubject.RETIREMENT, accepted=True),
+        )
+
+    def test_a_split_panel_rejects(self):
+        events = _rule_events(
+            DefectRuling(RULED_REF, RulingSubject.CLOSURE, True),
+            DefectRuling(RULED_REF, RulingSubject.CLOSURE, False),
+        )
+
+        assert events == (_reviewer_rule(RULED_REF, RulingSubject.CLOSURE, accepted=False),)
+
+    def test_a_unanimous_panel_accepts_once(self):
+        events = _rule_events(
+            DefectRuling(RULED_REF, RulingSubject.CLOSURE, True),
+            DefectRuling(RULED_REF, RulingSubject.CLOSURE, True),
+        )
+
+        assert events == (_reviewer_rule(RULED_REF, RulingSubject.CLOSURE, accepted=True),)
+
+    def test_one_ref_ruled_on_both_subjects_is_two_rules(self):
+        events = _rule_events(
+            DefectRuling(RULED_REF, RulingSubject.CLOSURE, True),
+            DefectRuling(RULED_REF, RulingSubject.RETIREMENT, False),
+        )
+
+        assert events == (
+            _reviewer_rule(RULED_REF, RulingSubject.CLOSURE, accepted=True),
+            _reviewer_rule(RULED_REF, RulingSubject.RETIREMENT, accepted=False),
+        )
+
+    def test_rules_come_in_order_of_first_appearance(self):
+        events = _rule_events(
+            DefectRuling(SECOND_RULED_REF, RulingSubject.CLOSURE, True),
+            DefectRuling(RULED_REF, RulingSubject.CLOSURE, True),
+            DefectRuling(SECOND_RULED_REF, RulingSubject.CLOSURE, False),
+        )
+
+        assert [event.ref for event in events] == [SECOND_RULED_REF, RULED_REF]
+        assert [event.ruling.accepted for event in events] == [False, True]
+
+    def test_no_rulings_is_no_rules(self):
+        assert _rule_events() == ()
