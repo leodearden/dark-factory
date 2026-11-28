@@ -1288,10 +1288,10 @@ class TestRepairPlanFieldsTrailing:
         assert facts == [
             {
                 'tool': 'add_design_decision',
-                # add_design_decision is the ONLY writer of this field, so the
-                # fact claims no alternates. Where a field has more than one
-                # writer the fact says so rather than overstating its precision.
-                'also_written_by': [],
+                # supersede_design_decision rewrites this field in place too
+                # (task 3865), so the fact names it rather than overstating
+                # its precision.
+                'also_written_by': ['supersede_design_decision'],
                 'param': 'rationale',
                 'pattern': closer('rationale'),
                 'misclose': closer('rationale'),

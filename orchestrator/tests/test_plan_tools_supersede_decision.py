@@ -41,7 +41,7 @@ def _seed_plan(artifacts: TaskArtifacts) -> None:
     _add_design_decision(artifacts, *_SECOND)
 
 
-def _supersede(artifacts: TaskArtifacts, decision_index: object = 1, **overrides) -> dict:
+def _supersede(artifacts: TaskArtifacts, decision_index: int = 1, **overrides) -> dict:
     arguments = {
         'decision': _NEW_DECISION,
         'rationale': _NEW_RATIONALE,
