@@ -4207,10 +4207,17 @@ class OrchestratorConfig(BaseSettings):
     # (that dir is preserved for forensics regardless of this flag).
     recycle_config_dir_on_zero_output: bool = Field(default=True)
 
-    # Completion judge — opt-in loop-exit hint after each implementer iteration.
-    # Default False: production orchestrator runs unaffected. Eval runner
-    # enables this per-task (see evals/runner.py build_eval_orch_config).
-    judge_after_each_iteration: bool = Field(default=False)
+    judge_after_each_iteration: bool = Field(
+        default=False,
+        description=(
+            'Run the completion judge (role judge) after each implementer iteration; '
+            'a verdict of complete with substantive work ends EXECUTE early. '
+            'Evals only: production leaves it False, and '
+            'orchestrator/src/orchestrator/evals/runner.py::build_eval_orch_config '
+            'turns it on for every eval run, shadow cells included, unless the '
+            'fixture sets it False (task 5377).'
+        ),
+    )
 
     # Merge conflict reduction
     max_advance_attempts: int = Field(default=3)
