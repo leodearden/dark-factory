@@ -122,6 +122,7 @@ from orchestrator.completion_record import completion_record_metadata
 from orchestrator.config import EscalationConfig, ModuleConfig, OrchestratorConfig
 from orchestrator.curator_submit import SubmitBatchResult, submit_task_batch
 from orchestrator.decision_note import decision_note_fields
+from orchestrator.defect_records import awaits_a_ruling
 from orchestrator.delivered_checks import (
     DeliveredChecksBlock,
     gate_mark_done_on_delivered_checks,
@@ -9274,6 +9275,9 @@ class TaskWorkflow:
             # review rather than short-circuit to a stale verdict the new
             # config never produced.
             #
+            # Nor is a hit honoured while a defect closure or retirement on
+            # the task awaits its ruling: only a review can rule on it.
+            #
             # Fail-safe: a None tree hash (git error), a None fingerprint
             # (config unreadable), or a cache miss / stale fingerprint all
             # fall through to a normal review — the strictest safe direction
@@ -9300,6 +9304,7 @@ class TaskWorkflow:
                             and review_fingerprint is not None
                             and cached.get('reviewer_fingerprint')
                             == review_fingerprint
+                            and not await self._defect_records_await_a_ruling()
                         ):
                             logger.info(
                                 'Task %s: REVIEW skipped — cached %s verdict '
@@ -19607,6 +19612,17 @@ class TaskWorkflow:
                 self.task_id, unreadable,
             )
         return with_live_defect_records(self.task, fresh)
+
+    async def _defect_records_await_a_ruling(self) -> bool:
+        """Whether the live task holds a defect closure or retirement that only a review can rule on (PRD B8, B23)."""
+        metadata = (await self._task_with_live_defect_records()).get('metadata')
+        awaiting = awaits_a_ruling(metadata if isinstance(metadata, dict) else {})
+        if awaiting:
+            logger.info(
+                'Task %s: a defect record awaits a reviewer ruling, so the cached verdict is not reused',
+                self.task_id,
+            )
+        return awaiting
 
     async def _apply_review_defect_rulings(
         self, reviews: ReviewAggregation, *, verdict_cycle: int,

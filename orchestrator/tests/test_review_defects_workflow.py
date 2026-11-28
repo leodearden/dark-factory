@@ -58,6 +58,7 @@ from shared.governed_exceptions import Debt, TicketRef
 
 from orchestrator.agents.review_briefing import ReviewBriefing, ReviewSubject
 from orchestrator.agents.roles import REVIEWER_COMPREHENSIVE
+from orchestrator.artifacts import TaskArtifacts
 from orchestrator.escalation_rulings import Ruling as EscalationRuling
 from orchestrator.review_defects import RECORD_DEFECT_OUTCOME_TOOL
 from orchestrator.scheduler import TaskAssignment
@@ -471,3 +472,99 @@ class _StoreDownUntilBriefed:
             self.refused_reads += 1
             raise OSError('store unreachable')
         return await self._read(task_id)
+
+
+
+async def _fingerprint_a_prior_dispatch_cached_under(tmp_path: Path, monkeypatch) -> str:
+    """Run the task once to DONE and return the reviewer-config fingerprint its review's verdict was cached under."""
+    root = tmp_path / 'prior-dispatch'
+    root.mkdir()
+    fingerprints: list[str | None] = []
+    record = TaskArtifacts.record_review_verdict
+
+    def spy(
+        artifacts: TaskArtifacts, tree_hash: str, verdict: str, suggestions_routed: bool,
+        reviewer_fingerprint: str | None = None,
+    ) -> None:
+        fingerprints.append(reviewer_fingerprint)
+        record(artifacts, tree_hash, verdict, suggestions_routed, reviewer_fingerprint)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(TaskArtifacts, 'record_review_verdict', spy)
+        prior = _DefectRun(root, patch, AgentStub(), max_review_cycles=2)
+        assert await prior.run() == WorkflowOutcome.DONE
+    (fingerprint,) = fingerprints
+    assert fingerprint is not None
+    return fingerprint
+
+
+class _VerifyAfterACachedPass:
+    """Passes verification, first caching a PASS for HEAD's tree under *fingerprint*, as a prior dispatch's review left it."""
+
+    def __init__(self, run: _DefectRun, fingerprint: str) -> None:
+        self._run = run
+        self._fingerprint = fingerprint
+
+    async def __call__(self, *_args, **_kwargs):
+        workflow = self._run.workflow
+        assert workflow.artifacts is not None and workflow.worktree is not None
+        tree_hash = await workflow.git_ops.get_head_tree_hash(workflow.worktree)
+        assert tree_hash is not None
+        workflow.artifacts.record_review_verdict(
+            tree_hash, 'PASS', suggestions_routed=False, reviewer_fingerprint=self._fingerprint,
+        )
+        return PASSED
+
+
+@pytest.mark.asyncio
+class TestACachedVerdictDefersToAPendingRuling:
+    """A re-dispatch on the tree a prior dispatch's review passed, under the same reviewer config."""
+
+    async def _redispatch(
+        self, tmp_path, monkeypatch, stub: AgentStub, *, defects: Sequence[DefectDeclaration] = (),
+        retirements: Sequence[Retirement] = (),
+    ) -> tuple[_DefectRun, _TaskRecordingBriefing]:
+        fingerprint = await _fingerprint_a_prior_dispatch_cached_under(tmp_path, monkeypatch)
+        run = _DefectRun(tmp_path, monkeypatch, stub, max_review_cycles=2)
+        recorder = _TaskRecordingBriefing()
+        run.workflow.briefing = recorder
+        run.seed(defects=defects, retirements=retirements)
+        monkeypatch.setattr(
+            'orchestrator.workflow.run_scoped_verification', _VerifyAfterACachedPass(run, fingerprint),
+        )
+        return run, recorder
+
+    async def test_with_nothing_awaiting_a_ruling_the_review_is_skipped(self, tmp_path, monkeypatch):
+        run, recorder = await self._redispatch(
+            tmp_path, monkeypatch, AgentStub(), defects=[_open_defect(RULED_REF)],
+        )
+
+        assert await run.run() == WorkflowOutcome.DONE
+
+        assert recorder.briefed_tasks == []
+
+    async def test_a_pending_closure_is_reviewed_and_ruled(self, tmp_path, monkeypatch):
+        run, recorder = await self._redispatch(
+            tmp_path, monkeypatch, _RulingReviewerStub([contract_ruling()]),
+            defects=[_exemption_awaiting_ruling(RULED_REF)],
+        )
+
+        assert await run.run() == WorkflowOutcome.DONE
+
+        assert recorder.briefed_tasks
+        (entry,) = await run.defects()
+        assert entry.status is DefectStatus.EXEMPTED
+        assert entry.ruling == _reviewer_ruling(RulingSubject.CLOSURE, accepted=True, verdict_cycle=1)
+
+    async def test_a_pending_retirement_is_reviewed_and_ruled(self, tmp_path, monkeypatch):
+        ruling = contract_ruling(ref=SECOND_RULED_REF, subject=RulingSubject.RETIREMENT.value)
+        run, recorder = await self._redispatch(
+            tmp_path, monkeypatch, _RulingReviewerStub([ruling]),
+            retirements=[_retirement_awaiting_ruling(SECOND_RULED_REF)],
+        )
+
+        assert await run.run() == WorkflowOutcome.DONE
+
+        assert recorder.briefed_tasks
+        (record,) = await run.retirements()
+        assert record.state is RetirementState.ACCEPTED
