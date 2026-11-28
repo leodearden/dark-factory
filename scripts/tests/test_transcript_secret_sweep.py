@@ -16,6 +16,7 @@ import json
 import os
 import shutil
 import stat
+import tempfile
 import xml.etree.ElementTree as ET
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -351,9 +352,12 @@ def test_a_verify_hosts_transcript_archive_is_not_required(tree, tmp_path):
     assert [t.root for t in trees].count(verify_logs_dir(tree.project_a)) == 1
 
 
-def test_the_pytest_base_temp_is_the_one_this_pytest_run_uses(request, tmp_path_factory):
+def test_the_pytest_base_temp_is_the_one_this_pytest_run_uses(request, tmp_path_factory, monkeypatch):
     if request.config.getoption('basetemp') or os.environ.get('PYTEST_DEBUG_TEMPROOT'):
         pytest.skip('an explicit --basetemp or PYTEST_DEBUG_TEMPROOT moves this run off the per-user default')
+
+    # Undo scripts/tests/conftest.py::private_tempdir: pytest chose its basetemp from the real TMPDIR-or-/tmp root.
+    monkeypatch.setattr(tempfile, 'tempdir', None)
 
     assert sweep.pytest_base_temp().resolve() in tmp_path_factory.getbasetemp().parents
 
