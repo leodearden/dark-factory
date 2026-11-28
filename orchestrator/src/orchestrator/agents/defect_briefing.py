@@ -4,14 +4,13 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping, Sequence
 from enum import StrEnum
+from functools import partial
 from typing import Any
 
-from pydantic import ValidationError
 from shared.defects import (
     DEFECT_TEST_RETIREMENTS_METADATA_KEY,
     DEFECTS_METADATA_KEY,
     DefectDeclaration,
-    DefectStatus,
     Exemption,
     Retirement,
     RulingSubject,
@@ -20,6 +19,7 @@ from shared.defects import (
 from shared.governed_exceptions import TaskRef, TicketRef
 
 from orchestrator.agents.metadata_list_block import MetadataListBlock
+from orchestrator.defect_records import closures_awaiting_ruling, parse_record
 
 _DECLARED_DEFECTS_BLOCK = MetadataListBlock(
     title='Declared Defects',
@@ -54,20 +54,6 @@ _RETIREMENTS_BLOCK = MetadataListBlock(
 DEFECT_TEST_RETIREMENTS_HEADING = _RETIREMENTS_BLOCK.heading
 
 
-def _parse(entry: object) -> DefectDeclaration | None:
-    try:
-        return DefectDeclaration.model_validate(entry)
-    except ValidationError:
-        return None
-
-
-def _parse_retirement(entry: object) -> Retirement | None:
-    try:
-        return Retirement.model_validate(entry)
-    except ValidationError:
-        return None
-
-
 def _one_line(text: str) -> str:
     return ' '.join(text.split())
 
@@ -98,15 +84,9 @@ def _bullets(declarations: Sequence[DefectDeclaration]) -> Iterable[str]:
         )
 
 
-def _awaiting_ruling(raw: object) -> Iterable[str]:
-    for declaration in map(_parse, raw if isinstance(raw, list) else ()):
-        if declaration is None or declaration.status is not DefectStatus.PENDING:
-            continue
-        if declaration.closure is not None:
-            yield (
-                f'- `{declaration.ref}` — {_closure(declaration.closure)} — '
-                f'{_one_line(declaration.summary)}'
-            )
+def _awaiting_ruling(metadata: Mapping[str, Any]) -> Iterable[str]:
+    for declaration, closure in closures_awaiting_ruling(metadata):
+        yield f'- `{declaration.ref}` — {_closure(closure)} — {_one_line(declaration.summary)}'
 
 
 def _retirement_bullets(retirements: Sequence[Retirement]) -> Iterable[str]:
@@ -119,7 +99,9 @@ def _retirement_bullets(retirements: Sequence[Retirement]) -> Iterable[str]:
 
 def format_declared_defects(metadata: Mapping[str, Any]) -> str:
     """The ``metadata.defects`` block: '' when none are declared, malformed entries counted visibly."""
-    return _DECLARED_DEFECTS_BLOCK.render(metadata.get(DEFECTS_METADATA_KEY), _parse, _bullets)
+    return _DECLARED_DEFECTS_BLOCK.render(
+        metadata.get(DEFECTS_METADATA_KEY), partial(parse_record, DefectDeclaration), _bullets,
+    )
 
 
 def format_closures_awaiting_ruling(metadata: Mapping[str, Any]) -> str:
@@ -127,7 +109,7 @@ def format_closures_awaiting_ruling(metadata: Mapping[str, Any]) -> str:
 
     Malformed entries are skipped here; the declared-defects block counts them.
     """
-    listed = '\n'.join(_awaiting_ruling(metadata.get(DEFECTS_METADATA_KEY)))
+    listed = '\n'.join(_awaiting_ruling(metadata))
     if not listed:
         return ''
     return f'{CLOSURES_AWAITING_RULING_HEADING}\n\n{_CLOSURES_INTRO}\n\n{listed}'
@@ -136,5 +118,6 @@ def format_closures_awaiting_ruling(metadata: Mapping[str, Any]) -> str:
 def format_defect_test_retirements(metadata: Mapping[str, Any]) -> str:
     """The ``metadata.defect_test_retirements`` block: '' when none, malformed entries counted visibly."""
     return _RETIREMENTS_BLOCK.render(
-        metadata.get(DEFECT_TEST_RETIREMENTS_METADATA_KEY), _parse_retirement, _retirement_bullets,
+        metadata.get(DEFECT_TEST_RETIREMENTS_METADATA_KEY), partial(parse_record, Retirement),
+        _retirement_bullets,
     )

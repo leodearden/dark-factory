@@ -12,7 +12,6 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
-from pydantic import ValidationError
 from shared.defects import (
     DEFECT_TEST_RETIREMENTS_METADATA_KEY,
     DEFECTS_METADATA_KEY,
@@ -31,6 +30,7 @@ from shared.defects import (
 )
 from shared.mcp_envelope import parse_tool_result, write_failure_reason
 
+from orchestrator.defect_records import readable_records
 from orchestrator.review_issue_contract import IssueField
 from orchestrator.review_payload import DefectRuling
 
@@ -231,14 +231,8 @@ def with_live_defect_records(task: Mapping[str, Any], fresh: object) -> dict[str
 
 
 def declared_refs(metadata: Mapping[str, Any]) -> frozenset[str]:
-    """The refs of the readable ``metadata.defects`` entries; malformed entries are skipped."""
-    entries = metadata.get(DEFECTS_METADATA_KEY)
-    if not isinstance(entries, list):
-        return frozenset()
-    refs: set[str] = set()
-    for entry in entries:
-        try:
-            refs.add(DefectDeclaration.model_validate(entry).ref)
-        except ValidationError:
-            continue
-    return frozenset(refs)
+    """The refs of the readable ``metadata.defects`` entries."""
+    return frozenset(
+        declaration.ref
+        for declaration in readable_records(DefectDeclaration, metadata.get(DEFECTS_METADATA_KEY))
+    )
