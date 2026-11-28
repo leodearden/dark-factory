@@ -19,16 +19,39 @@ from unittest.mock import AsyncMock
 import pytest
 from _briefing_helpers import _mcp_search_envelope, memory_transport
 from shared.defects import (
+    DEFECT_TEST_RETIREMENTS_METADATA_KEY,
     DEFECTS_METADATA_KEY,
+    DeclareClosure,
     DefectDeclaration,
     DefectOrigin,
     DefectStatus,
+    Exemption,
+    ExemptionReason,
+    Retirement,
+    RetirementCode,
+    RetirementReason,
+    RuledBy,
+    Ruling,
+    RulingSubject,
+    Withdrawal,
+    WithdrawalCode,
+    WithdrawalReason,
+    apply_event,
     mint_human_ref,
+    mint_redmain_ref,
     mint_review_ref,
 )
+from shared.governed_exceptions import Debt, TaskRef, TicketRef
 
 from orchestrator.agents.briefing import BriefingAssembler
-from orchestrator.agents.defect_briefing import DECLARED_DEFECTS_HEADING, format_declared_defects
+from orchestrator.agents.defect_briefing import (
+    CLOSURES_AWAITING_RULING_HEADING,
+    DECLARED_DEFECTS_HEADING,
+    DEFECT_TEST_RETIREMENTS_HEADING,
+    format_closures_awaiting_ruling,
+    format_declared_defects,
+    format_defect_test_retirements,
+)
 from orchestrator.agents.review_briefing import ChangedFile, ReviewChange, ReviewSubject
 from orchestrator.agents.roles import DEFECT_TEST_RULE
 from orchestrator.agents.steward_digest import EarlierAttempts
@@ -239,3 +262,216 @@ class TestTaskBlockBriefingsListDeclaredDefects:
         # The architect hides the queue-time file guess (C-A1), not the charter.
         assert 'widget_footprint_guess.py' not in prompt
         assert all(d.ref in prompt for d in _DECLARED)
+
+
+_TICKET_ID = 'tkt_0RW782Z6RY3X8W8Q3NX8J1EKD0'
+
+
+def _awaiting_ruling(declaration: DefectDeclaration, closure: Exemption | Withdrawal) -> DefectDeclaration:
+    return apply_event(declaration, DeclareClosure(ref=declaration.ref, closure=closure))
+
+
+def _exemption(owner: TaskRef | TicketRef) -> Exemption:
+    return Exemption(reason=ExemptionReason.NEEDS_EXTERNAL_SYSTEM, owner=Debt(owner))
+
+
+_EXEMPT_SUMMARY = 'Flaky against the live payment gateway'
+_EXEMPT = _awaiting_ruling(
+    _declaration(
+        mint_review_ref(7050, 'pay.py', 'gateway retry'), DefectOrigin.REVIEW, _EXEMPT_SUMMARY,
+    ),
+    _exemption(TicketRef(_TICKET_ID)),
+)
+_WITHDRAW_SUMMARY = 'Same miscount as the human report'
+_WITHDRAW = _awaiting_ruling(
+    _declaration(
+        mint_review_ref(7050, 'widget.py', 'count off by one'), DefectOrigin.REVIEW, _WITHDRAW_SUMMARY,
+    ),
+    Withdrawal(reason=WithdrawalReason(reason=WithdrawalCode.DUPLICATE_OF, ref=_HUMAN.ref)),
+)
+
+
+class TestFormatClosuresAwaitingRuling:
+    def test_only_entries_awaiting_a_ruling_are_listed(self):
+        rendered = format_closures_awaiting_ruling(
+            {DEFECTS_METADATA_KEY: _wire(_REVIEW, _EXEMPT, _WITHDRAW)},
+        )
+
+        assert CLOSURES_AWAITING_RULING_HEADING in rendered
+        assert _REVIEW.ref not in rendered
+        assert _EXEMPT.ref in rendered
+        assert _WITHDRAW.ref in rendered
+
+    def test_an_exemption_names_its_kind_reason_owner_and_summary(self):
+        line = _line_naming(
+            format_closures_awaiting_ruling({DEFECTS_METADATA_KEY: _wire(_EXEMPT)}), _EXEMPT.ref,
+        )
+
+        assert 'exemption' in line
+        assert str(ExemptionReason.NEEDS_EXTERNAL_SYSTEM) in line
+        assert _TICKET_ID in line
+        assert _EXEMPT_SUMMARY in line
+
+    def test_a_task_owner_is_named_as_that_task(self):
+        owed = _awaiting_ruling(_REVIEW, _exemption(TaskRef(4242)))
+
+        line = _line_naming(format_closures_awaiting_ruling({DEFECTS_METADATA_KEY: _wire(owed)}), owed.ref)
+
+        assert 'task 4242' in line
+
+    def test_a_duplicate_withdrawal_names_the_ref_it_duplicates(self):
+        line = _line_naming(
+            format_closures_awaiting_ruling({DEFECTS_METADATA_KEY: _wire(_WITHDRAW)}), _WITHDRAW.ref,
+        )
+
+        assert 'withdrawal' in line
+        assert str(WithdrawalCode.DUPLICATE_OF) in line
+        assert _HUMAN.ref in line
+        assert _WITHDRAW_SUMMARY in line
+
+    def test_the_block_names_the_closure_ruling_subject(self):
+        rendered = format_closures_awaiting_ruling({DEFECTS_METADATA_KEY: _wire(_EXEMPT)})
+
+        assert f'`{RulingSubject.CLOSURE}`' in rendered
+        assert 'defect_rulings' in rendered
+
+    @pytest.mark.parametrize(
+        'metadata',
+        [{}, {DEFECTS_METADATA_KEY: None}, {DEFECTS_METADATA_KEY: []}, {DEFECTS_METADATA_KEY: _wire(_HUMAN)}],
+        ids=['absent', 'none', 'empty', 'nothing-pending'],
+    )
+    def test_nothing_awaiting_a_ruling_renders_nothing(self, metadata):
+        assert format_closures_awaiting_ruling(metadata) == ''
+
+
+_RETIRED_REF = mint_redmain_ref('0123456789abcdef')
+_SUCCESSOR_REF = mint_redmain_ref('fedcba9876543210')
+_PENDING_RETIREMENT = Retirement(
+    ref=_RETIRED_REF, reason=RetirementReason(reason=RetirementCode.SUPERSEDED_BY, ref=_SUCCESSOR_REF),
+)
+_ACCEPTED_RETIREMENT = Retirement(
+    ref=_HUMAN.ref,
+    reason=RetirementReason(reason=RetirementCode.FEATURE_REMOVED),
+    ruling=Ruling(subject=RulingSubject.RETIREMENT, accepted=True, ruled_by=RuledBy.OPERATOR),
+)
+
+
+def _retirements(*records: Retirement) -> dict[str, Any]:
+    return {DEFECT_TEST_RETIREMENTS_METADATA_KEY: [record.model_dump(mode='json') for record in records]}
+
+
+class TestFormatDefectTestRetirements:
+    def test_each_retirement_names_its_ref_reason_and_state_on_one_line(self):
+        rendered = format_defect_test_retirements(_retirements(_PENDING_RETIREMENT, _ACCEPTED_RETIREMENT))
+
+        assert DEFECT_TEST_RETIREMENTS_HEADING in rendered
+        for record in (_PENDING_RETIREMENT, _ACCEPTED_RETIREMENT):
+            line = _line_naming(rendered, record.ref)
+            assert str(record.reason.reason) in line
+            assert str(record.state) in line
+
+    def test_a_superseded_retirement_names_its_successor(self):
+        rendered = format_defect_test_retirements(_retirements(_PENDING_RETIREMENT))
+
+        assert _SUCCESSOR_REF in _line_naming(rendered, _RETIRED_REF)
+
+    def test_the_block_names_the_retirement_ruling_subject(self):
+        rendered = format_defect_test_retirements(_retirements(_PENDING_RETIREMENT))
+
+        assert f'`{RulingSubject.RETIREMENT}`' in rendered
+        assert 'defect_rulings' in rendered
+
+    @pytest.mark.parametrize(
+        'metadata',
+        [{}, {DEFECT_TEST_RETIREMENTS_METADATA_KEY: None}, {DEFECT_TEST_RETIREMENTS_METADATA_KEY: []}],
+        ids=['absent', 'none', 'empty'],
+    )
+    def test_no_retirement_renders_nothing(self, metadata):
+        assert format_defect_test_retirements(metadata) == ''
+
+    def test_malformed_entries_are_counted_not_rendered(self):
+        metadata = _retirements(_PENDING_RETIREMENT)
+        metadata[DEFECT_TEST_RETIREMENTS_METADATA_KEY].append({'ref': 'not-a-ref'})
+
+        rendered = format_defect_test_retirements(metadata)
+
+        assert _RETIRED_REF in rendered
+        assert 'not-a-ref' not in rendered
+        (warning,) = _warnings(rendered)
+        assert '1' in warning
+
+    def test_a_non_list_value_is_reported_and_never_iterated(self):
+        rendered = format_defect_test_retirements({DEFECT_TEST_RETIREMENTS_METADATA_KEY: 'not-a-list'})
+
+        assert DEFECT_TEST_RETIREMENTS_HEADING in rendered
+        (warning,) = _warnings(rendered)
+        assert 'str' in warning
+
+
+_RECORDED_TASK: dict[str, Any] = {
+    **_TASK,
+    'metadata': {
+        'files': ['widget_footprint_guess.py'],
+        DEFECTS_METADATA_KEY: _wire(_REVIEW, _EXEMPT),
+        **_retirements(_PENDING_RETIREMENT),
+    },
+}
+_RECORD_HEADINGS = (
+    DECLARED_DEFECTS_HEADING, CLOSURES_AWAITING_RULING_HEADING, DEFECT_TEST_RETIREMENTS_HEADING,
+)
+
+
+def _subject(task: dict[str, Any]) -> ReviewSubject:
+    return ReviewSubject(
+        task=task,
+        plan=None,
+        plan_absent_reason='no plan in this test',
+        change=ReviewChange(
+            base_sha='0123456789abcdef0123456789abcdef01234567',
+            diff='diff --git a/widget.py b/widget.py\n',
+            files=(ChangedFile('widget.py', 1, 0),),
+        ),
+        conventions=(),
+    )
+
+
+class TestReviewerBriefingsShowTheRecordsToRuleOn:
+    @pytest.mark.asyncio
+    async def test_the_diff_only_reviewer_gets_the_declared_defects_and_both_ruling_blocks(
+        self, briefing: BriefingAssembler,
+    ):
+        prompt = await briefing.build_reviewer_prompt(
+            'reviewer_comprehensive', 'diff --git a/widget.py b/widget.py\n', context='', task=_RECORDED_TASK,
+        )
+
+        for heading in _RECORD_HEADINGS:
+            assert heading in prompt
+        assert _EXEMPT.ref in prompt
+        assert _RETIRED_REF in prompt
+
+    @pytest.mark.asyncio
+    async def test_the_context_complete_reviewer_gets_both_ruling_blocks_beside_its_task_block(
+        self, briefing: BriefingAssembler,
+    ):
+        prompt = await briefing.build_context_complete_reviewer_prompt(
+            'reviewer_comprehensive', _subject(_RECORDED_TASK), context='',
+        )
+
+        assert CLOSURES_AWAITING_RULING_HEADING in prompt
+        assert DEFECT_TEST_RETIREMENTS_HEADING in prompt
+        assert prompt.count(DECLARED_DEFECTS_HEADING) == 1
+
+    @pytest.mark.asyncio
+    async def test_a_task_without_defect_records_leaves_the_diff_only_prompt_unchanged(
+        self, briefing: BriefingAssembler,
+    ):
+        diff = 'diff --git a/widget.py b/widget.py\n'
+        unrecorded = {**_TASK, 'metadata': {'files': ['widget_footprint_guess.py']}}
+
+        prompt = await briefing.build_reviewer_prompt('reviewer_comprehensive', diff, context='', task=unrecorded)
+        bare = await briefing.build_reviewer_prompt(
+            'reviewer_comprehensive', diff, context='', task={**_TASK, 'metadata': {}},
+        )
+
+        assert prompt == bare
+        assert [heading for heading in _RECORD_HEADINGS if heading in prompt] == []
