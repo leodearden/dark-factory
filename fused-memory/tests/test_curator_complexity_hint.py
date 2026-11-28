@@ -3,12 +3,15 @@
 Contract: plans/routing-experiment-substrate-prd.md §"Experiment 2: the curator hint (ε)".
 
 Driven through public seams only: jsonschema over the exported output
-schemas, and ``TaskCurator.curate_prepared`` with its invoker injected
-through the constructor. No private name is patched.
+schemas, ``TaskCurator.curate_prepared`` with its invoker injected through
+the constructor, and the pure ``with_complexity_hint``. No private name is
+patched.
 """
 
 from __future__ import annotations
 
+import json
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -23,8 +26,12 @@ from _curator_helpers import (
     prepared,
     tripwire,
 )
+from fused_memory.middleware.curator_complexity_hint import with_complexity_hint
+from shared.routing_split import split_bucket
 
+from fused_memory.middleware.candidate_key import compute_candidate_key
 from fused_memory.middleware.curator_types import CandidateTask, CuratorDecision
+from fused_memory.middleware.simple_task_files_guard import simple_task_files_error
 from fused_memory.middleware.task_curator import (
     CURATOR_BATCH_OUTPUT_SCHEMA,
     CURATOR_OUTPUT_SCHEMA,
@@ -154,3 +161,131 @@ class TestTheCuratorParsesTheHint:
 def test_a_decision_refuses_a_hint_other_than_simple_or_none(hint):
     with pytest.raises(ValueError, match=rf'complexity_hint.*{hint!r}'):
         CuratorDecision(action='create', complexity_hint=hint)
+
+
+FILES = ['src/app/guide.py']
+SIMPLE_CREATE = CuratorDecision(action='create', justification='new work', complexity_hint='simple')
+HINT = 'x_curator_complexity_hint'
+ARM_KEY = 'x_routing_exp2_arm_key'
+
+
+def _title_on_arm(bucket: int, files: list[str]) -> str:
+    """The first numbered guide-wording title whose routing-exp-2 arm is *bucket* over *files*.
+
+    The salt, bucket count and treated bucket are spelled literally: they are
+    the cross-leaf contract the experiment readout recomputes.
+    """
+    for n in range(1000):
+        title = f'Fix the wording of the guide ({n})'
+        key = compute_candidate_key(title, files)
+        assert key is not None
+        if split_bucket('routing-exp-2', key, 2) == bucket:
+            return title
+    raise AssertionError(f'no title lands on bucket {bucket}')
+
+
+def _hinted(metadata: Any, title: str, decision: CuratorDecision | None = SIMPLE_CREATE) -> Any:
+    """``with_complexity_hint``'s result, checked to be one the submit gate still accepts."""
+    result = with_complexity_hint(metadata, title=title, decision=decision)
+    if isinstance(result, Mapping):
+        assert simple_task_files_error(result) is None
+    return result
+
+
+class TestTheHintIsAppliedOnTheTreatedArm:
+    def test_the_treated_arm_declares_simple(self):
+        title = _title_on_arm(1, FILES)
+
+        assert _hinted({'files': FILES}, title) == {
+            'files': FILES,
+            HINT: 'simple',
+            ARM_KEY: compute_candidate_key(title, FILES),
+            'complexity': 'simple',
+        }
+
+    def test_the_untreated_arm_records_the_hint_and_the_arm_key_only(self):
+        title = _title_on_arm(0, FILES)
+
+        assert _hinted({'files': FILES}, title) == {
+            'files': FILES,
+            HINT: 'simple',
+            ARM_KEY: compute_candidate_key(title, FILES),
+        }
+
+    @pytest.mark.parametrize('filed', ['standard', 'simple'])
+    def test_the_filers_complexity_wins(self, filed):
+        metadata = {'files': FILES, 'complexity': filed}
+
+        assert _hinted(metadata, _title_on_arm(1, FILES)) == {**metadata, HINT: 'simple'}
+
+    @pytest.mark.parametrize('title', ['', '   '], ids=['empty', 'blank'])
+    def test_an_uncomputable_key_records_the_hint_only(self, title):
+        assert _hinted({'files': FILES}, title) == {'files': FILES, HINT: 'simple'}
+
+    def test_a_null_hint_is_recorded_and_declares_nothing(self):
+        unsure = CuratorDecision(action='create', justification='new work')
+
+        assert _hinted({'files': FILES}, _title_on_arm(1, FILES), unsure) == {
+            'files': FILES, HINT: None,
+        }
+
+    @pytest.mark.parametrize(('metadata', 'key_files'), [
+        ({}, []),
+        ({'files': []}, []),
+        ({'files': [5]}, []),
+        ({'files_to_modify': FILES}, FILES),
+    ], ids=['no-files', 'empty-files', 'non-str-files', 'legacy-files-to-modify'])
+    def test_no_declarable_files_records_the_hint_only(self, metadata, key_files):
+        assert _hinted(metadata, _title_on_arm(1, key_files)) == {**metadata, HINT: 'simple'}
+
+
+class TestOnlyAHealthyCreateIsStamped:
+    @pytest.mark.parametrize('decision', [
+        None,
+        CuratorDecision(
+            action='create', justification='curator-failed', degraded=True,
+            complexity_hint='simple',
+        ),
+        CuratorDecision(action='drop', target_id='7', justification='dup', complexity_hint='simple'),
+        CuratorDecision(
+            action='combine', target_id='7', justification='combine-refused',
+            complexity_hint='simple',
+        ),
+        CuratorDecision(action='route_deterministic', justification='operational'),
+    ], ids=['no-decision', 'degraded-create', 'drop', 'combine', 'route-deterministic'])
+    def test_any_other_decision_leaves_the_metadata_unchanged(self, decision):
+        metadata = {'files': FILES}
+
+        assert _hinted(metadata, _title_on_arm(1, FILES), decision) == {'files': FILES}
+
+
+class TestWireForms:
+    def test_a_json_string_is_decoded_and_stamped(self):
+        title = _title_on_arm(1, FILES)
+
+        assert _hinted(json.dumps({'files': FILES}), title) == {
+            'files': FILES,
+            HINT: 'simple',
+            ARM_KEY: compute_candidate_key(title, FILES),
+            'complexity': 'simple',
+        }
+
+    @pytest.mark.parametrize('wire', ['not json', json.dumps(FILES)], ids=['not-json', 'json-list'])
+    def test_an_unreadable_value_is_returned_as_is(self, wire):
+        assert _hinted(wire, _title_on_arm(1, FILES)) is wire
+
+    def test_the_input_dict_is_not_mutated(self):
+        metadata = {'files': FILES}
+
+        _hinted(metadata, _title_on_arm(1, FILES))
+
+        assert metadata == {'files': FILES}
+
+
+@pytest.mark.parametrize('shape', [
+    {},
+    {'files': FILES},
+    {'complexity': 'simple', 'files': FILES},
+], ids=['empty', 'files', 'simple-with-files'])
+def test_the_hint_key_does_not_change_what_the_submit_gate_accepts(shape):
+    assert simple_task_files_error({**shape, HINT: 'simple'}) is None
