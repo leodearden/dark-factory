@@ -126,6 +126,8 @@ class _Dispatch:
 
     Its tasks are not main-health fixes, so a restricted tick hands out none.
     Call number N blocks until ``held_ticks[N]`` is set, like a long tick.
+    A drive that awaits ``handed_out[<id>]`` wakes in the turn that hands the
+    task out, before that slot's first step.
     """
 
     def __init__(self, task_ids: list[str]) -> None:
@@ -134,6 +136,7 @@ class _Dispatch:
         self.scopes: list[DispatchScope] = []
         self.stop_when: Callable[[], bool] = lambda: False
         self.held_ticks: dict[int, asyncio.Event] = {}
+        self.handed_out: defaultdict[str, asyncio.Event] = defaultdict(asyncio.Event)
 
     async def acquire_next(self, scope: DispatchScope = DispatchScope.ANY) -> TaskAssignment | None:
         self.calls += 1
@@ -145,6 +148,7 @@ class _Dispatch:
         if scope is not DispatchScope.ANY or not self._pending:
             return None
         tid = self._pending.pop(0)
+        self.handed_out[tid].set()
         return TaskAssignment(task_id=tid, task={'title': tid}, modules=[])
 
 
@@ -287,8 +291,9 @@ async def _run_driven(
     async def driver() -> None:
         try:
             await drive()
-        finally:
+        except BaseException:
             slots.open_all()
+            raise
 
     steering = asyncio.create_task(driver())
     report = await h.run(until_idle=until_idle)
@@ -359,6 +364,7 @@ class TestParkedLoop:
             clock.now += _FORCE_FIRE_AFTER_SECS
             await _until(fired.is_set, 'owed restart force-fired while parked')
             assert dispatch.calls == 1, 'the loop must still be parked when it fires'
+            slots.open_all()
 
         await _run_driven(h, slots, drive)
 
@@ -374,6 +380,7 @@ class TestParkedLoop:
             first = _heartbeat_ts(fleet_dir) or 0.0
             await _until(lambda: (_heartbeat_ts(fleet_dir) or 0.0) > first, 'heartbeat advanced')
             assert dispatch.calls == 1, 'the loop must still be parked'
+            slots.open_all()
 
         await _run_driven(h, slots, drive)
 
@@ -386,11 +393,29 @@ class TestParkedLoop:
         assert main is not None
 
         async def sigterm_while_parked() -> None:
-            await _until(lambda: dispatch.calls >= 1, 'loop parked on slot 1')
+            await _until(lambda: '1' in slots.started, 'slot 1 running, loop parked')
             main.cancel()
 
         with pytest.raises(asyncio.CancelledError):
             await _run_driven(h, slots, sigterm_while_parked)
+
+        outcomes = {r.task_id: r.outcome for r in h.report.task_reports}
+        assert outcomes == {'1': WorkflowOutcome.CANCELLED}
+
+    async def test_slot_dispatched_in_the_sigterm_turn_is_collected(
+        self, tmp_path: Path, fleet_dir: Path,
+    ) -> None:
+        dispatch, slots = _Dispatch(['1', '2']), _Slots()
+        h = _harness(tmp_path, dispatch, slots)
+        main = asyncio.current_task()
+        assert main is not None
+
+        async def sigterm_in_the_dispatch_turn() -> None:
+            await dispatch.handed_out['1'].wait()
+            main.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await _run_driven(h, slots, sigterm_in_the_dispatch_turn)
 
         outcomes = {r.task_id: r.outcome for r in h.report.task_reports}
         assert outcomes == {'1': WorkflowOutcome.CANCELLED}
@@ -410,7 +435,7 @@ class TestParkedLoop:
         bystanders: list[asyncio.Task] = []
 
         async def sigterm_beside_an_immune_bystander() -> None:
-            await _until(lambda: dispatch.calls >= 1, 'loop parked on slot 1')
+            await _until(lambda: '1' in slots.started, 'slot 1 running, loop parked')
             bystanders.append(asyncio.create_task(ignore_cancels_until(release), name='immune-bystander'))
             await asyncio.sleep(0)
             guard.arm()
@@ -486,7 +511,7 @@ class TestParkedLoop:
         assert main is not None
 
         async def sigterm_while_parked() -> None:
-            await _until(lambda: dispatch.calls >= 1, 'loop parked on slot 1')
+            await _until(lambda: '1' in slots.started, 'slot 1 running, loop parked')
             main.cancel()
 
         with pytest.raises(asyncio.CancelledError):
