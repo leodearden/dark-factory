@@ -26,6 +26,9 @@ from orchestrator.evals.reviewer_trial.variants import (
     ReviewerSpec,
     build_trial_reviewer_role,
     campaign_arms,
+    panel_budgets,
+    trial_production_budget,
+    trial_reviewer_budget,
     trial_reviewer_max_turns,
     with_briefing,
 )
@@ -299,6 +302,7 @@ class TestBriefingArms:
             ReviewBriefing.DIFF_ONLY, ReviewBriefing.CONTEXT_COMPLETE,
         ] * 2
 
+    @pytest.mark.usefixtures('code_default_config')
     def test_a_d2_trial_role_is_the_production_d2_role(self) -> None:
         spec = VARIANT_A.reviewers[0]
         role = build_trial_reviewer_role(spec, ReviewBriefing.CONTEXT_COMPLETE)
@@ -309,7 +313,7 @@ class TestBriefingArms:
         assert role.prompt_harness_version == 'reviewer-d2-v3'
         assert role.system_prompt == production.system_prompt
         assert role.allowed_tools == production.allowed_tools
-        assert (role.default_model, role.default_budget) == (spec.model, spec.budget)
+        assert (role.default_model, role.default_budget) == (spec.model, 12.0)
 
     def test_a_diff_only_trial_role_is_the_production_incumbent(self) -> None:
         spec = VARIANT_A.reviewers[0]
@@ -405,3 +409,52 @@ class TestTrialReviewerTurnCap:
             trial_reviewer_max_turns(0)
         with pytest.raises(ValueError, match=r'got 0\b'):
             build_trial_reviewer_role(VARIANT_A.reviewers[0], max_turns=0)
+
+
+class TestTrialReviewerBudget:
+    """The incumbent arms run at production's reviewer budget unless told otherwise."""
+
+    @pytest.mark.usefixtures('code_default_config')
+    def test_the_incumbent_arms_built_with_no_override_carry_production_s_12_dollars(self) -> None:
+        assert trial_production_budget() == 12.0
+        for variant in (VARIANT_A, VARIANT_A_XHIGH):
+            for arm in (variant, with_briefing(variant, ReviewBriefing.CONTEXT_COMPLETE)):
+                assert arm.reviewers[0].budget is None
+                role = build_trial_reviewer_role(arm.reviewers[0], arm.briefing)
+                assert role.default_budget == 12.0
+
+    def test_the_budget_follows_production_s_reviewer_config(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv('ORCH_BUDGETS__REVIEWER', '7.5')
+
+        assert build_trial_reviewer_role(VARIANT_A.reviewers[0]).default_budget == 7.5
+        assert trial_reviewer_budget(VARIANT_A.reviewers[0]) == 7.5
+
+    def test_an_explicit_budget_wins_so_the_5_dollar_campaign_stays_reproducible(self) -> None:
+        role = build_trial_reviewer_role(
+            VARIANT_A_XHIGH.reviewers[0], ReviewBriefing.CONTEXT_COMPLETE, production_budget=5.0,
+        )
+
+        assert role.default_budget == 5.0
+        assert panel_budgets(VARIANT_A, 5.0) == (5.0,)
+
+    def test_an_int_override_resolves_to_a_float(self) -> None:
+        assert type(trial_production_budget(5)) is float
+        assert [type(budget) for budget in panel_budgets(VARIANT_A, 5)] == [float]
+
+    def test_a_pinned_spec_ignores_production_s_budget_and_the_override(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv('ORCH_BUDGETS__REVIEWER', '7.5')
+
+        fable = build_trial_reviewer_role(VARIANT_FABLE52_SOLO.reviewers[0], production_budget=6.0)
+        sol = build_trial_reviewer_role(VARIANT_CODEX_SOL62.reviewers[0], production_budget=6.0)
+
+        assert fable.default_budget == 10.0
+        assert sol.default_budget == 5.0
+        assert panel_budgets(VARIANT_C, 6.0) == (4.0, 2.0, 2.0)
+
+    def test_a_non_positive_budget_is_refused_naming_it(self) -> None:
+        with pytest.raises(ValueError, match=r'got 0\b'):
+            trial_production_budget(0)
+        with pytest.raises(ValueError):
+            build_trial_reviewer_role(VARIANT_A.reviewers[0], production_budget=-1.0)

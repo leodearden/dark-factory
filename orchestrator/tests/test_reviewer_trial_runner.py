@@ -26,8 +26,9 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from _eval_refusal import answered, refused_agent_result
 from _orch_helpers import build_usage_gate
-from shared.cli_invoke import AgentResult
+from shared.cli_invoke import BUDGET_EXHAUSTED_SUBTYPE, AgentResult
 from shared.config_models import AccountConfig
+from shared.cost_store import CapReason
 from shared.usage_gate import UsageGate
 from test_reviewer_trial_checkout import _CHANGE_AT_BASE, _commit, _git, _Source
 
@@ -124,6 +125,22 @@ def _one_reviewer(name: str = 'r1_panel') -> VariantConfig:
     )
 
 
+def _unpinned_reviewer(name: str = 'r1_unpinned') -> VariantConfig:
+    """A one-reviewer panel that pins no budget, so it runs at production's."""
+    return VariantConfig(
+        name=name, description='Test',
+        reviewers=[ReviewerSpec(name='r1', model='opus', specialization='Testing.', budget=None)],
+    )
+
+
+def _pinned_at(budget: float, name: str = 'r1_pinned') -> VariantConfig:
+    """A one-reviewer panel pinned at *budget*, as written, int or float."""
+    return VariantConfig(
+        name=name, description='Test',
+        reviewers=[ReviewerSpec(name='r1', model='opus', specialization='Testing.', budget=budget)],
+    )
+
+
 def _make_review(name: str = 'test', verdict: str = 'PASS') -> dict:
     return {
         'reviewer': name,
@@ -133,17 +150,24 @@ def _make_review(name: str = 'test', verdict: str = 'PASS') -> dict:
     }
 
 
-def _make_result(output: str = '', structured: dict | None = None, success: bool = True):
-    """Build a mock AgentResult."""
-    from types import SimpleNamespace
-    return SimpleNamespace(
+def _make_result(
+    output: str = '',
+    structured: dict | None = None,
+    success: bool = True,
+    *,
+    subtype: str | None = None,
+    cost_usd: float = 0.50,
+) -> AgentResult:
+    """An AgentResult whose CLI subtype is *subtype*, else 'success' or 'error' by *success*."""
+    return AgentResult(
         success=success,
         output=output,
-        cost_usd=0.50,
+        cost_usd=cost_usd,
         duration_ms=5000,
         turns=5,
         session_id='mock-session',
         structured_output=structured,
+        subtype=subtype if subtype is not None else ('success' if success else 'error'),
         stderr='',
     )
 
@@ -197,6 +221,20 @@ def _make_verdict_writing_invoke(
     return _invoke
 
 
+def _ceiling_killed_then_pass_invoke(kills: int, subtype: str = BUDGET_EXHAUSTED_SUBTYPE):
+    """An ``invoke_agent`` side effect whose first *kills* attempts a ceiling ends verdict-less, then a PASS."""
+    calls = {'n': 0}
+    with_verdict = _make_verdict_writing_invoke(verdict='PASS')
+
+    async def _invoke(**kwargs):
+        calls['n'] += 1
+        if calls['n'] <= kills:
+            return _make_result(success=False, subtype=subtype, cost_usd=12.0)
+        return await with_verdict(**kwargs)
+
+    return _invoke
+
+
 def _make_retry_then_succeed_invoke():
     """Build an ``invoke_agent`` side effect that, on its FIRST call, invokes
     successfully but writes NO verdict (forcing a retry), then on the second
@@ -247,22 +285,37 @@ def _full_panel_result(run_key: PanelRunKey | None) -> PanelRunResult:
         wall_clock_ms=4321,
         errors=['r3: no result'],
         run_key=run_key,
+        ceiling_kills={'r3': [CapReason.BUDGET]},
     )
 
 
 class TestPanelRunResultFromDict:
     @pytest.mark.parametrize('run_key', [
-        PanelRunKey.of(prices=default_price_table(), usage_gate=None, diff_cap_chars=0, max_turns=90),
+        PanelRunKey.of(
+            prices=default_price_table(), usage_gate=None, diff_cap_chars=0, max_turns=90,
+            reviewer_budgets_usd=(12.0,),
+        ),
         None,
     ])
     def test_round_trips_asdict(self, run_key: PanelRunKey | None) -> None:
         result = _full_panel_result(run_key)
         assert PanelRunResult.from_dict(asdict(result)) == result
 
+    def test_round_trips_through_json_with_its_ceilings_as_cap_reasons(self) -> None:
+        result = _full_panel_result(PanelRunKey.of(
+            prices=None, usage_gate=None, diff_cap_chars=0, max_turns=90, reviewer_budgets_usd=(12.0,),
+        ))
+
+        loaded = PanelRunResult.from_dict(json.loads(json.dumps(asdict(result))))
+
+        assert loaded == result
+        assert [type(reason) for reason in loaded.ceiling_kills['r3']] == [CapReason]
+
     def test_a_legacy_record_loads_with_defaults_and_no_key(self) -> None:
         loaded = PanelRunResult.from_dict({'variant_name': 'v1', 'diff_id': 'd1'})
         assert loaded == PanelRunResult(variant_name='v1', diff_id='d1')
         assert loaded.run_key is None
+        assert loaded.ceiling_kills == {}
 
     @pytest.mark.parametrize('missing', ['variant_name', 'diff_id'])
     def test_a_record_missing_its_identity_raises(self, missing: str) -> None:
@@ -276,9 +329,11 @@ class TestPanelRunKey:
     def test_equal_price_tables_give_equal_keys(self) -> None:
         first = PanelRunKey.of(
             prices=default_price_table(), usage_gate=None, diff_cap_chars=DIFF_CAP_CHARS, max_turns=90,
+            reviewer_budgets_usd=(12.0,),
         )
         second = PanelRunKey.of(
             prices=default_price_table(), usage_gate=None, diff_cap_chars=DIFF_CAP_CHARS, max_turns=90,
+            reviewer_budgets_usd=(12.0,),
         )
         assert first == second
 
@@ -296,18 +351,32 @@ class TestPanelRunKey:
         pytest.param(lambda: {'usage_gate': cast(UsageGate, object())}, id='gated'),
         pytest.param(lambda: {'diff_cap_chars': 0}, id='cap-lifted'),
         pytest.param(lambda: {'max_turns': 30}, id='turn-cap'),
+        pytest.param(lambda: {'reviewer_budgets_usd': (5.0,)}, id='reviewer-budget'),
     ])
     def test_each_component_changes_the_key(self, change) -> None:
         baseline = {
             'prices': default_price_table(), 'usage_gate': None, 'diff_cap_chars': DIFF_CAP_CHARS, 'max_turns': 90,
+            'reviewer_budgets_usd': (12.0,),
         }
         assert PanelRunKey.of(**{**baseline, **change()}) != PanelRunKey.of(**baseline)
 
     def test_round_trips_asdict(self) -> None:
         key = PanelRunKey.of(
             prices=default_price_table(), usage_gate=cast(UsageGate, object()), diff_cap_chars=0, max_turns=30,
+            reviewer_budgets_usd=(12.0,),
         )
         assert PanelRunKey.from_dict(asdict(key)) == key
+
+    def test_round_trips_through_json(self) -> None:
+        key = PanelRunKey.of(
+            prices=None, usage_gate=None, diff_cap_chars=DIFF_CAP_CHARS, max_turns=90,
+            reviewer_budgets_usd=(4.0, 2.0),
+        )
+
+        loaded = PanelRunKey.from_dict(json.loads(json.dumps(asdict(key))))
+
+        assert loaded == key
+        assert hash(loaded) == hash(key)
 
 
 class TestRunSingleReviewerLiveTransport:
@@ -509,7 +578,9 @@ class TestRunPanel:
                 _one_reviewer(), _diff_in(source), stagger_secs=0, diff_cap_chars=123, max_turns=30,
             )
 
-        assert result.run_key == PanelRunKey.of(prices=None, usage_gate=None, diff_cap_chars=123, max_turns=30)
+        assert result.run_key == PanelRunKey.of(
+            prices=None, usage_gate=None, diff_cap_chars=123, max_turns=30, reviewer_budgets_usd=(2.0,),
+        )
 
     @pytest.mark.asyncio
     async def test_its_turn_cap_reaches_every_reviewer_dispatch(self, source: _Source) -> None:
@@ -543,6 +614,92 @@ class TestRunPanel:
         assert mock_invoke.call_args.kwargs['max_turns'] == 90
         assert result.run_key is not None
         assert result.run_key.max_turns == 90
+
+    @pytest.mark.asyncio
+    async def test_each_reviewer_dispatches_and_is_keyed_at_its_own_budget(self, source: _Source) -> None:
+        variant = VariantConfig(
+            name='pinned_and_unpinned',
+            description='Test',
+            reviewers=[
+                ReviewerSpec(name='r1', model='opus', specialization='S1.', budget=4.0),
+                ReviewerSpec(name='r2', model='opus', specialization='S2.', budget=None),
+            ],
+        )
+        with patch(
+            'orchestrator.evals.reviewer_trial.runner.invoke_agent',
+            new=AsyncMock(side_effect=_make_verdict_writing_invoke()),
+        ) as mock_invoke:
+            result = await run_panel(variant, _diff_in(source), stagger_secs=0, production_budget=7.0)
+
+        assert [call.kwargs['max_budget_usd'] for call in mock_invoke.call_args_list] == [4.0, 7.0]
+        assert result.run_key is not None
+        assert result.run_key.reviewer_budgets_usd == (4.0, 7.0)
+
+    @pytest.mark.usefixtures('code_default_config')
+    @pytest.mark.asyncio
+    async def test_with_no_override_an_unpinned_reviewer_runs_and_is_keyed_at_production_s_12(
+        self, source: _Source,
+    ) -> None:
+        with patch(
+            'orchestrator.evals.reviewer_trial.runner.invoke_agent',
+            new=AsyncMock(side_effect=_make_verdict_writing_invoke()),
+        ) as mock_invoke:
+            result = await run_panel(_unpinned_reviewer(), _diff_in(source), stagger_secs=0)
+
+        assert mock_invoke.call_args.kwargs['max_budget_usd'] == 12.0
+        assert result.run_key is not None
+        assert result.run_key.reviewer_budgets_usd == (12.0,)
+
+    @pytest.mark.parametrize(('kills', 'subtype', 'verdict', 'ceilings'), [
+        pytest.param(2, BUDGET_EXHAUSTED_SUBTYPE, 'ERROR', [CapReason.BUDGET, CapReason.BUDGET], id='budget-every-attempt'),
+        pytest.param(1, BUDGET_EXHAUSTED_SUBTYPE, 'PASS', [CapReason.BUDGET], id='budget-then-pass'),
+        pytest.param(2, 'error_max_turns', 'ERROR', [CapReason.TURNS, CapReason.TURNS], id='turns-every-attempt'),
+    ])
+    @pytest.mark.asyncio
+    async def test_it_records_the_ceiling_that_ended_each_attempt(
+        self, source: _Source, kills: int, subtype: str, verdict: str, ceilings: list[CapReason],
+    ) -> None:
+        with patch(
+            'orchestrator.evals.reviewer_trial.runner.invoke_agent',
+            side_effect=_ceiling_killed_then_pass_invoke(kills, subtype),
+        ):
+            result = await run_panel(_one_reviewer(), _diff_in(source), stagger_secs=0)
+
+        assert result.reviews['r1']['verdict'] == verdict
+        assert result.ceiling_kills == {'r1': ceilings}
+
+    @pytest.mark.parametrize(('backend', 'cost_usd', 'max_turns', 'ceiling_kills'), [
+        pytest.param('claude', 3.0, 90, {'r1': [CapReason.BUDGET, CapReason.BUDGET]}, id='claude-at-its-pinned-budget'),
+        pytest.param('claude', 1.0, 5, {'r1': [CapReason.TURNS, CapReason.TURNS]}, id='claude-at-its-turn-cap'),
+        pytest.param('codex', 3.0, 5, {}, id='codex-enforces-neither-ceiling'),
+    ])
+    @pytest.mark.asyncio
+    async def test_an_inconclusive_failure_is_judged_against_the_reviewer_s_own_ceilings_and_backend(
+        self, source: _Source, backend: str, cost_usd: float, max_turns: int, ceiling_kills: dict,
+    ) -> None:
+        variant = VariantConfig(
+            name='inconclusive', description='Test',
+            reviewers=[ReviewerSpec(name='r1', model='opus', specialization='S.', budget=3.0, backend=backend)],
+        )
+        inconclusive = _make_result(success=False, subtype='error', cost_usd=cost_usd)
+        assert inconclusive.turns == 5
+
+        with patch('orchestrator.evals.reviewer_trial.runner.invoke_agent', new=AsyncMock(return_value=inconclusive)):
+            result = await run_panel(variant, _diff_in(source), stagger_secs=0, max_turns=max_turns)
+
+        assert result.reviews['r1']['verdict'] == 'ERROR'
+        assert result.ceiling_kills == ceiling_kills
+
+    @pytest.mark.asyncio
+    async def test_a_panel_no_ceiling_ended_records_none(self, source: _Source) -> None:
+        with patch(
+            'orchestrator.evals.reviewer_trial.runner.invoke_agent',
+            side_effect=_make_verdict_writing_invoke(verdict='PASS'),
+        ):
+            result = await run_panel(_one_reviewer(), _diff_in(source), stagger_secs=0)
+
+        assert result.reviews['r1']['verdict'] == 'PASS'
+        assert result.ceiling_kills == {}
 
     @pytest.mark.asyncio
     async def test_multiple_reviewers(self, source: _Source) -> None:
@@ -1011,7 +1168,9 @@ def _only_entry(directory: Path) -> Path:
     return entry
 
 
-_SMOKE_KEY = PanelRunKey.of(prices=None, usage_gate=None, diff_cap_chars=DIFF_CAP_CHARS, max_turns=90)
+_SMOKE_KEY = PanelRunKey.of(
+    prices=None, usage_gate=None, diff_cap_chars=DIFF_CAP_CHARS, max_turns=90, reviewer_budgets_usd=(2.0,),
+)
 
 
 def _write_legacy_panel(results_dir: Path, legacy: PanelRunResult) -> Path:
@@ -1037,7 +1196,9 @@ class TestPanelCache:
             await run_panel_cached(variant, diff, results_dir=results_dir, stagger_secs=0, **_full_style())
 
         assert dispatched == ['ungated', 'gated']
-        assert {p.run_key for p in _stored_panels(results_dir)} == {_SMOKE_KEY, PanelRunKey.of(**_full_style())}
+        assert {p.run_key for p in _stored_panels(results_dir)} == {
+            _SMOKE_KEY, PanelRunKey.of(**_full_style(), reviewer_budgets_usd=(2.0,)),
+        }
 
     @pytest.mark.asyncio
     async def test_each_key_keeps_its_own_slot(self, source: _Source, tmp_path: Path) -> None:
@@ -1049,6 +1210,29 @@ class TestPanelCache:
                 await run_panel_cached(variant, diff, results_dir=results_dir, stagger_secs=0, **_full_style())
 
         assert dispatched == ['ungated', 'gated']
+
+    @pytest.mark.parametrize(('as_int', 'as_float'), [
+        pytest.param(
+            (_unpinned_reviewer(), {'production_budget': 5}), (_unpinned_reviewer(), {'production_budget': 5.0}),
+            id='production-budget',
+        ),
+        pytest.param(
+            (_pinned_at(5), {}), (_pinned_at(5.0), {}),
+            id='pinned-budget',
+        ),
+    ])
+    @pytest.mark.asyncio
+    async def test_an_int_budget_is_served_from_its_float_s_slot(
+        self, source: _Source, tmp_path: Path, as_int: tuple, as_float: tuple,
+    ) -> None:
+        diff, results_dir = _diff_in(source), tmp_path / 'results'
+
+        with _counted_reviewers() as dispatched:
+            for variant, budget in (as_int, as_float):
+                await run_panel_cached(variant, diff, results_dir=results_dir, stagger_secs=0, **budget)
+
+        assert dispatched == ['ungated']
+        assert len(list(results_dir.glob('*.json'))) == 1
 
     @pytest.mark.asyncio
     async def test_an_identical_call_is_served_from_the_cache(self, source: _Source, tmp_path: Path) -> None:
@@ -1077,6 +1261,34 @@ class TestPanelCache:
             await run_panel_cached(variant, diff, results_dir=results_dir, stagger_secs=0, **change())
 
         assert len(dispatched) == 2
+
+    @pytest.mark.usefixtures('code_default_config')
+    @pytest.mark.asyncio
+    async def test_an_unpinned_panel_reruns_when_production_s_budget_changes(
+        self, source: _Source, tmp_path: Path,
+    ) -> None:
+        variant, diff, results_dir = _unpinned_reviewer(), _diff_in(source), tmp_path / 'results'
+
+        with _counted_reviewers() as dispatched:
+            await run_panel_cached(variant, diff, results_dir=results_dir, stagger_secs=0)
+            await run_panel_cached(variant, diff, results_dir=results_dir, stagger_secs=0, production_budget=5.0)
+
+        assert dispatched == ['ungated', 'ungated']
+        assert {p.run_key.reviewer_budgets_usd for p in _stored_panels(results_dir) if p.run_key is not None} == {
+            (12.0,), (5.0,),
+        }
+
+    @pytest.mark.asyncio
+    async def test_a_pinned_panel_is_reused_whatever_production_s_budget(
+        self, source: _Source, tmp_path: Path,
+    ) -> None:
+        variant, diff, results_dir = _one_reviewer(), _diff_in(source), tmp_path / 'results'
+
+        with _counted_reviewers() as dispatched:
+            await run_panel_cached(variant, diff, results_dir=results_dir, stagger_secs=0, production_budget=5.0)
+            await run_panel_cached(variant, diff, results_dir=results_dir, stagger_secs=0, production_budget=9.0)
+
+        assert dispatched == ['ungated']
 
     @pytest.mark.asyncio
     async def test_a_keyless_legacy_entry_is_honoured_and_named_quietly(
@@ -1131,6 +1343,48 @@ class TestPanelCache:
         infos = [r.getMessage() for r in caplog.records if r.levelno == logging.INFO]
         assert any(str(entry) in message for message in infos), infos
 
+    @pytest.mark.usefixtures('code_default_config')
+    @pytest.mark.asyncio
+    async def test_an_unpinned_keyless_legacy_entry_is_rerun_at_production_s_budget(
+        self, source: _Source, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        variant, diff, results_dir = _unpinned_reviewer(), _diff_in(source), tmp_path / 'results'
+        entry = _write_legacy_panel(results_dir, PanelRunResult(
+            variant_name=variant.name, diff_id=diff.diff_id, reviews={'r1': _make_review('r1')},
+        ))
+        legacy_bytes = entry.read_bytes()
+
+        with (
+            caplog.at_level(logging.INFO, logger='orchestrator.evals.reviewer_trial.runner'),
+            _counted_reviewers() as dispatched,
+        ):
+            result = await run_panel_cached(variant, diff, results_dir=results_dir, stagger_secs=0, max_turns=30)
+
+        assert dispatched == ['ungated']
+        assert result.run_key is not None
+        assert result.run_key.reviewer_budgets_usd == (12.0,)
+        assert entry.read_bytes() == legacy_bytes
+        infos = [r.getMessage() for r in caplog.records if r.levelno == logging.INFO]
+        assert any(str(entry) in message for message in infos), infos
+
+    @pytest.mark.asyncio
+    async def test_an_unpinned_keyless_legacy_entry_is_reused_at_the_5_dollars_it_ran_at(
+        self, source: _Source, tmp_path: Path,
+    ) -> None:
+        variant, diff, results_dir = _unpinned_reviewer(), _diff_in(source), tmp_path / 'results'
+        legacy = PanelRunResult(
+            variant_name=variant.name, diff_id=diff.diff_id, reviews={'r1': _make_review('r1')},
+        )
+        _write_legacy_panel(results_dir, legacy)
+
+        with _counted_reviewers() as dispatched:
+            result = await run_panel_cached(
+                variant, diff, results_dir=results_dir, stagger_secs=0, max_turns=30, production_budget=5.0,
+            )
+
+        assert dispatched == []
+        assert result == legacy
+
     @pytest.mark.asyncio
     async def test_a_corrupt_legacy_entry_is_rerun_even_at_its_30_turn_cap(
         self, source: _Source, tmp_path: Path,
@@ -1144,7 +1398,7 @@ class TestPanelCache:
 
         assert dispatched == ['ungated']
         assert result.run_key == PanelRunKey.of(
-            prices=None, usage_gate=None, diff_cap_chars=DIFF_CAP_CHARS, max_turns=30,
+            prices=None, usage_gate=None, diff_cap_chars=DIFF_CAP_CHARS, max_turns=30, reviewer_budgets_usd=(2.0,),
         )
 
     @pytest.mark.parametrize('stored', [
@@ -1243,6 +1497,80 @@ class TestPanelCache:
         [warning] = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
         assert 'Not reusing 2 legacy panel' in warning and str(results_dir) in warning, warning
         assert 'ran at 30 turns, this run uses 90' in warning, warning
+        assert "production's budget" not in warning, warning
+
+    @pytest.mark.usefixtures('code_default_config')
+    @pytest.mark.asyncio
+    async def test_run_trial_counts_the_legacy_panels_its_budget_passes_over_before_any_reviewer_runs(
+        self, source: _Source, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        variant, results_dir = _unpinned_reviewer(), tmp_path / 'results'
+        diffs = [_diff_in(source, diff_id='d1'), _diff_in(source, diff_id='d2')]
+        for diff in diffs:
+            _write_legacy_panel(results_dir, PanelRunResult(variant_name=variant.name, diff_id=diff.diff_id))
+        warned_before_dispatch: list[bool] = []
+
+        async def _run_panel_noting_the_warning(*args, **kwargs) -> PanelRunResult:
+            warned_before_dispatch.append(any(
+                'legacy panel' in r.getMessage() for r in caplog.records if r.levelno == logging.WARNING
+            ))
+            return await run_panel(*args, **kwargs)
+
+        with (
+            caplog.at_level(logging.INFO, logger='orchestrator.evals.reviewer_trial.runner'),
+            _counted_reviewers() as dispatched,
+            patch('orchestrator.evals.reviewer_trial.runner.run_panel', side_effect=_run_panel_noting_the_warning),
+        ):
+            await run_trial(
+                [variant], CorpusManifest(diffs=diffs), results_dir=results_dir, stagger_secs=0, max_turns=30,
+            )
+
+        assert dispatched == ['ungated', 'ungated']
+        assert warned_before_dispatch == [True, True]
+        [warning] = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert 'Not reusing 2 legacy panel' in warning and str(results_dir) in warning, warning
+        assert "arms taking production's budget ran at $5.00, this run uses $12.00" in warning, warning
+        assert 'turns' not in warning, warning
+
+    @pytest.mark.usefixtures('code_default_config')
+    @pytest.mark.asyncio
+    async def test_run_trial_names_both_mismatches_when_both_pass_a_legacy_panel_over(
+        self, source: _Source, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        variant, diff, results_dir = _unpinned_reviewer(), _diff_in(source), tmp_path / 'results'
+        _write_legacy_panel(results_dir, PanelRunResult(variant_name=variant.name, diff_id=diff.diff_id))
+
+        with (
+            caplog.at_level(logging.WARNING, logger='orchestrator.evals.reviewer_trial.runner'),
+            _counted_reviewers(),
+        ):
+            await run_trial([variant], CorpusManifest(diffs=[diff]), results_dir=results_dir, stagger_secs=0)
+
+        [warning] = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert 'they ran at 30 turns, this run uses 90' in warning, warning
+        assert "arms taking production's budget ran at $5.00, this run uses $12.00" in warning, warning
+
+    @pytest.mark.asyncio
+    async def test_run_trial_at_the_legacy_turns_and_budget_reuses_every_legacy_panel(
+        self, source: _Source, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        variant, results_dir = _unpinned_reviewer(), tmp_path / 'results'
+        diffs = [_diff_in(source, diff_id='d1'), _diff_in(source, diff_id='d2')]
+        for diff in diffs:
+            _write_legacy_panel(results_dir, PanelRunResult(variant_name=variant.name, diff_id=diff.diff_id))
+
+        with (
+            caplog.at_level(logging.INFO, logger='orchestrator.evals.reviewer_trial.runner'),
+            _counted_reviewers() as dispatched,
+        ):
+            await run_trial(
+                [variant], CorpusManifest(diffs=diffs), results_dir=results_dir, stagger_secs=0,
+                max_turns=30, production_budget=5.0,
+            )
+
+        assert dispatched == []
+        [warning] = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert 'Reused 2 legacy panel' in warning, warning
 
     @pytest.mark.usefixtures('code_default_config')
     @pytest.mark.asyncio
@@ -1258,6 +1586,23 @@ class TestPanelCache:
             )
 
         assert [call.kwargs['max_turns'] for call in spy.await_args_list] == [90, 90]
+
+    @pytest.mark.usefixtures('code_default_config')
+    @pytest.mark.asyncio
+    async def test_run_trial_runs_every_pair_at_one_resolved_production_budget(
+        self, source: _Source, tmp_path: Path,
+    ) -> None:
+        diffs = [_diff_in(source, diff_id='d1'), _diff_in(source, diff_id='d2')]
+
+        with (
+            _counted_reviewers(),
+            patch('orchestrator.evals.reviewer_trial.runner.run_panel_cached', wraps=run_panel_cached) as spy,
+        ):
+            await run_trial(
+                [_unpinned_reviewer()], CorpusManifest(diffs=diffs), results_dir=tmp_path / 'results', stagger_secs=0,
+            )
+
+        assert [call.kwargs['production_budget'] for call in spy.await_args_list] == [12.0, 12.0]
 
     @pytest.mark.asyncio
     async def test_run_trial_threads_its_stagger_to_each_panel(self, source: _Source, tmp_path: Path) -> None:
@@ -1477,3 +1822,32 @@ class TestRunAndScore:
 
         assert [c['max_turns'] for c in reviewer_calls] == [30]
         assert [p.run_key.max_turns for p in _stored_panels(results_dir) if p.run_key is not None] == [30]
+
+    @pytest.mark.asyncio
+    async def test_run_and_score_threads_its_production_budget_to_the_panels(
+        self, source: _Source, tmp_path: Path,
+    ) -> None:
+        reviewer_calls: list[dict] = []
+        write_verdict = _make_verdict_writing_invoke('ISSUES_FOUND', issues=[_BLOCKING_ISSUE])
+        results_dir = tmp_path / 'results'
+
+        async def reviewer(**kwargs):
+            reviewer_calls.append(kwargs)
+            return await write_verdict(**kwargs)
+
+        async def matcher(**kwargs: object):
+            return answered({'matches': []})
+
+        with (
+            patch('orchestrator.evals.reviewer_trial.runner.invoke_agent', side_effect=reviewer),
+            patch('orchestrator.evals.reviewer_trial.scorer.invoke_agent', matcher),
+        ):
+            await run_and_score(
+                [_unpinned_reviewer()], CorpusManifest(diffs=[_scored_diff(source, 'd_ok', 'OK_MARKER')]),
+                results_dir=results_dir, stagger_secs=0, production_budget=5.0,
+            )
+
+        assert [c['max_budget_usd'] for c in reviewer_calls] == [5.0]
+        assert [
+            p.run_key.reviewer_budgets_usd for p in _stored_panels(results_dir) if p.run_key is not None
+        ] == [(5.0,)]

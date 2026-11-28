@@ -870,6 +870,8 @@ class TestCampaignRound2ArmsAndTurnCap:
         ]
         assert fake.awaits[0].kwargs['max_turns'] == 90
         assert 'turn cap 90' in result.output
+        assert fake.awaits[0].kwargs['production_budget'] == 12.0
+        assert 'production budget $12.00' in result.output
 
     def test_max_turns_30_reaches_every_trial(self, tmp_path: Path) -> None:
         result, fake = self._invoke(
@@ -879,6 +881,22 @@ class TestCampaignRound2ArmsAndTurnCap:
         assert result.exit_code == 0, f'{result.output}\n{result.exception!r}'
         assert [a.kwargs['max_turns'] for a in fake.awaits] == [30, 30]
         assert 'turn cap 30' in result.output
+
+    def test_production_budget_5_reaches_every_trial(self, tmp_path: Path) -> None:
+        result, fake = self._invoke(
+            tmp_path, '--arms', 'variant_a,variant_a_xhigh', '--max-turns', '30', '--production-budget', '5',
+            trials='2',
+        )
+
+        assert result.exit_code == 0, f'{result.output}\n{result.exception!r}'
+        assert [a.kwargs['production_budget'] for a in fake.awaits] == [5.0, 5.0]
+        assert 'production budget $5.00' in result.output
+
+    def test_a_non_positive_production_budget_is_a_usage_error(self, tmp_path: Path) -> None:
+        result, fake = self._invoke(tmp_path, '--arms', 'variant_a', '--production-budget', '0')
+
+        assert result.exit_code == 2, f'{result.output}\n{result.exception!r}'
+        assert fake.awaits == []
 
     def test_a_non_positive_max_turns_is_a_usage_error(self, tmp_path: Path) -> None:
         result, fake = self._invoke(tmp_path, '--arms', 'variant_a', '--max-turns', '0')
