@@ -1909,7 +1909,7 @@ class TestRollupRendersRigProducedRows:
 
             assert '## Per-(model×role) rollup' in rendered
             assert (
-                '| model | role | invocations | done% | blocked% | cap-hit% | $/done |'
+                '| model | role | invocations | done% | blocked% | cap-hit% | $ per done run |'
                 in rendered
             )
             expected_stock_line = (

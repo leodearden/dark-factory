@@ -19153,10 +19153,13 @@ class Harness:
            the submissions diff (the EWA NUMERATOR).
         5. Compute window (last window_end → now).
         6. Aggregate escalation stats (fail-open).
-        7. Count done tasks in EventStore (fail-open).
-           done_count from EventStore is the single source of truth for both
-           the rendered digest figure and the update_ewa input — ensuring the
-           operator sees exactly the number that drove the EWA decision.
+        7. Count done runs in EventStore (fail-open): the former count, the
+           EWA denominator.  It is rendered beside the numerator under
+           digest.DONE_RUNS_LABEL, so the operator sees exactly the number
+           that drove the EWA decision.
+        7b. Count landings on main in the window (fail-open, None when
+            unreadable) through asyncio.to_thread: landings() runs a blocking
+            git first-parent cross-check that would otherwise stall the loop.
         8. Query cost stats from CostStore (fail-open).
         9. Read parked-task counts from Scheduler state.
         10. Update EWA using EventStore done_count.
@@ -19248,6 +19251,17 @@ class Harness:
                 )
                 if events_db_path is not None
                 else 0
+            )
+
+            # (7b) Landings in window, off the loop (INV-8; landings() runs git).
+            landings_count = (
+                await asyncio.to_thread(
+                    digest_mod.landings_in_window,
+                    events_db_path, Path(self.config.project_root), window_start, window_end,
+                    main_ref=self.config.git.main_branch,
+                )
+                if events_db_path is not None
+                else None
             )
 
             # (8) Cost stats (fail-open via cost_in_window).
@@ -19347,6 +19361,7 @@ class Harness:
                 pause_visibility=pause_visibility,
                 chain_telemetry=chain_telemetry,
                 lane_record_divergence=lane_record_divergence,
+                landings_count=landings_count,
             )
 
             digest_mod.write_digest_entry(digest_dir, inputs)

@@ -413,7 +413,7 @@ function OrchTab({ projectFilter, search }) {
                   <div>
                     <div style={{ fontSize: 11, color: 'var(--fg-3)', marginBottom: 4 }}>Started · {o.started}</div>
                     <div style={{ fontSize: 11, color: 'var(--fg-3)', marginBottom: 4 }}>Updated · {window.DF_SHELL.timeago(o.last_update)}</div>
-                    <div style={{ fontSize: 11, color: 'var(--fg-3)', marginBottom: 4 }}>Completed / day · {windowLabel(windowEcho(DF.__receipt, EP.burndown))}</div>
+                    <div style={{ fontSize: 11, color: 'var(--fg-3)', marginBottom: 4 }}>Closed / day (any path: gates, recon and bulk closes included) · {windowLabel(windowEcho(DF.__receipt, EP.burndown))}</div>
                     <div style={{ height: 50 }}><SP values={DF.BURNDOWN_BY_PROJECT[o.project]?.completed_per_day?.values || []} color={CP.accent} /></div>
                   </div>
                 </div>
@@ -1205,7 +1205,7 @@ function BurnTab({ projectFilter, displayWindow }) {
             deltaDir={pendingNow < pendingThen ? 'down' : 'up'}
             history={b.pending} sparkColor={CP.warn} />
         <ST label="Forecast clear" datum={burndownDatum(DF, b, 'forecast')} format={forecastText}
-            hint="7d vs lifetime velocity" history={b.pending} sparkColor={CP.ok} />
+            hint="backlog drain at the 7d vs lifetime close rate, not landings" history={b.pending} sparkColor={CP.ok} />
       </div>
 
       <div className="col-span-12" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
@@ -1304,7 +1304,7 @@ function BurnTab({ projectFilter, displayWindow }) {
                   <div className="panel-head"><span className="title">Velocity</span></div>
                   <div className="panel-body" style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
                     <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
-                      <div><div className="mono" style={{ fontSize: 22, color: CP.ok }}><DatumReading datum={pbLatest} format={r => r.velocity.toFixed(1)} /></div><div style={{ fontSize: 10, color: 'var(--fg-3)' }}>completed/day</div></div>
+                      <div><div className="mono" style={{ fontSize: 22, color: CP.ok }}><DatumReading datum={pbLatest} format={r => r.velocity.toFixed(1)} /></div><div style={{ fontSize: 10, color: 'var(--fg-3)' }}>closed/day (any path)</div></div>
                       <div><div className="mono" style={{ fontSize: 22, color: CP.warn }}><DatumReading datum={pbLatest} format={r => r.counts.pending} /></div><div style={{ fontSize: 10, color: 'var(--fg-3)' }}>pending now</div></div>
                     </div>
                     <div>

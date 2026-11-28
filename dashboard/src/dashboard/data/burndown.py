@@ -709,6 +709,10 @@ def aggregate_forecast_confidence(
     fewer than 7 distinct days overall, gives
     ``{forecast_low: None, forecast_high: None}`` (no synthesis on sparse or
     ragged history).
+
+    The band is backlog drain at the done-count close rate, every close
+    counted, not a landing rate: landings on main are
+    ``plans/quality-dashboard-prd.md``'s series.
     """
     none = {'forecast_low': None, 'forecast_high': None}
     measured: list[tuple[list[Any], list[Any]]] = []
@@ -883,8 +887,9 @@ def compute_window_completion(series: Mapping[str, Any]) -> dict[str, Any]:
     one entry per distinct ISO day: that day's last ``done`` minus the
     previous day's, the first day measured from the window's first row, each
     clamped at 0. It has ``window_days`` entries, and sums to ``completed``
-    whenever ``done`` never falls. It is what the OrchTab "Completed / day"
-    spark plots, so the client re-derives nothing.
+    whenever ``done`` never falls. It is what the OrchTab "Closed / day (any
+    path: gates, recon and bulk closes included)" spark plots, so the client
+    re-derives nothing.
 
     Returns ``{completed: 0, velocity: 0.0, window_days: 0}`` with an empty
     ``completed_per_day`` on empty / mismatched / single-snapshot input.

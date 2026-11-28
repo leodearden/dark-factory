@@ -352,9 +352,17 @@ class TestQueueProjectRoots:
         ])
 
         assert roots == {
-            'dark_factory': Path(_queue(df_root)).parents[1],
-            'reify': Path(reify_queue).parents[1],
+            'dark_factory': (Path(_queue(df_root)).parents[1],),
+            'reify': (Path(reify_queue).parents[1],),
         }
+
+    def test_every_root_a_project_folds_from_is_kept_in_scan_order(self, tmp_path, df_root):
+        twin = tmp_path / 'elsewhere' / 'dark_factory'
+        (twin / 'data' / 'escalations').mkdir(parents=True)
+
+        roots = mod.queue_project_roots([_queue(df_root), _recon_queue(df_root), _queue(twin)])
+
+        assert roots['dark_factory'] == (df_root, twin)
 
 
 class TestFailOpen:
@@ -403,6 +411,20 @@ class TestGlossary:
         }
         assert glossary.tasks['dark_factory'] == {'80': 'subject task', '90': 'cited task'}
         assert glossary.shortfalls == ()
+
+    def test_the_first_scanned_root_of_a_folded_project_is_the_one_glossed(self, tmp_path, fleet, df_root,
+                                                                           make_tasks_db):
+        _write_escalation(df_root / 'data' / 'escalations', id='esc-80-1', level=2)
+        make_tasks_db([{'id': 80, 'title': 'subject task'}], directory=df_root / '.taskmaster' / 'tasks')
+        twin = tmp_path / 'elsewhere' / 'dark_factory'
+        (twin / 'data' / 'escalations').mkdir(parents=True)
+        (twin / '.taskmaster' / 'tasks').mkdir(parents=True)
+        make_tasks_db([{'id': 80, 'title': 'twin task'}], directory=twin / '.taskmaster' / 'tasks')
+        inv = _collect([_queue(df_root), _queue(twin)], fleet)
+
+        glossary = mod.build_glossary(inv.items, inv.escalation_index)
+
+        assert glossary.tasks['dark_factory'] == {'80': 'subject task'}
 
     def test_missing_tasks_db_is_a_named_shortfall(self, fleet, df_root):
         _write_escalation(df_root / 'data' / 'escalations', id='esc-82-1', level=2)
