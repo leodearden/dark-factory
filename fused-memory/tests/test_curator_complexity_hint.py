@@ -4,7 +4,8 @@ Contract: plans/routing-experiment-substrate-prd.md §"Experiment 2: the curator
 
 Driven through public seams only: jsonschema over the exported output
 schemas, ``TaskCurator.curate_prepared`` with its invoker injected through
-the constructor, and the pure ``with_complexity_hint``. No private name is
+the constructor, the pure ``with_complexity_hint``, and the real submit stack
+of ``_submit_stack.py`` with its scripted curator. No private name is
 patched.
 """
 
@@ -26,6 +27,10 @@ from _curator_helpers import (
     prepared,
     tripwire,
 )
+from _submit_stack import CuratorScript, Stack
+from _submit_stack import curator_script as curator_script
+from _submit_stack import passthrough_main_checkout as passthrough_main_checkout
+from _submit_stack import stack as stack
 from shared.routing_split import split_bucket
 
 from fused_memory.middleware.candidate_key import compute_candidate_key
@@ -289,3 +294,75 @@ class TestWireForms:
 ], ids=['empty', 'files', 'simple-with-files'])
 def test_the_hint_key_does_not_change_what_the_submit_gate_accepts(shape):
     assert simple_task_files_error({**shape, HINT: 'simple'}) is None
+
+
+_DESCRIPTION = 'One-line wording fix.'
+
+
+@pytest.mark.asyncio
+class TestTheSubmitBoundary:
+    async def test_the_treated_arm_lands_simple_keyed_on_the_stored_candidate_key(
+        self, stack: Stack, curator_script: CuratorScript,
+    ):
+        title = _title_on_arm(1, FILES)
+        curator_script.decisions.append(SIMPLE_CREATE)
+
+        task_id = await stack.file_normal(
+            title=title, description=_DESCRIPTION, metadata={'files': FILES},
+        )
+
+        row = await stack.row(task_id)
+        metadata = row['metadata']
+        assert (metadata['complexity'], metadata[HINT], metadata[ARM_KEY]) == (
+            'simple', 'simple', compute_candidate_key(title, FILES),
+        )
+        assert metadata[ARM_KEY] == row['candidate_key']
+
+    async def test_the_untreated_arm_lands_with_the_hint_and_no_declaration(
+        self, stack: Stack, curator_script: CuratorScript,
+    ):
+        title = _title_on_arm(0, FILES)
+        curator_script.decisions.append(SIMPLE_CREATE)
+
+        task_id = await stack.file_normal(
+            title=title, description=_DESCRIPTION, metadata={'files': FILES},
+        )
+
+        metadata = await stack.metadata(task_id)
+        assert (metadata[HINT], metadata[ARM_KEY]) == ('simple', compute_candidate_key(title, FILES))
+        assert 'complexity' not in metadata
+
+    async def test_the_filers_complexity_wins(self, stack: Stack, curator_script: CuratorScript):
+        curator_script.decisions.append(SIMPLE_CREATE)
+
+        task_id = await stack.file_normal(
+            title=_title_on_arm(1, FILES), description=_DESCRIPTION,
+            metadata={'files': FILES, 'complexity': 'standard'},
+        )
+
+        metadata = await stack.metadata(task_id)
+        assert (metadata['complexity'], metadata[HINT]) == ('standard', 'simple')
+
+    async def test_the_default_create_records_a_null_hint_and_declares_nothing(
+        self, stack: Stack, curator_script: CuratorScript,
+    ):
+        task_id = await stack.file_normal(
+            title=_title_on_arm(1, FILES), description=_DESCRIPTION, metadata={'files': FILES},
+        )
+
+        metadata = await stack.metadata(task_id)
+        assert metadata[HINT] is None
+        assert 'complexity' not in metadata
+        assert ARM_KEY not in metadata
+
+    async def test_planning_mode_is_untouched(self, stack: Stack, curator_script: CuratorScript):
+        curator_script.decisions.append(SIMPLE_CREATE)
+
+        task_id = await stack.file_planned(
+            title=_title_on_arm(1, FILES), description=_DESCRIPTION, metadata={'files': FILES},
+        )
+
+        metadata = await stack.metadata(task_id)
+        assert HINT not in metadata
+        assert 'complexity' not in metadata
+        assert curator_script.handed == []
