@@ -522,28 +522,33 @@ class TestReadBeforeKill:
 
 
 class TestAllocateCommandCapture:
-    def test_the_directory_exists_inside_the_block_and_is_removed_after(self):
-        with allocate_command_capture() as capture:
+    @pytest.mark.asyncio
+    async def test_the_directory_exists_inside_the_block_and_is_removed_after(self):
+        async with allocate_command_capture() as capture:
             directory = capture.directory
             assert directory is not None
             assert directory.is_dir()
             (directory / 'cpu.stat').write_text(CPU_STAT_TEXT)
         assert not directory.exists()
 
-    def test_the_directory_is_removed_when_the_block_raises(self):
-        with pytest.raises(RuntimeError), allocate_command_capture() as capture:
-            directory = capture.directory
-            raise RuntimeError('boom')
+    @pytest.mark.asyncio
+    async def test_the_directory_is_removed_when_the_block_raises(self):
+        directory = None
+        with pytest.raises(RuntimeError):
+            async with allocate_command_capture() as capture:
+                directory = capture.directory
+                raise RuntimeError('boom')
         assert directory is not None
         assert not directory.exists()
 
-    def test_an_allocation_failure_degrades_to_an_unavailable_capture(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_an_allocation_failure_degrades_to_an_unavailable_capture(self, monkeypatch):
         def refuse(*args, **kwargs):
             raise OSError(28, 'No space left on device')
 
         monkeypatch.setattr(tempfile, 'mkdtemp', refuse)
 
-        with allocate_command_capture() as capture:
+        async with allocate_command_capture() as capture:
             assert capture.directory is None
             assert capture.wrap('echo hi') == 'echo hi'
             capture.launched(LAUNCHED)
@@ -925,7 +930,7 @@ class TestRunCmdCapturesInItsRealScope:
     @pytest.mark.asyncio
     @pytest.mark.timeout(60)
     async def test_capture_at_exit(self, tmp_path, real_project_slice: RealProjectSlice):
-        with allocate_command_capture() as capture:
+        async with allocate_command_capture() as capture:
             captured = await _scoped(
                 ALLOCATE_200_MIB, tmp_path, real_project_slice.slice_name, capture=capture
             )
@@ -947,7 +952,7 @@ class TestRunCmdCapturesInItsRealScope:
     async def test_capture_at_exit_keeps_a_failing_rc(
         self, tmp_path, real_project_slice: RealProjectSlice
     ):
-        with allocate_command_capture() as capture:
+        async with allocate_command_capture() as capture:
             rc, _output, timed_out = await _scoped(
                 'echo failing; exit 3', tmp_path, real_project_slice.slice_name, capture=capture
             )
@@ -962,7 +967,7 @@ class TestRunCmdCapturesInItsRealScope:
     async def test_capture_on_timeout_is_read_before_the_kill(
         self, tmp_path, real_project_slice: RealProjectSlice
     ):
-        with allocate_command_capture() as capture:
+        async with allocate_command_capture() as capture:
             _rc, _output, timed_out = await _scoped(
                 'sleep 30', tmp_path, real_project_slice.slice_name, timeout=5, capture=capture
             )
@@ -980,7 +985,7 @@ class TestRunCmdCapturesInItsRealScope:
     async def test_a_relocating_command_that_exits_reads_relocated(
         self, tmp_path, inner_unit, real_project_slice: RealProjectSlice
     ):
-        with allocate_command_capture() as capture:
+        async with allocate_command_capture() as capture:
             rc, _output, _ = await _scoped(
                 _relocating(inner_unit, 4),
                 tmp_path,
@@ -999,7 +1004,7 @@ class TestRunCmdCapturesInItsRealScope:
     async def test_a_relocating_command_that_is_killed_reads_relocated(
         self, tmp_path, inner_unit, real_project_slice: RealProjectSlice
     ):
-        with allocate_command_capture() as capture:
+        async with allocate_command_capture() as capture:
             _rc, _output, timed_out = await _scoped(
                 _relocating(inner_unit, 30),
                 tmp_path,
@@ -1018,7 +1023,7 @@ class TestRunCmdWithoutAScope:
     @pytest.mark.asyncio
     async def test_scope_off_runs_unchanged_and_reads_unavailable(self, tmp_path):
         cmd = 'echo out; echo err >&2; exit 4'
-        with allocate_command_capture() as capture:
+        async with allocate_command_capture() as capture:
             captured = await _run_cmd(cmd, tmp_path, timeout=UNREACHED_COMMAND_TIMEOUT_SECS, capture=capture)
             record = capture.record(**IDENTITY)
         bare = await _run_cmd(cmd, tmp_path, timeout=UNREACHED_COMMAND_TIMEOUT_SECS)
@@ -1033,7 +1038,7 @@ class TestRunCmdWithoutAScope:
     ):
         monkeypatch.setattr(shutil, 'which', lambda _name: None)
         cmd = 'echo out; exit 2'
-        with allocate_command_capture() as capture:
+        async with allocate_command_capture() as capture:
             captured = await _run_cmd(
                 cmd,
                 tmp_path,

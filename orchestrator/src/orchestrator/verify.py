@@ -8459,7 +8459,7 @@ async def run_verification(
                                 f'{shlex.join(seg_prefix)} /bin/bash -c {shlex.quote(governed)}'
                             )
                     segment_started_at = datetime.now(UTC).isoformat()
-                    with allocate_command_capture() as capture:
+                    async with allocate_command_capture() as capture:
                         segment_outcome = await _run_cmd(
                             governed,
                             segment_cwd,
@@ -8503,7 +8503,7 @@ async def run_verification(
                 resources = None
             else:
                 segment_dicts = None
-                with allocate_command_capture() as capture:
+                async with allocate_command_capture() as capture:
                     outcome = await _run_cmd(
                         cmd,
                         worktree,

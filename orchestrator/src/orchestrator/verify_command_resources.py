@@ -32,10 +32,9 @@ import dataclasses
 import logging
 import os
 import shlex
-import shutil
 import socket
 import tempfile
-from collections.abc import Awaitable, Iterable, Iterator, Mapping
+from collections.abc import AsyncIterator, Awaitable, Iterable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -55,6 +54,7 @@ from shared.cgroup_stats import (
 from shared.proc_group import unified_cgroup_path
 
 from orchestrator.relocated_scopes import SpawnedChild, relocated_scopes
+from orchestrator.tree_removal import remove_tree
 
 logger = logging.getLogger(__name__)
 
@@ -480,9 +480,11 @@ def wrapped_command(script: str) -> str | None:
     return command if opened and closed else None
 
 
-@contextlib.contextmanager
-def allocate_command_capture(*, cgroup_root: Path = CGROUP_ROOT) -> Iterator[CommandCapture]:
-    """A fresh capture directory, removed on exit.
+@contextlib.asynccontextmanager
+async def allocate_command_capture(
+    *, cgroup_root: Path = CGROUP_ROOT
+) -> AsyncIterator[CommandCapture]:
+    """A fresh capture directory, removed off the event loop thread on exit.
 
     Allocation failure is logged and yields a capture with no directory, whose
     record reads ``unavailable``, so the verify runs on rather than failing.
@@ -498,10 +500,7 @@ def allocate_command_capture(*, cgroup_root: Path = CGROUP_ROOT) -> Iterator[Com
         yield CommandCapture(directory, cgroup_root=cgroup_root, allocation_error=error)
     finally:
         if directory is not None:
-            try:
-                shutil.rmtree(directory)
-            except OSError as exc:
-                logger.warning('could not remove verify capture directory %s: %s', directory, exc)
+            await remove_tree(directory, ignore_errors=True)
 
 
 class _ScopeFinder(Protocol):
