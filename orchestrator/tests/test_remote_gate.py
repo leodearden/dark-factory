@@ -1619,6 +1619,17 @@ def test_the_reaper_deletes_idle_sha_dirs_and_old_trash_only(gate_root: Path):
     assert not [p for p in gate_root.glob('.trash-*') if p != new_trash]
 
 
+def test_the_reaper_applies_the_seven_day_rule_to_the_minute(gate_root: Path):
+    just_past = _dir(gate_root, '5' * 40, days=7.1)
+    just_short = _dir(gate_root, '6' * 40, days=6.9)
+
+    result = _reap(gate_root)
+
+    assert result.returncode == 0, result.stderr
+    assert not just_past.exists()
+    assert just_short.exists()
+
+
 def test_the_reaper_leaves_an_unmarked_root_alone(gate_root: Path):
     (gate_root / GATE_ROOT_MARKER).unlink()
     idle = _dir(gate_root, '1' * 40, days=30)
