@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _defect_records_fake import FakeDefectRecords
 from _git_fixtures import RepoSeed, seed_repo
 from _orch_helpers import pydantic_spec, wire_scheduler_liveness_mock
 from escalation.models import Escalation
@@ -114,6 +115,8 @@ class FakeScheduler:
         # writes are absorbed, every other write lands.
         self.blocked_write_suppressed_ids: set[str] = set()
         self.submit_task_calls: list[tuple[dict, float]] = []
+        # declare_defect / record_defect_outcome, folded into task_data.
+        self.defect_records = FakeDefectRecords(self.task_data)
 
     async def set_task_status(
         self,
@@ -229,6 +232,8 @@ class FakeScheduler:
     async def dispatch_tool(
         self, name: str, arguments: dict, *, timeout: float = 15
     ) -> dict:
+        if self.defect_records.handles(name):
+            return await self.defect_records.dispatch(name, arguments)
         return {}
 
     async def submit_task(self, arguments: dict, *, timeout: float = 30) -> SubmitOutcome:
