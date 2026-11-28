@@ -116,6 +116,7 @@ from fused_memory.reconciliation.task_filter import (
     filter_task_tree,
 )
 from fused_memory.reconciliation.tree_read_instant import resolve_tree_read_instant
+from fused_memory.server.embedded_uvicorn import EmbeddedUvicornServer, embedded_uvicorn_config
 from fused_memory.services.id_resolver import IdResolver
 from fused_memory.services.live_workflow_detector import (
     TaskLiveness,
@@ -546,6 +547,15 @@ def _finding_is_live_actionable(finding: dict) -> bool:
 # the global asyncio namespace.
 _sleep = asyncio.sleep
 
+_ESCALATION_SERVER_GRACE_SECS = 5
+"""uvicorn's ``timeout_graceful_shutdown`` for the escalation server: its tool
+calls are queue-file writes, so in-flight requests finish well inside it."""
+
+_ESCALATION_SERVER_STOP_BOUND_SECS = 2 * _ESCALATION_SERVER_GRACE_SECS
+"""How long :meth:`ReconciliationHarness._stop_escalation_server` waits for a
+clean uvicorn shutdown before cancelling; well inside
+``fused_memory/server/main.py::_HARNESS_CANCEL_TIMEOUT``."""
+
 
 class UnknownProjectError(ValueError):
     """Raised when a project_id has no entry in the KNOWN_PROJECT_ROOTS registry.
@@ -966,6 +976,7 @@ class ReconciliationHarness:
         # Escalation support
         self._escalation_queue: EscalationQueue | None = escalation_queue
         self._escalation_task: asyncio.Task | None = None
+        self._escalation_server: EmbeddedUvicornServer | None = None
         self._escalation_url: str | None = None
 
         # Per-project concurrent loops
@@ -2566,16 +2577,19 @@ class ReconciliationHarness:
         port = self.config.escalation_port
 
         listener = self._escalation_listener
+        server = EmbeddedUvicornServer(
+            embedded_uvicorn_config(
+                mcp_server.http_app(),
+                host=host,
+                port=port,
+                timeout_graceful_shutdown=_ESCALATION_SERVER_GRACE_SECS,
+            )
+        )
+        self._escalation_server = server
 
         async def _serve():
             try:
-                if listener is None:
-                    await mcp_server.run_http_async(host=host, port=port)
-                else:
-                    import uvicorn
-
-                    config = uvicorn.Config(mcp_server.http_app(), log_level='warning')
-                    await uvicorn.Server(config).serve(sockets=[listener])
+                await server.serve(sockets=[listener] if listener is not None else None)
             except Exception as e:
                 logger.error(f'Escalation server error: {e}')
 
@@ -2590,13 +2604,29 @@ class ReconciliationHarness:
         self._escalation_url = escalation_url
 
     async def _stop_escalation_server(self) -> None:
-        """Stop the escalation server."""
-        if self._escalation_task is not None:
-            self._escalation_task.cancel()
+        """Stop the escalation server: a started one through uvicorn's own shutdown, otherwise by cancelling it.
+
+        Cancelling a live uvicorn server leaves its lifespan pending, which
+        logs a CancelledError traceback at loop teardown.
+        """
+        task, server = self._escalation_task, self._escalation_server
+        if task is None:
+            return
+        if server is not None and server.started:
+            server.should_exit = True
+            await asyncio.wait({task}, timeout=_ESCALATION_SERVER_STOP_BOUND_SECS)
+            if not task.done():
+                logger.warning(
+                    'Reconciliation escalation server did not shut down within %d s; cancelling it',
+                    _ESCALATION_SERVER_STOP_BOUND_SECS,
+                )
+        if not task.done():
+            task.cancel()
             with suppress(asyncio.CancelledError):
-                await self._escalation_task
-            self._escalation_task = None
-            logger.info('Reconciliation escalation server stopped')
+                await task
+        self._escalation_task = None
+        self._escalation_server = None
+        logger.info('Reconciliation escalation server stopped')
 
     async def _shutdown_usage_gate(self) -> None:
         """Tear down the usage gate, best-effort: the one built from config or the one injected."""

@@ -20,7 +20,7 @@ async def create_escalation_server_kwargs(harness: ReconciliationHarness) -> dic
     with (
         patch(
             f'{_HARNESS_MODULE}.create_escalation_server',
-            return_value=MagicMock(run_http_async=AsyncMock()),
+            return_value=MagicMock(),
         ) as mock_create,
         patch(f'{_HARNESS_MODULE}._sleep', AsyncMock()),
         patch(f'{_HARNESS_MODULE}.HAS_ESCALATION', True),

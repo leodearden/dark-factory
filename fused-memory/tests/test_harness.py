@@ -606,7 +606,7 @@ async def test_harness_construction_has_no_vestigial_stages(
         ),
         patch(
             'fused_memory.reconciliation.harness.create_escalation_server',
-            return_value=MagicMock(run_http_async=AsyncMock()),
+            return_value=MagicMock(),
         ),
         patch('fused_memory.reconciliation.harness._sleep', AsyncMock()),
         patch('fused_memory.reconciliation.harness.HAS_ESCALATION', True),
