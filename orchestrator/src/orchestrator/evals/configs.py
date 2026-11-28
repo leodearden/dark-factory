@@ -711,7 +711,7 @@ MIMO_AUTH_TOKEN_ENV = 'MIMO_API_KEY'
 MINIMAX_MODEL = 'MiniMax-M3.1-Flash'
 GLM_MODEL = 'glm-5.3'
 GLM_FLASH_MODEL = 'glm-5.3-flash'
-DEEPSEEK_MODEL = 'deepseek-v4'
+DEEPSEEK_MODEL = 'deepseek-flash'
 KIMI_MODEL = 'kimi-latest'
 MIMO_PRO_MODEL = 'mimo-v2.6-pro'
 MIMO_FLASH_MODEL = 'mimo-v2.6-flash'
@@ -784,7 +784,7 @@ def claude_endpoint_candidates() -> list[EvalConfig]:
     """Incumbents (native cloud Opus/Sonnet) + the non-incumbent endpoint bundles.
 
     Each non-incumbent bundle is a (harness, model) candidate — Claude Code
-    driving MiniMax M3.1 Flash / GLM-5.3 / GLM-5.3-Flash / DeepSeek V4 / Kimi /
+    driving MiniMax M3.1 Flash / GLM-5.3 / GLM-5.3-Flash / DeepSeek V4.1 Flash / Kimi /
     MiMo V2.6 Pro / MiMo V2.6 Flash via their official Anthropic-format
     endpoint (PRD C5). ADDITIVE to
     :func:`ofat_candidates`:
@@ -809,8 +809,11 @@ def claude_endpoint_candidates() -> list[EvalConfig]:
             'glm-5.3-flash-endpoint', GLM_FLASH_MODEL,
             base_url=GLM_BASE_URL, auth_token_env=GLM_AUTH_TOKEN_ENV,
         ),
+        # DEEPSEEK_MODEL is a floating alias (DeepSeek-V4.1-Flash-1017 on
+        # 2026-11-28), so the name pins the version and the cell's
+        # served_model detects a move (PRD decision 12).
         _claude_endpoint_config(
-            'deepseek-v4-endpoint', DEEPSEEK_MODEL,
+            'deepseek-v4.1-flash-endpoint', DEEPSEEK_MODEL,
             base_url=DEEPSEEK_BASE_URL, auth_token_env=DEEPSEEK_AUTH_TOKEN_ENV,
         ),
         _claude_endpoint_config(
@@ -866,7 +869,14 @@ CANDIDATE_ENDPOINT_PRICES: dict[str, CandidateEndpointPrice] = {
     GLM_FLASH_MODEL: CandidateEndpointPrice(
         0.15, 0.50, CostBasis.SUBSCRIPTION, cached_input_per_1m=0.03, cache_write_per_1m=0.15,
     ),
-    DEEPSEEK_MODEL: CandidateEndpointPrice(0.28, 0.42, CostBasis.METERED),
+    # PEAK rates from https://api-docs.deepseek.com/quick_start/pricing/,
+    # retrieved 2026-11-28, a conservative choice: peak is 01:00-04:00 and
+    # 06:00-10:00 UTC Mon-Fri, off-peak is exactly half, and no time-of-day
+    # billing is modelled, so an off-peak cell is over-stated 2x. No
+    # cache-write price is listed, so writes bill at the cache-miss input rate.
+    DEEPSEEK_MODEL: CandidateEndpointPrice(
+        0.30, 1.20, CostBasis.METERED, cached_input_per_1m=0.006, cache_write_per_1m=0.30,
+    ),
     KIMI_MODEL: CandidateEndpointPrice(0.60, 2.50, CostBasis.METERED),
     # Imputed list prices from https://mimo.mi.com/docs/en-US/pricing, retrieved
     # 2026-10-31; the Token Plan bills credits (PRD decision 16).
