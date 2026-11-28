@@ -16,6 +16,7 @@ import json
 import os
 import shutil
 import subprocess
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -286,3 +287,99 @@ def test_a_rules_file_only_on_another_branch_is_not_read(arm_repo):
     assert 'cannot read' in result.stderr
     assert PROJECT_RULES in result.stderr
     assert readout.calls() == []
+
+
+D0 = '2026-11-01T12:00:00+00:00'
+D1 = '2026-11-02T12:00:00+00:00'
+D2 = '2026-11-03T12:00:00+00:00'
+D3 = '2026-11-04T12:00:00+00:00'
+RULE_A_B_RULES = 'routing:\n  rules:\n    - id: rule-a\n    - id: rule-b\n'
+_IDENTITY = ('-c', 'user.email=t@e', '-c', 'user.name=t', '-c', 'commit.gpgsign=false')
+
+
+def _seeded_at(arm_repo, monkeypatch, at: str, files: dict[str, str], **kwargs):
+    """arm_repo(*files*, ...) with its seed commit authored and committed at *at*."""
+    with monkeypatch.context() as dated:
+        dated.setenv('GIT_AUTHOR_DATE', at)
+        dated.setenv('GIT_COMMITTER_DATE', at)
+        return arm_repo(files, **kwargs)
+
+
+def _commit_dated(
+    repo: Path, path: str, text: str, *, at: str,
+    branch: str | None = None, merged_at: str | None = None,
+) -> str:
+    """Commit *text* to *path* at *at*: directly on main, or on a new *branch*
+    from main that lands on main with a --no-ff merge at *merged_at*.
+
+    Only *path* is ever added, so the copied scripts/ dir stays untracked
+    across the checkouts. Returns `git rev-parse main`.
+    """
+    def git(*args: str, when: str) -> str:
+        env = {**scrubbed_git_env(os.environ), 'GIT_AUTHOR_DATE': when, 'GIT_COMMITTER_DATE': when}
+        return subprocess.run(
+            ['git', '-C', str(repo), *args], check=True, capture_output=True, text=True,
+            env=env, timeout=TIMEOUT,
+        ).stdout.strip()
+
+    if branch is not None:
+        git('checkout', '-q', '-b', branch, 'main', when=at)
+    target = repo / path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(text, encoding='utf-8')
+    git('add', path, when=at)
+    git(*_IDENTITY, 'commit', '-q', '-m', f'edit {path}', when=at)
+    if branch is not None:
+        assert merged_at is not None, 'a branch commit lands only through a merge'
+        git('checkout', '-q', 'main', when=merged_at)
+        git(*_IDENTITY, 'merge', '-q', '--no-ff', '-m', 'land', branch, when=merged_at)
+    return git('rev-parse', 'main', when=at)
+
+
+def _aa_until(readout) -> datetime:
+    (argv,) = [argv for argv in readout.calls() if '--aa' in argv]
+    return datetime.fromisoformat(argv[argv.index('--until') + 1])
+
+
+def test_aa_window_ends_where_main_first_carried_every_rule_id(arm_repo, monkeypatch):
+    repo, readout = _seeded_at(arm_repo, monkeypatch, D0, {RULES_FILE: RULE_A_RULES})
+    _commit_dated(repo, RULES_FILE, RULE_A_B_RULES, at=D1, branch='gamma', merged_at=D2)
+    _commit_dated(repo, RULES_FILE, RULE_A_B_RULES + '# a later edit\n', at=D3)
+
+    result = _run_arm(repo, 'exp-salt', 'rule-a,rule-b')
+
+    assert result.returncode == 1
+    assert "the readout's A/A check did not pass" in result.stderr
+    assert _aa_until(readout) == datetime.fromisoformat(D2)
+
+
+def test_rule_ids_removed_then_restored_anchor_on_the_restoring_commit(arm_repo, monkeypatch):
+    repo, readout = _seeded_at(arm_repo, monkeypatch, D0, {RULES_FILE: RULE_A_B_RULES})
+    _commit_dated(repo, RULES_FILE, RULE_A_RULES, at=D1)
+    _commit_dated(repo, RULES_FILE, RULE_A_B_RULES, at=D2)
+
+    result = _run_arm(repo, 'exp-salt', 'rule-a,rule-b')
+
+    assert result.returncode == 1
+    assert _aa_until(readout) == datetime.fromisoformat(D2)
+
+
+def test_flip_record_carries_treatment_from_and_the_landing_commit_beside_armed_at(
+    arm_repo, monkeypatch,
+):
+    repo, _readout = _seeded_at(
+        arm_repo, monkeypatch, D0, {RULES_FILE: RULE_A_RULES}, readout_exit=0,
+    )
+    _install_reload_gate_stub(repo)
+    landing = _commit_dated(repo, RULES_FILE, RULE_A_B_RULES, at=D1, branch='gamma', merged_at=D2)
+    _commit_dated(repo, RULES_FILE, RULE_A_B_RULES + '# a later edit\n', at=D3)
+
+    result = _run_arm(repo, 'exp-salt', 'rule-a,rule-b')
+
+    assert result.returncode == 0, result.stderr
+    (line,) = (repo / FLIP_LEDGER).read_text().splitlines()
+    flip = json.loads(line)
+    treatment_from = datetime.fromisoformat(flip['treatment_from'])
+    assert treatment_from == datetime.fromisoformat(D2)
+    assert flip['rules_landed_in'] == landing
+    assert datetime.fromisoformat(flip['armed_at']) > treatment_from
