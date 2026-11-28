@@ -46,6 +46,7 @@ from _campaign_gate_helpers import (
 from _campaign_gate_helpers import (
     eval_base_config as _base_config,
 )
+from _eval_config_lookup import named_eval_config
 
 from orchestrator.evals.configs import EvalConfig
 from orchestrator.evals.metrics import EvalMetrics, RoleUnderTest, dispatched_models, off_pin_roles
@@ -191,8 +192,13 @@ class TestBuildEvalOrchConfigAdmitsCandidateModel:
             ('implementer', lambda: {'config': _endpoint_impl_cfg()}),
             ('architect', lambda: {'config': _impl_cfg(), 'architect_config': _fable_arch_cfg()}),
             ('judge', lambda: {'config': _impl_cfg(), 'judge_config': _off_allowlist_judge_cfg()}),
+            ('implementer', lambda: {'config': named_eval_config('implementer-fable52-high')}),
+            ('implementer', lambda: {'config': named_eval_config('implementer-fable52-medium')}),
         ],
-        ids=['implementer', 'architect', 'judge'],
+        ids=[
+            'implementer', 'architect', 'judge',
+            'fable52-high-implementer', 'fable52-medium-implementer',
+        ],
     )
     def test_claude_candidate_seat_is_admitted_and_routes_unrejected(
         self, tmp_path: Path, role_name: str, build_kwargs,
@@ -225,7 +231,7 @@ class TestBuildEvalOrchConfigAdmitsCandidateModel:
         from orchestrator.evals.configs import get_config_by_name
         from orchestrator.evals.runner import build_eval_orch_config
 
-        codex = get_config_by_name('codex-gpt6-astra')
+        codex = get_config_by_name('codex-gpt6.2-sol')
         assert codex is not None and codex.backend != 'claude'
         base = _base_config(tmp_path)
         cfg = build_eval_orch_config(codex, {}, base)
@@ -296,7 +302,7 @@ class TestCellRoutingPinsEveryRoleModel:
         from orchestrator.evals.configs import get_config_by_name
         from orchestrator.evals.runner import build_eval_orch_config
 
-        codex = get_config_by_name('codex-gpt6-astra')
+        codex = get_config_by_name('codex-gpt6.2-sol')
         assert codex is not None and codex.backend != 'claude'
         cfg = build_eval_orch_config(codex, {}, _base_config(tmp_path))
 

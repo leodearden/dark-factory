@@ -5,8 +5,11 @@ ARCHITECT_EVAL_CONFIGS, and get_config_by_name.
 from __future__ import annotations
 
 import copy
+import logging
 
 import pytest
+from _campaign_gate_helpers import eval_base_config
+from _eval_config_lookup import named_eval_config
 from click.testing import CliRunner
 
 from orchestrator.cli import main
@@ -14,12 +17,15 @@ from orchestrator.evals.configs import (
     ARCHITECT_EVAL_CONFIGS,
     EVAL_CONFIGS,
     FINAL_RUN_CONFIGS,
+    NATIVE_IMPLEMENTER_CANDIDATE_CONFIGS,
     VLLM_EVAL_CONFIGS,
     EvalConfig,
+    claude_endpoint_candidates,
     get_config_by_name,
     ofat_candidates,
 )
-from orchestrator.evals.metrics import RoleUnderTest
+from orchestrator.evals.metrics import EndpointKind, RoleUnderTest
+from orchestrator.evals.runner import build_eval_orch_config
 
 VLLM_NAMES: frozenset[str] = frozenset(cfg.name for cfg in VLLM_EVAL_CONFIGS)
 
@@ -502,3 +508,57 @@ class TestArchitectEvalConfigs:
         assert 'architect-fable-max' in {
             c.name for c in ofat_candidates() if c.role == 'architect'
         }
+
+
+# The 2026-11-25 native-cloud implementer arms as LITERALS (task 11726):
+# (name, model, effort).
+_NATIVE_IMPLEMENTER_CANDIDATE_ARMS = [
+    ('implementer-fable52-high', 'claude-fable-5-2', 'high'),
+    ('implementer-fable52-medium', 'claude-fable-5-2', 'medium'),
+    ('implementer-opus-xhigh-control', 'opus', 'xhigh'),
+]
+
+
+class TestNativeImplementerCandidateConfigs:
+    """Named-only native implementer arms: Fable 5.2 at high and medium, plus
+    the opus-xhigh incumbent control run as an ordinary shadow cell (task 11726).
+    """
+
+    def test_roster_is_exactly_the_three_arms(self):
+        assert {c.name for c in NATIVE_IMPLEMENTER_CANDIDATE_CONFIGS} == {
+            name for name, _, _ in _NATIVE_IMPLEMENTER_CANDIDATE_ARMS
+        }
+
+    @pytest.mark.parametrize(('name', 'model', 'effort'), _NATIVE_IMPLEMENTER_CANDIDATE_ARMS)
+    def test_get_config_by_name_resolves_each_arm(self, name, model, effort):
+        cfg = named_eval_config(name)
+        assert cfg.backend == 'claude'
+        assert cfg.model == model
+        assert cfg.effort == effort
+        assert cfg.role == 'implementer'
+        assert not cfg.env_overrides
+        assert cfg.endpoint_kind is EndpointKind.NATIVE_ANTHROPIC
+
+    def test_arms_join_no_default_matrix_and_no_ofat_incumbent_set(self):
+        names = {named_eval_config(name).name for name, _, _ in _NATIVE_IMPLEMENTER_CANDIDATE_ARMS}
+
+        assert names.isdisjoint({c.name for c in EVAL_CONFIGS})
+        assert names.isdisjoint({c.name for c in ofat_candidates()})
+        assert names.isdisjoint({c.name for c in claude_endpoint_candidates()})
+
+    def test_resolving_an_arm_builds_no_endpoint_bundle(self, monkeypatch, caplog):
+        monkeypatch.delenv('MIMO_ANTHROPIC_BASE_URL', raising=False)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.evals.configs'):
+            config = named_eval_config('implementer-fable52-medium')
+
+        assert config.name == 'implementer-fable52-medium'
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING], caplog.text
+
+    @pytest.mark.parametrize(('name', 'model', 'effort'), _NATIVE_IMPLEMENTER_CANDIDATE_ARMS)
+    def test_build_eval_orch_config_carries_each_arm(self, tmp_path, name, model, effort):
+        cfg = build_eval_orch_config(named_eval_config(name), {}, eval_base_config(tmp_path))
+
+        assert cfg.models.implementer == model
+        assert cfg.effort.implementer == effort
+        assert cfg.backends.implementer == 'claude'

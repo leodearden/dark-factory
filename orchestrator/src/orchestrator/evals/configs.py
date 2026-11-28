@@ -481,8 +481,22 @@ ARCHITECT_EVAL_CONFIGS = [
 ]
 
 
+# ===== Named-only native implementer candidates (task 11726) =====
+# Native-cloud implementer arms resolved only by name, e.g. from
+# shadow_eval.candidates. Kept out of EVAL_CONFIGS so they join no default
+# `eval --matrix` run and _cloud_implementer_incumbents never counts the opus
+# control, which is production's implementer (opus at xhigh) run as an
+# ordinary shadow cell, as an OFAT incumbent. Fable 5.2 stays out of production
+# routing; the cell admits it (evals/runner.py::_admitted_claude_role_models).
+NATIVE_IMPLEMENTER_CANDIDATE_CONFIGS = [
+    EvalConfig('implementer-fable52-high', 'claude', 'claude-fable-5-2', 'high', role=RoleUnderTest.IMPLEMENTER),
+    EvalConfig('implementer-fable52-medium', 'claude', 'claude-fable-5-2', 'medium', role=RoleUnderTest.IMPLEMENTER),
+    EvalConfig('implementer-opus-xhigh-control', 'claude', 'opus', 'xhigh', role=RoleUnderTest.IMPLEMENTER),
+]
+
+
 def get_config_by_name(name: str) -> EvalConfig | None:
-    """Look up an eval config by name (implementer, architect, OR ν/ξ candidates).
+    """Look up an eval config by name (implementer, architect, named native implementer candidates, OR ν/ξ candidates).
 
     ν's ``claude_endpoint_candidates()``, ξ's ``codex_pi_candidates()``,
     ω's ``zcode_candidates()`` and ``mimo_code_candidates()`` bundles are searched LAST, and built only when no static config matched:
@@ -541,6 +555,7 @@ def registered_configs() -> Iterator[EvalConfig]:
     yield from EVAL_CONFIGS
     yield from FINAL_RUN_CONFIGS
     yield from ARCHITECT_EVAL_CONFIGS
+    yield from NATIVE_IMPLEMENTER_CANDIDATE_CONFIGS
     yield from claude_endpoint_candidates()
     yield from codex_pi_candidates()
     yield from zcode_candidates()
@@ -711,7 +726,7 @@ MIMO_AUTH_TOKEN_ENV = 'MIMO_API_KEY'
 MINIMAX_MODEL = 'MiniMax-M3.1-Flash'
 GLM_MODEL = 'glm-5.3'
 GLM_FLASH_MODEL = 'glm-5.3-flash'
-DEEPSEEK_MODEL = 'deepseek-v4'
+DEEPSEEK_MODEL = 'deepseek-flash'
 KIMI_MODEL = 'kimi-latest'
 MIMO_PRO_MODEL = 'mimo-v2.6-pro'
 MIMO_FLASH_MODEL = 'mimo-v2.6-flash'
@@ -784,7 +799,7 @@ def claude_endpoint_candidates() -> list[EvalConfig]:
     """Incumbents (native cloud Opus/Sonnet) + the non-incumbent endpoint bundles.
 
     Each non-incumbent bundle is a (harness, model) candidate — Claude Code
-    driving MiniMax M3.1 Flash / GLM-5.3 / GLM-5.3-Flash / DeepSeek V4 / Kimi /
+    driving MiniMax M3.1 Flash / GLM-5.3 / GLM-5.3-Flash / DeepSeek V4.1 Flash / Kimi /
     MiMo V2.6 Pro / MiMo V2.6 Flash via their official Anthropic-format
     endpoint (PRD C5). ADDITIVE to
     :func:`ofat_candidates`:
@@ -809,8 +824,11 @@ def claude_endpoint_candidates() -> list[EvalConfig]:
             'glm-5.3-flash-endpoint', GLM_FLASH_MODEL,
             base_url=GLM_BASE_URL, auth_token_env=GLM_AUTH_TOKEN_ENV,
         ),
+        # DEEPSEEK_MODEL is a floating alias (DeepSeek-V4.1-Flash-1017 on
+        # 2026-11-28), so the name pins the version and the cell's
+        # served_model detects a move (PRD decision 12).
         _claude_endpoint_config(
-            'deepseek-v4-endpoint', DEEPSEEK_MODEL,
+            'deepseek-v4.1-flash-endpoint', DEEPSEEK_MODEL,
             base_url=DEEPSEEK_BASE_URL, auth_token_env=DEEPSEEK_AUTH_TOKEN_ENV,
         ),
         _claude_endpoint_config(
@@ -866,7 +884,14 @@ CANDIDATE_ENDPOINT_PRICES: dict[str, CandidateEndpointPrice] = {
     GLM_FLASH_MODEL: CandidateEndpointPrice(
         0.15, 0.50, CostBasis.SUBSCRIPTION, cached_input_per_1m=0.03, cache_write_per_1m=0.15,
     ),
-    DEEPSEEK_MODEL: CandidateEndpointPrice(0.28, 0.42, CostBasis.METERED),
+    # PEAK rates from https://api-docs.deepseek.com/quick_start/pricing/,
+    # retrieved 2026-11-28, a conservative choice: peak is 01:00-04:00 and
+    # 06:00-10:00 UTC Mon-Fri, off-peak is exactly half, and no time-of-day
+    # billing is modelled, so an off-peak cell is over-stated 2x. No
+    # cache-write price is listed, so writes bill at the cache-miss input rate.
+    DEEPSEEK_MODEL: CandidateEndpointPrice(
+        0.30, 1.20, CostBasis.METERED, cached_input_per_1m=0.006, cache_write_per_1m=0.30,
+    ),
     KIMI_MODEL: CandidateEndpointPrice(0.60, 2.50, CostBasis.METERED),
     # Imputed list prices from https://mimo.mi.com/docs/en-US/pricing, retrieved
     # 2026-10-31; the Token Plan bills credits (PRD decision 16).
@@ -904,15 +929,14 @@ def claude_endpoint_price_table() -> dict[str, dict[str, float]]:
 # dispatch an evaluate-only backend in every default `--matrix` run and
 # perturb the OFAT incumbent floor).
 #
-#   - codex: a three-arm price/capability ladder (Astra / Sol / Terra), effort
-#     held at 'xhigh' on every arm so only the model varies.
+#   - codex: a two-arm price/capability ladder (Sol / Terra), effort held at
+#     'xhigh' on every arm so only the model varies.
 #   - pi + Sonnet: harness-isolating control — same model+effort as the
 #     claude-sonnet-max incumbent, only the backend varies, isolating
 #     harness effect from model effect.
 
-# Codex model ids from the 2026-11-01 frontier check (task 8086); list prices
+# Codex model ids from the 2026-11-25 frontier check (task 11726); list prices
 # live in config.py::_DEFAULT_PRICES.
-#   - Astra needs Codex CLI 0.153.0 or newer; reasoning effort high/xhigh/max.
 #   - Sol is the Rust implementer, evaluate-only (RUST CAUTION, PRD decision
 #     14 — Claude leads the only Rust-bearing public benchmarks and open-model
 #     Rust evidence is thin, so no architect-role variant and no production
@@ -920,8 +944,7 @@ def claude_endpoint_price_table() -> dict[str, dict[str, float]]:
 #   - Terra is the mid-price control.
 # A candidate name embeds its model id and is never re-pointed:
 # plans/live-shadow-eval-prd.md decision 12.
-CODEX_ASTRA_MODEL = 'gpt-6-astra'
-CODEX_SOL_MODEL = 'gpt-6.1-sol'
+CODEX_SOL_MODEL = 'gpt-6.2-sol'
 CODEX_TERRA_MODEL = 'gpt-6.1-terra'
 
 # Mirrors the claude-sonnet-max incumbent's model literal EXACTLY so the pi
@@ -933,18 +956,14 @@ PI_CONTROL_MODEL = 'sonnet'
 
 
 def codex_pi_candidates() -> list[EvalConfig]:
-    """The ξ candidate bundles: the three-arm codex slate + the pi Sonnet control.
+    """The ξ candidate bundles: the two-arm codex slate + the pi Sonnet control.
 
     ADDITIVE, mirroring claude_endpoint_candidates() above: resolved by name
     via get_config_by_name, never added to EVAL_CONFIGS/ofat_candidates.
     """
     return [
         EvalConfig(
-            'codex-gpt6-astra', 'codex', CODEX_ASTRA_MODEL, 'xhigh', role=RoleUnderTest.IMPLEMENTER,
-            endpoint_kind=EndpointKind.VENDOR_CLOUD,
-        ),
-        EvalConfig(
-            'codex-gpt6.1-sol', 'codex', CODEX_SOL_MODEL, 'xhigh', role=RoleUnderTest.IMPLEMENTER,
+            'codex-gpt6.2-sol', 'codex', CODEX_SOL_MODEL, 'xhigh', role=RoleUnderTest.IMPLEMENTER,
             endpoint_kind=EndpointKind.VENDOR_CLOUD,
         ),
         EvalConfig(

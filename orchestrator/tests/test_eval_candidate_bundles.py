@@ -1,6 +1,6 @@
 """Tests for ν's Claude-format-endpoint candidate bundles (task 2479).
 
-Non-incumbent (MiniMax M3.1 Flash, GLM-5.3, GLM-5.3-Flash, DeepSeek V4, Kimi) +
+Non-incumbent (MiniMax M3.1 Flash, GLM-5.3, GLM-5.3-Flash, DeepSeek V4.1 Flash, Kimi) +
 native-cloud incumbent (Opus/Sonnet) bundles, each a (harness, model) ``EvalConfig``
 dispatched via Claude Code against a provider's official Anthropic-format
 endpoint (PRD C5: per-role ``ANTHROPIC_BASE_URL``/``ANTHROPIC_AUTH_TOKEN``).
@@ -21,15 +21,15 @@ from __future__ import annotations
 
 import pytest
 
-# The endpoint slate as LITERALS, pinned by task 5384, extended by task 7991
-# and moved to the 2026-11-01 frontier by task 8086, deliberately not read
-# from the ``*_MODEL`` constants: a pin that reads what it protects guards
-# nothing (INV-10).
+# The endpoint slate as LITERALS, pinned by task 5384, extended by task 7991,
+# moved to the 2026-11-01 frontier by task 8086 and refreshed by task 11726,
+# deliberately not read from the ``*_MODEL`` constants: a pin that reads what
+# it protects guards nothing (INV-10).
 _SLATE_MODELS_BY_NAME = {
     'minimax-m3.1-flash-endpoint': 'MiniMax-M3.1-Flash',
     'glm-5.3-endpoint': 'glm-5.3',
     'glm-5.3-flash-endpoint': 'glm-5.3-flash',
-    'deepseek-v4-endpoint': 'deepseek-v4',
+    'deepseek-v4.1-flash-endpoint': 'deepseek-flash',
     'kimi-endpoint': 'kimi-latest',
     'mimo-v2.6-pro-endpoint': 'mimo-v2.6-pro',
     'mimo-v2.6-flash-endpoint': 'mimo-v2.6-flash',
@@ -40,7 +40,7 @@ _SLATE_LIST_PRICES = [
     ('MiniMax-M3.1-Flash', 0.15, 0.60, None, None),
     ('glm-5.3', 1.40, 4.40, 0.26, 1.40),
     ('glm-5.3-flash', 0.15, 0.50, 0.03, 0.15),
-    ('deepseek-v4', 0.28, 0.42, None, None),
+    ('deepseek-flash', 0.30, 1.20, 0.006, 0.30),
     ('kimi-latest', 0.60, 2.50, None, None),
     ('mimo-v2.6-pro', 0.435, 0.87, None, None),
     ('mimo-v2.6-flash', 0.14, 0.28, None, None),
@@ -493,7 +493,7 @@ class TestCandidatePriceCostBasis:
         ('glm-5.3', 'subscription', True),
         ('glm-5.3-flash', 'subscription', True),
         ('MiniMax-M3.1-Flash', 'metered', False),
-        ('deepseek-v4', 'metered', False),
+        ('deepseek-flash', 'metered', False),
         ('kimi-latest', 'metered', False),
         ('mimo-v2.6-pro', 'subscription', True),
         ('mimo-v2.6-flash', 'subscription', True),
@@ -573,6 +573,7 @@ class TestEndpointSlatePin:
             'glm-5.3-endpoint': 'https://api.z.ai/api/anthropic',
             'glm-5.3-flash-endpoint': 'https://api.z.ai/api/anthropic',
             'minimax-m3.1-flash-endpoint': 'https://api.minimax.io/anthropic',
+            'deepseek-v4.1-flash-endpoint': 'https://api.deepseek.com/anthropic',
         }
         for name, base_url in expected_base_url.items():
             assert by_name[name].env_overrides['ANTHROPIC_BASE_URL'] == base_url
@@ -591,3 +592,9 @@ class TestEndpointSlatePin:
         from orchestrator.evals.configs import get_config_by_name
 
         assert get_config_by_name('minimax-m3-endpoint') is None
+
+    def test_retired_deepseek_name_resolves_to_none(self):
+        """A retired candidate name never resolves to its line's newer model."""
+        from orchestrator.evals.configs import get_config_by_name
+
+        assert get_config_by_name('deepseek-v4-endpoint') is None

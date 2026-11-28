@@ -3616,7 +3616,7 @@ class TestOrchestratorConfigPrices:
     """
 
     _SEED_KEYS = {
-        'gpt-5.4', 'gpt-6-astra', 'gpt-6.1-sol', 'gpt-6.1-terra', 'o4-mini',
+        'gpt-5.4', 'gpt-6-astra', 'gpt-6.2-sol', 'gpt-6.1-terra', 'o4-mini',
         'gemini-3.1-pro-preview', 'gemini-3-flash',
     }
 
@@ -3628,8 +3628,8 @@ class TestOrchestratorConfigPrices:
         assert config.prices['gpt-5.4'].output_per_1m == 10.00
         assert config.prices['gpt-6-astra'].input_per_1m == 10.00
         assert config.prices['gpt-6-astra'].output_per_1m == 50.00
-        assert config.prices['gpt-6.1-sol'].input_per_1m == 2.00
-        assert config.prices['gpt-6.1-sol'].output_per_1m == 10.00
+        assert config.prices['gpt-6.2-sol'].input_per_1m == 2.00
+        assert config.prices['gpt-6.2-sol'].output_per_1m == 10.00
         assert config.prices['gpt-6.1-terra'].input_per_1m == 1.00
         assert config.prices['gpt-6.1-terra'].output_per_1m == 5.00
         assert config.prices['o4-mini'].input_per_1m == 1.10
@@ -3652,7 +3652,7 @@ class TestOrchestratorConfigPrices:
     @pytest.mark.usefixtures("code_default_config")
     def test_sol_and_terra_seed_their_published_cached_input_rates(self):
         prices = OrchestratorConfig().prices
-        assert prices['gpt-6.1-sol'].cached_input_per_1m == 0.10
+        assert prices['gpt-6.2-sol'].cached_input_per_1m == 0.10
         assert prices['gpt-6.1-terra'].cached_input_per_1m == 0.05
 
     def test_default_price_table_matches_defaults_yaml(self):
