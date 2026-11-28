@@ -1818,17 +1818,45 @@ def test_reap_stamp_script_text_is_the_packaged_script():
 
 @pytest.mark.asyncio
 async def test_reap_idle_gates_launches_the_reaper_detached():
-    transport = _Scripted()
+    transport = _Scripted(reap=(0, '{"gate_root": true, "age_secs": 42}', ''))
 
-    await _scripted_runner(transport).reap_idle_gates()
+    reading = await _scripted_runner(transport).reap_idle_gates()
 
+    assert reading == ReapStamp(path='/gates/.last-reap', gate_root=True, age_secs=42)
     [(_, argv, _)] = transport.calls
     command = argv[-1]
-    assert command.startswith(f'{REMOTE_TOOL_PATH_PRELUDE} nohup env GATE_ROOT=/gates bash -c ')
+    probe = shlex.join(['env', 'GATE_ROOT=/gates', 'bash', '-c', reap_stamp_script_text(), 'reap-stamp'])
+    assert command.startswith(f'{probe}; ')
+    assert f'; {REMOTE_TOOL_PATH_PRELUDE} nohup env GATE_ROOT=/gates bash -c ' in command
     assert command.endswith(' reap-gates </dev/null >/dev/null 2>&1 &')
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('reply', [(255, '', 'unreachable'), OSError('no ssh')])
+@pytest.mark.parametrize('reply', [(255, '', 'unreachable'), OSError('no ssh'), (0, 'not json', '')])
 async def test_reap_idle_gates_never_raises(reply):
-    await _scripted_runner(_Scripted(reap=reply)).reap_idle_gates()
+    assert await _scripted_runner(_Scripted(reap=reply)).reap_idle_gates() is None
+
+
+@pytest.mark.asyncio
+async def test_reap_idle_gates_reads_the_stamp_of_the_run_it_launched_before(
+    gate_scene: _GateScene,
+):
+    gates = gate_scene.gates
+    gates.mkdir()
+    (gates / GATE_ROOT_MARKER).touch()
+    idle = _dir(gates, '1' * 40, days=8)
+    stamp = gates / REAP_STAMP
+    runner = gate_scene.runner()
+
+    first = await runner.reap_idle_gates()
+
+    assert first == ReapStamp(path=str(stamp), gate_root=True, age_secs=None)
+    assert await asyncio.to_thread(_holds_within, stamp.exists, 10)
+    assert not idle.exists()
+
+    first_run = stamp.stat().st_mtime_ns
+    second = await runner.reap_idle_gates()
+
+    assert second is not None and second.gate_root
+    assert second.age_secs is not None and 0 <= second.age_secs <= 30
+    assert await asyncio.to_thread(_holds_within, lambda: stamp.stat().st_mtime_ns > first_run, 10)
