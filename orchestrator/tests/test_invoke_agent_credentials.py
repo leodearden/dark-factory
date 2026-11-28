@@ -21,6 +21,7 @@ from unittest.mock import patch
 
 import pytest
 from shared.cli_invoke import resolve_claude_binary
+from shared.secret_env import is_secret_env_name
 
 from orchestrator.agents.invoke import invoke_agent
 
@@ -38,10 +39,7 @@ POOL_A = 'pool-a-' + 'A' * 41
 POOL_B = 'pool-b-' + 'B' * 41
 AMBIENT_SESSION_TOKEN = 'ambient-' + 'm' * 40
 SELECTED_TOKEN = 'selected-' + 's' * 39
-
-
-def _credential_shaped(name: str) -> bool:
-    return name.startswith('CLAUDE_OAUTH_TOKEN_') or name.endswith(('_API_KEY', '_TOKEN'))
+PLAN_PROXY_KEY_VALUE = 'plan-proxy-' + 'k' * 37
 
 
 @pytest.fixture
@@ -67,6 +65,7 @@ def child_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Callable[[], d
     monkeypatch.setenv('CLAUDE_OAUTH_TOKEN_B', POOL_B)
     monkeypatch.setenv('OPENAI_API_KEY', 'openai-' + 'o' * 41)
     monkeypatch.setenv('ANTHROPIC_API_KEY', 'anthropic-' + 'k' * 38)
+    monkeypatch.setenv('OPENAI_PLAN_PROXY_KEY', PLAN_PROXY_KEY_VALUE)
     monkeypatch.setenv('CLAUDE_CODE_OAUTH_TOKEN', AMBIENT_SESSION_TOKEN)
 
     assert resolve_claude_binary() == str(script), 'the fake must be the CLI that runs'
@@ -132,9 +131,10 @@ async def test_child_inherits_only_the_selected_credential(
 
     assert [k for k in env if k.startswith('CLAUDE_OAUTH_TOKEN_')] == []
     assert 'OPENAI_API_KEY' not in env
+    assert 'OPENAI_PLAN_PROXY_KEY' not in env
     assert 'ANTHROPIC_API_KEY' not in env
     assert env['CLAUDE_CODE_OAUTH_TOKEN'] == SELECTED_TOKEN
-    assert {k for k in env if _credential_shaped(k)} == {'CLAUDE_CODE_OAUTH_TOKEN'}
+    assert {k for k in env if is_secret_env_name(k)} == {'CLAUDE_CODE_OAUTH_TOKEN'}
     assert os.environ['CLAUDE_OAUTH_TOKEN_A'] == POOL_A, 'the parent keeps its pool'
 
 
@@ -166,6 +166,7 @@ _BACKEND_ENV = {
     'ANTHROPIC_OAUTH_TOKEN': 'ambient-oauth-' + 'u' * 34,
     'GITHUB_TOKEN': GITHUB_TOKEN_VALUE,
     'KRAKEN_API_KEY': 'kraken-' + 'r' * 41,
+    'OPENAI_PLAN_PROXY_KEY': PLAN_PROXY_KEY_VALUE,
 }
 
 
@@ -244,7 +245,8 @@ async def test_backend_child_inherits_only_its_provider_keys(
     await _dispatch_backend(tmp_path / 'work', backend, oauth_token=oauth_token)
     env = backend_child()
 
-    assert {k for k in env if _credential_shaped(k)} == expected_credentials
+    assert 'OPENAI_PLAN_PROXY_KEY' not in env
+    assert {k for k in env if is_secret_env_name(k)} == expected_credentials
     assert [k for k in env if k.startswith('CLAUDE_OAUTH_TOKEN_')] == []
     for name in expected_credentials - {'ANTHROPIC_OAUTH_TOKEN'}:
         assert env[name] == _BACKEND_ENV[name]
