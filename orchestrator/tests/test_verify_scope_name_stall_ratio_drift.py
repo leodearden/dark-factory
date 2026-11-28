@@ -1,11 +1,11 @@
 """scripts/cgroup-stall-ratio.py classes the verify scopes verify.py actually names.
 
 The script is stdlib-only, so it re-encodes the unit-name shape owned by
-``verify.py::_verify_scope_name`` and ``verify.py::_scope_tag_for`` instead of
-importing it. Here, where orchestrator is importable, the script's parser reads
-names built by that producer. If the shape moves, a project's verify worker
-falls into the script's 'other' bucket, and the per-project classes that task
-5208's AFTER gate compares read null.
+``shared/src/shared/verify_scope_tag.py`` instead of importing it. Here, where
+orchestrator is importable, the script's parser reads names built by the
+producer, ``verify.py::_verify_scope_name``. If the shape moves, a project's
+verify worker falls into the script's 'other' bucket, and the per-project
+classes that task 5208's AFTER gate compares read null.
 """
 from __future__ import annotations
 
@@ -15,8 +15,9 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from shared.verify_scope_tag import scope_tag_for
 
-from orchestrator.verify import _scope_tag_for, _verify_scope_name
+from orchestrator.verify import _verify_scope_name
 
 SCRIPT = Path(__file__).resolve().parents[2] / 'scripts' / 'cgroup-stall-ratio.py'
 APP_SLICE = '0::/user.slice/user-1000.slice/user@1000.service/app.slice'
@@ -45,7 +46,7 @@ stall_ratio = _load_stall_ratio()
 def test_a_merge_verify_in_a_produced_scope_lands_in_its_project_class(
     project_root: Path, bucket_label: str, merge_family: str, merge_class: str,
 ) -> None:
-    scope_cgroup = f'{APP_SLICE}/{_verify_scope_name(_scope_tag_for(project_root))}'
+    scope_cgroup = f'{APP_SLICE}/{_verify_scope_name(scope_tag_for(project_root))}'
     scope_bucket = stall_ratio.bucket(scope_cgroup)
     one_second = collections.Counter({(scope_bucket, merge_family, MERGE_NICE): 1_000_000_000})
 

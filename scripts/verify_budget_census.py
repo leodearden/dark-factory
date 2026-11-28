@@ -9,6 +9,8 @@ derived from, which is why this task does not run a measurement suite: the
 production corpus already is the measurement, and (since deliverable 1) each
 record carries the host load its command ran under. While the worktree lives,
 its copy and the archive copy are ONE record, and `load_records` counts it once.
+Since task 6355 each command also carries its C4 `resources` record, and the
+CPU AND PEAK MEMORY section reports what the clean full-suite legs cost.
 
 STRICTLY READ-ONLY. This script opens every file `mode='r'`; it writes nothing,
 files nothing, and emits no events. It is safe to run against a live tree while
@@ -57,7 +59,7 @@ from datetime import UTC, date, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
 from types import ModuleType
-from typing import Any, TypeGuard
+from typing import Any, NamedTuple, TypeGuard
 
 import yaml
 
@@ -414,6 +416,9 @@ class Leg:
     started_at: str
     duration_secs: float
     load: dict | None
+    # The entry's C4 record as JSON gave it, unvalidated: resources_summary
+    # judges it, so a malformed value is counted rather than dropped here.
+    resources: object
 
 
 @dataclass(frozen=True)
@@ -574,6 +579,7 @@ def select_full_suite_legs(
                     started_at=entry.get('started_at') or '',
                     duration_secs=float(entry['duration_secs']),
                     load=entry.get('load'),
+                    resources=entry.get('resources'),
                 ),
             )
 
@@ -810,16 +816,82 @@ def summarise_legs(legs: Iterable[Leg]) -> dict[str, Any]:
     timed_out = 0
     failed = 0
     for leg in legs:
-        if leg.timed_out:
-            timed_out += 1
-        elif leg.rc != 0:
-            failed += 1
-        else:
+        if _is_clean(leg):
             durations.append(leg.duration_secs)
+        elif leg.timed_out:
+            timed_out += 1
+        else:
+            failed += 1
     return {
         'durations': _series(durations),
         'timed_out': timed_out,
         'failed': failed,
+    }
+
+
+def _is_clean(leg: Leg) -> bool:
+    """Ran the whole suite and passed: the only legs whose figures are the suite's."""
+    return not leg.timed_out and leg.rc == 0
+
+
+# The C4 capture states, restated because this script imports no orchestrator
+# code. Their one home and meaning:
+# orchestrator/src/orchestrator/verify_command_resources.py::Capture, which
+# tests/scripts/test_verify_budget_census_cost.py pins this copy against.
+C4_CAPTURE_STATES = ('exit', 'before_kill', 'relocated', 'unavailable')
+UNRECORDED = 'unrecorded'
+MALFORMED = 'malformed'
+
+
+class _LegCost(NamedTuple):
+    capture: str
+    cpu_secs: float | None = None
+    memory_peak_bytes: int | None = None
+
+
+def _leg_cost(resources: object) -> _LegCost:
+    """What one leg's C4 record measured, or the state that says why it did not.
+
+    Only an ``exit`` capture measures the whole command: ``before_kill`` stops
+    at the kill and ``relocated`` misses the work done in other scopes.
+    """
+    if resources is None:
+        return _LegCost(UNRECORDED)
+    if not isinstance(resources, dict) or resources.get('capture') not in C4_CAPTURE_STATES:
+        return _LegCost(MALFORMED)
+    capture = resources['capture']
+    if capture != 'exit':
+        return _LegCost(capture)
+    cpu_usec, peak = resources.get('cpu_usec'), resources.get('memory_peak_bytes')
+    if _is_real_int(cpu_usec) and cpu_usec >= 0 and _is_real_int(peak) and peak >= 0:
+        return _LegCost('exit', cpu_usec / 1e6, peak)
+    return _LegCost(MALFORMED)
+
+
+def resources_summary(legs: Iterable[Leg]) -> dict[str, Any]:
+    """CPU-seconds and peak memory over the clean legs captured at exit.
+
+    Every clean leg is counted under exactly one capture state, ``unrecorded``
+    (no record: it predates task 6355, or is a remote run, which carries none
+    until PRD leaf 5) or ``malformed``, so the counts
+    reconcile with the overall ``n``. Timed-out and failed legs are left out,
+    as ``summarise_legs`` leaves them out of the durations.
+    """
+    cpu_secs: list[float] = []
+    peaks: list[float] = []
+    captures: Counter[str] = Counter()
+    for leg in legs:
+        if not _is_clean(leg):
+            continue
+        cost = _leg_cost(leg.resources)
+        captures[cost.capture] += 1
+        if cost.cpu_secs is not None and cost.memory_peak_bytes is not None:
+            cpu_secs.append(cost.cpu_secs)
+            peaks.append(float(cost.memory_peak_bytes))
+    return {
+        'cpu_secs': _series(cpu_secs),
+        'memory_peak_bytes': _series(peaks),
+        'captures': dict(captures),
     }
 
 
@@ -1197,6 +1269,7 @@ def build_report(
         'rejected_records': selection.rejected_records,
         'selected_outside_window': len(selection.legs) - len(legs),
         'overall': summarise_legs(legs),
+        'resources': resources_summary(legs),
         'by_day': by_day(legs),
         'by_load_band': by_load_band(legs),
         'load_movement': load_movement(legs),
@@ -1206,16 +1279,41 @@ def build_report(
     }
 
 
-def _format_series(series: dict[str, Any]) -> str:
-    """Render one duration series, printing ``-`` for a null rather than 0."""
+def _format_series(series: dict[str, Any], digits: int = 0) -> str:
+    """Render one series, printing ``-`` for a null rather than 0."""
     def show(key: str) -> str:
         value = series[key]
-        return '-' if value is None else f'{value:.0f}'
+        return '-' if value is None else f'{value:.{digits}f}'
 
     return (
         f"n={series['n']:<4} p50={show('p50'):>7} "
         f"p90={show('p90'):>7} max={show('max'):>7}"
     )
+
+
+_GIB = 1024 ** 3
+
+
+def _in_gib(series: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: value / _GIB if key != 'n' and value is not None else value
+        for key, value in series.items()
+    }
+
+
+def _format_cost(cost: dict[str, Any]) -> list[str]:
+    captures = ' '.join(f'{state}={n}' for state, n in sorted(cost['captures'].items()))
+    return [
+        '',
+        'CPU AND PEAK MEMORY (clean legs captured at exit; capture states and what '
+        'each misses: orchestrator/src/orchestrator/verify_command_resources.py)',
+        f"  CPU-seconds    {_format_series(cost['cpu_secs'])}",
+        f"  peak GiB       {_format_series(_in_gib(cost['memory_peak_bytes']), digits=1)}",
+        f"  captures       {captures or 'none'}",
+        f'  NOTE: {UNRECORDED} = no C4 record (predates task 6355, or a remote run '
+        'until leaf 5 carries it back); unavailable = the capture degraded. Both are '
+        '"not measured", NOT zero.',
+    ]
 
 
 def _format_row(name: str, row: dict[str, Any]) -> str:
@@ -1279,6 +1377,8 @@ def format_report(report: dict[str, Any]) -> str:
             '  NOTE: no full-suite run matched in this window. The nulls above '
             'are "not measured", NOT a fast suite.',
         )
+
+    lines += _format_cost(report['resources'])
 
     lines += [
         '',

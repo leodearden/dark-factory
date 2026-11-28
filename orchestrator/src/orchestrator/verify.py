@@ -49,6 +49,7 @@ from shared.psi import cpu_some10_or_none, read_psi_sample
 from shared.python_env import without_python_env_selection
 from shared.secret_env import without_account_pool
 from shared.verify_admission import acquire_task_slot, is_gated_role, nice_prefix
+from shared.verify_scope_tag import scope_tag_for, verify_scope_unit_name
 
 from orchestrator import (
     narrow_gate_delta,
@@ -137,6 +138,12 @@ from orchestrator.verify_cmd import (
     with_defect_plugin,
     with_junitxml,
     with_pytest_timeout,
+)
+from orchestrator.verify_command_resources import (
+    CommandCapture,
+    CommandResources,
+    allocate_command_capture,
+    watch_relocations,
 )
 from orchestrator.verify_event_channel import VerifyEventChannel, allocate_verify_event_log
 
@@ -3258,6 +3265,12 @@ def _build_summary_payload(
     read with ``.get`` like ``segments``, so a hand-built remote run reads
     None: not recorded.
 
+    ``resources`` (task 6355) is the command's C4 record, which the budget
+    census reads. ``None`` there means the leg was segmented (each executed
+    segment carries its own record), or the run was hand-built by the remote
+    path, which carries no record until PRD leaf 5 brings it back; ``.get``
+    serves those hand-built runs.
+
     A NEGATIVE rc is not a quiet outcome — it is asyncio reporting that the
     process was terminated by signal ``-rc`` and never got to exit at all, so
     it is the LOUDEST possible outcome and sorts above every non-negative rc
@@ -3296,6 +3309,7 @@ def _build_summary_payload(
                 'load': r.get('load'),
                 'slot_wait_secs': r.get('slot_wait_secs'),
                 'carried_over': r.get('carried_over'),
+                'resources': r.get('resources'),
             }
             for r in active_runs
         ],
@@ -5088,6 +5102,9 @@ class CheckRun:
     # True when verify's scope launcher refused to start this leg's command
     # (task 7339). LAST field, as above, and kept out of ``to_dict``.
     scope_launch_refused: bool = False
+    # C4 (task 6355): shape and states at verify_command_resources.py::CommandResources.
+    # None when no single command ran (skipped, or segmented: see segments[].resources).
+    resources: 'CommandResources | None' = None
 
     def __post_init__(self) -> None:
         if self.carried_over and self.cmd is None:
@@ -5114,9 +5131,9 @@ class CheckRun:
     def to_dict(self) -> dict:
         """Serialise to the runs-dict schema consumed by ``_persist_attempt_logs``/
         ``_build_summary_payload``/``archive_verify_logs``
-        (all take ``list[dict]``) — the exact 12-key shape (label/cmd/rc/output/
+        (all take ``list[dict]``) — the exact 13-key shape (label/cmd/rc/output/
         timed_out/started_at/duration_secs/segments/load/slot_wait_secs/admission/
-        carried_over), 7 of which were previously hand-built inline in
+        carried_over/resources), 7 of which were previously hand-built inline in
         ``run_verification``.
 
         ``started_at`` is normalised via ``or ''``: a skipped check's
@@ -5142,6 +5159,12 @@ class CheckRun:
 
         ``carried_over`` (task 5624) is emitted unconditionally as well: True
         marks a leg whose timing belongs to the attempt's first pass.
+
+        ``resources`` (task 6355) is emitted unconditionally: absent means the
+        run predates the C4 record, ``None`` means no single command ran
+        (skipped, or segmented: each segment's record is in ``segments``). A
+        summary also reads ``None`` for a remote run, which builds no CheckRun
+        (``_build_summary_payload``).
         """
         return {
             'label': self.label,
@@ -5156,6 +5179,7 @@ class CheckRun:
             'slot_wait_secs': self.slot_wait_secs,
             'admission': None if self.admission is None else self.admission.to_dict(),
             'carried_over': self.carried_over,
+            'resources': None if self.resources is None else self.resources.to_dict(),
         }
 
 
@@ -5600,48 +5624,15 @@ class VerifyResult:
         return '\n\n'.join(sections) if sections else self.summary
 
 
-def _scope_tag_for(project_root: Path) -> str:
-    """Derive a deterministic, systemd-name-safe per-project scope tag.
-
-    All ``orchestrator-*.service`` units (reify, dark-factory, know-live, …)
-    run the SAME orchestrator package under ONE shared ``systemctl --user``
-    session, so ``df-verify-*.scope`` is a single per-user namespace shared
-    across projects.  Embedding this tag in the verify-scope unit name
-    (``df-verify-{tag}-{uuid}.scope``) lets each orchestrator's startup sweep
-    reap ONLY its own leftovers — a bare-glob sweep would reap a sibling
-    project's LIVE in-flight verify scope during a rolling fleet restart.
-
-    The tag is ``{basename-slug}-{path-hash}``:
-
-    - the ``project_root`` basename, lowercased and sanitized to ``[a-z0-9-]``
-      (operator-legible), bounded in length to keep the total unit name within
-      systemd's limit; and
-    - the first 8 hex chars of ``sha1(str(resolved_path))`` so two projects
-      that share a basename but live at different absolute paths still get
-      distinct tags (collision-resistant disambiguation).
-
-    Pure and deterministic: the same ``project_root`` always yields the same
-    tag, so a fresh boot reaps its dead predecessor's same-tagged scopes.
-    """
-    resolved = Path(project_root).resolve()
-    slug = re.sub(r'[^a-z0-9-]+', '-', resolved.name.lower()).strip('-')
-    # Bound the slug so the whole df-verify-{slug}-{hash}-{uuid}.scope name
-    # stays well within systemd's unit-name length limit.
-    slug = slug[:32] or 'proj'
-    digest = hashlib.sha1(str(resolved).encode()).hexdigest()[:8]
-    return f'{slug}-{digest}'
-
-
 def _verify_scope_name(scope_tag: str) -> str:
-    """Build a per-project, uuid-unique transient verify-scope unit name.
+    """A uuid-unique transient verify-scope unit name for *scope_tag*.
 
-    Shape: ``df-verify-{scope_tag}-{uuid}.scope``.  The ``df-verify-`` prefix
-    is preserved (existing prefix matchers are unaffected); ``scope_tag`` (see
-    ``_scope_tag_for``) confines the leftover-scope startup sweep to THIS
-    project; the 12-hex uuid segment keeps concurrent verifies from colliding
-    on a unit name.
+    The 12-hex instance keeps concurrent verifies from colliding on a unit
+    name. The ``df-verify-<tag>-<instance>.scope`` shape and the per-project
+    tag rule have one home, ``shared/src/shared/verify_scope_tag.py``, so the
+    load recorder parses exactly what this builds.
     """
-    return f'df-verify-{scope_tag}-{uuid.uuid4().hex[:12]}.scope'
+    return verify_scope_unit_name(scope_tag, uuid.uuid4().hex[:12])
 
 
 async def _kill_cgroup_scope(unit: str) -> None:
@@ -5707,8 +5698,9 @@ async def reap_leftover_verify_scopes(project_root: Path) -> list[str]:
     Cross-project safety: every ``orchestrator-*.service`` unit shares ONE
     per-user ``systemctl --user`` session, so ``df-verify-*.scope`` is a single
     shared namespace.  The enumeration is TAG-SCOPED to
-    ``df-verify-{tag}-*.scope`` (see ``_scope_tag_for``) AND the returned names
-    are DEFENSIVELY re-filtered to the same ``df-verify-{tag}-…\\.scope`` shape,
+    ``df-verify-{tag}-*.scope`` (``shared.verify_scope_tag.scope_tag_for``) AND
+    the returned names are DEFENSIVELY re-filtered to the same
+    ``df-verify-{tag}-…\\.scope`` shape,
     so a sibling project's LIVE in-flight verify scope can never be reaped even
     if the ``systemctl`` glob were to over-return.  systemd guarantees one
     incarnation per unit, and this runs before this incarnation's first
@@ -5720,7 +5712,7 @@ async def reap_leftover_verify_scopes(project_root: Path) -> list[str]:
     """
     if shutil.which('systemctl') is None or shutil.which('systemd-run') is None:
         return []
-    tag = _scope_tag_for(project_root)
+    tag = scope_tag_for(project_root)
     pattern = f'df-verify-{tag}-*.scope'
     listing = ''
     with contextlib.suppress(Exception):
@@ -6584,6 +6576,7 @@ async def _reap_command_subtree(
     proc: asyncio.subprocess.Process | None,
     pgid: int | None,
     scope_unit: str | None,
+    capture: CommandCapture | None = None,
 ) -> None:
     """Kill a spawned verify command's whole subtree: its launch scope and every
     scope its session moved into
@@ -6594,6 +6587,9 @@ async def _reap_command_subtree(
     costs the kills: a failure finds nothing, and a cancellation during it
     still kills the launch scope and the process group before propagating.
 
+    A *capture* reads the live launch scope's counters just before the kills,
+    naming the scopes discovery found.
+
     A no-op when the spawn never returned a process: either it failed before
     any scope existed, or it was interrupted and asyncio's spawn cleanup
     already killed the child."""
@@ -6603,6 +6599,9 @@ async def _reap_command_subtree(
     try:
         relocated = await _discover_relocated_scopes(proc, scope_unit)
     finally:
+        if capture is not None:
+            with contextlib.suppress(Exception):
+                capture.read_before_kill(relocated)
         launched = [] if scope_unit is None else [scope_unit]
         for unit in [*launched, *sorted(relocated)]:
             await _kill_cgroup_scope(unit)
@@ -6648,6 +6647,23 @@ def _exited_outcome(
     return rc, output, False
 
 
+def _launch_scope_unit(use_cgroup_scope: bool, scope_tag: str | None) -> str | None:
+    """The scope unit ``_run_cmd`` launches its command in; ``None`` runs it unscoped.
+
+    The tag is refused whether or not ``systemd-run`` is on PATH, so a missing
+    or malformed tag never hides behind a host without it.
+    """
+    if not use_cgroup_scope:
+        return None
+    if scope_tag is None:
+        raise ValueError(
+            'use_cgroup_scope=True needs a scope_tag '
+            '(shared/src/shared/verify_scope_tag.py::scope_tag_for)'
+        )
+    unit = _verify_scope_name(scope_tag)
+    return unit if shutil.which('systemd-run') is not None else None
+
+
 async def _run_cmd(
     cmd: str,
     cwd: Path,
@@ -6656,23 +6672,29 @@ async def _run_cmd(
     log_path: 'Path | None' = None,
     *,
     use_cgroup_scope: bool = False,
-    scope_tag: str = '',
+    scope_tag: str | None = None,
     slice_name: str | None = None,
     cpu_weight: int | None = None,
     memory_properties: tuple[str, ...] = (),
     clock_stop: ClockStopConfig | None = None,
     defect_plugin: bool = False,
+    capture: CommandCapture | None = None,
 ) -> tuple[int, str, bool]:
     """Run a shell command, return (returncode, combined output, timed_out).
 
     The triple is a ``ScopeLaunchRefused`` when the scope launcher exited
     without ever starting the command (``scope_launch_handshake.py``).
 
+    A scoped command with a *capture* records its C4 resources
+    (``orchestrator/src/orchestrator/verify_command_resources.py``).
+
     When *env* is non-None, it is merged on top of ``os.environ`` and passed
     to the subprocess so callers can inject build accelerators like
     ``RUSTC_WRAPPER=sccache`` without mutating the parent process's env.
 
-    When *use_cgroup_scope* is True and ``systemd-run`` is available, the
+    When *use_cgroup_scope* is True, *scope_tag*
+    (``shared/src/shared/verify_scope_tag.py::scope_tag_for``) is required and
+    checked before anything spawns. If ``systemd-run`` is available, the
     command is launched inside a transient systemd ``--user --scope`` (its own
     cgroup) so any abnormal exit after the spawn (a timeout, a cancel, or
     another exception such as a log-write ``OSError``) reaps the WHOLE subtree
@@ -6724,6 +6746,7 @@ async def _run_cmd(
     so that python children (pytest, ruff, pyright via uv) flush their stdout
     per-line — necessary for the partial-log invariant under heavy buffering.
     """
+    scope_unit = _launch_scope_unit(use_cgroup_scope, scope_tag)
     # PYTHONUNBUFFERED is the cheap-but-decisive lever: without it pytest's
     # progress dots stay in stdio buffers and never reach our streaming loop,
     # so a hanging subprocess produces an opaque ``Command timed out after …``
@@ -6766,10 +6789,8 @@ async def _run_cmd(
 
     proc = None
     pgid: int | None = None
-    scope_unit: str | None = None
     handshake: ScopeLaunchHandshake | None = None
-    if use_cgroup_scope and shutil.which('systemd-run') is not None:
-        scope_unit = _verify_scope_name(scope_tag)
+    watcher: asyncio.Task[None] | None = None
     # Populated by the clock-stop loop, via _clock_stop_reason evaluated AT
     # THE STOP (task 3806), before raising TimeoutError — so the except
     # handler can emit a message with the real elapsed wall time and, when
@@ -6787,10 +6808,13 @@ async def _run_cmd(
             # forwarding stdio to our pipe; --collect auto-removes the scope when
             # it exits (no unit leak on the normal-completion path).
             handshake = ScopeLaunchHandshake()
+            if capture is not None:
+                capture.launched(scope_unit)
             try:
                 proc = await asyncio.create_subprocess_exec(
                     *_scope_launch_argv(scope_unit, slice_name, cpu_weight, memory_properties),
-                    '/bin/bash', '-c', handshake.payload(cmd),
+                    '/bin/bash', '-c',
+                    handshake.payload(cmd if capture is None else capture.wrap(cmd)),
                     cwd=str(cwd),
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.STDOUT,
@@ -6800,6 +6824,10 @@ async def _run_cmd(
                 )
             finally:
                 handshake.release_writer()
+            if capture is not None:
+                watcher = asyncio.create_task(
+                    watch_relocations(proc, launched_in=scope_unit, capture=capture)
+                )
         else:
             proc = await asyncio.create_subprocess_shell(
                 cmd,
@@ -6974,7 +7002,7 @@ async def _run_cmd(
         rc = proc.returncode if proc.returncode is not None else 1
         return _exited_outcome(rc, buf.decode(errors='replace'), handshake)
     except TimeoutError:
-        await _reap_command_subtree(proc, pgid, scope_unit)
+        await _reap_command_subtree(proc, pgid, scope_unit, capture)
         if _cs_timeout_msg:
             # Clock-stop path: include actual wall time and which deadline
             # fired so infra_timeout incidents are distinguishable in the
@@ -6983,14 +7011,17 @@ async def _run_cmd(
             return 1, f'Command clock-stop timed out ({_cs_timeout_msg[-1]}): {cmd}', True
         return 1, f'Command timed out after {timeout}s: {cmd}', True
     except asyncio.CancelledError:
-        await _reap_command_subtree(proc, pgid, scope_unit)
+        await _reap_command_subtree(proc, pgid, scope_unit, capture)
         raise
     except Exception as e:
-        await _reap_command_subtree(proc, pgid, scope_unit)
+        await _reap_command_subtree(proc, pgid, scope_unit, capture)
         return 1, f'Command failed: {e}', False
     finally:
         if handshake is not None:
             handshake.close()
+        if watcher is not None:
+            watcher.cancel()
+            await asyncio.wait({watcher})
 
 
 _CHAIN_BUDGET_EXHAUSTED = 'chain wall-clock budget exhausted before this segment started'
@@ -8124,6 +8155,23 @@ async def run_verification(
             infix = ''
         return verify_dir / f'attempt-{current_attempt}{infix}.{label}.log'
 
+    def _command_resources(
+        capture: CommandCapture, *, label: LegSlot, segment: str | None, started_at: str,
+    ) -> CommandResources:
+        """One command's C4 record, stamped with this verify's identity."""
+        return capture.record(
+            project=config.fused_memory.project_id,
+            role=role,
+            task_id=task_id,
+            attempt=attempt_id,
+            module=module_prefix,
+            leg=label.value,
+            segment=segment,
+            plan_id=None if admission_request is None else admission_request.plan_id,
+            started_at=started_at,
+            ended_at=datetime.now(UTC).isoformat(),
+        )
+
     async def _run_leg_command(
         leg_cmd: str,
         *,
@@ -8270,7 +8318,7 @@ async def run_verification(
             _scope_kw: _ScopeKw = (
                 {
                     'use_cgroup_scope': True,
-                    'scope_tag': _scope_tag_for(config.project_root),
+                    'scope_tag': scope_tag_for(config.project_root),
                     'slice_name': project_slice_name(config.fused_memory.project_id),
                     'cpu_weight': _resolve_scope_cpu_weight(config, role),
                     'memory_properties': config.verify_cgroup_memory.systemd_properties(),
@@ -8337,9 +8385,11 @@ async def run_verification(
                     len(chain_segments),
                 )
             if chain_segments is not None:
-                # Each segment's own xdist facts (task 5671), keyed by label and
-                # attached to its segment dict once _run_segmented returns.
+                # Each segment's own xdist facts (task 5671) and C4 record (task
+                # 6355), keyed by label and attached to its segment dict once
+                # _run_segmented returns.
                 segment_xdist: dict[str, dict] = {}
+                segment_resources: dict[str, dict] = {}
 
                 async def _run_one_segment(
                     segment_cmd: str,
@@ -8408,18 +8458,26 @@ async def run_verification(
                             governed = (
                                 f'{shlex.join(seg_prefix)} /bin/bash -c {shlex.quote(governed)}'
                             )
-                    return await _run_cmd(
-                        governed,
-                        segment_cwd,
-                        segment_timeout,
-                        env=leg_env or None,
-                        log_path=_stream_log_path(
-                            f'{label}.{segment_label}', current_attempt,
-                        ),
-                        **_scope_kw,
-                        **_clock_kw,
-                        **segment_plugin_kw,
-                    )
+                    segment_started_at = datetime.now(UTC).isoformat()
+                    async with allocate_command_capture() as capture:
+                        segment_outcome = await _run_cmd(
+                            governed,
+                            segment_cwd,
+                            segment_timeout,
+                            env=leg_env or None,
+                            log_path=_stream_log_path(
+                                f'{label}.{segment_label}', current_attempt,
+                            ),
+                            **_scope_kw,
+                            **_clock_kw,
+                            **segment_plugin_kw,
+                            capture=capture,
+                        )
+                        segment_resources[segment_label] = _command_resources(
+                            capture, label=label, segment=segment_label,
+                            started_at=segment_started_at,
+                        ).to_dict()
+                    return segment_outcome
 
                 rc, out, timed_out_flag, segment_dicts = await _run_segmented(
                     chain_segments,
@@ -8432,24 +8490,34 @@ async def run_verification(
                 )
                 # A not_run segment was never rendered, so it ran with nothing.
                 segment_dicts = [
-                    {**seg, 'xdist': segment_xdist.get(seg['label'])}
+                    {
+                        **seg,
+                        'xdist': segment_xdist.get(seg['label']),
+                        'resources': segment_resources.get(seg['label']),
+                    }
                     for seg in segment_dicts
                 ]
                 scope_launch_refused = _segments_red_only_from_scope_launch_refusal(
                     segment_dicts,
                 )
+                resources = None
             else:
                 segment_dicts = None
-                outcome = await _run_cmd(
-                    cmd,
-                    worktree,
-                    timeout,
-                    env=leg_env or None,
-                    log_path=_stream_log_path(label, current_attempt),
-                    **_scope_kw,
-                    **_clock_kw,
-                    **_plugin_kw,
-                )
+                async with allocate_command_capture() as capture:
+                    outcome = await _run_cmd(
+                        cmd,
+                        worktree,
+                        timeout,
+                        env=leg_env or None,
+                        log_path=_stream_log_path(label, current_attempt),
+                        **_scope_kw,
+                        **_clock_kw,
+                        **_plugin_kw,
+                        capture=capture,
+                    )
+                    resources = _command_resources(
+                        capture, label=label, segment=None, started_at=started_at,
+                    )
                 rc, out, timed_out_flag = outcome
                 scope_launch_refused = isinstance(outcome, ScopeLaunchRefused)
             # Both branches converge here, still INSIDE the slot and one
@@ -8571,6 +8639,7 @@ async def run_verification(
                 rc=rc, timed_out=timed_out_flag,
             ),
             scope_launch_refused=scope_launch_refused,
+            resources=resources,
         )
 
     async def _run_or_skip_timed(

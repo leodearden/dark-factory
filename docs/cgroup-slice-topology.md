@@ -16,7 +16,7 @@ PRD's §6.3 table stays the home of the `/proc/self/cgroup` parity fixtures.
   Flattening keeps exactly one project level under `df.slice`. An empty id is
   an error.
 - The name is never derived from
-  `orchestrator/src/orchestrator/verify.py::_scope_tag_for`. That tag is
+  `shared/src/shared/verify_scope_tag.py::scope_tag_for`. That tag is
   dash-sanitised and names verify scope UNITS only.
 
 ## Topology

@@ -25,8 +25,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from shared.proc_group import pid_running
+from shared.verify_scope_tag import scope_tag_for
 
-from orchestrator import verify
 from orchestrator.config import OrchestratorConfig
 from orchestrator.event_store import EventStore
 from orchestrator.harness import Harness
@@ -301,8 +301,8 @@ class TestVerifyScopeReaperRealSystemd:
         root.mkdir()
         sibling_root.mkdir()
 
-        tag = verify._scope_tag_for(root)
-        sibling_tag = verify._scope_tag_for(sibling_root)
+        tag = scope_tag_for(root)
+        sibling_tag = scope_tag_for(sibling_root)
         assert tag != sibling_tag, (tag, sibling_tag)
 
         unit = f'df-verify-{tag}-{uuid.uuid4().hex[:12]}.scope'

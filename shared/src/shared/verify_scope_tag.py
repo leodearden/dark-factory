@@ -7,11 +7,8 @@ tag ``<slug>-<hash8>``: the project root's basename made unit-name safe, and
 ``plans/per-consumer-resource-recording-prd.md`` D2 keys the load recorder's
 ``verify`` consumer by that tag, and C2's hold report computes it from a root.
 
-The rule is copied verbatim from
-``orchestrator/src/orchestrator/verify.py::_scope_tag_for``; until leaf 4
-(task 6355) switches verify.py to this module,
-``orchestrator/tests/test_verify_scope_tag_cross_check.py`` pins the two
-together.
+``orchestrator/src/orchestrator/verify.py`` builds its scope names through
+this module.
 
 Stdlib-only: a member of
 ``shared/tests/test_pure_stdlib_leaves.py::PURE_STDLIB_LEAVES``.

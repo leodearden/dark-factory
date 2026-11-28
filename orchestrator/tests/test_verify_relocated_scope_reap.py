@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import functools
+import json
 import os
 import random
 import signal
@@ -231,17 +232,27 @@ class TestRealGovernedMergeLeg:
             cpu_governance=CpuGovernConfig(enabled=True, exec_path=str(governed)),
             fused_memory=FusedMemoryConfig(project_id=real_project_slice.project_id),
         )
+        archive_root = tmp_path / 'archive'
         # `& wait` keeps bash as the session leader, so GNU timeout's setpgid
         # really leaves the spawn process group.
         result = await run_verification(
             worktree, config,
             module_config=_timing_out_module(f'timeout 900 sleep {marker} & wait', 3),
-            max_retries=0, role='merge',
+            max_retries=0, role='merge', task_id='6078', archive_root=archive_root,
         )
         assert result.timed_out, result.summary
 
         survivors = _survivors(marker)
         assert survivors == [], '\n'.join(_describe(pid) for pid in survivors)
+
+        (summary_path,) = sorted((archive_root / '6078').glob('*.summary-*.json'))
+        summary = json.loads(summary_path.read_text(encoding='utf-8'))
+        (test,) = [entry for entry in summary['commands'] if entry['label'] == 'test']
+        resources = test['resources']
+        assert resources['capture'] == 'relocated', resources['capture_reason']
+        assert resources['relocated_scopes'], resources
+        assert all(unit.endswith('.scope') for unit in resources['relocated_scopes'])
+        assert resources['scope_unit'] not in resources['relocated_scopes']
 
 
 async def _failing_discovery(*_args: object, **_kwargs: object) -> frozenset[str]:

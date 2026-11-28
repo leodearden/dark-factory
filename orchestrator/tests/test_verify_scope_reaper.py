@@ -3,10 +3,11 @@
 Covers the project-tagged verify-scope naming and the tag-scoped startup
 sweep that stops only THIS project's leftover verify scopes:
 
-  step-1/2  — ``verify._scope_tag_for``: a deterministic, systemd-name-safe
-              per-project tag (basename slug + path-hash suffix).
   step-3/4  — ``verify._verify_scope_name``: the tagged, uuid-suffixed
-              ``df-verify-{tag}-<hex>.scope`` unit name.
+              ``df-verify-{tag}-<hex>.scope`` unit name, built through
+              ``shared/src/shared/verify_scope_tag.py``, which also owns the
+              per-project tag rule and its tests. ``_run_cmd`` refuses a
+              scoped run whose tag that rule would not accept.
   step-5/6  — ``verify.reap_leftover_verify_scopes``: a TAG-SCOPED
               ``systemctl --user list-units`` enumeration + defensive
               re-filter + per-unit ``_kill_cgroup_scope`` reap, fully
@@ -20,56 +21,15 @@ each orchestrator's sweep to its own leftovers.
 """
 import logging
 import re
+import shutil
 from pathlib import Path
 
 import pytest
+from shared.verify_scope_tag import parse_verify_scope_unit, scope_tag_for
 
 from orchestrator import verify
 
-
-class TestScopeTagFor:
-    """``verify._scope_tag_for`` derives a deterministic, systemd-safe per-project tag."""
-
-    def test_tag_is_systemd_name_safe_slug(self, tmp_path: Path) -> None:
-        """The tag contains only lowercase ``[a-z0-9-]`` (embeddable in a scope
-        unit name without escaping) and is non-empty."""
-        tag = verify._scope_tag_for(tmp_path)
-        assert tag, 'tag must be non-empty'
-        assert re.fullmatch(r'[a-z0-9-]+', tag), (
-            f'tag must contain only lowercase [a-z0-9-]; got {tag!r}'
-        )
-
-    def test_tag_is_stable_across_calls(self, tmp_path: Path) -> None:
-        """Same project_root -> same tag, so a fresh boot reaps its dead
-        predecessor's same-tagged scopes."""
-        assert verify._scope_tag_for(tmp_path) == verify._scope_tag_for(tmp_path)
-
-    def test_distinct_roots_yield_distinct_tags(self, tmp_path: Path) -> None:
-        """Different project_roots get different tags."""
-        root_a = tmp_path / 'alpha'
-        root_b = tmp_path / 'beta'
-        root_a.mkdir()
-        root_b.mkdir()
-        assert verify._scope_tag_for(root_a) != verify._scope_tag_for(root_b)
-
-    def test_same_basename_different_path_disambiguated_by_hash(
-        self, tmp_path: Path,
-    ) -> None:
-        """Two projects that SHARE a basename but live at different absolute
-        paths still get distinct tags — the path-hash suffix disambiguates, so
-        one project's sweep can never match the other's scopes."""
-        a = tmp_path / 'a' / 'proj'
-        b = tmp_path / 'b' / 'proj'
-        a.mkdir(parents=True)
-        b.mkdir(parents=True)
-        tag_a = verify._scope_tag_for(a)
-        tag_b = verify._scope_tag_for(b)
-        assert tag_a != tag_b, (
-            'same-basename roots must differ via the path-hash suffix; '
-            f'got {tag_a!r} == {tag_b!r}'
-        )
-        # Both still carry the shared basename slug for operator legibility.
-        assert 'proj' in tag_a and 'proj' in tag_b
+UNREACHED_COMMAND_TIMEOUT_SECS = 120
 
 
 class TestVerifyScopeName:
@@ -92,6 +52,54 @@ class TestVerifyScopeName:
         tag = 'myproj-1a2b3c4d'
         names = {verify._verify_scope_name(tag) for _ in range(20)}
         assert len(names) == 20, f'expected 20 unique scope names; got {len(names)}'
+
+    def test_name_parses_with_the_shared_parser(self) -> None:
+        """The name is built through the shared rule, so the load recorder's
+        parser reads back exactly the tag and a 12-hex instance."""
+        tag = 'myproj-1a2b3c4d'
+        unit = parse_verify_scope_unit(verify._verify_scope_name(tag))
+        assert unit is not None
+        assert unit.tag == tag
+        assert re.fullmatch(r'[0-9a-f]{12}', unit.instance), unit
+
+    def test_a_tag_the_shared_parser_would_not_read_is_refused(self) -> None:
+        with pytest.raises(ValueError, match='Bad Tag'):
+            verify._verify_scope_name('Bad Tag')
+
+
+class TestRunCmdRefusesAScopeItCannotName:
+    """The tag is checked where ``_run_cmd``'s arguments enter, before any spawn,
+    whether or not this host has ``systemd-run``."""
+
+    @pytest.fixture(autouse=True)
+    def no_systemd_run(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(shutil, 'which', lambda _name: None)
+
+    @pytest.mark.asyncio
+    async def test_a_scoped_run_without_a_tag_is_refused(self, tmp_path: Path) -> None:
+        with pytest.raises(ValueError, match='scope_tag'):
+            await verify._run_cmd(
+                'touch spawned', tmp_path,
+                timeout=UNREACHED_COMMAND_TIMEOUT_SECS, use_cgroup_scope=True,
+            )
+        assert not (tmp_path / 'spawned').exists()
+
+    @pytest.mark.asyncio
+    async def test_a_scoped_run_with_a_malformed_tag_is_refused(self, tmp_path: Path) -> None:
+        with pytest.raises(ValueError, match='Bad Tag'):
+            await verify._run_cmd(
+                'touch spawned', tmp_path,
+                timeout=UNREACHED_COMMAND_TIMEOUT_SECS, use_cgroup_scope=True,
+                scope_tag='Bad Tag',
+            )
+        assert not (tmp_path / 'spawned').exists()
+
+    @pytest.mark.asyncio
+    async def test_an_unscoped_run_needs_no_tag(self, tmp_path: Path) -> None:
+        rc, output, timed_out = await verify._run_cmd(
+            'echo hi', tmp_path, timeout=UNREACHED_COMMAND_TIMEOUT_SECS,
+        )
+        assert (rc, output, timed_out) == (0, 'hi\n', False)
 
 
 class TestReapLeftoverVerifyScopes:
@@ -137,7 +145,7 @@ class TestReapLeftoverVerifyScopes:
         """(a) enumeration glob is TAG-SCOPED (cross-project safety); (b) each
         matching unit gets kill+stop; (c) a sibling-tagged unit is defensively
         dropped; (d) returns the reaped names."""
-        tag = verify._scope_tag_for(tmp_path)
+        tag = scope_tag_for(tmp_path)
         unit_a = f'df-verify-{tag}-aaa111aaa111.scope'
         unit_b = f'df-verify-{tag}-bbb222bbb222.scope'
         # A DIFFERENTLY-tagged unit systemctl might over-return — must be dropped.
@@ -176,6 +184,22 @@ class TestReapLeftoverVerifyScopes:
         assert reaped == [unit_a, unit_b], reaped
 
     @pytest.mark.asyncio
+    async def test_sweep_is_keyed_by_the_shared_tag(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """The enumeration glob is the shared rule's tag for the root, so the
+        sweep and the load recorder key the same project the same way, even for
+        a basename the slug has to sanitise."""
+        root = tmp_path / 'My_Solar Challenge'
+        root.mkdir()
+        captured = self._install_fake_exec(monkeypatch, '')
+
+        await verify.reap_leftover_verify_scopes(root)
+
+        enum = next(a for a in captured if 'list-units' in a)
+        assert enum[-1] == f'df-verify-{scope_tag_for(root)}-*.scope', enum
+
+    @pytest.mark.asyncio
     async def test_surviving_scope_is_not_reported_and_is_warned(
         self, tmp_path: Path, monkeypatch, caplog,
     ) -> None:
@@ -183,7 +207,7 @@ class TestReapLeftoverVerifyScopes:
         it is NOT returned as reaped and is surfaced loudly at WARNING, rather
         than being silently over-reported as reaped (a best-effort
         ``_kill_cgroup_scope`` can leave a genuinely un-killable scope alive)."""
-        tag = verify._scope_tag_for(tmp_path)
+        tag = scope_tag_for(tmp_path)
         dead = f'df-verify-{tag}-dead000dead0.scope'
         alive = f'df-verify-{tag}-alive0alive0.scope'
         listing = (

@@ -19,6 +19,8 @@ from pathlib import Path
 from typing import Literal
 
 import pytest
+from _command_capture_files import write_capture_directory
+from shared.testing_virtual_clock import virtual_clock_test
 
 _TEST_CMD = 'uv run pytest tests/ -q'
 _LINT_CMD = 'uv run ruff check src/'
@@ -154,6 +156,26 @@ class TestTheSummaryCarriesTheRole:
         )
 
         assert _read_archived_summary(archive_root)['role'] == role
+
+
+class TestTheWhitelistCarriesTheResourcesRecord:
+    """C4 (task 6355) rides ``commands[].resources``; the whitelist must not drop it."""
+
+    def test_each_command_carries_its_own_record(self):
+        from orchestrator.verify import _build_summary_payload
+
+        record = {'capture': 'exit', 'cpu_usec': 7}
+        hand_built = _run('lint')
+
+        payload = _build_summary_payload(
+            [_run('test', resources=record), hand_built], 'clean', '', role='merge',
+        )
+
+        assert 'resources' not in hand_built
+        by_label = {entry['label']: entry for entry in payload['commands']}
+        assert by_label['test']['resources'] == record
+        assert 'resources' in by_label['lint']
+        assert by_label['lint']['resources'] is None
 
 
 class TestTheTopLevelNamesItsCommand:
@@ -503,3 +525,161 @@ class TestTaskLegsArchiveAJunitReport:
 
         assert fake.pytest_runs == 2, 'precondition: the pure timeout was retried'
         assert _archived_junit(tmp_path / 'archive') == []
+
+
+_CAPTURED_UNIT = 'df-verify-wt-0123abcd-0123456789ab.scope'
+_CAPTURED_FILES = {
+    'cpu.stat': 'usage_usec 4200000\nuser_usec 3100000\nsystem_usec 1100000\n',
+    'memory.peak': '209715200\n',
+    'memory.swap.peak': '0\n',
+    'memory.events': 'low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\n',
+}
+
+
+def _fill_exit_capture(capture) -> None:
+    """Leave the capture directory as the in-scope script would after a clean exit."""
+    directory = capture.directory
+    assert directory is not None
+    write_capture_directory(
+        directory,
+        _CAPTURED_FILES,
+        cgroup=f'/user.slice/df.slice/{_CAPTURED_UNIT}',
+        complete=True,
+    )
+    capture.launched(_CAPTURED_UNIT)
+
+
+def _capturing(*, test_rc: int = 0):
+    async def run_cmd(cmd, cwd, timeout, env=None, log_path=None, *, capture=None, **_kw):
+        if 'pytest' not in cmd:
+            return 0, 'ok', False
+        assert capture is not None, 'the test leg was spawned without a capture'
+        _fill_exit_capture(capture)
+        if test_rc:
+            return test_rc, 'FAILED tests/test_x.py::test_y - assert 0', False
+        return 0, 'ok', False
+
+    return run_cmd
+
+
+def _assert_iso_ordered(record: dict) -> None:
+    from datetime import datetime
+
+    started = datetime.fromisoformat(record['started_at'])
+    ended = datetime.fromisoformat(record['ended_at'])
+    assert started <= ended
+
+
+class TestEveryCommandCarriesItsResourcesRecord:
+    """C4 (task 6355): every active command entry of the WRITTEN summary has a record."""
+
+    @pytest.mark.asyncio
+    async def test_the_task_summary_carries_the_exit_capture_with_identity(self, tmp_path):
+        from orchestrator.config import OrchestratorConfig
+        from orchestrator.verify_admission_record import begin_plan, plan_request
+
+        request = plan_request(begin_plan('task', task_id='5671'), '__fallback__')
+        assert request is not None
+        await _run_task_verification(
+            tmp_path, run_cmd=_capturing(), admission_request=request,
+        )
+
+        summary = _read_worktree_summary(tmp_path)
+        test = _entry(summary, 'test')['resources']
+        assert test['capture'] == 'exit', test['capture_reason']
+        assert test['cpu_usec'] == 4200000
+        assert test['memory_peak_bytes'] == 209715200
+        assert test['scope_unit'] == _CAPTURED_UNIT
+        assert test['leg'] == 'test'
+        assert test['segment'] is None
+        assert test['task_id'] == '5671'
+        assert test['attempt'] == 1
+        assert test['module'] == '__fallback__'
+        assert test['role'] == 'task'
+        assert test['project'] == OrchestratorConfig().fused_memory.project_id
+        assert test['plan_id'] == request.plan_id
+        _assert_iso_ordered(test)
+
+        lint = _entry(summary, 'lint')['resources']
+        assert lint['capture'] == 'unavailable'
+        assert lint['leg'] == 'lint'
+        assert all(entry['resources'] is not None for entry in summary['commands'])
+
+    @pytest.mark.asyncio
+    async def test_the_archived_merge_summary_carries_the_same_records(self, tmp_path):
+        archive_root = tmp_path / 'archive'
+        await _run_task_verification(
+            tmp_path, role='merge', run_cmd=_capturing(test_rc=1),
+            archive_root=archive_root,
+        )
+
+        summary = _read_archived_summary(archive_root)
+        test = _entry(summary, 'test')['resources']
+        assert test['capture'] == 'exit', test['capture_reason']
+        assert test['cpu_usec'] == 4200000
+        assert test['role'] == 'merge'
+        assert test['plan_id'] is None
+        assert _entry(summary, 'lint')['resources']['capture'] == 'unavailable'
+
+
+_SEGMENTED_TEST_CMD = 'cd a && uv run pytest tests/ -q && cd ../b && uv run pytest tests/ -q'
+
+
+def _segmented_module_config(timeout_secs: float | None = None):
+    from orchestrator.config import ModuleConfig
+
+    return ModuleConfig(
+        prefix='__fallback__',
+        test_command=_SEGMENTED_TEST_CMD,
+        lint_command=_LINT_CMD,
+        type_check_command=None,
+        verify_command_timeout_secs=timeout_secs,
+        verify_cold_command_timeout_secs=timeout_secs,
+    )
+
+
+class TestASegmentedLegCarriesOneRecordPerSegment:
+    @staticmethod
+    async def _run(tmp_path: Path, run_cmd, timeout_secs: float | None = None) -> dict:
+        for sub in ('a', 'b'):
+            (tmp_path / sub).mkdir(parents=True, exist_ok=True)
+        await _run_task_verification(
+            tmp_path,
+            run_cmd=run_cmd,
+            module_config=_segmented_module_config(timeout_secs),
+            segment_chained_test=True,
+        )
+        return _entry(_read_worktree_summary(tmp_path), 'test')
+
+    @pytest.mark.asyncio
+    async def test_each_executed_segment_has_its_own_record(self, tmp_path):
+        test = await self._run(tmp_path, _capturing())
+
+        assert test['resources'] is None
+        assert len(test['segments']) == 2
+        for segment in test['segments']:
+            record = segment['resources']
+            assert record['capture'] == 'exit', record['capture_reason']
+            assert record['segment'] == segment['label']
+            assert record['leg'] == 'test'
+            _assert_iso_ordered(record)
+
+    @virtual_clock_test
+    async def test_a_segment_that_never_ran_has_no_record(self, tmp_path):
+        import asyncio
+
+        capturing = _capturing()
+
+        async def first_segment_spends_the_budget(cmd, cwd, timeout, *args, **kwargs):
+            outcome = await capturing(cmd, cwd, timeout, *args, **kwargs)
+            if 'pytest' in cmd:
+                await asyncio.sleep(1.5)
+            return outcome
+
+        test = await self._run(tmp_path, first_segment_spends_the_budget, timeout_secs=1)
+
+        first, second = test['segments']
+        assert first['resources']['capture'] == 'exit'
+        assert second['status'] == 'not_run'
+        assert second['resources'] is None
+        assert test['resources'] is None

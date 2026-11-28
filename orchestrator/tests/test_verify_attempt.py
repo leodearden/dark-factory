@@ -77,7 +77,34 @@ class TestCheckRun:
         assert set(d) == {
             'label', 'cmd', 'rc', 'output', 'timed_out', 'started_at', 'duration_secs',
             'segments', 'load', 'slot_wait_secs', 'admission', 'carried_over',
+            'resources',
         }
+
+    def test_to_dict_carries_the_c4_resources_record(self):
+        from orchestrator.verify import CheckRun
+        from orchestrator.verify_command_resources import Capture, CommandResources
+
+        record = CommandResources(
+            capture=Capture.EXIT, capture_reason='read at exit', cpu_usec=7,
+            memory_peak_bytes=4096, leg='test',
+        )
+        run = CheckRun(
+            label='test', cmd='uv run pytest', rc=0, output='', timed_out=False,
+            started_at='2026-07-14T00:00:00+00:00', duration_secs=1.5,
+            resources=record,
+        )
+        assert run.to_dict()['resources'] == record.to_dict()
+
+    def test_to_dict_emits_resources_none_when_no_record(self):
+        from orchestrator.verify import CheckRun
+
+        run = CheckRun(
+            label='test', cmd='uv run pytest', rc=0, output='', timed_out=False,
+            started_at='2026-07-14T00:00:00+00:00', duration_secs=1.5,
+        )
+        d = run.to_dict()
+        assert 'resources' in d
+        assert d['resources'] is None
 
     def test_to_dict_started_at_passthrough_when_not_none(self):
         from orchestrator.verify import CheckRun
@@ -120,6 +147,7 @@ class TestCheckRun:
             'slot_wait_secs': None,
             'admission': None,
             'carried_over': False,
+            'resources': None,
         }
 
     def test_carried_over_defaults_to_false(self):

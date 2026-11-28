@@ -80,13 +80,21 @@ _FULL_CGROUP = {
     'memory.events': MEMORY_EVENTS_TEXT,
     'memory.current': '75084828672\n',
     'memory.swap.current': '45560156160\n',
+    'memory.peak': '1073741824\n',
+    'memory.swap.peak': '0\n',
     'cpu.pressure': CPU_PRESSURE_TEXT,
     'memory.pressure': MEMORY_PRESSURE_TEXT,
     'io.pressure': IO_PRESSURE_TEXT,
     'cgroup.procs': '',
 }
 
-_ROOT_ABSENT = ('memory.current', 'memory.swap.current', 'memory.events')
+_ROOT_ABSENT = (
+    'memory.current',
+    'memory.swap.current',
+    'memory.events',
+    'memory.peak',
+    'memory.swap.peak',
+)
 _NO_MEMORY_CONTROLLER = tuple(name for name in _FULL_CGROUP if name.startswith('memory.'))
 
 
@@ -175,13 +183,15 @@ class TestReadCgroup:
         assert reading.memory_events['oom_kill'] == 0
         assert reading.memory_current == 75084828672
         assert reading.swap_current == 45560156160
+        assert reading.memory_peak == 1073741824
+        assert reading.swap_peak == 0
         assert reading.pressure == {
             PressureResource.CPU: PressureTotals(2564242951592, 178949516551),
             PressureResource.MEMORY: PressureTotals(89266459893, 51877655090),
             PressureResource.IO: PressureTotals(480697007206, 82588805380),
         }
 
-    def test_the_root_lacks_three_files_and_is_still_a_reading(self, tmp_path):
+    def test_the_root_lacks_five_files_and_is_still_a_reading(self, tmp_path):
         files = {k: v for k, v in _FULL_CGROUP.items() if k not in _ROOT_ABSENT}
         reading = _read(_cgroup_dir(tmp_path, files))
 
@@ -189,6 +199,8 @@ class TestReadCgroup:
         assert reading.memory_current is None
         assert reading.swap_current is None
         assert reading.memory_events is None
+        assert reading.memory_peak is None
+        assert reading.swap_peak is None
         assert reading.memory_stat is not None
         assert reading.cpu_stat is not None
 
@@ -203,6 +215,8 @@ class TestReadCgroup:
         assert reading.memory_events is None
         assert reading.memory_current is None
         assert reading.swap_current is None
+        assert reading.memory_peak is None
+        assert reading.swap_peak is None
         assert set(reading.pressure) == {PressureResource.CPU, PressureResource.IO}
         assert reading.cpu_stat is not None
 
@@ -217,7 +231,15 @@ class TestReadCgroup:
         assert reading.memory_current is None
 
     @pytest.mark.parametrize(
-        'name', ['cpu.stat', 'memory.stat', 'memory.current', 'memory.pressure']
+        'name',
+        [
+            'cpu.stat',
+            'memory.stat',
+            'memory.current',
+            'memory.pressure',
+            'memory.peak',
+            'memory.swap.peak',
+        ],
     )
     def test_a_listed_file_that_cannot_be_opened_is_unreadable(self, tmp_path, name):
         files = {k: v for k, v in _FULL_CGROUP.items() if k != name}
@@ -237,6 +259,8 @@ class TestReadCgroup:
             ('memory.events', 'high\n'),
             ('memory.swap.current', 'many\n'),
             ('io.pressure', 'some avg10=0.00\n'),
+            ('memory.peak', 'garbage\n'),
+            ('memory.swap.peak', 'max\n'),
         ],
     )
     def test_a_listed_file_that_does_not_parse_is_unreadable(
