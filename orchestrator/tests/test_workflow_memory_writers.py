@@ -21,6 +21,7 @@ from orchestrator.evals.runner import (
     build_eval_orch_config,
     eval_mcp_lifecycle,
 )
+from orchestrator.plan_decisions import supersede_decision
 from orchestrator.workflow import TaskWorkflow
 
 _TASK_ID = '4102'
@@ -97,6 +98,24 @@ class TestDecisionNotes:
         written = _add_memory_arguments(sink)
         assert len(written) == len(_DECISIONS)
         assert all('entities' not in arguments for arguments in written), written
+
+    @pytest.mark.asyncio
+    async def test_a_superseded_rationale_never_reaches_the_corpus(self, tmp_path):
+        superseded_rationale = _DECISIONS[0]['rationale']
+        decisions = supersede_decision(
+            _DECISIONS, 0,
+            decision=_DECISIONS[0]['decision'],
+            rationale='Its paging was measured to be complete',
+            reason='the store-paging claim was never checked',
+        )
+        with RecordingMemorySink() as sink:
+            wf = _workflow(sink, tmp_path)
+            wf.plan = {**wf.plan, 'design_decisions': decisions}
+            await wf._write_decisions_to_memory()
+
+        written = _add_memory_arguments(sink)
+        assert 'Its paging was measured to be complete' in written[0]['content']
+        assert all(superseded_rationale not in arguments['content'] for arguments in written), written
 
 
 class TestSuggestionNotes:
