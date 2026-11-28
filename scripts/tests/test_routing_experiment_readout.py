@@ -236,8 +236,14 @@ def test_main_with_an_unreadable_unit_exits_nothing_read_naming_the_failure(caps
         ['--days', '0'],
         ['--until', '2026-11-20T00:00:00'],
         ['--until', 'yesterday'],
+        ['--since', '2026-11-10T00:00:00'],
+        ['--since', '2026-11-10T00:00:00+00:00', '--days', '3'],
+        ['--since', '2026-11-20T00:00:00+00:00', '--until', '2026-11-20T00:00:00+00:00'],
     ],
-    ids=['buckets-below-two', 'zero-days', 'until-without-offset', 'until-unparseable'],
+    ids=[
+        'buckets-below-two', 'zero-days', 'until-without-offset', 'until-unparseable',
+        'since-without-offset', 'since-with-days', 'since-not-before-until',
+    ],
 )
 def test_invalid_arguments_are_usage_errors(bad_arguments):
     with pytest.raises(SystemExit) as raised:
@@ -566,6 +572,27 @@ def test_an_until_with_a_non_utc_offset_reads_the_same_window_as_its_utc_spellin
     assert 'window [2026-10-21T00:00:00+00:00, 2026-11-20T00:00:00+00:00)' in _rule_line(utc)
     assert 'population = the 1 tasks' in _rule_line(utc)
     assert _out('2026-11-20T02:00:00+02:00') == utc
+
+
+def test_since_reads_the_half_open_window_from_since_to_until(fleet_root, capsys):
+    root = fleet_root(
+        'proj-a',
+        [
+            TaskSpec(1, results=(ResultRow('done', _at(5)),)),
+            TaskSpec(2, results=(ResultRow('done', _at(12)),)),
+            TaskSpec(3, results=(ResultRow('done', _at(19)),)),
+        ],
+    )
+
+    def _out(since):
+        argv = ['--roots', str(root), '--salt', SALT, '--since', since, '--until', UNTIL]
+        assert readout.main(argv, environ={}, unit_environment=_unit_must_not_be_read) == 0
+        return capsys.readouterr().out
+
+    utc = _out('2026-11-10T00:00:00+00:00')
+    assert 'window [2026-11-10T00:00:00+00:00, 2026-11-20T00:00:00+00:00)' in _rule_line(utc)
+    assert 'population = the 2 tasks' in _rule_line(utc)
+    assert _out('2026-11-10T02:00:00+02:00') == utc
 
 
 def test_main_over_only_unreadable_roots_exits_nothing_read(unreadable_roots, capsys):
