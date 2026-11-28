@@ -10992,6 +10992,13 @@ entries:
     manifested_phase: unknown
     note: The orchestrated-task session in worktree 7300 hit a ModuleNotFoundError. The digest does not show the phase, so I cannot confirm it was the architect explore phase that the entry names.
     evidence_quote: (record 40) modulenotfounderror
+  - date: '2026-11-27'
+    project: dark_factory
+    session: caa86e07-2a77-45eb-a42a-f2e2934ff263
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: Digest shows a ModuleNotFoundError in an orchestrated task running in a .worktrees/ cwd, which matches the title's mechanism. It does not show the architect explore phase, so phase is left unknown.
+    evidence_quote: '- (record 137) modulenotfounderror'
   last_seen_runs:
   - census-dark_factory-20261017
   - census-dark_factory-20261024
@@ -14311,6 +14318,14 @@ entries:
     manifested_phase: unknown
     note: The guard trip is rendered as a bare template with the matched substring missing, so it reads only 'blocked:' with no detail.
     evidence_quote: '- (record 315) blocked:'
+  - date: '2026-11-27'
+    project: dark_factory
+    session: 7348ba44-3a00-45c2-9797-c935c50aa8be
+    origin_phase: unknown
+    manifested_phase: unknown
+    invariant_violated: no-silent-fail-soft
+    note: The digest renders df_guard trips as '(record N) blocked:' with nothing after the colon, so the matched substring is dropped and the guard evidence is unusable.
+    evidence_quote: '- (record 45) blocked:'
   last_seen_runs:
   - census-dark_factory-20261017
   - census-dark_factory-20261024
@@ -25009,6 +25024,27 @@ entries:
     manifested_phase: unknown
     note: Orchestrated worktree session (cwd .worktrees/11875) logs two 'no such file or directory' not_found signals with no other diagnostic signal in the digest, matching the repeated-ENOENT-without-diagnostics mechanism the title names.
     evidence_quote: (record 31) no such file or directory
+  - date: '2026-11-27'
+    project: dark_factory
+    session: 9a952825-9ccd-4666-8b1c-ecde4b10f84c
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: Orchestrated worktree session (cwd .worktrees/10241) shows repeated bare not-found failures (8 not_found hits) with no accompanying diagnostic detail; signal_counts show only one tool_error, a ruff import-sort preview. Phase cannot be determined from the digest.
+    evidence_quote: (record 35) no such file or directory
+  - date: '2026-11-27'
+    project: dark_factory
+    session: c331d60c-6069-4faf-88e3-c804c263341b
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: Orchestrated-task session running in a task worktree (.worktrees/10607) with repeated not-found failures and no other fired signals. The digest shows one 'no such file or directory' plus three modulenotfounderror and one 'does not exist' under not_found, with no cause or phase evidence.
+    evidence_quote: 'cwd: "/home/leo/src/dark-factory/.worktrees/10607" ... agent_class: "orchestrated-task" ... - (record 35) no such file or directory'
+  - date: '2026-11-27'
+    project: dark_factory
+    session: 49d6b0a5-b495-4ee9-a451-4f0601950863
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: 'Orchestrated worktree session (cwd .worktrees/3346) with not_found: 4 and repeated ''does not exist'' entries, while tool_error, self_correct, and interrupt all read 0, so the failures carry no other diagnostic signal. The digest does not show the phase.'
+    evidence_quote: 'not_found: 4 ... - (record 230) does not exist ... - (record 495) does not exist'
   last_seen_runs:
   - census-dark_factory-20261017
   - census-dark_factory-20261024
@@ -25935,6 +25971,15 @@ entries:
     evidence_quote: '## Retry Loops
 
       - Bash x9 (1 designed-outcome results: [exit 124] [watcher-rearm-declared])'
+  - date: '2026-11-27'
+    project: dark_factory
+    session: 1d1f9c05-0552-4ce9-a677-fbf98f7dca0a
+    origin_phase: ops
+    manifested_phase: ops
+    note: The Retry Loops bucket lists repeated watcher-rearm.sh waits (designed re-arm calls for the next L1 escalation) as retry loops, which is the mislabeling this entry names. The digest does not show whether exit 144 is the designed bounded-wait ceiling, so no match is made to entry-cand-20260729-2.
+    evidence_quote: '## Retry Loops
+
+      - Bash x3: {"command": "cd $DARK_FACTORY_ROOT && scripts/watcher-rearm.sh --queue-dir /home/leo/src/dark-factory/data/escalations --level 1 --timeout 3600", "description": "Wait for next L1 escalation", "timeout": 3660000}'
   last_seen_runs:
   - census-dark_factory-20261017
   - census-dark_factory-20261024
@@ -29545,6 +29590,20 @@ entries:
     origin_phase: unknown
     manifested_phase: unknown
     note: Orchestrated-task session in a task worktree had a read-only Bash inspection (git merge-base --is-ancestor) denied because the session runs in don't-ask mode. This is the mechanism the entry title names. The digest does not show the phase.
+    evidence_quote: Permission to use Bash has been denied because Claude Code is running in don't ask mode.
+  - date: '2026-11-27'
+    project: dark_factory
+    session: b72a9403-a103-46e5-9cbe-452d04886644
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: The sub-agent's read-only git inspection (git branch, git ls-tree) was denied because the session runs in don't-ask mode, and it had to continue without that evidence.
+    evidence_quote: Permission to use Bash has been denied because Claude Code is running in don't ask mode.
+  - date: '2026-11-27'
+    project: dark_factory
+    session: 58d202ad-bfe7-4b02-bdd3-ced214dbee4b
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: Orchestrated-task session had a read-only git log Bash call denied in don't-ask mode. The digest does not show the verify-failure diagnosis the title also names, and no phase is evidenced.
     evidence_quote: Permission to use Bash has been denied because Claude Code is running in don't ask mode.
   filed_tickets:
   - ticket: null
@@ -47917,6 +47976,19 @@ candidates:
     origin_phase: unknown
     manifested_phase: unknown
     evidence_quote: '[let me fix] The section comment above `CanaryFigures` says every baseline is the 2026-11-04 report''s figure, which the new row breaks. Let me fix it.'
+- id: cand-20261127-1
+  title: Project module imports fail under bare system python3 outside the project environment
+  cause: A sub-agent running a probe script from a scratch directory with the system python3 could not import shared.task_metadata because pydantic is not installed in that interpreter. Nothing in the digest shows the project's interpreter or environment being discoverable from the task, so the agent has to guess how to run project code.
+  area: tooling
+  first_seen: '2026-11-27'
+  disposition: pending
+  sightings:
+  - date: '2026-11-27'
+    project: dark_factory
+    session: 54b6bc12-4027-4244-a202-3e12346f64b1/subagents/agent-a7fdc41338ad5cdda
+    origin_phase: unknown
+    manifested_phase: unknown
+    evidence_quote: "from shared.task_metadata import RetryLedger\n  File \"/home/leo/src/dark-factory/shared/src/shared/task_metadata.py\", line 26, in <module>\n    from pydantic import (\nModuleNotFoundError: No module named 'pydantic'"
 historical_backfill:
   run_id: census-dark_factory-20261024
   unmatched_task_ids:
