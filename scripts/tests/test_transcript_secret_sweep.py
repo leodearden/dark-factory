@@ -356,7 +356,8 @@ def test_the_pytest_base_temp_is_the_one_this_pytest_run_uses(request, tmp_path_
     if request.config.getoption('basetemp') or os.environ.get('PYTEST_DEBUG_TEMPROOT'):
         pytest.skip('an explicit --basetemp or PYTEST_DEBUG_TEMPROOT moves this run off the per-user default')
 
-    monkeypatch.setattr(tempfile, 'tempdir', None)  # undo conftest's private_tempdir: pytest chose its basetemp from the real TMPDIR-or-/tmp root
+    # Undo scripts/tests/conftest.py::private_tempdir: pytest chose its basetemp from the real TMPDIR-or-/tmp root.
+    monkeypatch.setattr(tempfile, 'tempdir', None)
 
     assert sweep.pytest_base_temp().resolve() in tmp_path_factory.getbasetemp().parents
 
