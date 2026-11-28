@@ -4,11 +4,11 @@ Additive Phase-4 candidate bundles, resolved by name by μ's OFAT/matrix
 driver via ``get_config_by_name`` (mirrors ν's ``claude_endpoint_candidates()``
 pattern, PRD §ξ):
 
-  - a three-arm codex slate, a price/capability ladder with effort held at
-    'xhigh' so only the model varies: GPT-6 "Astra", GPT-6.1 "Sol" (the
-    Rust implementer: evaluate-only, no architect variant, no production
-    wiring — RUST CAUTION, PRD decision 14) and GPT-6.1 "Terra" (mid-price
-    control).
+  - a two-arm codex slate, a price/capability ladder with effort held at
+    'xhigh' so only the model varies: GPT-6.2 "Sol" (the Rust implementer:
+    evaluate-only, no architect variant, no production wiring — RUST
+    CAUTION, PRD decision 14) and GPT-6.1 "Terra" (mid-price control).
+    Astra was removed by Leo's 2026-11-25 ruling.
   - pi + Sonnet harness-isolating control: same model+effort as the
     claude-sonnet-max incumbent, backend swapped to 'pi' only — isolates
     harness effect from model effect.
@@ -28,12 +28,11 @@ from __future__ import annotations
 
 import pytest
 
-# The 2026-11-01 frontier codex slate as LITERALS (task 8086), deliberately
+# The 2026-11-25 frontier codex slate as LITERALS (task 11726), deliberately
 # not read from the ``CODEX_*_MODEL`` constants: a pin that reads what it
 # protects guards nothing (INV-10).
 _CODEX_SLATE_MODELS_BY_NAME = {
-    'codex-gpt6-astra': 'gpt-6-astra',
-    'codex-gpt6.1-sol': 'gpt-6.1-sol',
+    'codex-gpt6.2-sol': 'gpt-6.2-sol',
     'codex-gpt6.1-terra': 'gpt-6.1-terra',
 }
 
@@ -135,9 +134,13 @@ class TestGetConfigByNameAndPropagation:
 
 
 class TestCodexSlatePin:
-    """The 2026-11-01 frontier codex slate, pinned by LITERAL ids and list
-    prices (task 5384, refreshed by task 8086), so a stale id, a drifted
-    price, or an unnoticed addition or removal fails loudly."""
+    """The 2026-11-25 frontier codex slate, pinned by LITERAL ids and list
+    prices (task 5384, refreshed by tasks 8086 and 11726), so a stale id, a
+    drifted price, or an unnoticed addition or removal fails loudly.
+
+    Two arms: GPT-6.2 "Sol" (the Rust implementer, evaluate-only — RUST
+    CAUTION, PRD decision 14) and GPT-6.1 "Terra" (mid-price control).
+    Astra was removed by Leo's 2026-11-25 ruling."""
 
     def test_roster_is_exactly_the_codex_slate_plus_the_pi_control(self):
         from orchestrator.evals.configs import codex_pi_candidates
@@ -168,8 +171,7 @@ class TestCodexSlatePin:
 
     @pytest.mark.parametrize(
         ('model', 'input_per_1m', 'cached_input_per_1m', 'output_per_1m'), [
-            ('gpt-6-astra', 10.00, 1.00, 50.00),
-            ('gpt-6.1-sol', 2.00, 0.10, 10.00),
+            ('gpt-6.2-sol', 2.00, 0.10, 10.00),
             ('gpt-6.1-terra', 1.00, 0.05, 5.00),
         ],
     )
@@ -184,12 +186,19 @@ class TestCodexSlatePin:
         assert entry['cached_input_per_1m'] == cached_input_per_1m
         assert entry['output_per_1m'] == output_per_1m
 
+    def test_sol_seeds_its_published_cache_write_rate(self):
+        from orchestrator.config import default_price_table
+
+        assert default_price_table()['gpt-6.2-sol']['cache_write_per_1m'] == 2.50
+
     def test_retired_codex_names_resolve_to_none(self):
         """A retired candidate name never resolves to its line's newer model."""
         from orchestrator.evals.configs import get_config_by_name
 
         assert get_config_by_name('codex-gpt5.6-sol') is None
         assert get_config_by_name('codex-gpt5.6-terra') is None
+        assert get_config_by_name('codex-gpt6.1-sol') is None
+        assert get_config_by_name('codex-gpt6-astra') is None
 
     def test_every_codex_arm_has_a_price_seed_with_a_cached_rate(self):
         """Derived from the roster, so a future arm without a seed or a cached rate reddens.

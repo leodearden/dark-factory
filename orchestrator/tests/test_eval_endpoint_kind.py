@@ -94,7 +94,7 @@ def test_vendor_endpoint_bundles_and_vendor_harness_arms_are_vendor_cloud():
         *zcode_candidates(),
         *(c for c in codex_pi_candidates() if c.backend == 'codex'),
     ]
-    assert len([c for c in vendor if c.backend == 'codex']) == 3
+    assert len([c for c in vendor if c.backend == 'codex']) == 2
     assert len([c for c in vendor if c.backend == 'mimo']) == 2
     assert len([c for c in vendor if c.backend == 'zcode']) == 1
     for cfg in vendor:
