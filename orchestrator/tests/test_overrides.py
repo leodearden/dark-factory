@@ -7,8 +7,12 @@ import threading
 import time
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
+
+if TYPE_CHECKING:
+    from orchestrator.overrides import OverrideStore
 
 
 class TestSchema:
@@ -679,7 +683,7 @@ class TestOverrideSource:
 
         assert issubclass(OverrideSource, StrEnum)
         assert {s.value for s in OverrideSource} == {
-            'operator', 'starvation_watchdog',
+            'operator', 'starvation_watchdog', 'main_health_fix',
         }
 
 
@@ -778,3 +782,197 @@ class TestWatchdogPin:
 
         assert store.count_pins('proj', OverrideSource.STARVATION_WATCHDOG) == 2
         assert store.count_pins('proj', OverrideSource.OPERATOR) == 1
+
+
+def _queue(
+    store: OverrideStore, project_root: str = 'proj'
+) -> list[tuple[str, int | None]]:
+    return [(tid, row.pin_order) for tid, row in store.get_pin_queue(project_root)]
+
+
+def _rows_without_updated_at(db_path: Path) -> list[tuple[object, ...]]:
+    conn = sqlite3.connect(str(db_path))
+    try:
+        return conn.execute(
+            'SELECT project_root, task_id, boost_tier, pinned, pin_order, '
+            'reserve_now, ttl_until, created_at, source '
+            'FROM overrides ORDER BY project_root, task_id'
+        ).fetchall()
+    finally:
+        conn.close()
+
+
+class TestMainHealthFixPin:
+    def test_empty_queue_pins_the_fix_first_with_reserve_now(
+        self, tmp_path: Path
+    ) -> None:
+        from orchestrator.overrides import OverrideSource, OverrideStore
+
+        store = OverrideStore(tmp_path / 'scheduler_overrides.db')
+
+        assert store.pin_main_health_fix('proj', 'H') == 1
+
+        row = store.get_overrides('proj')['H']
+        assert row.pinned is True
+        assert row.pin_order == 1
+        assert row.reserve_now is True
+        assert row.ttl_until is None
+        assert row.source is OverrideSource.MAIN_HEALTH_FIX
+
+    def test_fix_goes_ahead_of_operator_pins_which_keep_their_settings(
+        self, tmp_path: Path
+    ) -> None:
+        from orchestrator.overrides import OverrideSource, OverrideStore
+
+        store = OverrideStore(tmp_path / 'scheduler_overrides.db')
+        ttl = datetime(2026, 12, 1, tzinfo=UTC)
+        store.set_override('proj', 'O1', pinned=True, boost_tier='high')
+        store.set_override('proj', 'O2', pinned=True, reserve_now=True, ttl_until=ttl)
+
+        assert store.pin_main_health_fix('proj', 'H') == 1
+
+        assert _queue(store) == [('H', 1), ('O1', 2), ('O2', 3)]
+        overrides = store.get_overrides('proj')
+        assert overrides['O1'].source is OverrideSource.OPERATOR
+        assert overrides['O1'].boost_tier == 'high'
+        assert overrides['O1'].reserve_now is False
+        assert overrides['O1'].ttl_until is None
+        assert overrides['O2'].source is OverrideSource.OPERATOR
+        assert overrides['O2'].boost_tier is None
+        assert overrides['O2'].reserve_now is True
+        assert overrides['O2'].ttl_until == ttl
+
+    def test_regrant_keeps_position_and_rearms_reserve_now(
+        self, tmp_path: Path
+    ) -> None:
+        from orchestrator.overrides import OverrideStore
+
+        store = OverrideStore(tmp_path / 'scheduler_overrides.db')
+        store.set_override('proj', 'O1', pinned=True)
+        store.pin_main_health_fix('proj', 'H')
+        store.reorder_pin_queue('proj', ['O1', 'H'])
+        store.clear_override('proj', 'H', field='reserve_now')
+
+        assert store.pin_main_health_fix('proj', 'H') == 2
+
+        assert _queue(store) == [('O1', 1), ('H', 2)]
+        assert store.get_overrides('proj')['H'].reserve_now is True
+
+    def test_immediate_double_grant_changes_nothing_but_updated_at(
+        self, tmp_path: Path
+    ) -> None:
+        from orchestrator.overrides import OverrideStore
+
+        db_path = tmp_path / 'scheduler_overrides.db'
+        store = OverrideStore(db_path)
+        store.set_override('proj', 'O1', pinned=True)
+        store.pin_main_health_fix('proj', 'H')
+        before = _rows_without_updated_at(db_path)
+
+        assert store.pin_main_health_fix('proj', 'H') == 1
+
+        assert _rows_without_updated_at(db_path) == before
+
+    def test_newest_fix_goes_first(self, tmp_path: Path) -> None:
+        from orchestrator.overrides import OverrideStore
+
+        store = OverrideStore(tmp_path / 'scheduler_overrides.db')
+        store.set_override('proj', 'O1', pinned=True)
+        store.pin_main_health_fix('proj', 'H')
+
+        assert store.pin_main_health_fix('proj', 'H2') == 1
+
+        assert _queue(store) == [('H2', 1), ('H', 2), ('O1', 3)]
+
+    @pytest.mark.parametrize(
+        ('boost_tier', 'pinned'),
+        [('low', None), (None, True)],
+        ids=['boost-only', 'pinned'],
+    )
+    def test_operator_row_for_the_task_is_never_written(
+        self, tmp_path: Path, boost_tier: str | None, pinned: bool | None
+    ) -> None:
+        from orchestrator.overrides import OverrideStore
+
+        db_path = tmp_path / 'scheduler_overrides.db'
+        store = OverrideStore(db_path)
+        store.set_override('proj', 'O1', pinned=True)
+        store.set_override('proj', 'H', boost_tier=boost_tier, pinned=pinned)
+        before = _rows_without_updated_at(db_path)
+        before_raw = _raw_row(db_path, 'H')
+
+        assert store.pin_main_health_fix('proj', 'H') is None
+
+        assert _raw_row(db_path, 'H') == before_raw
+        assert _rows_without_updated_at(db_path) == before
+
+    def test_operator_unpin_of_the_fix_stands(self, tmp_path: Path) -> None:
+        from orchestrator.overrides import OverrideStore
+
+        store = OverrideStore(tmp_path / 'scheduler_overrides.db')
+        store.pin_main_health_fix('proj', 'H')
+        store.clear_override('proj', 'H', field='pinned')
+
+        assert store.pin_main_health_fix('proj', 'H') is None
+
+        row = store.get_overrides('proj')['H']
+        assert row.pinned is False
+        assert row.pin_order is None
+
+    def test_watchdog_row_is_taken_over_at_the_head_without_ttl(
+        self, tmp_path: Path
+    ) -> None:
+        from orchestrator.overrides import OverrideSource, OverrideStore
+
+        store = OverrideStore(tmp_path / 'scheduler_overrides.db')
+        store.set_override('proj', 'O1', pinned=True)
+        store.create_watchdog_pin(
+            'proj', 'H', ttl_until=datetime(2026, 12, 1, tzinfo=UTC),
+        )
+
+        assert store.pin_main_health_fix('proj', 'H') == 1
+
+        assert _queue(store) == [('H', 1), ('O1', 2)]
+        row = store.get_overrides('proj')['H']
+        assert row.ttl_until is None
+        assert row.reserve_now is True
+        assert row.source is OverrideSource.MAIN_HEALTH_FIX
+        assert store.release_watchdog_pin('proj', 'H') is False
+
+    def test_operator_pin_at_order_zero_moves_behind_the_fix(
+        self, tmp_path: Path
+    ) -> None:
+        from orchestrator.overrides import OverrideStore
+
+        store = OverrideStore(tmp_path / 'scheduler_overrides.db')
+        store.set_override('proj', 'O0', pinned=True, pin_order=0)
+
+        assert store.pin_main_health_fix('proj', 'H') == 0
+
+        assert _queue(store) == [('H', 0), ('O0', 1)]
+
+    def test_other_projects_rows_are_neither_shifted_nor_read(
+        self, tmp_path: Path
+    ) -> None:
+        from orchestrator.overrides import OverrideStore
+
+        db_path = tmp_path / 'scheduler_overrides.db'
+        store = OverrideStore(db_path)
+        store.set_override('other', 'X0', pinned=True, pin_order=0)
+        store.set_override('other', 'X1', pinned=True, pin_order=1)
+        other_before = store.get_overrides('other')
+
+        assert store.pin_main_health_fix('proj', 'H') == 1
+
+        assert store.get_overrides('other') == other_before
+        assert _queue(store, 'other') == [('X0', 0), ('X1', 1)]
+
+    def test_terminal_sweep_deletes_the_fix_row(self, tmp_path: Path) -> None:
+        from orchestrator.overrides import OverrideStore
+
+        store = OverrideStore(tmp_path / 'scheduler_overrides.db')
+        store.pin_main_health_fix('proj', 'H')
+
+        assert store.clear_terminal('proj', {'H'}) == ['H']
+
+        assert 'H' not in store.get_overrides('proj')
