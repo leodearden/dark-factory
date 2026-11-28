@@ -973,7 +973,7 @@ class TestWriteQueueDatum:
         assert datum == Datum(
             {
                 'pending': 4, 'retry': 1, 'parked': 0, 'dead': 0,
-                'oldest_pending_age_seconds': 12.5,
+                'awaiting_operator': 0, 'oldest_pending_age_seconds': 12.5,
             },
             self.MEASURED_AT,
             DatumState.FRESH,
@@ -994,13 +994,33 @@ class TestWriteQueueDatum:
         assert (datum.value['parked'], datum.value['pending']) == (111, 0)
         assert datum.value['oldest_pending_age_seconds'] == 86400.0
 
+    def test_awaiting_operator_counts_the_parked_and_dead_rows(self):
+        from dashboard.data.memory import write_queue_datum
+
+        datum = write_queue_datum(
+            {
+                'counts': {
+                    'pending': 4, 'retry': 1, 'parked': 111, 'in_flight': 3,
+                    'completed': 40, 'dead': 2,
+                },
+                'oldest_pending_age_seconds': 86400.0,
+            },
+            measured_at=self.MEASURED_AT,
+        )
+
+        assert datum.value is not None
+        assert datum.value['awaiting_operator'] == 113
+
     def test_the_shown_counts_follow_the_shared_vocabulary(self):
         from dashboard.data.memory import write_queue_datum
 
         datum = write_queue_datum(self.REACHABLE, measured_at=self.MEASURED_AT)
 
         assert datum.value is not None
-        shown = [key for key in datum.value if key != 'oldest_pending_age_seconds']
+        shown = [
+            key for key in datum.value
+            if key not in ('awaiting_operator', 'oldest_pending_age_seconds')
+        ]
         assert shown == [s.value for s in (*CLAIMABLE, WriteQueueStatus.DEAD)]
 
     def test_offline_answer_is_unknown_with_the_verbatim_error(self):
