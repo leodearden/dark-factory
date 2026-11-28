@@ -23,6 +23,7 @@ import pytest
 from _curator_fake import FakeCurator
 from _info_l0_router_fixtures import PASSED, TASK_ID, run_config
 from _info_l0_router_fixtures import assignment as _assignment
+from _replanning_review_stub import ReplanningReviewStub
 from _workflow_helpers import (
     PLAN,
     AgentStub,
@@ -44,7 +45,6 @@ from test_plan_revalidation_skip import (
     _scripted_architect,
     _wipe_to,
 )
-from test_workflow_e2e import ReplanningReviewStub
 from test_workflow_prompt_builder import _PLAN_RENDERING_SITES, _TASK_ID, _render_calls
 
 from orchestrator.agents.review_briefing import ReviewBriefing, ReviewSubject
