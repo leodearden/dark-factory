@@ -484,6 +484,8 @@ def _alternate_writer_changed_the_cell(
             kwargs[name] = seeded_id
         elif name == 'step_type':
             kwargs[name] = 'test'
+        elif name == 'decision_index':
+            kwargs[name] = 0
         elif name == 'kind':
             kwargs[name] = sorted(DEVIATION_KINDS)[0]
         elif name == 'prose_only':
@@ -861,6 +863,26 @@ class TestRepairableFieldTable:
         }
         assert 'mark_step_committed' in alternates[('steps', 'description')]
         assert 'mark_step_committed' in alternates[('prerequisites', 'description')]
+
+    def test_a_superseding_writer_is_declared_on_both_decision_cells(self, tmp_path):
+        """``supersede_design_decision`` rewrites a recorded decision and rationale in place (task 3865)."""
+        for field in ('decision', 'rationale'):
+            changed, refusal = _alternate_writer_changed_the_cell(
+                tmp_path / field, 'design_decisions', field, 'supersede_design_decision'
+            )
+            assert changed, (
+                f'supersede_design_decision refused the probe call: {refusal!r}'
+                if refusal is not None else
+                f'supersede_design_decision is supposed to rewrite design_decisions.{field} '
+                'but the probe observed no change'
+            )
+
+        alternates = {
+            (r.collection, r.field): set(r.also_written_by)
+            for r in plan_tools._REPAIRABLE_PLAN_FIELDS
+        }
+        assert 'supersede_design_decision' in alternates[('design_decisions', 'decision')]
+        assert 'supersede_design_decision' in alternates[('design_decisions', 'rationale')]
 
     def test_plan_mutating_method_names_are_real_task_artifacts_methods(self):
         """Guards the derivation's silent-vacuity failure mode.
@@ -2581,6 +2603,18 @@ def _added_decision(plan: dict, _sha: str) -> None:
     }
 
 
+def _decision_superseded(plan: dict, _sha: str) -> None:
+    assert plan['design_decisions'][1] == {
+        'decision': 'A superseding decision.',
+        'rationale': 'A superseding rationale.',
+        'superseded_versions': [{
+            'decision': 'A second clean decision.',
+            'rationale': 'A second clean rationale.',
+            'reason': 'The second rationale proved wrong.',
+        }],
+    }
+
+
 def _added_reuse(plan: dict, _sha: str) -> None:
     assert plan['reuse'][2]['what'] == 'A newly reused thing'
 
@@ -2662,6 +2696,16 @@ READ_PATH_CASES = [
         ),
         lambda _sha: {'status': 'ok', 'total_decisions': 3},
         _added_decision,
+    ),
+    (
+        # Index 1, so index 0's repaired rationale stays the observable cell.
+        'supersede_design_decision',
+        lambda a, _sha: plan_tools._supersede_design_decision(
+            a, 1, 'A superseding decision.', 'A superseding rationale.',
+            'The second rationale proved wrong.',
+        ),
+        lambda _sha: {'status': 'ok', 'decision_index': 1, 'superseded_versions': 1},
+        _decision_superseded,
     ),
     (
         'add_reuse_item',

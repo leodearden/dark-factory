@@ -36,6 +36,7 @@ from orchestrator.mcp.plan_tools import (
     _record_step_deviation,
     _remove_plan_step,
     _replace_plan_step,
+    _supersede_design_decision,
     _update_plan_metadata,
 )
 
@@ -93,6 +94,18 @@ def _one_rejection_carried(plan: dict) -> bool:
     return plan.get(_REJECTIONS, {}).get('count') == 1
 
 
+def _add_then_supersede_decision(ta: TaskArtifacts, head: str) -> dict[str, Any]:
+    _add_design_decision(ta, 'D', 'R')
+    return _supersede_design_decision(ta, 0, 'D2', 'R2', 'R was wrong')
+
+
+def _decision_superseded(plan: dict, head: str) -> bool:
+    [entry] = plan['design_decisions']
+    return (entry['decision'], entry['rationale']) == ('D2', 'R2') and entry['superseded_versions'] == [
+        {'decision': 'D', 'rationale': 'R', 'reason': 'R was wrong'},
+    ]
+
+
 @dataclass(frozen=True)
 class _Case:
     mutate: Callable[[TaskArtifacts, str], dict[str, Any]]
@@ -127,6 +140,11 @@ _CENSUS = [
         ],
         after_stamped=PlanState.STAMPED,
     ), id='add_design_decision'),
+    pytest.param(_Case(
+        mutate=_add_then_supersede_decision,
+        landed=_decision_superseded,
+        after_stamped=PlanState.STAMPED,
+    ), id='supersede_design_decision'),
     pytest.param(_Case(
         mutate=lambda ta, head: _add_reuse_item(ta, 'W', 'H', 'how'),
         landed=lambda plan, head: plan['reuse'] == [{'what': 'W', 'where': 'H', 'how': 'how'}],
