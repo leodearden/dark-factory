@@ -484,6 +484,8 @@ def _alternate_writer_changed_the_cell(
             kwargs[name] = seeded_id
         elif name == 'step_type':
             kwargs[name] = 'test'
+        elif name == 'decision_index':
+            kwargs[name] = 0
         elif name == 'kind':
             kwargs[name] = sorted(DEVIATION_KINDS)[0]
         elif name == 'prose_only':
@@ -1266,10 +1268,10 @@ class TestRepairPlanFieldsTrailing:
         assert facts == [
             {
                 'tool': 'add_design_decision',
-                # add_design_decision is the ONLY writer of this field, so the
-                # fact claims no alternates. Where a field has more than one
-                # writer the fact says so rather than overstating its precision.
-                'also_written_by': [],
+                # supersede_design_decision rewrites this field in place too
+                # (task 3865), so the fact names it rather than overstating
+                # its precision.
+                'also_written_by': ['supersede_design_decision'],
                 'param': 'rationale',
                 'pattern': closer('rationale'),
                 'misclose': closer('rationale'),
@@ -2581,6 +2583,21 @@ def _added_decision(plan: dict, _sha: str) -> None:
     }
 
 
+def _decision_superseded(plan: dict, _sha: str) -> None:
+    entry = plan['design_decisions'][1]
+    for version in entry['superseded_versions']:
+        assert isinstance(version.pop('superseded_at'), str)
+    assert entry == {
+        'decision': 'A superseding decision.',
+        'rationale': 'A superseding rationale.',
+        'superseded_versions': [{
+            'decision': 'A second clean decision.',
+            'rationale': 'A second clean rationale.',
+            'reason': 'The second rationale proved wrong.',
+        }],
+    }
+
+
 def _added_reuse(plan: dict, _sha: str) -> None:
     assert plan['reuse'][2]['what'] == 'A newly reused thing'
 
@@ -2662,6 +2679,21 @@ READ_PATH_CASES = [
         ),
         lambda _sha: {'status': 'ok', 'total_decisions': 3},
         _added_decision,
+    ),
+    (
+        # Index 1, so index 0's repaired rationale stays the observable cell.
+        'supersede_design_decision',
+        lambda a, _sha: plan_tools._supersede_design_decision(
+            a, 1, 'A superseding decision.', 'A superseding rationale.',
+            'The second rationale proved wrong.',
+        ),
+        lambda _sha: {
+            'status': 'ok',
+            'decision_index': 1,
+            'superseded_decision': 'A second clean decision.',
+            'superseded_versions': 1,
+        },
+        _decision_superseded,
     ),
     (
         'add_reuse_item',

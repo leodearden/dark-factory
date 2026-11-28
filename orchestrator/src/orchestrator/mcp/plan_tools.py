@@ -6,7 +6,8 @@ implementer marks steps done via ``mark_step_done`` and records where a
 step's text proved wrong via ``record_step_deviation``.  On revalidation
 (blast-radius requeue), the architect uses ``update_plan_metadata``,
 ``remove_plan_step``, ``replace_plan_step``, and ``confirm_plan`` to
-update an existing plan without recreating it from scratch, and
+update an existing plan without recreating it from scratch,
+``supersede_design_decision`` when a recorded decision proves wrong, and
 ``record_descoped_step`` when it genuinely drops a done step.  All writes
 go through ``TaskArtifacts`` methods, preserving ``_session_id`` and
 enforcing correct schema.
@@ -57,7 +58,7 @@ from shared.mcp_markup_middleware import (
 from shared.mcp_missing_arguments import MissingArgumentMiddleware
 from shared.plan_deviation import DeviationRecord, UnknownDeviationKind
 
-from orchestrator import plan_descope, quarantine_provenance
+from orchestrator import plan_decisions, plan_descope, quarantine_provenance
 from orchestrator.artifacts import Plan, PlanConfirmation, PlanState, TaskArtifacts
 from orchestrator.mcp import (
     branch_probes,
@@ -265,6 +266,7 @@ _DROP_PLAN_FILE_TARGETS: Mapping[str, str] = MappingProxyType({'reason': 'reason
 #: every case; only the remedy differs (audit the row, or teach the
 #: derivation about the new shape).
 _DESCRIPTION_ALSO: tuple[str, ...] = ('replace_plan_step', 'mark_step_committed')
+_DESIGN_DECISION_ALSO: tuple[str, ...] = ('supersede_design_decision',)
 _UPDATE_METADATA_ALSO: tuple[str, ...] = ('update_plan_metadata',)
 
 #: THE declared enumeration of the repairable surface. Adding a prose field to
@@ -321,10 +323,18 @@ def _build_repairable_plan_fields() -> tuple[PlanField, ...]:
             'steps', 'description', _add_plan_step, _ADD_PLAN_STEP_TARGETS, _DESCRIPTION_ALSO
         ),
         _plan_field(
-            'design_decisions', 'decision', _add_design_decision, _ADD_DESIGN_DECISION_TARGETS
+            'design_decisions',
+            'decision',
+            _add_design_decision,
+            _ADD_DESIGN_DECISION_TARGETS,
+            _DESIGN_DECISION_ALSO,
         ),
         _plan_field(
-            'design_decisions', 'rationale', _add_design_decision, _ADD_DESIGN_DECISION_TARGETS
+            'design_decisions',
+            'rationale',
+            _add_design_decision,
+            _ADD_DESIGN_DECISION_TARGETS,
+            _DESIGN_DECISION_ALSO,
         ),
         _plan_field('reuse', 'what', _add_reuse_item, _ADD_REUSE_ITEM_TARGETS),
         _plan_field('reuse', 'where', _add_reuse_item, _ADD_REUSE_ITEM_TARGETS),
@@ -605,8 +615,49 @@ def _add_design_decision(
         'rationale': rationale,
     })
     artifacts.write_plan_model(_body_edit(plan), mutex_held=True)
+    total = len(plan['design_decisions'])
     return _with_markup_repairs(
-        {'status': 'ok', 'total_decisions': len(plan['design_decisions'])},
+        {'status': 'ok', 'decision_index': total - 1, 'total_decisions': total},
+        markup_facts,
+    )
+
+
+@_plan_mutation
+def _supersede_design_decision(
+    artifacts: TaskArtifacts,
+    decision_index: int,
+    decision: str,
+    rationale: str,
+    reason: str,
+) -> dict[str, Any]:
+    plan, markup_facts = _read_plan_repaired(artifacts)
+    if not plan:
+        return {'status': 'error', 'message': 'No plan exists.'}
+
+    try:
+        decisions = plan_decisions.supersede_decision(
+            plan.get('design_decisions'),
+            decision_index,
+            decision=decision,
+            rationale=rationale,
+            reason=reason,
+            at=datetime.now(UTC).isoformat(),
+        )
+    except plan_decisions.InvalidSupersession as exc:
+        return _with_markup_repairs(
+            {'status': 'error', 'message': str(exc), 'field': exc.field}, markup_facts,
+        )
+
+    plan['design_decisions'] = decisions
+    artifacts.write_plan_model(_body_edit(plan), mutex_held=True)
+    versions = decisions[decision_index][plan_decisions.SUPERSEDED_VERSIONS_KEY]
+    return _with_markup_repairs(
+        {
+            'status': 'ok',
+            'decision_index': decision_index,
+            'superseded_decision': versions[-1]['decision'],
+            'superseded_versions': len(versions),
+        },
         markup_facts,
     )
 
@@ -1699,11 +1750,43 @@ def _server_with_every_tool(
     ) -> dict[str, Any]:
         """Record a design decision and its rationale in the plan.
 
+        To correct a recorded decision, call ``supersede_design_decision``.
+
         Args:
             decision: The decision that was made.
             rationale: Why this decision was made over alternatives.
         """
         return _add_design_decision(artifacts, decision, rationale)
+
+    @tool
+    @accepts_markup_override
+    def supersede_design_decision(
+        decision_index: int,
+        decision: str,
+        rationale: str,
+        reason: str,
+    ) -> dict[str, Any]:
+        """Correct a recorded design decision whose decision or rationale proved wrong.
+
+        The entry is rewritten in place; its prior decision and rationale are
+        kept under its ``superseded_versions`` with *reason* and the time.
+        Never append a correction entry with ``add_design_decision`` instead.
+
+        The response's ``superseded_decision`` is the decision text this call
+        replaced. Compare it with the decision you meant to correct: if they
+        differ, you addressed the wrong entry, so supersede that entry back to
+        its prior pair and then address the right one.
+
+        Args:
+            decision_index: The entry's 0-based position, as
+                ``add_design_decision``'s response reports it.
+            decision: The corrected decision, restated in full.
+            rationale: The corrected rationale, restated in full.
+            reason: Why the prior version was abandoned. Mandatory.
+        """
+        # Flat str parameters DELIBERATELY, as drop_plan_file: only flat
+        # strings get MarkupGuardMiddleware's inbound coverage.
+        return _supersede_design_decision(artifacts, decision_index, decision, rationale, reason)
 
     @tool
     @accepts_markup_override

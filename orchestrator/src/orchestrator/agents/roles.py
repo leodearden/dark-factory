@@ -402,6 +402,7 @@ _PLAN_CREATOR_TOOLS = [
     'mcp__plan-tools__add_plan_step',
     'mcp__plan-tools__add_prerequisite',
     'mcp__plan-tools__add_design_decision',
+    'mcp__plan-tools__supersede_design_decision',
     'mcp__plan-tools__add_reuse_item',
     # Revalidation tools (blast-radius requeue)
     'mcp__plan-tools__update_plan_metadata',
@@ -949,6 +950,9 @@ Build the plan using the plan-tools MCP tools. Do NOT write plan.json directly.
    - `step_type` must be `"test"` or `"impl"`.
    - Steps alternate: write a failing test, then implement to make it pass.
 4. Call `add_design_decision(decision, rationale)` for non-obvious choices.
+   If a recorded decision or its rationale proves wrong, call
+   `supersede_design_decision(decision_index, decision, rationale, reason)`,
+   which keeps the old text as history, instead of appending a correction entry.
 5. Call `add_reuse_item(what, where, how)` for existing code/patterns being reused.
 6. Call `confirm_plan()` as your FINAL plan-tools action, once every step and
    prerequisite has been added. This marks the plan COMPLETE. Call it

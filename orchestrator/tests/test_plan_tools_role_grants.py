@@ -184,19 +184,19 @@ def test_the_plan_tools_family_is_exactly_the_roles_tested_here():
     ('role', 'granted', 'withheld'),
     [
         pytest.param(
-            ARCHITECT, {'create_plan', 'add_plan_step', 'confirm_plan'},
+            ARCHITECT, {'create_plan', 'add_plan_step', 'confirm_plan', 'supersede_design_decision'},
             {'mark_step_done', 'record_step_deviation'}, id='architect',
         ),
         pytest.param(
             IMPLEMENTER, {'mark_step_done', 'record_step_deviation', 'report_missing_plan_file'},
-            {'create_plan', 'confirm_plan'}, id='implementer',
+            {'create_plan', 'confirm_plan', 'supersede_design_decision'}, id='implementer',
         ),
         pytest.param(
             DEBUGGER, {'mark_step_done', 'record_step_deviation', 'report_missing_plan_file'},
-            {'create_plan', 'confirm_plan'}, id='debugger',
+            {'create_plan', 'confirm_plan', 'supersede_design_decision'}, id='debugger',
         ),
         pytest.param(
-            SIMPLE_TASK, {'create_plan', 'confirm_plan', 'mark_step_done'},
+            SIMPLE_TASK, {'create_plan', 'confirm_plan', 'mark_step_done', 'supersede_design_decision'},
             {'record_step_deviation'}, id='simple_task',
         ),
     ],
