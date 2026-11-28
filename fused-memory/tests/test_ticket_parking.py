@@ -222,7 +222,7 @@ class TestUncappedCurationUnchanged:
         [call] = taskmaster.add_task_calls
         assert {**call, 'metadata': json.loads(call['metadata'])} == {
             'project_root': PROJECT_ROOT,
-            'metadata': _FILED_METADATA,
+            'metadata': {**_FILED_METADATA, 'x_curator_complexity_hint': None},
             'title': 'New work',
             'description': 'New work description',
         }
