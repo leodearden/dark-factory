@@ -2,17 +2,20 @@
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import logging
 import signal
 import socket
 from collections.abc import Iterator
 from dataclasses import dataclass
+from pathlib import Path
 
 import pytest
 import uvicorn
 from starlette.applications import Starlette
 
+import fused_memory
 from fused_memory.server.embedded_uvicorn import EmbeddedUvicornServer, embedded_uvicorn_config
 
 UVICORN_LOGGER_NAMES = ('uvicorn', 'uvicorn.error', 'uvicorn.access', 'uvicorn.asgi')
@@ -109,3 +112,38 @@ async def test_serving_leaves_the_process_signal_handlers_alone() -> None:
         await serving
 
     assert (signal.getsignal(signal.SIGTERM), signal.getsignal(signal.SIGINT)) == handlers_before
+
+
+_UVICORN_CONSTRUCTORS = frozenset({'Server', 'Config'})
+
+
+def _uvicorn_constructor_sites(tree: ast.Module) -> Iterator[int]:
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Attribute)
+            and node.attr in _UVICORN_CONSTRUCTORS
+            and isinstance(node.value, ast.Name)
+            and node.value.id == 'uvicorn'
+        ) or (
+            isinstance(node, ast.ImportFrom)
+            and node.module == 'uvicorn'
+            and any(alias.name in _UVICORN_CONSTRUCTORS for alias in node.names)
+        ):
+            yield node.lineno
+
+
+def test_only_the_embedded_module_constructs_uvicorn_servers() -> None:
+    """Every in-process uvicorn server shares the process's signals and loggers, so each construction site must go through the seam (heuristic 10, uniformly enforced)."""
+    package = Path(fused_memory.__file__).parent
+    seam = package / 'server' / 'embedded_uvicorn.py'
+
+    offending_sites = [
+        f'{path.relative_to(package.parent)}:{lineno}'
+        for path in sorted(package.rglob('*.py'))
+        if path != seam
+        for lineno in _uvicorn_constructor_sites(ast.parse(path.read_text(), filename=str(path)))
+    ]
+
+    assert offending_sites == [], (
+        'build uvicorn servers through fused_memory.server.embedded_uvicorn, not uvicorn.Server/Config'
+    )
