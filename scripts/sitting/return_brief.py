@@ -461,7 +461,7 @@ def _hours_apart(stamp: str, generated_at: str) -> str:
 def _trial_text(project: str, measurement: Measurement[PreparerTrial]) -> str:
     if not measurement.ok:
         return f'{project}: not measured — {_flag_text(measurement)}'
-    trial, turns = measurement.value, measurement.value.resolution_turns
+    trial, turns = measurement.value.trailing, measurement.value.resolution_turns
     rate = f' ({trial.rate:.0%})' if trial.rate is not None else ''
     median = 'n/a' if turns.median is None else f'{turns.median:g}'
     return (f'{project}: agreement {trial.numerator}/{trial.denominator}{rate} over n={trial.n} prepared '
