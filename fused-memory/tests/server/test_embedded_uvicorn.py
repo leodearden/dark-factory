@@ -13,10 +13,13 @@ from pathlib import Path
 
 import pytest
 import uvicorn
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 from starlette.applications import Starlette
 
 import fused_memory
 from fused_memory.server.embedded_uvicorn import EmbeddedUvicornServer, embedded_uvicorn_config
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 UVICORN_LOGGER_NAMES = ('uvicorn', 'uvicorn.error', 'uvicorn.access', 'uvicorn.asgi')
 
