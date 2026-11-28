@@ -43,7 +43,7 @@ def test_a_supersession_rewrites_the_entry_and_keeps_the_prior_pair():
         {'decision': 'Key the sweep on text', 'rationale': 'Titles are stable', 'reason': _REASON},
     ]
     assert after[1] == _DECISIONS[1]
-    assert _DECISIONS == before
+    assert before == _DECISIONS
 
 
 def test_a_second_supersession_appends_oldest_first():
