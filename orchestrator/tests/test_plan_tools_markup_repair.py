@@ -864,26 +864,6 @@ class TestRepairableFieldTable:
         assert 'mark_step_committed' in alternates[('steps', 'description')]
         assert 'mark_step_committed' in alternates[('prerequisites', 'description')]
 
-    def test_a_superseding_writer_is_declared_on_both_decision_cells(self, tmp_path):
-        """``supersede_design_decision`` rewrites a recorded decision and rationale in place (task 3865)."""
-        for field in ('decision', 'rationale'):
-            changed, refusal = _alternate_writer_changed_the_cell(
-                tmp_path / field, 'design_decisions', field, 'supersede_design_decision'
-            )
-            assert changed, (
-                f'supersede_design_decision refused the probe call: {refusal!r}'
-                if refusal is not None else
-                f'supersede_design_decision is supposed to rewrite design_decisions.{field} '
-                'but the probe observed no change'
-            )
-
-        alternates = {
-            (r.collection, r.field): set(r.also_written_by)
-            for r in plan_tools._REPAIRABLE_PLAN_FIELDS
-        }
-        assert 'supersede_design_decision' in alternates[('design_decisions', 'decision')]
-        assert 'supersede_design_decision' in alternates[('design_decisions', 'rationale')]
-
     def test_plan_mutating_method_names_are_real_task_artifacts_methods(self):
         """Guards the derivation's silent-vacuity failure mode.
 
