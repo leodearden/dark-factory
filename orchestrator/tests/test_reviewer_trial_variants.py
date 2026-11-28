@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import dataclasses
+
 import pytest
 
 from orchestrator.agents.review_briefing import ReviewBriefing
@@ -413,12 +415,15 @@ class TestTrialReviewerTurnCap:
 
 
 class TestTrialReviewerBudget:
-    """The incumbent arms run at production's reviewer budget unless told otherwise."""
+    """An arm that pins no budget runs at production's reviewer budget unless told otherwise.
+
+    A pinned arm keeps its pin.
+    """
 
     @pytest.mark.usefixtures('code_default_config')
-    def test_the_incumbent_arms_built_with_no_override_carry_production_s_12_dollars(self) -> None:
+    def test_the_unpinned_arms_built_with_no_override_carry_production_s_12_dollars(self) -> None:
         assert trial_production_budget() == 12.0
-        for variant in (VARIANT_A, VARIANT_A_XHIGH):
+        for variant in (VARIANT_A, VARIANT_A_XHIGH, VARIANT_FABLE52_SOLO):
             for arm in (variant, with_briefing(variant, ReviewBriefing.CONTEXT_COMPLETE)):
                 assert arm.reviewers[0].budget is None
                 role = build_trial_reviewer_role(arm.reviewers[0], arm.briefing)
@@ -427,8 +432,8 @@ class TestTrialReviewerBudget:
     @pytest.mark.usefixtures('code_default_config')
     def test_the_fable_5_2_candidate_runs_at_the_incumbent_s_budget(self) -> None:
         """Candidate and incumbent differ only in model, so the budget never varies with the arm."""
-        for arm in (VARIANT_FABLE52_SOLO, with_briefing(VARIANT_FABLE52_SOLO, ReviewBriefing.CONTEXT_COMPLETE)):
-            assert build_trial_reviewer_role(arm.reviewers[0], arm.briefing).default_budget == 12.0
+        candidate = VARIANT_FABLE52_SOLO.reviewers[0]
+        assert dataclasses.replace(VARIANT_A.reviewers[0], model=candidate.model) == candidate
         assert panel_budgets(VARIANT_FABLE52_SOLO) == panel_budgets(VARIANT_A) == (12.0,)
         assert panel_budgets(VARIANT_FABLE52_SOLO, 7.5) == panel_budgets(VARIANT_A, 7.5) == (7.5,)
 
