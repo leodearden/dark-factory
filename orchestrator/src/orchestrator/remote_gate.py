@@ -5,7 +5,8 @@ of the dispatcher's deployed sha, built by the package script
 ``remote_gate/ensure-gate.sh``.  Before any verify is spent on it, the gate
 proves who it is with ``orchestrator gate-identity``: the sha it was built from
 and a fingerprint of the verify wire shapes.  This module owns that identity,
-its one parser, the script, and the one rule that classes every remote failure.
+its one parser, the script, the gate reaper's scripts and its completion
+stamp, and the one rule that classes every remote failure.
 
 It imports nothing from the wire path at module level, so ``verify_runner`` and
 ``cli`` may import it; :func:`wire_classes` imports the wire classes lazily.
@@ -43,6 +44,10 @@ ENSURE_CLIENT_TIMEOUT_SECS = 600
 # The marker ensure-gate.sh writes in every gate root; a reaper deletes only
 # under a root that carries it.
 GATE_ROOT_MARKER = '.dark-factory-gate-root'
+
+# The file reap-gates.sh touches under the root as the last step of a run that
+# completed.
+REAP_STAMP = '.last-reap'
 
 _FULL_SHA = re.compile(r'[0-9a-f]{40}')
 _SHA256_HEX = re.compile(r'[0-9a-f]{64}')
@@ -105,6 +110,45 @@ class EnsureReport:
 
 class GateReplyError(ValueError):
     """A gate's stdout is not the documented reply; the caller classes it 'gate'."""
+
+
+@dataclass(frozen=True)
+class ReapStamp:
+    """One reading of a gate root's reap stamp: reap-stamp.sh's reply.
+
+    ``path`` is the stamp file on the host; ``gate_root`` is whether the root
+    carries :data:`GATE_ROOT_MARKER`; ``age_secs`` is how many seconds ago,
+    on the host's own clock, a reap run last completed there, or None if none
+    has.
+    """
+
+    path: str
+    gate_root: bool
+    age_secs: int | None
+
+    def shows_a_run_within(self, secs: float) -> bool:
+        """Whether a reap completed in the last *secs*; an unmarked root has nothing to reap, so it does."""
+        return not self.gate_root or (self.age_secs is not None and self.age_secs <= secs)
+
+
+@dataclass(frozen=True)
+class ReapStampUnreadable:
+    """A reading of the reap stamp at ``path`` whose reply is not reap-stamp.sh's.
+
+    ``error`` is :func:`parse_reap_stamp`'s complaint; ``stderr`` is the ssh
+    round trip's, where a failing probe's own message lands.
+    """
+
+    path: str
+    error: str
+    stderr: str
+
+    def shows_a_run_within(self, secs: float) -> bool:
+        """Never: a reply that cannot be read shows no completed run."""
+        return False
+
+
+ReapReading = ReapStamp | ReapStampUnreadable
 
 
 _WIRE_METADATA_KEY = 'df_wire'
@@ -230,6 +274,19 @@ def parse_ensure_report(stdout: str) -> EnsureReport:
     return EnsureReport(built=reply['built'], identity=_identity_from_mapping(reply['identity']))
 
 
+def parse_reap_stamp(stdout: str, *, path: str) -> ReapStamp:
+    """Parse reap-stamp.sh's stdout, ``{"gate_root": bool, "age_secs": int | null}``, as a reading of *path*."""
+    reply = _single_json_document(stdout)
+    if not isinstance(reply, dict) or set(reply) != {'gate_root', 'age_secs'}:
+        raise GateReplyError(f'reap stamp reply must be {{gate_root, age_secs}}, got {stdout[:200]!r}')
+    gate_root, age_secs = reply['gate_root'], reply['age_secs']
+    if not isinstance(gate_root, bool):
+        raise GateReplyError(f'reap stamp gate_root must be a bool, got {gate_root!r}')
+    if age_secs is not None and (isinstance(age_secs, bool) or not isinstance(age_secs, int)):
+        raise GateReplyError(f'reap stamp age_secs must be an int or null, got {age_secs!r}')
+    return ReapStamp(path=path, gate_root=gate_root, age_secs=age_secs)
+
+
 def classify_remote_exit(
     rc: int | None, stderr: str = '', *, channel: RemoteChannel = 'ssh',
 ) -> RunnerUnavailableKind:
@@ -280,10 +337,23 @@ def reap_script_text() -> str:
 
     Its contract: env ``GATE_ROOT`` (absolute).  Under a root carrying
     :data:`GATE_ROOT_MARKER` it deletes sha dirs idle for 7 days, each with
-    its build lock, and trash older than a day; elsewhere it does nothing.
-    Run detached: it prints nothing and its outcome is not awaited.
+    its build lock, and trash older than a day, then touches
+    :data:`REAP_STAMP` as its last step; elsewhere it does nothing.  Run
+    detached: it prints nothing and its outcome is not awaited.
     """
     return _packaged_script('reap-gates.sh')
+
+
+def reap_stamp_script_text() -> str:
+    """The text of ``remote_gate/reap-stamp.sh``, shipped as package data.
+
+    Its contract: env ``GATE_ROOT`` (absolute).  It prints one
+    :func:`parse_reap_stamp` line: whether the root carries
+    :data:`GATE_ROOT_MARKER`, and how many seconds ago on the host's own clock
+    reap-gates.sh last touched :data:`REAP_STAMP` there.  A relative root
+    exits 64.
+    """
+    return _packaged_script('reap-stamp.sh')
 
 
 # The client-side tell of a host shim that ignores ORCH_GATE_BIN and runs a

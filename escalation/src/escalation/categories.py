@@ -43,6 +43,7 @@ class EscalationCategory(StrEnum):
     DURABLE_WRITE_DEAD_LETTER = 'durable_write_dead_letter'
     ENTITY_MINT_STORM = 'entity_mint_storm'
     EVAL_REGRESSION = 'eval_regression'
+    GATE_REAPER_STALE = 'gate_reaper_stale'
     ILLEGAL_DEPLOY_TRANSITION = 'illegal_deploy_transition'
     INFRA_ISSUE = 'infra_issue'
     INTEGRATION_SKEW = 'integration_skew'

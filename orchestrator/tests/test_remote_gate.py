@@ -17,6 +17,7 @@ import contextlib
 import dataclasses
 import fcntl
 import json
+import math
 import os
 import shlex
 import shutil
@@ -45,17 +46,22 @@ from orchestrator.deployed_sha import DeployedSha
 from orchestrator.event_store import EventType
 from orchestrator.remote_gate import (
     GATE_ROOT_MARKER,
+    REAP_STAMP,
     EnsureReport,
     GateIdentity,
     GateIdentityPair,
     GateReplyError,
+    ReapStamp,
+    ReapStampUnreadable,
     classify_remote_exit,
     ensure_script_text,
     local_gate_identity,
     off_wire_field,
     parse_ensure_report,
     parse_gate_identity,
+    parse_reap_stamp,
     reap_script_text,
+    reap_stamp_script_text,
     wire_classes,
     wire_fields,
     wire_fingerprint,
@@ -903,7 +909,7 @@ class _Scripted:
             'verify': (0, result_to_json(_VERDICT), ''),
             'cancel': (0, '', ''),
             'probe': (1, '', ''),
-            'reap': (0, '', ''),
+            'reap': (0, '{"gate_root": true, "age_secs": 0}', ''),
             'other': (0, '', ''),
             **replies,
         }
@@ -1619,12 +1625,54 @@ def test_the_reaper_deletes_idle_sha_dirs_and_old_trash_only(gate_root: Path):
     assert not [p for p in gate_root.glob('.trash-*') if p != new_trash]
 
 
+def test_the_reaper_applies_the_seven_day_rule_to_the_minute(gate_root: Path):
+    just_past = _dir(gate_root, '5' * 40, days=7.1)
+    just_short = _dir(gate_root, '6' * 40, days=6.9)
+
+    result = _reap(gate_root)
+
+    assert result.returncode == 0, result.stderr
+    assert not just_past.exists()
+    assert just_short.exists()
+
+
+def test_a_completed_reap_stamps_the_gate_root(gate_root: Path):
+    _dir(gate_root, '1' * 40, days=8)
+    before = time.time()
+
+    result = _reap(gate_root)
+
+    assert result.returncode == 0, result.stderr
+    stamp = gate_root / REAP_STAMP
+    assert stamp.is_file()
+    assert stamp.stat().st_mtime >= before - 1
+
+
+def test_a_reap_that_fails_leaves_no_stamp(gate_root: Path):
+    if os.geteuid() == 0:
+        pytest.skip('root empties a read-only dir')
+    old_trash = _dir(gate_root, '.trash-old', days=2)
+    locked = old_trash / 'locked'
+    locked.mkdir()
+    (locked / 'file').write_text('x')
+    _age(old_trash, 2)
+    locked.chmod(0o500)
+    try:
+        result = _reap(gate_root)
+    finally:
+        locked.chmod(0o700)
+
+    assert result.returncode != 0
+    assert not (gate_root / REAP_STAMP).exists()
+
+
 def test_the_reaper_leaves_an_unmarked_root_alone(gate_root: Path):
     (gate_root / GATE_ROOT_MARKER).unlink()
     idle = _dir(gate_root, '1' * 40, days=30)
 
     assert _reap(gate_root).returncode == 0
     assert idle.exists()
+    assert not (gate_root / REAP_STAMP).exists()
 
 
 def test_the_reaper_skips_a_sha_whose_build_lock_is_held(gate_root: Path):
@@ -1687,19 +1735,155 @@ def test_reap_script_text_is_the_packaged_script():
     assert reap_script_text() == packaged.read_text()
 
 
+# ---------------------------------------------------------------------------
+# reap-stamp.sh against real directories (task 8520)
+# ---------------------------------------------------------------------------
+
+
+_STAMP_PROBE_EXIT_CEILING_SECS = 60
+
+
+def _run_stamp_probe(root: Path | str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ['bash', '-c', reap_stamp_script_text(), 'reap-stamp'],
+        env={'PATH': os.environ['PATH'], 'GATE_ROOT': str(root)},
+        capture_output=True, text=True, timeout=_STAMP_PROBE_EXIT_CEILING_SECS,
+    )
+
+
+def _read_stamp(root: Path) -> ReapStamp:
+    result = _run_stamp_probe(root)
+    assert result.returncode == 0, result.stderr
+    return parse_reap_stamp(result.stdout, path=str(root / REAP_STAMP))
+
+
+def test_an_unmarked_or_missing_root_reads_as_no_gate_root(gate_root: Path, tmp_path: Path):
+    (gate_root / GATE_ROOT_MARKER).unlink()
+    missing = tmp_path / 'absent'
+
+    assert _read_stamp(gate_root) == ReapStamp(
+        path=str(gate_root / REAP_STAMP), gate_root=False, age_secs=None,
+    )
+    assert _read_stamp(missing) == ReapStamp(
+        path=str(missing / REAP_STAMP), gate_root=False, age_secs=None,
+    )
+
+
+def test_a_marked_root_never_reaped_reads_no_age(gate_root: Path):
+    assert _read_stamp(gate_root) == ReapStamp(
+        path=str(gate_root / REAP_STAMP), gate_root=True, age_secs=None,
+    )
+
+
+def test_a_stamp_reads_its_age_on_the_hosts_clock(gate_root: Path):
+    stamp = gate_root / REAP_STAMP
+    stamp.touch()
+    aged_at = time.time()
+    _age(stamp, 1 / 24)
+
+    reading = _read_stamp(gate_root)
+
+    assert reading.gate_root
+    assert reading.age_secs is not None
+    assert 3600 <= reading.age_secs <= 3600 + math.ceil(time.time() - aged_at) + 1
+
+
+def test_the_stamp_probe_rejects_a_relative_root():
+    assert _run_stamp_probe('gates').returncode == 64
+
+
+@pytest.mark.parametrize('stdout', [
+    'nope',
+    '{}',
+    '{"gate_root": true}',
+    '{"gate_root": true, "age_secs": true}',
+    '{"gate_root": true, "age_secs": "42"}',
+    '{"gate_root": 1, "age_secs": 42}',
+    '{"gate_root": true, "age_secs": 42, "extra": 1}',
+])
+def test_parse_reap_stamp_rejects_anything_else(stdout: str):
+    with pytest.raises(GateReplyError):
+        parse_reap_stamp(stdout, path='/gates/.last-reap')
+
+
+@pytest.mark.parametrize(('gate_root', 'age_secs', 'window', 'shows'), [
+    (False, None, 0, True),
+    (False, None, 1e9, True),
+    (True, None, 1e9, False),
+    (True, 100, 100, True),
+    (True, 100, 99, False),
+])
+def test_a_reading_shows_a_run_within_a_window(gate_root, age_secs, window, shows):
+    reading = ReapStamp(path='/gates/.last-reap', gate_root=gate_root, age_secs=age_secs)
+    assert reading.shows_a_run_within(window) is shows
+
+
+def test_reap_stamp_script_text_is_the_packaged_script():
+    packaged = Path(__file__).parents[1] / 'src/orchestrator/remote_gate/reap-stamp.sh'
+    assert reap_stamp_script_text() == packaged.read_text()
+
+
 @pytest.mark.asyncio
 async def test_reap_idle_gates_launches_the_reaper_detached():
-    transport = _Scripted()
+    transport = _Scripted(reap=(0, '{"gate_root": true, "age_secs": 42}', ''))
 
-    await _scripted_runner(transport).reap_idle_gates()
+    reading = await _scripted_runner(transport).reap_idle_gates()
 
+    assert reading == ReapStamp(path='/gates/.last-reap', gate_root=True, age_secs=42)
     [(_, argv, _)] = transport.calls
     command = argv[-1]
-    assert command.startswith(f'{REMOTE_TOOL_PATH_PRELUDE} nohup env GATE_ROOT=/gates bash -c ')
+    probe = shlex.join(['env', 'GATE_ROOT=/gates', 'bash', '-c', reap_stamp_script_text(), 'reap-stamp'])
+    assert command.startswith(f'{probe}; ')
+    assert f'; {REMOTE_TOOL_PATH_PRELUDE} nohup env GATE_ROOT=/gates bash -c ' in command
     assert command.endswith(' reap-gates </dev/null >/dev/null 2>&1 &')
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize('reply', [(255, '', 'unreachable'), OSError('no ssh')])
-async def test_reap_idle_gates_never_raises(reply):
-    await _scripted_runner(_Scripted(reap=reply)).reap_idle_gates()
+async def test_a_reap_launch_that_never_reached_the_host_reads_none(reply):
+    assert await _scripted_runner(_Scripted(reap=reply)).reap_idle_gates() is None
+
+
+@pytest.mark.asyncio
+async def test_a_reap_stamp_reply_that_does_not_parse_reads_unreadable_with_sshs_stderr():
+    transport = _Scripted(reap=(0, '', 'stat: invalid option -- c\n'))
+
+    reading = await _scripted_runner(transport).reap_idle_gates()
+
+    assert isinstance(reading, ReapStampUnreadable)
+    assert reading.path == '/gates/.last-reap'
+    assert reading.stderr == 'stat: invalid option -- c\n'
+    assert not reading.shows_a_run_within(math.inf)
+
+
+# A hang guard: the detached reaper finishes in well under a second, so a
+# passing test never waits this out.
+_DETACHED_REAP_HANG_CEILING_SECS = 120
+
+
+@pytest.mark.asyncio
+async def test_reap_idle_gates_reads_the_stamp_of_the_run_it_launched_before(
+    gate_scene: _GateScene,
+):
+    gates = gate_scene.gates
+    gates.mkdir()
+    (gates / GATE_ROOT_MARKER).touch()
+    idle = _dir(gates, '1' * 40, days=8)
+    stamp = gates / REAP_STAMP
+    runner = gate_scene.runner()
+
+    first = await runner.reap_idle_gates()
+
+    assert first == ReapStamp(path=str(stamp), gate_root=True, age_secs=None)
+    assert await asyncio.to_thread(_holds_within, stamp.exists, _DETACHED_REAP_HANG_CEILING_SECS)
+    assert not idle.exists()
+
+    first_run = stamp.stat().st_mtime_ns
+    second = await runner.reap_idle_gates()
+
+    assert isinstance(second, ReapStamp) and second.gate_root
+    assert second.age_secs is not None
+    assert 0 <= second.age_secs <= math.ceil(time.time() - first_run / 1e9) + 1
+    assert await asyncio.to_thread(
+        _holds_within, lambda: stamp.stat().st_mtime_ns > first_run, _DETACHED_REAP_HANG_CEILING_SECS,
+    )

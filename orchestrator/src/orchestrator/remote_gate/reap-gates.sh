@@ -9,7 +9,10 @@
 # are exactly 40 hex digits or start with .trash-. A sha dir is reaped under its
 # build lock (never while ensure-gate.sh builds or touches it), is renamed to
 # trash first so an interrupted reap never leaves a half-dir at a sha path, and
-# is aged by its mtime, which every ensure refreshes.
+# is aged by its mtime, to the minute, which every ensure refreshes.
+#
+# A run that completed touches $GATE_ROOT/.last-reap as its last step; the name
+# must match remote_gate.py::REAP_STAMP.
 #
 # Build lock protocol, binding on every locker of $GATE_ROOT/.build-<sha>.lock
 # (this script, ensure-gate.sh and any future one): this script unlinks a reaped
@@ -25,13 +28,14 @@ set -euo pipefail
 	exit 64
 }
 [[ -f $GATE_ROOT/.dark-factory-gate-root ]] || exit 0
+idle_mins=$((7 * 24 * 60))
 
 reap_sha_dir() {
 	local dir=$1 lock trash=''
 	lock="$GATE_ROOT/.build-$(basename "$dir").lock"
 	exec 9>"$lock"
 	if flock -n 9 && [[ /dev/fd/9 -ef $lock ]] &&
-		[[ -n $(find "$dir" -maxdepth 0 -mtime +7 2>/dev/null) ]]; then
+		[[ -n $(find "$dir" -maxdepth 0 -mmin "+$idle_mins" 2>/dev/null) ]]; then
 		trash=$(mktemp -u -d "$GATE_ROOT/.trash-XXXXXXXX")
 		mv -T "$dir" "$trash"
 		rm -f "$lock"
@@ -43,7 +47,9 @@ reap_sha_dir() {
 while IFS= read -r -d '' dir; do
 	reap_sha_dir "$dir"
 done < <(find "$GATE_ROOT" -mindepth 1 -maxdepth 1 -type d \
-	-regextype posix-extended -regex '.*/[0-9a-f]{40}' -mtime +7 -print0)
+	-regextype posix-extended -regex '.*/[0-9a-f]{40}' -mmin "+$idle_mins" -print0)
 
 find "$GATE_ROOT" -mindepth 1 -maxdepth 1 -name '.trash-*' -mmin +1440 \
 	-exec rm -rf {} +
+
+touch "$GATE_ROOT/.last-reap"

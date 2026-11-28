@@ -425,7 +425,7 @@ class LaptopHost:
             return self.pgrep_rc, '', ''
         if 'reap-gates' in remote_cmd:
             self._log('reap', None, argv)
-            return 0, '', ''
+            return 0, '{"gate_root": true, "age_secs": 0}', ''
         if 'cancel-verify' in remote_cmd:
             return await self._cancel(argv, _orchestrator_args(remote_cmd))
         self._log('unscripted', None, argv)

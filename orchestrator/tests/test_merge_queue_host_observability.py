@@ -175,7 +175,7 @@ class _FakeRemoteRunner:
     def __init__(self, name: str, *, healthy: bool = True) -> None:
         self.name = name
         self.health = AsyncMock(return_value=healthy)
-        self.reap_idle_gates = AsyncMock()
+        self.reap_idle_gates = AsyncMock(return_value=None)
 
 
 class _FakeRemoteRunnerCancelFails(_FakeRemoteRunner):

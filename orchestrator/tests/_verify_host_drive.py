@@ -100,7 +100,7 @@ def runner_double(
     runner.name = name
     runner.is_local = is_local
     runner.health = AsyncMock(return_value=True)
-    runner.reap_idle_gates = AsyncMock()
+    runner.reap_idle_gates = AsyncMock(return_value=None)
     if ensure_error is not None:
         runner.ensure_gate = AsyncMock(side_effect=ensure_error)
     else:

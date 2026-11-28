@@ -2231,6 +2231,52 @@ unit: the commit each unit's verify wire path was imported from, read from
 its fleet heartbeat. Units at different commits build different gate
 directories; they never share or overwrite one.
 
+### The remote gate reaper and its `gate_reaper_stale` L1 (task 8520)
+
+The merge lane's reprobe sweep launches
+`orchestrator/src/orchestrator/remote_gate/reap-gates.sh` over ssh on each
+in-pool remote, at most hourly
+(`orchestrator/src/orchestrator/merge_lane/host_quarantine.py::HostQuarantine._reap_idle_gates`);
+a benched host is skipped. No systemd timer or cron runs it on the host, and
+none should be installed: the dispatcher sends the script text inline, and the
+host keeps no copy of it.
+
+The rule: a sha dir idle more than 7 days by mtime, measured to the minute, is
+reaped; every ensure refreshes that mtime. A reaped sha's `.build-<sha>.lock`
+is unlinked with it, under that lock, by the protocol whose one home is the
+`reap-gates.sh` header. `.trash-*` older than a day is removed too. A run that
+completes touches `<gate_checkouts_path>/.last-reap` as its last step. To check
+it on leo-laptop:
+
+```bash
+ssh leo-laptop stat -c %y /home/leo/src/dark-factory-gate/.last-reap
+```
+
+Each launch first reads that stamp in the same ssh round trip
+(`orchestrator/src/orchestrator/remote_gate/reap-stamp.sh`), so each reading
+judges the run the previous launch started
+(`orchestrator/src/orchestrator/merge_lane/gate_reaper_watch.py::GateReaperWatch`).
+After two consecutive launches whose previous run never completed, it files one
+L1: category `gate_reaper_stale`, sentinel `__gate_reaper_stale__<host>`. The
+L1 resolves itself at the next completed run. A reply the host gave but that
+does not parse counts as a launch with no completed run, so a probe that keeps
+failing raises the same L1; its detail carries the parse error and ssh's
+stderr, since ssh exits with the launch's status rather than the probe's. A
+launch that failed to reach the host neither counts nor resets the streak (an
+unreachable host has its own `verify_host_unreachable` alarm), and the first
+reading after an orchestrator restart is not judged. A failure of the
+escalation queue itself is logged and retried at the next launch; it never
+stops another host's reaper launch.
+
+To see why a run fails, run the script in the foreground, from a dark-factory
+checkout, with the `bash -s <` recipe the L1's detail gives:
+
+```bash
+ssh leo-laptop env GATE_ROOT=/home/leo/src/dark-factory-gate bash -s < orchestrator/src/orchestrator/remote_gate/reap-gates.sh
+```
+
+Never delete sha dirs or lock files by hand.
+
 ### Remote task verifies (`verify_task_*`, task 6670)
 
 An implement-phase task verify can run on a `verify_runners` host instead of

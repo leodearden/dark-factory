@@ -28,7 +28,7 @@ from escalation.queue import EscalationQueue
 from orchestrator.config import OrchestratorConfig
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.merge_lane.host_quarantine import HostQuarantine
-from orchestrator.remote_gate import RunnerUnavailableKind
+from orchestrator.remote_gate import ReapStamp, RunnerUnavailableKind
 from orchestrator.verify_runner import HostAllocator, RunnerUnavailable
 
 _HOST = 'laptop'
@@ -47,6 +47,7 @@ class _Remote:
         self.healthy = True
         self.probes: list[str] = []
         self.reaps = 0
+        self.reap_reading: ReapStamp | None = None
 
     async def health(self) -> bool:
         self.probes.append('health')
@@ -58,8 +59,9 @@ class _Remote:
     async def probe_clean(self) -> bool:
         return True
 
-    async def reap_idle_gates(self) -> None:
+    async def reap_idle_gates(self) -> ReapStamp | None:
         self.reaps += 1
+        return self.reap_reading
 
 
 class _Events(EventStore):
@@ -271,6 +273,45 @@ async def test_the_sweep_reaps_idle_gates_at_most_hourly_and_skips_benched_hosts
 
     await scene.sweep(advance=HostQuarantine.GATE_REAP_INTERVAL_SECS)
     assert (scene.remotes[_HOST].reaps, scene.remotes[_OTHER].reaps) == (2, 0)
+
+
+@pytest.mark.asyncio
+async def test_the_sweep_files_an_l1_when_a_hosts_gate_reaper_stops_completing_runs(
+    scene: _Scene,
+) -> None:
+    remote = scene.remotes[_HOST]
+    remote.reap_reading = ReapStamp(path='/gates/.last-reap', gate_root=True, age_secs=None)
+
+    await scene.sweep()
+    for _ in range(2):
+        await scene.sweep(advance=HostQuarantine.GATE_REAP_INTERVAL_SECS)
+
+    [alarm] = scene.escalations.get_pending()
+    assert (alarm.category, alarm.task_id) == ('gate_reaper_stale', '__gate_reaper_stale__laptop')
+
+    remote.reap_reading = ReapStamp(path='/gates/.last-reap', gate_root=True, age_secs=0)
+    await scene.sweep(advance=HostQuarantine.GATE_REAP_INTERVAL_SECS)
+
+    assert scene.escalations.get_by_task('__gate_reaper_stale__laptop', status='pending') == []
+
+
+class _UnwritableEscalations(EscalationQueue):
+    def has_open_l1(self, *_: Any, **__: Any) -> bool:
+        raise OSError('escalation store unwritable')
+
+
+@pytest.mark.asyncio
+async def test_a_failing_gate_reaper_alarm_costs_no_other_host_its_reap(tmp_path: Path) -> None:
+    scene = _Scene(tmp_path, hosts=(_HOST, _OTHER))
+    scene.escalations = _UnwritableEscalations(tmp_path / 'unwritable')
+    for remote in scene.remotes.values():
+        remote.reap_reading = ReapStamp(path='/gates/.last-reap', gate_root=True, age_secs=None)
+
+    await scene.sweep()
+    for _ in range(2):
+        await scene.sweep(advance=HostQuarantine.GATE_REAP_INTERVAL_SECS)
+
+    assert (scene.remotes[_HOST].reaps, scene.remotes[_OTHER].reaps) == (3, 3)
 
 
 # ---------------------------------------------------------------------------
