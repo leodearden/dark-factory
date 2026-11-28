@@ -249,5 +249,35 @@ PY
 ```
 
 Task 11727's round-2 campaign reports these counts with its results. Since
-task 11912 the incumbent runs at production's $12, so a budget kill on any arm
-is a finding to report, not noise.
+tasks 11912 and 11964 the incumbent and the Fable 5.2 candidate run at
+production's $12, so a budget kill on any arm is a finding to report, not
+noise.
+
+## 8. Round 2 (task 11727): candidate budgets
+
+Since task 11964, `variant_fable52_solo` pins no budget. It takes production's
+`budgets.reviewer` ($12) like the incumbent, and `--production-budget` moves
+both together. The two arms therefore differ only in model, and a Q1
+replacement is measured at the budget production would dispatch it at.
+
+The measured basis is the finished D6/D7 panels' `total_cost_usd`, retried
+attempts included:
+
+- `variant_fable51_solo_d2` ran at a $10 pin and 30 turns: 192 panels (32
+  originals x 3 trials, plus 96 amendment fixtures). It had 0 ERROR reviews, a
+  p50 of $1.95, a p95 of $3.53, a max of $6.03 and a mean of $2.06.
+- `variant_a_d2` had a mean of $0.55 and a p95 of $0.93. The 3.7x in task
+  11727 is the ratio of the two means. It therefore scales the trial's
+  opus-high arm, not production's $3.10 opus p95.
+- Fable 5.2's list rates are 0.8x Fable 5.1's
+  (`shared/src/shared/process_cost.py::_LIST_RATES`). They are published rates,
+  not yet fitted.
+- Fable spend past 30 turns is unmeasured. The §7 count reports any budget
+  kill per arm.
+
+`variant_codex_sol62` keeps its $5 pin. The pin is inert, because codex
+enforces neither ceiling
+(`shared/src/shared/cli_invoke.py::classify_cap_kill`).
+
+Task 11727's pre-registration states each arm's budget and turn cap. Leo's go
+on its cost estimate covers this choice.
