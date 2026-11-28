@@ -6,8 +6,11 @@
 
 from __future__ import annotations
 
-from collections.abc import Collection, Mapping, Sequence
+import logging
+from collections.abc import Awaitable, Callable, Collection, Mapping, Sequence
+from dataclasses import dataclass
 from datetime import datetime
+from typing import Any
 
 from shared.defects import (
     Declare,
@@ -23,11 +26,23 @@ from shared.defects import (
     issue_kind_of,
     mint_review_ref,
 )
+from shared.mcp_envelope import parse_tool_result, write_failure_reason
 
 from orchestrator.review_issue_contract import IssueField
 from orchestrator.review_payload import DefectRuling
 
+logger = logging.getLogger(__name__)
+
+DECLARE_DEFECT_TOOL = 'declare_defect'
+RECORD_DEFECT_OUTCOME_TOOL = 'record_defect_outcome'
+
+#: The ``event`` a refused or undeliverable defect-record write is logged under.
+DEFECT_WRITE_FAILED_FACT = 'review_defect_write_failed'
+
 _UNNAMED_REVIEWER = 'reviewer'
+
+ReviewDefectEvent = Declare | Sighting | Rule
+DefectToolDispatch = Callable[[str, dict], Awaitable[dict]]
 
 
 def _text(issue: Mapping[str, object], field: str) -> str:
@@ -104,3 +119,77 @@ def review_ruling_events(
         ))
         for (ref, subject), accepted in accepted_by_subject.items()
     )
+
+
+_TOOL_BY_EVENT: Mapping[type[ReviewDefectEvent], str] = {
+    Declare: DECLARE_DEFECT_TOOL,
+    Sighting: DECLARE_DEFECT_TOOL,
+    Rule: RECORD_DEFECT_OUTCOME_TOOL,
+}
+
+
+@dataclass(frozen=True)
+class DefectWrite:
+    """One event's delivery: the tool it went to, its ref, and why it did not land (None if it did)."""
+
+    tool: str
+    ref: str
+    failure: str | None
+
+
+def _arguments(project_root: str, task_id: str, event: ReviewDefectEvent) -> dict[str, Any]:
+    arguments: dict[str, Any] = {'project_root': project_root, 'task_id': task_id}
+    if isinstance(event, Rule):
+        arguments['ref'] = event.ref
+    arguments['event'] = event.model_dump(mode='json')
+    return arguments
+
+
+def _failure_of(body: object) -> str | None:
+    reply, envelope_error = parse_tool_result(body, None, dict)
+    if envelope_error is not None:
+        return f'reply was not a tool result: {envelope_error}'
+    return write_failure_reason(reply)
+
+
+async def _send_one(
+    dispatch: DefectToolDispatch, project_root: str, task_id: str, event: ReviewDefectEvent,
+) -> DefectWrite:
+    tool = _TOOL_BY_EVENT[type(event)]
+    try:
+        body = await dispatch(tool, _arguments(project_root, task_id, event))
+    except Exception as exc:
+        failure: str | None = f'{type(exc).__name__}: {exc}'
+    else:
+        failure = _failure_of(body)
+    return DefectWrite(tool=tool, ref=event.ref, failure=failure)
+
+
+async def send_defect_events(
+    dispatch: DefectToolDispatch,
+    *,
+    project_root: str,
+    task_id: str,
+    events: Sequence[ReviewDefectEvent],
+) -> tuple[DefectWrite, ...]:
+    """Send each event through its defect-record tool, in order; never raises.
+
+    A write that fails is logged once and does not stop the events after it.
+    """
+    writes: list[DefectWrite] = []
+    for event in events:
+        write = await _send_one(dispatch, project_root, task_id, event)
+        if write.failure is not None:
+            logger.warning(
+                'Task %s: %s for %s did not land: %s',
+                task_id, write.tool, write.ref, write.failure,
+                extra={
+                    'event': DEFECT_WRITE_FAILED_FACT,
+                    'task_id': task_id,
+                    'tool': write.tool,
+                    'ref': write.ref,
+                    'failure': write.failure,
+                },
+            )
+        writes.append(write)
+    return tuple(writes)
