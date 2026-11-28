@@ -44,7 +44,7 @@ from fused_memory.middleware.task_curator import (
 )
 
 PROJECT_ID = 'p'
-PROJECT_ROOT = '/x'
+CURATION_ROOT = '/x'
 
 _ABSENT = object()
 
@@ -112,7 +112,7 @@ class TestTheCuratorParsesTheHint:
         )
 
         [decision] = await curator.curate_prepared(
-            [_bundle('Fix the wording of the guide')], PROJECT_ID, PROJECT_ROOT,
+            [_bundle('Fix the wording of the guide')], PROJECT_ID, CURATION_ROOT,
         )
 
         assert (decision.action, decision.complexity_hint) == ('create', parsed)
@@ -131,7 +131,7 @@ class TestTheCuratorParsesTheHint:
 
         decisions = await curator.curate_prepared(
             [_bundle('Fix the wording of the guide'), _bundle('Redesign the scheduler')],
-            PROJECT_ID, PROJECT_ROOT,
+            PROJECT_ID, CURATION_ROOT,
         )
 
         assert [(d.action, d.complexity_hint) for d in decisions] == [
@@ -154,7 +154,7 @@ class TestTheCuratorParsesTheHint:
 
         [decision] = await curator.curate_prepared(
             [_bundle('Fix the wording of the guide', pool=(('7', 'pending'),))],
-            PROJECT_ID, PROJECT_ROOT,
+            PROJECT_ID, CURATION_ROOT,
         )
 
         assert (decision.action, decision.target_id, decision.complexity_hint) == (
