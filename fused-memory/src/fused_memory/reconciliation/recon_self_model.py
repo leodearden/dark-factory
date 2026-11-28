@@ -545,6 +545,8 @@ def render_investigation_outcome_section() -> str:
         'evidence. Schema (observations_and_summaries category):\n'
         f'  - `metadata.kind = "{MEM0_KIND_INVESTIGATION_OUTCOME}"`\n'
         "  - `metadata.entity_uuid = <the investigated entity's uuid>`\n"
+        "  - `metadata.task_id = <the investigated task's id, when the investigated "
+        'entity is a task>`\n'
         '  - `metadata.actionable = false`\n'
         '  - `metadata.run_id = <current run_id>`\n\n'
         'Write one such record on every not-actionable investigation conclusion going '
@@ -713,7 +715,10 @@ def render_source_completion_section(*, can_file_tasks: bool) -> str:
     5929 (5929 even carried ``prior_escalation_tasks=[5916, 5902]`` and filed
     anyway). ``middleware/recurring_gate_guard.py`` enforces the resulting
     invariant at the ``submit_task`` boundary; this text is what tells the
-    filing agent the key exists and what happens if it is reused.
+    filing agent the key exists and what happens if it is reused. The filing
+    stage is taught task 5456's preserved-specimen refusal here for the same
+    reason: ``middleware/preserved_specimen_gate_guard.py`` refuses the gate,
+    and only this text can tell the stage not to reword it past that guard.
     """
     if can_file_tasks:
         residual_clause = (
@@ -735,7 +740,17 @@ def render_source_completion_section(*, can_file_tasks: bool) -> str:
             'already filed under those older, invented spellings are still '
             'matched. They are read-side only: never use either for a NEW '
             "filing, and never rewrite an existing carrier's metadata to "
-            'canonicalise it.'
+            'canonicalise it. A gate asking for a task to be moved out of '
+            'in-progress must name that task by its bare id, such as '
+            "`gate_subject='3105'`. If the task is a deliberately preserved "
+            'specimen, the gate is REFUSED with '
+            '`PreservedSpecimenResetViolation`, and that refusal is the answer: '
+            'do not re-file the reset request in other words. Moving it to '
+            'pending, setting it to pending and cancelling it all ask for the '
+            'same destruction. A gate asking only to keep the task in-progress, '
+            'such as one asking for its pinning record to be restored, is not a '
+            'reset request: say so plainly ("so it is not reset"), and it is '
+            'admitted.'
         )
     else:
         residual_clause = (

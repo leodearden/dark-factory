@@ -98,6 +98,7 @@ from fused_memory.middleware.operational_suggestion_guard import (
     operational_suggestion_warning,
 )
 from fused_memory.middleware.premise_lint_guard import premise_lint_error
+from fused_memory.middleware.preserved_specimen_gate_guard import preserved_specimen_gate_error
 from fused_memory.middleware.recurring_gate_guard import recurring_gate_guard_error
 from fused_memory.middleware.retired_key_modules_guard import retired_key_modules_error
 from fused_memory.middleware.routing_intent_guard import (
@@ -9779,6 +9780,23 @@ def create_mcp_server(
         if _exec_err is not None:
             return _exec_err
         metadata = inject_execution_class(metadata)
+
+        # Preserved-specimen reset refusal (task 5456); rationale in its module
+        # docstring. Reads DECLARED metadata, before inject_operational_routing,
+        # and runs ahead of the recurring-gate dedupe so a reset request for a
+        # preserved specimen is refused outright, never steered into amending a
+        # carrier. Covers the curator and planning_mode paths alike. Exempt
+        # callers pay one startswith.
+        _specimen_err = await preserved_specimen_gate_error(
+            metadata,
+            agent_id,
+            project_root,
+            title=title,
+            description=description,
+            memory_service=memory_service,
+        )
+        if _specimen_err is not None:
+            return _specimen_err
 
         # Recurring-human-gate dedupe guard (task 3588) — refuse to mint a
         # SECOND open human gate for a subject that already has one.

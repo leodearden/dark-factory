@@ -1,8 +1,11 @@
-"""submit_task boundary tests for the recurring-human-gate guard (task 3588).
+"""submit_task boundary tests for the recon human-gate ADMISSION guards.
 
-The unit-level invariant matrix for ``recurring_gate_guard`` lives in
-tests/test_recurring_gate_guard.py; this file asserts the guard is WIRED
-into the ``submit_task`` tool boundary, and realizes the task's literal
+Two guards decide whether a recon-filed human gate is admitted: task 3588's
+recurring-gate dedupe (``recurring_gate_guard``) and task 5456's
+preserved-specimen reset refusal (``preserved_specimen_gate_guard``). Their
+unit-level invariant matrices live in tests/test_recurring_gate_guard.py and
+tests/test_preserved_specimen_gate_guard.py; this file asserts both are WIRED
+into the ``submit_task`` tool boundary, and realizes each task's literal
 user-observable signal end to end.
 
 Naming follows the existing dedicated-boundary-file convention
@@ -17,7 +20,8 @@ Part A drives the lightweight mocked-interceptor harness
 rejection happens BEFORE persistence and that exempt callers pay zero
 added I/O. Part B drives a REAL stack — SqliteTaskBackend + EventBuffer +
 TicketStore + real TaskInterceptor + create_mcp_server — so the
-bounded-queue invariant is asserted against real persisted rows.
+bounded-queue invariant, and the refusal of a reset gate for a preserved
+specimen, are asserted against real persisted rows.
 """
 
 from __future__ import annotations
@@ -30,6 +34,15 @@ from unittest.mock import AsyncMock
 
 import pytest
 import pytest_asyncio
+from _preserved_specimen_fixtures import (
+    OWN_NODE_ENTITY,
+    SPECIMEN_MEMORY_ID,
+    corroboration_reads,
+    reset_gate_description,
+    reset_gate_metadata,
+    reset_gate_title,
+    specimen_memory,
+)
 
 from fused_memory.server.tools import create_mcp_server
 
@@ -86,6 +99,19 @@ def _submission(**overrides: Any) -> dict[str, Any]:
             'operational_mode': 'gate',
             'gate_subject': '5879',
         },
+    }
+    payload.update(overrides)
+    return payload
+
+
+def _reset_gate_submission(subject: str = '3105', **overrides: Any) -> dict[str, Any]:
+    """A task-5080-shaped recon gate submission asking for *subject* to be reset."""
+    payload: dict[str, Any] = {
+        'project_root': '/project',
+        'title': reset_gate_title(subject),
+        'description': reset_gate_description(subject),
+        'agent_id': 'recon-stage-task_knowledge_sync',
+        'metadata': reset_gate_metadata(subject),
     }
     payload.update(overrides)
     return payload
@@ -260,15 +286,159 @@ class TestSubmitTaskRecurringGateWiring:
         assert not (set(map(str, statuses)) & set(map(str, TERMINAL)))
 
 
+class TestSubmitTaskPreservedSpecimenWiring:
+    """The preserved-specimen guard runs inside submit_task, before persistence."""
+
+    @staticmethod
+    def _server(memory: AsyncMock, *carriers: dict[str, Any]):
+        mock_ti = AsyncMock()
+        mock_ti.submit_task.return_value = {'ticket': 'tkt_x'}
+        mock_ti.get_tasks = AsyncMock(return_value={'tasks': list(carriers)})
+        return create_mcp_server(memory, task_interceptor=mock_ti), mock_ti
+
+    @pytest.mark.asyncio
+    async def test_reset_gate_for_preserved_specimen_is_rejected_before_persistence(self):
+        server, mock_ti = self._server(specimen_memory())
+
+        result = await server._tool_manager.call_tool('submit_task', _reset_gate_submission())
+
+        parsed = _parse_tool_result(result)
+        assert parsed.get('error_type') == 'PreservedSpecimenResetViolation', f'got {parsed!r}'
+        assert parsed.get('gate_subject') == '3105', f'got {parsed!r}'
+        assert parsed.get('preservation_citation') == SPECIMEN_MEMORY_ID, f'got {parsed!r}'
+        mock_ti.submit_task.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_corroboration_read_is_scoped_to_the_submitting_project(self):
+        from fused_memory.models.scope import resolve_project_id
+
+        memory = specimen_memory()
+        server, _ = self._server(memory)
+
+        await server._tool_manager.call_tool('submit_task', _reset_gate_submission())
+
+        memory.get_memories_by_metadata.assert_awaited_once()
+        project_id = memory.get_memories_by_metadata.await_args.kwargs['project_id']
+        assert project_id == resolve_project_id('/project')
+
+    @pytest.mark.asyncio
+    async def test_reset_gate_without_a_subject_is_refused_without_memory_reads(self):
+        memory = specimen_memory()
+        server, mock_ti = self._server(memory)
+
+        result = await server._tool_manager.call_tool(
+            'submit_task',
+            _reset_gate_submission(metadata={'execution_class': 'operational'}),
+        )
+
+        parsed = _parse_tool_result(result)
+        assert parsed.get('error_type') == 'ResetGateSubjectRequired', f'got {parsed!r}'
+        assert corroboration_reads(memory) == 0
+        mock_ti.submit_task.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_reset_gate_for_an_ordinary_stranded_task_reaches_the_interceptor(self):
+        server, mock_ti = self._server(specimen_memory())
+
+        result = await server._tool_manager.call_tool(
+            'submit_task', _reset_gate_submission(subject='3843'),
+        )
+
+        parsed = _parse_tool_result(result)
+        assert 'error' not in parsed, f'got {parsed!r}'
+        mock_ti.submit_task.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_another_tasks_node_does_not_lend_its_citation(self):
+        """The esc-4223-1 binding at this call site: only 'Task 3105' came back for 5231."""
+        server, mock_ti = self._server(specimen_memory(entity=OWN_NODE_ENTITY))
+
+        result = await server._tool_manager.call_tool(
+            'submit_task', _reset_gate_submission(subject='5231'),
+        )
+
+        parsed = _parse_tool_result(result)
+        assert 'error' not in parsed, f'got {parsed!r}'
+        mock_ti.submit_task.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_non_recon_caller_is_exempt_and_pays_no_memory_reads(self):
+        memory = specimen_memory()
+        server, mock_ti = self._server(memory)
+
+        result = await server._tool_manager.call_tool(
+            'submit_task', _reset_gate_submission(agent_id='claude-interactive'),
+        )
+
+        parsed = _parse_tool_result(result)
+        assert 'error' not in parsed, f'got {parsed!r}'
+        assert corroboration_reads(memory) == 0
+        mock_ti.submit_task.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_gate_that_requests_no_reset_pays_no_memory_reads(self):
+        memory = specimen_memory()
+        server, _ = self._server(memory)
+
+        await server._tool_manager.call_tool('submit_task', _submission())
+
+        assert corroboration_reads(memory) == 0
+
+    @pytest.mark.asyncio
+    async def test_preserved_specimen_refusal_precedes_the_recurring_gate_dedupe(self):
+        """An open carrier for 3105 must not turn the refusal into "amend the carrier"."""
+        server, mock_ti = self._server(specimen_memory(), _carrier(subject='3105'))
+
+        result = await server._tool_manager.call_tool('submit_task', _reset_gate_submission())
+
+        parsed = _parse_tool_result(result)
+        assert parsed.get('error_type') == 'PreservedSpecimenResetViolation', f'got {parsed!r}'
+        mock_ti.get_tasks.assert_not_awaited()
+        mock_ti.submit_task.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_degraded_memory_read_fails_open(self):
+        memory = specimen_memory()
+        memory.get_memories_by_metadata.side_effect = RuntimeError('qdrant down')
+        server, mock_ti = self._server(memory)
+
+        result = await server._tool_manager.call_tool('submit_task', _reset_gate_submission())
+
+        parsed = _parse_tool_result(result)
+        assert 'error' not in parsed, f'got {parsed!r}'
+        mock_ti.submit_task.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_llm_mode_reset_gate_for_preserved_specimen_is_refused(self):
+        """operational+'llm' escalates, though is_gate_submission does not cover it."""
+        server, mock_ti = self._server(specimen_memory())
+
+        result = await server._tool_manager.call_tool(
+            'submit_task',
+            _reset_gate_submission(
+                metadata={
+                    'execution_class': 'operational',
+                    'operational_mode': 'llm',
+                    'gate_subject': '3105',
+                },
+            ),
+        )
+
+        parsed = _parse_tool_result(result)
+        assert parsed.get('error_type') == 'PreservedSpecimenResetViolation', f'got {parsed!r}'
+        mock_ti.submit_task.assert_not_called()
+
+
 # ---------------------------------------------------------------------------
 # Part B — end-to-end on a real stack
 # ---------------------------------------------------------------------------
 
 
-async def _build_stack(tmp_path):
+async def _build_stack(tmp_path, memory_service: AsyncMock | None = None):
     """Real SqliteTaskBackend + EventBuffer + TicketStore + TaskInterceptor
     + create_mcp_server. Mirrors test_operational_routing_boundary_matrix.py's
-    `_build_stack` (and test_task_tools.py's `real_task_stack`).
+    `_build_stack` (and test_task_tools.py's `real_task_stack`). The memory
+    service is a fake: a fresh AsyncMock unless *memory_service* is given.
 
     `config.taskmaster` is cleared so `_get_curator()`'s one-shot
     corpus-backfill background task never fires — keeps the stack hermetic
@@ -293,7 +463,10 @@ async def _build_stack(tmp_path):
     interceptor = TaskInterceptor(
         backend, None, event_buffer, config, ticket_store=ticket_store
     )
-    server = create_mcp_server(AsyncMock(), task_interceptor=interceptor)
+    server = create_mcp_server(
+        memory_service if memory_service is not None else AsyncMock(),
+        task_interceptor=interceptor,
+    )
     return server, interceptor, backend, event_buffer, ticket_store
 
 
@@ -314,6 +487,17 @@ async def _teardown_stack(interceptor, ticket_store, event_buffer, backend):
 async def real_stack(tmp_path):
     server, interceptor, backend, event_buffer, ticket_store = await _build_stack(
         tmp_path
+    )
+    try:
+        yield server, str(tmp_path)
+    finally:
+        await _teardown_stack(interceptor, ticket_store, event_buffer, backend)
+
+
+@pytest_asyncio.fixture
+async def specimen_stack(tmp_path):
+    server, interceptor, backend, event_buffer, ticket_store = await _build_stack(
+        tmp_path, memory_service=specimen_memory()
     )
     try:
         yield server, str(tmp_path)
@@ -423,3 +607,48 @@ class TestRecurringGateEndToEnd:
         # exactly what should happen.
         assert third.get('task_id'), f'got {third!r}'
         assert third['task_id'] != first['task_id'], f'got {third!r}'
+
+
+class TestPreservedSpecimenEndToEnd:
+    """Task 5456's signal on real persisted rows: no reset gate lands for 3105.
+
+    `planning_mode=True` returns a `task_id` synchronously, as in
+    TestRecurringGateEndToEnd, so "did a gate land" is read off the store.
+    """
+
+    @staticmethod
+    async def _file_reset_gate(server, root: str, subject: str):
+        return _parse_tool_result(
+            await server._tool_manager.call_tool(
+                'submit_task',
+                _reset_gate_submission(subject=subject, project_root=root, planning_mode=True),
+            )
+        )
+
+    @pytest.mark.asyncio
+    async def test_reset_gate_for_the_preserved_specimen_never_lands(self, specimen_stack):
+        server, root = specimen_stack
+
+        refused = await self._file_reset_gate(server, root, '3105')
+
+        assert refused.get('error_type') == 'PreservedSpecimenResetViolation', f'got {refused!r}'
+        assert 'task_id' not in refused, f'no gate may be minted: {refused!r}'
+        listing = _parse_tool_result(
+            await server._tool_manager.call_tool('get_tasks', {'project_root': root})
+        )
+        gates = [
+            t
+            for t in listing['tasks']
+            if isinstance(t.get('metadata'), dict)
+            and t['metadata'].get('gate_subject') == '3105'
+        ]
+        assert gates == [], f'got {gates!r}'
+
+    @pytest.mark.asyncio
+    async def test_reset_gate_for_an_ordinary_stranded_task_lands(self, specimen_stack):
+        server, root = specimen_stack
+
+        filed = await self._file_reset_gate(server, root, '3843')
+
+        assert filed.get('task_id'), f'got {filed!r}'
+        assert filed.get('status') == 'deferred', f'got {filed!r}'
