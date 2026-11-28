@@ -481,14 +481,14 @@ ARCHITECT_EVAL_CONFIGS = [
 ]
 
 
-# ===== Named-only implementer candidates (task 11726) =====
+# ===== Named-only native implementer candidates (task 11726) =====
 # Native-cloud implementer arms resolved only by name, e.g. from
 # shadow_eval.candidates. Kept out of EVAL_CONFIGS so they join no default
 # `eval --matrix` run and _cloud_implementer_incumbents never counts the opus
 # control, which is production's implementer (opus at xhigh) run as an
 # ordinary shadow cell, as an OFAT incumbent. Fable 5.2 stays out of production
 # routing; the cell admits it (evals/runner.py::_admitted_claude_role_models).
-IMPLEMENTER_CANDIDATE_CONFIGS = [
+NATIVE_IMPLEMENTER_CANDIDATE_CONFIGS = [
     EvalConfig('implementer-fable52-high', 'claude', 'claude-fable-5-2', 'high', role=RoleUnderTest.IMPLEMENTER),
     EvalConfig('implementer-fable52-medium', 'claude', 'claude-fable-5-2', 'medium', role=RoleUnderTest.IMPLEMENTER),
     EvalConfig('implementer-opus-xhigh-control', 'claude', 'opus', 'xhigh', role=RoleUnderTest.IMPLEMENTER),
@@ -496,7 +496,7 @@ IMPLEMENTER_CANDIDATE_CONFIGS = [
 
 
 def get_config_by_name(name: str) -> EvalConfig | None:
-    """Look up an eval config by name (implementer, architect, named implementer candidates, OR ν/ξ candidates).
+    """Look up an eval config by name (implementer, architect, named native implementer candidates, OR ν/ξ candidates).
 
     ν's ``claude_endpoint_candidates()``, ξ's ``codex_pi_candidates()``,
     ω's ``zcode_candidates()`` and ``mimo_code_candidates()`` bundles are searched LAST, and built only when no static config matched:
@@ -555,7 +555,7 @@ def registered_configs() -> Iterator[EvalConfig]:
     yield from EVAL_CONFIGS
     yield from FINAL_RUN_CONFIGS
     yield from ARCHITECT_EVAL_CONFIGS
-    yield from IMPLEMENTER_CANDIDATE_CONFIGS
+    yield from NATIVE_IMPLEMENTER_CANDIDATE_CONFIGS
     yield from claude_endpoint_candidates()
     yield from codex_pi_candidates()
     yield from zcode_candidates()

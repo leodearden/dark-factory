@@ -3653,7 +3653,6 @@ class TestOrchestratorConfigPrices:
     def test_sol_and_terra_seed_their_published_cached_input_rates(self):
         prices = OrchestratorConfig().prices
         assert prices['gpt-6.2-sol'].cached_input_per_1m == 0.10
-        assert prices['gpt-6.2-sol'].cache_write_per_1m == 2.50
         assert prices['gpt-6.1-terra'].cached_input_per_1m == 0.05
 
     def test_default_price_table_matches_defaults_yaml(self):

@@ -372,9 +372,9 @@ question. `end-to-end` is the live confirm stage, opened only for a survivor can
     is unchanged. Leo ruled "Yes" to an incumbent control on 2026-11-25:
     `implementer-opus-xhigh-control` (opus at xhigh, production's implementer) runs as an
     ordinary shadow cell, so every candidate is compared with the incumbent on the same task under
-    the same eval conditions. Task 11756 adds the config key that names it. The three arms live in
-    `orchestrator/src/orchestrator/evals/configs.py::IMPLEMENTER_CANDIDATE_CONFIGS`, outside the
-    default matrix. Re-checked 2026-11-28 and unchanged: GLM stays `glm-5.3` / `glm-5.3-flash`
+    the same eval conditions. Task 11756 adds the config key that names it. The three arms live
+    in `orchestrator/src/orchestrator/evals/configs.py::NATIVE_IMPLEMENTER_CANDIDATE_CONFIGS`,
+    outside the default matrix. Re-checked 2026-11-28 and unchanged: GLM stays `glm-5.3` / `glm-5.3-flash`
     (`https://docs.z.ai/guides/overview/pricing`; GLM-5.3-FlashX is outside the Coding Plan),
     MiniMax stays `MiniMax-M3.1-Flash` (`https://platform.minimax.io/docs/pricing/overview`), and
     MiMo stays `mimo-v2.6-pro` / `mimo-v2.6-flash`. MiMo's pricing source has moved to
