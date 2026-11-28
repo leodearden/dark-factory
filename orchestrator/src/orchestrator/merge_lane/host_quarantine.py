@@ -26,6 +26,7 @@ from typing import Any, TypeVar
 from orchestrator.config import OrchestratorConfig
 from orchestrator.deployed_sha import DeployedSha
 from orchestrator.event_store import EventStore, EventType
+from orchestrator.merge_lane.gate_reaper_watch import GateReaperWatch
 from orchestrator.merge_lane.liveness import (
     _alarm_verify_host_skew,
     _alarm_verify_host_unreachable,
@@ -193,6 +194,8 @@ class HostQuarantine:
         self._skew_benches: dict[tuple[str, str | None], int] = {}
         # When _reap_idle_gates last launched the remote gate reapers.
         self._last_gate_reap_at: float | None = None
+        # Task 8520: judges each launch's reap-stamp reading per host.
+        self._gate_reaper_watch = GateReaperWatch(escalation_queue=escalation_queue)
 
     # ── the pool this lane hands out ─────────────────────────────────────
 
@@ -589,7 +592,8 @@ class HostQuarantine:
         Three steps: the tracker-driven :meth:`_reprobe_quarantined_hosts`
         first, then :meth:`_reprobe_untracked_parked_slots`, the backstop for
         PARKED hosts with no tracker entry, then the at-most-hourly
-        :meth:`_reap_idle_gates`.
+        :meth:`_reap_idle_gates`, which also checks each host's reaper still
+        completes its runs.
 
         Each step is fault-isolated: an unexpected exception is logged and
         swallowed (same pattern as the worker's heartbeat loop), so a probe
@@ -1001,7 +1005,8 @@ class HostQuarantine:
         """At most hourly, launch the detached gate reaper of each remote in the pool (design D2).
 
         A benched host (tracked unavailable, or quarantined for any reason,
-        verdict divergence included) is skipped.
+        verdict divergence included) is skipped.  Each launch's reap-stamp
+        reading goes to the gate reaper watch (task 8520).
         """
         allocator = self._allocator()
         if not isinstance(allocator, HostAllocator):
@@ -1014,4 +1019,7 @@ class HostQuarantine:
             runner = allocator.remote_runner(name)
             benched = name in self._runner_unavailable or allocator.is_quarantined(name)
             if runner is not None and not benched:
-                await runner.reap_idle_gates()
+                self._gate_reaper_watch.observe(
+                    name, await runner.reap_idle_gates(),
+                    launched_at=now, ssh_target=self._runner_ssh_targets.get(name),
+                )

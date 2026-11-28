@@ -1,0 +1,12 @@
+{
+  "task_id": "8520",
+  "reason": "Net-additive: new module merge_lane/gate_reaper_watch.py (GateReaperWatch, task 8520) adds its own cognitive 10 to the derived cluster total. No existing path or function rose: host_quarantine.py stays at file cognitive 90 and HostQuarantine::_reap_idle_gates at 8, because observe() takes a None reading so the call site gains no branch.",
+  "measures": [
+    {
+      "measure": "total:cognitive",
+      "key": "<cluster>",
+      "baseline": 5413,
+      "current": 5423
+    }
+  ]
+}
