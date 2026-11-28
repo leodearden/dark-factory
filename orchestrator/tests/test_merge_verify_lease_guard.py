@@ -25,6 +25,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from _git_fixtures import seed_repo
 
 from orchestrator.config import GitConfig
 from orchestrator.git_ops import GitOps, _run
@@ -175,15 +176,6 @@ class TestMergeVerifyLeaseContextManager:
 # ---------------------------------------------------------------------------
 
 
-async def _setup_repo(repo: Path) -> None:
-    await _run(['git', 'init', '-b', 'main'], cwd=repo)
-    await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=repo)
-    await _run(['git', 'config', 'user.name', 'Test'], cwd=repo)
-    (repo / 'README.md').write_text('# Test\n')
-    await _run(['git', 'add', '-A'], cwd=repo)
-    await _run(['git', 'commit', '-m', 'Initial commit'], cwd=repo)
-
-
 async def _get_merge_commit(git_ops: GitOps, branch_name: str, filename: str) -> str:
     """Create a feature branch, commit a file, merge to main, return merge_commit."""
     wt_info = await git_ops.create_worktree(branch_name)
@@ -197,9 +189,7 @@ async def _get_merge_commit(git_ops: GitOps, branch_name: str, filename: str) ->
 @pytest.fixture
 def git_repo(tmp_path: Path) -> Path:
     """A real temporary git repository with an initial commit (step-13+)."""
-    repo = tmp_path / 'repo'
-    repo.mkdir()
-    asyncio.run(_setup_repo(repo))
+    repo = seed_repo(tmp_path / 'repo')
     return repo
 
 
