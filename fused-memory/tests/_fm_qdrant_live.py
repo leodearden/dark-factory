@@ -9,10 +9,13 @@ import contextlib
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import pytest
 from _fm_polling import poll_until, poll_until_sync
+
+if TYPE_CHECKING:
+    from qdrant_client.http.exceptions import ResponseHandlingException
 
 # ---------------------------------------------------------------------------
 # Shared Qdrant test scaffolding (task 2277)
@@ -97,6 +100,18 @@ class _SettleCheck:
     seen: str
 
 
+def _unanswered(exc: 'ResponseHandlingException') -> bool:
+    """Whether the server has the request *exc* abandoned and left it unanswered past the client's timeout."""
+    import httpx
+
+    return isinstance(exc.source, httpx.ReadTimeout)
+
+
+def _cause(exc: 'ResponseHandlingException') -> str:
+    """The transport failure underneath *exc*, as 'Type: message'."""
+    return f'{type(exc.source).__name__}: {exc.source}'
+
+
 def _run_meta_op(
     request: Callable[[], Any],
     *,
@@ -109,22 +124,28 @@ def _run_meta_op(
 
     A read timeout means the server has the request and may still be applying
     it, so the outcome is judged by the observed state, never by re-sending.
-    A wait that times out names the state its last check saw. Every other
-    failure propagates unchanged.
+    A state read the server leaves unanswered past the client's timeout is no
+    evidence about that state, so it counts as not yet settled; nothing is
+    re-sent. A wait that times out names the state its last check saw. Every
+    other failure propagates unchanged.
     """
-    import httpx
     from qdrant_client.http.exceptions import ResponseHandlingException
 
     try:
         request()
     except ResponseHandlingException as exc:
-        if not isinstance(exc.source, httpx.ReadTimeout):
+        if not _unanswered(exc):
             raise
         last_seen = ''
 
         def settled() -> bool:
             nonlocal last_seen
-            observed = check()
+            try:
+                observed = check()
+            except ResponseHandlingException as err:
+                if not _unanswered(err):
+                    raise
+                observed = _SettleCheck(settled=False, seen=f'no answer to the state read ({_cause(err)})')
             last_seen = observed.seen
             return observed.settled
 
@@ -132,8 +153,7 @@ def _run_meta_op(
             poll_until_sync(settled, timeout=timeout, interval=0.05)
         except AssertionError:
             raise AssertionError(
-                f'{describe}: the client stopped waiting for the answer '
-                f'({type(exc.source).__name__}: {exc.source}), and the '
+                f'{describe}: the client stopped waiting for the answer ({_cause(exc)}), and the '
                 f'collection was not {expected} {timeout}s later; last seen: {last_seen}'
             ) from exc
 
@@ -211,7 +231,8 @@ def ensure_fresh_collection(
     Any other ``UnexpectedResponse`` (e.g. a genuine 500) is re-raised — fail
     loud, no retry. A create or delete whose answer the client abandons on a
     read timeout is judged by whether the collection appears with every local
-    shard Active and empty, or disappears, within *settle_timeout*. An abandoned create cannot tell its
+    shard Active and empty, or disappears, within *settle_timeout*; a state
+    read left unanswered the same way reads as not yet. An abandoned create cannot tell its
     own collection from a stale one whose 409 it never read, so one that
     appears holding points fails rather than passing as fresh.
 
