@@ -289,6 +289,12 @@ class YamlSettingsSource(PydanticBaseSettingsSource):
 # --- Sub-models ---
 
 
+_EVAL_ONLY_JUDGE_DESCRIPTION = (
+    'Completion judge setting; the judge runs in evals only '
+    '(see OrchestratorConfig.judge_after_each_iteration).'
+)
+
+
 class ModelsConfig(BaseModel):
     """Model selection per agent role."""
 
@@ -301,7 +307,7 @@ class ModelsConfig(BaseModel):
     triage: str = Field(default='sonnet')
     module_tagger: str = Field(default='haiku')
     deep_reviewer: str = Field(default='opus')
-    judge: str = Field(default='sonnet')
+    judge: str = Field(default='sonnet', description=_EVAL_ONLY_JUDGE_DESCRIPTION)
     simple_task: str = Field(default='sonnet')
 
 
@@ -317,7 +323,7 @@ class BudgetsConfig(BaseModel):
     triage: float = Field(default=2.0)
     module_tagger: float = Field(default=2.0)
     deep_reviewer: float = Field(default=15.0)
-    judge: float = Field(default=0.50)
+    judge: float = Field(default=0.50, description=_EVAL_ONLY_JUDGE_DESCRIPTION)
     simple_task: float = Field(default=2.50)
 
 
@@ -333,7 +339,7 @@ class TurnsConfig(BaseModel):
     triage: int = Field(default=25)
     module_tagger: int = Field(default=30)
     deep_reviewer: int = Field(default=100)
-    judge: int = Field(default=15)
+    judge: int = Field(default=15, description=_EVAL_ONLY_JUDGE_DESCRIPTION)
     simple_task: int = Field(default=50)
 
 
@@ -349,7 +355,7 @@ class EffortConfig(BaseModel):
     triage: str = Field(default='medium')
     module_tagger: str = Field(default='medium')
     deep_reviewer: str = Field(default='xhigh')
-    judge: str = Field(default='medium')
+    judge: str = Field(default='medium', description=_EVAL_ONLY_JUDGE_DESCRIPTION)
     simple_task: str = Field(default='high')
 
 
@@ -375,7 +381,7 @@ class TimeoutsConfig(BaseModel):
     triage: float = Field(default=300.0)
     module_tagger: float = Field(default=300.0)
     deep_reviewer: float = Field(default=2400.0)
-    judge: float = Field(default=300.0)
+    judge: float = Field(default=300.0, description=_EVAL_ONLY_JUDGE_DESCRIPTION)
     # Dedicated per-role knob (deliberately decoupled from
     # OrchestratorConfig.invocation_timeout — see that field's docstring):
     # today simple_task's timeout comes from the getattr(timeouts_cfg,
@@ -426,7 +432,7 @@ class BackendsConfig(BaseModel):
     triage: str = Field(default='claude')
     module_tagger: str = Field(default='claude')
     deep_reviewer: str = Field(default='claude')
-    judge: str = Field(default='claude')
+    judge: str = Field(default='claude', description=_EVAL_ONLY_JUDGE_DESCRIPTION)
     simple_task: str = Field(default='claude')
 
 
