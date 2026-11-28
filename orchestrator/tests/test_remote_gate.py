@@ -1738,11 +1738,14 @@ def test_reap_script_text_is_the_packaged_script():
 # ---------------------------------------------------------------------------
 
 
+_STAMP_PROBE_EXIT_CEILING_SECS = 60
+
+
 def _run_stamp_probe(root: Path | str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         ['bash', '-c', reap_stamp_script_text(), 'reap-stamp'],
         env={'PATH': os.environ['PATH'], 'GATE_ROOT': str(root)},
-        capture_output=True, text=True, timeout=60,
+        capture_output=True, text=True, timeout=_STAMP_PROBE_EXIT_CEILING_SECS,
     )
 
 
