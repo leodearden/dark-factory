@@ -347,6 +347,44 @@ question. `end-to-end` is the live confirm stage, opened only for a survivor can
     answered), so 0.164.0 suffices and no upgrade is needed (recorded on esc-7992-1). The literal
     slate pin covers the new ids and prices, and the retired names resolve to `None`.
 
+    **Amended 2026-11-25 (Leo, task 11726). Frontier refresh.** The Sol line moves from
+    `gpt-6.1-sol` to `gpt-6.2-sol` (released 2026-11-17; $2 / $0.10 cached / $10 per 1M
+    in / cached-in / out, with a 30-minute cache write of $2.50; the OpenAI prices apply at up to
+    272K input; `https://developers.openai.com/api/docs/models/gpt-6.2-sol`), candidate
+    `codex-gpt6.2-sol`. Astra is **removed** from the implementer slate by Leo's ruling: "remove
+    Astra from the slate. It's expensive and recent feedback from other coders has been mostly
+    negative." `codex-gpt6-astra` is retired and `gpt-6.2-astra` ($8 / $0.40 / $40) is not added.
+    The `gpt-6-astra` price row is kept because
+    `orchestrator/src/orchestrator/evals/reviewer_trial/variants.py::VARIANT_CROSS_FAMILY` reads
+    it. Terra stays `gpt-6.1-terra` ($1 / $0.05 / $5); OpenAI has published no newer Terra. The
+    DeepSeek line moves from the stale `deepseek-v4`, no longer an accepted API name, to
+    `deepseek-flash`, candidate `deepseek-v4.1-flash-endpoint`, via the Anthropic-format base
+    `https://api.deepseek.com/anthropic`; `deepseek-v4-endpoint` is retired. `deepseek-flash` is a
+    floating alias, currently serving DeepSeek-V4.1-Flash-1017, so `served_model` is what detects
+    a change. Its row is priced at **peak**: $0.30 cache-miss input, $0.006 cache-hit and $1.20
+    output, with cache writes at the cache-miss rate. Peak is 01:00-04:00 and 06:00-10:00 UTC
+    Mon-Fri, excluding Chinese public holidays. Off-peak is exactly half, and no time-of-day
+    billing is modelled, so an off-peak cell over-states its cost (source
+    `https://api-docs.deepseek.com/quick_start/pricing/`). DeepSeek's own harness is not added;
+    that is a separate decision for Leo at gate 5393. Fable 5.2 joins as the implementer arms
+    `implementer-fable52-high` and `implementer-fable52-medium` (`claude-fable-5-2`, reusing task
+    10488's cost row). The eval cell admits the model into its allowlist, and production routing
+    is unchanged. Leo ruled "Yes" to an incumbent control on 2026-11-25:
+    `implementer-opus-xhigh-control` (opus at xhigh, production's implementer) runs as an
+    ordinary shadow cell, so every candidate is compared with the incumbent on the same task under
+    the same eval conditions. Task 11756 adds the config key that names it. The three arms live in
+    `orchestrator/src/orchestrator/evals/configs.py::IMPLEMENTER_CANDIDATE_CONFIGS`, outside the
+    default matrix. Re-checked 2026-11-28 and unchanged: GLM stays `glm-5.3` / `glm-5.3-flash`
+    (`https://docs.z.ai/guides/overview/pricing`; GLM-5.3-FlashX is outside the Coding Plan),
+    MiniMax stays `MiniMax-M3.1-Flash` (`https://platform.minimax.io/docs/pricing/overview`), and
+    MiMo stays `mimo-v2.6-pro` / `mimo-v2.6-flash`. MiMo's pricing source has moved to
+    `https://mimo.mi.com/docs/en-US/price/pay-as-you-go`, and the earlier `/docs/en-US/pricing`
+    URL now returns 404. Codex CLI: measured 2026-11-28 on this host, codex-cli 0.170.0 runs
+    `codex exec -m gpt-6.2-sol` (rc 0, answered), so no upgrade is needed. No shadow cell had run
+    (`shadow_cells` had 0 rows in dark_factory and reify), so no trial was frozen and the change
+    cost no evidence. The literal slate pins cover the new ids and prices, and the retired names
+    (`codex-gpt6.1-sol`, `codex-gpt6-astra`, `deepseek-v4-endpoint`) resolve to `None`.
+
     **Standing rule (Leo, 2026-11-01): keep the slate on the frontier.** In Leo's words: "keep
     the slate on the frontier: always use the newest model in each line, frozen at the start of
     that model's trial." The mechanics:
@@ -434,11 +472,14 @@ question. `end-to-end` is the live confirm stage, opened only for a survivor can
   dispatching leaf and everything after it depend on both.
 - Provider credentials present in the orchestrator's environment for any endpoint bundle to be
   sampled — a **GLM Coding Plan** key for the GLM arms (paired with the coding endpoint, not the
-  general one), `MINIMAX_API_KEY`, a Codex CLI ≥ 0.153.0 for `gpt-6-astra` (0.164.0 is measured
-  to serve `gpt-6.1-sol` and `gpt-6.1-terra`), … A missing
-  credential is a per-candidate `shadow_cell_skipped reason=no_credentials`, never a run that
-  401s; a Coding Plan whose allowance is spent settles the cell `cap_excluded` with reason
-  `credits_exhausted`.
+  general one), `MINIMAX_API_KEY`, and a Codex CLI that serves the Codex arms (codex-cli 0.170.0
+  is measured to serve `gpt-6.2-sol`, and 0.164.0 `gpt-6.1-terra`), … DeepSeek is
+  pay-as-you-go only and the orchestrator's `.env` has no `DEEPSEEK_API_KEY`, so before the
+  DeepSeek arm can open a cell, gate 5393 must have Leo create a DeepSeek API account, top it
+  up, and put `DEEPSEEK_API_KEY` in the orchestrator's environment; until then the arm skips as
+  `no_credentials`. A missing credential is a per-candidate
+  `shadow_cell_skipped reason=no_credentials`, never a run that 401s; a Coding Plan whose
+  allowance is spent settles the cell `cap_excluded` with reason `credits_exhausted`.
 - Nothing else is novel: every substrate item in §Premise exists on main.
 
 ## Cross-PRD relationship
