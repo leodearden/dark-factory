@@ -52,7 +52,12 @@ from orchestrator.agents.defect_briefing import (
     format_declared_defects,
     format_defect_test_retirements,
 )
-from orchestrator.agents.review_briefing import ChangedFile, ReviewChange, ReviewSubject
+from orchestrator.agents.review_briefing import (
+    ChangedFile,
+    ReviewChange,
+    ReviewSubject,
+    review_action_section,
+)
 from orchestrator.agents.roles import DEFECT_TEST_RULE
 from orchestrator.agents.steward_digest import EarlierAttempts
 
@@ -419,6 +424,15 @@ _RECORDED_TASK: dict[str, Any] = {
 _RECORD_HEADINGS = (
     DECLARED_DEFECTS_HEADING, CLOSURES_AWAITING_RULING_HEADING, DEFECT_TEST_RETIREMENTS_HEADING,
 )
+_REVIEWER = 'reviewer_comprehensive'
+_UNRECORDED_TASK: dict[str, Any] = {**_TASK, 'metadata': {'files': ['widget_footprint_guess.py']}}
+
+
+def _action_section_close(reviewer_type: str) -> str:
+    """What every reviewer briefing's ``# Action`` section ends with, whatever its review step says."""
+    step = '<review step>'
+    section = review_action_section(reviewer_type, step)
+    return section[section.index(step) + len(step):]
 
 
 def _subject(task: dict[str, Any]) -> ReviewSubject:
@@ -462,16 +476,23 @@ class TestReviewerBriefingsShowTheRecordsToRuleOn:
         assert prompt.count(DECLARED_DEFECTS_HEADING) == 1
 
     @pytest.mark.asyncio
-    async def test_a_task_without_defect_records_leaves_the_diff_only_prompt_unchanged(
+    async def test_a_task_without_defect_records_ends_the_diff_only_prompt_at_its_action_section(
         self, briefing: BriefingAssembler,
     ):
-        diff = 'diff --git a/widget.py b/widget.py\n'
-        unrecorded = {**_TASK, 'metadata': {'files': ['widget_footprint_guess.py']}}
-
-        prompt = await briefing.build_reviewer_prompt('reviewer_comprehensive', diff, context='', task=unrecorded)
-        bare = await briefing.build_reviewer_prompt(
-            'reviewer_comprehensive', diff, context='', task={**_TASK, 'metadata': {}},
+        prompt = await briefing.build_reviewer_prompt(
+            _REVIEWER, 'diff --git a/widget.py b/widget.py\n', context='', task=_UNRECORDED_TASK,
         )
 
-        assert prompt == bare
+        assert prompt.endswith(_action_section_close(_REVIEWER))
+        assert [heading for heading in _RECORD_HEADINGS if heading in prompt] == []
+
+    @pytest.mark.asyncio
+    async def test_a_task_without_defect_records_ends_the_context_complete_prompt_at_its_action_section(
+        self, briefing: BriefingAssembler,
+    ):
+        prompt = await briefing.build_context_complete_reviewer_prompt(
+            _REVIEWER, _subject(_UNRECORDED_TASK), context='',
+        )
+
+        assert prompt.endswith(_action_section_close(_REVIEWER))
         assert [heading for heading in _RECORD_HEADINGS if heading in prompt] == []
