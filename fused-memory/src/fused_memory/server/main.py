@@ -77,6 +77,7 @@ if TYPE_CHECKING:
     from fused_memory.reconciliation.journal import ReconciliationJournal
     from fused_memory.reconciliation.recon_ledger import ReconLedgerStore
     from fused_memory.reconciliation.sqlite_watchdog import SqliteWatchdog
+    from fused_memory.server.embedded_uvicorn import EmbeddedUvicornServer
     from fused_memory.server.topic_cluster_store import TopicClusterStore
     from fused_memory.services.consolidation_ops import MemoryUpdater
     from fused_memory.services.journal_growth_alarm import JournalGrowthAlarm
@@ -1208,8 +1209,6 @@ async def run_server():
     logger.info(f'Starting MCP server with transport: {transport}')
 
     # recon_report_state already initialized above (PRD γ, task 1546 step-12)
-    server: Any | None = None  # primary uvicorn.Server
-    recon_server: Any | None = None  # uvicorn.Server for the 2nd port
     try:
         if transport == 'stdio':
             await mcp.run_stdio_async()
@@ -1298,18 +1297,6 @@ async def run_server():
             )
 
             _sd_notify('READY=1')
-            # Wrap both serve() coroutines in named tasks so that a failure in
-            # one (e.g. port-already-bound on the recon port) automatically
-            # cancels the other rather than leaving it running unmanaged.
-            # asyncio.gather() with bare coroutines wraps them in Tasks internally
-            # but does NOT cancel the sibling on first failure — the surviving
-            # Task would continue serving while the finally block runs, emitting
-            # "Task was destroyed but it is pending!" on loop teardown.
-            _primary_task = asyncio.create_task(
-                server.serve(sockets=[primary_socket] if primary_socket else None),
-                name='fused_memory_primary',
-            )
-            _recon_task = asyncio.create_task(recon_server.serve(), name='fused_memory_recon_report')
 
             # Signal the harness once the recon-report server is accepting connections.
             # Polls uvicorn's server.started flag (set inside serve() after startup()).
@@ -1325,16 +1312,11 @@ async def run_server():
 
                 asyncio.create_task(_watch_recon_server_ready(), name='recon_server_readiness_watcher')
 
-            try:
-                await asyncio.gather(_primary_task, _recon_task)
-            except BaseException:
-                # Cancel whichever task is still running to prevent orphaned tasks.
-                _primary_task.cancel()
-                _recon_task.cancel()
-                # Await with return_exceptions=True so CancelledErrors are collected
-                # as values rather than re-raised; the outer finally handles shutdown.
-                await asyncio.gather(_primary_task, _recon_task, return_exceptions=True)
-                raise
+            await _serve_primary_and_recon(
+                server,
+                recon_server,
+                primary_sockets=[primary_socket] if primary_socket else None,
+            )
         else:
             raise ValueError(f'Unsupported transport: {transport}')
     finally:
@@ -1349,17 +1331,6 @@ async def run_server():
         if topic_cluster_store is not None:
             with contextlib.suppress(BaseException):
                 topic_cluster_store.close()
-        # Symmetrically tear down both servers so that a failure in either
-        # (e.g. recon_server port-already-bound) doesn't leave the primary
-        # server serving while the rest of the app shuts down.
-        if server is not None:
-            server.should_exit = True
-            with contextlib.suppress(BaseException):
-                await server.shutdown()
-        if recon_server is not None:
-            recon_server.should_exit = True
-            with contextlib.suppress(BaseException):
-                await recon_server.shutdown()
         _stop_watchdog_thread()
         if janitor_task is not None:
             janitor_task.cancel()
@@ -2407,6 +2378,40 @@ def _build_recon_report_components(
         graceful_shutdown_timeout=config.server.graceful_shutdown_timeout,
     )
     return state, mcp, uv_config
+
+
+async def _serve_primary_and_recon(
+    server: EmbeddedUvicornServer,
+    recon_server: EmbeddedUvicornServer,
+    *,
+    primary_sockets: list[socket.socket] | None,
+) -> None:
+    """Serve both servers until both stop; a failure in either cancels the other.
+
+    Each serve() runs in its own task, because a bare gather leaves the
+    survivor of a failure serving unmanaged. A serve() that returned has run
+    uvicorn's own shutdown, and a second one would log it all again, so only a
+    server whose serve() was cancelled or raised is shut down here. Contract
+    pinned by fused-memory/tests/test_operator_signal_handler.py::TestServePrimaryAndRecon.
+    """
+    serving = [
+        (server, asyncio.create_task(server.serve(sockets=primary_sockets), name='fused_memory_primary')),
+        (recon_server, asyncio.create_task(recon_server.serve(), name='fused_memory_recon_report')),
+    ]
+    tasks = [task for _, task in serving]
+    try:
+        await asyncio.gather(*tasks)
+    except BaseException:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
+    finally:
+        for stopped_server, task in serving:
+            if not (task.done() and not task.cancelled() and task.exception() is None):
+                stopped_server.should_exit = True
+                with contextlib.suppress(BaseException):
+                    await stopped_server.shutdown()
 
 
 def _make_operator_stop_callback(

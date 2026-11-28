@@ -9,15 +9,19 @@ flag set by the SIGTERM/SIGINT handler.
 import asyncio
 import os
 import signal
+import socket
 import subprocess
 import sys
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
+from starlette.applications import Starlette
 
 import fused_memory.server.main as main_mod
+from fused_memory.server.embedded_uvicorn import EmbeddedUvicornServer, embedded_uvicorn_config
 from fused_memory.server.main import _install_operator_stop_handler, _make_operator_stop_callback
 
 
@@ -185,9 +189,10 @@ class TestInstallOperatorStopHandlerIntegration:
 )
 class TestOneStopSignalStopsBothServersCleanly:
     """Task 10067: one SIGTERM to a process serving two uvicorn servers is delivered
-    to the operator-stop handler once, and each server's lifespan shutdown is logged
+    to the operator-stop handler once, and each server's shutdown is logged once,
     through main.py's own logging. The real signal goes to a child process, never to
-    the pytest worker; the driver composes main.py's seams the way run_server does.
+    the pytest worker; the driver serves and tears down through run_server's own
+    _serve_primary_and_recon.
     """
 
     _DRIVER = Path(__file__).with_name('_two_server_operator_stop.py')
@@ -206,9 +211,59 @@ class TestOneStopSignalStopsBothServersCleanly:
         assert not [
             line for line in lines if 'Repeat stop signal' in line or 'Second stop signal' in line
         ], child.stderr
-        assert sum(
-            line.endswith(' - uvicorn.error - INFO - Application shutdown complete.') for line in lines
-        ) == 2, child.stderr
+        for shutdown_line in ('Shutting down', 'Application shutdown complete.'):
+            assert sum(line.endswith(f' - uvicorn.error - INFO - {shutdown_line}') for line in lines) == 2, (
+                child.stderr
+            )
+
+
+class _ScriptedServer(EmbeddedUvicornServer):
+    """A server whose serve() runs *serve_behaviour* instead of uvicorn, and which counts its shutdown() calls."""
+
+    def __init__(self, serve_behaviour: Callable[[], Awaitable[None]]) -> None:
+        super().__init__(embedded_uvicorn_config(Starlette()))
+        self._serve_behaviour = serve_behaviour
+        self.shutdown_calls = 0
+
+    async def serve(self, sockets: list[socket.socket] | None = None) -> None:
+        await self._serve_behaviour()
+
+    async def shutdown(self, sockets: list[socket.socket] | None = None) -> None:
+        self.shutdown_calls += 1
+
+
+async def _returns() -> None:
+    return None
+
+
+async def _serves_until_cancelled() -> None:
+    await asyncio.get_running_loop().create_future()
+
+
+async def _fails_to_bind() -> None:
+    raise OSError('address already in use')
+
+
+class TestServePrimaryAndRecon:
+    """main.py::_serve_primary_and_recon shuts down only a server whose serve() did not return (task 10067)."""
+
+    @pytest.mark.asyncio
+    async def test_a_server_whose_serve_returned_is_not_shut_down_again(self):
+        primary, recon = _ScriptedServer(_returns), _ScriptedServer(_returns)
+
+        await main_mod._serve_primary_and_recon(primary, recon, primary_sockets=None)
+
+        assert (primary.shutdown_calls, recon.shutdown_calls) == (0, 0)
+
+    @pytest.mark.asyncio
+    async def test_a_failed_serve_cancels_the_other_and_both_are_shut_down(self):
+        primary, recon = _ScriptedServer(_fails_to_bind), _ScriptedServer(_serves_until_cancelled)
+
+        with pytest.raises(OSError, match='address already in use'):
+            await main_mod._serve_primary_and_recon(primary, recon, primary_sockets=None)
+
+        assert (primary.shutdown_calls, recon.shutdown_calls) == (1, 1)
+        assert primary.should_exit and recon.should_exit
 
 
 class TestMainExitCode:
