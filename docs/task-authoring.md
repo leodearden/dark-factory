@@ -1093,14 +1093,18 @@ token (`migration`, `architecture`, `integration test`, `design ... new`,
 **Hard escape:** `metadata.force_full_path = true` always forces the full
 architect path regardless of `complexity`.
 
-**Curator complexity hint:** not on main yet; task 8376 adds it, and this
-paragraph describes that task's specification. Once it lands, on every curated
-`create` the curator stamps
+**Curator complexity hint:** on every healthy curated `create` (not a
+degraded or fall-through create) the curator stamps
 `metadata.x_curator_complexity_hint` (`"simple"` or null) from the criteria
-above. On the treated arm of experiment `routing-exp-2` it also applies
-`metadata.complexity = "simple"` when the hint is `simple` and the task names
-files; the untreated arm records the hint only. A filer's own `complexity`
-always wins, and `planning_mode` batches are untouched.
+above. A task is declarable when the hint is `"simple"`, the filer set no
+`complexity`, and its non-empty `metadata.files` passes the
+`simple_task_files_error` guard. Both arms of a declarable task carry
+`metadata.x_routing_exp2_arm_key`, the `candidate_key` its arm was drawn from
+at create. On the treated arm of `routing-exp-2`,
+`split_bucket("routing-exp-2", candidate_key, 2) == 1`, a declarable task
+also gets `metadata.complexity = "simple"`. A filer's own `complexity` always wins, and
+`planning_mode` is untouched. The policy:
+`fused-memory/src/fused_memory/middleware/curator_complexity_hint.py::with_complexity_hint`.
 
 ### `execution_class` routes to a HUMAN — it is not "non-code work"
 
