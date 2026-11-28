@@ -65,11 +65,15 @@ class OverrideSource(StrEnum):
 
     An operator write always takes ownership.  The starvation watchdog only
     ever creates a row where none exists and only ever deletes rows it still
-    owns, so it can never clobber or clear an operator's override.
+    owns, so it can never clobber or clear an operator's override.  The
+    main-health fix owner pins at the head and moves every other pin back one
+    place in order; it never takes over an operator row, and it does take
+    over a watchdog row.
     """
 
     OPERATOR = 'operator'
     STARVATION_WATCHDOG = 'starvation_watchdog'
+    MAIN_HEALTH_FIX = 'main_health_fix'
 
 
 def _migrate_add_source_column(conn: sqlite3.Connection) -> None:
@@ -150,6 +154,70 @@ def _expired_params(project_root: str, now: datetime | None) -> tuple[str, str]:
     if now is None:
         now = datetime.now(UTC)
     return project_root, now.astimezone(UTC).isoformat()
+
+
+def _write_main_health_fix_pin(
+    conn: sqlite3.Connection, project_root: str, task_id: str, now_iso: str,
+) -> int | None:
+    """The writes of :meth:`OverrideStore.pin_main_health_fix`, inside its transaction."""
+    existing = conn.execute(
+        'SELECT pinned, pin_order, source FROM overrides '
+        'WHERE project_root=? AND task_id=?',
+        (project_root, task_id),
+    ).fetchone()
+    if existing is not None:
+        pinned, pin_order, source = existing
+        match source:
+            case OverrideSource.OPERATOR:
+                return None
+            case OverrideSource.MAIN_HEALTH_FIX:
+                if not pinned:
+                    return None
+                conn.execute(
+                    'UPDATE overrides SET reserve_now=1, updated_at=? '
+                    'WHERE project_root=? AND task_id=?',
+                    (now_iso, project_root, task_id),
+                )
+                return pin_order
+            case OverrideSource.STARVATION_WATCHDOG:
+                pass
+            case _:
+                raise ValueError(
+                    f'pin_main_health_fix has no ownership rule for a row of '
+                    f'source {source!r} (task {task_id})'
+                )
+    (head,) = conn.execute(
+        'SELECT MIN(1, COALESCE(MIN(pin_order), 1)) FROM overrides '
+        'WHERE project_root=? AND pinned=1 AND pin_order IS NOT NULL '
+        'AND task_id != ?',
+        (project_root, task_id),
+    ).fetchone()
+    conn.execute(
+        'UPDATE overrides SET pin_order = pin_order + 1, updated_at=? '
+        'WHERE project_root=? AND pinned=1 AND pin_order IS NOT NULL '
+        'AND pin_order >= ? AND task_id != ?',
+        (now_iso, project_root, head, task_id),
+    )
+    conn.execute(
+        """
+        INSERT INTO overrides
+            (project_root, task_id, pinned, pin_order, reserve_now,
+             ttl_until, created_at, updated_at, source)
+        VALUES (?, ?, 1, ?, 1, NULL, ?, ?, ?)
+        ON CONFLICT(project_root, task_id) DO UPDATE SET
+            pinned      = 1,
+            pin_order   = excluded.pin_order,
+            reserve_now = 1,
+            ttl_until   = NULL,
+            updated_at  = excluded.updated_at,
+            source      = excluded.source
+        """,
+        (
+            project_root, task_id, head,
+            now_iso, now_iso, OverrideSource.MAIN_HEALTH_FIX,
+        ),
+    )
+    return head
 
 
 class OverrideStore:
@@ -259,11 +327,11 @@ class OverrideStore:
         on update alike, so an operator touching a watchdog pin takes it over
         and :meth:`release_watchdog_pin` will no longer delete it.
 
-        **Concurrency note:** ``set_override`` and ``create_watchdog_pin``
-        are the only writers in this class that open their connection with
-        ``isolation_level=None`` and an explicit ``BEGIN IMMEDIATE``, because
-        each performs a ``MAX(pin_order)`` read followed by a write and must
-        serialize that pair against concurrent callers.  All other writers
+        **Concurrency note:** ``set_override``, ``create_watchdog_pin`` and
+        ``pin_main_health_fix`` are the only writers in this class that open
+        their connection with ``isolation_level=None`` and an explicit
+        ``BEGIN IMMEDIATE``, because each performs a pin-order read followed
+        by a write and must serialize that pair against concurrent callers.  All other writers
         (``clear_override``, ``reorder_pin_queue``, ``release_watchdog_pin``,
         ``clear_terminal``, ``clear_expired``) are
         single-statement or single-transaction batch operations with no
@@ -569,6 +637,43 @@ class OverrideStore:
             )
             conn.commit()
             return cur.rowcount > 0
+        finally:
+            conn.close()
+
+    # ------------------------------------------------------------------
+    # Main-health fix pins
+    # ------------------------------------------------------------------
+
+    def pin_main_health_fix(self, project_root: str, task_id: str) -> int | None:
+        """Pin *task_id* at the head of the queue with ``reserve_now`` armed.
+
+        Returns the fix's ``pin_order``, or None when nothing was written.  An
+        operator row is never written, and a row this owner holds that is no
+        longer pinned means an operator unpinned it, so that unpin stands.
+        Only a ``field='pinned'`` clear leaves such a row: a whole-row clear
+        leaves none, so the next grant pins the fix again.  A fix this owner
+        already pins keeps its place and re-arms ``reserve_now``, even one an
+        operator cleared.  Otherwise the fix takes order ``min(1, lowest other
+        order)``, every other pin at or after it moves back one place, and a
+        watchdog row is taken over with its TTL dropped.  A row of any other
+        source raises ``ValueError`` and writes nothing, so a new owner must
+        be given its rule here.  Rationale:
+        docs/main-health-fix-run-slot-reserve.md (task 10399).
+        """
+        now_iso = datetime.now(UTC).isoformat()
+        conn = self._connect_autocommit(timeout=30)
+        try:
+            conn.execute('BEGIN IMMEDIATE')
+            try:
+                pin_order = _write_main_health_fix_pin(
+                    conn, project_root, task_id, now_iso,
+                )
+                conn.execute('COMMIT')
+                return pin_order
+            except Exception:
+                with contextlib.suppress(sqlite3.Error):
+                    conn.execute('ROLLBACK')
+                raise
         finally:
             conn.close()
 

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from os.path import commonprefix
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
@@ -75,12 +76,16 @@ class FakeTaskStore:
 
     def __init__(
         self, *, lookup_fails: bool = False, submit_fails: bool = False, commit_fails: bool = False,
+        grant_fails: bool = False,
     ) -> None:
         self.tasks: dict[str, dict] = {}
         self.submits: list[dict] = []
+        self.precedence_grants: list[tuple[str, str]] = []
         self.lookup_fails = lookup_fails
         self.submit_fails = submit_fails
         self.commit_fails = commit_fails
+        self.grant_fails = grant_fails
+        self.combine_into: str | None = None
 
     def add(self, *, status: str, metadata: dict) -> str:
         task_id = str(9000 + len(self.tasks))
@@ -131,6 +136,8 @@ class FakeTaskStore:
         self.submits.append(arguments)
         if self.submit_fails:
             return SubmitFailed('submit refused')
+        if self.combine_into is not None:
+            return SubmittedTask(self.combine_into, self.tasks[self.combine_into]['status'], combined=True)
         if arguments.get('planning_mode'):
             metadata = {**arguments['metadata'], 'deferral': {'kind': 'planning'}}
             return SubmittedTask(self.add(status='deferred', metadata=metadata), 'deferred')
@@ -139,6 +146,14 @@ class FakeTaskStore:
     async def post_submit_tasks(self, arguments_list: list[dict]) -> None:
         for arguments in arguments_list:
             await self.submit_task(arguments)
+
+    async def grant_main_health_fix_precedence(self, task_id: str) -> int | None:
+        """Record ``(task_id, its status at the grant)``; the scheduler's override-store seam."""
+        await asyncio.sleep(0)
+        if self.grant_fails:
+            raise RuntimeError('override store unavailable')
+        self.precedence_grants.append((task_id, self.tasks[task_id]['status']))
+        return len(self.precedence_grants)
 
 
 def _break_of(outcome) -> MainBreak:
@@ -343,6 +358,108 @@ class TestMainFixTaskFiler:
         assert detail.startswith('main is red')
         assert f'task {owner.task_id}' in detail
         assert TEST_BREAK.signature in detail
+
+    def test_a_filed_owner_is_granted_precedence_once_after_its_commit(self) -> None:
+        store = FakeTaskStore()
+
+        owner = _ensure(store, TEST_BREAK)
+
+        assert owner.task_id is not None
+        assert store.precedence_grants == [(owner.task_id, 'pending')]
+
+    @pytest.mark.parametrize(
+        ('status', 'granted'),
+        [('pending', True), ('in-progress', False), ('blocked', False), ('merge-deferred', False)],
+    )
+    def test_an_adopted_owner_is_granted_precedence_only_when_pending(
+        self, status: str, granted: bool,
+    ) -> None:
+        store = FakeTaskStore()
+        existing = store.add(status=status, metadata={SIGNATURE_KEY: TEST_BREAK.signature})
+
+        _ensure(store, TEST_BREAK)
+
+        assert store.precedence_grants == ([(existing, 'pending')] if granted else [])
+
+    def test_a_half_filed_owner_is_granted_only_once_released(self) -> None:
+        store = FakeTaskStore(commit_fails=True)
+        filer = MainFixTaskFiler(store)
+        first = _ensure(store, TEST_BREAK, filer).task_id
+        assert first is not None
+        assert store.precedence_grants == []
+        store.commit_fails = False
+
+        _ensure(store, TEST_BREAK, filer)
+
+        assert store.precedence_grants == [(first, 'pending')]
+
+    @pytest.mark.parametrize(
+        ('status', 'granted'),
+        [('pending', True), ('in-progress', False), ('blocked', False)],
+    )
+    def test_an_owner_the_curator_combined_into_is_granted_only_when_pending(
+        self, status: str, granted: bool,
+    ) -> None:
+        store = FakeTaskStore()
+        store.combine_into = store.add(status=status, metadata={})
+
+        owner = _ensure(store, TEST_BREAK)
+
+        assert owner.task_id == store.combine_into and not owner.filed
+        assert store.precedence_grants == ([(owner.task_id, 'pending')] if granted else [])
+
+    def test_a_hand_carried_deferral_is_not_granted_precedence(self) -> None:
+        store = FakeTaskStore()
+        store.add(status='deferred', metadata={
+            SIGNATURE_KEY: TEST_BREAK.signature,
+            'spawn_context': 'main_health_fix_filed',
+            'deferral': {'kind': 'held_by_session', 'reason': 'hand carry'},
+        })
+
+        _ensure(store, TEST_BREAK)
+
+        assert store.precedence_grants == []
+
+    @pytest.mark.parametrize(
+        'store',
+        [FakeTaskStore(lookup_fails=True), FakeTaskStore(submit_fails=True)],
+        ids=['lookup-fails', 'submit-fails'],
+    )
+    def test_no_owner_means_no_grant(self, store: FakeTaskStore) -> None:
+        owner = _ensure(store, TEST_BREAK)
+
+        assert owner.task_id is None
+        assert store.precedence_grants == []
+
+    def test_a_failed_grant_never_costs_the_break_its_owner(
+        self, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        store = FakeTaskStore(grant_fails=True)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.main_health_fix_owner'):
+            owner = _ensure(store, TEST_BREAK)
+
+        assert owner.task_id is not None and owner.filed
+        assert store.tasks[owner.task_id]['status'] == 'pending'
+        assert any(
+            record.levelno == logging.WARNING and owner.task_id in record.getMessage()
+            for record in caplog.records
+        )
+
+    def test_concurrent_breaks_of_one_signature_grant_only_their_one_owner(self) -> None:
+        store = FakeTaskStore()
+        filer = MainFixTaskFiler(store)
+
+        async def _five_at_once():
+            return await asyncio.gather(
+                *(filer.ensure(TEST_BREAK, project_root='/proj') for _ in range(5)),
+            )
+
+        asyncio.run(_five_at_once())
+
+        [owner] = store.open_owners(TEST_BREAK.signature)
+        assert store.precedence_grants
+        assert {task_id for task_id, _ in store.precedence_grants} == {owner}
 
 
 # ---------------------------------------------------------------------------

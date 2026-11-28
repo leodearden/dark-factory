@@ -4029,6 +4029,30 @@ class Scheduler:
             )
             return False
 
+    async def grant_main_health_fix_precedence(self, task_id: str) -> int | None:
+        """Pin the main-health fix filer's *task_id* at the queue head; the rules are ``OverrideStore.pin_main_health_fix``'s."""
+        if self._override_store is None:
+            return None
+        try:
+            pin_order = await asyncio.to_thread(
+                self._override_store.pin_main_health_fix, self._project_root, task_id,
+            )
+        except Exception:
+            logger.warning(
+                'Main-health fix precedence: pinning %s raised', task_id, exc_info=True,
+            )
+            return None
+        if pin_order is None:
+            logger.info(
+                'Main-health fix precedence: an operator override for %s stands', task_id,
+            )
+        else:
+            logger.info(
+                'Main-health fix precedence: %s pinned at pin_order %d with reserve_now',
+                task_id, pin_order,
+            )
+        return pin_order
+
     def _release_unpending_watchdog_pins(
         self, overrides: Mapping[str, OverrideRow], status_map: Mapping[str, str],
     ) -> list[str]:

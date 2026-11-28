@@ -41,10 +41,10 @@ Two specimens:
   `main_health_fix_owner.py::build_main_fix_task_arguments` stamps
   `merge_lane: high`. It acts after dispatch, so on its own it cannot get a fix
   dispatched.
-- **Sibling task 10399's interim fix** (pin_order 1 plus `reserve_now` on
-  filing) orders lock acquisition but still needs a free permit, so it cannot
-  break the cycle alone. With this task in place it stays useful for lock
-  precedence.
+- **Sibling task 10399: precedence on filing, LANDED** (§7). The filer pins
+  the fix at the head of the queue with `reserve_now`. That orders dispatch and
+  lock acquisition, but it still needs a free permit, so it could not break the
+  cycle alone. The reserve supplies the permit; the pin supplies precedence.
 
 ## 3. Admission
 
@@ -106,11 +106,21 @@ From `docs/code-quality.md`:
 
 ## 6. Residuals
 
-- A fix whose planned files overlap a merge-waiter's held modules, or a pin
-  head's reservation, still waits on module locks. That lock precedence is owned
-  by 10399 item (3) and by 8795. When the pin head is one the PSI hold defers,
-  that wait has no bound; DA-D10 of `docs/prds/dispatch-admission-load-cap.md`
-  records it.
+- A fix no longer waits behind another pin head's reservation, a PSI-deferred
+  one included: the filed fix is the pin head (§7). What remains is a fix whose
+  planned files overlap modules a merge-waiter holds while the normal merge lane
+  is halted for the heal. That holder cannot finish before the heal lands, and
+  nothing may preempt it. Today only the starvation watchdog's `park_blocked`
+  L1 names it for a human, after `park_blocked_age_secs` (default 4 h). Raising
+  that case at once for a main-health fix is task 12013.
+- With `pin_reservation_max_active` above 1, a pin the fix moved back off the
+  head keeps the pin-rank parks it already holds. Those parks still rank as
+  `PinOrder(1)`, because
+  `orchestrator/src/orchestrator/lock_table.py::ModuleLockTable.unparked_modules`
+  treats a better existing rank as covering and nothing re-ranks it. On a
+  shared module that stale rank ties the fix's, and the park key's id
+  tie-break decides who takes it first. Two fixes tie in the same way. At the
+  default of 1 the demoted pin's reservation is released, so no tie arises.
 - Resolved by task 10600: an admitted fix is exempt from the PSI admission
   gate's hold on every tick, in both dispatch loops. The rationale and the load
   bound are DA-D10 of `docs/prds/dispatch-admission-load-cap.md`.
@@ -119,3 +129,68 @@ From `docs/code-quality.md`:
   (INV-8 `loop-thread-occupancy-bounded`). A general slot that frees during
   such a restricted tick is refilled by an unrestricted tick at once, not
   after the next poll.
+
+## 7. Precedence on filing (task 10399)
+
+What is written, and by whom:
+
+- `orchestrator/src/orchestrator/main_health_fix_owner.py::MainFixTaskFiler`
+  grants precedence to an owner the scheduler can dispatch next. That is one
+  it has just filed, a half-filed one that reads back pending once its commit
+  is re-run, or an adopted owner that is pending.
+- It never grants an in-progress, blocked, merge-deferred or hand-carried
+  owner. On those, `reserve_now` would be refused and consumed at once.
+- The grant goes through
+  `orchestrator/src/orchestrator/scheduler.py::Scheduler.grant_main_health_fix_precedence`
+  to `orchestrator/src/orchestrator/overrides.py::OverrideStore.pin_main_health_fix`.
+- The row is owned by `OverrideSource.MAIN_HEALTH_FIX` (`main_health_fix`). It is
+  pinned at the head, with `reserve_now` armed and no TTL.
+- A failed grant is logged. It never costs the break its fix owner.
+
+Head insert: the fix takes pin_order `min(1, lowest other order)`, and every
+other pin of the project moves back one place, keeping its relative order.
+Among several fixes the newest is first. A fix already pinned keeps its place,
+and a re-grant only re-arms `reserve_now`, so the many adoptions a red main
+produces never churn the queue.
+
+Ownership rules:
+
+- An operator's row for the task stands. It is never written.
+- An operator's unpin of the fix stands. The owner's unpinned row is left as it
+  is. Only `clear_task_priority_override(field='pinned')` leaves that row. The
+  tool's default whole-row clear deletes it, so the next adoption of a
+  still-pending fix pins it at the head again. In the same way, an operator's
+  `field='reserve_now'` clear is re-armed at the next grant: the store cannot
+  tell it from the scheduler consuming the flag. To keep a fix off the head,
+  clear `pinned`.
+- A starvation-watchdog row is taken over and its TTL dropped, so
+  `clear_expired` cannot later remove the fix's pin.
+- A row of any other source raises `ValueError` and writes nothing. A new
+  `OverrideSource` must be given its rule in
+  `orchestrator/src/orchestrator/overrides.py::_write_main_health_fix_pin`.
+
+Why the in-process store, not the `set_task_priority_override` MCP tool: both
+write `scheduler_overrides.db`, but the tool stamps `source='operator'`, so a
+machine pin would pass for an operator's. It also refuses a `pin_order`
+collision, the normal case once an operator has pinned anything.
+
+Lock precedence: the fix parks behind a held lock and never preempts it.
+"Preemption / force-release of a HELD lock" is explicitly rejected in
+`plans/scheduler-dispatch-scoring-and-lock-layer-prd.md` §7.
+
+- As pin head, a lock-blocked fix reserves its modules at pin rank. At the
+  default `pin_reservation_max_active` of 1, it therefore takes a released
+  module ahead of every operator pin, tier park and critical candidate. A
+  higher cap leaves a rank tie (§6).
+- `Scheduler._bound_pin_reservations` keeps the first
+  `pin_reservation_max_active` reservation owners in queue order. The fix is
+  first, so it is kept ahead of a PSI-deferred operator head, which removes the
+  wait that the DA-D10 residual of `docs/prds/dispatch-admission-load-cap.md`
+  describes.
+- A fix filed with no files locks only its fallback key `task-<id>`. It meets
+  contention only after plan refinement persists real files and requeues it.
+
+The clear: the tick's override GC (`OverrideStore.clear_terminal`) deletes the
+row when the fix is done or cancelled, as it does for every owner. The pin is
+not released on dispatch, so a fix whose workflow requeues it to pending still
+dispatches first.
