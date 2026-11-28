@@ -14,22 +14,19 @@ from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
-from unittest.mock import AsyncMock
 
 import pytest
 from _defect_ruling_fixtures import RULED_REF, SECOND_RULED_REF, contract_ruling
-from _info_l0_router_fixtures import PASSED, TASK_ID, assignment, run_config
+from _info_l0_router_fixtures import PASSED, TASK_ID, assignment
 from _replanning_review_stub import ReplanningReviewStub
 from _workflow_helpers import (
     PLAN,
     AgentStub,
     FakeBriefing,
-    _build_workflow_with_escalation,
-    _init_repo,
-    _make_git_ops,
     _make_review,
     _make_status_setting_steward,
 )
+from _workflow_run import WorkflowRun
 from shared.cli_invoke import AgentResult
 from shared.defects import (
     DEFECT_TEST_RETIREMENTS_METADATA_KEY,
@@ -131,31 +128,21 @@ def _deferring_steward(run: _DefectRun) -> type:
     return _DeferringSteward
 
 
-class _DefectRun:
+class _DefectRun(WorkflowRun[FakeBriefing]):
     """One TaskWorkflow.run() whose task is seeded into the FakeScheduler's store."""
 
     def __init__(
         self, tmp_path: Path, monkeypatch, stub: AgentStub, *,
         max_review_cycles: int, briefing: ReviewBriefing = ReviewBriefing.DIFF_ONLY,
+        recorder: FakeBriefing | None = None,
     ) -> None:
-        repo = tmp_path / 'repo'
-        repo.mkdir()
-        _init_repo(repo)
-        config = run_config(repo, briefing=briefing, router_enabled=False)
         dispatched = _dispatched()
-        self.workflow, self.scheduler, self.queue = _build_workflow_with_escalation(
-            config, _make_git_ops(config.project_root), dispatched, stub, tmp_path,
-            steward_factory=_deferring_steward(self),
+        super().__init__(
+            tmp_path, monkeypatch, stub, recorder or FakeBriefing(), dispatched,
+            briefing=briefing, router_enabled=False, steward_factory=_deferring_steward(self),
         )
         self.workflow.config.max_review_cycles = max_review_cycles
         self.scheduler.task_data[TASK_ID] = copy.deepcopy(dispatched.task)
-        monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
-        monkeypatch.setattr(
-            'orchestrator.workflow.run_scoped_verification', AsyncMock(return_value=PASSED),
-        )
-
-    async def run(self) -> WorkflowOutcome:
-        return (await self.workflow.run()).outcome
 
     async def run_to_the_review_cap(self) -> None:
         """Run until the cap exit's review_issues escalation, which the deferring steward settles."""
@@ -407,9 +394,10 @@ class TestReviewerIsBriefedFromLiveRecords:
     """The store holds a closure awaiting a ruling that the dispatch task never carried."""
 
     def _run(self, tmp_path, monkeypatch, briefing: ReviewBriefing) -> tuple[_DefectRun, _TaskRecordingBriefing]:
-        run = _DefectRun(tmp_path, monkeypatch, AgentStub(), max_review_cycles=2, briefing=briefing)
         recorder = _TaskRecordingBriefing()
-        run.workflow.briefing = recorder
+        run = _DefectRun(
+            tmp_path, monkeypatch, AgentStub(), max_review_cycles=2, briefing=briefing, recorder=recorder,
+        )
         run.seed(defects=[_exemption_awaiting_ruling(RULED_REF)])
         return run, recorder
 
@@ -525,9 +513,8 @@ class TestACachedVerdictDefersToAPendingRuling:
         retirements: Sequence[Retirement] = (),
     ) -> tuple[_DefectRun, _TaskRecordingBriefing]:
         fingerprint = await _fingerprint_a_prior_dispatch_cached_under(tmp_path, monkeypatch)
-        run = _DefectRun(tmp_path, monkeypatch, stub, max_review_cycles=2)
         recorder = _TaskRecordingBriefing()
-        run.workflow.briefing = recorder
+        run = _DefectRun(tmp_path, monkeypatch, stub, max_review_cycles=2, recorder=recorder)
         run.seed(defects=defects, retirements=retirements)
         monkeypatch.setattr(
             'orchestrator.workflow.run_scoped_verification', _VerifyAfterACachedPass(run, fingerprint),
