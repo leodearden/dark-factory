@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import logging
 from datetime import UTC, datetime
 
@@ -9,10 +10,15 @@ import pytest
 from _defect_ruling_fixtures import RULED_REF, SECOND_RULED_REF
 from _orch_helpers import mcp_tool_envelope
 from shared.defects import (
+    DEFECT_TEST_RETIREMENTS_METADATA_KEY,
+    DEFECTS_METADATA_KEY,
     Declare,
     DefectOrigin,
     DefectStatus,
     IssueKind,
+    Retirement,
+    RetirementCode,
+    RetirementReason,
     Rule,
     RuledBy,
     Ruling,
@@ -25,9 +31,11 @@ from shared.defects import (
 
 from orchestrator.review_defects import (
     DefectWrite,
+    declared_refs,
     review_defect_declarations,
     review_ruling_events,
     send_defect_events,
+    with_live_defect_records,
 )
 from orchestrator.review_payload import DefectRuling
 
@@ -286,3 +294,102 @@ class TestSendDefectEvents:
         (write,) = await _send(_RecordingDispatch({'unexpected': 'shape'}), _declare_event())
 
         assert write.failure is not None
+
+
+def _defect_record(description: str) -> dict:
+    return _declare_event(description).declaration.model_dump(mode='json')
+
+
+def _retirement_record(ref: str) -> dict:
+    return Retirement(
+        ref=ref, reason=RetirementReason(reason=RetirementCode.FEATURE_REMOVED),
+    ).model_dump(mode='json')
+
+
+STALE_DEFECTS = [_defect_record('declared at dispatch')]
+STALE_RETIREMENTS = [_retirement_record(SECOND_RULED_REF)]
+LIVE_DEFECTS = [_defect_record('declared at dispatch'), _defect_record('declared mid-run')]
+LIVE_RETIREMENTS = [_retirement_record(RULED_REF)]
+
+
+def _dispatch_task(**metadata: object) -> dict:
+    return {
+        'id': TASK_ID,
+        'title': 'the title dispatch saw',
+        'description': 'the description dispatch saw',
+        'metadata': {'files': ['lib.py'], **metadata},
+    }
+
+
+def _fresh_task(**metadata: object) -> dict:
+    return {
+        'id': TASK_ID,
+        'title': 'a title edited since dispatch',
+        'description': 'a description edited since dispatch',
+        'metadata': {'files': ['elsewhere.py'], **metadata},
+    }
+
+
+class TestLiveDefectRecords:
+    def test_the_two_defect_keys_come_from_the_fresh_read_and_the_rest_from_dispatch(self):
+        dispatch = _dispatch_task(
+            **{DEFECTS_METADATA_KEY: STALE_DEFECTS, DEFECT_TEST_RETIREMENTS_METADATA_KEY: STALE_RETIREMENTS},
+        )
+        fresh = _fresh_task(
+            **{DEFECTS_METADATA_KEY: LIVE_DEFECTS, DEFECT_TEST_RETIREMENTS_METADATA_KEY: LIVE_RETIREMENTS},
+        )
+
+        live = with_live_defect_records(dispatch, fresh)
+
+        assert live == {
+            **dispatch,
+            'metadata': {
+                'files': ['lib.py'],
+                DEFECTS_METADATA_KEY: LIVE_DEFECTS,
+                DEFECT_TEST_RETIREMENTS_METADATA_KEY: LIVE_RETIREMENTS,
+            },
+        }
+
+    def test_keys_the_fresh_read_lacks_are_dropped(self):
+        dispatch = _dispatch_task(
+            **{DEFECTS_METADATA_KEY: STALE_DEFECTS, DEFECT_TEST_RETIREMENTS_METADATA_KEY: STALE_RETIREMENTS},
+        )
+
+        live = with_live_defect_records(dispatch, _fresh_task())
+
+        assert live == {**dispatch, 'metadata': {'files': ['lib.py']}}
+
+    @pytest.mark.parametrize(
+        'fresh',
+        [None, 'not a task', ['not', 'a', 'task'], {'id': TASK_ID, 'metadata': 'not a dict'}],
+        ids=['none', 'str', 'list', 'metadata-not-a-dict'],
+    )
+    def test_an_unreadable_fresh_read_leaves_the_dispatch_task(self, fresh):
+        dispatch = _dispatch_task(**{DEFECTS_METADATA_KEY: STALE_DEFECTS})
+
+        assert with_live_defect_records(dispatch, fresh) == dispatch
+
+    def test_the_dispatch_task_is_not_mutated(self):
+        dispatch = _dispatch_task(**{DEFECTS_METADATA_KEY: STALE_DEFECTS})
+        before = copy.deepcopy(dispatch)
+
+        live = with_live_defect_records(
+            dispatch, _fresh_task(**{DEFECTS_METADATA_KEY: LIVE_DEFECTS}),
+        )
+
+        assert dispatch == before
+        assert live['metadata'] is not dispatch['metadata']
+
+    def test_declared_refs_are_the_refs_of_readable_entries(self):
+        readable = _defect_record('a readable entry')
+        metadata = {DEFECTS_METADATA_KEY: [readable, {'ref': 'not a record'}, 'not a dict']}
+
+        assert declared_refs(metadata) == frozenset({readable['ref']})
+
+    @pytest.mark.parametrize(
+        'metadata',
+        [{}, {DEFECTS_METADATA_KEY: None}, {DEFECTS_METADATA_KEY: {'ref': 'a dict, not a list'}}],
+        ids=['absent', 'none', 'not-a-list'],
+    )
+    def test_no_readable_list_declares_no_refs(self, metadata):
+        assert declared_refs(metadata) == frozenset()
