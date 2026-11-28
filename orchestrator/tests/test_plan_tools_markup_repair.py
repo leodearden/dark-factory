@@ -2604,7 +2604,10 @@ def _added_decision(plan: dict, _sha: str) -> None:
 
 
 def _decision_superseded(plan: dict, _sha: str) -> None:
-    assert plan['design_decisions'][1] == {
+    entry = plan['design_decisions'][1]
+    for version in entry['superseded_versions']:
+        assert isinstance(version.pop('superseded_at'), str)
+    assert entry == {
         'decision': 'A superseding decision.',
         'rationale': 'A superseding rationale.',
         'superseded_versions': [{
@@ -2704,7 +2707,12 @@ READ_PATH_CASES = [
             a, 1, 'A superseding decision.', 'A superseding rationale.',
             'The second rationale proved wrong.',
         ),
-        lambda _sha: {'status': 'ok', 'decision_index': 1, 'superseded_versions': 1},
+        lambda _sha: {
+            'status': 'ok',
+            'decision_index': 1,
+            'superseded_decision': 'A second clean decision.',
+            'superseded_versions': 1,
+        },
         _decision_superseded,
     ),
     (

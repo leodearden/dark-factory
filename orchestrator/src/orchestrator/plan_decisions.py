@@ -52,9 +52,9 @@ def _stored_entry(field: str, entry: object) -> dict:
 
 
 def supersede_decision(
-    decisions: object, index: object, *, decision: str, rationale: str, reason: str,
+    decisions: object, index: object, *, decision: str, rationale: str, reason: str, at: str,
 ) -> list[dict]:
-    """*decisions* with entry *index* restated as the new pair, its prior pair and *reason* appended to its history.
+    """*decisions* with entry *index* restated as the new pair, its prior pair, *reason* and *at* appended to its history.
 
     The input list and its entries are never mutated.
     """
@@ -74,7 +74,7 @@ def supersede_decision(
         raise InvalidSupersession(
             'decision', decision, 'restates the current decision and rationale, so there is nothing to supersede',
         )
-    superseded = {'decision': old_decision, 'rationale': old_rationale, 'reason': reason}
+    superseded = {'decision': old_decision, 'rationale': old_rationale, 'reason': reason, 'superseded_at': at}
     updated = [*current]
     updated[position] = {
         **entry,

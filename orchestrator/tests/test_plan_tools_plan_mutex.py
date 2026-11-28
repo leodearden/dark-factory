@@ -101,7 +101,11 @@ def _add_then_supersede_decision(ta: TaskArtifacts, head: str) -> dict[str, Any]
 
 def _decision_superseded(plan: dict, head: str) -> bool:
     [entry] = plan['design_decisions']
-    return (entry['decision'], entry['rationale']) == ('D2', 'R2') and entry['superseded_versions'] == [
+    versions = [
+        {key: value for key, value in version.items() if key != 'superseded_at'}
+        for version in entry['superseded_versions']
+    ]
+    return (entry['decision'], entry['rationale']) == ('D2', 'R2') and versions == [
         {'decision': 'D', 'rationale': 'R', 'reason': 'R was wrong'},
     ]
 

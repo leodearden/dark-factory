@@ -107,6 +107,7 @@ class TestDecisionNotes:
             decision=_DECISIONS[0]['decision'],
             rationale='Its paging was measured to be complete',
             reason='the store-paging claim was never checked',
+            at='2026-11-28T05:00:00+00:00',
         )
         with RecordingMemorySink() as sink:
             wf = _workflow(sink, tmp_path)

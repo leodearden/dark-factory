@@ -20,10 +20,11 @@ _DECISIONS = [
 ]
 _NEW = {'decision': 'Key the sweep on metadata', 'rationale': 'Text keys drift'}
 _REASON = 'titles were measured to drift'
+_AT = '2026-11-28T05:00:00+00:00'
 
 
 def _supersede(decisions, index=0, **overrides):
-    arguments = {**_NEW, 'reason': _REASON, **overrides}
+    arguments = {**_NEW, 'reason': _REASON, 'at': _AT, **overrides}
     return supersede_decision(decisions, index, **arguments)
 
 
@@ -36,7 +37,12 @@ def test_a_supersession_rewrites_the_entry_and_keeps_the_prior_pair():
     assert after[0]['decision'] == _NEW['decision']
     assert after[0]['rationale'] == _NEW['rationale']
     assert after[0][SUPERSEDED_VERSIONS_KEY] == [
-        {'decision': 'Key the sweep on text', 'rationale': 'Titles are stable', 'reason': _REASON},
+        {
+            'decision': 'Key the sweep on text',
+            'rationale': 'Titles are stable',
+            'reason': _REASON,
+            'superseded_at': _AT,
+        },
     ]
     assert after[1] == _DECISIONS[1]
     assert before == _DECISIONS
@@ -46,12 +52,18 @@ def test_a_second_supersession_appends_oldest_first():
     once = _supersede(_DECISIONS, 1)
     twice = supersede_decision(
         once, 1, decision='Stream the store', rationale='Paging is slow', reason='paging measured slow',
+        at='2026-11-29T09:30:00+00:00',
     )
 
     assert twice[1]['decision'] == 'Stream the store'
     assert twice[1][SUPERSEDED_VERSIONS_KEY] == [
-        {'decision': 'Page the store', 'rationale': 'It is large', 'reason': _REASON},
-        {'decision': _NEW['decision'], 'rationale': _NEW['rationale'], 'reason': 'paging measured slow'},
+        {'decision': 'Page the store', 'rationale': 'It is large', 'reason': _REASON, 'superseded_at': _AT},
+        {
+            'decision': _NEW['decision'],
+            'rationale': _NEW['rationale'],
+            'reason': 'paging measured slow',
+            'superseded_at': '2026-11-29T09:30:00+00:00',
+        },
     ]
     assert len(once[1][SUPERSEDED_VERSIONS_KEY]) == 1
 

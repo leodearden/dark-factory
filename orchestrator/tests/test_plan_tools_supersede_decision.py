@@ -7,6 +7,8 @@ driven in ``test_plan_decisions.py``.
 """
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 import pytest
 
 from orchestrator.artifacts import TaskArtifacts
@@ -58,12 +60,21 @@ def _plan_bytes(artifacts: TaskArtifacts) -> bytes:
 class TestSupersedeDesignDecision:
     def test_rewrites_the_entry_and_keeps_its_prior_pair(self, artifacts):
         _seed_plan(artifacts)
+        before = datetime.now(UTC)
 
         result = _supersede(artifacts, 1)
 
-        assert result == {'status': 'ok', 'decision_index': 1, 'superseded_versions': 1}
+        after = datetime.now(UTC)
+        assert result == {
+            'status': 'ok',
+            'decision_index': 1,
+            'superseded_decision': _SECOND[0],
+            'superseded_versions': 1,
+        }
         first, second = artifacts.read_plan()['design_decisions']
         assert first == {'decision': _FIRST[0], 'rationale': _FIRST[1]}
+        superseded_at = second[SUPERSEDED_VERSIONS_KEY][0].pop('superseded_at')
+        assert before <= datetime.fromisoformat(superseded_at) <= after
         assert second == {
             'decision': _NEW_DECISION,
             'rationale': _NEW_RATIONALE,
@@ -81,6 +92,7 @@ class TestSupersedeDesignDecision:
         )
 
         assert result['superseded_versions'] == 2
+        assert result['superseded_decision'] == _NEW_DECISION
         [_, entry] = artifacts.read_plan()['design_decisions']
         assert [v['decision'] for v in entry[SUPERSEDED_VERSIONS_KEY]] == [_SECOND[0], _NEW_DECISION]
 

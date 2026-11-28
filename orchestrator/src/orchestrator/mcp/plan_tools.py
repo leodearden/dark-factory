@@ -641,6 +641,7 @@ def _supersede_design_decision(
             decision=decision,
             rationale=rationale,
             reason=reason,
+            at=datetime.now(UTC).isoformat(),
         )
     except plan_decisions.InvalidSupersession as exc:
         return _with_markup_repairs(
@@ -651,7 +652,12 @@ def _supersede_design_decision(
     artifacts.write_plan_model(_body_edit(plan), mutex_held=True)
     versions = decisions[decision_index][plan_decisions.SUPERSEDED_VERSIONS_KEY]
     return _with_markup_repairs(
-        {'status': 'ok', 'decision_index': decision_index, 'superseded_versions': len(versions)},
+        {
+            'status': 'ok',
+            'decision_index': decision_index,
+            'superseded_decision': versions[-1]['decision'],
+            'superseded_versions': len(versions),
+        },
         markup_facts,
     )
 
@@ -1763,8 +1769,13 @@ def _server_with_every_tool(
         """Correct a recorded design decision whose decision or rationale proved wrong.
 
         The entry is rewritten in place; its prior decision and rationale are
-        kept under its ``superseded_versions`` with *reason*. Never append a
-        correction entry with ``add_design_decision`` instead.
+        kept under its ``superseded_versions`` with *reason* and the time.
+        Never append a correction entry with ``add_design_decision`` instead.
+
+        The response's ``superseded_decision`` is the decision text this call
+        replaced. Compare it with the decision you meant to correct: if they
+        differ, you addressed the wrong entry, so supersede that entry back to
+        its prior pair and then address the right one.
 
         Args:
             decision_index: The entry's 0-based position, as

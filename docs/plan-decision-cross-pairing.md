@@ -226,9 +226,9 @@ it is the only machine-visible one that exists.
 
 **Since task 3865 (2026-11-28).** An author who notices a mis-paired or wrong
 entry now corrects it with `supersede_design_decision`. The entry is rewritten
-in place, and its prior pair is kept under that entry's `superseded_versions`,
-so a reader of the top-level `decision` and `rationale` never sees the
-abandoned text. A supersession is not a CORRECTION entry, so the lower bound
+in place, and its prior pair is kept under that entry's `superseded_versions`
+with the reason and the time it was superseded, so a reader of the top-level
+`decision` and `rationale` never sees the abandoned text. A supersession is not a CORRECTION entry, so the lower bound
 `shared.decision_pairing` computes does not count it.
 
 ---
