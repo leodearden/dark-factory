@@ -147,7 +147,7 @@ tasks:
     verdict: PASS
     delivered_check:
       kind: grep
-      pattern: gpt-6-astra
+      pattern: CODEX_TERRA_MODEL = 'gpt-6\.[0-9]+-terra'
       paths:
       - orchestrator/src/orchestrator/evals/configs.py
       expect: present
