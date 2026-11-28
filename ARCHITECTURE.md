@@ -460,9 +460,14 @@ For a normal task, `TaskWorkflow._drive()`
    a plan.
 4. **EXECUTE.** `_execute_iterations()` runs `implementer` iteratively over
    the plan: RED test → GREEN implementation → commit → mark the step done.
-   After each iteration, a cheap, read-only `judge` agent verdicts whether
-   the diff actually represents substantive completion — deliberately
-   distrusting the plan's own step-done bookkeeping. Before EXECUTE, and
+   In evals only, a cheap, read-only `judge` agent verdicts after each
+   iteration whether the diff actually represents substantive completion —
+   deliberately distrusting the plan's own step-done bookkeeping — and a
+   substantive-completion verdict ends EXECUTE early. The eval runner turns
+   it on through `judge_after_each_iteration`
+   (`orchestrator/src/orchestrator/evals/runner.py::build_eval_orch_config`,
+   shadow cells included); production leaves it off, so no production task
+   is judged. Before EXECUTE, and
    again before the implementer resumes after each escalation resolution,
    the workflow checks that the lane `.task/plan.json` reads the task's plan
    (`orchestrator/src/orchestrator/artifacts.py::TaskArtifacts.lane_plan_fault`).
@@ -814,7 +819,7 @@ matter most for reasoning about safety:
 | `implementer` | EXECUTE | RED test → GREEN implementation → commit, per plan step; sandboxed | sonnet / xhigh / $10 / 80 (routed to opus above ~12 steps or ~3 modules) |
 | `debugger` | VERIFY failure loop | Fixes test/lint/typecheck failures with minimal changes; sandboxed | sonnet / xhigh / $5 / 50 |
 | `reviewer_comprehensive` | REVIEW | Sole reviewer: test quality, reuse, architecture, performance, robustness; read-only | opus / high / $5 / 30 (config resolves `reviewer_comprehensive` → the `reviewer` config key) |
-| `judge` | Post-EXECUTE-iteration | Read-only completion verdict on the diff vs. the plan | sonnet / medium / $0.50 / 15 |
+| `judge` | Post-EXECUTE-iteration, evals only (never in production) | Read-only completion verdict on the diff vs. the plan | sonnet / medium / $0.50 / 15 |
 | `merger` | Merge-conflict resolution | Conservative conflict resolution with a drop-aware protocol | opus / xhigh / $5 / 50 |
 | `steward` | ESCALATED (persistent, per task) | L0 escalation handling; the only role that may set task status | opus / high / $5 / 100 |
 | `deep_reviewer` | ReviewCheckpoint (every ~40 merges) | Cross-task integration review; can file its own tasks/escalations | opus / xhigh / $15 / 100 |
